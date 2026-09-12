@@ -1,0 +1,22 @@
+{
+  "name": "ai-assistant-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Node.js AI service with direct LLM API, LangChain, PDF extraction, and WebSocket streaming",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.0",
+    "@langchain/openai": "^0.3.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.0",
+    "langchain": "^0.3.0",
+    "multer": "^2.0.0",
+    "openai": "^4.67.0",
+    "pdf-parse": "^1.1.1",
+    "ws": "^8.18.0"
+  }
+}
