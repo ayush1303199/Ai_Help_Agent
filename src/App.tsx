@@ -264,6 +264,8 @@ function App() {
   const segmentAudioContextRef = useRef<AudioContext | null>(null);
   const segmentHeardAudioRef = useRef(false);
   const captureActiveRef = useRef(false);
+  const pendingSegmentQueueRef = useRef<Blob[]>([]);
+  const segmentProcessorActiveRef = useRef(false);
   const lastProcessedTranscriptRef = useRef('');
   const requestInProgressRef = useRef(false);
   const chatRequestIdRef = useRef('');
@@ -655,7 +657,6 @@ function App() {
         const normalized = detected.question.toLowerCase().replace(/\s+/g, ' ');
         if (normalized === lastProcessedTranscriptRef.current) return;
         lastProcessedTranscriptRef.current = normalized;
-        requestInProgressRef.current = true;
         setPipelineStatus('question');
         console.log('[QUESTION] Question detected');
         setLiveTranscript(transcript);
@@ -673,8 +674,23 @@ function App() {
           ? 'Speech-to-text failed. Please try speaking again.'
           : (err as Error).message);
       } finally {
-        requestInProgressRef.current = false;
         setIsTranscribing(false);
+      }
+    };
+
+    const processPendingSegments = async () => {
+      if (segmentProcessorActiveRef.current) return;
+      segmentProcessorActiveRef.current = true;
+      requestInProgressRef.current = true;
+      try {
+        while (pendingSegmentQueueRef.current.length > 0) {
+          const nextSegment = pendingSegmentQueueRef.current.shift();
+          if (nextSegment) await processSegment(nextSegment);
+        }
+      } finally {
+        requestInProgressRef.current = false;
+        segmentProcessorActiveRef.current = false;
+        if (captureActiveRef.current) setPipelineStatus('listening');
       }
     };
 
@@ -698,7 +714,8 @@ function App() {
         setPipelineStatus('stopped');
       }
       if (segment.length > 0) {
-        void processSegment(new Blob(segment, { type: recorder.mimeType || 'audio/webm' }));
+        pendingSegmentQueueRef.current.push(new Blob(segment, { type: recorder.mimeType || 'audio/webm' }));
+        void processPendingSegments();
       }
     };
     recorder.start();
