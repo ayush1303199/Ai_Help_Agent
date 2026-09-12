@@ -451,6 +451,7 @@ function App() {
         return [...next];
       });
       setError(msg.message);
+      setPipelineStatus('error');
     }
   }, [flushStreamBuffer, voiceReplies]);
 
@@ -534,6 +535,7 @@ function App() {
       liveRequestInFlightRef.current = false;
       setChatStreaming(false);
       chatRequestIdRef.current = '';
+      setPipelineStatus('error');
       setMessages((prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
@@ -972,6 +974,14 @@ function App() {
   const sessionActive = isRecording || isTranscribing || chatStreaming || messages.length > 0 || pipelineStatus === 'question' || pipelineStatus === 'thinking' || pipelineStatus === 'answer';
   const lastQuestion = [...messages].reverse().find((message) => message.role === 'user')?.content || '';
   const lastAnswer = [...messages].reverse().find((message) => message.role === 'assistant')?.content || '';
+  const answeredSegments = messages.reduce<Array<{ question: string; answer: string }>>((segments, message, index) => {
+    if (message.role !== 'user') return segments;
+    const answer = messages[index + 1];
+    if (answer?.role === 'assistant' && answer.content && !answer.streaming) {
+      segments.push({ question: message.content, answer: answer.content });
+    }
+    return segments;
+  }, []);
   const statusLabel = pipelineStatus === 'listening' ? 'Listening...' : pipelineStatus === 'transcribing' ? 'Transcribing...' : pipelineStatus === 'question' ? 'Question detected' : pipelineStatus === 'thinking' ? 'Thinking...' : pipelineStatus === 'answer' ? 'Answer ready' : pipelineStatus === 'stopped' ? 'Stopped' : 'Ready';
   const statusTone = pipelineStatus === 'error' ? 'text-rose-300' : pipelineStatus === 'answer' ? 'text-emerald-300' : 'text-sky-300';
 
@@ -1242,6 +1252,17 @@ function App() {
               <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-emerald-300">Answer</p>
               {lastAnswer ? <div className="space-y-4 text-lg leading-relaxed text-slate-100">{renderAnswerMarkdown(lastAnswer)}</div> : <p className="text-sm text-slate-500">{pipelineStatus === 'thinking' ? 'Generating answer...' : 'No answer yet.'}</p>}
             </article>
+            {answeredSegments.length > 1 && <section className="mt-4 rounded-xl border border-slate-700 bg-slate-900/70 p-4">
+              <p className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Earlier answers</p>
+              <div className="max-h-64 space-y-3 overflow-y-auto">
+                {answeredSegments.slice(0, -1).reverse().map((segment, index) => (
+                  <article key={`${segment.question}-${index}`} className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                    <p className="text-xs font-medium text-slate-400">{segment.question}</p>
+                    <div className="mt-2 text-sm leading-relaxed text-slate-300">{renderAnswerMarkdown(segment.answer)}</div>
+                  </article>
+                ))}
+              </div>
+            </section>}
             <div className="mt-4 flex items-center justify-between"><button onClick={() => setTranscriptOpen((open) => !open)} className="text-xs text-emerald-300 hover:text-emerald-200">{transcriptOpen ? 'Hide full transcript' : 'View full transcript'}</button><button onClick={stopMeetingCapture} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-rose-400">Stop Listening</button></div>
             {transcriptOpen && <div className="mt-3 max-h-48 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">{liveTranscript || 'No transcript captured yet.'}</div>}
             {error && <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
