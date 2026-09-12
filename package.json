@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npm run electron:dev",
+    "web:dev": "vite",
     "electron:dev": "concurrently -k \"vite --port 5174 --strictPort\" \"wait-on http://localhost:5174 && cross-env ELECTRON_DEV_URL=http://localhost:5174 electron electron/main.cjs\"",
     "electron:start": "electron electron/main.cjs",
     "build": "vite build",
