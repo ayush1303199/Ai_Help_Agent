@@ -52,11 +52,29 @@ interface ChatSession {
   updatedAt: string;
 }
 
+interface SessionDocument {
+  id: string;
+  name: string;
+  text: string;
+  uploadedAt: number;
+}
+
+interface TrainedProfile {
+  id: string;
+  name: string;
+  summary: string;
+  context: string;
+  createdAt: number;
+}
+
 const HTTP_URL = 'http://localhost:3001';
 const WS_URL = 'ws://localhost:3002';
 const MAX_CHAT_HISTORY_MESSAGES = 8;
 const MAX_CHAT_MESSAGE_CHARS = 2000;
 const MAX_CONTEXT_CHARS = 9000;
+const MAX_PDF_SIZE = 20 * 1024 * 1024;
+const PDF_CONTEXT_BUDGET_RATIO = 0.65;
+const PDF_CONTEXT_CHAR_BUDGET = Math.floor(MAX_CONTEXT_CHARS * PDF_CONTEXT_BUDGET_RATIO);
 // The active capture path is system audio only; microphone access is never
 // requested. Transcription begins only after the user stops listening.
 const PDF_UPLOAD_TIMEOUT_MS = 20000;
@@ -138,6 +156,29 @@ function detectQuestion(text: string) {
   return { isQuestion, question: isQuestion ? question : null };
 }
 
+function truncateContextText(text: string, maxChars: number) {
+  if (!text) return '';
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, maxChars - 24).trim()}…`;
+}
+
+function resolveContext({ mode, sessionDocuments, activeProfile }: { mode: Mode; sessionDocuments: SessionDocument[]; activeProfile: TrainedProfile | null }) {
+  if (mode === 'direct') return '';
+
+  const sections: string[] = [];
+  if (activeProfile?.context) {
+    sections.push(`Trained profile: ${activeProfile.name}\n${truncateContextText(activeProfile.context, PDF_CONTEXT_CHAR_BUDGET / 2)}`);
+  }
+  if (sessionDocuments.length > 0) {
+    const sessionText = sessionDocuments
+      .map((doc) => `Document: ${doc.name}\n${truncateContextText(doc.text, Math.max(900, Math.floor(PDF_CONTEXT_CHAR_BUDGET / Math.max(sessionDocuments.length, 1))))}`)
+      .join('\n\n');
+    sections.push(sessionText);
+  }
+  return sections.join('\n\n');
+}
+
 function renderAnswerMarkdown(text: string) {
   return text.split(/\n{2,}/).map((block, index) => {
     const trimmed = block.trim();
@@ -215,9 +256,30 @@ function App() {
   const [pdfLoading, setPdfLoading] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
+  const [statusMessage, setStatusMessage] = useState('');
   const [health, setHealth] = useState<{ provider: string; model: string } | null>(null);
+  const [sessionDocuments, setSessionDocuments] = useState<SessionDocument[]>([]);
+  const [trainedProfiles, setTrainedProfiles] = useState<TrainedProfile[]>(() => {
+    try {
+      const raw = localStorage.getItem('trained-profiles-v1');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+  const [activeProfileId, setActiveProfileId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('active-profile-id-v1') || null;
+    } catch {
+      return null;
+    }
+  });
+  const [profilePreviewOpen, setProfilePreviewOpen] = useState(false);
   const [meetingSource] = useState('System Audio');
   const [meetingMenuOpen, setMeetingMenuOpen] = useState(false);
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
+  const [jobDescription, setJobDescription] = useState('');
   const [transcriptOpen, setTranscriptOpen] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
@@ -252,6 +314,8 @@ function App() {
   const wsConnectPromiseRef = useRef<Promise<WebSocket> | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const resumeFileInputRef = useRef<HTMLInputElement>(null);
+  const jobDescriptionFileInputRef = useRef<HTMLInputElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const voiceBufferRef = useRef('');
@@ -305,6 +369,18 @@ function App() {
   useEffect(() => {
     localStorage.setItem('chat-history', JSON.stringify(chatHistory));
   }, [chatHistory]);
+
+  useEffect(() => {
+    localStorage.setItem('trained-profiles-v1', JSON.stringify(trainedProfiles));
+  }, [trainedProfiles]);
+
+  useEffect(() => {
+    if (activeProfileId) {
+      localStorage.setItem('active-profile-id-v1', activeProfileId);
+    } else {
+      localStorage.removeItem('active-profile-id-v1');
+    }
+  }, [activeProfileId]);
 
   // Save only completed turns, so streaming tokens never cause storage writes.
   useEffect(() => {
@@ -375,6 +451,149 @@ function App() {
   useEffect(() => {
     void ensureWs().catch(() => undefined);
   }, [ensureWs]);
+
+  const activeProfile = trainedProfiles.find((profile) => profile.id === activeProfileId) ?? null;
+
+  const clearSessionContext = useCallback(() => {
+    setSessionDocuments([]);
+    setPdfText('');
+    setPdfName('');
+    setJobDescription('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (resumeFileInputRef.current) resumeFileInputRef.current.value = '';
+    if (jobDescriptionFileInputRef.current) jobDescriptionFileInputRef.current.value = '';
+    setStatusMessage('Session context cleared.');
+  }, []);
+
+  const deleteProfile = useCallback((profileId: string) => {
+    const profile = trainedProfiles.find((item) => item.id === profileId);
+    if (profile && !window.confirm(`Delete trained profile "${profile.name}"?`)) return;
+    setTrainedProfiles((prev) => prev.filter((profile) => profile.id !== profileId));
+    setActiveProfileId((current) => (current === profileId ? null : current));
+    setProfilePreviewOpen(false);
+    setStatusMessage('Profile deleted.');
+  }, [trainedProfiles]);
+
+  const handlePdfUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>, documentLabel = 'Session Document') => {
+    const files = Array.from(event.target.files || []);
+    if (!files.length) return;
+
+    setPdfLoading(true);
+    setError('');
+    setStatusMessage('');
+
+    try {
+      const extractedDocs: SessionDocument[] = [];
+      for (const file of files) {
+        if (!file.name.toLowerCase().endsWith('.pdf')) {
+          throw new Error('Only PDF files can be uploaded to the context area.');
+        }
+        if (file.size > MAX_PDF_SIZE) {
+          throw new Error(`${file.name} is larger than the 20MB PDF limit.`);
+        }
+
+        const formData = new FormData();
+        formData.append('file', file);
+        const response = await fetch(`${HTTP_URL}/api/extract-pdf`, {
+          method: 'POST',
+          body: formData,
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || `Failed to extract ${file.name}.`);
+        }
+
+        const extractedText = typeof data.text === 'string' ? data.text : '';
+        if (!extractedText.trim()) {
+          throw new Error(`${file.name} was not readable as text. Try a different PDF or an OCR-enabled file.`);
+        }
+
+        extractedDocs.push({
+          id: crypto.randomUUID(),
+          name: `${documentLabel}: ${file.name}`,
+          text: extractedText,
+          uploadedAt: Date.now(),
+        });
+      }
+
+      if (!extractedDocs.length) return;
+      setSessionDocuments((prev) => [...prev, ...extractedDocs]);
+      const combinedText = extractedDocs.map((doc) => doc.text).join('\n\n');
+      setPdfText(combinedText);
+      if (documentLabel === 'Resume') {
+        setPdfName(extractedDocs.map((doc) => doc.name).join(', '));
+      }
+      setStatusMessage(`${extractedDocs.length} PDF document${extractedDocs.length > 1 ? 's were' : ' was'} added to session context.`);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setPdfLoading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }, []);
+
+  const handleResumeUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    void handlePdfUpload(event, 'Resume');
+  }, [handlePdfUpload]);
+
+  const handleJobDescriptionPdfUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    await handlePdfUpload(event, 'Job Description');
+  }, [handlePdfUpload]);
+
+  const saveJobDescription = useCallback(() => {
+    const text = jobDescription.trim();
+    if (!text) return;
+
+    setSessionDocuments((previous) => [
+      ...previous.filter((document) => !document.name.startsWith('Job Description: Pasted')),
+      {
+        id: crypto.randomUUID(),
+        name: 'Job Description: Pasted text',
+        text,
+        uploadedAt: Date.now(),
+      },
+    ]);
+    setStatusMessage('Pasted job description added to session context.');
+    setError('');
+  }, [jobDescription]);
+
+  const trainProfile = useCallback(() => {
+    if (!sessionDocuments.length) {
+      setError('Upload at least one readable PDF before creating a trained profile.');
+      return;
+    }
+
+    const suggestedName = sessionDocuments[0]?.name.replace(/\.pdf$/i, '') || 'Profile';
+    const profileName = window.prompt('Name this trained profile', suggestedName);
+    if (!profileName || !profileName.trim()) return;
+
+    const trimmedName = profileName.trim();
+    const context = sessionDocuments
+      .map((doc) => `Document: ${doc.name}\n${doc.text}`)
+      .join('\n\n');
+    const summary = `Session context from ${sessionDocuments.length} document${sessionDocuments.length > 1 ? 's' : ''}.`;
+
+    setTrainedProfiles((prev) => {
+      const normalized = trimmedName.toLowerCase();
+      const existingIndex = prev.findIndex((profile) => profile.name.toLowerCase() === normalized);
+      const profile: TrainedProfile = {
+        id: existingIndex >= 0 ? prev[existingIndex].id : crypto.randomUUID(),
+        name: trimmedName,
+        summary,
+        context: truncateContextText(context, MAX_CONTEXT_CHARS),
+        createdAt: Date.now(),
+      };
+      if (existingIndex >= 0) {
+        const next = [...prev];
+        next[existingIndex] = profile;
+        return next;
+      }
+      return [profile, ...prev];
+    });
+    setStatusMessage(`Profile "${trimmedName}" is ready.`);
+    setError('');
+  }, [sessionDocuments]);
 
   const handleWsMessage = useCallback((data: string) => {
     const msg = JSON.parse(data);
@@ -522,6 +741,9 @@ function App() {
         .filter((m) => m.role === 'user' || m.role === 'assistant')
         .slice(-MAX_CHAT_HISTORY_MESSAGES)
         .map((m) => ({ role: m.role, content: compactMessageContent(m.content) }));
+      const resolvedContext = contextOverride !== undefined
+        ? contextOverride
+        : resolveContext({ mode, sessionDocuments, activeProfile });
 
       ws.send(JSON.stringify({
         type: 'chat',
@@ -529,7 +751,7 @@ function App() {
         mode,
         messages: [{ role: 'system', content: AI_SYSTEM_PROMPT }, ...conversationHistory],
         // Archived transcripts remain available in the UI; only the current one is chat context.
-        pdfContext: (contextOverride || [pdfText, liveTranscript].filter(Boolean).join('\n\n')).slice(-MAX_CONTEXT_CHARS),
+        pdfContext: resolvedContext.slice(-MAX_CONTEXT_CHARS),
       }));
     } catch (err) {
       liveRequestInFlightRef.current = false;
@@ -753,20 +975,24 @@ function App() {
 
   const startMeetingCapture = async () => {
     setError('');
+    setStatusMessage('Opening the system-audio source selector...');
     try {
       const systemStream = await requestSystemAudioStream();
       recordAudioStream(systemStream, () => {
         systemStream.getTracks().forEach((track) => track.stop());
       });
+      setStatusMessage('System audio connected. Listening is ready.');
     } catch (err) {
       setAudioStatus('disabled');
       setAudioSourceLabel('Not connected');
       setError(systemAudioErrorMessage(err, 'capture'));
+      setStatusMessage('');
     }
   };
 
   const testSystemAudio = async () => {
     setError('');
+    setStatusMessage('Opening the system-audio source selector...');
     let stream: MediaStream | null = null;
     try {
       stream = await requestSystemAudioStream();
@@ -779,6 +1005,7 @@ function App() {
       setAudioStatus('disabled');
       setAudioSourceLabel('Not connected');
       setError(systemAudioErrorMessage(err, 'test'));
+      setStatusMessage('');
     } finally {
       stream?.getTracks().forEach((track) => track.stop());
       void electronAudioContextRef.current?.close();
@@ -787,6 +1014,7 @@ function App() {
       audioLevelTimerRef.current = null;
       setAudioLevel(0);
       if (!isRecording) setAudioStatus('disabled');
+      if (!isRecording && !error) setStatusMessage('');
     }
   };
 
@@ -891,49 +1119,12 @@ function App() {
   };
 
   // --- PDF upload ---
-  const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setPdfLoading(true);
-    setError('');
-
-    const formData = new FormData();
-    formData.append('file', file);
-
-    // Added a timeout (matching /api/transcribe-audio) so a slow/hung server
-    // doesn't leave the UI stuck on "Extracting text from PDF..." forever.
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), PDF_UPLOAD_TIMEOUT_MS);
-
-    try {
-      const res = await fetch(`${HTTP_URL}/api/extract-pdf`, {
-        method: 'POST',
-        body: formData,
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || 'Upload failed');
-      }
-
-      const data = await res.json();
-      setPdfText(data.text);
-      setPdfName(file.name);
-    } catch (err) {
-      const isTimeout = (err as Error).name === 'AbortError';
-      setError(`PDF upload failed: ${isTimeout ? 'request timed out' : (err as Error).message}`);
-    } finally {
-      clearTimeout(timeout);
-      setPdfLoading(false);
-    }
-  };
-
   const removePdf = () => {
     setPdfText('');
     setPdfName('');
+    setSessionDocuments([]);
     if (fileInputRef.current) fileInputRef.current.value = '';
+    setStatusMessage('Session document cleared.');
   };
 
   const copyText = async (text: string, item: string) => {
@@ -994,7 +1185,90 @@ function App() {
             <div><h1 className="text-sm font-semibold">Meeting AI Assistant</h1><p className={`text-[11px] ${statusTone}`}>● {statusLabel}</p></div>
           </div>
           <div className="flex items-center gap-2">
+            <div className="flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5" aria-label="AI mode">
+              <button
+                onClick={() => setMode('direct')}
+                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${mode === 'direct' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                Direct
+              </button>
+              <button
+                onClick={() => setMode('langchain')}
+                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${mode === 'langchain' ? 'bg-teal-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                LangChain
+              </button>
+            </div>
             {sessionActive && <button onClick={() => setMeetingMenuOpen((open) => !open)} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
+            <div className="relative">
+              <button
+                onClick={() => setContextMenuOpen((open) => !open)}
+                className={`rounded-lg border px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400 ${contextMenuOpen ? 'border-emerald-400 bg-emerald-500/10' : 'border-slate-700'}`}
+              >
+                Context
+              </button>
+              {contextMenuOpen && (
+                <div className="absolute right-0 top-11 z-20 max-h-[calc(100vh-5rem)] w-[min(23rem,calc(100vw-2rem))] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl">
+                  <div className="mb-3 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold">Session context</p>
+                      <p className="text-xs text-slate-500">Resume and job description context</p>
+                    </div>
+                    <button onClick={() => setContextMenuOpen(false)} className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200" aria-label="Close context panel"><X className="h-4 w-4" /></button>
+                  </div>
+                  {mode === 'direct' && (sessionDocuments.length > 0 || activeProfile) && (
+                    <p className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                      This context is available but not used while in Direct mode.
+                    </p>
+                  )}
+                  <input ref={resumeFileInputRef} type="file" accept="application/pdf" onChange={handleResumeUpload} className="hidden" />
+                  <input ref={jobDescriptionFileInputRef} type="file" accept="application/pdf" onChange={handleJobDescriptionPdfUpload} className="hidden" />
+                  <div className="space-y-3">
+                    <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <p className="text-xs font-medium text-slate-200">Resume / document</p>
+                        <button onClick={() => resumeFileInputRef.current?.click()} disabled={pdfLoading} className="rounded-md border border-emerald-500/40 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
+                          {pdfLoading ? 'Reading...' : 'Upload PDF'}
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-slate-500">{pdfName || 'No resume uploaded'}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <p className="text-xs font-medium text-slate-200">Job Description</p>
+                        <button onClick={() => jobDescriptionFileInputRef.current?.click()} disabled={pdfLoading} className="rounded-md border border-emerald-500/40 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
+                          Upload PDF
+                        </button>
+                      </div>
+                      <textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the job description here..." rows={4} className="w-full resize-y rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400" />
+                      <button onClick={saveJobDescription} disabled={!jobDescription.trim()} className="mt-2 rounded-md bg-slate-700 px-2.5 py-1.5 text-[11px] text-slate-200 hover:bg-slate-600 disabled:opacity-40">Add pasted text</button>
+                    </div>
+                    {sessionDocuments.length > 0 && (
+                      <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                        <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">Session uploads</p>
+                        <div className="space-y-1">
+                          {sessionDocuments.map((document) => <p key={document.id} className="truncate text-[11px] text-slate-300">✓ {document.name}</p>)}
+                        </div>
+                      </div>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <select value={activeProfileId ?? 'none'} onChange={(event) => setActiveProfileId(event.target.value === 'none' ? null : event.target.value)} className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400">
+                        <option value="none">None (Normal)</option>
+                        {trainedProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                      </select>
+                      <button onClick={trainProfile} disabled={pdfLoading || sessionDocuments.length === 0} className="rounded-md bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400 disabled:opacity-40">Train</button>
+                    </div>
+                    {activeProfile && (
+                      <div className="flex items-center justify-between rounded-md border border-slate-700 bg-slate-800/60 px-2.5 py-2">
+                        <span className="truncate text-[11px] text-slate-300">Active: {activeProfile.name}</span>
+                        <button onClick={() => deleteProfile(activeProfile.id)} className="ml-2 shrink-0 text-[11px] text-rose-300 hover:text-rose-200">Delete profile</button>
+                      </div>
+                    )}
+                    {(sessionDocuments.length > 0 || activeProfile) && <button onClick={clearSessionContext} className="text-[11px] text-slate-400 hover:text-slate-200">Clear session upload</button>}
+                  </div>
+                </div>
+              )}
+            </div>
             <button onClick={() => { setSettingsOpen(true); void loadAgentActivity(); }} className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="Settings"><Settings className="h-4 w-4" /></button>
             <button onClick={() => setHistoryOpen(true)} className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="History"><History className="h-4 w-4" /></button>
           </div>
@@ -1143,6 +1417,12 @@ function App() {
         </div>
       </header>
 
+      {statusMessage && (
+        <div className="mx-auto mt-3 w-full max-w-4xl rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-2 text-xs text-emerald-200">
+          {statusMessage}
+        </div>
+      )}
+
       {historyOpen && (
         <div className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-slate-950/70 px-3 py-4 backdrop-blur-sm sm:px-4 sm:py-8" onMouseDown={() => setHistoryOpen(false)}>
           <div className="my-auto w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl sm:p-5" role="dialog" aria-modal="true" aria-label="Chat history" onMouseDown={(event) => event.stopPropagation()}>
@@ -1240,6 +1520,7 @@ function App() {
               <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-sm"><div className="flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[12rem] truncate text-slate-200">{audioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span className="text-emerald-300">● {audioStatus === 'testing' ? 'Testing' : audioStatus === 'connected' ? 'Connected' : 'Ready'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className="font-semibold text-emerald-300">OFF</span></div><div className="mt-3"><div className="mb-1 flex justify-between text-[11px] text-slate-500"><span>System audio level</span><span>{audioLevel}%</span></div><div className="flex h-2 gap-1">{Array.from({ length: 10 }, (_, index) => <span key={index} className={`flex-1 rounded ${audioLevel >= (index + 1) * 10 ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}</div></div></div>
               <p className="text-center text-[11px] text-slate-500">SYSTEM AUDIO ONLY · Physical microphone is never requested.</p>
               <div className="flex gap-2"><button onClick={() => void testSystemAudio()} className="flex-1 rounded-lg border border-emerald-500/40 px-3 py-2.5 text-sm text-emerald-300 hover:bg-emerald-500/10">Test Audio</button><button onClick={() => void startMeetingCapture()} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2.5 text-sm font-medium text-slate-950 hover:bg-emerald-400">Start Listening</button></div>
+              {error && <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs leading-relaxed text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
             </div>
           </section>
         ) : (
@@ -1274,49 +1555,130 @@ function App() {
       {/* Main content */}
       <div className="hidden mx-auto flex min-h-[calc(100dvh-73px)] max-w-4xl min-w-0 flex-col px-3 py-4 sm:px-4 sm:py-6">
         {/* PDF upload bar */}
-        <div className="mb-4">
+        <div className="mb-4 space-y-3">
           <input
             ref={fileInputRef}
             type="file"
             accept="application/pdf"
             onChange={handlePdfUpload}
+            multiple
             className="hidden"
           />
-          {pdfName ? (
-            <div className="flex items-center gap-3 bg-slate-800/60 border border-slate-700 rounded-xl px-4 py-3">
-              <div className="w-9 h-9 rounded-lg bg-emerald-500/20 flex items-center justify-center flex-shrink-0">
-                <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+
+          <div className="flex items-center justify-between gap-2 rounded-xl border border-slate-700 bg-slate-800/60 px-3 py-2">
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] uppercase tracking-wide text-slate-500">Context mode</p>
+              <p className="text-sm font-medium text-slate-200">{mode === 'direct' ? 'Direct mode: profile and PDF context are ignored' : 'LangChain mode: profile and session docs are included'}</p>
+            </div>
+            {mode === 'direct' && (sessionDocuments.length > 0 || !!activeProfile) && (
+              <div className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-medium text-amber-200">
+                Context unavailable
               </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium truncate">{pdfName}</p>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="text-[11px] uppercase tracking-wide text-slate-500">Trained profile</p>
+              <div className="flex items-center gap-2">
+                {activeProfile && (
+                  <button
+                    onClick={() => setProfilePreviewOpen((current) => !current)}
+                    className="text-[11px] text-emerald-300 hover:text-emerald-200"
+                  >
+                    {profilePreviewOpen ? 'Hide preview' : 'Preview'}
+                  </button>
+                )}
+                {activeProfile && (
+                  <button
+                    onClick={() => deleteProfile(activeProfile.id)}
+                    className="text-[11px] text-rose-300 hover:text-rose-200"
+                  >
+                    Delete
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <select
+                value={activeProfileId ?? 'none'}
+                onChange={(event) => setActiveProfileId(event.target.value === 'none' ? null : event.target.value)}
+                className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 outline-none focus:border-emerald-400"
+              >
+                <option value="none">No profile selected</option>
+                {trainedProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>{profile.name}</option>
+                ))}
+              </select>
+              <button
+                onClick={trainProfile}
+                disabled={pdfLoading || sessionDocuments.length === 0}
+                className="rounded-lg bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400 disabled:opacity-40"
+              >
+                Train
+              </button>
+            </div>
+            {activeProfile && profilePreviewOpen && (
+              <div className="mt-3 rounded-lg border border-slate-700 bg-slate-900/80 p-3 text-[11px] leading-relaxed text-slate-300">
+                <p className="mb-1 font-medium text-emerald-300">{activeProfile.name}</p>
+                <p>{activeProfile.summary}</p>
+              </div>
+            )}
+          </div>
+
+          {pdfName ? (
+            <div className="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-800/60 px-4 py-3">
+              <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-emerald-500/20">
+                <CheckCircle2 className="h-5 w-5 text-emerald-400" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-medium text-slate-200">{pdfName}</p>
                 <p className="text-xs text-slate-400">
-                  {pdfText.length.toLocaleString()} characters extracted — sent as context
+                  {pdfText.length.toLocaleString()} characters extracted — included in LangChain context
                 </p>
               </div>
               <button
                 onClick={removePdf}
-                className="p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors"
+                className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-200"
               >
-                <X className="w-4 h-4" />
+                <X className="h-4 w-4" />
               </button>
             </div>
           ) : (
             <button
               onClick={() => fileInputRef.current?.click()}
               disabled={pdfLoading}
-              className="w-full flex items-center justify-center gap-2.5 bg-slate-800/40 hover:bg-slate-800/70 border border-dashed border-slate-600 hover:border-emerald-500/50 rounded-xl px-4 py-3 text-sm text-slate-400 hover:text-slate-200 transition-all disabled:opacity-50"
+              className="flex w-full items-center justify-center gap-2.5 rounded-xl border border-dashed border-slate-600 bg-slate-800/40 px-4 py-3 text-sm text-slate-400 transition-all hover:border-emerald-500/50 hover:bg-slate-800/70 hover:text-slate-200 disabled:opacity-50"
             >
               {pdfLoading ? (
                 <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <Loader2 className="h-4 w-4 animate-spin" />
                   Extracting text from PDF...
                 </>
               ) : (
                 <>
-                  <FileText className="w-4 h-4" />
+                  <FileText className="h-4 w-4" />
                   Upload PDF for context (optional)
                 </>
               )}
+            </button>
+          )}
+
+          {sessionDocuments.length > 1 && (
+            <div className="flex flex-wrap gap-2">
+              {sessionDocuments.map((doc) => (
+                <span key={doc.id} className="rounded-full border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] text-slate-300">
+                  {doc.name}
+                </span>
+              ))}
+            </div>
+          )}
+          {sessionDocuments.length > 0 && (
+            <button
+              onClick={clearSessionContext}
+              className="text-xs text-slate-400 hover:text-slate-200"
+            >
+              Clear session documents
             </button>
           )}
         </div>
