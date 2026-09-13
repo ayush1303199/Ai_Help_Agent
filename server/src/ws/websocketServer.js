@@ -106,6 +106,7 @@ export function startWebSocketServer(port) {
         const streamFn = mode === 'langchain' ? streamLangChain : streamDirect;
         const fullText = await streamFn({ messages: finalMessages, onToken });
         const responseReceivedAt = performance.now();
+        console.log(`[LLM][FINAL] request=${requestId} length=${fullText.length} startsWith=${JSON.stringify(fullText.slice(0, 80))}`);
         console.log(`[TIMING] Provider response received at: ${new Date().toISOString()} request=${requestId} elapsed=${Math.round(responseReceivedAt - requestStartedAt)}ms`);
 
         flushTokens();

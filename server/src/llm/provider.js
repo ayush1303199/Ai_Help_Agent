@@ -113,6 +113,8 @@ async function streamAnthropic(active, messages, onToken) {
     parseSse(buffer, (event) => { const token = event.delta?.text || ''; if (token) { text += token; onToken(token); } });
     buffer = buffer.slice(buffer.lastIndexOf('\n') + 1);
   }
+  buffer += decoder.decode();
+  if (buffer) parseSse(`${buffer}\n`, (event) => { const token = event.delta?.text || ''; if (token) { text += token; onToken(token); } });
   return text;
 }
 
@@ -130,6 +132,8 @@ async function streamGemini(active, messages, onToken) {
     parseSse(buffer, (event) => { const token = event.candidates?.[0]?.content?.parts?.[0]?.text || ''; if (token) { text += token; onToken(token); } });
     buffer = buffer.slice(buffer.lastIndexOf('\n') + 1);
   }
+  buffer += decoder.decode();
+  if (buffer) parseSse(`${buffer}\n`, (event) => { const token = event.candidates?.[0]?.content?.parts?.[0]?.text || ''; if (token) { text += token; onToken(token); } });
   return text;
 }
 
@@ -148,6 +152,8 @@ async function streamCohere(active, messages, onToken) {
     parseSse(buffer, (event) => { const token = event.delta?.message?.content?.text || event.delta?.text || ''; if (token) { text += token; onToken(token); } });
     buffer = buffer.slice(buffer.lastIndexOf('\n') + 1);
   }
+  buffer += decoder.decode();
+  if (buffer) parseSse(`${buffer}\n`, (event) => { const token = event.delta?.message?.content?.text || event.delta?.text || ''; if (token) { text += token; onToken(token); } });
   return text;
 }
 

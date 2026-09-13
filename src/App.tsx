@@ -31,6 +31,7 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   streaming?: boolean;
+  requestId?: string;
 }
 
 interface RequestTiming {
@@ -259,6 +260,9 @@ function App() {
   const voiceBufferRef = useRef('');
   const streamBufferRef = useRef('');
   const streamFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestStreamBuffersRef = useRef(new Map<string, string>());
+  const requestStreamFlushTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const pendingChatRequestIdsRef = useRef(new Set<string>());
   const liveRequestInFlightRef = useRef(false);
   const electronAudioContextRef = useRef<AudioContext | null>(null);
   const audioLevelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -306,24 +310,42 @@ function App() {
     };
   }, []);
 
-  const flushStreamBuffer = useCallback(() => {
-    if (streamFlushTimerRef.current) {
-      clearTimeout(streamFlushTimerRef.current);
-      streamFlushTimerRef.current = null;
+  const flushStreamBuffer = useCallback((requestId?: string, fallbackContent = '') => {
+    if (!requestId) {
+      if (streamFlushTimerRef.current) {
+        clearTimeout(streamFlushTimerRef.current);
+        streamFlushTimerRef.current = null;
+      }
+      const content = streamBufferRef.current;
+      streamBufferRef.current = '';
+      if (!content) return;
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.role === 'assistant' && last.streaming) last.content += content;
+        return next;
+      });
+      return;
     }
-    const content = streamBufferRef.current;
-    streamBufferRef.current = '';
+    const timer = requestStreamFlushTimersRef.current.get(requestId);
+    if (timer) {
+      clearTimeout(timer);
+      requestStreamFlushTimersRef.current.delete(requestId);
+    }
+    const content = requestStreamBuffersRef.current.get(requestId) || fallbackContent;
+    requestStreamBuffersRef.current.delete(requestId);
     if (!content) return;
     setMessages((prev) => {
       const next = [...prev];
-      const last = next[next.length - 1];
-      if (last && last.role === 'assistant' && last.streaming) last.content += content;
+      const message = next.find((item) => item.role === 'assistant' && item.requestId === requestId);
+      if (message && message.streaming) message.content += content;
       return next;
     });
   }, []);
 
   useEffect(() => () => {
     if (streamFlushTimerRef.current) clearTimeout(streamFlushTimerRef.current);
+    requestStreamFlushTimersRef.current.forEach((timer) => clearTimeout(timer));
   }, []);
 
   useEffect(() => {
@@ -574,7 +596,7 @@ function App() {
   const handleWsMessage = useCallback((data: string) => {
     const msg = JSON.parse(data);
     const isDraftImprove = msg.requestId && msg.requestId === draftImproveRequestIdRef.current;
-    const isCurrentChat = msg.requestId && msg.requestId === chatRequestIdRef.current;
+    const isCurrentChat = msg.requestId && pendingChatRequestIdsRef.current.has(msg.requestId);
 
     if (!isDraftImprove && !isCurrentChat) return;
 
@@ -590,17 +612,20 @@ function App() {
           if (speakableSentence) window.speechSynthesis.speak(new SpeechSynthesisUtterance(speakableSentence));
         }
       }
-      streamBufferRef.current += msg.content;
-      if (!streamFlushTimerRef.current) {
-        // Keep React updates batched without adding a visible delay after the
-        // server has already batched the provider's token chunks.
-        streamFlushTimerRef.current = setTimeout(flushStreamBuffer, 16);
+      const requestId = String(msg.requestId);
+      requestStreamBuffersRef.current.set(requestId, `${requestStreamBuffersRef.current.get(requestId) || ''}${msg.content}`);
+      if (!requestStreamFlushTimersRef.current.has(requestId)) {
+      // Keep React updates batched without adding a visible delay after the
+      // server has already batched the provider's token chunks.
+      requestStreamFlushTimersRef.current.set(requestId, setTimeout(() => flushStreamBuffer(requestId), 16));
       }
     } else if (msg.type === 'done') {
       const timing = requestTimingRef.current.get(msg.requestId);
       const parsedAt = performance.now();
-      console.log('[LLM] Response received');
-      console.log('[ANSWER]', String(msg.content || '').slice(0, 160));
+      const responseText = String(msg.content || '');
+      const answerText = responseText || requestStreamBuffersRef.current.get(String(msg.requestId)) || '';
+      console.log(`[LLM] Response received request=${msg.requestId}`);
+      console.log(`[ANSWER] request=${msg.requestId}`, answerText.slice(0, 160));
       console.log(`[TIMING] Provider response received at: ${new Date().toISOString()} request=${msg.requestId} provider=${msg.timing?.providerRequestMs ?? 'unknown'}ms`);
       console.log(`[TIMING] Answer parsed/formatted at: ${new Date().toISOString()} request=${msg.requestId} elapsed=${timing ? Math.round(parsedAt - timing.sendMessageCalledAt) : 'unknown'}ms`);
       setPipelineStatus('answer');
@@ -610,10 +635,11 @@ function App() {
         draftImproveRequestIdRef.current = '';
         return;
       }
-      flushStreamBuffer();
+      flushStreamBuffer(String(msg.requestId), responseText);
+      pendingChatRequestIdsRef.current.delete(String(msg.requestId));
       liveRequestInFlightRef.current = false;
-      setChatStreaming(false);
-      chatRequestIdRef.current = '';
+      setChatStreaming(pendingChatRequestIdsRef.current.size > 0);
+      if (chatRequestIdRef.current === msg.requestId) chatRequestIdRef.current = '';
       if (voiceReplies && typeof window !== 'undefined' && 'speechSynthesis' in window && msg.content) {
         if (voiceBufferRef.current.trim()) {
           const speakableText = voiceSafeText(voiceBufferRef.current);
@@ -623,9 +649,10 @@ function App() {
       }
       setMessages((prev) => {
         const next = [...prev];
-        const last = next[next.length - 1];
-        if (last && last.role === 'assistant') {
-          last.streaming = false;
+        const message = next.find((item) => item.role === 'assistant' && item.requestId === msg.requestId);
+        if (message) {
+          if (responseText) message.content = responseText;
+          message.streaming = false;
         }
         return [...next];
       });
@@ -645,16 +672,17 @@ function App() {
         setError(msg.message);
         return;
       }
-      flushStreamBuffer();
+      pendingChatRequestIdsRef.current.delete(String(msg.requestId));
+      flushStreamBuffer(String(msg.requestId));
       liveRequestInFlightRef.current = false;
-      setChatStreaming(false);
-      chatRequestIdRef.current = '';
+      setChatStreaming(pendingChatRequestIdsRef.current.size > 0);
+      if (chatRequestIdRef.current === msg.requestId) chatRequestIdRef.current = '';
       setMessages((prev) => {
         const next = [...prev];
-        const last = next[next.length - 1];
-        if (last && last.role === 'assistant' && last.streaming) {
-          last.content = `Error: ${msg.message}`;
-          last.streaming = false;
+        const message = next.find((item) => item.role === 'assistant' && item.requestId === msg.requestId);
+        if (message && message.streaming) {
+          message.content = `Error: ${msg.message}`;
+          message.streaming = false;
         }
         return [...next];
       });
@@ -711,9 +739,9 @@ function App() {
       return;
     }
 
-    const userMsg: Message = { role: 'user', content: question };
-    const assistantMsg: Message = { role: 'assistant', content: '', streaming: true };
     const requestId = crypto.randomUUID();
+    const userMsg: Message = { role: 'user', content: question };
+    const assistantMsg: Message = { role: 'assistant', content: '', streaming: true, requestId };
     const sendMessageCalledAt = performance.now();
     requestTimingRef.current.set(requestId, { questionFinalizedAt, sendMessageCalledAt });
     console.log(`[TIMING] sendMessage() called at: ${new Date().toISOString()} request=${requestId}`);
@@ -723,6 +751,7 @@ function App() {
     setError('');
     setChatStreaming(true);
     chatRequestIdRef.current = requestId;
+    pendingChatRequestIdsRef.current.add(requestId);
 
     try {
       const ws = await ensureWs();
@@ -754,16 +783,17 @@ function App() {
         pdfContext: resolvedContext.slice(-MAX_CONTEXT_CHARS),
       }));
     } catch (err) {
+      pendingChatRequestIdsRef.current.delete(requestId);
       liveRequestInFlightRef.current = false;
-      setChatStreaming(false);
-      chatRequestIdRef.current = '';
+      setChatStreaming(pendingChatRequestIdsRef.current.size > 0);
+      if (chatRequestIdRef.current === requestId) chatRequestIdRef.current = '';
       setPipelineStatus('error');
       setMessages((prev) => {
         const next = [...prev];
-        const last = next[next.length - 1];
-        if (last && last.role === 'assistant') {
-          last.content = `Connection error: ${(err as Error).message}`;
-          last.streaming = false;
+        const message = next.find((item) => item.role === 'assistant' && item.requestId === requestId);
+        if (message) {
+          message.content = `Connection error: ${(err as Error).message}`;
+          message.streaming = false;
         }
         return [...next];
       });
@@ -858,18 +888,28 @@ function App() {
       if (event.data.size > 0) chunks.push(event.data);
     };
     const processSegment = async (segment: Blob) => {
+      const segmentId = crypto.randomUUID();
       setIsTranscribing(true);
       setPipelineStatus('transcribing');
       console.log('[CAPTURE] Silence/end-of-utterance detected — flushing segment');
-      console.log('[STT] Sending audio segment to STT');
+      console.log(`[STT] Request started segment=${segmentId}`);
       try {
         const formData = new FormData();
         console.log(`[AUDIO] Audio chunk size: ${segment.size} bytes`);
         formData.append('file', segment, 'meeting.webm');
         const response = await fetch(`${HTTP_URL}/api/transcribe-audio`, { method: 'POST', body: formData });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Transcription failed');
+        let data: { text?: unknown; error?: string } = {};
+        try {
+          data = await response.json();
+        } catch {
+          if (!response.ok) throw new Error(`Transcription failed with HTTP ${response.status}.`);
+        }
+        if (!response.ok) {
+          console.warn(`[STT] Failure segment=${segmentId} status=${response.status}`);
+          throw new Error(data.error || `Transcription failed with HTTP ${response.status}.`);
+        }
         const transcript = cleanTranscript(String(data.text || ''));
+        console.log(`[STT] Success segment=${segmentId} transcriptLength=${transcript.length}`);
         console.log(`[STT] Final transcript: "${transcript}"`);
         if (!transcript) throw new Error('No speech detected.');
         const detected = detectQuestion(transcript);
@@ -896,6 +936,7 @@ function App() {
         console.log(`[TIMING] Question finalized at: ${new Date().toISOString()}`);
         await sendMessage(detected.question, '', detected.question, questionFinalizedAt);
       } catch (err) {
+        console.warn(`[STT] Segment discarded segment=${segmentId}`);
         setError((err as Error).message.includes('Transcription')
           ? 'Speech-to-text failed. Please try speaking again.'
           : (err as Error).message);
@@ -1401,7 +1442,7 @@ function App() {
                   </div>
                   <div className="space-y-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
                     <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-400">Audio source</label>
-                    <select value="system" aria-label="Audio source" className="w-full rounded-md border border-slate-700 bg-slate-800 px-2 py-2 text-xs text-slate-200">
+                    <select defaultValue="system" aria-label="Audio source" className="w-full rounded-md border border-slate-700 bg-slate-800 px-2 py-2 text-xs text-slate-200">
                       <option value="system">System / Internal Audio</option>
                     </select>
                     <div className="flex items-center justify-between text-xs">
@@ -1631,7 +1672,7 @@ function App() {
           <section className="m-auto w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900/80 p-6 shadow-2xl">
             <div className="mb-6 text-center"><h2 className="text-2xl font-semibold">Meeting AI Assistant</h2><p className="mt-2 text-sm text-slate-400">Listen to internal system audio and get concise answers.</p></div>
             <div className="space-y-4">
-              <label className="block text-xs font-medium uppercase tracking-wide text-slate-400">Audio source<select value="system" aria-label="Audio source" className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-200"><option value="system">System / Internal Audio</option></select></label>
+              <label className="block text-xs font-medium uppercase tracking-wide text-slate-400">Audio source<select defaultValue="system" aria-label="Audio source" className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-200"><option value="system">System / Internal Audio</option></select></label>
               <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-sm"><div className="flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[12rem] truncate text-slate-200">{audioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span className="text-emerald-300">● {audioStatus === 'testing' ? 'Testing' : audioStatus === 'connected' ? 'Connected' : 'Ready'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className="font-semibold text-emerald-300">OFF</span></div><div className="mt-3"><div className="mb-1 flex justify-between text-[11px] text-slate-500"><span>System audio level</span><span>{audioLevel}%</span></div><div className="flex h-2 gap-1">{Array.from({ length: 10 }, (_, index) => <span key={index} className={`flex-1 rounded ${audioLevel >= (index + 1) * 10 ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}</div></div></div>
               <p className="text-center text-[11px] text-slate-500">SYSTEM AUDIO ONLY · Physical microphone is never requested.</p>
               <div className="flex gap-2"><button onClick={() => void testSystemAudio()} className="flex-1 rounded-lg border border-emerald-500/40 px-3 py-2.5 text-sm text-emerald-300 hover:bg-emerald-500/10">Test Audio</button><button onClick={() => void startMeetingCapture()} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2.5 text-sm font-medium text-slate-950 hover:bg-emerald-400">Start Listening</button></div>

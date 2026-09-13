@@ -9,10 +9,10 @@ export function renderAnswerMarkdown(text: string): ReactNode[] {
     }
     const lines = trimmed.split('\n');
     if (lines.every((line) => /^[-*]\s+/.test(line))) {
-      return <ul key={index} className="list-disc space-y-1 pl-5">{lines.map((line) => <li key={line}>{formatInlineMarkdown(line.replace(/^[-*]\s+/, ''))}</li>)}</ul>;
+      return <ul key={index} className="list-disc space-y-1 pl-5">{lines.map((line, lineIndex) => <li key={`${index}-${lineIndex}`}>{formatInlineMarkdown(line.replace(/^[-*]\s+/, ''))}</li>)}</ul>;
     }
     if (lines.every((line) => /^\d+\.\s+/.test(line))) {
-      return <ol key={index} className="list-decimal space-y-1 pl-5">{lines.map((line) => <li key={line}>{formatInlineMarkdown(line.replace(/^\d+\.\s+/, ''))}</li>)}</ol>;
+      return <ol key={index} className="list-decimal space-y-1 pl-5">{lines.map((line, lineIndex) => <li key={`${index}-${lineIndex}`}>{formatInlineMarkdown(line.replace(/^\d+\.\s+/, ''))}</li>)}</ol>;
     }
     if (/^#{1,3}\s+/.test(trimmed)) {
       const heading = trimmed.replace(/^#{1,3}\s+/, '');
