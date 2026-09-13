@@ -1,6 +1,8 @@
 import { ChatOpenAI } from '@langchain/openai';
 import { SystemMessage, HumanMessage } from '@langchain/core/messages';
 import { config } from '../config.js';
+import { isFallbackError, normalizeProviderError, providerOrder } from './provider.js';
+import { setConfiguredProviderStatus } from '../config.js';
 
 /**
  * LangChain implementation.
@@ -19,9 +21,10 @@ import { config } from '../config.js';
 let _model = null;
 let _modelKey = null;
 
-function getModel() {
-  const active = config[config.provider];
-  const modelKey = `${config.provider}|${active.apiKey}|${active.model}|${active.baseURL}`;
+function getModel(provider) {
+  const active = typeof provider === 'string' ? config[provider] : provider;
+  const providerId = typeof provider === 'string' ? provider : provider.adapterType;
+  const modelKey = `${providerId}|${active.apiKey}|${active.model}|${active.baseURL}`;
   if (_model && _modelKey === modelKey) return _model;
 
   _model = new ChatOpenAI({
@@ -40,9 +43,9 @@ function getModel() {
  * Stream a response using LangChain's `model.stream()`.
  * `onToken` fires for every chunk; resolves with the full text.
  */
-export async function streamLangChain({ messages, onToken }) {
+async function streamOne({ provider, messages, onToken }) {
   try {
-    const model = getModel();
+    const model = getModel(provider);
 
     const lcMessages = messages.map((m) => {
       if (m.role === 'system') return new SystemMessage(m.content);
@@ -62,6 +65,22 @@ export async function streamLangChain({ messages, onToken }) {
 
     return fullText;
   } catch (err) {
-    throw new Error(`LangChain LLM error: ${err.message}`);
+    throw normalizeProviderError(err, provider.label || provider.adapterType || provider);
   }
+}
+
+export async function streamLangChain({ messages, onToken }) {
+  let lastError;
+  for (const provider of providerOrder()) {
+    try {
+      const result = await streamOne({ provider, messages, onToken });
+      if (provider.id) setConfiguredProviderStatus(provider.id, 'ok');
+      return result;
+    } catch (error) {
+      lastError = normalizeProviderError(error, provider.label || provider.adapterType || provider);
+      if (provider.id) setConfiguredProviderStatus(provider.id, lastError.kind === 'quota' ? 'quota-exceeded' : lastError.kind === 'invalid_key' ? 'invalid-key' : 'error', lastError.message);
+      if (!isFallbackError(lastError)) throw lastError;
+    }
+  }
+  throw lastError || new Error('No configured provider available.');
 }

@@ -4,7 +4,17 @@ import multer from 'multer';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import OpenAI, { toFile } from 'openai';
-import { config, setAgentPermissions, setFallbackEnabled, setRuntimeProvider } from './config.js';
+import {
+  config,
+  getConfiguredProviders,
+  removeConfiguredProvider,
+  reorderConfiguredProviders,
+  setAgentPermissions,
+  setFallbackEnabled,
+  setRuntimeProvider,
+  updateConfiguredProvider,
+  upsertConfiguredProvider,
+} from './config.js';
 import { getProviderInfo } from './llm/provider.js';
 import { extractTextFromPdfBuffer } from './pdf/pdfExtractor.js';
 import { startWebSocketServer } from './ws/websocketServer.js';
@@ -78,6 +88,43 @@ app.post('/api/settings/provider', async (req, res) => {
     setRuntimeProvider({ provider, apiKey, model, baseURL });
     if (typeof fallbackEnabled === 'boolean') setFallbackEnabled(fallbackEnabled);
     res.json({ status: 'ok', provider: config.provider, model: config[config.provider].model });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/api/settings/providers', (_req, res) => {
+  res.json({ providers: getConfiguredProviders(), fallbackEnabled: config.fallbackEnabled });
+});
+
+app.post('/api/settings/providers', (req, res) => {
+  try {
+    const provider = upsertConfiguredProvider(req.body || {});
+    res.json({ provider: { ...provider, apiKey: undefined }, providers: getConfiguredProviders() });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.patch('/api/settings/providers/:id', (req, res) => {
+  try {
+    const provider = updateConfiguredProvider(req.params.id, req.body || {});
+    res.json({ provider: { ...provider, apiKey: undefined }, providers: getConfiguredProviders() });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/settings/providers/:id', (req, res) => {
+  removeConfiguredProvider(req.params.id);
+  res.json({ providers: getConfiguredProviders() });
+});
+
+app.post('/api/settings/providers/reorder', (req, res) => {
+  try {
+    if (!Array.isArray(req.body?.ids)) throw new Error('Provider IDs must be an array.');
+    reorderConfiguredProviders(req.body.ids);
+    res.json({ providers: getConfiguredProviders() });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

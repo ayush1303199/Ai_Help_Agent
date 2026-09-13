@@ -13,6 +13,7 @@ export const config = {
   provider: env('LLM_PROVIDER', 'groq'),
   fallbackEnabled: process.env.AI_AUTO_FALLBACK !== 'false',
   runtimeProviders: {},
+  configuredProviders: [],
   agentPermissions: {
     openTeams: false, openBrowser: false, openCamera: false, openChrome: false,
     openVSCode: false, openDesktop: false, openSourceTree: false,
@@ -44,7 +45,20 @@ export const config = {
 
 const providerNames = Object.keys(config).filter((key) => key !== 'server' && key !== 'runtimeProviders' && key !== 'agentPermissions' && key !== 'provider' && key !== 'fallbackEnabled');
 for (const provider of providerNames) {
-  if (config[provider]?.apiKey && !config[provider].apiKey.includes('your_')) config.runtimeProviders[provider] = config[provider];
+  if (config[provider]?.apiKey && !config[provider].apiKey.includes('your_')) {
+    config.runtimeProviders[provider] = config[provider];
+    config.configuredProviders.push({
+      id: `env-${provider}`,
+      label: provider,
+      adapterType: provider,
+      apiKey: config[provider].apiKey,
+      model: config[provider].model,
+      baseURL: config[provider].baseURL,
+      enabled: provider === config.provider,
+      priority: config.configuredProviders.length + 1,
+      status: 'unknown',
+    });
+  }
 }
 
 export function setRuntimeProvider({ provider, apiKey, model, baseURL }) {
@@ -53,9 +67,92 @@ export function setRuntimeProvider({ provider, apiKey, model, baseURL }) {
   config[provider] = { ...existing, apiKey, model, baseURL: baseURL || existing?.baseURL || config.custom.baseURL };
   config.provider = provider;
   config.runtimeProviders[provider] = config[provider];
+  const configured = config.configuredProviders.find((item) => item.adapterType === provider);
+  if (configured) {
+    Object.assign(configured, { apiKey, model, baseURL: config[provider].baseURL, enabled: true, status: 'unknown' });
+  } else {
+    config.configuredProviders.push({
+      id: `runtime-${provider}-${Date.now()}`,
+      label: provider,
+      adapterType: provider,
+      apiKey,
+      model,
+      baseURL: config[provider].baseURL,
+      enabled: true,
+      priority: config.configuredProviders.length + 1,
+      status: 'unknown',
+    });
+  }
 }
 
 export function setFallbackEnabled(enabled) { config.fallbackEnabled = Boolean(enabled); }
+
+export function getConfiguredProviders() {
+  return config.configuredProviders
+    .map(({ apiKey, ...provider }) => ({ ...provider, hasApiKey: Boolean(apiKey) }))
+    .sort((a, b) => a.priority - b.priority);
+}
+
+export function upsertConfiguredProvider(input) {
+  const adapterType = String(input.adapterType || '').trim();
+  const apiKey = String(input.apiKey || '').trim();
+  const model = String(input.model || '').trim();
+  if (!adapterType || !apiKey || !model) throw new Error('Adapter type, API key, and model are required.');
+  if (!config[adapterType]) throw new Error(`Unsupported provider adapter "${adapterType}".`);
+  const id = String(input.id || `provider-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const provider = {
+    id,
+    label: String(input.label || adapterType).trim(),
+    adapterType,
+    apiKey,
+    model,
+    baseURL: String(input.baseURL || config[adapterType].baseURL || '').trim(),
+    enabled: input.enabled !== false,
+    priority: Number.isFinite(Number(input.priority)) ? Number(input.priority) : config.configuredProviders.length + 1,
+    status: input.status || 'unknown',
+  };
+  const index = config.configuredProviders.findIndex((item) => item.id === id);
+  if (index >= 0) config.configuredProviders[index] = provider;
+  else config.configuredProviders.push(provider);
+  config[adapterType] = { apiKey, model, baseURL: provider.baseURL };
+  config.runtimeProviders[adapterType] = config[adapterType];
+  normalizeProviderPriorities();
+  return provider;
+}
+
+export function removeConfiguredProvider(id) {
+  config.configuredProviders = config.configuredProviders.filter((provider) => provider.id !== id);
+  normalizeProviderPriorities();
+}
+
+export function updateConfiguredProvider(id, changes) {
+  const current = config.configuredProviders.find((provider) => provider.id === id);
+  if (!current) throw new Error('Configured provider not found.');
+  return upsertConfiguredProvider({ ...current, ...changes, id, apiKey: changes.apiKey || current.apiKey });
+}
+
+export function reorderConfiguredProviders(ids) {
+  const order = new Map(ids.map((id, index) => [id, index + 1]));
+  for (const provider of config.configuredProviders) {
+    if (order.has(provider.id)) provider.priority = order.get(provider.id);
+  }
+  normalizeProviderPriorities();
+}
+
+export function normalizeProviderPriorities() {
+  config.configuredProviders
+    .sort((a, b) => a.priority - b.priority)
+    .forEach((provider, index) => { provider.priority = index + 1; });
+}
+
+export function setConfiguredProviderStatus(id, status, lastError = '') {
+  const provider = config.configuredProviders.find((item) => item.id === id);
+  if (provider) {
+    provider.status = status;
+    provider.lastError = lastError;
+    provider.lastCheckedAt = Date.now();
+  }
+}
 
 export function setAgentPermissions(permissions) {
   config.agentPermissions = Object.fromEntries(Object.keys(config.agentPermissions).map((key) => [key, Boolean(permissions?.[key])]));

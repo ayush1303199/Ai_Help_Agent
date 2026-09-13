@@ -1,7 +1,9 @@
-const { app, BrowserWindow, desktopCapturer, session } = require('electron');
+const { app, BrowserWindow, desktopCapturer, session, ipcMain } = require('electron');
 const path = require('node:path');
 
 const isDev = !app.isPackaged;
+let mainWindow = null;
+let overlayWindow = null;
 
 // Keep Chromium cache in a writable app-specific directory on Windows.
 app.setPath('userData', path.join(app.getPath('temp'), 'ai-assistant-electron'));
@@ -15,6 +17,7 @@ function createWindow() {
     backgroundColor: '#0b1020',
     autoHideMenuBar: true,
     webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -38,7 +41,59 @@ function createWindow() {
   return window;
 }
 
+function createOverlayWindow() {
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.show();
+    overlayWindow.focus();
+    return;
+  }
+
+  overlayWindow = new BrowserWindow({
+    width: 620,
+    height: 420,
+    minWidth: 320,
+    minHeight: 180,
+    transparent: true,
+    frame: false,
+    alwaysOnTop: true,
+    resizable: true,
+    hasShadow: false,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  const overlayUrl = isDev
+    ? `${process.env.ELECTRON_DEV_URL || 'http://localhost:5174'}?overlay=1`
+    : `file://${path.join(__dirname, '..', 'dist', 'index.html')}?overlay=1`;
+  overlayWindow.loadURL(overlayUrl);
+  overlayWindow.on('closed', () => {
+    overlayWindow = null;
+  });
+}
+
+function toggleOverlayWindow() {
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.close();
+    return;
+  }
+  createOverlayWindow();
+}
+
 app.whenReady().then(() => {
+  ipcMain.handle('overlay:open', () => {
+    createOverlayWindow();
+  });
+  ipcMain.handle('overlay:toggle', () => {
+    toggleOverlayWindow();
+  });
+  ipcMain.handle('overlay:close', () => {
+    if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close();
+  });
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(['media'].includes(permission));
   });
@@ -65,7 +120,7 @@ app.whenReady().then(() => {
     callback({ video: source, audio: 'loopback' });
   });
 
-  createWindow();
+  mainWindow = createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

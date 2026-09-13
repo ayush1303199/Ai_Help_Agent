@@ -75,6 +75,9 @@ export function startWebSocketServer(port) {
       }
 
       let tokenBuffer = '';
+      const requestStartedAt = performance.now();
+      let firstTokenAt = null;
+      console.log(`[TIMING] Provider request started at: ${new Date().toISOString()} request=${requestId}`);
       let tokenFlushTimer = null;
       const flushTokens = () => {
         if (tokenFlushTimer) {
@@ -90,6 +93,10 @@ export function startWebSocketServer(port) {
         tokenBuffer = '';
       };
       const onToken = (token) => {
+        if (firstTokenAt === null) {
+          firstTokenAt = performance.now();
+          console.log(`[TIMING] First provider token at: ${new Date().toISOString()} request=${requestId} elapsed=${Math.round(firstTokenAt - requestStartedAt)}ms`);
+        }
         tokenBuffer += token;
         // Batch tiny provider chunks for one animation frame's worth of work.
         if (!tokenFlushTimer) tokenFlushTimer = setTimeout(flushTokens, 16);
@@ -98,9 +105,19 @@ export function startWebSocketServer(port) {
       try {
         const streamFn = mode === 'langchain' ? streamLangChain : streamDirect;
         const fullText = await streamFn({ messages: finalMessages, onToken });
+        const responseReceivedAt = performance.now();
+        console.log(`[TIMING] Provider response received at: ${new Date().toISOString()} request=${requestId} elapsed=${Math.round(responseReceivedAt - requestStartedAt)}ms`);
 
         flushTokens();
-        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'done', content: fullText, ...responseMeta }));
+        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({
+          type: 'done',
+          content: fullText,
+          timing: {
+            providerRequestMs: Math.round(responseReceivedAt - requestStartedAt),
+            timeToFirstTokenMs: firstTokenAt === null ? null : Math.round(firstTokenAt - requestStartedAt),
+          },
+          ...responseMeta,
+        }));
       } catch (err) {
         flushTokens();
         console.error('Stream error:', err.message);

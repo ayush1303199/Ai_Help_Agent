@@ -29,6 +29,11 @@ interface Message {
   streaming?: boolean;
 }
 
+interface RequestTiming {
+  questionFinalizedAt: number;
+  sendMessageCalledAt: number;
+}
+
 type Mode = 'direct' | 'langchain';
 
 interface MeetingTranscript {
@@ -65,6 +70,18 @@ interface TrainedProfile {
   summary: string;
   context: string;
   createdAt: number;
+}
+
+interface ConfiguredProvider {
+  id: string;
+  label: string;
+  adapterType: string;
+  model: string;
+  baseURL?: string;
+  enabled: boolean;
+  priority: number;
+  status?: string;
+  hasApiKey?: boolean;
 }
 
 const HTTP_URL = 'http://localhost:3001';
@@ -179,7 +196,7 @@ function resolveContext({ mode, sessionDocuments, activeProfile }: { mode: Mode;
   return sections.join('\n\n');
 }
 
-function renderAnswerMarkdown(text: string) {
+export function renderAnswerMarkdown(text: string) {
   return text.split(/\n{2,}/).map((block, index) => {
     const trimmed = block.trim();
     if (!trimmed) return null;
@@ -201,7 +218,7 @@ function renderAnswerMarkdown(text: string) {
   });
 }
 
-function formatInlineMarkdown(text: string) {
+export function formatInlineMarkdown(text: string) {
   const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
   return parts.map((part, index) => {
     if (part.startsWith('**') && part.endsWith('**')) return <strong key={index}>{part.slice(2, -2)}</strong>;
@@ -303,6 +320,9 @@ function App() {
   const [providerModel, setProviderModel] = useState<string>(providerPresets.groq.model);
   const [providerBaseURL, setProviderBaseURL] = useState<string>(providerPresets.groq.baseURL);
   const [providerSaving, setProviderSaving] = useState(false);
+  const [configuredProviders, setConfiguredProviders] = useState<ConfiguredProvider[]>([]);
+  const [providerLabel, setProviderLabel] = useState('');
+  const [providerEnabled, setProviderEnabled] = useState(true);
   const [fallbackEnabled, setFallbackEnabled] = useState(true);
   const [voiceReplies, setVoiceReplies] = useState(false);
   const [agentPermissions, setAgentPermissions] = useState(defaultAgentPermissions);
@@ -334,6 +354,9 @@ function App() {
   const requestInProgressRef = useRef(false);
   const chatRequestIdRef = useRef('');
   const draftImproveRequestIdRef = useRef('');
+  const overlayChannelRef = useRef<BroadcastChannel | null>(null);
+  const overlayStateRef = useRef({ answer: '', status: pipelineStatus });
+  const requestTimingRef = useRef(new Map<string, RequestTiming>());
 
   // --- Auto-scroll to bottom on new content ---
   useEffect(() => {
@@ -341,6 +364,29 @@ function App() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
+
+  useEffect(() => {
+    overlayStateRef.current = {
+      answer: [...messages].reverse().find((message) => message.role === 'assistant')?.content || '',
+      status: pipelineStatus,
+    };
+    overlayChannelRef.current?.postMessage({ type: 'state', ...overlayStateRef.current });
+  }, [messages, pipelineStatus]);
+
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const channel = new BroadcastChannel('meeting-ai-overlay');
+    overlayChannelRef.current = channel;
+    channel.onmessage = (event) => {
+      if (event.data?.type === 'overlay-ready') {
+        channel.postMessage({ type: 'state', ...overlayStateRef.current });
+      }
+    };
+    return () => {
+      channel.close();
+      overlayChannelRef.current = null;
+    };
+  }, []);
 
   const flushStreamBuffer = useCallback(() => {
     if (streamFlushTimerRef.current) {
@@ -400,6 +446,14 @@ function App() {
 
     document.addEventListener('keydown', closeOnEscape);
     return () => document.removeEventListener('keydown', closeOnEscape);
+  }, [settingsOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    fetch(`${HTTP_URL}/api/settings/providers`)
+      .then((response) => response.json())
+      .then((data) => setConfiguredProviders(Array.isArray(data.providers) ? data.providers : []))
+      .catch((err) => setError(`Could not load providers: ${(err as Error).message}`));
   }, [settingsOpen]);
 
   // --- Fetch health info on mount ---
@@ -494,10 +548,14 @@ function App() {
 
         const formData = new FormData();
         formData.append('file', file);
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), PDF_UPLOAD_TIMEOUT_MS);
         const response = await fetch(`${HTTP_URL}/api/extract-pdf`, {
           method: 'POST',
           body: formData,
+          signal: controller.signal,
         });
+        window.clearTimeout(timeout);
 
         const data = await response.json();
         if (!response.ok) {
@@ -621,8 +679,12 @@ function App() {
         streamFlushTimerRef.current = setTimeout(flushStreamBuffer, 16);
       }
     } else if (msg.type === 'done') {
+      const timing = requestTimingRef.current.get(msg.requestId);
+      const parsedAt = performance.now();
       console.log('[LLM] Response received');
       console.log('[ANSWER]', String(msg.content || '').slice(0, 160));
+      console.log(`[TIMING] Provider response received at: ${new Date().toISOString()} request=${msg.requestId} provider=${msg.timing?.providerRequestMs ?? 'unknown'}ms`);
+      console.log(`[TIMING] Answer parsed/formatted at: ${new Date().toISOString()} request=${msg.requestId} elapsed=${timing ? Math.round(parsedAt - timing.sendMessageCalledAt) : 'unknown'}ms`);
       setPipelineStatus('answer');
       if (isDraftImprove) {
         setInput(String(msg.content || '').trim());
@@ -649,6 +711,15 @@ function App() {
         }
         return [...next];
       });
+      if (timing) {
+        console.log(`[TIMING] TOTAL pending until React render request=${msg.requestId} question-to-parse=${Math.round(parsedAt - timing.questionFinalizedAt)}ms`);
+        requestAnimationFrame(() => {
+          const renderedAt = performance.now();
+          console.log(`[TIMING] Answer rendered in UI at: ${new Date().toISOString()} request=${msg.requestId}`);
+          console.log(`[TIMING] TOTAL: question-finalized → answer-rendered = ${Math.round(renderedAt - timing.questionFinalizedAt)}ms request=${msg.requestId}`);
+        });
+      }
+      requestTimingRef.current.delete(msg.requestId);
     } else if (msg.type === 'error') {
       if (isDraftImprove) {
         setDraftImproving(false);
@@ -675,7 +746,7 @@ function App() {
   }, [flushStreamBuffer, voiceReplies]);
 
   // --- Send a chat message ---
-  const sendMessage = async (question = input.trim(), contextOverride?: string, modelInstruction = question) => {
+  const sendMessage = async (question = input.trim(), contextOverride?: string, modelInstruction = question, questionFinalizedAt = performance.now()) => {
     if (!question) return;
 
     if (/^open\s+(to\s+)?(team|teams|microsoft\s+teams)\s*$/i.test(question)) {
@@ -725,6 +796,9 @@ function App() {
     const userMsg: Message = { role: 'user', content: question };
     const assistantMsg: Message = { role: 'assistant', content: '', streaming: true };
     const requestId = crypto.randomUUID();
+    const sendMessageCalledAt = performance.now();
+    requestTimingRef.current.set(requestId, { questionFinalizedAt, sendMessageCalledAt });
+    console.log(`[TIMING] sendMessage() called at: ${new Date().toISOString()} request=${requestId}`);
 
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setInput('');
@@ -741,9 +815,11 @@ function App() {
         .filter((m) => m.role === 'user' || m.role === 'assistant')
         .slice(-MAX_CHAT_HISTORY_MESSAGES)
         .map((m) => ({ role: m.role, content: compactMessageContent(m.content) }));
+      const contextStartedAt = performance.now();
       const resolvedContext = contextOverride !== undefined
         ? contextOverride
         : resolveContext({ mode, sessionDocuments, activeProfile });
+      console.log(`[TIMING] Context resolved at: ${new Date().toISOString()} request=${requestId} elapsed=${Math.round(performance.now() - contextStartedAt)}ms chars=${resolvedContext.length}`);
 
       ws.send(JSON.stringify({
         type: 'chat',
@@ -892,7 +968,9 @@ function App() {
         }, ...current]);
         setPipelineStatus('thinking');
         console.log('[LLM] Sending text to LLM');
-        await sendMessage(detected.question, '', detected.question);
+        const questionFinalizedAt = performance.now();
+        console.log(`[TIMING] Question finalized at: ${new Date().toISOString()}`);
+        await sendMessage(detected.question, '', detected.question, questionFinalizedAt);
       } catch (err) {
         setError((err as Error).message.includes('Transcription')
           ? 'Speech-to-text failed. Please try speaking again.'
@@ -1041,6 +1119,93 @@ function App() {
     setProviderId(value);
     setProviderModel(providerPresets[value].model);
     setProviderBaseURL(providerPresets[value].baseURL);
+  };
+
+  const refreshConfiguredProviders = async () => {
+    const response = await fetch(`${HTTP_URL}/api/settings/providers`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Could not load providers.');
+    setConfiguredProviders(Array.isArray(data.providers) ? data.providers : []);
+  };
+
+  const saveConfiguredProvider = async () => {
+    if (!providerKey.trim() || !providerModel.trim()) {
+      setError('API key and model are required.');
+      return;
+    }
+    setProviderSaving(true);
+    setError('');
+    try {
+      const response = await fetch(`${HTTP_URL}/api/settings/providers`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          label: providerLabel || providerPresets[providerId].label,
+          adapterType: providerId,
+          apiKey: providerKey,
+          model: providerModel,
+          baseURL: providerBaseURL,
+          enabled: providerEnabled,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not save provider.');
+      setConfiguredProviders(data.providers || []);
+      setProviderKey('');
+      setProviderLabel('');
+      setStatusMessage('Provider saved.');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setProviderSaving(false);
+    }
+  };
+
+  const updateConfiguredProviderState = async (provider: ConfiguredProvider, changes: Partial<ConfiguredProvider>) => {
+    try {
+      const response = await fetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(changes),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not update provider.');
+      setConfiguredProviders(data.providers || []);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const deleteConfiguredProvider = async (provider: ConfiguredProvider) => {
+    if (!window.confirm(`Remove provider "${provider.label}"?`)) return;
+    try {
+      const response = await fetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not remove provider.');
+      setConfiguredProviders(data.providers || []);
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  const moveConfiguredProvider = async (provider: ConfiguredProvider, direction: -1 | 1) => {
+    const index = configuredProviders.findIndex((item) => item.id === provider.id);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= configuredProviders.length) return;
+    const ids = configuredProviders.map((item) => item.id);
+    [ids[index], ids[target]] = [ids[target], ids[index]];
+    try {
+      const response = await fetch(`${HTTP_URL}/api/settings/providers/reorder`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not reorder providers.');
+      setConfiguredProviders(data.providers || []);
+    } catch (err) {
+      setError((err as Error).message);
+    }
   };
 
   const saveProviderSettings = async () => {
@@ -1199,6 +1364,19 @@ function App() {
                 LangChain
               </button>
             </div>
+            <button
+              onClick={() => {
+                if (window.electronAPI) {
+                  void window.electronAPI.toggleOverlay();
+                } else {
+                  setError('Overlay mode is available in the Electron desktop app.');
+                }
+              }}
+              className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400"
+              title="Open transparent answer overlay"
+            >
+              Overlay
+            </button>
             {sessionActive && <button onClick={() => setMeetingMenuOpen((open) => !open)} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
             <div className="relative">
               <button
@@ -1459,6 +1637,17 @@ function App() {
             </div>
             {settingsTab === 'providers' && (
               <>
+            <div className="mb-5 rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+              <div className="mb-3 flex items-center justify-between">
+                <div><p className="text-xs font-medium text-slate-200">Configured providers</p><p className="text-[11px] text-slate-500">Lower priority runs first; quota errors fall through enabled providers.</p></div>
+                <button onClick={() => void refreshConfiguredProviders()} className="text-[11px] text-emerald-300 hover:text-emerald-200">Refresh</button>
+              </div>
+              {configuredProviders.length === 0 ? <p className="mb-3 text-[11px] text-slate-500">No runtime providers configured yet.</p> : <div className="mb-3 space-y-2">{configuredProviders.map((provider, index) => <div key={provider.id} className="rounded-md border border-slate-700 bg-slate-900 px-2.5 py-2"><div className="flex items-center gap-2"><span className="w-5 text-[11px] text-slate-500">{provider.priority}</span><span className="min-w-0 flex-1 truncate text-xs text-slate-200">{provider.label} <span className="text-slate-500">· {provider.adapterType} · {provider.model}</span></span><span className={`text-[10px] ${provider.enabled ? 'text-emerald-300' : 'text-slate-500'}`}>{provider.enabled ? 'ON' : 'OFF'}</span><span className="text-[10px] text-slate-500">{provider.status || 'unknown'}</span><button onClick={() => void moveConfiguredProvider(provider, -1)} disabled={index === 0} className="text-[11px] text-slate-400 disabled:opacity-30" aria-label="Move provider up">↑</button><button onClick={() => void moveConfiguredProvider(provider, 1)} disabled={index === configuredProviders.length - 1} className="text-[11px] text-slate-400 disabled:opacity-30" aria-label="Move provider down">↓</button><button onClick={() => void updateConfiguredProviderState(provider, { enabled: !provider.enabled })} className="text-[11px] text-amber-300">{provider.enabled ? 'Disable' : 'Enable'}</button><button onClick={() => void deleteConfiguredProvider(provider)} className="text-[11px] text-rose-300">Remove</button></div></div>)}</div>}
+              <label className="mb-2 block text-[11px] font-medium text-slate-300">Add provider instance</label>
+              <input value={providerLabel} onChange={(event) => setProviderLabel(event.target.value)} placeholder="Label (for example: Backup Groq)" className="mb-2 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-100 outline-none focus:border-emerald-400" />
+              <label className="mb-2 flex cursor-pointer items-center gap-2 text-[11px] text-slate-300"><input type="checkbox" checked={providerEnabled} onChange={(event) => setProviderEnabled(event.target.checked)} className="h-3.5 w-3.5 accent-emerald-500" /> Enabled for requests</label>
+              <button onClick={() => void saveConfiguredProvider()} disabled={providerSaving} className="w-full rounded-lg bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400 disabled:opacity-50">Add configured provider</button>
+            </div>
             <label className="mb-2 block text-xs font-medium text-slate-300">Provider integrations</label>
             <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
               {Object.entries(providerPresets).map(([id, preset]) => (

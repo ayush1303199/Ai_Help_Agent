@@ -1,3 +1,108 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+html.overlay-document,
+html.overlay-document body,
+body.overlay-body {
+  background: transparent !important;
+}
+
+.overlay-shell {
+  min-height: 100vh;
+  box-sizing: border-box;
+  padding: 12px;
+  color: #fff;
+  background: transparent;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  text-shadow: 0 2px 5px rgba(0, 0, 0, 0.95), 0 0 2px rgba(0, 0, 0, 0.95);
+  -webkit-app-region: drag;
+}
+
+.overlay-dragbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 28px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.overlay-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.overlay-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #6ee7b7;
+  box-shadow: 0 0 8px rgba(110, 231, 183, 0.9);
+}
+
+.overlay-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border: 0;
+  border-radius: 6px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.28);
+  cursor: pointer;
+  text-shadow: none;
+}
+
+.overlay-close:hover {
+  background: rgba(127, 29, 29, 0.72);
+}
+
+.overlay-answer {
+  max-height: calc(100vh - 52px);
+  overflow: auto;
+  padding: 10px 14px 16px;
+  font-size: 18px;
+  line-height: 1.6;
+  scrollbar-width: thin;
+  -webkit-app-region: no-drag;
+}
+
+.overlay-answer p,
+.overlay-answer ul,
+.overlay-answer ol,
+.overlay-answer h3,
+.overlay-answer pre {
+  margin: 0 0 14px;
+}
+
+.overlay-answer h3 {
+  font-size: 1.2em;
+  font-weight: 700;
+}
+
+.overlay-answer ul,
+.overlay-answer ol {
+  padding-left: 1.5em;
+}
+
+.overlay-answer pre {
+  overflow-x: auto;
+  padding: 12px;
+  border-radius: 8px;
+  color: #d1fae5;
+  background: rgba(0, 0, 0, 0.55);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.8em;
+  text-shadow: none;
+  -webkit-app-region: no-drag;
+}
+
+.overlay-placeholder {
+  opacity: 0.75;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}

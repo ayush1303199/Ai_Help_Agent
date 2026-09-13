@@ -2,10 +2,10 @@ import OpenAI from 'openai';
 import { config } from '../config.js';
 
 const openAICompatible = new Set([
-  'groq', 'openai', 'deepseek', 'openrouter', 'together', 'mistral',
-  'llama', 'xai', 'perplexity', 'fireworks', 'cerebras', 'custom', 'custom-openai',
+  'groq', 'openai', 'deepseek', 'openrouter', 'together', 'llama', 'mistral',
+  'xai', 'perplexity', 'fireworks', 'cerebras', 'custom', 'custom-openai',
 ]);
-/** Public registry used by health checks and runtime integrations. */
+
 export const PROVIDER_REGISTRY = Object.freeze({
   groq: { adapter: 'openai-compatible' }, openai: { adapter: 'openai-compatible' },
   deepseek: { adapter: 'openai-compatible' }, openrouter: { adapter: 'openai-compatible' },
@@ -16,8 +16,10 @@ export const PROVIDER_REGISTRY = Object.freeze({
   'custom-openai': { adapter: 'openai-compatible' }, anthropic: { adapter: 'anthropic' },
   gemini: { adapter: 'gemini' }, cohere: { adapter: 'cohere' },
 });
+
 let cachedClient;
 let cachedClientKey;
+const configuredClients = new Map();
 
 export class ProviderError extends Error {
   constructor(message, kind, provider, status) {
@@ -59,30 +61,49 @@ export function getClient(provider = config.provider) {
   return cachedClient;
 }
 
+function getConfiguredClient(provider) {
+  const key = `${provider.id}|${provider.apiKey}|${provider.baseURL}`;
+  const existing = configuredClients.get(key);
+  if (existing) return existing;
+  const client = new OpenAI({ apiKey: provider.apiKey, baseURL: provider.baseURL });
+  configuredClients.set(key, client);
+  return client;
+}
+
 export function getModel(provider = config.provider) { return config[provider]?.model; }
 export function getProviderInfo() { return { provider: config.provider, model: getModel() }; }
 export function isFallbackError(error) { return normalizeProviderError(error).kind === 'quota'; }
+
 export function providerOrder() {
+  if (config.configuredProviders.length > 0) {
+    const providers = config.configuredProviders
+      .filter((provider) => provider.enabled && provider.apiKey && provider.model)
+      .sort((a, b) => a.priority - b.priority);
+    return config.fallbackEnabled ? providers : providers.slice(0, 1);
+  }
   const all = [config.provider, ...(config.fallbackEnabled ? Object.keys(config.runtimeProviders) : [])];
-  return [...new Set(all)].slice(0, 4); // active provider plus at most three alternates
+  return [...new Set(all)].map((provider, index) => ({
+    id: `legacy-${provider}`, label: provider, adapterType: provider, priority: index + 1,
+  }));
 }
 
 function parseSse(buffer, callback) {
   const lines = buffer.split('\n');
-  return lines.pop(), lines.forEach((line) => {
+  lines.pop();
+  lines.forEach((line) => {
     if (!line.startsWith('data:')) return;
     const value = line.slice(5).trim();
     if (!value || value === '[DONE]') return;
-    try { callback(JSON.parse(value)); } catch { /* providers occasionally emit keep-alive frames */ }
+    try { callback(JSON.parse(value)); } catch { /* keep-alive frame */ }
   });
 }
 
 async function streamAnthropic(active, messages, onToken) {
-  const system = messages.find((m) => m.role === 'system')?.content;
+  const system = messages.find((message) => message.role === 'system')?.content;
   const response = await fetch(`${active.baseURL}/messages`, {
     method: 'POST',
     headers: { 'x-api-key': active.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: active.model, max_tokens: config.server.maxTokens, stream: true, system, messages: messages.filter((m) => m.role !== 'system') }),
+    body: JSON.stringify({ model: active.model, max_tokens: config.server.maxTokens, stream: true, system, messages: messages.filter((message) => message.role !== 'system') }),
   });
   if (!response.ok || !response.body) throw Object.assign(new Error(await response.text()), { status: response.status });
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let text = '';
@@ -98,35 +119,58 @@ async function streamAnthropic(active, messages, onToken) {
 async function streamGemini(active, messages, onToken) {
   const baseURL = active.baseURL.replace(/\/openai\/?$/, '');
   const url = `${baseURL}/models/${active.model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(active.apiKey)}`;
-  const contents = messages.filter((m) => m.role !== 'system').map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
-  const system = messages.find((m) => m.role === 'system');
+  const contents = messages.filter((message) => message.role !== 'system').map((message) => ({ role: message.role === 'assistant' ? 'model' : 'user', parts: [{ text: message.content }] }));
+  const system = messages.find((message) => message.role === 'system');
   const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ systemInstruction: system && { parts: [{ text: system.content }] }, contents, generationConfig: { maxOutputTokens: config.server.maxTokens, temperature: 0.3 } }) });
   if (!response.ok || !response.body) throw Object.assign(new Error(await response.text()), { status: response.status });
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let text = '';
-  while (true) { const { value, done } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true }); parseSse(buffer, (event) => { const token = event.candidates?.[0]?.content?.parts?.[0]?.text || ''; if (token) { text += token; onToken(token); } }); buffer = buffer.slice(buffer.lastIndexOf('\n') + 1); }
+  while (true) {
+    const { value, done } = await reader.read(); if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    parseSse(buffer, (event) => { const token = event.candidates?.[0]?.content?.parts?.[0]?.text || ''; if (token) { text += token; onToken(token); } });
+    buffer = buffer.slice(buffer.lastIndexOf('\n') + 1);
+  }
   return text;
 }
 
 async function streamCohere(active, messages, onToken) {
   const baseURL = active.baseURL.replace(/\/compatibility\/v1\/?$/, '/v2');
-  const response = await fetch(`${baseURL}/chat`, { method: 'POST', headers: { Authorization: `Bearer ${active.apiKey}`, 'content-type': 'application/json' }, body: JSON.stringify({ model: active.model, stream: true, max_tokens: config.server.maxTokens, messages }) });
+  const response = await fetch(`${baseURL}/chat`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${active.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: active.model, stream: true, max_tokens: config.server.maxTokens, messages }),
+  });
   if (!response.ok || !response.body) throw Object.assign(new Error(await response.text()), { status: response.status });
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let text = '';
-  while (true) { const { value, done } = await reader.read(); if (done) break; buffer += decoder.decode(value, { stream: true }); parseSse(buffer, (event) => { const token = event.delta?.message?.content?.text || event.delta?.text || ''; if (token) { text += token; onToken(token); } }); buffer = buffer.slice(buffer.lastIndexOf('\n') + 1); }
+  while (true) {
+    const { value, done } = await reader.read(); if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    parseSse(buffer, (event) => { const token = event.delta?.message?.content?.text || event.delta?.text || ''; if (token) { text += token; onToken(token); } });
+    buffer = buffer.slice(buffer.lastIndexOf('\n') + 1);
+  }
   return text;
 }
 
 export async function streamProvider({ provider, messages, onToken }) {
-  const active = config[provider];
-  if (!active?.apiKey || !active?.model) throw new ProviderError(`Provider ${provider} is not configured.`, 'invalid_key', provider);
+  const providerId = typeof provider === 'string' ? provider : provider.adapterType;
+  const active = typeof provider === 'string' ? config[provider] : provider;
+  if (!active?.apiKey || !active?.model) throw new ProviderError(`Provider ${providerId} is not configured.`, 'invalid_key', providerId);
   try {
-    if (provider === 'anthropic') return await streamAnthropic(active, messages, onToken);
-    if (provider === 'gemini') return await streamGemini(active, messages, onToken);
-    if (provider === 'cohere') return await streamCohere(active, messages, onToken);
-    if (openAICompatible.has(provider)) {
-      const stream = await getClient(provider).chat.completions.create({ model: active.model, messages, stream: true, max_tokens: config.server.maxTokens, temperature: 0.3 });
-      let text = ''; for await (const chunk of stream) { const token = chunk.choices?.[0]?.delta?.content || ''; if (token) { text += token; onToken(token); } } return text;
+    if (providerId === 'anthropic') return await streamAnthropic(active, messages, onToken);
+    if (providerId === 'gemini') return await streamGemini(active, messages, onToken);
+    if (providerId === 'cohere') return await streamCohere(active, messages, onToken);
+    if (openAICompatible.has(providerId)) {
+      const client = typeof provider === 'string' ? getClient(provider) : getConfiguredClient(provider);
+      const stream = await client.chat.completions.create({ model: active.model, messages, stream: true, max_tokens: config.server.maxTokens, temperature: 0.3 });
+      let text = '';
+      for await (const chunk of stream) {
+        const token = chunk.choices?.[0]?.delta?.content || '';
+        if (token) { text += token; onToken(token); }
+      }
+      return text;
     }
-    throw new ProviderError(`Unsupported provider "${provider}".`, 'unexpected', provider);
-  } catch (error) { throw normalizeProviderError(error, provider); }
+    throw new ProviderError(`Unsupported provider "${providerId}".`, 'unexpected', providerId);
+  } catch (error) {
+    throw normalizeProviderError(error, providerId);
+  }
 }
