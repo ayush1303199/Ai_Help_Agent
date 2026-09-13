@@ -24,6 +24,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { cleanTranscript, detectQuestion, voiceSafeText } from './audio/transcriptUtils';
 import { resolveContext, truncateContextText } from './context/contextResolver';
+import { renderAnswerMarkdown } from './ui/answerMarkdown';
 import { AnswerSessionView } from './ui/AnswerSessionView';
 import { ConfiguredProvidersPanel } from './ui/ConfiguredProvidersPanel';
 
@@ -40,6 +41,7 @@ interface RequestTiming {
 }
 
 type Mode = 'direct' | 'langchain';
+type AppMode = 'assistant' | 'developer';
 
 interface MeetingTranscript {
   id: string;
@@ -87,6 +89,40 @@ interface ConfiguredProvider {
   priority: number;
   status?: string;
   hasApiKey?: boolean;
+}
+
+interface DeveloperSearchResult {
+  path: string;
+  line: number;
+  text: string;
+  matchType: 'filename' | 'content';
+}
+
+interface DeveloperDiffFile {
+  path: string;
+  lines: string[];
+}
+
+function parseUnifiedDiff(content: string): DeveloperDiffFile[] {
+  const lines = content
+    .replace(/^```(?:diff|patch)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .split(/\r?\n/);
+  const files: DeveloperDiffFile[] = [];
+  let current: DeveloperDiffFile | null = null;
+
+  for (const line of lines) {
+    const fileHeader = line.match(/^\+\+\+ b\/(.+)$/);
+    if (fileHeader) {
+      current = { path: fileHeader[1], lines: [] };
+      files.push(current);
+      continue;
+    }
+    if (current && (line.startsWith('@@') || line.startsWith('+') || line.startsWith('-') || line.startsWith(' '))) {
+      current.lines.push(line);
+    }
+  }
+  return files;
 }
 
 const HTTP_URL = 'http://localhost:3001';
@@ -185,6 +221,21 @@ function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [copiedItem, setCopiedItem] = useState('');
   const [chatStreaming, setChatStreaming] = useState(false);
+  const [developerMessages, setDeveloperMessages] = useState<Message[]>([]);
+  const [developerInput, setDeveloperInput] = useState('');
+  const [developerStreaming, setDeveloperStreaming] = useState(false);
+  const [developerProjectRoot, setDeveloperProjectRoot] = useState<string | null>(null);
+  const [developerDirectory, setDeveloperDirectory] = useState<Array<{ name: string; type: 'file' | 'directory' }>>([]);
+  const [developerPath, setDeveloperPath] = useState('.');
+  const [developerFileContent, setDeveloperFileContent] = useState('');
+  const [developerFilePath, setDeveloperFilePath] = useState('');
+  const [developerSearchQuery, setDeveloperSearchQuery] = useState('');
+  const [developerSearchResults, setDeveloperSearchResults] = useState<DeveloperSearchResult[]>([]);
+  const [developerProposalSearchQuery, setDeveloperProposalSearchQuery] = useState('');
+  const [developerChangeRequest, setDeveloperChangeRequest] = useState('');
+  const [developerProposal, setDeveloperProposal] = useState<{ files: DeveloperDiffFile[]; raw: string; searchedFiles: string[] } | null>(null);
+  const [developerBusy, setDeveloperBusy] = useState(false);
+  const [appMode, setAppMode] = useState<AppMode>('assistant');
   const [draftImproving, setDraftImproving] = useState(false);
   const [mode, setMode] = useState<Mode>('direct');
   const [pdfText, setPdfText] = useState('');
@@ -263,6 +314,12 @@ function App() {
   const requestStreamBuffersRef = useRef(new Map<string, string>());
   const requestStreamFlushTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const pendingChatRequestIdsRef = useRef(new Set<string>());
+  const pendingDeveloperRequestIdsRef = useRef(new Set<string>());
+  const developerStreamBuffersRef = useRef(new Map<string, string>());
+  const developerStreamFlushTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const pendingDeveloperProposalRequestIdsRef = useRef(new Set<string>());
+  const developerProposalBuffersRef = useRef(new Map<string, string>());
+  const developerProposalFilesRef = useRef(new Map<string, string[]>());
   const liveRequestInFlightRef = useRef(false);
   const electronAudioContextRef = useRef<AudioContext | null>(null);
   const audioLevelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -337,6 +394,23 @@ function App() {
     if (!content) return;
     setMessages((prev) => {
       const next = [...prev];
+      const message = next.find((item) => item.role === 'assistant' && item.requestId === requestId);
+      if (message && message.streaming) message.content += content;
+      return next;
+    });
+  }, []);
+
+  const flushDeveloperStreamBuffer = useCallback((requestId: string, fallbackContent = '') => {
+    const timer = developerStreamFlushTimersRef.current.get(requestId);
+    if (timer) {
+      clearTimeout(timer);
+      developerStreamFlushTimersRef.current.delete(requestId);
+    }
+    const content = developerStreamBuffersRef.current.get(requestId) || fallbackContent;
+    developerStreamBuffersRef.current.delete(requestId);
+    if (!content) return;
+    setDeveloperMessages((previous) => {
+      const next = [...previous];
       const message = next.find((item) => item.role === 'assistant' && item.requestId === requestId);
       if (message && message.streaming) message.content += content;
       return next;
@@ -597,11 +671,26 @@ function App() {
     const msg = JSON.parse(data);
     const isDraftImprove = msg.requestId && msg.requestId === draftImproveRequestIdRef.current;
     const isCurrentChat = msg.requestId && pendingChatRequestIdsRef.current.has(msg.requestId);
+    const isDeveloperChat = msg.requestId && pendingDeveloperRequestIdsRef.current.has(msg.requestId);
+    const isDeveloperProposal = msg.requestId && pendingDeveloperProposalRequestIdsRef.current.has(msg.requestId);
 
-    if (!isDraftImprove && !isCurrentChat) return;
+    if (!isDraftImprove && !isCurrentChat && !isDeveloperChat && !isDeveloperProposal) return;
 
     if (msg.type === 'token') {
       if (isDraftImprove) return;
+      if (isDeveloperProposal) {
+        const requestId = String(msg.requestId);
+        developerProposalBuffersRef.current.set(requestId, `${developerProposalBuffersRef.current.get(requestId) || ''}${msg.content}`);
+        return;
+      }
+      if (isDeveloperChat) {
+        const requestId = String(msg.requestId);
+        developerStreamBuffersRef.current.set(requestId, `${developerStreamBuffersRef.current.get(requestId) || ''}${msg.content}`);
+        if (!developerStreamFlushTimersRef.current.has(requestId)) {
+          developerStreamFlushTimersRef.current.set(requestId, setTimeout(() => flushDeveloperStreamBuffer(requestId), 16));
+        }
+        return;
+      }
       if (voiceReplies && typeof window !== 'undefined' && 'speechSynthesis' in window) {
         voiceBufferRef.current += msg.content;
         const sentenceMatch = voiceBufferRef.current.match(/^(.+?[.!?])(?:\s|$)/s);
@@ -620,6 +709,53 @@ function App() {
       requestStreamFlushTimersRef.current.set(requestId, setTimeout(() => flushStreamBuffer(requestId), 16));
       }
     } else if (msg.type === 'done') {
+      if (isDeveloperProposal) {
+        const requestId = String(msg.requestId);
+        const responseText = String(msg.content || developerProposalBuffersRef.current.get(requestId) || '');
+        const files = parseUnifiedDiff(responseText);
+        const searchedFiles = developerProposalFilesRef.current.get(requestId) || [];
+        const unexpectedFiles = files.filter((file) => !searchedFiles.includes(file.path));
+        if (!files.length && responseText.trim() !== 'NO_CHANGES') {
+          developerProposalBuffersRef.current.delete(requestId);
+          developerProposalFilesRef.current.delete(requestId);
+          pendingDeveloperProposalRequestIdsRef.current.delete(requestId);
+          setDeveloperBusy(false);
+          setError('The assistant returned an invalid proposal. Expected a unified diff or NO_CHANGES.');
+          return;
+        }
+        if (unexpectedFiles.length > 0) {
+          developerProposalBuffersRef.current.delete(requestId);
+          developerProposalFilesRef.current.delete(requestId);
+          pendingDeveloperProposalRequestIdsRef.current.delete(requestId);
+          setDeveloperBusy(false);
+          setError(`The proposal referenced files that were not re-read: ${unexpectedFiles.map((file) => file.path).join(', ')}`);
+          return;
+        }
+        setDeveloperProposal({
+          files,
+          raw: responseText,
+          searchedFiles,
+        });
+        developerProposalBuffersRef.current.delete(requestId);
+        developerProposalFilesRef.current.delete(requestId);
+        pendingDeveloperProposalRequestIdsRef.current.delete(requestId);
+        setDeveloperBusy(false);
+        return;
+      }
+      if (isDeveloperChat) {
+        const requestId = String(msg.requestId);
+        const responseText = String(msg.content || '');
+        console.log(`[DEVELOPER] Response received request=${requestId} length=${responseText.length}`);
+        flushDeveloperStreamBuffer(requestId, responseText);
+        pendingDeveloperRequestIdsRef.current.delete(requestId);
+        setDeveloperStreaming(pendingDeveloperRequestIdsRef.current.size > 0);
+        setDeveloperMessages((previous) => previous.map((message) =>
+          message.requestId === requestId
+            ? { ...message, content: responseText || message.content, streaming: false }
+            : message,
+        ));
+        return;
+      }
       const timing = requestTimingRef.current.get(msg.requestId);
       const parsedAt = performance.now();
       const responseText = String(msg.content || '');
@@ -666,6 +802,26 @@ function App() {
       }
       requestTimingRef.current.delete(msg.requestId);
     } else if (msg.type === 'error') {
+      if (isDeveloperProposal) {
+        developerProposalBuffersRef.current.delete(String(msg.requestId));
+        developerProposalFilesRef.current.delete(String(msg.requestId));
+        pendingDeveloperProposalRequestIdsRef.current.delete(String(msg.requestId));
+        setDeveloperBusy(false);
+        setError(`Could not generate proposal: ${msg.message}`);
+        return;
+      }
+      if (isDeveloperChat) {
+        const requestId = String(msg.requestId);
+        pendingDeveloperRequestIdsRef.current.delete(requestId);
+        flushDeveloperStreamBuffer(requestId);
+        setDeveloperStreaming(pendingDeveloperRequestIdsRef.current.size > 0);
+        setDeveloperMessages((previous) => previous.map((message) =>
+          message.requestId === requestId
+            ? { ...message, content: `Error: ${msg.message}`, streaming: false }
+            : message,
+        ));
+        return;
+      }
       if (isDraftImprove) {
         setDraftImproving(false);
         draftImproveRequestIdRef.current = '';
@@ -689,7 +845,7 @@ function App() {
       setError(msg.message);
       setPipelineStatus('error');
     }
-  }, [flushStreamBuffer, voiceReplies]);
+  }, [flushDeveloperStreamBuffer, flushStreamBuffer, voiceReplies]);
 
   // --- Send a chat message ---
   const sendMessage = async (question = input.trim(), contextOverride?: string, modelInstruction = question, questionFinalizedAt = performance.now()) => {
@@ -797,6 +953,182 @@ function App() {
         }
         return [...next];
       });
+    }
+  };
+
+  const sendDeveloperMessage = async () => {
+    const question = developerInput.trim();
+    if (!question || developerStreaming || developerBusy) return;
+
+    const requestId = crypto.randomUUID();
+    const userMsg: Message = { role: 'user', content: question };
+    const assistantMsg: Message = { role: 'assistant', content: '', streaming: true, requestId };
+    const conversationHistory = [...developerMessages, userMsg]
+      .slice(-MAX_CHAT_HISTORY_MESSAGES)
+      .map((message) => ({ role: message.role, content: compactMessageContent(message.content) }));
+
+    setDeveloperMessages((previous) => [...previous, userMsg, assistantMsg]);
+    setDeveloperInput('');
+    setDeveloperStreaming(true);
+    pendingDeveloperRequestIdsRef.current.add(requestId);
+
+    try {
+      const ws = await ensureWs();
+      ws.onmessage = (event) => handleWsMessage(event.data);
+      ws.send(JSON.stringify({
+        type: 'chat',
+        requestId,
+        mode: 'direct',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a software development assistant. Help the user understand, debug, design, and modify software. You have no filesystem or tool access. Only use information provided in this conversation, and never claim to have inspected files or run commands.',
+          },
+          ...conversationHistory,
+        ],
+        pdfContext: '',
+      }));
+    } catch (err) {
+      pendingDeveloperRequestIdsRef.current.delete(requestId);
+      setDeveloperStreaming(false);
+      setDeveloperMessages((previous) => previous.map((message) =>
+        message.requestId === requestId
+          ? { ...message, content: `Connection error: ${(err as Error).message}`, streaming: false }
+          : message,
+      ));
+    }
+  };
+
+  const chooseDeveloperProject = async () => {
+    if (!window.electronAPI || developerBusy || developerStreaming) {
+      if (!window.electronAPI) setError('Project access is available in the Electron desktop app.');
+      return;
+    }
+    setDeveloperBusy(true);
+    try {
+      const result = await window.electronAPI.chooseDeveloperProject();
+      if (!result.canceled) {
+        setDeveloperProjectRoot(result.projectRoot);
+        setDeveloperPath('.');
+        setDeveloperFileContent('');
+        setDeveloperFilePath('');
+        setDeveloperDirectory(await window.electronAPI.listDeveloperDirectory('.'));
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setDeveloperBusy(false);
+    }
+  };
+
+  const clearDeveloperProject = async () => {
+    if (!window.electronAPI || developerBusy || developerStreaming) return;
+    setDeveloperBusy(true);
+    try {
+      await window.electronAPI.clearDeveloperProject();
+      setDeveloperProjectRoot(null);
+      setDeveloperDirectory([]);
+      setDeveloperPath('.');
+      setDeveloperFileContent('');
+      setDeveloperFilePath('');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setDeveloperBusy(false);
+    }
+  };
+
+  const listDeveloperDirectory = async () => {
+    if (!window.electronAPI || !developerProjectRoot || developerBusy || developerStreaming) return;
+    setDeveloperBusy(true);
+    try {
+      setDeveloperDirectory(await window.electronAPI.listDeveloperDirectory(developerPath || '.'));
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setDeveloperBusy(false);
+    }
+  };
+
+  const readDeveloperFile = async (requestedPath = developerPath) => {
+    if (!window.electronAPI || !developerProjectRoot || !requestedPath || developerBusy || developerStreaming) return;
+    setDeveloperBusy(true);
+    try {
+      const result = await window.electronAPI.readDeveloperFile(requestedPath);
+      setDeveloperFilePath(result.path);
+      setDeveloperFileContent(result.content);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setDeveloperBusy(false);
+    }
+  };
+
+  const searchDeveloperCode = async () => {
+    if (!window.electronAPI || !developerProjectRoot || !developerSearchQuery.trim() || developerBusy || developerStreaming) return;
+    setDeveloperBusy(true);
+    try {
+      const result = await window.electronAPI.searchDeveloperCode(developerSearchQuery);
+      setDeveloperSearchResults(result.results);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setDeveloperBusy(false);
+    }
+  };
+
+  const generateDeveloperProposal = async () => {
+    const request = developerChangeRequest.trim();
+    const searchQuery = developerProposalSearchQuery.trim();
+    if (!window.electronAPI || !developerProjectRoot || !request || !searchQuery || developerBusy || developerStreaming) return;
+
+    setDeveloperBusy(true);
+    setError('');
+    setDeveloperProposal(null);
+    try {
+      const search = await window.electronAPI.searchDeveloperCode(searchQuery);
+      const paths = [...new Set(search.results.map((result) => result.path))].slice(0, 6);
+      if (!paths.length) throw new Error('No relevant files were found. Refine the search query before generating a proposal.');
+
+      const initialFiles = await Promise.all(paths.map(async (path) => ({
+        path,
+        content: (await window.electronAPI!.readDeveloperFile(path)).content,
+      })));
+      const snapshot = initialFiles
+        .map(({ path, content }) => `FILE: ${path}\n${content.slice(0, 24000)}`)
+        .join('\n\n');
+
+      // Re-read immediately before generation so the proposal is based on the
+      // latest safe, project-root-confined file contents.
+      const latestFiles = await Promise.all(paths.map(async (path) => ({
+        path,
+        content: (await window.electronAPI!.readDeveloperFile(path)).content,
+      })));
+      const latestSnapshot = latestFiles
+        .map(({ path, content }) => `FILE: ${path}\n${content.slice(0, 24000)}`)
+        .join('\n\n');
+
+      const requestId = crypto.randomUUID();
+      pendingDeveloperProposalRequestIdsRef.current.add(requestId);
+      developerProposalFilesRef.current.set(requestId, paths);
+      const ws = await ensureWs();
+      ws.onmessage = (event) => handleWsMessage(event.data);
+      ws.send(JSON.stringify({
+        type: 'chat',
+        requestId,
+        mode: 'direct',
+        messages: [{
+          role: 'system',
+          content: 'You generate read-only code change proposals. Return only a minimal unified diff. Never claim to apply changes, run commands, or access files beyond the supplied snapshots. Use exact relative paths from the snapshots. Include --- a/path, +++ b/path, and @@ hunks. If no safe change is needed, return NO_CHANGES.',
+        }, {
+          role: 'user',
+          content: `Change request:\n${request}\n\nInitial search snapshot:\n${snapshot}\n\nLatest re-read snapshot (authoritative):\n${latestSnapshot}`,
+        }],
+        pdfContext: '',
+      }));
+    } catch (err) {
+      setDeveloperBusy(false);
+      setError((err as Error).message);
     }
   };
 
@@ -1315,7 +1647,23 @@ function App() {
             <div><h1 className="text-sm font-semibold">Meeting AI Assistant</h1><p className={`text-[11px] ${statusTone}`}>● {statusLabel}</p></div>
           </div>
           <div className="flex items-center gap-2">
-            <div className="flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5" aria-label="AI mode">
+            <div className="flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5" aria-label="Application mode">
+              <button
+                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming) setAppMode('assistant'); }}
+                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming}
+                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${appMode === 'assistant' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
+              >
+                AI Assistant
+              </button>
+              <button
+                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming) setAppMode('developer'); }}
+                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming}
+                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${appMode === 'developer' ? 'bg-sky-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
+              >
+                Developer
+              </button>
+            </div>
+            <div className={`${appMode === 'assistant' ? '' : 'hidden'} flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5`} aria-label="AI mode">
               <button
                 onClick={() => setMode('direct')}
                 className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${mode === 'direct' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'}`}
@@ -1337,13 +1685,13 @@ function App() {
                   setError('Overlay mode is available in the Electron desktop app.');
                 }
               }}
-              className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400"
+              className={`${appMode === 'assistant' ? '' : 'hidden'} rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400`}
               title="Open transparent answer overlay"
             >
               Overlay
             </button>
-            {sessionActive && <button onClick={() => setMeetingMenuOpen((open) => !open)} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
-            <div className="relative">
+            {appMode === 'assistant' && sessionActive && <button onClick={() => setMeetingMenuOpen((open) => !open)} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
+            <div className={`${appMode === 'assistant' ? '' : 'hidden'} relative`}>
               <button
                 onClick={() => setContextMenuOpen((open) => !open)}
                 className={`rounded-lg border px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400 ${contextMenuOpen ? 'border-emerald-400 bg-emerald-500/10' : 'border-slate-700'}`}
@@ -1668,7 +2016,105 @@ function App() {
       )}
 
       <main className="mx-auto flex min-h-[calc(100dvh-57px)] w-full max-w-3xl flex-col px-4 py-6">
-        {!sessionActive ? (
+        {appMode === 'developer' ? (
+          <section className="m-auto flex w-full max-w-3xl flex-1 flex-col rounded-2xl border border-sky-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7">
+            <div className="mb-5">
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-sky-300">Developer Mode</p>
+              <h2 className="mt-1 text-xl font-semibold">Coding assistant</h2>
+              <p className="mt-2 text-xs text-slate-500">Read-only project access. No writes, commands, microphone, or Assistant audio pipeline are available.</p>
+            </div>
+            <div className="mb-5 rounded-xl border border-slate-700 bg-slate-800/50 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Project</p>
+                  <p className="truncate text-xs text-slate-300">{developerProjectRoot || 'No project folder selected'}</p>
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  <button onClick={() => void chooseDeveloperProject()} disabled={developerBusy || developerStreaming} className="rounded-md border border-sky-500/50 px-2 py-1.5 text-[11px] text-sky-300 disabled:opacity-40">Select folder</button>
+                  {developerProjectRoot && <button onClick={() => void clearDeveloperProject()} disabled={developerBusy || developerStreaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Clear</button>}
+                </div>
+              </div>
+              {developerProjectRoot && <div className="mt-3 space-y-2">
+                <div className="flex gap-2">
+                  <input value={developerPath} onChange={(event) => setDeveloperPath(event.target.value)} placeholder="Relative path (.)" className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400" />
+                  <button onClick={() => void listDeveloperDirectory()} disabled={developerBusy || developerStreaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">List</button>
+                  <button onClick={() => void readDeveloperFile()} disabled={developerBusy || developerStreaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Read file</button>
+                </div>
+                {developerDirectory.length > 0 && <div className="max-h-32 overflow-y-auto rounded-md border border-slate-700 bg-slate-950 p-2">{developerDirectory.map((entry) => <button key={`${entry.type}-${entry.name}`} onClick={() => setDeveloperPath(developerPath === '.' ? entry.name : `${developerPath.replace(/[\\/]+$/, '')}/${entry.name}`)} className="block w-full truncate px-1 py-1 text-left text-[11px] text-slate-300 hover:text-sky-300">{entry.type === 'directory' ? '📁' : '📄'} {entry.name}</button>)}</div>}
+                {developerFilePath && <pre className="max-h-48 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] leading-relaxed text-slate-300">{developerFileContent}</pre>}
+                <div className="border-t border-slate-700 pt-2">
+                  <div className="flex gap-2">
+                    <input value={developerSearchQuery} onChange={(event) => setDeveloperSearchQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void searchDeveloperCode(); } }} placeholder="Search filenames and code..." className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400" />
+                    <button onClick={() => void searchDeveloperCode()} disabled={developerBusy || developerStreaming || !developerSearchQuery.trim()} className="rounded-md border border-sky-500/50 px-2 py-1.5 text-[11px] text-sky-300 disabled:opacity-40">Search</button>
+                  </div>
+                  {developerSearchResults.length > 0 && <div className="mt-2 max-h-40 overflow-y-auto rounded-md border border-slate-700 bg-slate-950 p-2">{developerSearchResults.map((result, index) => <button key={`${result.path}-${result.line}-${index}`} onClick={() => { setDeveloperPath(result.path); if (result.line > 0) void readDeveloperFile(result.path); }} className="block w-full truncate px-1 py-1 text-left text-[11px] text-slate-300 hover:text-sky-300">{result.path}{result.line > 0 ? `:${result.line}` : ''} · {result.text}</button>)}</div>}
+                </div>
+                <div className="border-t border-slate-700 pt-3">
+                  <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Proposal-only code changes</p>
+                  <p className="mb-2 text-[11px] leading-relaxed text-slate-500">Search and read context is captured twice before the assistant proposes a minimal patch. Nothing is written to disk.</p>
+                  <input
+                    value={developerProposalSearchQuery}
+                    onChange={(event) => setDeveloperProposalSearchQuery(event.target.value)}
+                    placeholder="Search query for relevant files"
+                    className="mb-2 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400"
+                  />
+                  <textarea
+                    value={developerChangeRequest}
+                    onChange={(event) => setDeveloperChangeRequest(event.target.value)}
+                    placeholder="Describe the code change to propose..."
+                    rows={3}
+                    className="w-full resize-y rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400"
+                  />
+                  <button
+                    onClick={() => void generateDeveloperProposal()}
+                    disabled={developerBusy || developerStreaming || !developerProposalSearchQuery.trim() || !developerChangeRequest.trim()}
+                    className="mt-2 rounded-md border border-amber-500/50 px-2 py-1.5 text-[11px] text-amber-200 disabled:opacity-40"
+                  >
+                    {developerBusy ? 'Preparing proposal...' : 'Generate proposal'}
+                  </button>
+                </div>
+              </div>}
+            </div>
+            {developerProposal && (
+              <section className="mb-5 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-200">Proposed diff</p>
+                    <p className="mt-1 text-[11px] text-slate-400">Proposal only — no files changed.</p>
+                  </div>
+                  <button onClick={() => setDeveloperProposal(null)} className="text-[11px] text-slate-400 hover:text-slate-200">Discard</button>
+                </div>
+                <p className="mt-2 text-[11px] text-slate-500">Re-read files: {developerProposal.searchedFiles.join(', ')}</p>
+                {developerProposal.files.length > 0 ? (
+                  <div className="mt-3 space-y-3">
+                    {developerProposal.files.map((file) => (
+                      <div key={file.path} className="overflow-hidden rounded-md border border-slate-700 bg-slate-950">
+                        <p className="border-b border-slate-700 px-2 py-1.5 text-xs font-medium text-slate-200">{file.path}</p>
+                        <pre className="max-h-80 overflow-auto p-2 text-[11px] leading-relaxed text-slate-300">{file.lines.map((line, index) => <span key={`${file.path}-${index}`} className={`block ${line.startsWith('+') && !line.startsWith('+++') ? 'bg-emerald-500/10 text-emerald-200' : line.startsWith('-') && !line.startsWith('---') ? 'bg-rose-500/10 text-rose-200' : 'text-slate-400'}`}>{line || ' '}</span>)}</pre>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <pre className="mt-3 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] text-slate-300">{developerProposal.raw || 'No safe changes proposed.'}</pre>
+                )}
+              </section>
+            )}
+            <div className="flex-1 space-y-4 overflow-y-auto">
+              {developerMessages.length === 0 && <p className="rounded-lg border border-dashed border-slate-700 p-5 text-center text-sm text-slate-500">Ask a coding question to get started.</p>}
+              {developerMessages.map((message, index) => (
+                <article key={message.requestId || `${message.role}-${index}`} className={`rounded-xl border p-4 ${message.role === 'user' ? 'border-slate-700 bg-slate-800/60' : 'border-sky-500/20 bg-slate-950/60'}`}>
+                  <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">{message.role === 'user' ? 'You' : 'Developer assistant'}</p>
+                  {message.role === 'assistant' ? <div className="text-sm leading-relaxed text-slate-100">{renderAnswerMarkdown(message.content || (message.streaming ? 'Thinking...' : 'No answer yet.'))}</div> : <p className="whitespace-pre-wrap text-sm text-slate-200">{message.content}</p>}
+                </article>
+              ))}
+            </div>
+            <div className="mt-5 flex gap-2">
+              <input value={developerInput} onChange={(event) => setDeveloperInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendDeveloperMessage(); } }} placeholder="Ask a coding question..." className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-sky-400" />
+              <button onClick={() => void sendDeveloperMessage()} disabled={!developerInput.trim() || developerStreaming || developerBusy} className="rounded-lg bg-sky-500 px-4 text-sm font-medium text-slate-950 disabled:opacity-40">Send</button>
+            </div>
+            {developerMessages.length > 0 && <button onClick={() => { setDeveloperMessages([]); setDeveloperInput(''); }} className="mt-3 self-start text-xs text-slate-400 hover:text-slate-200">Clear developer conversation</button>}
+          </section>
+        ) : !sessionActive ? (
           <section className="m-auto w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900/80 p-6 shadow-2xl">
             <div className="mb-6 text-center"><h2 className="text-2xl font-semibold">Meeting AI Assistant</h2><p className="mt-2 text-sm text-slate-400">Listen to internal system audio and get concise answers.</p></div>
             <div className="space-y-4">

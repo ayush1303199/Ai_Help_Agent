@@ -1,5 +1,6 @@
-const { app, BrowserWindow, desktopCapturer, session, ipcMain } = require('electron');
+const { app, BrowserWindow, desktopCapturer, session, ipcMain, dialog } = require('electron');
 const path = require('node:path');
+const developerFiles = require('./developerFiles.cjs');
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
@@ -101,6 +102,13 @@ app.whenReady().then(() => {
   ipcMain.handle('overlay:close', () => {
     if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close();
   });
+  ipcMain.handle('developer:choose-project', (_event) => developerFiles.chooseProjectFolder(dialog));
+  ipcMain.handle('developer:clear-project', () => {
+    developerFiles.clearProject();
+  });
+  ipcMain.handle('developer:list-directory', (_event, relativePath) => developerFiles.listDirectory(relativePath));
+  ipcMain.handle('developer:read-file', (_event, relativePath) => developerFiles.readFile(relativePath));
+  ipcMain.handle('developer:search-code', (_event, query) => developerFiles.searchCode(query));
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(['media'].includes(permission));
   });
