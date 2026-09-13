@@ -145,6 +145,18 @@ This serves the Yii2 API on `http://localhost:8080`.
 3. **Type a message** and press Enter. The AI response streams in token-by-token via WebSocket.
 4. **Ask about the PDF**: If you uploaded a document, ask questions like "Summarize this document" or "What are the key points?"
 
+## System Audio Only Capture
+
+Meeting capture is intentionally **system audio only**. The app uses the operating system/browser display-audio permission flow and never requests a physical microphone stream. Select the meeting tab, window, screen, speaker, headphones, or configured virtual output in the capture dialog, enable audio sharing, and then use **Test Audio** before **Start Listening**.
+
+For Windows loopback capture, run the desktop app with `npm run dev` (or `npm run electron:dev`). Use `npm run web:dev` only for the browser-only session; it does not provide Electron's Windows loopback handler and will report system audio as unsupported.
+
+- **Windows 10/11:** select the required playback source in the Windows/Chromium capture dialog. WASAPI loopback availability depends on the Electron/Chromium build and selected output.
+- **macOS:** select a supported system-audio route such as BlackHole when the platform requires a virtual audio device. Install and configure that driver separately; the app does not install or enable it automatically.
+- **Android/iOS:** internal playback capture is controlled by the mobile OS and the source application. If the browser or application does not expose a supported system-audio capture stream, the app reports that capture is unavailable and does not fall back to the microphone.
+
+The meeting panel displays `SYSTEM AUDIO ONLY`, the active source label, connection state, microphone `OFF`, and a live system-audio level meter. Stop listening to release the selected audio stream.
+
 ---
 
 ## Complete Request Flow

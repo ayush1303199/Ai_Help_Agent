@@ -4,14 +4,19 @@ import multer from 'multer';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import OpenAI, { toFile } from 'openai';
-import { config, setAgentPermissions, setFallbackEnabled, setRuntimeProvider, validateConfig } from './config.js';
+import { config, setAgentPermissions, setFallbackEnabled, setRuntimeProvider } from './config.js';
 import { getProviderInfo } from './llm/provider.js';
 import { extractTextFromPdfBuffer } from './pdf/pdfExtractor.js';
 import { startWebSocketServer } from './ws/websocketServer.js';
 
-// --- Validate .env before anything else ---
-validateConfig();
-console.log(`Using LLM provider: ${config.provider} (model: ${config[config.provider].model})`);
+// The server can start without a configured key so the local health and
+// provider-settings endpoints remain available for first-time setup.
+const activeProvider = config[config.provider];
+if (activeProvider?.apiKey && !activeProvider.apiKey.includes('your_')) {
+  console.log(`Using LLM provider: ${config.provider} (model: ${activeProvider.model})`);
+} else {
+  console.warn(`No API key configured for provider "${config.provider}". Configure one in the app before chatting.`);
+}
 
 const app = express();
 const agentActivity = [];
@@ -147,6 +152,8 @@ app.post('/api/transcribe-audio', audioUpload.single('file'), async (req, res) =
   }
 
   try {
+    console.log(`[AUDIO] Audio chunk received (${req.file.size} bytes, ${req.file.mimetype || 'unknown format'})`);
+    console.log('[STT] Transcribing audio chunk');
     const active = config[config.provider];
     const client = new OpenAI({ apiKey: active.apiKey, baseURL: active.baseURL });
     const transcript = await client.audio.transcriptions.create({
@@ -154,8 +161,10 @@ app.post('/api/transcribe-audio', audioUpload.single('file'), async (req, res) =
       model: process.env.TRANSCRIPTION_MODEL || 'whisper-large-v3-turbo',
       response_format: 'text',
     });
-    res.json({ text: transcript });
+    console.log(`[STT] Final transcript: "${String(transcript).slice(0, 240)}"`);
+    res.json({ text: transcript, confidence: null, isFinal: true });
   } catch (err) {
+    console.error('[STT] Speech-to-text failed:', err.message);
     res.status(502).json({ error: `Audio transcription failed: ${err.message}` });
   }
 });

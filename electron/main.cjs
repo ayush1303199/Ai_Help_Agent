@@ -1,4 +1,4 @@
-const { app, BrowserWindow, session } = require('electron');
+const { app, BrowserWindow, desktopCapturer, session } = require('electron');
 const path = require('node:path');
 
 const isDev = !app.isPackaged;
@@ -44,6 +44,25 @@ app.whenReady().then(() => {
   });
   session.defaultSession.setPermissionCheckHandler((_webContents, permission) => {
     return ['media'].includes(permission);
+  });
+  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+    if (process.platform !== 'win32') {
+      // Electron does not provide a general system-output loopback stream on
+      // macOS/Linux. Those platforms require a supported virtual audio route.
+      callback({});
+      return;
+    }
+
+    const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] });
+    const source = sources[0];
+    if (!source) {
+      callback({});
+      return;
+    }
+
+    // Chromium's Windows loopback captures the selected display/window output,
+    // not the physical microphone. The renderer still discards the video track.
+    callback({ video: source, audio: 'loopback' });
   });
 
   createWindow();

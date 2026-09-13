@@ -7,7 +7,6 @@ import {
   History,
   Link as LinkIcon,
   Loader2,
-  Mic,
   MonitorUp,
   Search,
   Send,
@@ -53,52 +52,55 @@ interface ChatSession {
   updatedAt: string;
 }
 
-interface SpeechRecognitionResultLike extends ArrayLike<{ transcript: string }> {
-  isFinal: boolean;
+interface SessionDocument {
+  id: string;
+  name: string;
+  text: string;
+  uploadedAt: number;
 }
 
-interface SpeechRecognitionResultEvent {
-  resultIndex: number;
-  results: ArrayLike<SpeechRecognitionResultLike>;
+interface TrainedProfile {
+  id: string;
+  name: string;
+  summary: string;
+  context: string;
+  createdAt: number;
 }
-
-interface SpeechRecognitionLike {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: (event: SpeechRecognitionResultEvent) => void;
-  onerror: (event: { error?: string }) => void;
-  onend: () => void;
-  start: () => void;
-  stop: () => void;
-}
-
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-
-const meetingSources = [
-  { name: 'Zoom', color: 'bg-blue-500', note: 'Use microphone capture' },
-  { name: 'Google Meet', color: 'bg-emerald-500', note: 'Use microphone capture' },
-  { name: 'Teams', color: 'bg-indigo-500', note: 'Use microphone capture' },
-  { name: 'Webex', color: 'bg-cyan-500', note: 'Use microphone capture' },
-  { name: 'CoderPad', color: 'bg-orange-500', note: 'Use microphone capture' },
-  { name: 'More', color: 'bg-slate-600', note: 'Choose a meeting source' },
-];
 
 const HTTP_URL = 'http://localhost:3001';
 const WS_URL = 'ws://localhost:3002';
 const MAX_CHAT_HISTORY_MESSAGES = 8;
 const MAX_CHAT_MESSAGE_CHARS = 2000;
 const MAX_CONTEXT_CHARS = 9000;
-// A short pause feels natural in a conversation while avoiding a long delay
-// before the live assistant can start answering.
-const BROWSER_VOICE_SILENCE_MS = 1800;
-const ELECTRON_VOICE_SILENCE_MS = 1800;
+const MAX_PDF_SIZE = 20 * 1024 * 1024;
+const PDF_CONTEXT_BUDGET_RATIO = 0.65;
+const PDF_CONTEXT_CHAR_BUDGET = Math.floor(MAX_CONTEXT_CHARS * PDF_CONTEXT_BUDGET_RATIO);
+// The active capture path is system audio only; microphone access is never
+// requested. Transcription begins only after the user stops listening.
 const PDF_UPLOAD_TIMEOUT_MS = 20000;
-const AI_SYSTEM_PROMPT =
-  'You are a concise AI software-engineering assistant. Use only the project context, code, documents, and conversation supplied by the user. ' +
-  'Do not claim to access files, repositories, services, credentials, or test results that were not provided. ' +
-  'When enough context is supplied, answer directly; otherwise ask for the smallest useful missing detail. ' +
-  'For general conversation, respond naturally and briefly.';
+const SYSTEM_AUDIO_SILENCE_MS = 1000;
+const SYSTEM_AUDIO_LEVEL_THRESHOLD = 2;
+const AI_SYSTEM_PROMPT = `You are a helpful AI voice assistant.
+
+Your primary job is to accurately process the user's speech and respond only to what the user actually says.
+
+Voice-to-text rules:
+- Preserve the user's original meaning. Never invent words, requests, questions, or intentions.
+- Ignore background noise, random sounds, and incomplete audio when they contain no meaningful speech.
+- If the speech is unclear, ask the user to repeat it instead of guessing.
+- Wait until the user has finished speaking before responding.
+- Do not add unrelated phrases such as "Thank you", "Enjoy your meal", "Have a nice day", or "You're welcome" unless the user's actual words require that response.
+- Do not repeat the same response unnecessarily.
+
+Conversation behavior:
+- "Introduce yourself" -> "Hi, I'm your AI voice assistant. I can help you with questions, information, coding, and everyday tasks. How can I help you today?"
+- "Hello" -> "Hi! How can I help you?"
+- "Thank you" -> "You're welcome!"
+- Unclear speech -> "Sorry, I didn't catch that. Could you please repeat?"
+
+First determine the user's intent, then provide the shortest useful response. Do not treat every voice input as a request for a long answer. Always prioritize the user's actual spoken words over assumptions.
+
+For coding and other typed requests, remain accurate and concise. Use only the project context, code, documents, and conversation supplied by the user. Do not claim to access files, repositories, services, credentials, or test results that were not provided.`;
 
 function compactMessageContent(content: string) {
   if (content.length <= MAX_CHAT_MESSAGE_CHARS) return content;
@@ -110,25 +112,102 @@ function chatTitle(messages: Message[]) {
   return firstUserMessage.length > 52 ? `${firstUserMessage.slice(0, 52)}…` : firstUserMessage;
 }
 
-function isVoiceAssistantRequest(text: string) {
-  const normalized = text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s?]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!normalized) return false;
-  if (/^(ok|okay|thanks?|thank you|welcome|yes|yeah|yep|no|nope|bye|goodbye|hi|hello|hey|um|uh|hmm)[?]?$/.test(normalized)) return false;
-
-  // A completed spoken sentence is intentional input, even without a question word.
-  return normalized.split(' ').length >= 2;
-}
-
 function voiceSafeText(text: string) {
   return text
-    .replace(/(^|\s)(thank you|thanks|you're welcome|you are welcome)[.!]?($|\s)/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function systemAudioErrorMessage(error: unknown, action: 'capture' | 'test') {
+  const message = error instanceof Error ? error.message : String(error);
+  const isElectron = typeof navigator !== 'undefined' && /Electron/i.test(navigator.userAgent);
+  if (/not supported/i.test(message)) {
+    if (!isElectron) {
+      return `System audio ${action} needs the Electron desktop app on Windows. Start it with "npm run electron:dev"; the plain Vite browser session cannot provide Windows loopback audio.`;
+    }
+    return `System audio ${action} is not supported by this platform configuration. On Windows, restart the Electron app and select a playback source. On macOS, route meeting audio through a supported virtual device such as BlackHole.`;
+  }
+  return `System audio ${action} failed: ${message}`;
+}
+
+const technicalTerms = ['Java', 'Spring Boot', 'Spring Security', 'Hibernate', 'JPA', 'PHP', 'Yii2', 'React', 'MySQL', 'AWS', 'Docker', 'Kubernetes', 'Terraform', 'Jenkins', 'REST API', 'Microservices'];
+
+function cleanTranscript(rawText: string) {
+  let text = rawText.replace(/\s+/g, ' ').trim();
+  text = text.replace(/^(um+|uh+|you know|like)\s+/i, '');
+  for (const term of technicalTerms) {
+    text = text.replace(new RegExp(`\\b${term.replace(/[+/]/g, '\\$&')}\\b`, 'gi'), term);
+  }
+  if (/^(what|why|how|when|where|who|can|could|would|is|are|do|does|explain|tell me)\b/i.test(text) && !/[.!?]$/.test(text)) {
+    text += '?';
+  }
+  return text;
+}
+
+function detectQuestion(text: string) {
+  const question = text.trim();
+  if (question.length < 3) return { isQuestion: false, question: null };
+  if (/^(hi|hello|hey|okay|ok|thanks?|thank you|bye|goodbye)[.!?]?$/i.test(question)) {
+    return { isQuestion: false, question: null };
+  }
+  const isQuestion = /[?]$/.test(question)
+    || /^(what|why|how|when|where|who|can|could|would|is|are|do|does|explain|tell me|compare|describe)\b/i.test(question)
+    || question.split(/\s+/).length >= 4;
+  return { isQuestion, question: isQuestion ? question : null };
+}
+
+function truncateContextText(text: string, maxChars: number) {
+  if (!text) return '';
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, maxChars - 24).trim()}…`;
+}
+
+function resolveContext({ mode, sessionDocuments, activeProfile }: { mode: Mode; sessionDocuments: SessionDocument[]; activeProfile: TrainedProfile | null }) {
+  if (mode === 'direct') return '';
+
+  const sections: string[] = [];
+  if (activeProfile?.context) {
+    sections.push(`Trained profile: ${activeProfile.name}\n${truncateContextText(activeProfile.context, PDF_CONTEXT_CHAR_BUDGET / 2)}`);
+  }
+  if (sessionDocuments.length > 0) {
+    const sessionText = sessionDocuments
+      .map((doc) => `Document: ${doc.name}\n${truncateContextText(doc.text, Math.max(900, Math.floor(PDF_CONTEXT_CHAR_BUDGET / Math.max(sessionDocuments.length, 1))))}`)
+      .join('\n\n');
+    sections.push(sessionText);
+  }
+  return sections.join('\n\n');
+}
+
+function renderAnswerMarkdown(text: string) {
+  return text.split(/\n{2,}/).map((block, index) => {
+    const trimmed = block.trim();
+    if (!trimmed) return null;
+    if (/^```/.test(trimmed)) {
+      return <pre key={index} className="overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs text-emerald-200"><code>{trimmed.replace(/^```[^\n]*\n?/, '').replace(/\n?```$/, '')}</code></pre>;
+    }
+    const lines = trimmed.split('\n');
+    if (lines.every((line) => /^[-*]\s+/.test(line))) {
+      return <ul key={index} className="list-disc space-y-1 pl-5">{lines.map((line) => <li key={line}>{formatInlineMarkdown(line.replace(/^[-*]\s+/, ''))}</li>)}</ul>;
+    }
+    if (lines.every((line) => /^\d+\.\s+/.test(line))) {
+      return <ol key={index} className="list-decimal space-y-1 pl-5">{lines.map((line) => <li key={line}>{formatInlineMarkdown(line.replace(/^\d+\.\s+/, ''))}</li>)}</ol>;
+    }
+    if (/^#{1,3}\s+/.test(trimmed)) {
+      const heading = trimmed.replace(/^#{1,3}\s+/, '');
+      return <h3 key={index} className="text-lg font-semibold text-emerald-200">{formatInlineMarkdown(heading)}</h3>;
+    }
+    return <p key={index}>{formatInlineMarkdown(trimmed)}</p>;
+  });
+}
+
+function formatInlineMarkdown(text: string) {
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith('**') && part.endsWith('**')) return <strong key={index}>{part.slice(2, -2)}</strong>;
+    if (part.startsWith('`') && part.endsWith('`')) return <code key={index} className="rounded bg-slate-950 px-1.5 py-0.5 text-emerald-200">{part.slice(1, -1)}</code>;
+    return <span key={index}>{part}</span>;
+  });
 }
 
 const providerPresets = {
@@ -166,7 +245,7 @@ function App() {
       return [];
     }
   });
-  const [activeChatId, setActiveChatId] = useState(() => crypto.randomUUID());
+  const [activeChatId, setActiveChatId] = useState<string>(() => crypto.randomUUID());
   const [historyOpen, setHistoryOpen] = useState(false);
   const [copiedItem, setCopiedItem] = useState('');
   const [chatStreaming, setChatStreaming] = useState(false);
@@ -177,12 +256,37 @@ function App() {
   const [pdfLoading, setPdfLoading] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
+  const [statusMessage, setStatusMessage] = useState('');
   const [health, setHealth] = useState<{ provider: string; model: string } | null>(null);
-  const [meetingSource, setMeetingSource] = useState('Zoom');
+  const [sessionDocuments, setSessionDocuments] = useState<SessionDocument[]>([]);
+  const [trainedProfiles, setTrainedProfiles] = useState<TrainedProfile[]>(() => {
+    try {
+      const raw = localStorage.getItem('trained-profiles-v1');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+  const [activeProfileId, setActiveProfileId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('active-profile-id-v1') || null;
+    } catch {
+      return null;
+    }
+  });
+  const [profilePreviewOpen, setProfilePreviewOpen] = useState(false);
+  const [meetingSource] = useState('System Audio');
   const [meetingMenuOpen, setMeetingMenuOpen] = useState(false);
+  const [contextMenuOpen, setContextMenuOpen] = useState(false);
+  const [jobDescription, setJobDescription] = useState('');
+  const [transcriptOpen, setTranscriptOpen] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
-  const [isLiveAnswering, setIsLiveAnswering] = useState(false);
+  const [audioSourceLabel, setAudioSourceLabel] = useState('Not connected');
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [audioStatus, setAudioStatus] = useState<'disabled' | 'connected' | 'testing'>('disabled');
+  const [pipelineStatus, setPipelineStatus] = useState<'ready' | 'listening' | 'transcribing' | 'question' | 'thinking' | 'answer' | 'error' | 'stopped'>('ready');
   const [liveTranscript, setLiveTranscript] = useState('');
   const [transcripts, setTranscripts] = useState<MeetingTranscript[]>(() => {
     try {
@@ -210,22 +314,24 @@ function App() {
   const wsConnectPromiseRef = useRef<Promise<WebSocket> | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const resumeFileInputRef = useRef<HTMLInputElement>(null);
+  const jobDescriptionFileInputRef = useRef<HTMLInputElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const liveAnsweringRef = useRef(false);
-  const liveQuestionRef = useRef('');
   const voiceBufferRef = useRef('');
   const streamBufferRef = useRef('');
   const streamFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveRequestInFlightRef = useRef(false);
-  const lastLiveQuestionRef = useRef('');
-  const realtimeUploadTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const realtimeAnswerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const electronTranscriptionBusyRef = useRef(false);
-  const electronPendingSegmentsRef = useRef<Blob[]>([]);
-  const electronSilenceMonitorRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const electronAudioContextRef = useRef<AudioContext | null>(null);
+  const audioLevelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const segmentSilenceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const segmentAudioContextRef = useRef<AudioContext | null>(null);
+  const segmentHeardAudioRef = useRef(false);
+  const captureActiveRef = useRef(false);
+  const pendingSegmentQueueRef = useRef<Blob[]>([]);
+  const segmentProcessorActiveRef = useRef(false);
+  const lastProcessedTranscriptRef = useRef('');
+  const requestInProgressRef = useRef(false);
   const chatRequestIdRef = useRef('');
   const draftImproveRequestIdRef = useRef('');
 
@@ -264,6 +370,18 @@ function App() {
     localStorage.setItem('chat-history', JSON.stringify(chatHistory));
   }, [chatHistory]);
 
+  useEffect(() => {
+    localStorage.setItem('trained-profiles-v1', JSON.stringify(trainedProfiles));
+  }, [trainedProfiles]);
+
+  useEffect(() => {
+    if (activeProfileId) {
+      localStorage.setItem('active-profile-id-v1', activeProfileId);
+    } else {
+      localStorage.removeItem('active-profile-id-v1');
+    }
+  }, [activeProfileId]);
+
   // Save only completed turns, so streaming tokens never cause storage writes.
   useEffect(() => {
     if (messages.length === 0 || messages.some((message) => message.streaming)) return;
@@ -279,6 +397,7 @@ function App() {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') setSettingsOpen(false);
     };
+
     document.addEventListener('keydown', closeOnEscape);
     return () => document.removeEventListener('keydown', closeOnEscape);
   }, [settingsOpen]);
@@ -333,6 +452,149 @@ function App() {
     void ensureWs().catch(() => undefined);
   }, [ensureWs]);
 
+  const activeProfile = trainedProfiles.find((profile) => profile.id === activeProfileId) ?? null;
+
+  const clearSessionContext = useCallback(() => {
+    setSessionDocuments([]);
+    setPdfText('');
+    setPdfName('');
+    setJobDescription('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (resumeFileInputRef.current) resumeFileInputRef.current.value = '';
+    if (jobDescriptionFileInputRef.current) jobDescriptionFileInputRef.current.value = '';
+    setStatusMessage('Session context cleared.');
+  }, []);
+
+  const deleteProfile = useCallback((profileId: string) => {
+    const profile = trainedProfiles.find((item) => item.id === profileId);
+    if (profile && !window.confirm(`Delete trained profile "${profile.name}"?`)) return;
+    setTrainedProfiles((prev) => prev.filter((profile) => profile.id !== profileId));
+    setActiveProfileId((current) => (current === profileId ? null : current));
+    setProfilePreviewOpen(false);
+    setStatusMessage('Profile deleted.');
+  }, [trainedProfiles]);
+
+  const handlePdfUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>, documentLabel = 'Session Document') => {
+    const files = Array.from(event.target.files || []);
+    if (!files.length) return;
+
+    setPdfLoading(true);
+    setError('');
+    setStatusMessage('');
+
+    try {
+      const extractedDocs: SessionDocument[] = [];
+      for (const file of files) {
+        if (!file.name.toLowerCase().endsWith('.pdf')) {
+          throw new Error('Only PDF files can be uploaded to the context area.');
+        }
+        if (file.size > MAX_PDF_SIZE) {
+          throw new Error(`${file.name} is larger than the 20MB PDF limit.`);
+        }
+
+        const formData = new FormData();
+        formData.append('file', file);
+        const response = await fetch(`${HTTP_URL}/api/extract-pdf`, {
+          method: 'POST',
+          body: formData,
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || `Failed to extract ${file.name}.`);
+        }
+
+        const extractedText = typeof data.text === 'string' ? data.text : '';
+        if (!extractedText.trim()) {
+          throw new Error(`${file.name} was not readable as text. Try a different PDF or an OCR-enabled file.`);
+        }
+
+        extractedDocs.push({
+          id: crypto.randomUUID(),
+          name: `${documentLabel}: ${file.name}`,
+          text: extractedText,
+          uploadedAt: Date.now(),
+        });
+      }
+
+      if (!extractedDocs.length) return;
+      setSessionDocuments((prev) => [...prev, ...extractedDocs]);
+      const combinedText = extractedDocs.map((doc) => doc.text).join('\n\n');
+      setPdfText(combinedText);
+      if (documentLabel === 'Resume') {
+        setPdfName(extractedDocs.map((doc) => doc.name).join(', '));
+      }
+      setStatusMessage(`${extractedDocs.length} PDF document${extractedDocs.length > 1 ? 's were' : ' was'} added to session context.`);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setPdfLoading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }, []);
+
+  const handleResumeUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    void handlePdfUpload(event, 'Resume');
+  }, [handlePdfUpload]);
+
+  const handleJobDescriptionPdfUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    await handlePdfUpload(event, 'Job Description');
+  }, [handlePdfUpload]);
+
+  const saveJobDescription = useCallback(() => {
+    const text = jobDescription.trim();
+    if (!text) return;
+
+    setSessionDocuments((previous) => [
+      ...previous.filter((document) => !document.name.startsWith('Job Description: Pasted')),
+      {
+        id: crypto.randomUUID(),
+        name: 'Job Description: Pasted text',
+        text,
+        uploadedAt: Date.now(),
+      },
+    ]);
+    setStatusMessage('Pasted job description added to session context.');
+    setError('');
+  }, [jobDescription]);
+
+  const trainProfile = useCallback(() => {
+    if (!sessionDocuments.length) {
+      setError('Upload at least one readable PDF before creating a trained profile.');
+      return;
+    }
+
+    const suggestedName = sessionDocuments[0]?.name.replace(/\.pdf$/i, '') || 'Profile';
+    const profileName = window.prompt('Name this trained profile', suggestedName);
+    if (!profileName || !profileName.trim()) return;
+
+    const trimmedName = profileName.trim();
+    const context = sessionDocuments
+      .map((doc) => `Document: ${doc.name}\n${doc.text}`)
+      .join('\n\n');
+    const summary = `Session context from ${sessionDocuments.length} document${sessionDocuments.length > 1 ? 's' : ''}.`;
+
+    setTrainedProfiles((prev) => {
+      const normalized = trimmedName.toLowerCase();
+      const existingIndex = prev.findIndex((profile) => profile.name.toLowerCase() === normalized);
+      const profile: TrainedProfile = {
+        id: existingIndex >= 0 ? prev[existingIndex].id : crypto.randomUUID(),
+        name: trimmedName,
+        summary,
+        context: truncateContextText(context, MAX_CONTEXT_CHARS),
+        createdAt: Date.now(),
+      };
+      if (existingIndex >= 0) {
+        const next = [...prev];
+        next[existingIndex] = profile;
+        return next;
+      }
+      return [profile, ...prev];
+    });
+    setStatusMessage(`Profile "${trimmedName}" is ready.`);
+    setError('');
+  }, [sessionDocuments]);
+
   const handleWsMessage = useCallback((data: string) => {
     const msg = JSON.parse(data);
     const isDraftImprove = msg.requestId && msg.requestId === draftImproveRequestIdRef.current;
@@ -359,6 +621,9 @@ function App() {
         streamFlushTimerRef.current = setTimeout(flushStreamBuffer, 16);
       }
     } else if (msg.type === 'done') {
+      console.log('[LLM] Response received');
+      console.log('[ANSWER]', String(msg.content || '').slice(0, 160));
+      setPipelineStatus('answer');
       if (isDraftImprove) {
         setInput(String(msg.content || '').trim());
         setDraftImproving(false);
@@ -405,6 +670,7 @@ function App() {
         return [...next];
       });
       setError(msg.message);
+      setPipelineStatus('error');
     }
   }, [flushStreamBuffer, voiceReplies]);
 
@@ -475,6 +741,9 @@ function App() {
         .filter((m) => m.role === 'user' || m.role === 'assistant')
         .slice(-MAX_CHAT_HISTORY_MESSAGES)
         .map((m) => ({ role: m.role, content: compactMessageContent(m.content) }));
+      const resolvedContext = contextOverride !== undefined
+        ? contextOverride
+        : resolveContext({ mode, sessionDocuments, activeProfile });
 
       ws.send(JSON.stringify({
         type: 'chat',
@@ -482,12 +751,13 @@ function App() {
         mode,
         messages: [{ role: 'system', content: AI_SYSTEM_PROMPT }, ...conversationHistory],
         // Archived transcripts remain available in the UI; only the current one is chat context.
-        pdfContext: (contextOverride || [pdfText, liveTranscript].filter(Boolean).join('\n\n')).slice(-MAX_CONTEXT_CHARS),
+        pdfContext: resolvedContext.slice(-MAX_CONTEXT_CHARS),
       }));
     } catch (err) {
       liveRequestInFlightRef.current = false;
       setChatStreaming(false);
       chatRequestIdRef.current = '';
+      setPipelineStatus('error');
       setMessages((prev) => {
         const next = [...prev];
         const last = next[next.length - 1];
@@ -529,190 +799,55 @@ function App() {
   };
 
   const stopMeetingCapture = () => {
-    if (isLiveAnswering) {
-      setIsLiveAnswering(false);
-      liveAnsweringRef.current = false;
-      if (realtimeUploadTimerRef.current) clearInterval(realtimeUploadTimerRef.current);
-      realtimeUploadTimerRef.current = null;
-      if (electronSilenceMonitorRef.current) clearInterval(electronSilenceMonitorRef.current);
-      electronSilenceMonitorRef.current = null;
-      void electronAudioContextRef.current?.close();
-      electronAudioContextRef.current = null;
-      electronPendingSegmentsRef.current = [];
-      if (realtimeAnswerTimerRef.current) clearTimeout(realtimeAnswerTimerRef.current);
-      realtimeAnswerTimerRef.current = null;
-      recognitionRef.current?.stop();
-      recognitionRef.current = null;
-      liveQuestionRef.current = '';
-      // Explicitly stop the Electron mic recorder instead of relying on the
-      // implicit stop triggered by ending the underlying tracks below.
-      recorderRef.current?.stop();
-      recorderRef.current = null;
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-      setIsRecording(false);
-      return;
-    }
+    captureActiveRef.current = false;
+    if (segmentSilenceTimerRef.current) clearInterval(segmentSilenceTimerRef.current);
+    segmentSilenceTimerRef.current = null;
+    void segmentAudioContextRef.current?.close();
+    segmentAudioContextRef.current = null;
     recorderRef.current?.stop();
     setIsRecording(false);
+    setPipelineStatus('stopped');
   };
 
-  const startElectronMicrophone = async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    streamRef.current = stream;
-    const chunks: Blob[] = [];
-    const recorder = new MediaRecorder(stream);
-    recorder.ondataavailable = (event) => {
-      if (event.data.size) chunks.push(event.data);
-    };
-    recorder.onstop = async () => {
-      const segment = chunks.splice(0, chunks.length);
-      if (liveAnsweringRef.current) recorder.start();
-      if (!segment.length) return;
-      const blob = new Blob(segment, { type: recorder.mimeType || 'audio/webm' });
-      if (electronTranscriptionBusyRef.current) {
-        electronPendingSegmentsRef.current.push(blob);
-        return;
-      }
-
-      const transcribeSegment = async (audio: Blob): Promise<void> => {
-        electronTranscriptionBusyRef.current = true;
-        setIsTranscribing(true);
-        const formData = new FormData();
-        formData.append('file', audio, 'live-segment.webm');
-        try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 15000);
-          const response = await fetch(`${HTTP_URL}/api/transcribe-audio`, { method: 'POST', body: formData, signal: controller.signal });
-          clearTimeout(timeout);
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || 'Transcription failed');
-          const text = String(data.text || '').trim();
-          if (!text || liveRequestInFlightRef.current) return;
-          const question = `${liveQuestionRef.current} ${text}`.replace(/\s+/g, ' ').trim();
-          setLiveTranscript(question);
-          liveQuestionRef.current = question;
-          if (realtimeAnswerTimerRef.current) clearTimeout(realtimeAnswerTimerRef.current);
-          realtimeAnswerTimerRef.current = setTimeout(() => {
-            const completedQuestion = liveQuestionRef.current.trim();
-            const normalized = completedQuestion.toLowerCase().replace(/\s+/g, ' ');
-            if (!completedQuestion || !liveAnsweringRef.current || liveRequestInFlightRef.current) return;
-            if (!isVoiceAssistantRequest(completedQuestion)) {
-              liveQuestionRef.current = '';
-              return;
-            }
-            if (normalized === lastLiveQuestionRef.current) return;
-            liveQuestionRef.current = '';
-            setLiveTranscript('');
-            liveRequestInFlightRef.current = true;
-            lastLiveQuestionRef.current = normalized;
-            void sendMessage(completedQuestion, completedQuestion, `Answer briefly and directly: ${completedQuestion}`);
-          }, ELECTRON_VOICE_SILENCE_MS);
-        } catch (error) {
-          setError(`Live transcription failed: ${(error as Error).message}`);
-        } finally {
-          electronTranscriptionBusyRef.current = false;
-          setIsTranscribing(false);
-          const pending = electronPendingSegmentsRef.current.shift();
-          if (pending && liveAnsweringRef.current) void transcribeSegment(pending);
-        }
-      };
-
-      void transcribeSegment(blob);
-    };
-    recorder.start();
-    recorderRef.current = recorder;
-    liveAnsweringRef.current = true;
-    setIsLiveAnswering(true);
-    setIsRecording(true);
+  const monitorSystemAudio = (stream: MediaStream) => {
     const audioContext = new AudioContext();
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 1024;
     audioContext.createMediaStreamSource(stream).connect(analyser);
     electronAudioContextRef.current = audioContext;
-    const audioSamples = new Uint8Array(analyser.fftSize);
-    let lastSpeechAt = Date.now();
-    let heardSpeech = false;
-    electronSilenceMonitorRef.current = setInterval(() => {
-      analyser.getByteTimeDomainData(audioSamples);
+    const samples = new Uint8Array(analyser.fftSize);
+    if (audioLevelTimerRef.current) clearInterval(audioLevelTimerRef.current);
+    audioLevelTimerRef.current = setInterval(() => {
+      analyser.getByteTimeDomainData(samples);
       let volume = 0;
-      for (const sample of audioSamples) volume += Math.abs(sample - 128);
-      volume /= audioSamples.length;
-      if (volume > 2) {
-        heardSpeech = true;
-        lastSpeechAt = Date.now();
-      } else if (heardSpeech && Date.now() - lastSpeechAt >= ELECTRON_VOICE_SILENCE_MS && recorder.state === 'recording') {
-        heardSpeech = false;
-        recorder.stop();
-      }
+      for (const sample of samples) volume += Math.abs(sample - 128);
+      setAudioLevel(Math.min(100, Math.round((volume / samples.length) * 5)));
     }, 100);
   };
 
-  const startRealtimeMicrophone = async () => {
-    setError('');
-    try {
-      if (navigator.userAgent.includes('Electron')) {
-        await startElectronMicrophone();
-        return;
-      }
-      const browserWindow = window as unknown as {
-        SpeechRecognition?: SpeechRecognitionConstructor;
-        webkitSpeechRecognition?: SpeechRecognitionConstructor;
-      };
-      const SpeechRecognition = browserWindow.SpeechRecognition || browserWindow.webkitSpeechRecognition;
-      if (!SpeechRecognition) throw new Error('Live microphone needs Chrome or Edge.');
-
-      const microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = microphoneStream;
-      void ensureWs().catch(() => undefined);
-      liveQuestionRef.current = '';
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-      const finalSpeech = { value: '' };
-      recognition.onresult = (event) => {
-        let interim = '';
-        for (let index = event.resultIndex; index < event.results.length; index += 1) {
-          const result = event.results[index];
-          if (result.isFinal) finalSpeech.value = `${finalSpeech.value} ${result[0].transcript}`.trim();
-          else interim += result[0].transcript;
-        }
-        liveQuestionRef.current = `${finalSpeech.value} ${interim}`.trim();
-        setLiveTranscript(liveQuestionRef.current);
-        if (realtimeAnswerTimerRef.current) clearTimeout(realtimeAnswerTimerRef.current);
-        realtimeAnswerTimerRef.current = setTimeout(() => {
-          const question = finalSpeech.value.trim();
-          const normalized = question.toLowerCase().replace(/\s+/g, ' ');
-          if (!question || !liveAnsweringRef.current || liveRequestInFlightRef.current) return;
-          if (!isVoiceAssistantRequest(question)) {
-            finalSpeech.value = '';
-            liveQuestionRef.current = '';
-            return;
-          }
-          if (normalized === lastLiveQuestionRef.current) return;
-          finalSpeech.value = '';
-          liveQuestionRef.current = '';
-          setLiveTranscript('');
-          liveRequestInFlightRef.current = true;
-          lastLiveQuestionRef.current = normalized;
-          void sendMessage(question, question, `Answer briefly and directly: ${question}`);
-        }, BROWSER_VOICE_SILENCE_MS);
-      };
-      recognition.onerror = (event) => setError(`Live listening error: ${event.error || 'unknown'}. Check microphone permission.`);
-      recognition.onend = () => {
-        if (recognitionRef.current && liveAnsweringRef.current) {
-          try { recognition.start(); } catch { /* already restarting */ }
-        }
-      };
-      recognitionRef.current = recognition;
-      liveAnsweringRef.current = true;
-      setIsLiveAnswering(true);
-      setIsRecording(true);
-      recognition.start();
-    } catch (err) {
-      setError(`Live microphone permission failed: ${(err as Error).message}`);
+  const requestSystemAudioStream = async (): Promise<MediaStream> => {
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      throw new Error(/Electron/i.test(navigator.userAgent)
+        ? 'System audio capture is unavailable in this Electron build.'
+        : 'System audio capture requires the Electron desktop app on Windows.');
     }
+
+    // The OS chooser controls the source. We request audio only semantically;
+    // Chromium requires a video permission for display capture, so its video
+    // track is stopped immediately and never sent to recording or STT.
+    const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    const audioTracks = displayStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      displayStream.getTracks().forEach((track) => track.stop());
+      throw new Error('No system audio source selected. Choose a tab, window, or screen and enable Share audio.');
+    }
+    displayStream.getVideoTracks().forEach((track) => track.stop());
+    const systemStream = new MediaStream(audioTracks);
+    const sourceLabel = audioTracks[0].label || 'Selected system audio';
+    setAudioSourceLabel(sourceLabel);
+    setAudioStatus('connected');
+    monitorSystemAudio(systemStream);
+    return systemStream;
   };
 
   const recordAudioStream = (stream: MediaStream, cleanup: () => void) => {
@@ -722,22 +857,32 @@ function App() {
     recorder.ondataavailable = (event) => {
       if (event.data.size > 0) chunks.push(event.data);
     };
-    recorder.onstop = async () => {
-      cleanup();
-      stream.getTracks().forEach((track) => track.stop());
-      recorderRef.current = null;
-      streamRef.current = null;
-      if (chunks.length === 0) return;
-
+    const processSegment = async (segment: Blob) => {
       setIsTranscribing(true);
+      setPipelineStatus('transcribing');
+      console.log('[CAPTURE] Silence/end-of-utterance detected — flushing segment');
+      console.log('[STT] Sending audio segment to STT');
       try {
         const formData = new FormData();
-        formData.append('file', new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }), 'meeting.webm');
+        console.log(`[AUDIO] Audio chunk size: ${segment.size} bytes`);
+        formData.append('file', segment, 'meeting.webm');
         const response = await fetch(`${HTTP_URL}/api/transcribe-audio`, { method: 'POST', body: formData });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Transcription failed');
-        const transcript = String(data.text || '').trim();
-        if (!transcript) throw new Error('No speech was found in the meeting audio.');
+        const transcript = cleanTranscript(String(data.text || ''));
+        console.log(`[STT] Final transcript: "${transcript}"`);
+        if (!transcript) throw new Error('No speech detected.');
+        const detected = detectQuestion(transcript);
+        if (!detected.isQuestion || !detected.question) {
+          setPipelineStatus('ready');
+          setError('No complete question or request detected.');
+          return;
+        }
+        const normalized = detected.question.toLowerCase().replace(/\s+/g, ' ');
+        if (normalized === lastProcessedTranscriptRef.current) return;
+        lastProcessedTranscriptRef.current = normalized;
+        setPipelineStatus('question');
+        console.log('[QUESTION] Question detected');
         setLiveTranscript(transcript);
         setTranscripts((current) => [{
           id: crypto.randomUUID(),
@@ -745,37 +890,131 @@ function App() {
           text: transcript,
           createdAt: new Date().toISOString(),
         }, ...current]);
-        await sendMessage('Answer the latest meeting question using the meeting transcript. Give a direct, concise answer.', transcript);
+        setPipelineStatus('thinking');
+        console.log('[LLM] Sending text to LLM');
+        await sendMessage(detected.question, '', detected.question);
       } catch (err) {
-        setError((err as Error).message);
+        setError((err as Error).message.includes('Transcription')
+          ? 'Speech-to-text failed. Please try speaking again.'
+          : (err as Error).message);
       } finally {
         setIsTranscribing(false);
       }
     };
+
+    const processPendingSegments = async () => {
+      if (segmentProcessorActiveRef.current) return;
+      segmentProcessorActiveRef.current = true;
+      requestInProgressRef.current = true;
+      try {
+        while (pendingSegmentQueueRef.current.length > 0) {
+          const nextSegment = pendingSegmentQueueRef.current.shift();
+          if (nextSegment) await processSegment(nextSegment);
+        }
+      } finally {
+        requestInProgressRef.current = false;
+        segmentProcessorActiveRef.current = false;
+        if (captureActiveRef.current) setPipelineStatus('listening');
+      }
+    };
+
+    recorder.onstop = () => {
+      const segment = chunks.splice(0, chunks.length);
+      segmentHeardAudioRef.current = false;
+      if (captureActiveRef.current) {
+        recorder.start();
+        console.log('[CAPTURE] Utterance segment started');
+      } else {
+        cleanup();
+        stream.getTracks().forEach((track) => track.stop());
+        recorderRef.current = null;
+        streamRef.current = null;
+        void electronAudioContextRef.current?.close();
+        electronAudioContextRef.current = null;
+        if (audioLevelTimerRef.current) clearInterval(audioLevelTimerRef.current);
+        audioLevelTimerRef.current = null;
+        setAudioLevel(0);
+        setAudioStatus('disabled');
+        setPipelineStatus('stopped');
+      }
+      if (segment.length > 0) {
+        pendingSegmentQueueRef.current.push(new Blob(segment, { type: recorder.mimeType || 'audio/webm' }));
+        void processPendingSegments();
+      }
+    };
     recorder.start();
+    captureActiveRef.current = true;
+    console.log('[CAPTURE] Utterance segment started');
     recorderRef.current = recorder;
     setLiveTranscript('');
     setIsRecording(true);
+    setPipelineStatus('listening');
+
+    const audioContext = new AudioContext();
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 1024;
+    audioContext.createMediaStreamSource(stream).connect(analyser);
+    segmentAudioContextRef.current = audioContext;
+    const samples = new Uint8Array(analyser.fftSize);
+    let lastAudioAt = Date.now();
+    segmentSilenceTimerRef.current = setInterval(() => {
+      if (!captureActiveRef.current || recorder.state !== 'recording') return;
+      analyser.getByteTimeDomainData(samples);
+      let volume = 0;
+      for (const sample of samples) volume += Math.abs(sample - 128);
+      volume /= samples.length;
+      if (volume > SYSTEM_AUDIO_LEVEL_THRESHOLD) {
+        segmentHeardAudioRef.current = true;
+        lastAudioAt = Date.now();
+      } else if (segmentHeardAudioRef.current && Date.now() - lastAudioAt >= SYSTEM_AUDIO_SILENCE_MS) {
+        console.log('[CAPTURE] Silence/end-of-utterance detected — flushing segment');
+        recorder.stop();
+      }
+    }, 100);
   };
 
   const startMeetingCapture = async () => {
     setError('');
+    setStatusMessage('Opening the system-audio source selector...');
     try {
-      if (!navigator.mediaDevices?.getDisplayMedia) {
-        throw new Error('This browser does not support screen-audio sharing. Use Chrome or Edge.');
-      }
-
-      const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-      if (displayStream.getAudioTracks().length === 0) {
-        displayStream.getTracks().forEach((track) => track.stop());
-        throw new Error('No shared audio selected. Choose a tab or window and enable Share audio.');
-      }
-
-      recordAudioStream(new MediaStream(displayStream.getAudioTracks()), () => {
-        displayStream.getTracks().forEach((track) => track.stop());
+      const systemStream = await requestSystemAudioStream();
+      recordAudioStream(systemStream, () => {
+        systemStream.getTracks().forEach((track) => track.stop());
       });
+      setStatusMessage('System audio connected. Listening is ready.');
     } catch (err) {
-      setError(`Screen audio permission failed: ${(err as Error).message}`);
+      setAudioStatus('disabled');
+      setAudioSourceLabel('Not connected');
+      setError(systemAudioErrorMessage(err, 'capture'));
+      setStatusMessage('');
+    }
+  };
+
+  const testSystemAudio = async () => {
+    setError('');
+    setStatusMessage('Opening the system-audio source selector...');
+    let stream: MediaStream | null = null;
+    try {
+      stream = await requestSystemAudioStream();
+      setAudioStatus('testing');
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      if (stream.getAudioTracks().some((track) => track.readyState === 'live')) {
+        setError('System audio test passed. Only the selected system-audio source was received; microphone capture was not requested.');
+      }
+    } catch (err) {
+      setAudioStatus('disabled');
+      setAudioSourceLabel('Not connected');
+      setError(systemAudioErrorMessage(err, 'test'));
+      setStatusMessage('');
+    } finally {
+      stream?.getTracks().forEach((track) => track.stop());
+      void electronAudioContextRef.current?.close();
+      electronAudioContextRef.current = null;
+      if (audioLevelTimerRef.current) clearInterval(audioLevelTimerRef.current);
+      audioLevelTimerRef.current = null;
+      setAudioLevel(0);
+      if (!isRecording) setAudioStatus('disabled');
+      if (!isRecording && !error) setStatusMessage('');
     }
   };
 
@@ -880,49 +1119,12 @@ function App() {
   };
 
   // --- PDF upload ---
-  const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setPdfLoading(true);
-    setError('');
-
-    const formData = new FormData();
-    formData.append('file', file);
-
-    // Added a timeout (matching /api/transcribe-audio) so a slow/hung server
-    // doesn't leave the UI stuck on "Extracting text from PDF..." forever.
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), PDF_UPLOAD_TIMEOUT_MS);
-
-    try {
-      const res = await fetch(`${HTTP_URL}/api/extract-pdf`, {
-        method: 'POST',
-        body: formData,
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || 'Upload failed');
-      }
-
-      const data = await res.json();
-      setPdfText(data.text);
-      setPdfName(file.name);
-    } catch (err) {
-      const isTimeout = (err as Error).name === 'AbortError';
-      setError(`PDF upload failed: ${isTimeout ? 'request timed out' : (err as Error).message}`);
-    } finally {
-      clearTimeout(timeout);
-      setPdfLoading(false);
-    }
-  };
-
   const removePdf = () => {
     setPdfText('');
     setPdfName('');
+    setSessionDocuments([]);
     if (fileInputRef.current) fileInputRef.current.value = '';
+    setStatusMessage('Session document cleared.');
   };
 
   const copyText = async (text: string, item: string) => {
@@ -960,10 +1162,120 @@ function App() {
     startNewChat();
   };
 
+  const sessionActive = isRecording || isTranscribing || chatStreaming || messages.length > 0 || pipelineStatus === 'question' || pipelineStatus === 'thinking' || pipelineStatus === 'answer';
+  const lastQuestion = [...messages].reverse().find((message) => message.role === 'user')?.content || '';
+  const lastAnswer = [...messages].reverse().find((message) => message.role === 'assistant')?.content || '';
+  const answeredSegments = messages.reduce<Array<{ question: string; answer: string }>>((segments, message, index) => {
+    if (message.role !== 'user') return segments;
+    const answer = messages[index + 1];
+    if (answer?.role === 'assistant' && answer.content && !answer.streaming) {
+      segments.push({ question: message.content, answer: answer.content });
+    }
+    return segments;
+  }, []);
+  const statusLabel = pipelineStatus === 'listening' ? 'Listening...' : pipelineStatus === 'transcribing' ? 'Transcribing...' : pipelineStatus === 'question' ? 'Question detected' : pipelineStatus === 'thinking' ? 'Thinking...' : pipelineStatus === 'answer' ? 'Answer ready' : pipelineStatus === 'stopped' ? 'Stopped' : 'Ready';
+  const statusTone = pipelineStatus === 'error' ? 'text-rose-300' : pipelineStatus === 'answer' ? 'text-emerald-300' : 'text-sky-300';
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-100">
+      <header className="sticky top-0 z-10 border-b border-slate-800/80 bg-slate-950/90 px-4 py-3 backdrop-blur">
+        <div className="mx-auto flex max-w-3xl items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-400"><Bot className="h-5 w-5 text-slate-950" /></div>
+            <div><h1 className="text-sm font-semibold">Meeting AI Assistant</h1><p className={`text-[11px] ${statusTone}`}>● {statusLabel}</p></div>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5" aria-label="AI mode">
+              <button
+                onClick={() => setMode('direct')}
+                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${mode === 'direct' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                Direct
+              </button>
+              <button
+                onClick={() => setMode('langchain')}
+                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${mode === 'langchain' ? 'bg-teal-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                LangChain
+              </button>
+            </div>
+            {sessionActive && <button onClick={() => setMeetingMenuOpen((open) => !open)} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
+            <div className="relative">
+              <button
+                onClick={() => setContextMenuOpen((open) => !open)}
+                className={`rounded-lg border px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400 ${contextMenuOpen ? 'border-emerald-400 bg-emerald-500/10' : 'border-slate-700'}`}
+              >
+                Context
+              </button>
+              {contextMenuOpen && (
+                <div className="absolute right-0 top-11 z-20 max-h-[calc(100vh-5rem)] w-[min(23rem,calc(100vw-2rem))] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl">
+                  <div className="mb-3 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold">Session context</p>
+                      <p className="text-xs text-slate-500">Resume and job description context</p>
+                    </div>
+                    <button onClick={() => setContextMenuOpen(false)} className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200" aria-label="Close context panel"><X className="h-4 w-4" /></button>
+                  </div>
+                  {mode === 'direct' && (sessionDocuments.length > 0 || activeProfile) && (
+                    <p className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                      This context is available but not used while in Direct mode.
+                    </p>
+                  )}
+                  <input ref={resumeFileInputRef} type="file" accept="application/pdf" onChange={handleResumeUpload} className="hidden" />
+                  <input ref={jobDescriptionFileInputRef} type="file" accept="application/pdf" onChange={handleJobDescriptionPdfUpload} className="hidden" />
+                  <div className="space-y-3">
+                    <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <p className="text-xs font-medium text-slate-200">Resume / document</p>
+                        <button onClick={() => resumeFileInputRef.current?.click()} disabled={pdfLoading} className="rounded-md border border-emerald-500/40 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
+                          {pdfLoading ? 'Reading...' : 'Upload PDF'}
+                        </button>
+                      </div>
+                      <p className="text-[11px] text-slate-500">{pdfName || 'No resume uploaded'}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <p className="text-xs font-medium text-slate-200">Job Description</p>
+                        <button onClick={() => jobDescriptionFileInputRef.current?.click()} disabled={pdfLoading} className="rounded-md border border-emerald-500/40 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
+                          Upload PDF
+                        </button>
+                      </div>
+                      <textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the job description here..." rows={4} className="w-full resize-y rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400" />
+                      <button onClick={saveJobDescription} disabled={!jobDescription.trim()} className="mt-2 rounded-md bg-slate-700 px-2.5 py-1.5 text-[11px] text-slate-200 hover:bg-slate-600 disabled:opacity-40">Add pasted text</button>
+                    </div>
+                    {sessionDocuments.length > 0 && (
+                      <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                        <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-slate-500">Session uploads</p>
+                        <div className="space-y-1">
+                          {sessionDocuments.map((document) => <p key={document.id} className="truncate text-[11px] text-slate-300">✓ {document.name}</p>)}
+                        </div>
+                      </div>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <select value={activeProfileId ?? 'none'} onChange={(event) => setActiveProfileId(event.target.value === 'none' ? null : event.target.value)} className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-800 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400">
+                        <option value="none">None (Normal)</option>
+                        {trainedProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                      </select>
+                      <button onClick={trainProfile} disabled={pdfLoading || sessionDocuments.length === 0} className="rounded-md bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400 disabled:opacity-40">Train</button>
+                    </div>
+                    {activeProfile && (
+                      <div className="flex items-center justify-between rounded-md border border-slate-700 bg-slate-800/60 px-2.5 py-2">
+                        <span className="truncate text-[11px] text-slate-300">Active: {activeProfile.name}</span>
+                        <button onClick={() => deleteProfile(activeProfile.id)} className="ml-2 shrink-0 text-[11px] text-rose-300 hover:text-rose-200">Delete profile</button>
+                      </div>
+                    )}
+                    {(sessionDocuments.length > 0 || activeProfile) && <button onClick={clearSessionContext} className="text-[11px] text-slate-400 hover:text-slate-200">Clear session upload</button>}
+                  </div>
+                </div>
+              )}
+            </div>
+            <button onClick={() => { setSettingsOpen(true); void loadAgentActivity(); }} className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="Settings"><Settings className="h-4 w-4" /></button>
+            <button onClick={() => setHistoryOpen(true)} className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="History"><History className="h-4 w-4" /></button>
+          </div>
+        </div>
+      </header>
       {/* Header */}
-      <header className="border-b border-slate-700/50 bg-slate-900/80 backdrop-blur-md sticky top-0 z-10">
+      <header className="hidden border-b border-slate-700/50 bg-slate-900/80 backdrop-blur-md sticky top-0 z-10">
         <div className="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-3 px-4 py-3">
           <div className="flex min-w-0 items-center gap-3">
             <div className="relative">
@@ -983,28 +1295,41 @@ function App() {
                       <p className="text-sm font-semibold">Meeting capture</p>
                       <p className="text-xs text-slate-500">Listen and save searchable notes</p>
                     </div>
-                    <span className={`text-xs ${isRecording ? 'text-rose-300' : isTranscribing ? 'text-amber-300' : 'text-slate-500'}`}>{isRecording ? 'Listening' : isTranscribing ? 'Transcribing...' : 'Ready'}</span>
+                    <span className={`text-xs ${pipelineStatus === 'listening' ? 'text-rose-300' : pipelineStatus === 'transcribing' ? 'text-amber-300' : pipelineStatus === 'thinking' ? 'text-blue-300' : pipelineStatus === 'answer' ? 'text-emerald-300' : 'text-slate-500'}`}>● {pipelineStatus === 'listening' ? 'Listening...' : pipelineStatus === 'transcribing' ? 'Transcribing...' : pipelineStatus === 'question' ? 'Question detected' : pipelineStatus === 'thinking' ? 'Thinking...' : pipelineStatus === 'answer' ? 'Answer ready' : 'Ready'}</span>
                   </div>
-                  <div className="grid grid-cols-3 gap-2">
-                    {meetingSources.map((source) => (
-                      <button
-                        key={source.name}
-                        onClick={() => setMeetingSource(source.name)}
-                        className={`rounded-lg border px-2 py-2 text-center ${meetingSource === source.name ? 'border-emerald-400 bg-emerald-400/10' : 'border-slate-700 bg-slate-800/60 hover:border-slate-500'}`}
-                      >
-                        <span className={`mx-auto mb-1 flex h-7 w-7 items-center justify-center rounded-md ${source.color}`}><Video className="h-3.5 w-3.5 text-white" /></span>
-                        <span className="block truncate text-[11px] text-slate-200">{source.name}</span>
-                      </button>
-                    ))}
+                  <div className="space-y-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
+                    <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-400">Audio source</label>
+                    <select value="system" aria-label="Audio source" className="w-full rounded-md border border-slate-700 bg-slate-800 px-2 py-2 text-xs text-slate-200">
+                      <option value="system">System / Internal Audio</option>
+                    </select>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-400">Status</span>
+                      <span className={audioStatus === 'disabled' ? 'text-slate-500' : 'text-emerald-300'}>● {audioStatus === 'testing' ? 'Testing system audio' : audioStatus === 'connected' ? 'System Audio Connected' : 'System Audio Disabled'}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-400">Input device</span>
+                      <span className="max-w-[11rem] truncate text-right text-slate-200">{audioSourceLabel}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-400">Microphone</span>
+                      <span className="font-semibold text-emerald-300">OFF</span>
+                    </div>
+                    <div>
+                      <div className="mb-1 flex justify-between text-[10px] text-slate-500"><span>System audio level</span><span>{audioLevel}%</span></div>
+                      <div className="flex h-2 gap-0.5" aria-label={`System audio level ${audioLevel}%`}>
+                        {Array.from({ length: 10 }, (_, index) => <span key={index} className={`flex-1 rounded-sm ${audioLevel >= (index + 1) * 10 ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}
+                      </div>
+                    </div>
                   </div>
+                  <p className="mt-2 text-[10px] leading-relaxed text-slate-500">SYSTEM AUDIO ONLY. Choose a playback source in the operating-system capture dialog. The physical microphone is never requested or sent to speech-to-text.</p>
                   <div className="mt-3 flex gap-2">
                     {!isRecording && !isTranscribing ? (
                       <>
-                        <button onClick={startRealtimeMicrophone} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-rose-500 px-3 py-2 text-xs font-medium text-white hover:bg-rose-400"><Mic className="h-3.5 w-3.5" /> Live microphone</button>
-                        <button onClick={startMeetingCapture} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-xs font-medium text-white hover:bg-blue-400"><MonitorUp className="h-3.5 w-3.5" /> Screen audio</button>
+                        <button onClick={() => void testSystemAudio()} className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/10"><MonitorUp className="h-3.5 w-3.5" /> Test Audio</button>
+                        <button onClick={() => void startMeetingCapture()} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-xs font-medium text-white hover:bg-blue-400"><MonitorUp className="h-3.5 w-3.5" /> Start Listening</button>
                       </>
                     ) : (
-                      <button onClick={stopMeetingCapture} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-slate-700 px-3 py-2 text-xs font-medium text-white hover:bg-slate-600"><Square className="h-3 w-3" /> Stop listening</button>
+                      <button onClick={stopMeetingCapture} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-slate-700 px-3 py-2 text-xs font-medium text-white hover:bg-slate-600"><Square className="h-3 w-3" /> Stop Listening</button>
                     )}
                     {liveTranscript && <button onClick={saveMeetingTranscript} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:bg-emerald-500/10">Save</button>}
                   </div>
@@ -1091,6 +1416,12 @@ function App() {
           </div>
         </div>
       </header>
+
+      {statusMessage && (
+        <div className="mx-auto mt-3 w-full max-w-4xl rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-2 text-xs text-emerald-200">
+          {statusMessage}
+        </div>
+      )}
 
       {historyOpen && (
         <div className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-slate-950/70 px-3 py-4 backdrop-blur-sm sm:px-4 sm:py-8" onMouseDown={() => setHistoryOpen(false)}>
@@ -1180,52 +1511,174 @@ function App() {
         </div>
       )}
 
+      <main className="mx-auto flex min-h-[calc(100dvh-57px)] w-full max-w-3xl flex-col px-4 py-6">
+        {!sessionActive ? (
+          <section className="m-auto w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900/80 p-6 shadow-2xl">
+            <div className="mb-6 text-center"><h2 className="text-2xl font-semibold">Meeting AI Assistant</h2><p className="mt-2 text-sm text-slate-400">Listen to internal system audio and get concise answers.</p></div>
+            <div className="space-y-4">
+              <label className="block text-xs font-medium uppercase tracking-wide text-slate-400">Audio source<select value="system" aria-label="Audio source" className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-200"><option value="system">System / Internal Audio</option></select></label>
+              <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-sm"><div className="flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[12rem] truncate text-slate-200">{audioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span className="text-emerald-300">● {audioStatus === 'testing' ? 'Testing' : audioStatus === 'connected' ? 'Connected' : 'Ready'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className="font-semibold text-emerald-300">OFF</span></div><div className="mt-3"><div className="mb-1 flex justify-between text-[11px] text-slate-500"><span>System audio level</span><span>{audioLevel}%</span></div><div className="flex h-2 gap-1">{Array.from({ length: 10 }, (_, index) => <span key={index} className={`flex-1 rounded ${audioLevel >= (index + 1) * 10 ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}</div></div></div>
+              <p className="text-center text-[11px] text-slate-500">SYSTEM AUDIO ONLY · Physical microphone is never requested.</p>
+              <div className="flex gap-2"><button onClick={() => void testSystemAudio()} className="flex-1 rounded-lg border border-emerald-500/40 px-3 py-2.5 text-sm text-emerald-300 hover:bg-emerald-500/10">Test Audio</button><button onClick={() => void startMeetingCapture()} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2.5 text-sm font-medium text-slate-950 hover:bg-emerald-400">Start Listening</button></div>
+              {error && <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs leading-relaxed text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
+            </div>
+          </section>
+        ) : (
+          <section className="flex flex-1 flex-col">
+            {meetingMenuOpen && <div className="mb-4 rounded-xl border border-slate-700 bg-slate-900 p-4 text-xs"><div className="flex justify-between"><span className="text-slate-400">Audio source</span><span>System / Internal Audio</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[14rem] truncate">{audioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className="text-emerald-300">OFF</span></div><button onClick={stopMeetingCapture} className="mt-3 rounded-lg border border-slate-600 px-3 py-2 text-slate-300 hover:border-rose-400">Stop Listening</button></div>}
+            <div className="mb-5 text-center"><p className={`text-sm font-medium ${statusTone}`}>● {statusLabel}</p><p className="mt-2 text-xs text-slate-500">{pipelineStatus === 'listening' ? 'Listening for a question' : pipelineStatus === 'thinking' ? 'Generating answer...' : 'Your answer will appear below'}</p></div>
+            <div className="mb-4"><p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-slate-500">Last heard</p><p className="truncate text-sm text-slate-300">{liveTranscript || 'Waiting for speech...'}</p></div>
+            <article className="flex-1 rounded-2xl border border-emerald-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7">
+              <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Question</p><p className="mb-7 text-base text-slate-300">{lastQuestion || 'Waiting for the next detected question...'}</p>
+              <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-emerald-300">Answer</p>
+              {lastAnswer ? <div className="space-y-4 text-lg leading-relaxed text-slate-100">{renderAnswerMarkdown(lastAnswer)}</div> : <p className="text-sm text-slate-500">{pipelineStatus === 'thinking' ? 'Generating answer...' : 'No answer yet.'}</p>}
+            </article>
+            {answeredSegments.length > 1 && <section className="mt-4 rounded-xl border border-slate-700 bg-slate-900/70 p-4">
+              <p className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Earlier answers</p>
+              <div className="max-h-64 space-y-3 overflow-y-auto">
+                {answeredSegments.slice(0, -1).reverse().map((segment, index) => (
+                  <article key={`${segment.question}-${index}`} className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+                    <p className="text-xs font-medium text-slate-400">{segment.question}</p>
+                    <div className="mt-2 text-sm leading-relaxed text-slate-300">{renderAnswerMarkdown(segment.answer)}</div>
+                  </article>
+                ))}
+              </div>
+            </section>}
+            <div className="mt-4 flex items-center justify-between"><button onClick={() => setTranscriptOpen((open) => !open)} className="text-xs text-emerald-300 hover:text-emerald-200">{transcriptOpen ? 'Hide full transcript' : 'View full transcript'}</button><button onClick={stopMeetingCapture} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-rose-400">Stop Listening</button></div>
+            {transcriptOpen && <div className="mt-3 max-h-48 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">{liveTranscript || 'No transcript captured yet.'}</div>}
+            {error && <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
+            <div className="mt-5 flex gap-2"><input value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Ask a text question..." className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-emerald-400" /><button onClick={() => void sendMessage()} disabled={!input.trim() || chatStreaming} className="rounded-lg bg-emerald-500 px-4 text-sm font-medium text-slate-950 disabled:opacity-40">Send</button></div>
+          </section>
+        )}
+      </main>
+
       {/* Main content */}
-      <div className="mx-auto flex min-h-[calc(100dvh-73px)] max-w-4xl min-w-0 flex-col px-3 py-4 sm:px-4 sm:py-6">
+      <div className="hidden mx-auto flex min-h-[calc(100dvh-73px)] max-w-4xl min-w-0 flex-col px-3 py-4 sm:px-4 sm:py-6">
         {/* PDF upload bar */}
-        <div className="mb-4">
+        <div className="mb-4 space-y-3">
           <input
             ref={fileInputRef}
             type="file"
             accept="application/pdf"
             onChange={handlePdfUpload}
+            multiple
             className="hidden"
           />
-          {pdfName ? (
-            <div className="flex items-center gap-3 bg-slate-800/60 border border-slate-700 rounded-xl px-4 py-3">
-              <div className="w-9 h-9 rounded-lg bg-emerald-500/20 flex items-center justify-center flex-shrink-0">
-                <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+
+          <div className="flex items-center justify-between gap-2 rounded-xl border border-slate-700 bg-slate-800/60 px-3 py-2">
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] uppercase tracking-wide text-slate-500">Context mode</p>
+              <p className="text-sm font-medium text-slate-200">{mode === 'direct' ? 'Direct mode: profile and PDF context are ignored' : 'LangChain mode: profile and session docs are included'}</p>
+            </div>
+            {mode === 'direct' && (sessionDocuments.length > 0 || !!activeProfile) && (
+              <div className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-medium text-amber-200">
+                Context unavailable
               </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium truncate">{pdfName}</p>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-slate-700 bg-slate-800/60 p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="text-[11px] uppercase tracking-wide text-slate-500">Trained profile</p>
+              <div className="flex items-center gap-2">
+                {activeProfile && (
+                  <button
+                    onClick={() => setProfilePreviewOpen((current) => !current)}
+                    className="text-[11px] text-emerald-300 hover:text-emerald-200"
+                  >
+                    {profilePreviewOpen ? 'Hide preview' : 'Preview'}
+                  </button>
+                )}
+                {activeProfile && (
+                  <button
+                    onClick={() => deleteProfile(activeProfile.id)}
+                    className="text-[11px] text-rose-300 hover:text-rose-200"
+                  >
+                    Delete
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <select
+                value={activeProfileId ?? 'none'}
+                onChange={(event) => setActiveProfileId(event.target.value === 'none' ? null : event.target.value)}
+                className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 outline-none focus:border-emerald-400"
+              >
+                <option value="none">No profile selected</option>
+                {trainedProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>{profile.name}</option>
+                ))}
+              </select>
+              <button
+                onClick={trainProfile}
+                disabled={pdfLoading || sessionDocuments.length === 0}
+                className="rounded-lg bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400 disabled:opacity-40"
+              >
+                Train
+              </button>
+            </div>
+            {activeProfile && profilePreviewOpen && (
+              <div className="mt-3 rounded-lg border border-slate-700 bg-slate-900/80 p-3 text-[11px] leading-relaxed text-slate-300">
+                <p className="mb-1 font-medium text-emerald-300">{activeProfile.name}</p>
+                <p>{activeProfile.summary}</p>
+              </div>
+            )}
+          </div>
+
+          {pdfName ? (
+            <div className="flex items-center gap-3 rounded-xl border border-slate-700 bg-slate-800/60 px-4 py-3">
+              <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-emerald-500/20">
+                <CheckCircle2 className="h-5 w-5 text-emerald-400" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-medium text-slate-200">{pdfName}</p>
                 <p className="text-xs text-slate-400">
-                  {pdfText.length.toLocaleString()} characters extracted — sent as context
+                  {pdfText.length.toLocaleString()} characters extracted — included in LangChain context
                 </p>
               </div>
               <button
                 onClick={removePdf}
-                className="p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors"
+                className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-200"
               >
-                <X className="w-4 h-4" />
+                <X className="h-4 w-4" />
               </button>
             </div>
           ) : (
             <button
               onClick={() => fileInputRef.current?.click()}
               disabled={pdfLoading}
-              className="w-full flex items-center justify-center gap-2.5 bg-slate-800/40 hover:bg-slate-800/70 border border-dashed border-slate-600 hover:border-emerald-500/50 rounded-xl px-4 py-3 text-sm text-slate-400 hover:text-slate-200 transition-all disabled:opacity-50"
+              className="flex w-full items-center justify-center gap-2.5 rounded-xl border border-dashed border-slate-600 bg-slate-800/40 px-4 py-3 text-sm text-slate-400 transition-all hover:border-emerald-500/50 hover:bg-slate-800/70 hover:text-slate-200 disabled:opacity-50"
             >
               {pdfLoading ? (
                 <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <Loader2 className="h-4 w-4 animate-spin" />
                   Extracting text from PDF...
                 </>
               ) : (
                 <>
-                  <FileText className="w-4 h-4" />
+                  <FileText className="h-4 w-4" />
                   Upload PDF for context (optional)
                 </>
               )}
+            </button>
+          )}
+
+          {sessionDocuments.length > 1 && (
+            <div className="flex flex-wrap gap-2">
+              {sessionDocuments.map((doc) => (
+                <span key={doc.id} className="rounded-full border border-slate-700 bg-slate-800 px-2 py-1 text-[10px] text-slate-300">
+                  {doc.name}
+                </span>
+              ))}
+            </div>
+          )}
+          {sessionDocuments.length > 0 && (
+            <button
+              onClick={clearSessionContext}
+              className="text-xs text-slate-400 hover:text-slate-200"
+            >
+              Clear session documents
             </button>
           )}
         </div>
