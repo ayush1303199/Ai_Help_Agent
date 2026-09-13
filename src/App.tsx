@@ -22,6 +22,9 @@ import {
   Zap
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { cleanTranscript, detectQuestion, voiceSafeText } from './audio/transcriptUtils';
+import { resolveContext, truncateContextText } from './context/contextResolver';
+import { AnswerSessionView } from './ui/AnswerSessionView';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -129,12 +132,6 @@ function chatTitle(messages: Message[]) {
   return firstUserMessage.length > 52 ? `${firstUserMessage.slice(0, 52)}…` : firstUserMessage;
 }
 
-function voiceSafeText(text: string) {
-  return text
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 function systemAudioErrorMessage(error: unknown, action: 'capture' | 'test') {
   const message = error instanceof Error ? error.message : String(error);
   const isElectron = typeof navigator !== 'undefined' && /Electron/i.test(navigator.userAgent);
@@ -145,86 +142,6 @@ function systemAudioErrorMessage(error: unknown, action: 'capture' | 'test') {
     return `System audio ${action} is not supported by this platform configuration. On Windows, restart the Electron app and select a playback source. On macOS, route meeting audio through a supported virtual device such as BlackHole.`;
   }
   return `System audio ${action} failed: ${message}`;
-}
-
-const technicalTerms = ['Java', 'Spring Boot', 'Spring Security', 'Hibernate', 'JPA', 'PHP', 'Yii2', 'React', 'MySQL', 'AWS', 'Docker', 'Kubernetes', 'Terraform', 'Jenkins', 'REST API', 'Microservices'];
-
-function cleanTranscript(rawText: string) {
-  let text = rawText.replace(/\s+/g, ' ').trim();
-  text = text.replace(/^(um+|uh+|you know|like)\s+/i, '');
-  for (const term of technicalTerms) {
-    text = text.replace(new RegExp(`\\b${term.replace(/[+/]/g, '\\$&')}\\b`, 'gi'), term);
-  }
-  if (/^(what|why|how|when|where|who|can|could|would|is|are|do|does|explain|tell me)\b/i.test(text) && !/[.!?]$/.test(text)) {
-    text += '?';
-  }
-  return text;
-}
-
-function detectQuestion(text: string) {
-  const question = text.trim();
-  if (question.length < 3) return { isQuestion: false, question: null };
-  if (/^(hi|hello|hey|okay|ok|thanks?|thank you|bye|goodbye)[.!?]?$/i.test(question)) {
-    return { isQuestion: false, question: null };
-  }
-  const isQuestion = /[?]$/.test(question)
-    || /^(what|why|how|when|where|who|can|could|would|is|are|do|does|explain|tell me|compare|describe)\b/i.test(question)
-    || question.split(/\s+/).length >= 4;
-  return { isQuestion, question: isQuestion ? question : null };
-}
-
-function truncateContextText(text: string, maxChars: number) {
-  if (!text) return '';
-  const trimmed = text.trim();
-  if (trimmed.length <= maxChars) return trimmed;
-  return `${trimmed.slice(0, maxChars - 24).trim()}…`;
-}
-
-function resolveContext({ mode, sessionDocuments, activeProfile }: { mode: Mode; sessionDocuments: SessionDocument[]; activeProfile: TrainedProfile | null }) {
-  if (mode === 'direct') return '';
-
-  const sections: string[] = [];
-  if (activeProfile?.context) {
-    sections.push(`Trained profile: ${activeProfile.name}\n${truncateContextText(activeProfile.context, PDF_CONTEXT_CHAR_BUDGET / 2)}`);
-  }
-  if (sessionDocuments.length > 0) {
-    const sessionText = sessionDocuments
-      .map((doc) => `Document: ${doc.name}\n${truncateContextText(doc.text, Math.max(900, Math.floor(PDF_CONTEXT_CHAR_BUDGET / Math.max(sessionDocuments.length, 1))))}`)
-      .join('\n\n');
-    sections.push(sessionText);
-  }
-  return sections.join('\n\n');
-}
-
-export function renderAnswerMarkdown(text: string) {
-  return text.split(/\n{2,}/).map((block, index) => {
-    const trimmed = block.trim();
-    if (!trimmed) return null;
-    if (/^```/.test(trimmed)) {
-      return <pre key={index} className="overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs text-emerald-200"><code>{trimmed.replace(/^```[^\n]*\n?/, '').replace(/\n?```$/, '')}</code></pre>;
-    }
-    const lines = trimmed.split('\n');
-    if (lines.every((line) => /^[-*]\s+/.test(line))) {
-      return <ul key={index} className="list-disc space-y-1 pl-5">{lines.map((line) => <li key={line}>{formatInlineMarkdown(line.replace(/^[-*]\s+/, ''))}</li>)}</ul>;
-    }
-    if (lines.every((line) => /^\d+\.\s+/.test(line))) {
-      return <ol key={index} className="list-decimal space-y-1 pl-5">{lines.map((line) => <li key={line}>{formatInlineMarkdown(line.replace(/^\d+\.\s+/, ''))}</li>)}</ol>;
-    }
-    if (/^#{1,3}\s+/.test(trimmed)) {
-      const heading = trimmed.replace(/^#{1,3}\s+/, '');
-      return <h3 key={index} className="text-lg font-semibold text-emerald-200">{formatInlineMarkdown(heading)}</h3>;
-    }
-    return <p key={index}>{formatInlineMarkdown(trimmed)}</p>;
-  });
-}
-
-export function formatInlineMarkdown(text: string) {
-  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
-  return parts.map((part, index) => {
-    if (part.startsWith('**') && part.endsWith('**')) return <strong key={index}>{part.slice(2, -2)}</strong>;
-    if (part.startsWith('`') && part.endsWith('`')) return <code key={index} className="rounded bg-slate-950 px-1.5 py-0.5 text-emerald-200">{part.slice(1, -1)}</code>;
-    return <span key={index}>{part}</span>;
-  });
 }
 
 const providerPresets = {
@@ -818,7 +735,13 @@ function App() {
       const contextStartedAt = performance.now();
       const resolvedContext = contextOverride !== undefined
         ? contextOverride
-        : resolveContext({ mode, sessionDocuments, activeProfile });
+        : resolveContext({
+          mode,
+          sessionDocuments,
+          activeProfile,
+          contextCharBudget: PDF_CONTEXT_CHAR_BUDGET,
+          profileCharBudget: PDF_CONTEXT_CHAR_BUDGET,
+        });
       console.log(`[TIMING] Context resolved at: ${new Date().toISOString()} request=${requestId} elapsed=${Math.round(performance.now() - contextStartedAt)}ms chars=${resolvedContext.length}`);
 
       ws.send(JSON.stringify({
@@ -1717,22 +1640,7 @@ function App() {
             {meetingMenuOpen && <div className="mb-4 rounded-xl border border-slate-700 bg-slate-900 p-4 text-xs"><div className="flex justify-between"><span className="text-slate-400">Audio source</span><span>System / Internal Audio</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[14rem] truncate">{audioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className="text-emerald-300">OFF</span></div><button onClick={stopMeetingCapture} className="mt-3 rounded-lg border border-slate-600 px-3 py-2 text-slate-300 hover:border-rose-400">Stop Listening</button></div>}
             <div className="mb-5 text-center"><p className={`text-sm font-medium ${statusTone}`}>● {statusLabel}</p><p className="mt-2 text-xs text-slate-500">{pipelineStatus === 'listening' ? 'Listening for a question' : pipelineStatus === 'thinking' ? 'Generating answer...' : 'Your answer will appear below'}</p></div>
             <div className="mb-4"><p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-slate-500">Last heard</p><p className="truncate text-sm text-slate-300">{liveTranscript || 'Waiting for speech...'}</p></div>
-            <article className="flex-1 rounded-2xl border border-emerald-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7">
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Question</p><p className="mb-7 text-base text-slate-300">{lastQuestion || 'Waiting for the next detected question...'}</p>
-              <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-emerald-300">Answer</p>
-              {lastAnswer ? <div className="space-y-4 text-lg leading-relaxed text-slate-100">{renderAnswerMarkdown(lastAnswer)}</div> : <p className="text-sm text-slate-500">{pipelineStatus === 'thinking' ? 'Generating answer...' : 'No answer yet.'}</p>}
-            </article>
-            {answeredSegments.length > 1 && <section className="mt-4 rounded-xl border border-slate-700 bg-slate-900/70 p-4">
-              <p className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Earlier answers</p>
-              <div className="max-h-64 space-y-3 overflow-y-auto">
-                {answeredSegments.slice(0, -1).reverse().map((segment, index) => (
-                  <article key={`${segment.question}-${index}`} className="rounded-lg border border-slate-800 bg-slate-950/50 p-3">
-                    <p className="text-xs font-medium text-slate-400">{segment.question}</p>
-                    <div className="mt-2 text-sm leading-relaxed text-slate-300">{renderAnswerMarkdown(segment.answer)}</div>
-                  </article>
-                ))}
-              </div>
-            </section>}
+            <AnswerSessionView lastQuestion={lastQuestion} lastAnswer={lastAnswer} isThinking={pipelineStatus === 'thinking'} answeredSegments={answeredSegments} />
             <div className="mt-4 flex items-center justify-between"><button onClick={() => setTranscriptOpen((open) => !open)} className="text-xs text-emerald-300 hover:text-emerald-200">{transcriptOpen ? 'Hide full transcript' : 'View full transcript'}</button><button onClick={stopMeetingCapture} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-rose-400">Stop Listening</button></div>
             {transcriptOpen && <div className="mt-3 max-h-48 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">{liveTranscript || 'No transcript captured yet.'}</div>}
             {error && <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}

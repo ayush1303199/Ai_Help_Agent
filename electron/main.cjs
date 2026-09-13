@@ -48,6 +48,12 @@ function createOverlayWindow() {
     return;
   }
 
+  const overlayCompositorOptions = process.platform === 'darwin'
+    ? { vibrancy: 'hud' }
+    : process.platform === 'win32'
+      ? { backgroundMaterial: 'acrylic' }
+      : {};
+
   overlayWindow = new BrowserWindow({
     width: 620,
     height: 420,
@@ -59,6 +65,7 @@ function createOverlayWindow() {
     resizable: true,
     hasShadow: false,
     backgroundColor: '#00000000',
+    ...overlayCompositorOptions,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,

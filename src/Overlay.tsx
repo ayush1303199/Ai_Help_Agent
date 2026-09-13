@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
-import { renderAnswerMarkdown } from './App';
+import { renderAnswerMarkdown } from './ui/answerMarkdown';
 
 type OverlayState = {
   answer: string;
