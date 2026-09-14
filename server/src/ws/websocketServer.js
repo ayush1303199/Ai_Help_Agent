@@ -1,7 +1,9 @@
 import { WebSocketServer } from 'ws';
 import { streamDirect } from '../llm/directLlm.js';
 import { streamLangChain } from '../llm/langchainLlm.js';
+import { completeDeveloper, validateToolCall } from '../llm/developerTools.js';
 import { trimContext } from '../pdf/pdfExtractor.js';
+import { developerDecisionPrompt, buildReadPlan, updateEvidence, evidenceContinuationPrompt, evaluateUnderstanding, clarificationDecision } from '../llm/developerDecisionEngine.js';
 
 /**
  * WebSocket server — the heart of the streaming experience.
@@ -12,7 +14,11 @@ import { trimContext } from '../pdf/pdfExtractor.js';
  * Server → client messages:
  *   { type: "token",  content: "..." }   — one token chunk
  *   { type: "done",   content: "..." }   — full text, stream finished
+ *   { type: "tool_call", name, arguments, toolCallId } — developer read request
  *   { type: "error",  message: "..." }  — something went wrong
+ *
+ * Developer clients answer tool_call with:
+ *   { type: "tool_result", requestId, toolCallId, result|error }
  */
 export function startWebSocketServer(port) {
   const wss = new WebSocketServer({ port });
@@ -21,6 +27,8 @@ export function startWebSocketServer(port) {
 
   wss.on('connection', (ws) => {
     console.log('New WebSocket client connected');
+    const pendingToolCalls = new Map();
+    const completedToolCalls = new Map();
 
     ws.on('message', async (raw) => {
       let payload;
@@ -34,6 +42,16 @@ export function startWebSocketServer(port) {
         }));
       }
 
+      if (payload.type === 'tool_result') {
+        const key = `${payload.requestId}:${payload.toolCallId}`;
+        const pending = pendingToolCalls.get(key);
+        if (!pending) return;
+        pendingToolCalls.delete(key);
+        completedToolCalls.set(key, payload.result);
+        pending.resolve(payload.result);
+        return;
+      }
+
       if (payload.type !== 'chat') {
         return ws.send(JSON.stringify({
           type: 'error',
@@ -41,7 +59,7 @@ export function startWebSocketServer(port) {
         }));
       }
 
-      const { messages, mode = 'direct', pdfContext = '', requestId = '' } = payload;
+      const { messages, mode = 'direct', pdfContext = '', requestId = '', developer = false } = payload;
       const responseMeta = typeof requestId === 'string' ? { requestId } : {};
 
       if (!Array.isArray(messages) || messages.length === 0) {
@@ -49,6 +67,95 @@ export function startWebSocketServer(port) {
           type: 'error',
           message: 'No messages provided.',
         }));
+      }
+
+      // Developer tools are an explicit, request-scoped protocol. The server
+      // never touches the filesystem: the Electron renderer executes each
+      // approved read-only call through its existing IPC handlers.
+      if (developer === true || mode === 'developer') {
+        const startedAt = performance.now();
+        const lastUserMessage = [...messages].reverse().find((message) => message.role === 'user')?.content || '';
+        const readPlan = buildReadPlan(lastUserMessage);
+        console.log(`[DEVELOPER][DECISION] request=${requestId} intent=${readPlan.classification.intent} writeRequired=${readPlan.classification.writeRequired} risk=${readPlan.classification.risk} next=${readPlan.nextStep}`);
+        const toolMessages = [
+          { role: 'system', content: developerDecisionPrompt(lastUserMessage) },
+          ...messages.map((message) => ({ ...message })),
+        ];
+        const evidence = {};
+        const maxRounds = 6;
+        let finalMessage = null;
+        try {
+          for (let round = 0; round < maxRounds; round += 1) {
+            console.log(`[DEVELOPER][ROUND] request=${requestId} round=${round + 1}`);
+            const message = await completeDeveloper({ messages: toolMessages });
+            toolMessages.push(message);
+            if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0) {
+              finalMessage = message;
+              break;
+            }
+            for (const call of message.tool_calls) {
+              const { name, args } = validateToolCall(call);
+              const toolCallId = String(call.id || `${name}-${round}`);
+              const key = `${requestId}:${toolCallId}`;
+              console.log(`[DEVELOPER][TOOL] request=${requestId} round=${round + 1} tool=${name}`);
+              if (completedToolCalls.has(key)) {
+                toolMessages.push({
+                  role: 'tool',
+                  tool_call_id: toolCallId,
+                  content: JSON.stringify(completedToolCalls.get(key)).slice(0, 12000),
+                });
+                continue;
+              }
+              if (ws.readyState !== ws.OPEN) throw new Error('Developer client disconnected.');
+              const resultPromise = new Promise((resolve, reject) => {
+                pendingToolCalls.set(key, { resolve, reject });
+                setTimeout(() => {
+                  if (!pendingToolCalls.has(key)) return;
+                  pendingToolCalls.delete(key);
+                  reject(new Error('Developer tool timed out.'));
+                }, 30000);
+              });
+              ws.send(JSON.stringify({
+                type: 'tool_call',
+                requestId,
+                toolCallId,
+                name,
+                arguments: args,
+              }));
+              const result = await resultPromise;
+              const serialized = JSON.stringify(result ?? null);
+              Object.assign(evidence, updateEvidence(evidence, name, result));
+              toolMessages.push({
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: serialized.slice(0, 12000),
+              });
+            }
+            const understanding = evaluateUnderstanding({ request: lastUserMessage, evidence });
+            const clarification = clarificationDecision(evidence);
+            console.log(`[DEVELOPER][EVIDENCE] request=${requestId} state=${understanding.state} decision=${understanding.decision} scope=${understanding.scope.state}`);
+            if (clarification && evidence.searches > 1 && (evidence.filesRead || []).length >= 2) {
+              if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'decision', requestId, decision: clarification }));
+              finalMessage = { content: clarification.question };
+              break;
+            }
+            toolMessages.push({ role: 'system', content: evidenceContinuationPrompt(lastUserMessage, evidence) });
+          }
+          if (!finalMessage) throw new Error(`Developer tool loop stopped after ${maxRounds} rounds.`);
+          const content = typeof finalMessage.content === 'string' ? finalMessage.content : '';
+          if (content && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'token', content, ...responseMeta }));
+          if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({
+            type: 'done',
+            content,
+            rounds: toolMessages.filter((message) => message.role === 'assistant' && message.tool_calls).length,
+            timing: { providerRequestMs: Math.round(performance.now() - startedAt), timeToFirstTokenMs: content ? 0 : null },
+            ...responseMeta,
+          }));
+        } catch (err) {
+          console.error(`[DEVELOPER][ERROR] request=${requestId}:`, err.message);
+          if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', message: err.message, ...responseMeta }));
+        }
+        return;
       }
 
       // Give the assistant a stable role without pretending it can inspect files
@@ -104,7 +211,7 @@ export function startWebSocketServer(port) {
 
       try {
         const streamFn = mode === 'langchain' ? streamLangChain : streamDirect;
-        const fullText = await streamFn({ messages: finalMessages, onToken });
+        const fullText = await streamFn({ messages: finalMessages, onToken, requestId });
         const responseReceivedAt = performance.now();
         console.log(`[LLM][FINAL] request=${requestId} length=${fullText.length} startsWith=${JSON.stringify(fullText.slice(0, 80))}`);
         console.log(`[TIMING] Provider response received at: ${new Date().toISOString()} request=${requestId} elapsed=${Math.round(responseReceivedAt - requestStartedAt)}ms`);

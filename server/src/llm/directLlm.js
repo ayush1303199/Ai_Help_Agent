@@ -6,7 +6,7 @@ import { setConfiguredProviderStatus } from '../config.js';
  * to quota/rate-limit failures; authentication and network failures are
  * actionable and must not silently switch credentials.
  */
-export async function streamDirect({ messages, onToken }) {
+export async function streamDirect({ messages, onToken, requestId = 'unknown' }) {
   let lastError;
   for (const provider of providerOrder()) {
     try {
@@ -15,6 +15,7 @@ export async function streamDirect({ messages, onToken }) {
       return result;
     } catch (error) {
       lastError = normalizeProviderError(error, provider.label || provider.adapterType || provider);
+      console.error(`[PROVIDER] Request failed request=${requestId} provider=${provider.label || provider.adapterType} status=${lastError.status ?? 'none'} kind=${lastError.kind}`);
       if (provider.id) setConfiguredProviderStatus(provider.id, lastError.kind === 'quota' ? 'quota-exceeded' : lastError.kind === 'invalid_key' ? 'invalid-key' : 'error', lastError.message);
       if (!isFallbackError(lastError)) throw lastError;
       console.warn(`Provider ${provider.label || provider.adapterType} quota exhausted; trying fallback.`);

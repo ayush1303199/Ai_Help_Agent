@@ -15,7 +15,7 @@ import {
   updateConfiguredProvider,
   upsertConfiguredProvider,
 } from './config.js';
-import { getProviderInfo } from './llm/provider.js';
+import { getProviderCapabilities, getProviderInfo, selfTestProvider } from './llm/provider.js';
 import { extractTextFromPdfBuffer } from './pdf/pdfExtractor.js';
 import { startWebSocketServer } from './ws/websocketServer.js';
 
@@ -80,6 +80,27 @@ app.get('/api/health', (_req, res) => {
     ...getProviderInfo(),
     wsPort: config.server.wsPort,
   });
+});
+
+app.get('/api/settings/providers/capabilities', (_req, res) => {
+  res.json({
+    active: getProviderInfo(),
+    providers: getProviderCapabilities(),
+  });
+});
+
+app.post('/api/settings/providers/self-test', async (req, res) => {
+  const requested = typeof req.body?.provider === 'string' ? req.body.provider : config.provider;
+  try {
+    const result = await selfTestProvider(requested);
+    res.status(result.status === 'READY' ? 200 : 503).json(result);
+  } catch (error) {
+    res.status(503).json({
+      provider: requested,
+      status: 'NETWORK_ERROR',
+      message: 'Provider self-test failed.',
+    });
+  }
 });
 
 app.post('/api/settings/provider', async (req, res) => {

@@ -1,10 +1,15 @@
 const { app, BrowserWindow, desktopCapturer, session, ipcMain, dialog } = require('electron');
 const path = require('node:path');
 const developerFiles = require('./developerFiles.cjs');
+const developerAgent = require('./developerAgent.cjs');
+const developerIndex = require('./developerIndex.cjs');
+const developerContext = require('./developerContext.cjs');
+const developerBenchmark = require('./developerBenchmark.cjs');
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
 let overlayWindow = null;
+let developerIndexCache = null;
 
 // Keep Chromium cache in a writable app-specific directory on Windows.
 app.setPath('userData', path.join(app.getPath('temp'), 'ai-assistant-electron'));
@@ -92,7 +97,16 @@ function toggleOverlayWindow() {
   createOverlayWindow();
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  developerAgent.configureDurability({
+    journalFile: path.join(app.getPath('userData'), 'developer-task-journal.json'),
+    auditFile: path.join(app.getPath('userData'), 'developer-audit.jsonl'),
+  });
+  try {
+    await developerAgent.loadJournal();
+  } catch (error) {
+    console.error('[DEV][JOURNAL] startup reconciliation failed:', error);
+  }
   ipcMain.handle('overlay:open', () => {
     createOverlayWindow();
   });
@@ -109,6 +123,67 @@ app.whenReady().then(() => {
   ipcMain.handle('developer:list-directory', (_event, relativePath) => developerFiles.listDirectory(relativePath));
   ipcMain.handle('developer:read-file', (_event, relativePath) => developerFiles.readFile(relativePath));
   ipcMain.handle('developer:search-code', (_event, query) => developerFiles.searchCode(query));
+  const ownedDeveloperSession = (event) => {
+    const sessionId = developerAgent.getSession(event.sender.id);
+    return { sessionId, ownerWebContentsId: event.sender.id };
+  };
+  ipcMain.handle('developer:index', async (event) => {
+    ownedDeveloperSession(event);
+    const currentRoot = developerFiles.getProjectRoot();
+    developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
+    return { capabilities: developerIndexCache.capabilities, files: Object.keys(developerIndexCache.files), cacheHits: developerIndexCache.cacheHits };
+  });
+  ipcMain.handle('developer:symbol-search', async (event, query) => {
+    ownedDeveloperSession(event);
+    const currentRoot = developerFiles.getProjectRoot();
+    developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
+    return developerIndex.searchSymbols(developerIndexCache, query).slice(0, 100);
+  });
+  ipcMain.handle('developer:context', async (event, payload) => {
+    ownedDeveloperSession(event);
+    const query = payload?.query;
+    const search = await developerFiles.searchCode(query);
+    if (!developerIndexCache || developerIndexCache.root !== developerFiles.getProjectRoot()) {
+      developerIndexCache = await developerIndex.buildIndex(developerFiles.getProjectRoot());
+    }
+    const symbols = developerIndexCache
+      ? developerIndex.searchSymbols(developerIndexCache, query).slice(0, 50)
+      : [];
+    return developerContext.assembleContext({ query, results: [...search.results, ...symbols], maxTokens: payload?.maxTokens });
+  });
+  ipcMain.handle('developer:provider-discovery', (_event, providers) => developerBenchmark.discoverProviders(providers));
+  ipcMain.handle('developer:run-verification', (_event, script) => developerFiles.runVerification(script));
+  ipcMain.handle('developer:session', (event) => {
+    event.sender.once('destroyed', () => developerAgent.releaseSession(event.sender.id));
+    return { sessionId: developerAgent.getSession(event.sender.id) };
+  });
+  ipcMain.handle('developer:session-resume', (event, sessionId) => ({ sessionId: developerAgent.resumeSession(event.sender.id, sessionId) }));
+  ipcMain.handle('developer:git-inspect', (_event, kind) => developerFiles.runGit(kind === 'diff' ? ['diff', '--no-ext-diff'] : ['status', '--short']));
+  ipcMain.handle('developer:proposal-create', (event, payload) => developerAgent.createProposal({
+    root: developerFiles.getProjectRoot(), raw: payload?.raw, expectedSnapshots: payload?.snapshots,
+    sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id,
+    workspace: payload?.workspace,
+    verificationScript: payload?.verificationScript || null,
+  }));
+  ipcMain.handle('developer:proposal-approve', (event, id) => developerAgent.approve(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
+  ipcMain.handle('developer:proposal-apply', async (event, id) => {
+    const owner = { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id };
+    const task = developerAgent.getTaskForTest(id);
+    const verify = () => task.verificationScript
+      ? developerFiles.runVerification(task.verificationScript)
+        .then(developerAgent.normalizeCommandResult)
+        .catch((error) => (/not defined/i.test(error.message) ? { ok: true, skipped: true, failure: null } : Promise.reject(error)))
+      : Promise.resolve({ ok: true, skipped: true, failure: null });
+    try {
+      return await developerAgent.apply(id, owner, verify);
+    } catch (error) {
+      if (error.taskSnapshot) return error.taskSnapshot;
+      throw error;
+    }
+  });
+  ipcMain.handle('developer:proposal-undo', (event, id) => developerAgent.undo(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
+  ipcMain.handle('developer:proposal-get', (event, id) => developerAgent.getTask(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
+  ipcMain.handle('developer:proposal-cancel', (event) => developerAgent.cancelSession(event.sender.id));
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(['media'].includes(permission));
   });

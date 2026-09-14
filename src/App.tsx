@@ -34,7 +34,6 @@ interface Message {
   streaming?: boolean;
   requestId?: string;
 }
-
 interface RequestTiming {
   questionFinalizedAt: number;
   sendMessageCalledAt: number;
@@ -103,6 +102,17 @@ interface DeveloperDiffFile {
   lines: string[];
 }
 
+interface DeveloperSnapshot {
+  path: string;
+  hash: string;
+}
+
+async function hashDeveloperContent(content: string) {
+  const bytes = new TextEncoder().encode(content);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 function parseUnifiedDiff(content: string): DeveloperDiffFile[] {
   const lines = content
     .replace(/^```(?:diff|patch)?\s*/i, '')
@@ -114,7 +124,11 @@ function parseUnifiedDiff(content: string): DeveloperDiffFile[] {
   for (const line of lines) {
     const fileHeader = line.match(/^\+\+\+ b\/(.+)$/);
     if (fileHeader) {
-      current = { path: fileHeader[1], lines: [] };
+      const normalizedPath = fileHeader[1].replace(/\\/g, '/');
+      if (!normalizedPath || normalizedPath.startsWith('/') || normalizedPath.split('/').includes('..')) {
+        continue;
+      }
+      current = { path: normalizedPath, lines: [] };
       files.push(current);
       continue;
     }
@@ -123,6 +137,38 @@ function parseUnifiedDiff(content: string): DeveloperDiffFile[] {
     }
   }
   return files;
+}
+
+function validateUnifiedFile(lines: string[], original: string) {
+  const source = original.split(/\r?\n/);
+  let sourceIndex = 0;
+  const hunkIndexes = lines.flatMap((line, index) => line.startsWith('@@') ? [index] : []);
+  for (const hunkIndex of hunkIndexes) {
+    const hunk = lines[hunkIndex];
+    const match = hunk.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (!match) return false;
+    const oldCount = match[0].match(/^@@ -\d+(?:,(\d+))?/);
+    const start = Number(match[1]) - 1;
+    if (start < sourceIndex || start > source.length) return false;
+    sourceIndex = start;
+    let consumed = 0;
+    for (const line of lines.slice(hunkIndex + 1)) {
+      if (line.startsWith('@@')) break;
+      if (line.startsWith(' ')) {
+        if (source[sourceIndex] !== line.slice(1)) return false;
+        sourceIndex += 1;
+        consumed += 1;
+      } else if (line.startsWith('-')) {
+        if (source[sourceIndex] !== line.slice(1)) return false;
+        sourceIndex += 1;
+        consumed += 1;
+      } else if (line.startsWith('+') || line === '\\ No newline at end of file') {
+        continue;
+      }
+    }
+    if (oldCount && Number(oldCount[1] || 1) !== consumed) return false;
+  }
+  return hunkIndexes.length > 0;
 }
 
 const HTTP_URL = 'http://localhost:3001';
@@ -233,7 +279,7 @@ function App() {
   const [developerSearchResults, setDeveloperSearchResults] = useState<DeveloperSearchResult[]>([]);
   const [developerProposalSearchQuery, setDeveloperProposalSearchQuery] = useState('');
   const [developerChangeRequest, setDeveloperChangeRequest] = useState('');
-  const [developerProposal, setDeveloperProposal] = useState<{ files: DeveloperDiffFile[]; raw: string; searchedFiles: string[] } | null>(null);
+  const [developerProposal, setDeveloperProposal] = useState<{ id?: string; state?: string; files: DeveloperDiffFile[]; raw: string; searchedFiles: string[]; snapshots: DeveloperSnapshot[] } | null>(null);
   const [developerBusy, setDeveloperBusy] = useState(false);
   const [appMode, setAppMode] = useState<AppMode>('assistant');
   const [draftImproving, setDraftImproving] = useState(false);
@@ -320,6 +366,9 @@ function App() {
   const pendingDeveloperProposalRequestIdsRef = useRef(new Set<string>());
   const developerProposalBuffersRef = useRef(new Map<string, string>());
   const developerProposalFilesRef = useRef(new Map<string, string[]>());
+  const developerProposalSnapshotsRef = useRef(new Map<string, DeveloperSnapshot[]>());
+  const developerProposalSourcesRef = useRef(new Map<string, Map<string, string>>());
+  const completedDeveloperToolResultsRef = useRef(new Map<string, unknown>());
   const liveRequestInFlightRef = useRef(false);
   const electronAudioContextRef = useRef<AudioContext | null>(null);
   const audioLevelTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -676,6 +725,61 @@ function App() {
 
     if (!isDraftImprove && !isCurrentChat && !isDeveloperChat && !isDeveloperProposal) return;
 
+    if (msg.type === 'tool_call') {
+      const requestId = String(msg.requestId);
+      const toolCallId = String(msg.toolCallId);
+      const resultKey = `${requestId}:${toolCallId}`;
+      const cachedResult = completedDeveloperToolResultsRef.current.get(resultKey);
+      const args = msg.arguments && typeof msg.arguments === 'object' ? msg.arguments : {};
+      const sendToolResult = (result: unknown, error?: unknown) => {
+        const socket = wsRef.current;
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        const normalized = error
+          ? { ok: false, tool: msg.name, error: { code: error instanceof Error && /outside|relative|project/i.test(error.message) ? 'PATH_OUTSIDE_PROJECT' : 'TOOL_ERROR', message: error instanceof Error ? error.message : String(error) } }
+          : { ok: true, tool: msg.name, data: result };
+        completedDeveloperToolResultsRef.current.set(resultKey, normalized);
+        socket.send(JSON.stringify({
+          type: 'tool_result',
+          requestId,
+          toolCallId,
+          result: normalized,
+        }));
+      };
+      if (cachedResult) {
+        const socket = wsRef.current;
+        if (socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'tool_result', requestId, toolCallId, result: cachedResult }));
+        }
+        return;
+      }
+      if (msg.type === 'decision' && isDeveloperChat) {
+        const decision = msg.decision;
+        if (decision?.decision === 'NEEDS_CLARIFICATION') {
+          setDeveloperMessages((previous) => [...previous, {
+            role: 'assistant',
+            content: `${decision.question}\n\nCandidates:\n${decision.candidates.map((candidate: string) => `- ${candidate}`).join('\n')}`,
+            streaming: false,
+            requestId: String(msg.requestId),
+          }]);
+        }
+        return;
+      }
+      void (async () => {
+        try {
+          if (!window.electronAPI || !developerProjectRoot) throw new Error('Select a project before using developer tools.');
+          if (msg.name === 'list_directory') sendToolResult(await window.electronAPI.listDeveloperDirectory(String(args.relativePath || '.')));
+          else if (msg.name === 'read_file') sendToolResult(await window.electronAPI.readDeveloperFile(String(args.relativePath || '')));
+          else if (msg.name === 'search_code') sendToolResult(await window.electronAPI.searchDeveloperCode(String(args.query || '')));
+          else if (msg.name === 'search_symbols') sendToolResult(await window.electronAPI.searchDeveloperSymbols(String(args.query || '').slice(0, 200)));
+          else if (msg.name === 'get_context') sendToolResult(await window.electronAPI.assembleDeveloperContext({ query: String(args.query || '').slice(0, 200), maxTokens: args.maxTokens }));
+          else if (msg.name === 'run_command') sendToolResult(await window.electronAPI.runDeveloperVerification(String(args.script || '')));
+          else throw new Error(`Unsupported developer tool: ${String(msg.name)}`);
+        } catch (error) {
+          sendToolResult(null, error);
+        }
+      })();
+      return;
+    }
     if (msg.type === 'token') {
       if (isDraftImprove) return;
       if (isDeveloperProposal) {
@@ -714,10 +818,13 @@ function App() {
         const responseText = String(msg.content || developerProposalBuffersRef.current.get(requestId) || '');
         const files = parseUnifiedDiff(responseText);
         const searchedFiles = developerProposalFilesRef.current.get(requestId) || [];
+        const sources = developerProposalSourcesRef.current.get(requestId) || new Map();
         const unexpectedFiles = files.filter((file) => !searchedFiles.includes(file.path));
         if (!files.length && responseText.trim() !== 'NO_CHANGES') {
           developerProposalBuffersRef.current.delete(requestId);
           developerProposalFilesRef.current.delete(requestId);
+          developerProposalSnapshotsRef.current.delete(requestId);
+          developerProposalSourcesRef.current.delete(requestId);
           pendingDeveloperProposalRequestIdsRef.current.delete(requestId);
           setDeveloperBusy(false);
           setError('The assistant returned an invalid proposal. Expected a unified diff or NO_CHANGES.');
@@ -726,18 +833,31 @@ function App() {
         if (unexpectedFiles.length > 0) {
           developerProposalBuffersRef.current.delete(requestId);
           developerProposalFilesRef.current.delete(requestId);
+          developerProposalSnapshotsRef.current.delete(requestId);
+          developerProposalSourcesRef.current.delete(requestId);
           pendingDeveloperProposalRequestIdsRef.current.delete(requestId);
           setDeveloperBusy(false);
           setError(`The proposal referenced files that were not re-read: ${unexpectedFiles.map((file) => file.path).join(', ')}`);
           return;
         }
-        setDeveloperProposal({
-          files,
-          raw: responseText,
-          searchedFiles,
-        });
+        if (files.some((file) => !validateUnifiedFile(file.lines, sources.get(file.path) || ''))) {
+          developerProposalBuffersRef.current.delete(requestId);
+          developerProposalFilesRef.current.delete(requestId);
+          developerProposalSnapshotsRef.current.delete(requestId);
+          developerProposalSourcesRef.current.delete(requestId);
+          pendingDeveloperProposalRequestIdsRef.current.delete(requestId);
+          setDeveloperBusy(false);
+          setError('The proposal could not be validated against the current file contents.');
+          return;
+        }
+        const snapshots = developerProposalSnapshotsRef.current.get(requestId) || [];
+        void window.electronAPI?.createDeveloperProposal(responseText, snapshots).then((registered) => {
+          setDeveloperProposal({ id: registered.id, state: registered.state, files, raw: responseText, searchedFiles, snapshots });
+        }).catch((error) => setError((error as Error).message));
         developerProposalBuffersRef.current.delete(requestId);
         developerProposalFilesRef.current.delete(requestId);
+        developerProposalSnapshotsRef.current.delete(requestId);
+        developerProposalSourcesRef.current.delete(requestId);
         pendingDeveloperProposalRequestIdsRef.current.delete(requestId);
         setDeveloperBusy(false);
         return;
@@ -805,6 +925,8 @@ function App() {
       if (isDeveloperProposal) {
         developerProposalBuffersRef.current.delete(String(msg.requestId));
         developerProposalFilesRef.current.delete(String(msg.requestId));
+        developerProposalSnapshotsRef.current.delete(String(msg.requestId));
+        developerProposalSourcesRef.current.delete(String(msg.requestId));
         pendingDeveloperProposalRequestIdsRef.current.delete(String(msg.requestId));
         setDeveloperBusy(false);
         setError(`Could not generate proposal: ${msg.message}`);
@@ -845,7 +967,7 @@ function App() {
       setError(msg.message);
       setPipelineStatus('error');
     }
-  }, [flushDeveloperStreamBuffer, flushStreamBuffer, voiceReplies]);
+  }, [developerProjectRoot, flushDeveloperStreamBuffer, flushStreamBuffer, voiceReplies]);
 
   // --- Send a chat message ---
   const sendMessage = async (question = input.trim(), contextOverride?: string, modelInstruction = question, questionFinalizedAt = performance.now()) => {
@@ -959,6 +1081,16 @@ function App() {
   const sendDeveloperMessage = async () => {
     const question = developerInput.trim();
     if (!question || developerStreaming || developerBusy) return;
+    if (/^(?:please\s+)?(?:apply|save|write|update|modify|make)\b.*(?:change|patch|file|it|this)/i.test(question)
+      || /^(?:go ahead and )?(?:apply|save|write)\b/i.test(question)) {
+      setDeveloperMessages((previous) => [
+        ...previous,
+        { role: 'user', content: question },
+        { role: 'assistant', content: 'Proposal only — applying changes is not available from chat. Use the Apply action on a validated proposal.' },
+      ]);
+      setDeveloperInput('');
+      return;
+    }
 
     const requestId = crypto.randomUUID();
     const userMsg: Message = { role: 'user', content: question };
@@ -978,11 +1110,12 @@ function App() {
       ws.send(JSON.stringify({
         type: 'chat',
         requestId,
-        mode: 'direct',
+        mode: 'developer',
+        developer: true,
         messages: [
           {
             role: 'system',
-            content: 'You are a software development assistant. Help the user understand, debug, design, and modify software. You have no filesystem or tool access. Only use information provided in this conversation, and never claim to have inspected files or run commands.',
+            content: 'You are a software development assistant. Help the user understand and debug the selected project. You may use the supplied read-only developer tools to inspect it. Never modify files, run commands, open applications, or claim to have done so. Prefer the smallest necessary inspection and then answer accurately.',
           },
           ...conversationHistory,
         ],
@@ -1094,6 +1227,7 @@ function App() {
         path,
         content: (await window.electronAPI!.readDeveloperFile(path)).content,
       })));
+      const initialSnapshots = await Promise.all(initialFiles.map(async ({ path, content }) => ({ path, hash: await hashDeveloperContent(content) })));
       const snapshot = initialFiles
         .map(({ path, content }) => `FILE: ${path}\n${content.slice(0, 24000)}`)
         .join('\n\n');
@@ -1104,6 +1238,10 @@ function App() {
         path,
         content: (await window.electronAPI!.readDeveloperFile(path)).content,
       })));
+      const latestSnapshots = await Promise.all(latestFiles.map(async ({ path, content }) => ({ path, hash: await hashDeveloperContent(content) })));
+      if (initialSnapshots.some((snapshot, index) => snapshot.hash !== latestSnapshots[index]?.hash)) {
+        throw new Error('The file changed while the proposal was being prepared. Please retry.');
+      }
       const latestSnapshot = latestFiles
         .map(({ path, content }) => `FILE: ${path}\n${content.slice(0, 24000)}`)
         .join('\n\n');
@@ -1111,6 +1249,8 @@ function App() {
       const requestId = crypto.randomUUID();
       pendingDeveloperProposalRequestIdsRef.current.add(requestId);
       developerProposalFilesRef.current.set(requestId, paths);
+      developerProposalSnapshotsRef.current.set(requestId, latestSnapshots);
+      developerProposalSourcesRef.current.set(requestId, new Map(latestFiles.map(({ path, content }) => [path, content])));
       const ws = await ensureWs();
       ws.onmessage = (event) => handleWsMessage(event.data);
       ws.send(JSON.stringify({
@@ -1130,6 +1270,32 @@ function App() {
       setDeveloperBusy(false);
       setError((err as Error).message);
     }
+  };
+
+  const approveDeveloperProposal = async () => {
+    if (!developerProposal?.id || !window.electronAPI) return;
+    try {
+      const result = await window.electronAPI.approveDeveloperProposal(developerProposal.id);
+      setDeveloperProposal((current) => current ? { ...current, state: result.state } : current);
+    } catch (error) { setError((error as Error).message); }
+  };
+
+  const applyDeveloperProposal = async () => {
+    if (!developerProposal?.id || !window.electronAPI) return;
+    setDeveloperBusy(true);
+    try {
+      const result = await window.electronAPI.applyDeveloperProposal(developerProposal.id);
+      setDeveloperProposal((current) => current ? { ...current, state: result.state } : current);
+    } catch (error) { setError((error as Error).message); } finally { setDeveloperBusy(false); }
+  };
+
+  const undoDeveloperProposal = async () => {
+    if (!developerProposal?.id || !window.electronAPI) return;
+    setDeveloperBusy(true);
+    try {
+      const result = await window.electronAPI.undoDeveloperProposal(developerProposal.id);
+      setDeveloperProposal((current) => current ? { ...current, state: result.state } : current);
+    } catch (error) { setError((error as Error).message); } finally { setDeveloperBusy(false); }
   };
 
   const improveDraft = async () => {
@@ -2080,9 +2246,14 @@ function App() {
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-200">Proposed diff</p>
-                    <p className="mt-1 text-[11px] text-slate-400">Proposal only — no files changed.</p>
+                    <p className="mt-1 text-[11px] text-slate-400">State: {developerProposal.state || 'pending'} · main process validates every file before writing.</p>
                   </div>
-                  <button onClick={() => setDeveloperProposal(null)} className="text-[11px] text-slate-400 hover:text-slate-200">Discard</button>
+                  <div className="flex items-center gap-2">
+                    {developerProposal.state === 'awaiting_approval' && <button onClick={() => void approveDeveloperProposal()} className="rounded-md bg-amber-400 px-2 py-1 text-[11px] font-medium text-slate-950">Approve</button>}
+                    {developerProposal.state === 'approved' && <button onClick={() => void applyDeveloperProposal()} disabled={developerBusy} className="rounded-md bg-emerald-400 px-2 py-1 text-[11px] font-medium text-slate-950 disabled:opacity-40">Apply</button>}
+                    {developerProposal.state === 'completed' && <button onClick={() => void undoDeveloperProposal()} disabled={developerBusy} className="rounded-md border border-rose-400/60 px-2 py-1 text-[11px] text-rose-200 disabled:opacity-40">Undo</button>}
+                    <button onClick={() => setDeveloperProposal(null)} className="text-[11px] text-slate-400 hover:text-slate-200">Discard</button>
+                  </div>
                 </div>
                 <p className="mt-2 text-[11px] text-slate-500">Re-read files: {developerProposal.searchedFiles.join(', ')}</p>
                 {developerProposal.files.length > 0 ? (

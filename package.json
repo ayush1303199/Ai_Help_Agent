@@ -5,11 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "npm run electron:dev",
+    "preflight": "node scripts/launcher-preflight.mjs",
     "web:dev": "vite",
     "server:dev": "npm --prefix server run dev",
-    "electron:dev": "concurrently -k \"npm run server:dev\" \"vite --port 5174 --strictPort\" \"wait-on http://localhost:5174 http://localhost:3001/api/health && cross-env ELECTRON_DEV_URL=http://localhost:5174 electron electron/main.cjs\"",
+    "electron:dev": "npm run preflight && node scripts/electron-dev.mjs",
     "electron:start": "electron electron/main.cjs",
     "build": "vite build",
+    "test:phase8": "node scripts/phase8-protocol-test.mjs",
+    "test:developer-agent": "node scripts/developer-agent-test.mjs",
+    "test:developer-gates": "node scripts/developer-gates-test.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json"

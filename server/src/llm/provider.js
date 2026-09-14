@@ -71,7 +71,66 @@ function getConfiguredClient(provider) {
 }
 
 export function getModel(provider = config.provider) { return config[provider]?.model; }
-export function getProviderInfo() { return { provider: config.provider, model: getModel() }; }
+export function getProviderInfo() {
+  const active = config[config.provider];
+  return {
+    provider: config.provider,
+    model: getModel(),
+    configured: Boolean(active?.apiKey && active?.model && !active.apiKey.includes('your_')),
+    toolCalling: openAICompatible.has(config.provider),
+  };
+}
+export function getProviderCapabilities() {
+  return Object.entries(PROVIDER_REGISTRY).map(([provider, metadata]) => {
+    const active = config[provider];
+    const configured = Boolean(active?.apiKey && active?.model && !active.apiKey.includes('your_'));
+    return {
+      provider,
+      model: active?.model || null,
+      configured,
+      toolCalling: metadata.adapter === 'openai-compatible',
+      status: !configured ? 'NOT_CONFIGURED' : metadata.adapter === 'openai-compatible' ? 'READY' : 'TOOL_CALL_UNSUPPORTED',
+    };
+  });
+}
+export async function selfTestProvider(providerName = config.provider) {
+  const provider = config[providerName];
+  const metadata = PROVIDER_REGISTRY[providerName];
+  const base = {
+    provider: providerName,
+    model: provider?.model || null,
+    configured: Boolean(provider?.apiKey && provider?.model && !provider.apiKey.includes('your_')),
+    toolCalling: Boolean(metadata && metadata.adapter === 'openai-compatible'),
+  };
+  if (!metadata || !provider) return { ...base, status: 'MODEL_UNAVAILABLE' };
+  if (!base.configured) return { ...base, status: 'NOT_CONFIGURED' };
+  if (!base.toolCalling) return { ...base, status: 'TOOL_CALL_UNSUPPORTED' };
+  try {
+    await completeProvider({
+      provider: providerName,
+      messages: [{ role: 'user', content: 'Reply with the single word READY.' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'provider_self_test',
+          description: 'Return a readiness marker.',
+          parameters: { type: 'object', properties: {}, additionalProperties: false },
+        },
+      }],
+    });
+    return { ...base, status: 'READY' };
+  } catch (error) {
+    const normalized = normalizeProviderError(error, providerName);
+    const status = normalized.kind === 'invalid_key'
+      ? 'INVALID_CREDENTIAL'
+      : normalized.kind === 'network'
+        ? 'NETWORK_ERROR'
+        : normalized.kind === 'unexpected' && /model/i.test(normalized.message)
+          ? 'MODEL_UNAVAILABLE'
+          : 'NETWORK_ERROR';
+    return { ...base, status };
+  }
+}
 export function isFallbackError(error) { return normalizeProviderError(error).kind === 'quota'; }
 
 export function providerOrder() {
@@ -173,9 +232,38 @@ export async function streamProvider({ provider, messages, onToken }) {
         const token = chunk.choices?.[0]?.delta?.content || '';
         if (token) { text += token; onToken(token); }
       }
+
       return text;
     }
     throw new ProviderError(`Unsupported provider "${providerId}".`, 'unexpected', providerId);
+  } catch (error) {
+    throw normalizeProviderError(error, providerId);
+  }
+}
+
+/**
+ * Request one structured response for the developer tool loop. This is kept
+ * separate from streamProvider so the existing assistant streaming path is
+ * unchanged. OpenAI-compatible providers are the only adapters that expose
+ * the common tool-call shape.
+ */
+export async function completeProvider({ provider, messages, tools }) {
+  const providerId = typeof provider === 'string' ? provider : provider.adapterType;
+  const active = typeof provider === 'string' ? config[provider] : provider;
+  if (!active?.apiKey || !active?.model) throw new ProviderError(`Provider ${providerId} is not configured.`, 'invalid_key', providerId);
+  if (!openAICompatible.has(providerId)) {
+    throw new ProviderError(`Developer tools are not supported by ${providerId}.`, 'unexpected', providerId);
+  }
+  try {
+    const client = typeof provider === 'string' ? getClient(provider) : getConfiguredClient(provider);
+    return await client.chat.completions.create({
+      model: active.model,
+      messages,
+      tools,
+      tool_choice: 'auto',
+      max_tokens: config.server.maxTokens,
+      temperature: 0.3,
+    });
   } catch (error) {
     throw normalizeProviderError(error, providerId);
   }
