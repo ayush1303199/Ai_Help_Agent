@@ -17,6 +17,12 @@ try {
   assert.equal(first.files['main.ts'].imports[0].source, './helper');
   assert.equal(index.definitions(first, 'helper')[0].path, 'helper.ts');
   assert.equal(index.searchSymbols(first, 'main')[0].kind, 'function');
+  const map = await index.buildRepositoryMap(root);
+  assert.equal(map.type, 'repository-map');
+  assert.ok(Array.isArray(map.structure));
+  assert.ok(map.sourceDirectories.length >= 1);
+  const refs = index.findReferences(first, 'helper');
+  assert.ok(refs.some((item) => item.file === 'main.ts' && item.relationship === 'reference'));
   const second = await index.buildIndex(root, first);
   assert.equal(second.cacheHits, 2);
   const ranked = context.assembleContext({ query: 'main', results: [{ path: 'z.ts', text: 'main' }, { path: 'a.ts', text: 'other' }], maxTokens: 10 });

@@ -20,6 +20,28 @@ import { developerDecisionPrompt, buildReadPlan, updateEvidence, evidenceContinu
  * Developer clients answer tool_call with:
  *   { type: "tool_result", requestId, toolCallId, result|error }
  */
+function buildFinalizationMessages(toolMessages, lastUserMessage) {
+  let remainingChars = 12000;
+  const evidenceMessages = toolMessages
+    .filter((message) => message.role === 'tool' && remainingChars > 0)
+    .map((message) => {
+      const content = String(message.content || '').slice(0, Math.min(3000, remainingChars));
+      remainingChars -= content.length;
+      return {
+        role: 'system',
+        content: `Read-only tool result (${message.tool_call_id}): ${content}`,
+      };
+    });
+  return [
+    {
+      role: 'system',
+      content: 'Finalization turn. Tools are disabled. Do not emit a tool call. Use only the read-only evidence below and answer the user in plain text. Clearly state any remaining uncertainty.',
+    },
+    { role: 'user', content: lastUserMessage },
+    ...evidenceMessages,
+  ];
+}
+
 export function startWebSocketServer(port) {
   const wss = new WebSocketServer({ port });
 
@@ -102,6 +124,7 @@ export function startWebSocketServer(port) {
                 toolMessages.push({
                   role: 'tool',
                   tool_call_id: toolCallId,
+                  name,
                   content: JSON.stringify(completedToolCalls.get(key)).slice(0, 12000),
                 });
                 continue;
@@ -128,6 +151,7 @@ export function startWebSocketServer(port) {
               toolMessages.push({
                 role: 'tool',
                 tool_call_id: toolCallId,
+                name,
                 content: serialized.slice(0, 12000),
               });
             }
@@ -141,7 +165,18 @@ export function startWebSocketServer(port) {
             }
             toolMessages.push({ role: 'system', content: evidenceContinuationPrompt(lastUserMessage, evidence) });
           }
-          if (!finalMessage) throw new Error(`Developer tool loop stopped after ${maxRounds} rounds.`);
+          if (!finalMessage) {
+            // Preserve the bounded tool-call budget, then give the provider one
+            // final answer-only turn using the evidence already collected.
+            toolMessages.push({
+              role: 'system',
+              content: 'The read-only exploration budget is complete. Do not request another tool. Give the best evidence-based final answer now, and clearly state any remaining uncertainty.',
+            });
+            finalMessage = await completeDeveloper({
+              messages: buildFinalizationMessages(toolMessages, lastUserMessage),
+              allowTools: false,
+            });
+          }
           const content = typeof finalMessage.content === 'string' ? finalMessage.content : '';
           if (content && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'token', content, ...responseMeta }));
           if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({

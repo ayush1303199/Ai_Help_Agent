@@ -88,6 +88,10 @@ interface ConfiguredProvider {
   priority: number;
   status?: string;
   hasApiKey?: boolean;
+  assistantCapable?: boolean;
+  developerToolCalling?: boolean;
+  developerToolCallingVerified?: boolean;
+  developerStatus?: string;
 }
 
 interface DeveloperSearchResult {
@@ -236,7 +240,7 @@ const providerPresets = {
   openrouter: { label: 'OpenRouter', model: 'openai/gpt-4o-mini', baseURL: 'https://openrouter.ai/api/v1' },
   llama: { label: 'Llama / Together', model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', baseURL: 'https://api.together.xyz/v1' },
   mistral: { label: 'Mistral', model: 'mistral-small-latest', baseURL: 'https://api.mistral.ai/v1' },
-  gemini: { label: 'Gemini gateway', model: 'gemini-2.0-flash', baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai' },
+  gemini: { label: 'Gemini', model: 'gemini-3.6-flash', baseURL: 'https://generativelanguage.googleapis.com/v1beta' },
   xai: { label: 'xAI Grok', model: 'grok-3-mini', baseURL: 'https://api.x.ai/v1' },
   perplexity: { label: 'Perplexity', model: 'sonar', baseURL: 'https://api.perplexity.ai' },
   fireworks: { label: 'Fireworks', model: 'accounts/fireworks/models/llama-v3p1-8b-instruct', baseURL: 'https://api.fireworks.ai/inference/v1' },
@@ -279,7 +283,18 @@ function App() {
   const [developerSearchResults, setDeveloperSearchResults] = useState<DeveloperSearchResult[]>([]);
   const [developerProposalSearchQuery, setDeveloperProposalSearchQuery] = useState('');
   const [developerChangeRequest, setDeveloperChangeRequest] = useState('');
-  const [developerProposal, setDeveloperProposal] = useState<{ id?: string; state?: string; files: DeveloperDiffFile[]; raw: string; searchedFiles: string[]; snapshots: DeveloperSnapshot[] } | null>(null);
+  const [developerProposal, setDeveloperProposal] = useState<{
+    id?: string;
+    state?: string;
+    lifecycleState?: string;
+    files: DeveloperDiffFile[];
+    raw: string;
+    searchedFiles: string[];
+    snapshots: DeveloperSnapshot[];
+    verification?: { status?: string; classification?: string; reason?: string; attempts?: Array<{ check?: string; ok?: boolean; classification?: string; extracted?: { file?: string | null; line?: number | null; message?: string } }> } | null;
+    outcome?: string | null;
+    error?: string | null;
+  } | null>(null);
   const [developerBusy, setDeveloperBusy] = useState(false);
   const [appMode, setAppMode] = useState<AppMode>('assistant');
   const [draftImproving, setDraftImproving] = useState(false);
@@ -725,6 +740,19 @@ function App() {
 
     if (!isDraftImprove && !isCurrentChat && !isDeveloperChat && !isDeveloperProposal) return;
 
+    if (msg.type === 'decision' && isDeveloperChat) {
+      const decision = msg.decision;
+      if (decision?.decision === 'NEEDS_CLARIFICATION') {
+        setDeveloperMessages((previous) => [...previous, {
+          role: 'assistant',
+          content: `${decision.question}\n\nCandidates:\n${decision.candidates.map((candidate: string) => `- ${candidate}`).join('\n')}`,
+          streaming: false,
+          requestId: String(msg.requestId),
+        }]);
+      }
+      return;
+    }
+
     if (msg.type === 'tool_call') {
       const requestId = String(msg.requestId);
       const toolCallId = String(msg.toolCallId);
@@ -752,18 +780,6 @@ function App() {
         }
         return;
       }
-      if (msg.type === 'decision' && isDeveloperChat) {
-        const decision = msg.decision;
-        if (decision?.decision === 'NEEDS_CLARIFICATION') {
-          setDeveloperMessages((previous) => [...previous, {
-            role: 'assistant',
-            content: `${decision.question}\n\nCandidates:\n${decision.candidates.map((candidate: string) => `- ${candidate}`).join('\n')}`,
-            streaming: false,
-            requestId: String(msg.requestId),
-          }]);
-        }
-        return;
-      }
       void (async () => {
         try {
           if (!window.electronAPI || !developerProjectRoot) throw new Error('Select a project before using developer tools.');
@@ -771,6 +787,8 @@ function App() {
           else if (msg.name === 'read_file') sendToolResult(await window.electronAPI.readDeveloperFile(String(args.relativePath || '')));
           else if (msg.name === 'search_code') sendToolResult(await window.electronAPI.searchDeveloperCode(String(args.query || '')));
           else if (msg.name === 'search_symbols') sendToolResult(await window.electronAPI.searchDeveloperSymbols(String(args.query || '').slice(0, 200)));
+          else if (msg.name === 'get_repository_map') sendToolResult(await window.electronAPI.getDeveloperRepositoryMap());
+          else if (msg.name === 'find_references') sendToolResult(await window.electronAPI.findDeveloperReferences(String(args.query || '').slice(0, 200)));
           else if (msg.name === 'get_context') sendToolResult(await window.electronAPI.assembleDeveloperContext({ query: String(args.query || '').slice(0, 200), maxTokens: args.maxTokens }));
           else if (msg.name === 'run_command') sendToolResult(await window.electronAPI.runDeveloperVerification(String(args.script || '')));
           else throw new Error(`Unsupported developer tool: ${String(msg.name)}`);
@@ -852,7 +870,7 @@ function App() {
         }
         const snapshots = developerProposalSnapshotsRef.current.get(requestId) || [];
         void window.electronAPI?.createDeveloperProposal(responseText, snapshots).then((registered) => {
-          setDeveloperProposal({ id: registered.id, state: registered.state, files, raw: responseText, searchedFiles, snapshots });
+          setDeveloperProposal({ id: registered.id, state: registered.state, lifecycleState: registered.lifecycleState, files, raw: responseText, searchedFiles, snapshots, verification: null, outcome: null, error: null });
         }).catch((error) => setError((error as Error).message));
         developerProposalBuffersRef.current.delete(requestId);
         developerProposalFilesRef.current.delete(requestId);
@@ -1274,10 +1292,11 @@ function App() {
 
   const approveDeveloperProposal = async () => {
     if (!developerProposal?.id || !window.electronAPI) return;
+    setDeveloperBusy(true);
     try {
       const result = await window.electronAPI.approveDeveloperProposal(developerProposal.id);
-      setDeveloperProposal((current) => current ? { ...current, state: result.state } : current);
-    } catch (error) { setError((error as Error).message); }
+      setDeveloperProposal((current) => current ? { ...current, state: result.state, lifecycleState: result.lifecycleState } : current);
+    } catch (error) { setError((error as Error).message); } finally { setDeveloperBusy(false); }
   };
 
   const applyDeveloperProposal = async () => {
@@ -1285,7 +1304,14 @@ function App() {
     setDeveloperBusy(true);
     try {
       const result = await window.electronAPI.applyDeveloperProposal(developerProposal.id);
-      setDeveloperProposal((current) => current ? { ...current, state: result.state } : current);
+      setDeveloperProposal((current) => current ? {
+        ...current,
+        state: result.state,
+        lifecycleState: result.lifecycleState,
+        verification: result.verification,
+        outcome: result.outcome,
+        error: result.error,
+      } : current);
     } catch (error) { setError((error as Error).message); } finally { setDeveloperBusy(false); }
   };
 
@@ -2187,7 +2213,7 @@ function App() {
             <div className="mb-5">
               <p className="text-[11px] font-semibold uppercase tracking-wider text-sky-300">Developer Mode</p>
               <h2 className="mt-1 text-xl font-semibold">Coding assistant</h2>
-              <p className="mt-2 text-xs text-slate-500">Read-only project access. No writes, commands, microphone, or Assistant audio pipeline are available.</p>
+              <p className="mt-2 text-xs text-slate-500">Read and search are automatic. Source writes happen only through a validated proposal after you explicitly approve it; verification uses allow-listed project scripts.</p>
             </div>
             <div className="mb-5 rounded-xl border border-slate-700 bg-slate-800/50 p-3">
               <div className="flex items-center justify-between gap-2">
@@ -2246,11 +2272,11 @@ function App() {
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-200">Proposed diff</p>
-                    <p className="mt-1 text-[11px] text-slate-400">State: {developerProposal.state || 'pending'} · main process validates every file before writing.</p>
+                    <p className="mt-1 text-[11px] text-slate-400">State: {developerProposal.lifecycleState || developerProposal.state || 'pending'} · main process validates every file before writing.</p>
                   </div>
                   <div className="flex items-center gap-2">
-                    {developerProposal.state === 'awaiting_approval' && <button onClick={() => void approveDeveloperProposal()} className="rounded-md bg-amber-400 px-2 py-1 text-[11px] font-medium text-slate-950">Approve</button>}
-                    {developerProposal.state === 'approved' && <button onClick={() => void applyDeveloperProposal()} disabled={developerBusy} className="rounded-md bg-emerald-400 px-2 py-1 text-[11px] font-medium text-slate-950 disabled:opacity-40">Apply</button>}
+                    {developerProposal.state === 'awaiting_approval' && <button onClick={() => void approveDeveloperProposal()} disabled={developerBusy} className="rounded-md bg-amber-400 px-2 py-1 text-[11px] font-medium text-slate-950 disabled:opacity-40">Approve</button>}
+                    {developerProposal.state === 'approved' && <button onClick={() => void applyDeveloperProposal()} disabled={developerBusy} className="rounded-md bg-emerald-400 px-2 py-1 text-[11px] font-medium text-slate-950 disabled:opacity-40">Apply and verify</button>}
                     {developerProposal.state === 'completed' && <button onClick={() => void undoDeveloperProposal()} disabled={developerBusy} className="rounded-md border border-rose-400/60 px-2 py-1 text-[11px] text-rose-200 disabled:opacity-40">Undo</button>}
                     <button onClick={() => setDeveloperProposal(null)} className="text-[11px] text-slate-400 hover:text-slate-200">Discard</button>
                   </div>
@@ -2268,6 +2294,18 @@ function App() {
                 ) : (
                   <pre className="mt-3 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] text-slate-300">{developerProposal.raw || 'No safe changes proposed.'}</pre>
                 )}
+                {developerProposal.verification && (
+                  <div className={`mt-3 rounded-md border p-2 text-[11px] ${developerProposal.verification.status === 'PASS' || developerProposal.verification.status === 'NOT_AVAILABLE' ? 'border-emerald-500/30 text-emerald-200' : 'border-rose-500/30 text-rose-200'}`}>
+                    <p>Verification: {developerProposal.verification.status || 'UNKNOWN'}</p>
+                    {developerProposal.verification.reason && <p className="mt-1 text-slate-400">{developerProposal.verification.reason}</p>}
+                    {developerProposal.verification.attempts?.filter((attempt) => !attempt.ok).map((attempt, index) => (
+                      <p key={`${attempt.check || 'check'}-${index}`} className="mt-1 text-rose-200">
+                        {attempt.check || 'check'}: {attempt.classification || 'failed'}{attempt.extracted?.file ? ` · ${attempt.extracted.file}${attempt.extracted.line ? `:${attempt.extracted.line}` : ''}` : ''}
+                      </p>
+                    ))}
+                  </div>
+                )}
+                {developerProposal.error && <p className="mt-2 text-[11px] text-rose-300">{developerProposal.error}</p>}
               </section>
             )}
             <div className="flex-1 space-y-4 overflow-y-auto">

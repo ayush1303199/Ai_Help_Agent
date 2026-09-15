@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import {
   clarificationDecision,
+  createTaskGraph,
+  createTaskMemory,
   evaluateScope,
   evaluateUnderstanding,
+  resolveAgentMode,
   updateEvidence,
+  buildReadPlan,
 } from '../server/src/llm/developerDecisionEngine.js';
 
 function simulateAdaptiveLoop() {
@@ -91,9 +95,22 @@ const scope = evaluateScope({
   proposalFiles: ['src/login.ts', 'src/config.ts'],
 });
 assert.equal(scope.state, 'SCOPE_EXPANDED');
+assert.equal(resolveAgentMode('Fix the login timeout bug.'), 'AGENT');
+assert.equal(resolveAgentMode('Explain where the login timeout is configured.'), 'ASK');
+assert.equal(resolveAgentMode('Plan the authentication bugfix steps.'), 'PLAN');
+const plan = buildReadPlan('Fix the login timeout bug.');
+assert.equal(plan.mode, 'AGENT');
+assert.ok(Array.isArray(plan.taskPlan.tasks) && plan.taskPlan.tasks.length >= 3);
+assert.ok(createTaskGraph(plan.taskPlan).tasks.length >= 3);
+const memory = createTaskMemory();
+memory.setGoal('Fix login timeout').recordFile('src/login.ts').addFinding('timeout is read from config').recordProposal('proposal-1');
+assert.equal(memory.filesInspected[0], 'src/login.ts');
+assert.equal(memory.proposalIds[0], 'proposal-1');
 console.log(JSON.stringify({
   simulated: true,
   adaptiveEvents,
   clarification,
   scope: { state: scope.state, scopeExpansion: scope.scopeExpansion, scopeRisk: scope.scopeRisk },
+  plan: { mode: plan.mode, taskCount: plan.taskPlan.tasks.length },
+  memory: memory.summarize(),
 }));

@@ -5,11 +5,20 @@ function tokens(text) { return Math.ceil(String(text || '').length / 4); }
 function rankResults(results, query) {
   const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
   return [...results].map((item) => {
-    const haystack = `${item.path || ''} ${item.text || ''} ${item.name || ''}`.toLowerCase();
-    const score = terms.reduce((total, term) => total + (haystack.includes(term) ? 10 : 0), 0)
+    const path = String(item.path || '');
+    const name = String(item.name || '');
+    const text = String(item.text || item.content || '');
+    const haystack = `${path} ${text} ${name}`.toLowerCase();
+    let score = terms.reduce((total, term) => total + (haystack.includes(term) ? 10 : 0), 0)
       + (item.matchType === 'content' ? 2 : 1)
       + (item.isDependency || item.dependency ? 3 : 0)
-      + (item.isTest || /(?:^|[./_-])(test|spec)(?:[./_-]|$)/i.test(item.path || '') ? 2 : 0);
+      + (item.isTest || /(?:^|[./_-])(test|spec)(?:[./_-]|$)/i.test(path) ? 2 : 0)
+      + (path.toLowerCase().includes('src/') || path.toLowerCase().includes('/src') ? 4 : 0)
+      + (path.toLowerCase().includes('electron') ? 5 : 0)
+      + (path.toLowerCase().includes('server') ? 4 : 0)
+      + (name && terms.some((term) => name.toLowerCase().includes(term)) ? 8 : 0);
+    const symbolBoost = /(?:function|class|component|hook|service|provider|model|context|route|index)/i.test(path + ' ' + name);
+    if (symbolBoost) score += 3;
     return { ...item, score };
   }).sort((a, b) => b.score - a.score || String(a.path).localeCompare(String(b.path)) || (a.line || 0) - (b.line || 0));
 }

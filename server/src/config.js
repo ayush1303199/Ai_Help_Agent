@@ -33,7 +33,7 @@ export const config = {
   custom: { apiKey: process.env.CUSTOM_OPENAI_API_KEY, model: env('CUSTOM_OPENAI_MODEL', 'gpt-4o-mini'), baseURL: env('CUSTOM_OPENAI_BASE_URL', 'https://api.openai.com/v1') },
   'custom-openai': { apiKey: process.env.CUSTOM_OPENAI_API_KEY, model: env('CUSTOM_OPENAI_MODEL', 'gpt-4o-mini'), baseURL: env('CUSTOM_OPENAI_BASE_URL', 'https://api.openai.com/v1') },
   anthropic: { apiKey: process.env.ANTHROPIC_API_KEY, model: env('ANTHROPIC_MODEL', 'claude-3-5-haiku-latest'), baseURL: 'https://api.anthropic.com/v1' },
-  gemini: { apiKey: process.env.GEMINI_API_KEY, model: env('GEMINI_MODEL', 'gemini-2.0-flash'), baseURL: 'https://generativelanguage.googleapis.com/v1beta' },
+  gemini: { apiKey: process.env.GEMINI_API_KEY, model: env('GEMINI_MODEL', 'gemini-3.6-flash'), baseURL: 'https://generativelanguage.googleapis.com/v1beta' },
   cohere: { apiKey: process.env.COHERE_API_KEY, model: env('COHERE_MODEL', 'command-r-plus'), baseURL: 'https://api.cohere.com/v2' },
   server: {
     port: parseInt(process.env.PORT, 10) || 3001,

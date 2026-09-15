@@ -1,5 +1,6 @@
 const { app, BrowserWindow, desktopCapturer, session, ipcMain, dialog } = require('electron');
 const path = require('node:path');
+const fs = require('node:fs/promises');
 const developerFiles = require('./developerFiles.cjs');
 const developerAgent = require('./developerAgent.cjs');
 const developerIndex = require('./developerIndex.cjs');
@@ -116,33 +117,63 @@ app.whenReady().then(async () => {
   ipcMain.handle('overlay:close', () => {
     if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close();
   });
-  ipcMain.handle('developer:choose-project', (_event) => developerFiles.chooseProjectFolder(dialog));
-  ipcMain.handle('developer:clear-project', () => {
-    developerFiles.clearProject();
+  ipcMain.handle('developer:choose-project', (event) => {
+    developerAgent.getSession(event.sender.id);
+    return developerFiles.chooseProjectFolder(dialog, event.sender.id);
   });
-  ipcMain.handle('developer:list-directory', (_event, relativePath) => developerFiles.listDirectory(relativePath));
-  ipcMain.handle('developer:read-file', (_event, relativePath) => developerFiles.readFile(relativePath));
-  ipcMain.handle('developer:search-code', (_event, query) => developerFiles.searchCode(query));
+  ipcMain.handle('developer:clear-project', (event) => {
+    developerAgent.getSession(event.sender.id);
+    developerFiles.clearProject(event.sender.id);
+  });
+  ipcMain.handle('developer:list-directory', (event, relativePath) => {
+    developerAgent.getSession(event.sender.id);
+    return developerFiles.listDirectory(relativePath, event.sender.id);
+  });
+  ipcMain.handle('developer:read-file', (event, relativePath) => {
+    developerAgent.getSession(event.sender.id);
+    return developerFiles.readFile(relativePath, event.sender.id);
+  });
+  ipcMain.handle('developer:search-code', (event, query) => {
+    developerAgent.getSession(event.sender.id);
+    return developerFiles.searchCode(query, event.sender.id);
+  });
   const ownedDeveloperSession = (event) => {
     const sessionId = developerAgent.getSession(event.sender.id);
     return { sessionId, ownerWebContentsId: event.sender.id };
   };
   ipcMain.handle('developer:index', async (event) => {
     ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
     const currentRoot = developerFiles.getProjectRoot();
     developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
     return { capabilities: developerIndexCache.capabilities, files: Object.keys(developerIndexCache.files), cacheHits: developerIndexCache.cacheHits };
   });
   ipcMain.handle('developer:symbol-search', async (event, query) => {
     ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
     const currentRoot = developerFiles.getProjectRoot();
     developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
     return developerIndex.searchSymbols(developerIndexCache, query).slice(0, 100);
   });
+  ipcMain.handle('developer:repository-map', async (event) => {
+    ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const currentRoot = developerFiles.getProjectRoot();
+    developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
+    return developerIndex.buildRepositoryMap(currentRoot, developerIndexCache?.repositoryMap || null);
+  });
+  ipcMain.handle('developer:find-references', async (event, query) => {
+    ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const currentRoot = developerFiles.getProjectRoot();
+    developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
+    return developerIndex.findReferences(developerIndexCache, String(query || '').trim()).slice(0, 100);
+  });
   ipcMain.handle('developer:context', async (event, payload) => {
     ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
     const query = payload?.query;
-    const search = await developerFiles.searchCode(query);
+    const search = await developerFiles.searchCode(query, event.sender.id);
     if (!developerIndexCache || developerIndexCache.root !== developerFiles.getProjectRoot()) {
       developerIndexCache = await developerIndex.buildIndex(developerFiles.getProjectRoot());
     }
@@ -152,30 +183,78 @@ app.whenReady().then(async () => {
     return developerContext.assembleContext({ query, results: [...search.results, ...symbols], maxTokens: payload?.maxTokens });
   });
   ipcMain.handle('developer:provider-discovery', (_event, providers) => developerBenchmark.discoverProviders(providers));
-  ipcMain.handle('developer:run-verification', (_event, script) => developerFiles.runVerification(script));
+  ipcMain.handle('developer:run-verification', (event, script) => {
+    ownedDeveloperSession(event);
+    return developerFiles.runVerification(script, event.sender.id);
+  });
   ipcMain.handle('developer:session', (event) => {
-    event.sender.once('destroyed', () => developerAgent.releaseSession(event.sender.id));
+    event.sender.once('destroyed', () => {
+      developerAgent.releaseSession(event.sender.id);
+      developerFiles.releaseProject(event.sender.id);
+    });
     return { sessionId: developerAgent.getSession(event.sender.id) };
   });
   ipcMain.handle('developer:session-resume', (event, sessionId) => ({ sessionId: developerAgent.resumeSession(event.sender.id, sessionId) }));
-  ipcMain.handle('developer:git-inspect', (_event, kind) => developerFiles.runGit(kind === 'diff' ? ['diff', '--no-ext-diff'] : ['status', '--short']));
-  ipcMain.handle('developer:proposal-create', (event, payload) => developerAgent.createProposal({
-    root: developerFiles.getProjectRoot(), raw: payload?.raw, expectedSnapshots: payload?.snapshots,
-    sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id,
-    workspace: payload?.workspace,
-    verificationScript: payload?.verificationScript || null,
-  }));
+  ipcMain.handle('developer:git-inspect', (event, kind) => {
+    ownedDeveloperSession(event);
+    return developerFiles.runGit(kind === 'diff' ? ['diff', '--no-ext-diff'] : ['status', '--short'], event.sender.id);
+  });
+  ipcMain.handle('developer:proposal-create', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
+    return developerAgent.createProposal({
+      root: developerFiles.getProjectRoot(), raw: payload?.raw, expectedSnapshots: payload?.snapshots,
+      sessionId: owner.sessionId, ownerWebContentsId: owner.ownerWebContentsId,
+      workspace: payload?.workspace,
+      verificationScript: payload?.verificationScript || null,
+    });
+  });
   ipcMain.handle('developer:proposal-approve', (event, id) => developerAgent.approve(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
   ipcMain.handle('developer:proposal-apply', async (event, id) => {
     const owner = { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id };
     const task = developerAgent.getTaskForTest(id);
-    const verify = () => task.verificationScript
-      ? developerFiles.runVerification(task.verificationScript)
-        .then(developerAgent.normalizeCommandResult)
-        .catch((error) => (/not defined/i.test(error.message) ? { ok: true, skipped: true, failure: null } : Promise.reject(error)))
-      : Promise.resolve({ ok: true, skipped: true, failure: null });
+    if (!task) throw new Error('Unknown Developer task.');
+    developerAgent.getTask(id, owner);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const currentRoot = await fs.realpath(developerFiles.getProjectRoot());
+    const requestedScripts = task.verificationScripts?.length
+      ? task.verificationScripts
+      : task.verificationScript ? [task.verificationScript] : [];
+    const verificationPlan = await developerFiles.getVerificationScripts(event.sender.id, requestedScripts);
+    const verify = () => {
+      if (verificationPlan.missing?.length) {
+        return Promise.resolve({
+          ok: false,
+          status: 'COMMAND_NOT_AVAILABLE',
+          classification: 'COMMAND_NOT_AVAILABLE',
+          failure: 'missing_dependency',
+          checks: verificationPlan.scripts,
+          attempts: [],
+          reason: verificationPlan.reason,
+        });
+      }
+      return developerAgent.runVerificationChecks({
+        checks: verificationPlan.scripts,
+        isCancelled: () => developerAgent.isCancellationRequested(id, owner),
+        onProgress: (progress) => {
+          if (progress.check) console.log(`[DEV][VERIFY] task=${id} check=${progress.check}`);
+        },
+        runCheck: (script) => developerFiles.runVerification(script, event.sender.id, {
+          isCancelled: () => developerAgent.isCancellationRequested(id, owner),
+        }).catch((error) => ({
+          ok: false,
+          script,
+          exitCode: null,
+          stdout: '',
+          stderr: error.message,
+          error: error.message,
+        })),
+      }).then((result) => verificationPlan.reason && result.status === 'NOT_AVAILABLE'
+        ? { ...result, reason: verificationPlan.reason }
+        : result);
+    };
     try {
-      return await developerAgent.apply(id, owner, verify);
+      return await developerAgent.apply(id, owner, verify, currentRoot);
     } catch (error) {
       if (error.taskSnapshot) return error.taskSnapshot;
       throw error;

@@ -6,6 +6,12 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const viteCommand = process.platform === 'win32'
+  ? path.join(root, 'node_modules', '.bin', 'vite.cmd')
+  : path.join(root, 'node_modules', '.bin', 'vite');
+const electronCommand = process.platform === 'win32'
+  ? path.join(root, 'node_modules', '.bin', 'electron.cmd')
+  : path.join(root, 'node_modules', '.bin', 'electron');
 const children = [];
 let shuttingDown = false;
 
@@ -21,6 +27,27 @@ function start(command, args) {
     }
   });
   return child;
+}
+
+async function stopChild(child) {
+  if (!child || child.exitCode !== null || child.killed) return;
+
+  if (process.platform === 'win32') {
+    await new Promise((resolve) => {
+      const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+      killer.once('exit', () => setTimeout(resolve, 250));
+      killer.once('error', () => setTimeout(resolve, 250));
+    });
+    return;
+  }
+
+  child.kill('SIGTERM');
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (child.exitCode === null) child.kill('SIGKILL');
 }
 
 function waitForHttp(url, timeoutMs = 30000) {
@@ -64,7 +91,7 @@ async function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   for (const child of children.slice().reverse()) {
-    if (!child.killed) child.kill();
+    await stopChild(child);
   }
   setTimeout(() => process.exit(code), 750).unref();
 }
@@ -74,13 +101,13 @@ process.once('SIGTERM', () => void shutdown(0));
 
 try {
   start(npmCommand, ['run', 'server:dev']);
-  start(process.platform === 'win32' ? 'vite.cmd' : 'vite', ['--port', '5174', '--strictPort']);
+  start(viteCommand, ['--port', '5174', '--strictPort']);
   await Promise.all([
     waitForTcp(5174),
     waitForHttp('http://localhost:3001/api/health'),
     waitForTcp(3002),
   ]);
-  const electron = start(process.platform === 'win32' ? 'electron.cmd' : 'electron', ['electron/main.cjs']);
+  const electron = start(electronCommand, ['electron/main.cjs']);
   await new Promise((resolve) => electron.once('exit', (code) => resolve(code || 0)));
   await shutdown(0);
 } catch (error) {

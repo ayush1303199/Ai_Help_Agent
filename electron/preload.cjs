@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   searchDeveloperCode: (query) => ipcRenderer.invoke('developer:search-code', query),
   buildDeveloperIndex: () => ipcRenderer.invoke('developer:index'),
   searchDeveloperSymbols: (query) => ipcRenderer.invoke('developer:symbol-search', query),
+  getDeveloperRepositoryMap: () => ipcRenderer.invoke('developer:repository-map'),
+  findDeveloperReferences: (query) => ipcRenderer.invoke('developer:find-references', query),
   assembleDeveloperContext: (payload) => ipcRenderer.invoke('developer:context', {
     query: String(payload?.query || '').slice(0, 200),
     maxTokens: Math.max(64, Math.min(Number(payload?.maxTokens) || 4000, 12000)),

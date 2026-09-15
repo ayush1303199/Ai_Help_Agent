@@ -11,9 +11,12 @@
     "electron:dev": "npm run preflight && node scripts/electron-dev.mjs",
     "electron:start": "electron electron/main.cjs",
     "build": "vite build",
+    "test": "node scripts/test-all.mjs",
     "test:phase8": "node scripts/phase8-protocol-test.mjs",
     "test:developer-agent": "node scripts/developer-agent-test.mjs",
     "test:developer-gates": "node scripts/developer-gates-test.mjs",
+    "test:developer-lifecycle": "node scripts/developer-lifecycle-test.mjs",
+    "test:gemini-protocol": "node scripts/gemini-protocol-test.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json"

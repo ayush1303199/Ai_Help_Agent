@@ -22,3 +22,7 @@ dist-ssr
 *.sln
 *.sw?
 .env
+.developer-journal-*
+.developer-test-*
+.developer-gates-*
+.developer-lifecycle-*

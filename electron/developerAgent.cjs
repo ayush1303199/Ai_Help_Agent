@@ -24,7 +24,7 @@ const transitions = {
   reading: ['understanding', 'proposal_ready', 'failed', 'cancelled'],
   understanding: ['proposal_ready', 'reading', 'failed', 'cancelled'],
   proposal_ready: ['awaiting_approval', 'failed', 'cancelled'],
-  awaiting_approval: ['approved', 'applying', 'verifying', 'failed', 'cancelled'],
+  awaiting_approval: ['approved', 'verifying', 'failed', 'cancelled'],
   approved: ['applying', 'failed', 'cancelled'],
   applying: ['verifying', 'recovering', 'failed', 'cancelled'],
   verifying: ['completed', 'recovering', 'failed', 'cancelled'],
@@ -196,11 +196,16 @@ function publicTask(task) {
   return {
     id: task.taskId, taskId: task.taskId, sessionId: task.sessionId, state: task.state,
     lifecycleState: STATE_ALIASES[task.state] || task.state.toUpperCase(),
+    proposalId: task.proposalId || task.taskId,
     workspace: task.workspace, files: task.files.map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
+    targetFiles: task.files.map(({ path }) => path),
+    snapshotHashes: task.before.map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
+    approval: task.approval ? { approvedAt: task.approval.approvedAt, actor: task.approval.actor } : null,
     progress: task.progress, verification: task.verification || null, verificationScript: task.verificationScript || null,
+    verificationScripts: task.verificationScripts || [],
     outcome: task.outcome || null, error: task.error || null,
     durability: { journalError: journalError?.message || null, auditError: auditError?.message || null },
-    updatedAt: task.updatedAt,
+    createdAt: task.createdAt, updatedAt: task.updatedAt,
   };
 }
 function inside(root, target) {
@@ -260,9 +265,17 @@ function applyFilePatch(original, lines) {
   output.push(...source.slice(cursor)); return output.join('\n');
 }
 
-async function createProposal({ root: inputRoot, raw, expectedSnapshots = [], sessionId, ownerWebContentsId, workspace = {}, verificationScript = null }) {
+async function createProposal({
+  root: inputRoot, raw, expectedSnapshots = [], sessionId, ownerWebContentsId,
+  workspace = {}, verificationScript = null, verificationScripts = [],
+}) {
   if (!sessionId || ownerWebContentsId === undefined) throw new Error('Developer session ownership is required.');
   if (verificationScript !== null) commandPolicy(verificationScript);
+  const requestedScripts = [
+    ...(Array.isArray(verificationScripts) ? verificationScripts : []),
+    ...(verificationScript ? [verificationScript] : []),
+  ];
+  const safeVerificationScripts = [...new Set(requestedScripts.map((script) => commandPolicy(script).script))];
   const root = await fs.realpath(inputRoot);
   const files = parsePatch(raw); const unique = new Set(); const before = []; const changes = [];
   for (const file of files) {
@@ -278,32 +291,50 @@ async function createProposal({ root: inputRoot, raw, expectedSnapshots = [], se
   }
   const task = {
     taskId: crypto.randomUUID(), sessionId, ownerWebContentsId, root,
+    proposalId: crypto.randomUUID(),
     workspace: { root, name: workspace.name || path.basename(root), branch: workspace.branch || null },
-    raw, files: changes, before, verificationScript, state: 'proposal_ready', progress: { phase: 'proposal', message: 'Validated proposal.', at: now() },
+    raw, files: changes, before,
+    verificationScript: safeVerificationScripts[0] || null,
+    verificationScripts: safeVerificationScripts,
+    state: 'proposal_ready', progress: { phase: 'proposal', message: 'Validated proposal.', at: now() },
     createdAt: now(), updatedAt: now(),
   };
-  registry.set(task.taskId, task); recordMutation(task, 'proposal_registered', { proposalId: task.taskId });
+  registry.set(task.taskId, task); recordMutation(task, 'proposal_registered', { proposalId: task.proposalId });
   transition(task, 'awaiting_approval'); return publicTask(task);
 }
 function getTask(taskId, owner) { const task = registry.get(taskId); if (!task) throw new Error('Unknown Developer task.'); assertOwner(task, owner); return task; }
-function approve(taskId, owner) { const task = getTask(taskId, owner); transition(task, 'approved'); recordMutation(task, 'proposal_approved', { proposalId: taskId }); return publicTask(task); }
+function approve(taskId, owner) {
+  const task = getTask(taskId, owner);
+  task.approval = { approvedAt: now(), actor: 'renderer-session' };
+  transition(task, 'approved');
+  recordMutation(task, 'proposal_approved', { proposalId: task.proposalId || taskId, actor: task.approval.actor });
+  return publicTask(task);
+}
 async function writeAndVerify(task, files) {
   const written = [];
+  const temporary = [];
   try {
     for (const file of files) {
       const safe = await safePath(task.root, file.path);
       const temp = `${safe.target}.developer-${task.taskId}.tmp`;
+      temporary.push(temp);
       await fs.writeFile(temp, file.content, 'utf8');
       await fs.rename(temp, safe.target); written.push(file);
     }
     const resulting = await Promise.all(files.map((file) => snapshot(task.root, file.path)));
     if (resulting.some((item, index) => item.hash !== files[index].hash)) throw new Error('Post-apply verification failed.');
   } catch (error) {
+    await Promise.all(temporary.map((temp) => fs.rm(temp, { force: true }).catch(() => {})));
     for (const file of written) {
       const safe = await safePath(task.root, file.path);
       const original = task.before.find((item) => item.path === file.path);
-      await fs.writeFile(`${safe.target}.developer-rollback-${task.taskId}.tmp`, original.content, 'utf8');
-      await fs.rename(`${safe.target}.developer-rollback-${task.taskId}.tmp`, safe.target);
+      const rollbackTemp = `${safe.target}.developer-rollback-${task.taskId}.tmp`;
+      try {
+        await fs.writeFile(rollbackTemp, original.content, 'utf8');
+        await fs.rename(rollbackTemp, safe.target);
+      } finally {
+        await fs.rm(rollbackTemp, { force: true }).catch(() => {});
+      }
     }
     const restored = await Promise.all(written.map((file) => snapshot(task.root, file.path)));
     if (restored.some((item, index) => item.hash !== task.before.find((before) => before.path === written[index].path).hash)) {
@@ -312,48 +343,67 @@ async function writeAndVerify(task, files) {
     throw error;
   }
 }
-async function apply(taskId, owner, verifyRunner) {
+async function restoreBeforeSnapshot(task) {
+  const temporary = [];
+  try {
+    for (const file of task.before) {
+      const safe = await safePath(task.root, file.path);
+      const temp = `${safe.target}.developer-recovery-${task.taskId}.tmp`;
+      temporary.push(temp);
+      await fs.writeFile(temp, file.content, 'utf8');
+      await fs.rename(temp, safe.target);
+    }
+    const restored = await Promise.all(task.before.map((item) => snapshot(task.root, item.path)));
+    if (restored.some((item, index) => item.hash !== task.before[index].hash)) {
+      throw new Error('Rollback verification failed.');
+    }
+  } finally {
+    await Promise.all(temporary.map((temp) => fs.rm(temp, { force: true }).catch(() => {})));
+  }
+}
+async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
   const task = getTask(taskId, owner);
   if (task.state !== 'approved') throw new Error('Proposal must be approved exactly once.');
+  if (expectedRoot && (await fs.realpath(expectedRoot)) !== task.root) throw new Error('The selected project changed after this proposal was created.');
   const release = await acquireLock();
   task.transactionId = crypto.randomUUID();
+  let patchApplied = false;
+  let writeStarted = false;
   recordMutation(task, 'transaction_started', { transactionId: task.transactionId });
   try {
     transition(task, 'applying'); progress(task, 'apply', 'Applying validated patch.');
     const current = await Promise.all(task.before.map((item) => snapshot(task.root, item.path)));
     if (current.some((item, index) => item.hash !== task.before[index].hash)) throw new Error('Files changed after approval.');
     if (task.cancelRequested) { transition(task, 'cancelled'); return publicTask(task); }
+    writeStarted = true;
     await writeAndVerify(task, task.files);
+    patchApplied = true;
+    if (task.cancelRequested) throw Object.assign(new Error('Developer task was cancelled before verification.'), { cancelled: true });
     transition(task, 'verifying'); progress(task, 'verify', 'Running approved verification.');
     if (verifyRunner) {
       const result = await verifyRunner();
       task.verification = result;
-      recordMutation(task, 'verification_recorded', { transactionId: task.transactionId, attempt: 1, result: result?.failure || (result?.ok ? 'pass' : 'failure') });
+      recordMutation(task, 'verification_recorded', {
+        transactionId: task.transactionId, attempt: 1,
+        result: result?.status || result?.failure || (result?.ok ? 'pass' : 'failure'),
+      });
+      if (task.cancelRequested || result?.cancelled) {
+        throw Object.assign(new Error('Developer task was cancelled during verification.'), { cancelled: true });
+      }
       if (!result?.ok) throw new Error(`Verification failed (${result.failure || 'verification'}).`);
     }
     transition(task, 'completed'); progress(task, 'complete', 'Apply and verification completed.');
     return publicTask(task);
   } catch (error) {
     task.error = error.message;
-    if (task.state === 'applying' || task.state === 'verifying') {
+    if (patchApplied || writeStarted || task.state === 'verifying') {
       task.state = 'recovering'; task.updatedAt = now(); progress(task, 'recover', 'Apply failed; verifying rollback state.');
       try {
-        if (task.verification) {
-          for (const file of task.before) {
-            const safe = await safePath(task.root, file.path);
-            const temp = `${safe.target}.developer-recovery-${task.taskId}.tmp`;
-            await fs.writeFile(temp, file.content, 'utf8');
-            await fs.rename(temp, safe.target);
-          }
-        }
-        const restored = await Promise.all(task.before.map((item) => snapshot(task.root, item.path)));
-        if (restored.some((item, index) => item.hash !== task.before[index].hash)) {
-          task.error = `Rollback verification failed: ${error.message}`;
-        }
+        await restoreBeforeSnapshot(task);
       } catch (rollbackError) {
         task.error = `Rollback verification failed: ${rollbackError.message}`;
       }
-      task.state = 'failed'; task.updatedAt = now();
+      task.state = error.cancelled ? 'cancelled' : 'failed'; task.updatedAt = now();
     }
     task.updatedAt = now();
     recordMutation(task, 'transaction_failed', { transactionId: task.transactionId, error: error.message });
@@ -382,10 +432,26 @@ function classifyFailure(result) {
   if (/syntax|type error|compile/i.test(`${result?.stderr || ''}`)) return 'compile';
   return result?.exitCode === 0 ? 'success' : (Number.isInteger(result?.exitCode) ? 'exit' : 'verification');
 }
+function classifyFailureCategory(result) {
+  if (result?.cancelled) return 'CANCELLED';
+  if (result?.timedOut) return 'TIMEOUT';
+  const text = `${result?.stderr || ''}\n${result?.stdout || ''}\n${result?.error || ''}`;
+  if (/provider|quota|rate.?limit|429|503|high demand|service unavailable/i.test(text)) return 'PROVIDER_FAILURE';
+  if (result?.spawnError || result?.error) {
+    return /not found|enoent|cannot find/i.test(text) ? 'COMMAND_NOT_AVAILABLE' : 'ENVIRONMENT_FAILURE';
+  }
+  if (/module not found|cannot find module|dependency|package.*missing/i.test(text)) return 'DEPENDENCY_FAILURE';
+  if (/permission|access denied|eacces/i.test(text)) return 'ENVIRONMENT_FAILURE';
+  if (/syntax|type error|compile|ts\d{3,4}|failed|failure/i.test(text) || Number.isInteger(result?.exitCode)) return 'CODE_FAILURE';
+  return result?.ok ? null : 'ENVIRONMENT_FAILURE';
+}
 function normalizeCommandResult(result) {
   return { ok: Boolean(result?.ok), script: String(result?.script || ''), exitCode: result?.exitCode ?? null,
     stdout: String(result?.stdout || ''), stderr: String(result?.stderr || ''), durationMs: Number(result?.durationMs || 0),
-    failure: result?.ok ? null : classifyFailure(result) };
+    failure: result?.ok ? null : classifyFailure(result),
+    classification: result?.ok ? null : classifyFailureCategory(result),
+    cancelled: Boolean(result?.cancelled),
+  };
 }
 function commandPolicy(script) {
   const allowed = new Set(['lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify']);
@@ -437,16 +503,42 @@ function normalizeObservation(result, check = result?.script || '') {
   return { ...normalized, check, failure: normalized.failure, extracted: extractFailure(normalized) };
 }
 function diagnoseObservation(observation, metadata = {}) {
-  const environment = new Set(['spawn', 'permission', 'missing_dependency', 'timeout']);
+  const environment = new Set(['ENVIRONMENT_FAILURE', 'DEPENDENCY_FAILURE', 'COMMAND_NOT_AVAILABLE', 'TIMEOUT']);
   return {
     taskId: metadata.taskId || null,
     attempt: metadata.attempt || 1,
     check: observation.check,
-    classification: observation.failure,
-    environmentFailure: environment.has(observation.failure),
+    classification: observation.classification || classifyFailureCategory(observation),
+    environmentFailure: environment.has(observation.classification || classifyFailureCategory(observation)),
     location: observation.extracted,
     context: { workspace: metadata.workspace || null, branch: metadata.branch || null },
   };
+}
+async function runVerificationChecks({ checks, runCheck, isCancelled = () => false, onProgress = () => {} }) {
+  if (typeof runCheck !== 'function') throw new Error('Verification runner is required.');
+  const selectedChecks = [...new Set(checks || [])].map((check) => commandPolicy(check).script);
+  if (!selectedChecks.length) {
+    return { ok: true, status: 'NOT_AVAILABLE', skipped: true, checks: [], attempts: [] };
+  }
+  const attempts = [];
+  for (const check of selectedChecks) {
+    if (isCancelled()) return { ok: false, status: 'CANCELLED', cancelled: true, checks: selectedChecks, attempts };
+    onProgress({ phase: 'verify', check });
+    const result = normalizeObservation(await runCheck(check), check);
+    attempts.push(result);
+    if (!result.ok) {
+      return {
+        ok: false,
+        status: result.classification || 'CODE_FAILURE',
+        failure: result.failure,
+        classification: result.classification,
+        checks: selectedChecks,
+        attempts,
+        diagnosis: diagnoseObservation(result),
+      };
+    }
+  }
+  return { ok: true, status: 'PASS', checks: selectedChecks, attempts };
 }
 function updateLoopTask(taskId, owner, state, phase, message, outcome = null) {
   if (!taskId) return null;
@@ -534,6 +626,10 @@ async function runEngineeringLoop({
   return { status: 'MAX_ATTEMPTS', attempts: observations, fixes };
 }
 function getTaskForTest(taskId) { return registry.get(taskId); }
+function isCancellationRequested(taskId, owner) {
+  const task = getTask(taskId, owner);
+  return Boolean(task.cancelRequested);
+}
 function resetForTest() {
   registry.clear(); sessions.clear(); locked = false; journalError = null; auditError = null;
   journalQueue = Promise.resolve(); auditQueue = Promise.resolve();
@@ -541,7 +637,8 @@ function resetForTest() {
 module.exports = {
   STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, createProposal, approve, apply, undo,
   getTask: (id, owner) => publicTask(getTask(id, owner)), getTaskForTest, normalizeCommandResult,
-  classifyFailure, commandPolicy, selectVerificationChecks, extractFailure, normalizeObservation,
-  diagnoseObservation, executeVerificationLoop, runEngineeringLoop, configureDurability, loadJournal,
+  classifyFailure, classifyFailureCategory, commandPolicy, selectVerificationChecks, extractFailure, normalizeObservation,
+  diagnoseObservation, executeVerificationLoop, runVerificationChecks, runEngineeringLoop, isCancellationRequested,
+  configureDurability, loadJournal,
   flushDurability, resumeSession, releaseSession, resetForTest, parsePatch, applyFilePatch,
 };

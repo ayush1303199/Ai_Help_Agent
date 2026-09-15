@@ -14,6 +14,129 @@ function normalized(value) {
   return String(value || '').trim().replace(/\s+/g, ' ');
 }
 
+export function resolveAgentMode(input, defaultMode = 'AGENT') {
+  const text = normalized(input).toLowerCase();
+  if (!text) return defaultMode;
+  if (/\b(what is|what does|why does|where is|who is|show me|explain|summarize|walk me through|describe)\b/.test(text)) return 'ASK';
+  if (/\b(plan|roadmap|outline|strategy|breakdown|design)\b/.test(text) && !/\b(fix|implement|add|update|change|modify|refactor)\b/.test(text)) return 'PLAN';
+  return defaultMode;
+}
+
+export function createTaskMemory(initial = {}) {
+  const memory = {
+    goal: '',
+    constraints: [],
+    filesInspected: [],
+    importantFindings: [],
+    plannedChanges: [],
+    proposalIds: [],
+    verificationResults: [],
+    failures: [],
+    repairRounds: 0,
+    ...initial,
+  };
+
+  return {
+    ...memory,
+    recordFile(filePath) {
+      if (!filePath) return this;
+      const file = String(filePath);
+      if (!this.filesInspected.includes(file)) this.filesInspected.push(file);
+      return this;
+    },
+    addFinding(finding) {
+      const cleaned = normalized(finding);
+      if (!cleaned) return this;
+      this.importantFindings.push(cleaned);
+      return this;
+    },
+    setGoal(goal) {
+      this.goal = normalized(goal || '');
+      return this;
+    },
+    addConstraint(constraint) {
+      const normalizedConstraint = normalized(constraint);
+      if (!normalizedConstraint) return this;
+      if (!this.constraints.includes(normalizedConstraint)) this.constraints.push(normalizedConstraint);
+      return this;
+    },
+    recordProposal(proposalId) {
+      if (!proposalId || this.proposalIds.includes(String(proposalId))) return this;
+      this.proposalIds.push(String(proposalId));
+      return this;
+    },
+    recordVerification(result) {
+      this.verificationResults.push(result);
+      return this;
+    },
+    recordFailure(failure) {
+      this.failures.push(failure);
+      return this;
+    },
+    incrementRepairRound() {
+      this.repairRounds += 1;
+      return this;
+    },
+    summarize() {
+      return {
+        goal: this.goal,
+        constraints: [...this.constraints],
+        filesInspected: [...this.filesInspected],
+        importantFindings: [...this.importantFindings].slice(-8),
+        proposalIds: [...this.proposalIds],
+        verificationResults: [...this.verificationResults].slice(-8),
+        failures: [...this.failures].slice(-8),
+        repairRounds: this.repairRounds,
+      };
+    },
+  };
+}
+
+export function buildTaskPlan(request, evidence = {}) {
+  const classification = classifyDeveloperRequest(request);
+  const terms = normalized(request).match(/[a-z][a-z0-9_-]{2,}/gi) || [];
+  const uniqueTerms = [...new Set(terms.filter((term) => !['please', 'with', 'from', 'into', 'that', 'this', 'what', 'where', 'when', 'there', 'them', 'into'].includes(term.toLowerCase())))].slice(0, 5);
+  const taskList = classification.writeRequired
+    ? [
+        'Inspect the likely implementation target and any direct dependencies.',
+        'Confirm the root cause, affected behavior, and relevant tests.',
+        'Draft a minimal multi-file proposal and validate the expected scope.',
+        'Run the relevant verification script(s).',
+        'If verification fails, diagnose, repair, and re-test with approval.',
+      ]
+    : [
+        'Identify the relevant project files or symbols.',
+        'Read the most relevant evidence only.',
+        'Answer the question or describe the implementation.',
+      ];
+
+  return {
+    mode: resolveAgentMode(request),
+    goal: classification.writeRequired ? 'Fix or implement the requested change safely.' : 'Answer the developer question using repository evidence.',
+    tasks: taskList,
+    dependencies: taskList.map((_, index) => index === 0 ? [] : [taskList[index - 1]]),
+    terms: uniqueTerms,
+    evidence: {
+      candidatePaths: [...new Set((evidence.candidatePaths || []).slice(0, 10))],
+      filesRead: [...new Set((evidence.filesRead || []).slice(0, 10))],
+    },
+  };
+}
+
+export function createTaskGraph(taskPlan = {}) {
+  const tasks = Array.isArray(taskPlan.tasks) ? taskPlan.tasks : [];
+  return {
+    goal: taskPlan.goal || 'Developer task',
+    status: 'PENDING',
+    tasks: tasks.map((task, index) => ({
+      id: `task-${index + 1}`,
+      label: task,
+      status: index === 0 ? 'PENDING' : 'WAITING',
+      dependsOn: index === 0 ? [] : [`task-${index}`],
+    })),
+  };
+}
+
 export function classifyDeveloperRequest(input) {
   const text = normalized(input);
   const lower = text.toLowerCase();
@@ -52,12 +175,17 @@ export function buildReadPlan(request) {
     }
   }
   if (classification.writeRequired && initialSearches.length === 0) initialSearches.push('src');
+  const taskPlan = buildTaskPlan(request);
+  const taskGraph = createTaskGraph(taskPlan);
   return {
     classification,
     initialSearches: initialSearches.slice(0, 6),
     maxFilesPerStep: 6,
     maxReadCharsPerStep: 24000,
     nextStep: classification.intent === 'QUESTION' ? 'ANSWER_FROM_CONTEXT' : 'SEARCH_RELEVANT_FILES',
+    mode: resolveAgentMode(request),
+    taskPlan,
+    taskGraph,
   };
 }
 
@@ -171,9 +299,22 @@ export function evidenceContinuationPrompt(request, evidence) {
 
 export function developerDecisionPrompt(request) {
   const plan = buildReadPlan(request);
+  const memory = createTaskMemory({
+    goal: plan.taskPlan.goal,
+    constraints: [
+      'read-only until a validated proposal is explicitly approved',
+      'do not guess target files or dependencies',
+      'respect project-root confinement and allow-listed verification',
+    ],
+  });
   return [
     'Developer decision layer (read-only until a validated proposal is explicitly approved):',
-    JSON.stringify(plan),
+    JSON.stringify({
+      ...plan,
+      taskMemory: memory.summarize(),
+    }),
+    'Mode: ' + plan.mode,
+    'Task plan: ' + JSON.stringify(plan.taskPlan),
     'For coding changes, search and read relevant files before proposing anything.',
     'Do not guess target files, symbols, dependencies, tests, or configuration. If evidence is missing, use another focused read step or ask a clarification.',
     'Never claim a change was applied. The current Developer Mode has no filesystem write capability.',

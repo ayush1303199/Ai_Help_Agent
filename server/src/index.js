@@ -15,7 +15,7 @@ import {
   updateConfiguredProvider,
   upsertConfiguredProvider,
 } from './config.js';
-import { getProviderCapabilities, getProviderInfo, selfTestProvider } from './llm/provider.js';
+import { getConfiguredProviderCapabilities, getProviderCapabilities, getProviderInfo, selfTestProvider } from './llm/provider.js';
 import { extractTextFromPdfBuffer } from './pdf/pdfExtractor.js';
 import { startWebSocketServer } from './ws/websocketServer.js';
 
@@ -40,6 +40,25 @@ function recordAgentActivity(target) {
     createdAt: new Date().toISOString(),
   });
   if (agentActivity.length > MAX_AGENT_ACTIVITY) agentActivity.length = MAX_AGENT_ACTIVITY;
+}
+
+function configuredProvidersWithCapabilities() {
+  const capabilities = new Map(getConfiguredProviderCapabilities().map((item) => [item.id, item]));
+  return getConfiguredProviders().map((provider) => ({
+    ...provider,
+    ...(capabilities.get(provider.id) || {}),
+  }));
+}
+
+function storeSelfTestStatus(adapterType, model, result) {
+  const storedStatus = result.status === 'READY' ? 'ok' : String(result.status || 'unknown').toLowerCase().replace(/_/g, '-');
+  for (const provider of config.configuredProviders) {
+    if (provider.adapterType === adapterType && (!model || provider.model === model)) {
+      provider.status = storedStatus;
+      provider.lastError = result.status === 'READY' ? '' : (result.reason || result.status || '');
+      provider.lastCheckedAt = Date.now();
+    }
+  }
 }
 
 // Desktop-control endpoints must never accept requests from another machine.
@@ -93,8 +112,10 @@ app.post('/api/settings/providers/self-test', async (req, res) => {
   const requested = typeof req.body?.provider === 'string' ? req.body.provider : config.provider;
   try {
     const result = await selfTestProvider(requested);
+    storeSelfTestStatus(requested, result.model, result);
     res.status(result.status === 'READY' ? 200 : 503).json(result);
   } catch (error) {
+    storeSelfTestStatus(requested, config[requested]?.model, { status: 'NETWORK_ERROR' });
     res.status(503).json({
       provider: requested,
       status: 'NETWORK_ERROR',
@@ -108,20 +129,34 @@ app.post('/api/settings/provider', async (req, res) => {
     const { provider, apiKey, model, baseURL, fallbackEnabled } = req.body || {};
     setRuntimeProvider({ provider, apiKey, model, baseURL });
     if (typeof fallbackEnabled === 'boolean') setFallbackEnabled(fallbackEnabled);
-    res.json({ status: 'ok', provider: config.provider, model: config[config.provider].model });
+    const capability = await selfTestProvider(provider);
+    storeSelfTestStatus(provider, model, capability);
+    res.json({
+      status: 'ok',
+      provider: config.provider,
+      model: config[config.provider].model,
+      capability,
+    });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    const status = err?.status === 429 ? 429 : 400;
+    res.status(status).json({ error: err.message });
   }
 });
 
 app.get('/api/settings/providers', (_req, res) => {
-  res.json({ providers: getConfiguredProviders(), fallbackEnabled: config.fallbackEnabled });
+  res.json({ providers: configuredProvidersWithCapabilities(), fallbackEnabled: config.fallbackEnabled });
 });
 
-app.post('/api/settings/providers', (req, res) => {
+app.post('/api/settings/providers', async (req, res) => {
   try {
     const provider = upsertConfiguredProvider(req.body || {});
-    res.json({ provider: { ...provider, apiKey: undefined }, providers: getConfiguredProviders() });
+    const capability = await selfTestProvider(provider.adapterType);
+    storeSelfTestStatus(provider.adapterType, provider.model, capability);
+    res.json({
+      provider: { ...provider, apiKey: undefined, ...capability },
+      providers: configuredProvidersWithCapabilities(),
+      capability,
+    });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -130,7 +165,7 @@ app.post('/api/settings/providers', (req, res) => {
 app.patch('/api/settings/providers/:id', (req, res) => {
   try {
     const provider = updateConfiguredProvider(req.params.id, req.body || {});
-    res.json({ provider: { ...provider, apiKey: undefined }, providers: getConfiguredProviders() });
+    res.json({ provider: { ...provider, apiKey: undefined }, providers: configuredProvidersWithCapabilities() });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -138,14 +173,14 @@ app.patch('/api/settings/providers/:id', (req, res) => {
 
 app.delete('/api/settings/providers/:id', (req, res) => {
   removeConfiguredProvider(req.params.id);
-  res.json({ providers: getConfiguredProviders() });
+  res.json({ providers: configuredProvidersWithCapabilities() });
 });
 
 app.post('/api/settings/providers/reorder', (req, res) => {
   try {
     if (!Array.isArray(req.body?.ids)) throw new Error('Provider IDs must be an array.');
     reorderConfiguredProviders(req.body.ids);
-    res.json({ providers: getConfiguredProviders() });
+    res.json({ providers: configuredProvidersWithCapabilities() });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

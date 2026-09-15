@@ -16,6 +16,7 @@ const CREDENTIAL_ENV_PATTERN = /(?:key|token|secret|pass|credential|auth|private
 const NETWORK_POLICY = Object.freeze({ mode: 'restricted', outbound: 'not-granted-by-verification-layer' });
 
 let projectRoot = null;
+let projectOwnerWebContentsId = null;
 
 function isInsideRoot(root, target) {
   const relative = path.relative(root, target);
@@ -46,7 +47,14 @@ async function resolveWithinRoot(root, requestedPath = '.') {
   return { root: canonicalRoot, target: realTarget };
 }
 
-async function validateProjectRoot() {
+function assertProjectOwner(ownerWebContentsId) {
+  if (projectOwnerWebContentsId === null || ownerWebContentsId === undefined || projectOwnerWebContentsId !== ownerWebContentsId) {
+    throw new Error('Developer project is not owned by this renderer session.');
+  }
+}
+
+async function validateProjectRoot(ownerWebContentsId) {
+  assertProjectOwner(ownerWebContentsId);
   if (!projectRoot) throw new Error('No project folder selected.');
   const root = await fs.realpath(projectRoot);
   const stat = await fs.stat(root);
@@ -62,20 +70,30 @@ function appendAudit(root, tool, target, result) {
   ).catch(() => {});
 }
 
-async function resolveProjectPath(relativePath = '.') {
-  const root = await validateProjectRoot();
+async function resolveProjectPath(relativePath = '.', ownerWebContentsId) {
+  const root = await validateProjectRoot(ownerWebContentsId);
   return resolveWithinRoot(root, relativePath);
 }
 
-async function chooseProjectFolder(dialog) {
-  const result = await dialog.showOpenDialog({ properties: ['openDirectory'] });
-  if (result.canceled || !result.filePaths[0]) return { canceled: true, projectRoot };
+async function chooseProjectFolder(dialog, ownerWebContentsId) {
+  if (ownerWebContentsId === undefined) throw new Error('Developer project ownership is required.');
+  const scaffoldPath = projectRoot || process.cwd() || require('node:os').homedir();
+  const result = await dialog.showOpenDialog({
+    title: 'Select project folder',
+    defaultPath: scaffoldPath,
+    properties: ['openDirectory'],
+  });
+  if (result.canceled || !result.filePaths[0]) {
+    if (projectRoot !== null) assertProjectOwner(ownerWebContentsId);
+    return { canceled: true, projectRoot };
+  }
   projectRoot = await fs.realpath(result.filePaths[0]);
+  projectOwnerWebContentsId = ownerWebContentsId;
   return { canceled: false, projectRoot };
 }
 
-async function listDirectory(relativePath = '.') {
-  const { root, target } = await resolveProjectPath(relativePath);
+async function listDirectory(relativePath = '.', ownerWebContentsId) {
+  const { root, target } = await resolveProjectPath(relativePath, ownerWebContentsId);
   const stat = await fs.stat(target);
   if (!stat.isDirectory()) throw new Error('The requested path is not a directory.');
   const entries = await fs.readdir(target, { withFileTypes: true });
@@ -87,8 +105,8 @@ async function listDirectory(relativePath = '.') {
   return result;
 }
 
-async function readFile(relativePath) {
-  const { root, target } = await resolveProjectPath(relativePath);
+async function readFile(relativePath, ownerWebContentsId) {
+  const { root, target } = await resolveProjectPath(relativePath, ownerWebContentsId);
   const stat = await fs.stat(target);
   if (!stat.isFile()) throw new Error('The requested path is not a file.');
   if (stat.size > MAX_FILE_BYTES) throw new Error('File is too large to read (512KB limit).');
@@ -97,16 +115,16 @@ async function readFile(relativePath) {
   return result;
 }
 
-async function searchCode(query) {
+async function searchCode(query, ownerWebContentsId) {
   const normalizedQuery = typeof query === 'string' ? query.trim().toLowerCase() : '';
   if (!normalizedQuery) throw new Error('Search query is required.');
-  const root = await validateProjectRoot();
+  const root = await validateProjectRoot(ownerWebContentsId);
   const results = [];
   let filesVisited = 0;
 
   async function walk(relativeDirectory) {
     if (results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES) return;
-    const directory = await resolveProjectPath(relativeDirectory);
+    const directory = await resolveProjectPath(relativeDirectory, ownerWebContentsId);
     const entries = await fs.readdir(directory.target, { withFileTypes: true });
     for (const entry of entries) {
       if (results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES) return;
@@ -119,7 +137,7 @@ async function searchCode(query) {
 
       if (!entry.isFile()) continue;
       filesVisited += 1;
-      const target = await resolveProjectPath(childRelative);
+      const target = await resolveProjectPath(childRelative, ownerWebContentsId);
       const stat = await fs.stat(target.target);
       if (stat.size > MAX_FILE_BYTES) continue;
       const content = await fs.readFile(target.target, 'utf8');
@@ -168,8 +186,8 @@ function safeEnvironment(env = process.env) {
     .filter(([key]) => SAFE_ENV_KEYS.has(key) && !CREDENTIAL_ENV_PATTERN.test(key)));
 }
 
-async function runGit(args) {
-  const root = await validateProjectRoot();
+async function runGit(args, ownerWebContentsId) {
+  const root = await validateProjectRoot(ownerWebContentsId);
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) throw new Error('Invalid git inspection request.');
   const allowed = args[0] === 'status' || (args[0] === 'diff' && args.every((arg) => ['diff', '--stat', '--name-only', '--no-ext-diff'].includes(arg)));
   if (!allowed) throw new Error('Only read-only git status and diff are permitted.');
@@ -186,8 +204,8 @@ async function runGit(args) {
   return { args, stdout, stderr };
 }
 
-async function runVerification(script) {
-  const root = await validateProjectRoot();
+async function runVerification(script, ownerWebContentsId, options = {}) {
+  const root = await validateProjectRoot(ownerWebContentsId);
   if (typeof script !== 'string' || !/^[a-z][a-z0-9:_-]{0,31}$/i.test(script)) throw new Error('Verification script name is invalid.');
   let packageJson;
   try {
@@ -205,7 +223,7 @@ async function runVerification(script) {
   }
 
   async function runGit(args) {
-    const root = await validateProjectRoot();
+    const root = await validateProjectRoot(ownerWebContentsId);
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) throw new Error('Invalid git inspection request.');
     const allowed = args[0] === 'status' || (args[0] === 'diff' && args.every((arg) => ['diff', '--stat', '--name-only', '--no-ext-diff'].includes(arg)));
     if (!allowed) throw new Error('Only read-only git status and diff are permitted.');
@@ -238,18 +256,32 @@ async function runVerification(script) {
   child.stderr.on('data', (chunk) => { stderr = appendBounded(stderr, chunk); });
   const result = await new Promise((resolve) => {
     let settled = false;
+    let cancellationTimer;
     const finish = (value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (cancellationTimer) clearInterval(cancellationTimer);
       resolve(value);
     };
-    const timer = setTimeout(() => {
+    const terminate = () => {
       if (process.platform === 'win32' && child.pid) {
         spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
-      } else child.kill('SIGTERM');
+      } else {
+        child.kill('SIGTERM');
+      }
+    };
+    const timer = setTimeout(() => {
+      terminate();
       finish({ timedOut: true, exitCode: null });
     }, MAX_COMMAND_DURATION_MS);
+    if (typeof options.isCancelled === 'function') {
+      cancellationTimer = setInterval(() => {
+        if (!options.isCancelled()) return;
+        terminate();
+        finish({ cancelled: true, exitCode: null });
+      }, 100);
+    }
     child.on('error', (error) => finish({ error: error.message, exitCode: null }));
     child.on('close', (code) => finish({ exitCode: code }));
   });
@@ -259,6 +291,10 @@ async function runVerification(script) {
     console.warn(`[DEV][VERIFY] project=${project} script=${script} exitCode=null durationMs=${durationMs} success=false timedOut=true`);
     await appendAudit(root, 'run_command', script, 'failure:timeout');
     return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
+  }
+  if (result.cancelled) {
+    await appendAudit(root, 'run_command', script, 'cancelled');
+    return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: 'Verification command cancelled.', durationMs, cancelled: true, networkPolicy: NETWORK_POLICY };
   }
   if (result.error) {
     console.warn(`[DEV][VERIFY] project=${project} script=${script} exitCode=null durationMs=${durationMs} success=false`);
@@ -271,8 +307,47 @@ async function runVerification(script) {
   return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, networkPolicy: NETWORK_POLICY };
 }
 
-function clearProject() {
-  projectRoot = null;
+async function getVerificationScripts(ownerWebContentsId, requested = []) {
+  const root = await validateProjectRoot(ownerWebContentsId);
+  let packageJson;
+  try {
+    const packageFile = await resolveWithinRoot(root, 'package.json');
+    packageJson = JSON.parse(await fs.readFile(packageFile.target, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return { scripts: [], reason: 'Selected project has no package.json.' };
+    throw new Error('Selected project package.json is invalid.');
+  }
+  const hasRequestedScripts = Array.isArray(requested) && requested.length > 0;
+  const scriptNames = hasRequestedScripts
+    ? requested
+    : ['typecheck', 'lint', 'test', 'build'];
+  const normalizedScripts = [...new Set(scriptNames.map((script) => String(script).trim().toLowerCase()))];
+  const scripts = normalizedScripts
+    .filter((script) => SAFE_SCRIPT_NAMES.has(script))
+    .filter((script) => typeof packageJson.scripts?.[script] === 'string' && packageJson.scripts[script].trim());
+  const missing = hasRequestedScripts ? normalizedScripts.filter((script) => !scripts.includes(script)) : [];
+  return {
+    scripts,
+    missing,
+    reason: scripts.length ? (missing.length ? `Verification scripts are unavailable: ${missing.join(', ')}.` : null) : 'No safe verification scripts are defined in package.json.',
+  };
 }
 
-module.exports = { chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit, resolveWithinRoot, clearProject, getProjectRoot: () => projectRoot, safeEnvironment, NETWORK_POLICY };
+function clearProject(ownerWebContentsId) {
+  if (projectRoot !== null) assertProjectOwner(ownerWebContentsId);
+  projectRoot = null;
+  projectOwnerWebContentsId = null;
+}
+
+function releaseProject(ownerWebContentsId) {
+  if (projectOwnerWebContentsId === ownerWebContentsId) {
+    projectRoot = null;
+    projectOwnerWebContentsId = null;
+  }
+}
+
+module.exports = {
+  chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit,
+  getVerificationScripts, resolveWithinRoot, clearProject, releaseProject,
+  assertProjectOwner, getProjectRoot: () => projectRoot, safeEnvironment, NETWORK_POLICY,
+};
