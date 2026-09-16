@@ -15,8 +15,7 @@ const SAFE_ENV_KEYS = new Set(['PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'C
 const CREDENTIAL_ENV_PATTERN = /(?:key|token|secret|pass|credential|auth|private|cookie|session|client[_-]?secret|access[_-]?id)/i;
 const NETWORK_POLICY = Object.freeze({ mode: 'restricted', outbound: 'not-granted-by-verification-layer' });
 
-let projectRoot = null;
-let projectOwnerWebContentsId = null;
+const projectRoots = new Map();
 
 function isInsideRoot(root, target) {
   const relative = path.relative(root, target);
@@ -48,18 +47,23 @@ async function resolveWithinRoot(root, requestedPath = '.') {
 }
 
 function assertProjectOwner(ownerWebContentsId) {
-  if (projectOwnerWebContentsId === null || ownerWebContentsId === undefined || projectOwnerWebContentsId !== ownerWebContentsId) {
+  if (ownerWebContentsId === undefined) {
+    throw new Error('Developer project owner is required.');
+  }
+  const assignedRoot = projectRoots.get(ownerWebContentsId);
+  if (!assignedRoot) {
     throw new Error('Developer project is not owned by this renderer session.');
   }
 }
 
 async function validateProjectRoot(ownerWebContentsId) {
   assertProjectOwner(ownerWebContentsId);
-  if (!projectRoot) throw new Error('No project folder selected.');
-  const root = await fs.realpath(projectRoot);
-  const stat = await fs.stat(root);
+  const root = projectRoots.get(ownerWebContentsId);
+  if (!root) throw new Error('No project folder selected.');
+  const resolvedRoot = await fs.realpath(root);
+  const stat = await fs.stat(resolvedRoot);
   if (!stat.isDirectory()) throw new Error('Invalid project path.');
-  return root;
+  return resolvedRoot;
 }
 
 function appendAudit(root, tool, target, result) {
@@ -77,19 +81,18 @@ async function resolveProjectPath(relativePath = '.', ownerWebContentsId) {
 
 async function chooseProjectFolder(dialog, ownerWebContentsId) {
   if (ownerWebContentsId === undefined) throw new Error('Developer project ownership is required.');
-  const scaffoldPath = projectRoot || process.cwd() || require('node:os').homedir();
+  const scaffoldPath = projectRoots.get(ownerWebContentsId) || process.cwd() || require('node:os').homedir();
   const result = await dialog.showOpenDialog({
     title: 'Select project folder',
     defaultPath: scaffoldPath,
     properties: ['openDirectory'],
   });
   if (result.canceled || !result.filePaths[0]) {
-    if (projectRoot !== null) assertProjectOwner(ownerWebContentsId);
-    return { canceled: true, projectRoot };
+    return { canceled: true, projectRoot: projectRoots.get(ownerWebContentsId) || null };
   }
-  projectRoot = await fs.realpath(result.filePaths[0]);
-  projectOwnerWebContentsId = ownerWebContentsId;
-  return { canceled: false, projectRoot };
+  const selectedRoot = await fs.realpath(result.filePaths[0]);
+  projectRoots.set(ownerWebContentsId, selectedRoot);
+  return { canceled: false, projectRoot: selectedRoot };
 }
 
 async function listDirectory(relativePath = '.', ownerWebContentsId) {
@@ -334,20 +337,27 @@ async function getVerificationScripts(ownerWebContentsId, requested = []) {
 }
 
 function clearProject(ownerWebContentsId) {
-  if (projectRoot !== null) assertProjectOwner(ownerWebContentsId);
-  projectRoot = null;
-  projectOwnerWebContentsId = null;
+  if (ownerWebContentsId !== undefined) {
+    projectRoots.delete(ownerWebContentsId);
+  }
 }
 
 function releaseProject(ownerWebContentsId) {
-  if (projectOwnerWebContentsId === ownerWebContentsId) {
-    projectRoot = null;
-    projectOwnerWebContentsId = null;
+  if (ownerWebContentsId !== undefined) {
+    projectRoots.delete(ownerWebContentsId);
   }
+}
+
+function getProjectRoot(ownerWebContentsId = null) {
+  if (ownerWebContentsId !== null && ownerWebContentsId !== undefined) {
+    return projectRoots.get(ownerWebContentsId) || null;
+  }
+  if (projectRoots.size === 1) return [...projectRoots.values()][0];
+  return null;
 }
 
 module.exports = {
   chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit,
   getVerificationScripts, resolveWithinRoot, clearProject, releaseProject,
-  assertProjectOwner, getProjectRoot: () => projectRoot, safeEnvironment, NETWORK_POLICY,
+  assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY,
 };

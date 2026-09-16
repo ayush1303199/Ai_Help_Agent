@@ -6,11 +6,24 @@ const developerAgent = require('./developerAgent.cjs');
 const developerIndex = require('./developerIndex.cjs');
 const developerContext = require('./developerContext.cjs');
 const developerBenchmark = require('./developerBenchmark.cjs');
+const generalAgent = require('./generalAgent.cjs');
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
 let overlayWindow = null;
-let developerIndexCache = null;
+const developerIndexCaches = new Map();
+const generalSessionRenderers = new Set();
+
+function registerGeneralRenderer(event) {
+  const ownerId = event.sender.id;
+  if (generalSessionRenderers.has(ownerId)) return ownerId;
+  generalSessionRenderers.add(ownerId);
+  event.sender.once('destroyed', () => {
+    generalAgent.releaseSession(ownerId);
+    generalSessionRenderers.delete(ownerId);
+  });
+  return ownerId;
+}
 
 // Keep Chromium cache in a writable app-specific directory on Windows.
 app.setPath('userData', path.join(app.getPath('temp'), 'ai-assistant-electron'));
@@ -119,10 +132,20 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('developer:choose-project', (event) => {
     developerAgent.getSession(event.sender.id);
+    const currentRoot = developerFiles.getProjectRoot(event.sender.id);
+    if (currentRoot) {
+      developerIndexCaches.delete(currentRoot);
+      developerContext.invalidateContextCache(currentRoot);
+    }
     return developerFiles.chooseProjectFolder(dialog, event.sender.id);
   });
   ipcMain.handle('developer:clear-project', (event) => {
     developerAgent.getSession(event.sender.id);
+    const currentRoot = developerFiles.getProjectRoot(event.sender.id);
+    if (currentRoot) {
+      developerIndexCaches.delete(currentRoot);
+      developerContext.invalidateContextCache(currentRoot);
+    }
     developerFiles.clearProject(event.sender.id);
   });
   ipcMain.handle('developer:list-directory', (event, relativePath) => {
@@ -144,43 +167,52 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:index', async (event) => {
     ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
-    const currentRoot = developerFiles.getProjectRoot();
-    developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
-    return { capabilities: developerIndexCache.capabilities, files: Object.keys(developerIndexCache.files), cacheHits: developerIndexCache.cacheHits };
+    const currentRoot = developerFiles.getProjectRoot(event.sender.id);
+    const cached = developerIndexCaches.get(currentRoot) || null;
+    const nextIndex = await developerIndex.buildIndex(currentRoot, cached && cached.root === currentRoot ? cached : null);
+    developerIndexCaches.set(currentRoot, nextIndex);
+    return { capabilities: nextIndex.capabilities, files: Object.keys(nextIndex.files), cacheHits: nextIndex.cacheHits };
   });
   ipcMain.handle('developer:symbol-search', async (event, query) => {
     ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
-    const currentRoot = developerFiles.getProjectRoot();
-    developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
-    return developerIndex.searchSymbols(developerIndexCache, query).slice(0, 100);
+    const currentRoot = developerFiles.getProjectRoot(event.sender.id);
+    const cached = developerIndexCaches.get(currentRoot) || null;
+    const nextIndex = await developerIndex.buildIndex(currentRoot, cached && cached.root === currentRoot ? cached : null);
+    developerIndexCaches.set(currentRoot, nextIndex);
+    return developerIndex.searchSymbols(nextIndex, query).slice(0, 100);
   });
   ipcMain.handle('developer:repository-map', async (event) => {
     ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
-    const currentRoot = developerFiles.getProjectRoot();
-    developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
-    return developerIndex.buildRepositoryMap(currentRoot, developerIndexCache?.repositoryMap || null);
+    const currentRoot = developerFiles.getProjectRoot(event.sender.id);
+    const cached = developerIndexCaches.get(currentRoot) || null;
+    const nextIndex = await developerIndex.buildIndex(currentRoot, cached && cached.root === currentRoot ? cached : null);
+    developerIndexCaches.set(currentRoot, nextIndex);
+    return developerIndex.buildRepositoryMap(currentRoot, nextIndex?.repositoryMap || null);
   });
   ipcMain.handle('developer:find-references', async (event, query) => {
     ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
-    const currentRoot = developerFiles.getProjectRoot();
-    developerIndexCache = await developerIndex.buildIndex(currentRoot, developerIndexCache?.root === currentRoot ? developerIndexCache : null);
-    return developerIndex.findReferences(developerIndexCache, String(query || '').trim()).slice(0, 100);
+    const currentRoot = developerFiles.getProjectRoot(event.sender.id);
+    const cached = developerIndexCaches.get(currentRoot) || null;
+    const nextIndex = await developerIndex.buildIndex(currentRoot, cached && cached.root === currentRoot ? cached : null);
+    developerIndexCaches.set(currentRoot, nextIndex);
+    return developerIndex.findReferences(nextIndex, String(query || '').trim()).slice(0, 100);
   });
   ipcMain.handle('developer:context', async (event, payload) => {
     ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
     const query = payload?.query;
+    const currentRoot = developerFiles.getProjectRoot(event.sender.id);
     const search = await developerFiles.searchCode(query, event.sender.id);
-    if (!developerIndexCache || developerIndexCache.root !== developerFiles.getProjectRoot()) {
-      developerIndexCache = await developerIndex.buildIndex(developerFiles.getProjectRoot());
-    }
-    const symbols = developerIndexCache
-      ? developerIndex.searchSymbols(developerIndexCache, query).slice(0, 50)
+    const cached = currentRoot ? developerIndexCaches.get(currentRoot) || null : null;
+    const nextIndex = currentRoot ? await developerIndex.buildIndex(currentRoot, cached && cached.root === currentRoot ? cached : null) : null;
+    if (currentRoot) developerIndexCaches.set(currentRoot, nextIndex);
+    const symbols = nextIndex
+      ? developerIndex.searchSymbols(nextIndex, query).slice(0, 50)
       : [];
-    return developerContext.assembleContext({ query, results: [...search.results, ...symbols], maxTokens: payload?.maxTokens });
+    return developerContext.assembleContext({ root: currentRoot, query, results: [...search.results, ...symbols], maxTokens: payload?.maxTokens });
   });
   ipcMain.handle('developer:provider-discovery', (_event, providers) => developerBenchmark.discoverProviders(providers));
   ipcMain.handle('developer:run-verification', (event, script) => {
@@ -189,6 +221,11 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('developer:session', (event) => {
     event.sender.once('destroyed', () => {
+      const currentRoot = developerFiles.getProjectRoot(event.sender.id);
+      if (currentRoot) {
+        developerIndexCaches.delete(currentRoot);
+        developerContext.invalidateContextCache(currentRoot);
+      }
       developerAgent.releaseSession(event.sender.id);
       developerFiles.releaseProject(event.sender.id);
     });
@@ -203,7 +240,7 @@ app.whenReady().then(async () => {
     const owner = ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
     return developerAgent.createProposal({
-      root: developerFiles.getProjectRoot(), raw: payload?.raw, expectedSnapshots: payload?.snapshots,
+      root: developerFiles.getProjectRoot(event.sender.id), raw: payload?.raw, expectedSnapshots: payload?.snapshots,
       sessionId: owner.sessionId, ownerWebContentsId: owner.ownerWebContentsId,
       workspace: payload?.workspace,
       verificationScript: payload?.verificationScript || null,
@@ -216,7 +253,7 @@ app.whenReady().then(async () => {
     if (!task) throw new Error('Unknown Developer task.');
     developerAgent.getTask(id, owner);
     developerFiles.assertProjectOwner(event.sender.id);
-    const currentRoot = await fs.realpath(developerFiles.getProjectRoot());
+    const currentRoot = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
     const requestedScripts = task.verificationScripts?.length
       ? task.verificationScripts
       : task.verificationScript ? [task.verificationScript] : [];
@@ -263,6 +300,41 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:proposal-undo', (event, id) => developerAgent.undo(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
   ipcMain.handle('developer:proposal-get', (event, id) => developerAgent.getTask(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
   ipcMain.handle('developer:proposal-cancel', (event) => developerAgent.cancelSession(event.sender.id));
+  ipcMain.handle('general:session', (event) => {
+    registerGeneralRenderer(event);
+    return generalAgent.getPublicSession(event.sender.id);
+  });
+  ipcMain.handle('general:task-create', (event, input) => { registerGeneralRenderer(event); return generalAgent.createTask(event.sender.id, input || {}); });
+  ipcMain.handle('general:task-get', (event, taskId) => { registerGeneralRenderer(event); return generalAgent.getTask(taskId, event.sender.id); });
+  ipcMain.handle('general:task-start', (event, taskId) => { registerGeneralRenderer(event); return generalAgent.startTask(taskId, event.sender.id); });
+  ipcMain.handle('general:browser-session-create', (event, taskId) => { registerGeneralRenderer(event); return generalAgent.createExecutionBrowserSession(taskId, event.sender.id); });
+  ipcMain.handle('general:browser-operation', (event, taskId, operation, target) => { registerGeneralRenderer(event); return generalAgent.performBrowserOperation(taskId, event.sender.id, operation, target || {}); });
+  ipcMain.handle('general:execution-plan', (event, taskId, input) => { registerGeneralRenderer(event); return generalAgent.planExecutionAction(taskId, event.sender.id, input || {}); });
+  ipcMain.handle('general:execution-get', (event, taskId, actionId) => { registerGeneralRenderer(event); return generalAgent.getExecutionAction(taskId, event.sender.id, actionId); });
+  ipcMain.handle('general:execution-validate', (event, taskId, actionId) => { registerGeneralRenderer(event); return generalAgent.validateExecutionAction(taskId, event.sender.id, actionId); });
+  ipcMain.handle('general:execution-confirmation', (event, taskId, actionId) => { registerGeneralRenderer(event); return generalAgent.requestExecutionConfirmation(taskId, event.sender.id, actionId); });
+  ipcMain.handle('general:execution-confirm', (event, taskId, actionId, confirmationId) => { registerGeneralRenderer(event); return generalAgent.confirmExecutionAction(taskId, event.sender.id, actionId, confirmationId); });
+  ipcMain.handle('general:execution-execute', (event, taskId, actionId) => { registerGeneralRenderer(event); return generalAgent.executeExecutionAction(taskId, event.sender.id, actionId); });
+  ipcMain.handle('general:execution-observe', (event, taskId, actionId) => { registerGeneralRenderer(event); return generalAgent.observeExecutionAction(taskId, event.sender.id, actionId); });
+  ipcMain.handle('general:execution-verify', (event, taskId, actionId, evidence) => { registerGeneralRenderer(event); return generalAgent.verifyExecutionAction(taskId, event.sender.id, actionId, evidence || {}); });
+  ipcMain.handle('general:execution-recover', (event, taskId, actionId, options) => { registerGeneralRenderer(event); return generalAgent.recoverExecutionAction(taskId, event.sender.id, actionId, options || {}); });
+  ipcMain.handle('general:execution-cancel', (event, taskId, actionId, reason) => { registerGeneralRenderer(event); return generalAgent.cancelExecutionAction(taskId, event.sender.id, actionId, reason); });
+  ipcMain.handle('general:task-replan', (event, taskId, input) => { registerGeneralRenderer(event); return generalAgent.replanTask(taskId, event.sender.id, input || {}); });
+  ipcMain.handle('general:task-handoff-developer', (event, taskId) => { registerGeneralRenderer(event); return generalAgent.prepareDeveloperHandoff(taskId, event.sender.id); });
+  ipcMain.handle('general:capabilities', () => generalAgent.getCapabilityCatalog());
+  ipcMain.handle('general:task-stop', (event, taskId) => { registerGeneralRenderer(event); return generalAgent.stopTask(taskId, event.sender.id); });
+  ipcMain.handle('general:task-pause', (event, taskId) => { registerGeneralRenderer(event); return generalAgent.pauseTask(taskId, event.sender.id); });
+  ipcMain.handle('general:task-resume', (event, taskId) => { registerGeneralRenderer(event); return generalAgent.resumeTask(taskId, event.sender.id); });
+  ipcMain.handle('general:task-recover', (event, taskId) => { registerGeneralRenderer(event); return generalAgent.recoverTask(taskId, event.sender.id); });
+  ipcMain.handle('general:observe', (event, taskId, observation) => { registerGeneralRenderer(event); return generalAgent.observe(taskId, event.sender.id, observation || {}); });
+  ipcMain.handle('general:prepare-action', (event, taskId, name, args) => { registerGeneralRenderer(event); return generalAgent.prepareAction(taskId, event.sender.id, name, args || {}); });
+  ipcMain.handle('general:begin-action', (event, taskId) => { registerGeneralRenderer(event); return generalAgent.beginAction(taskId, event.sender.id); });
+  ipcMain.handle('general:confirm-action', (event, taskId, confirmationId) => { registerGeneralRenderer(event); return generalAgent.confirmAction(taskId, event.sender.id, confirmationId); });
+  ipcMain.handle('general:complete-action', (event, taskId, result) => { registerGeneralRenderer(event); return generalAgent.completeAction(taskId, event.sender.id, result || {}); });
+  ipcMain.handle('general:verify-action', (event, taskId, evidence) => { registerGeneralRenderer(event); return generalAgent.verifyAction(taskId, event.sender.id, evidence || {}); });
+  ipcMain.handle('general:login-required', (event, taskId, reason) => { registerGeneralRenderer(event); return generalAgent.requestLogin(taskId, event.sender.id, reason); });
+  ipcMain.handle('general:login-status', (event, taskId, status) => { registerGeneralRenderer(event); return generalAgent.completeLogin(taskId, event.sender.id, status); });
+  ipcMain.handle('general:task-complete', (event, taskId, status, evidence) => { registerGeneralRenderer(event); return generalAgent.finishTask(taskId, event.sender.id, status, evidence); });
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(['media'].includes(permission));
   });

@@ -192,6 +192,35 @@ function progress(task, phase, message) {
   task.progress = { phase, message, at: now() };
   recordMutation(task, 'progress', { phase, message });
 }
+function runtimeState(task) {
+  const state = task.runtime || {
+    phase: 'CREATED',
+    taskState: 'CREATED',
+    planVersion: 1,
+    plan: null,
+    taskGraph: null,
+    assumptions: [],
+    observations: [],
+    metrics: { toolCalls: 0, usefulToolCalls: 0, duplicateToolCalls: 0, unnecessaryToolCalls: 0, filesRead: 0, filesChanged: 0, verificationRuns: 0, repairAttempts: 0, confidence: 'LOW' },
+    taskMemory: { goal: '', constraints: [], filesInspected: [], importantFindings: [], plannedChanges: [], proposalIds: [], verificationResults: [], failures: [], repairRounds: 0 },
+    history: [],
+    lastUpdated: now(),
+  };
+  state.lastUpdated = now();
+  return {
+    phase: state.phase || 'CREATED',
+    taskState: state.taskState || state.phase || 'CREATED',
+    planVersion: Number(state.planVersion || 1),
+    plan: state.plan || null,
+    taskGraph: state.taskGraph || null,
+    assumptions: Array.isArray(state.assumptions) ? [...state.assumptions] : [],
+    observations: Array.isArray(state.observations) ? [...state.observations].slice(-20) : [],
+    metrics: { ...state.metrics },
+    taskMemory: { ...state.taskMemory },
+    history: Array.isArray(state.history) ? [...state.history].slice(-20) : [],
+    lastUpdated: state.lastUpdated,
+  };
+}
 function publicTask(task) {
   return {
     id: task.taskId, taskId: task.taskId, sessionId: task.sessionId, state: task.state,
@@ -204,6 +233,7 @@ function publicTask(task) {
     progress: task.progress, verification: task.verification || null, verificationScript: task.verificationScript || null,
     verificationScripts: task.verificationScripts || [],
     outcome: task.outcome || null, error: task.error || null,
+    runtime: runtimeState(task),
     durability: { journalError: journalError?.message || null, auditError: auditError?.message || null },
     createdAt: task.createdAt, updatedAt: task.updatedAt,
   };
@@ -297,6 +327,19 @@ async function createProposal({
     verificationScript: safeVerificationScripts[0] || null,
     verificationScripts: safeVerificationScripts,
     state: 'proposal_ready', progress: { phase: 'proposal', message: 'Validated proposal.', at: now() },
+    runtime: {
+      phase: 'PROPOSING',
+      taskState: 'PROPOSING',
+      planVersion: 1,
+      plan: { goal: 'Validate and propose a minimal safe code change.', tasks: ['Inspect relevant files', 'Validate proposed change', 'Await approval', 'Apply and verify'] },
+      taskGraph: null,
+      assumptions: [],
+      observations: [{ kind: 'PROPOSAL_CREATED', files: changes.map((entry) => entry.path) }],
+      metrics: { toolCalls: 0, usefulToolCalls: 0, duplicateToolCalls: 0, unnecessaryToolCalls: 0, filesRead: before.length, filesChanged: changes.length, verificationRuns: 0, repairAttempts: 0, confidence: 'MEDIUM' },
+      taskMemory: { goal: 'Validate and propose a minimal safe code change.', constraints: ['read-only until explicit approval', 'project-root confinement'], filesInspected: before.map((entry) => entry.path), importantFindings: [], plannedChanges: ['validated proposal', 'approval gate'], proposalIds: [], verificationResults: [], failures: [], repairRounds: 0 },
+      history: [{ phase: 'PROPOSING', at: now(), message: 'Validated proposal ready for approval.' }],
+      lastUpdated: now(),
+    },
     createdAt: now(), updatedAt: now(),
   };
   registry.set(task.taskId, task); recordMutation(task, 'proposal_registered', { proposalId: task.proposalId });
@@ -306,6 +349,11 @@ function getTask(taskId, owner) { const task = registry.get(taskId); if (!task) 
 function approve(taskId, owner) {
   const task = getTask(taskId, owner);
   task.approval = { approvedAt: now(), actor: 'renderer-session' };
+  task.runtime = task.runtime || {};
+  task.runtime.phase = 'AWAITING_APPROVAL';
+  task.runtime.taskState = 'AWAITING_APPROVAL';
+  task.runtime.history = [...(task.runtime.history || []), { phase: 'AWAITING_APPROVAL', at: now(), message: 'User approved the proposal.' }].slice(-20);
+  task.runtime.lastUpdated = now();
   transition(task, 'approved');
   recordMutation(task, 'proposal_approved', { proposalId: task.proposalId || taskId, actor: task.approval.actor });
   return publicTask(task);
@@ -371,7 +419,13 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
   let writeStarted = false;
   recordMutation(task, 'transaction_started', { transactionId: task.transactionId });
   try {
-    transition(task, 'applying'); progress(task, 'apply', 'Applying validated patch.');
+    transition(task, 'applying');
+    task.runtime = task.runtime || {};
+    task.runtime.phase = 'APPLYING';
+    task.runtime.taskState = 'APPLYING';
+    task.runtime.history = [...(task.runtime.history || []), { phase: 'APPLYING', at: now(), message: 'Applying validated patch.' }].slice(-20);
+    task.runtime.lastUpdated = now();
+    progress(task, 'apply', 'Applying validated patch.');
     const current = await Promise.all(task.before.map((item) => snapshot(task.root, item.path)));
     if (current.some((item, index) => item.hash !== task.before[index].hash)) throw new Error('Files changed after approval.');
     if (task.cancelRequested) { transition(task, 'cancelled'); return publicTask(task); }
@@ -379,7 +433,13 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     await writeAndVerify(task, task.files);
     patchApplied = true;
     if (task.cancelRequested) throw Object.assign(new Error('Developer task was cancelled before verification.'), { cancelled: true });
-    transition(task, 'verifying'); progress(task, 'verify', 'Running approved verification.');
+    transition(task, 'verifying');
+    task.runtime = task.runtime || {};
+    task.runtime.phase = 'VERIFYING';
+    task.runtime.taskState = 'VERIFYING';
+    task.runtime.history = [...(task.runtime.history || []), { phase: 'VERIFYING', at: now(), message: 'Running approved verification.' }].slice(-20);
+    task.runtime.lastUpdated = now();
+    progress(task, 'verify', 'Running approved verification.');
     if (verifyRunner) {
       const result = await verifyRunner();
       task.verification = result;
@@ -392,7 +452,14 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
       }
       if (!result?.ok) throw new Error(`Verification failed (${result.failure || 'verification'}).`);
     }
-    transition(task, 'completed'); progress(task, 'complete', 'Apply and verification completed.');
+    transition(task, 'completed');
+    task.runtime = task.runtime || {};
+    task.runtime.phase = 'COMPLETED';
+    task.runtime.taskState = 'COMPLETED';
+    task.runtime.metrics = { ...(task.runtime.metrics || {}), verificationRuns: Number(task.runtime.metrics?.verificationRuns || 0) + 1, confidence: 'HIGH' };
+    task.runtime.history = [...(task.runtime.history || []), { phase: 'COMPLETED', at: now(), message: 'Apply and verification completed.' }].slice(-20);
+    task.runtime.lastUpdated = now();
+    progress(task, 'complete', 'Apply and verification completed.');
     return publicTask(task);
   } catch (error) {
     task.error = error.message;

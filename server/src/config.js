@@ -1,13 +1,45 @@
 import dotenv from 'dotenv';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 dotenv.config();
 
 const env = (name, fallback) => process.env[name] || fallback;
+const providerConfigPath = () => process.env.AI_PROVIDER_CONFIG_PATH || path.join(os.homedir(), '.ai-help-agent', 'provider-config.json');
+
+function readPersistedProviderState() {
+  const resolvedPath = providerConfigPath();
+  try {
+    const raw = fs.readFileSync(resolvedPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    const providers = Array.isArray(parsed?.providers) ? parsed.providers : Array.isArray(parsed) ? parsed : [];
+    return { provider: parsed?.provider || null, providers };
+  } catch {
+    return { provider: null, providers: [] };
+  }
+}
+
+function writePersistedProviderState() {
+  const resolvedPath = providerConfigPath();
+  const directory = path.dirname(resolvedPath);
+  fs.mkdirSync(directory, { recursive: true });
+  const payload = {
+    provider: config.provider,
+    providers: config.configuredProviders.map((provider) => ({
+      ...provider,
+      apiKey: provider.apiKey || '',
+    })),
+  };
+  fs.writeFileSync(resolvedPath, JSON.stringify(payload, null, 2), 'utf8');
+}
 
 /**
- * Provider settings are deliberately plain objects.  This makes them safe to
- * replace at runtime (the desktop client sends credentials without writing
- * them to disk) and keeps the provider layer independent of the UI.
+ * Provider settings are intentionally plain objects but they are now restored from
+ * a local user config file when the server process restarts, without storing
+ * secrets in the repo. This keeps the runtime self-test and UI configuration
+ * flow working after watch-mode or Electron restarts while avoiding any commit to
+ * the working tree.
  */
 export const config = {
   provider: env('LLM_PROVIDER', 'groq'),
@@ -61,6 +93,49 @@ for (const provider of providerNames) {
   }
 }
 
+function hydratePersistedProviderState() {
+  const { provider, providers } = readPersistedProviderState();
+  if (!providers.length) return;
+  const hydrated = providers.filter((item) => item?.adapterType && item?.apiKey && item?.model);
+  if (!hydrated.length) return;
+
+  const existingByAdapter = new Map(config.configuredProviders.map((item) => [item.adapterType, item]));
+  for (const item of hydrated) {
+    const adapterType = String(item.adapterType || '').trim();
+    if (!adapterType || !item.apiKey || !item.model) continue;
+    const normalized = {
+      id: item.id || `persisted-${adapterType}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      label: String(item.label || adapterType).trim(),
+      adapterType,
+      apiKey: String(item.apiKey),
+      model: String(item.model),
+      baseURL: String(item.baseURL || config[adapterType]?.baseURL || ''),
+      enabled: item.enabled !== false,
+      priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : config.configuredProviders.length + 1,
+      status: item.status || 'unknown',
+    };
+    const existing = existingByAdapter.get(adapterType);
+    if (existing) {
+      Object.assign(existing, normalized);
+    } else {
+      config.configuredProviders.push(normalized);
+      existingByAdapter.set(adapterType, normalized);
+    }
+    config[adapterType] = { apiKey: normalized.apiKey, model: normalized.model, baseURL: normalized.baseURL || config[adapterType]?.baseURL };
+    config.runtimeProviders[adapterType] = config[adapterType];
+    if (normalized.enabled) config.provider = adapterType;
+  }
+
+  if (provider && config[provider]) {
+    config.provider = provider;
+  } else if (config.configuredProviders.length > 0) {
+    config.provider = config.configuredProviders.find((item) => item.enabled)?.adapterType || config.configuredProviders[0].adapterType;
+  }
+  normalizeProviderPriorities();
+}
+
+hydratePersistedProviderState();
+
 export function setRuntimeProvider({ provider, apiKey, model, baseURL }) {
   if (!provider || !apiKey || !model) throw new Error('Provider, API key, and model are required.');
   const existing = config[provider] || config.custom;
@@ -83,6 +158,8 @@ export function setRuntimeProvider({ provider, apiKey, model, baseURL }) {
       status: 'unknown',
     });
   }
+  normalizeProviderPriorities();
+  writePersistedProviderState();
 }
 
 export function setFallbackEnabled(enabled) { config.fallbackEnabled = Boolean(enabled); }
@@ -117,12 +194,14 @@ export function upsertConfiguredProvider(input) {
   config[adapterType] = { apiKey, model, baseURL: provider.baseURL };
   config.runtimeProviders[adapterType] = config[adapterType];
   normalizeProviderPriorities();
+  writePersistedProviderState();
   return provider;
 }
 
 export function removeConfiguredProvider(id) {
   config.configuredProviders = config.configuredProviders.filter((provider) => provider.id !== id);
   normalizeProviderPriorities();
+  writePersistedProviderState();
 }
 
 export function updateConfiguredProvider(id, changes) {
@@ -137,6 +216,7 @@ export function reorderConfiguredProviders(ids) {
     if (order.has(provider.id)) provider.priority = order.get(provider.id);
   }
   normalizeProviderPriorities();
+  writePersistedProviderState();
 }
 
 export function normalizeProviderPriorities() {
@@ -151,6 +231,7 @@ export function setConfiguredProviderStatus(id, status, lastError = '') {
     provider.status = status;
     provider.lastError = lastError;
     provider.lastCheckedAt = Date.now();
+    writePersistedProviderState();
   }
 }
 

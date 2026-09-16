@@ -72,18 +72,42 @@ function waitForHttp(url, timeoutMs = 30000) {
 
 function waitForTcp(port, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
+  const hosts = ['localhost', '127.0.0.1', '::1'];
+  let attemptIndex = 0;
+
   return new Promise((resolve, reject) => {
     const attempt = () => {
-      const socket = net.createConnection({ host: '127.0.0.1', port });
+      const host = hosts[attemptIndex % hosts.length];
+      attemptIndex += 1;
+      const socket = net.createConnection({ host, port });
       socket.once('connect', () => { socket.destroy(); resolve(); });
-      socket.once('error', () => { socket.destroy(); retry(); });
-      socket.setTimeout(500, () => { socket.destroy(); retry(); });
+      socket.once('error', () => {
+        socket.destroy();
+        if (Date.now() >= deadline) {
+          reject(new Error(`Timed out waiting for TCP port ${port} on ${host}`));
+          return;
+        }
+        setTimeout(attempt, 250);
+      });
+      socket.setTimeout(500, () => {
+        socket.destroy();
+        if (Date.now() >= deadline) {
+          reject(new Error(`Timed out waiting for TCP port ${port} on ${host}`));
+          return;
+        }
+        setTimeout(attempt, 250);
+      });
     };
-    const retry = () => {
-      if (Date.now() >= deadline) reject(new Error(`Timed out waiting for TCP port ${port}`));
-      else setTimeout(attempt, 250);
+
+    const start = () => {
+      if (Date.now() >= deadline) {
+        reject(new Error(`Timed out waiting for TCP port ${port}`));
+        return;
+      }
+      attempt();
     };
-    attempt();
+
+    start();
   });
 }
 

@@ -1,3 +1,168 @@
+interface GeneralTaskState {
+  taskId: string;
+  sessionId: string;
+  goal: string;
+  requirements: string[];
+  constraints: string[];
+  phase: string;
+  currentSite: string | null;
+  currentUrl: string | null;
+  browserSessionId: string | null;
+  pendingAction: {
+    actionId: string;
+    tool: string;
+    args: Record<string, unknown>;
+    riskLevel: string;
+    target: string;
+    preparedAt: string;
+    startedAt: string | null;
+    confirmedAt: string | null;
+    result: { ok: boolean; status: string } | null;
+  } | null;
+  riskLevel: string;
+  confirmationId: string | null;
+  authenticationState: string;
+  planningStatus: string;
+  progressMessage: string;
+  trace: {
+    taskId: string;
+    phase: string;
+    intent: string | null;
+    capability: string | null;
+    provider: string | null;
+    currentNode: string | null;
+    action: string | null;
+    risk: string;
+    confirmationState: string;
+    verificationState: string;
+    failureClassification: string | null;
+    retryCount: number;
+  };
+  structuredRequirements: {
+    taskType: string;
+    origin: string | null;
+    destination: string | null;
+    travelDate: string | null;
+    resultCount: number | null;
+    optimization: string;
+    actionIntent: string;
+    intent: string;
+    currentIntent: string;
+    allowedActions: string[];
+    forbiddenActions: string[];
+    autonomyLevel: string;
+    domainRequirements: Record<string, Record<string, unknown>>;
+    criticalRequirements: string[];
+    requirementStatus: Record<string, string>;
+    preferences: Record<string, string | number>;
+    executionPolicy: string;
+    bookingAllowed: boolean;
+    paymentAllowed: boolean;
+    submitAllowed: boolean;
+    confirmationRequired: boolean;
+    refinement: {
+      input: string;
+      changedFields: string[];
+      before: Record<string, unknown> | null;
+      after: Record<string, unknown>;
+    } | null;
+  } | null;
+  categories: string[];
+  preferences: Record<string, unknown>;
+  missingInformation: Array<{ id: string; prompt: string; reason: string; requiredFor: string; criticality?: string }>;
+  capabilityRoutes: Array<{
+    capability: string;
+    description: string;
+    allowedActions: string[];
+    riskLevel: string;
+    requiredPermissions: string[];
+    requiredConfirmation: boolean;
+    verificationStrategy: string;
+    recoveryStrategy: string;
+    providerCandidates: Array<{
+      providerId: string;
+      displayName: string;
+      lifecycle: string;
+      implemented: boolean;
+      ready: boolean;
+      supportsFallback: boolean;
+    }>;
+  }>;
+  providers: string[];
+  plan: {
+    version: number;
+    status: string;
+    nextAction: string;
+    taskGraph: {
+      nodes: Array<{ id: string; title: string; capability: string | null; action: string; dependsOn: string[]; status: string }>;
+      roots: string[];
+      terminalNodeId: string;
+    };
+  } | null;
+  handoff: Record<string, unknown> | null;
+  executionActionId: string | null;
+  observationVersion: number;
+  lastObservation: Record<string, unknown> | null;
+  actionCount: number;
+  retryCount: number;
+  navigationDepth: number;
+  screenshotCount: number;
+  taskMemory: {
+    summary: string | null;
+    references: Array<{ phrase: string; status: string }>;
+    referenceResolution: { status: string; phrase?: string; reason?: string; index?: number } | null;
+    currentIntent: string | null;
+    currentCapability: string | null;
+    structuredRequirements: Record<string, unknown> | null;
+    constraints: string[];
+    preferences: Record<string, unknown>;
+    selectedReferences: Array<{ phrase: string; index?: number; selectedAt: string }>;
+    resultSetSummary: { count: number; source: string; updatedAt: string } | null;
+    lastRefinement: Record<string, unknown> | null;
+    conversationSummary: string;
+    pendingAction: { actionId: string; tool: string; target: string } | null;
+    riskLevel: string;
+    confirmationState: string;
+    completed: string[];
+    remaining: string[];
+    ruledOut: string[];
+    observations: Array<Record<string, unknown>>;
+  };
+  finalStatus: string | null;
+  blockedReason: string | null;
+  paused: boolean;
+  bounds: Record<string, number>;
+  history: Array<Record<string, unknown>>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface GeneralExecutionAction {
+  actionId: string;
+  taskId: string;
+  generalSessionId: string;
+  browserSessionId: string | null;
+  capability: string;
+  provider: string;
+  operation: string;
+  target: string | Record<string, unknown>;
+  arguments: Record<string, unknown>;
+  riskLevel: string;
+  requiresConfirmation: boolean;
+  expectedOutcome: unknown;
+  observationVersion: number;
+  state: string;
+  lifecycle: Array<{ state: string; at: string; [key: string]: unknown }>;
+  confirmationId: string | null;
+  confirmedAt: string | null;
+  attempts: number;
+  retryCount: number;
+  result: Record<string, unknown> | null;
+  observation: Record<string, unknown> | null;
+  verification: Record<string, unknown> | null;
+  failure: Record<string, unknown> | null;
+}
+
 interface Window {
   electronAPI?: {
     openOverlay: () => Promise<void>;
@@ -15,12 +180,13 @@ interface Window {
     assembleDeveloperContext: (payload: { query: string; maxTokens?: number }) => Promise<{ tokenCount: number; budget: number; items: unknown[]; diversity: number; cached: boolean }>;
     runDeveloperVerification: (script: string) => Promise<{ ok: boolean; script: string; exitCode: number | null; stdout: string; stderr: string; durationMs: number; classification?: string; cancelled?: boolean }>;
     inspectDeveloperGit: (kind: 'status' | 'diff') => Promise<{ args: string[]; stdout: string; stderr: string }>;
-    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null) => Promise<{ id: string; state: string; lifecycleState?: string; files: Array<{ path: string; hash: string }> }>;
-    approveDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string }>;
+    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null) => Promise<{ id: string; state: string; lifecycleState?: string; files: Array<{ path: string; hash: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
+    approveDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     applyDeveloperProposal: (id: string) => Promise<{
       id: string;
       state: string;
       lifecycleState?: string;
+      runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null;
       verification?: {
         status?: string;
         classification?: string;
@@ -30,10 +196,63 @@ interface Window {
       outcome?: string | null;
       error?: string | null;
     }>;
-    undoDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string }>;
-    getDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string }>;
+    undoDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
+    getDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperSession: () => Promise<{ sessionId: string }>;
     resumeDeveloperSession: (sessionId: string) => Promise<{ sessionId: string }>;
     cancelDeveloperTask: () => Promise<void>;
+    getGeneralSession: () => Promise<{ sessionId: string; taskIds: string[]; tasks: GeneralTaskState[] }>;
+    createGeneralTask: (input: { goal: string; requirements?: string[]; constraints?: string[] }) => Promise<GeneralTaskState>;
+    getGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
+    startGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
+    createGeneralBrowserSession: (taskId: string) => Promise<{ browserSessionId: string; task: GeneralTaskState }>;
+    generalBrowserOperation: (taskId: string, operation: string, target?: Record<string, unknown> | string) => Promise<{ observation: Record<string, unknown>; task: GeneralTaskState }>;
+    planGeneralExecutionAction: (taskId: string, input: {
+      capability: string;
+      provider: string;
+      operation: string;
+      target: string | Record<string, unknown>;
+      arguments?: Record<string, unknown>;
+      riskLevel?: string;
+      requiresConfirmation?: boolean;
+      expectedOutcome?: unknown;
+      observationVersion?: number;
+      browserSessionId?: string;
+    }) => Promise<{ action: GeneralExecutionAction; task: GeneralTaskState }>;
+    getGeneralExecutionAction: (taskId: string, actionId: string) => Promise<{ action: GeneralExecutionAction; task: GeneralTaskState }>;
+    validateGeneralExecutionAction: (taskId: string, actionId: string) => Promise<{ action: GeneralExecutionAction; task: GeneralTaskState }>;
+    requestGeneralExecutionConfirmation: (taskId: string, actionId: string) => Promise<{ confirmation: Record<string, unknown>; task: GeneralTaskState }>;
+    confirmGeneralExecutionAction: (taskId: string, actionId: string, confirmationId: string) => Promise<{ action: GeneralExecutionAction; task: GeneralTaskState }>;
+    executeGeneralExecutionAction: (taskId: string, actionId: string) => Promise<{ action: GeneralExecutionAction; task: GeneralTaskState }>;
+    observeGeneralExecutionAction: (taskId: string, actionId: string) => Promise<{ action: GeneralExecutionAction; task: GeneralTaskState }>;
+    verifyGeneralExecutionAction: (taskId: string, actionId: string, evidence?: Record<string, unknown>) => Promise<{ action: GeneralExecutionAction; task: GeneralTaskState }>;
+    recoverGeneralExecutionAction: (taskId: string, actionId: string, options?: Record<string, unknown>) => Promise<{ action: GeneralExecutionAction; task: GeneralTaskState }>;
+    cancelGeneralExecutionAction: (taskId: string, actionId: string, reason?: string) => Promise<{ action: GeneralExecutionAction; task: GeneralTaskState }>;
+    replanGeneralTask: (taskId: string, input?: { message?: string; requirements?: string[]; constraints?: string[] }) => Promise<GeneralTaskState>;
+    prepareGeneralDeveloperHandoff: (taskId: string) => Promise<{ handoff: Record<string, unknown>; task: GeneralTaskState }>;
+    getGeneralCapabilities: () => Promise<Array<{
+      name: string;
+      description: string;
+      allowedActions: string[];
+      riskLevel: string;
+      requiredPermissions: string[];
+      requiredConfirmation: boolean;
+      supportedProviders: string[];
+      verificationStrategy: string;
+      recoveryStrategy: string;
+    }>>;
+    stopGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
+    pauseGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
+    resumeGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
+    recoverGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
+    observeGeneralTask: (taskId: string, observation: { kind?: string; url?: string; text?: string; summary?: string }) => Promise<GeneralTaskState>;
+    prepareGeneralAction: (taskId: string, name: string, args?: Record<string, unknown>) => Promise<{ requiresConfirmation: boolean; loginRequired?: boolean; confirmation?: { confirmationId: string; taskId: string; sessionId: string; actionId: string; site: string | null; target: string; riskLevel: string; summary: string; expiresAt: string }; task: GeneralTaskState }>;
+    beginGeneralAction: (taskId: string) => Promise<GeneralTaskState>;
+    confirmGeneralAction: (taskId: string, confirmationId: string) => Promise<GeneralTaskState>;
+    completeGeneralAction: (taskId: string, result: { ok?: boolean; status?: string }) => Promise<GeneralTaskState>;
+    verifyGeneralAction: (taskId: string, evidence: { ok?: boolean; evidence?: string; text?: string; status?: string }) => Promise<GeneralTaskState>;
+    markGeneralLoginRequired: (taskId: string, reason?: string) => Promise<{ requiresConfirmation: boolean; loginRequired: boolean; task: GeneralTaskState }>;
+    setGeneralLoginStatus: (taskId: string, status: 'LOGIN_SUCCESS' | 'LOGIN_FAILED') => Promise<GeneralTaskState>;
+    completeGeneralTask: (taskId: string, status: 'COMPLETED' | 'COMPLETED_WITH_LIMITATIONS', evidence: string) => Promise<GeneralTaskState>;
   };
 }

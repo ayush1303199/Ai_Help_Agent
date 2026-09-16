@@ -14,6 +14,161 @@ function normalized(value) {
   return String(value || '').trim().replace(/\s+/g, ' ');
 }
 
+export function createTaskRuntimeState(initial = {}) {
+  const state = {
+    phase: initial.phase || 'CREATED',
+    taskState: initial.taskState || initial.phase || 'CREATED',
+    planVersion: Number(initial.planVersion || 1),
+    plan: initial.plan || null,
+    taskGraph: initial.taskGraph || null,
+    assumptions: Array.isArray(initial.assumptions) ? [...initial.assumptions] : [],
+    observations: Array.isArray(initial.observations) ? [...initial.observations] : [],
+    decisionLog: Array.isArray(initial.decisionLog) ? [...initial.decisionLog] : [],
+    contextQuality: {
+      candidateFiles: Array.isArray(initial?.contextQuality?.candidateFiles) ? [...initial.contextQuality.candidateFiles] : [],
+      selectedFiles: Array.isArray(initial?.contextQuality?.selectedFiles) ? [...initial.contextQuality.selectedFiles] : [],
+      usedFiles: Array.isArray(initial?.contextQuality?.usedFiles) ? [...initial.contextQuality.usedFiles] : [],
+      irrelevantFiles: Array.isArray(initial?.contextQuality?.irrelevantFiles) ? [...initial.contextQuality.irrelevantFiles] : [],
+      precision: Number(initial?.contextQuality?.precision || 0),
+      recall: Number(initial?.contextQuality?.recall || 0),
+      waste: Number(initial?.contextQuality?.waste || 0),
+      selectionReason: initial?.contextQuality?.selectionReason || '',
+    },
+    metrics: {
+      toolCalls: Number(initial?.metrics?.toolCalls || 0),
+      usefulToolCalls: Number(initial?.metrics?.usefulToolCalls || 0),
+      duplicateToolCalls: Number(initial?.metrics?.duplicateToolCalls || 0),
+      unnecessaryToolCalls: Number(initial?.metrics?.unnecessaryToolCalls || 0),
+      filesRead: Number(initial?.metrics?.filesRead || 0),
+      filesChanged: Number(initial?.metrics?.filesChanged || 0),
+      verificationRuns: Number(initial?.metrics?.verificationRuns || 0),
+      repairAttempts: Number(initial?.metrics?.repairAttempts || 0),
+      confidence: initial?.metrics?.confidence || 'LOW',
+    },
+    taskMemory: {
+      goal: initial?.taskMemory?.goal || '',
+      constraints: Array.isArray(initial?.taskMemory?.constraints) ? [...initial.taskMemory.constraints] : [],
+      filesInspected: Array.isArray(initial?.taskMemory?.filesInspected) ? [...initial.taskMemory.filesInspected] : [],
+      importantFindings: Array.isArray(initial?.taskMemory?.importantFindings) ? [...initial.taskMemory.importantFindings] : [],
+      plannedChanges: Array.isArray(initial?.taskMemory?.plannedChanges) ? [...initial.taskMemory.plannedChanges] : [],
+      proposalIds: Array.isArray(initial?.taskMemory?.proposalIds) ? [...initial.taskMemory.proposalIds] : [],
+      verificationResults: Array.isArray(initial?.taskMemory?.verificationResults) ? [...initial.taskMemory.verificationResults] : [],
+      failures: Array.isArray(initial?.taskMemory?.failures) ? [...initial.taskMemory.failures] : [],
+      negativeFindings: Array.isArray(initial?.taskMemory?.negativeFindings) ? [...initial.taskMemory.negativeFindings] : [],
+      repairRounds: Number(initial?.taskMemory?.repairRounds || 0),
+    },
+    history: Array.isArray(initial.history) ? [...initial.history] : [],
+    lastUpdated: initial.lastUpdated || new Date().toISOString(),
+  };
+
+  return {
+    ...state,
+    setPhase(phase, detail = {}) {
+      this.phase = phase;
+      this.taskState = phase;
+      const stamp = new Date().toISOString();
+      this.history.push({ phase, at: stamp, ...detail });
+      this.observations.push({ kind: phase, phase, at: stamp, eventType: 'PHASE_CHANGE', ...detail });
+      if (this.history.length > 18) this.history.shift();
+      if (this.observations.length > 24) this.observations.shift();
+      this.lastUpdated = stamp;
+      return this;
+    },
+    recordObservation(kind, detail = {}) {
+      this.observations.push({ kind, at: new Date().toISOString(), ...detail });
+      if (this.observations.length > 24) this.observations.shift();
+      this.lastUpdated = new Date().toISOString();
+      return this;
+    },
+    recordDecisionTelemetry(entry = {}) {
+      const item = {
+        taskId: entry.taskId || this.taskState || 'task',
+        phase: entry.phase || this.phase || 'CREATED',
+        tool: entry.tool || 'unknown',
+        reasonCategory: entry.reasonCategory || 'GENERAL',
+        targetScope: entry.targetScope || 'NARROW',
+        resultClass: entry.resultClass || 'UNKNOWN',
+        duration: Number(entry.duration || 0),
+        nextPhase: entry.nextPhase || this.phase || 'CREATED',
+        at: entry.at || new Date().toISOString(),
+      };
+      this.decisionLog.push(item);
+      if (this.decisionLog.length > 32) this.decisionLog.shift();
+      this.lastUpdated = item.at;
+      return item;
+    },
+    recordToolDecision(decision = {}) {
+      this.metrics.toolCalls = Number(this.metrics.toolCalls || 0) + 1;
+      if (decision.useful) this.metrics.usefulToolCalls = Number(this.metrics.usefulToolCalls || 0) + 1;
+      if (decision.duplicate) this.metrics.duplicateToolCalls = Number(this.metrics.duplicateToolCalls || 0) + 1;
+      if (decision.unnecessary) this.metrics.unnecessaryToolCalls = Number(this.metrics.unnecessaryToolCalls || 0) + 1;
+      this.observations.push({ kind: 'TOOL_DECISION', ...decision, at: new Date().toISOString() });
+      if (this.observations.length > 24) this.observations.shift();
+      this.lastUpdated = new Date().toISOString();
+      return this;
+    },
+    recordContextSelection(selection = {}) {
+      const candidateFiles = [...new Set((selection.candidateFiles || []).filter(Boolean))];
+      const selectedFiles = [...new Set((selection.selectedFiles || []).filter(Boolean))];
+      const usedFiles = [...new Set((selection.usedFiles || []).filter(Boolean))];
+      const irrelevantFiles = [...new Set((selection.irrelevantFiles || []).filter(Boolean))];
+      const precision = selectedFiles.length > 0 ? usedFiles.length / selectedFiles.length : 0;
+      const recall = candidateFiles.length > 0 ? usedFiles.length / candidateFiles.length : 0;
+      const waste = candidateFiles.length > 0 ? irrelevantFiles.length / candidateFiles.length : 0;
+      this.contextQuality = { candidateFiles, selectedFiles, usedFiles, irrelevantFiles, precision, recall, waste, selectionReason: selection.selectionReason || '' };
+      this.observations.push({ kind: 'CONTEXT_SELECTION', ...this.contextQuality, at: new Date().toISOString() });
+      if (this.observations.length > 24) this.observations.shift();
+      this.lastUpdated = new Date().toISOString();
+      return this.contextQuality;
+    },
+    recordPlanRevision(reason, nextPlan, evidence = {}) {
+      const previousVersion = this.planVersion;
+      this.planVersion += 1;
+      this.plan = nextPlan || this.plan;
+      this.history.push({ phase: 'PLAN_REVISION', reason, at: new Date().toISOString(), previousPlanVersion: previousVersion, newPlanVersion: this.planVersion, evidenceCategory: evidence.evidenceCategory || 'UNKNOWN' });
+      if (this.history.length > 18) this.history.shift();
+      this.lastUpdated = new Date().toISOString();
+      return { previousPlanVersion: previousVersion, newPlanVersion: this.planVersion, reason, plan: this.plan };
+    },
+    recordAssumption(kind, detail = {}) {
+      const item = {
+        kind: String(kind || 'UNKNOWN'),
+        at: new Date().toISOString(),
+        ...detail,
+      };
+      this.assumptions.push(item);
+      if (this.assumptions.length > 16) this.assumptions.shift();
+      this.lastUpdated = item.at;
+      return item;
+    },
+    recordRepairAttempt(strategy, result = {}) {
+      this.metrics.repairAttempts = Number(this.metrics.repairAttempts || 0) + 1;
+      this.taskMemory.repairRounds = Number(this.taskMemory.repairRounds || 0) + 1;
+      this.taskMemory.failures.push({ strategy, result, at: new Date().toISOString() });
+      if (this.taskMemory.failures.length > 12) this.taskMemory.failures.shift();
+      this.lastUpdated = new Date().toISOString();
+      return this.metrics.repairAttempts;
+    },
+    summarize() {
+      return {
+        phase: this.phase,
+        taskState: this.taskState,
+        planVersion: this.planVersion,
+        plan: this.plan,
+        taskGraph: this.taskGraph,
+        metrics: { ...this.metrics },
+        taskMemory: { ...this.taskMemory },
+        assumptions: [...this.assumptions],
+        decisionLog: [...this.decisionLog].slice(-10),
+        contextQuality: { ...this.contextQuality },
+        observations: [...this.observations].slice(-10),
+        history: [...this.history].slice(-10),
+        lastUpdated: this.lastUpdated,
+      };
+    },
+  };
+}
+
 export function resolveAgentMode(input, defaultMode = 'AGENT') {
   const text = normalized(input).toLowerCase();
   if (!text) return defaultMode;
@@ -28,6 +183,7 @@ export function createTaskMemory(initial = {}) {
     constraints: [],
     filesInspected: [],
     importantFindings: [],
+    negativeFindings: [],
     plannedChanges: [],
     proposalIds: [],
     verificationResults: [],
@@ -48,6 +204,12 @@ export function createTaskMemory(initial = {}) {
       const cleaned = normalized(finding);
       if (!cleaned) return this;
       this.importantFindings.push(cleaned);
+      return this;
+    },
+    addNegativeFinding(finding) {
+      const cleaned = normalized(finding);
+      if (!cleaned) return this;
+      if (!this.negativeFindings.includes(cleaned)) this.negativeFindings.push(cleaned);
       return this;
     },
     setGoal(goal) {
@@ -83,6 +245,8 @@ export function createTaskMemory(initial = {}) {
         constraints: [...this.constraints],
         filesInspected: [...this.filesInspected],
         importantFindings: [...this.importantFindings].slice(-8),
+        negativeFindings: [...this.negativeFindings].slice(-8),
+        plannedChanges: [...this.plannedChanges].slice(-8),
         proposalIds: [...this.proposalIds],
         verificationResults: [...this.verificationResults].slice(-8),
         failures: [...this.failures].slice(-8),
@@ -121,6 +285,91 @@ export function buildTaskPlan(request, evidence = {}) {
       filesRead: [...new Set((evidence.filesRead || []).slice(0, 10))],
     },
   };
+}
+
+export function revisePlanForEvidence(request, evidence = {}) {
+  const basePlan = buildTaskPlan(request, evidence);
+  const readFiles = Array.isArray(evidence.filesRead) ? evidence.filesRead : [];
+  const configEvidence = readFiles.some((file) => /(?:config|env|settings|package|vite|tsconfig|webpack)/i.test(String(file)));
+  const likelyConfigBug = configEvidence && /(?:config|env|timeout|port|secret|auth|credential|provider)/i.test(normalized(request));
+  if (!likelyConfigBug) return { plan: basePlan, revised: false, planVersion: 1 };
+  const revisedPlan = {
+    ...basePlan,
+    tasks: [
+      'Confirm actual configuration or environment inputs involved in the bug.',
+      'Validate the observed runtime behavior against configuration and failing tests.',
+      'Apply the minimal code or config fix with explicit verification.',
+      'Run targeted verification and check for regressions.',
+    ],
+    dependencies: [[], ['Confirm actual configuration or environment inputs involved in the bug.'], ['Validate the observed runtime behavior against configuration and failing tests.'], ['Apply the minimal code or config fix with explicit verification.']],
+    revisionReason: 'Config or environment evidence narrowed the likely root cause away from the first implementation target.',
+  };
+  return { plan: revisedPlan, revised: true, planVersion: basePlan ? 2 : 1 };
+}
+
+export function summarizeToolEfficiency(runtime = {}) {
+  const metrics = runtime.metrics || {};
+  return {
+    totalToolCalls: Number(metrics.toolCalls || 0),
+    usefulToolCalls: Number(metrics.usefulToolCalls || 0),
+    duplicateToolCalls: Number(metrics.duplicateToolCalls || 0),
+    unnecessaryToolCalls: Number(metrics.unnecessaryToolCalls || 0),
+    filesRead: Number(metrics.filesRead || 0),
+    filesChanged: Number(metrics.filesChanged || 0),
+    verificationRuns: Number(metrics.verificationRuns || 0),
+    repairAttempts: Number(metrics.repairAttempts || 0),
+  };
+}
+
+export function detectBadToolBehavior(decisionLog = []) {
+  const duplicateToolCalls = [];
+  const repeatedSearches = [];
+  const repeatedReads = [];
+  const invalidPhaseUsage = [];
+  const seenKeys = new Map();
+
+  for (const item of decisionLog) {
+    const tool = String(item.tool || '');
+    const phase = String(item.phase || '');
+    const repeated = decisionLog.filter((entry) => String(entry.tool || '') === tool).length > 1;
+    if (repeated && /(search_code|find_references|get_repository_map)/i.test(tool)) repeatedSearches.push(tool);
+    if (repeated && /read_file/i.test(tool)) repeatedReads.push(tool);
+    if (tool && /run_command|read_file/.test(tool) && /UNDERSTANDING|PROPOSING/.test(phase)) invalidPhaseUsage.push({ tool, phase });
+    if (tool) {
+      const key = `${item.tool}:${item.phase}:${item.targetScope}:${item.reasonCategory}`;
+      const seen = seenKeys.get(key) || 0;
+      if (seen > 0) duplicateToolCalls.push(key);
+      seenKeys.set(key, seen + 1);
+    }
+  }
+
+  return {
+    duplicateToolCalls: [...new Set(duplicateToolCalls)],
+    repeatedSearches: [...new Set(repeatedSearches)],
+    repeatedReads: [...new Set(repeatedReads)],
+    invalidPhaseUsage,
+  };
+}
+
+export function calculateContextQuality({ candidateFiles = [], selectedFiles = [], usedFiles = [], irrelevantFiles = [] } = {}) {
+  const candidate = [...new Set(candidateFiles.filter(Boolean))];
+  const selected = [...new Set(selectedFiles.filter(Boolean))];
+  const used = [...new Set(usedFiles.filter(Boolean))];
+  const irrelevant = [...new Set(irrelevantFiles.filter(Boolean))];
+  const precision = selected.length > 0 ? used.length / selected.length : 0;
+  const recall = candidate.length > 0 ? used.length / candidate.length : 0;
+  const waste = candidate.length > 0 ? irrelevant.length / candidate.length : 0;
+  return { candidateFiles: candidate, selectedFiles: selected, usedFiles: used, irrelevantFiles: irrelevant, contextPrecision: Number(precision.toFixed(3)), contextRecall: Number(recall.toFixed(3)), contextWaste: Number(waste.toFixed(3)) };
+}
+
+export function evaluateCompletionState({ implemented = false, verificationStatus = null, repairAttempts = 0, changedFiles = [], taskState = 'CREATED' } = {}) {
+  const shouldComplete = implemented && verificationStatus === 'PASS';
+  if (shouldComplete) return { status: 'COMPLETED', confidence: 'HIGH' };
+  if (verificationStatus === 'FAIL' || repairAttempts > 0) return { status: 'FAILED', confidence: 'MEDIUM' };
+  if (taskState === 'BLOCKED') return { status: 'BLOCKED', confidence: 'LOW' };
+  if (implemented && verificationStatus === 'NOT_AVAILABLE') return { status: 'COMPLETED_WITH_LIMITATIONS', confidence: 'MEDIUM' };
+  if (changedFiles.length > 0 && verificationStatus === null) return { status: 'FAILED', confidence: 'LOW' };
+  return { status: 'FAILED', confidence: 'LOW' };
 }
 
 export function createTaskGraph(taskPlan = {}) {
@@ -177,6 +426,23 @@ export function buildReadPlan(request) {
   if (classification.writeRequired && initialSearches.length === 0) initialSearches.push('src');
   const taskPlan = buildTaskPlan(request);
   const taskGraph = createTaskGraph(taskPlan);
+  const runtimeState = createTaskRuntimeState({
+    phase: 'UNDERSTANDING',
+    taskState: 'UNDERSTANDING',
+    plan: taskPlan,
+    taskGraph,
+    taskMemory: {
+      goal: taskPlan.goal,
+      constraints: ['read-only until explicit approval', 'respect project confinement'],
+      filesInspected: [],
+      importantFindings: [],
+      plannedChanges: taskPlan.tasks,
+      proposalIds: [],
+      verificationResults: [],
+      failures: [],
+      repairRounds: 0,
+    },
+  });
   return {
     classification,
     initialSearches: initialSearches.slice(0, 6),
@@ -186,6 +452,7 @@ export function buildReadPlan(request) {
     mode: resolveAgentMode(request),
     taskPlan,
     taskGraph,
+    runtimeState: runtimeState.summarize(),
   };
 }
 
@@ -307,14 +574,23 @@ export function developerDecisionPrompt(request) {
       'respect project-root confinement and allow-listed verification',
     ],
   });
+  const runtimeState = createTaskRuntimeState({
+    phase: 'UNDERSTANDING',
+    taskState: 'UNDERSTANDING',
+    plan: plan.taskPlan,
+    taskGraph: plan.taskGraph,
+    taskMemory: memory.summarize(),
+  });
   return [
     'Developer decision layer (read-only until a validated proposal is explicitly approved):',
     JSON.stringify({
       ...plan,
       taskMemory: memory.summarize(),
+      runtimeState: runtimeState.summarize(),
     }),
     'Mode: ' + plan.mode,
     'Task plan: ' + JSON.stringify(plan.taskPlan),
+    'Task state: ' + JSON.stringify(runtimeState.summarize()),
     'For coding changes, search and read relevant files before proposing anything.',
     'Do not guess target files, symbols, dependencies, tests, or configuration. If evidence is missing, use another focused read step or ask a clarification.',
     'Never claim a change was applied. The current Developer Mode has no filesystem write capability.',

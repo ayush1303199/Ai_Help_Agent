@@ -36,6 +36,35 @@ try {
   assert.equal(files.NETWORK_POLICY.mode, 'restricted');
   const measured = await benchmark.benchmark('index', async () => 42);
   assert.equal(measured.status, 'ok');
+  const agentMetrics = benchmark.buildAgentMetrics({
+    taskSuccessRate: 0.9,
+    firstAttemptSuccessRate: 0.8,
+    repairSuccessRate: 0.75,
+    falseCompletionRate: 0.05,
+    toolCalls: 12,
+    usefulToolCalls: 9,
+    duplicateToolCalls: 1,
+    unnecessaryToolCalls: 1,
+    filesRead: 14,
+    usefulFilesRead: 11,
+    irrelevantFilesRead: 1,
+    filesChanged: 2,
+    unnecessaryFilesChanged: 0,
+    linesChanged: 28,
+    verificationPassRate: 0.9,
+    averageRepairAttempts: 0.3,
+    contextPrecision: 0.8,
+    contextRecall: 0.75,
+    tokenEfficiency: 0.7,
+    taskLatency: 2100,
+  });
+  assert.equal(agentMetrics.summary.taskSuccessRate, 0.9);
+  assert.ok(agentMetrics.agentEfficiency > 0.5);
+  const regressionReport = benchmark.compareBenchmarkSnapshots(
+    { taskSuccessRate: 0.8, firstAttemptSuccessRate: 0.75, repairSuccessRate: 0.7, verificationPassRate: 0.8, contextPrecision: 0.7, contextRecall: 0.65, tokenEfficiency: 0.6, toolCalls: 15, duplicateToolCalls: 3, unnecessaryToolCalls: 2, irrelevantFilesRead: 2, unnecessaryFilesChanged: 1, averageRepairAttempts: 1 },
+    { taskSuccessRate: 0.9, firstAttemptSuccessRate: 0.85, repairSuccessRate: 0.8, verificationPassRate: 0.9, contextPrecision: 0.8, contextRecall: 0.75, tokenEfficiency: 0.7, toolCalls: 12, duplicateToolCalls: 1, unnecessaryToolCalls: 1, irrelevantFilesRead: 1, unnecessaryFilesChanged: 0, averageRepairAttempts: 0.3 },
+  );
+  assert.equal(regressionReport.regression, true);
   const gates = await benchmark.runCodeGates([{ name: 'deterministic-index', run: async () => ({ indexed: true }) }]);
   assert.equal(gates.status, 'pass');
   console.log('developer gates tests passed');

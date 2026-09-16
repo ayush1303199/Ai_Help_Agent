@@ -2,6 +2,10 @@ const crypto = require('node:crypto');
 const cache = new Map();
 const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
 function tokens(text) { return Math.ceil(String(text || '').length / 4); }
+function normalizeRoot(root) {
+  const value = typeof root === 'string' && root.trim() ? root.trim() : '__global__';
+  return value.replace(/\\/g, '/');
+}
 function rankResults(results, query) {
   const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
   return [...results].map((item) => {
@@ -22,13 +26,14 @@ function rankResults(results, query) {
     return { ...item, score };
   }).sort((a, b) => b.score - a.score || String(a.path).localeCompare(String(b.path)) || (a.line || 0) - (b.line || 0));
 }
-function assembleContext({ query, results = [], files = [], maxTokens = 4000 }) {
+function assembleContext({ query, results = [], files = [], maxTokens = 4000, root = '__global__' } = {}) {
   if (typeof query !== 'string' || query.length > 200 || !Array.isArray(results) || results.length > 500) {
     throw new Error('Invalid bounded Developer context request.');
   }
   maxTokens = Math.max(64, Math.min(Number(maxTokens) || 4000, 12000));
-  const key = digest(JSON.stringify({ query, results, files, maxTokens }));
-  if (cache.has(key)) return { ...cache.get(key), cached: true };
+  const scopedRoot = normalizeRoot(root);
+  const key = digest(JSON.stringify({ root: scopedRoot, query, results, files, maxTokens }));
+  if (cache.has(key)) return { ...cache.get(key), cached: true, root: scopedRoot };
   const ranked = rankResults(results, query);
   const selected = []; let used = 0;
   for (const item of ranked) {
@@ -37,9 +42,19 @@ function assembleContext({ query, results = [], files = [], maxTokens = 4000 }) 
     if (used + cost > maxTokens) continue;
     selected.push(item); used += cost;
   }
-  const context = { query, tokenCount: used, budget: maxTokens, items: selected, diversity: new Set(selected.map((item) => item.path)).size };
+  const context = { root: scopedRoot, query, tokenCount: used, budget: maxTokens, items: selected, diversity: new Set(selected.map((item) => item.path)).size };
   cache.set(key, context);
   return { ...context, cached: false };
 }
-function invalidateContextCache() { cache.clear(); }
+function invalidateContextCache(root = null) {
+  if (root === null || root === undefined) {
+    cache.clear();
+    return;
+  }
+  const scopedRoot = normalizeRoot(root);
+  for (const key of [...cache.keys()]) {
+    const value = cache.get(key);
+    if (value && value.root === scopedRoot) cache.delete(key);
+  }
+}
 module.exports = { tokens, rankResults, assembleContext, invalidateContextCache };

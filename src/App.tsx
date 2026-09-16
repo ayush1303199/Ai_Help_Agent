@@ -40,7 +40,7 @@ interface RequestTiming {
 }
 
 type Mode = 'direct' | 'langchain';
-type AppMode = 'assistant' | 'developer';
+type AppMode = 'assistant' | 'developer' | 'general';
 
 interface MeetingTranscript {
   id: string;
@@ -248,6 +248,42 @@ const providerPresets = {
   cohere: { label: 'Cohere', model: 'command-r7b-12-2024', baseURL: 'https://api.cohere.com/compatibility/v1' },
   custom: { label: 'Custom OpenAI-compatible', model: '', baseURL: '' },
 } as const;
+const PERSISTED_PROVIDER_STORAGE_KEY = 'ai-help-agent-provider-settings-v1';
+const PERSISTED_PROVIDER_SECRET_KEY = 'ai-help-agent-provider-secrets-v1';
+
+function readPersistedProviderSettings() {
+  try {
+    const raw = localStorage.getItem(PERSISTED_PROVIDER_STORAGE_KEY);
+    if (!raw) return { activeProvider: null as string | null, providers: [] as Array<Record<string, string | boolean | number>> };
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return { activeProvider: null, providers: [] };
+    const providers = Array.isArray(parsed.providers) ? parsed.providers : [];
+    return { activeProvider: typeof parsed.activeProvider === 'string' ? parsed.activeProvider : null, providers };
+  } catch {
+    return { activeProvider: null, providers: [] as Array<Record<string, string | boolean | number>> };
+  }
+}
+
+function readPersistedProviderSecrets() {
+  try {
+    const raw = localStorage.getItem(PERSISTED_PROVIDER_SECRET_KEY);
+    if (!raw) return {} as Record<string, string>;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, string> : {};
+  } catch {
+    return {} as Record<string, string>;
+  }
+}
+
+function writePersistedProviderSettings(activeProvider: string | null, providers: Array<{ label: string; adapterType: string; model: string; baseURL?: string; enabled: boolean; priority: number; status?: string; }>, secrets: Record<string, string>) {
+  try {
+    localStorage.setItem(PERSISTED_PROVIDER_STORAGE_KEY, JSON.stringify({ activeProvider, providers }));
+    localStorage.setItem(PERSISTED_PROVIDER_SECRET_KEY, JSON.stringify(secrets));
+  } catch {
+    // Ignore storage issues. Provider configuration still remains in the app's
+    // live server state when the browser can write local storage again.
+  }
+}
 type ProviderId = keyof typeof providerPresets;
 
 const defaultAgentPermissions = { openTeams: false, openBrowser: false, openCamera: false, openChrome: false, openVSCode: false, openDesktop: false, openSourceTree: false, openSqlServer: false, openNotepad: false, openSublime: false };
@@ -294,8 +330,18 @@ function App() {
     verification?: { status?: string; classification?: string; reason?: string; attempts?: Array<{ check?: string; ok?: boolean; classification?: string; extracted?: { file?: string | null; line?: number | null; message?: string } }> } | null;
     outcome?: string | null;
     error?: string | null;
+    runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null;
   } | null>(null);
   const [developerBusy, setDeveloperBusy] = useState(false);
+  const [generalGoal, setGeneralGoal] = useState('');
+  const [generalClarification, setGeneralClarification] = useState('');
+  const [generalFollowUp, setGeneralFollowUp] = useState('');
+  const [generalTask, setGeneralTask] = useState<GeneralTaskState | null>(null);
+  const [generalBusy, setGeneralBusy] = useState(false);
+  const [generalBrowserUrl, setGeneralBrowserUrl] = useState('');
+  const [generalExecutionAction, setGeneralExecutionAction] = useState<GeneralExecutionAction | null>(null);
+  const [generalConfirmation, setGeneralConfirmation] = useState<Record<string, unknown> | null>(null);
+  const [generalVerificationEvidence, setGeneralVerificationEvidence] = useState('');
   const [appMode, setAppMode] = useState<AppMode>('assistant');
   const [draftImproving, setDraftImproving] = useState(false);
   const [mode, setMode] = useState<Mode>('direct');
@@ -493,6 +539,27 @@ function App() {
   useEffect(() => {
     localStorage.setItem('chat-history', JSON.stringify(chatHistory));
   }, [chatHistory]);
+
+  useEffect(() => {
+    const secretMap = readPersistedProviderSecrets();
+    if (configuredProviders.length > 0) {
+      writePersistedProviderSettings(providerId, configuredProviders.map((provider) => ({
+        id: provider.id,
+        label: provider.label,
+        adapterType: provider.adapterType,
+        model: provider.model,
+        baseURL: provider.baseURL || '',
+        enabled: provider.enabled,
+        priority: provider.priority,
+        status: provider.status || 'unknown',
+      })), secretMap);
+      return;
+    }
+    const { activeProvider } = readPersistedProviderSettings();
+    if (activeProvider) {
+      setProviderId(activeProvider as ProviderId);
+    }
+  }, [configuredProviders, providerId]);
 
   useEffect(() => {
     localStorage.setItem('trained-profiles-v1', JSON.stringify(trainedProfiles));
@@ -870,7 +937,7 @@ function App() {
         }
         const snapshots = developerProposalSnapshotsRef.current.get(requestId) || [];
         void window.electronAPI?.createDeveloperProposal(responseText, snapshots).then((registered) => {
-          setDeveloperProposal({ id: registered.id, state: registered.state, lifecycleState: registered.lifecycleState, files, raw: responseText, searchedFiles, snapshots, verification: null, outcome: null, error: null });
+          setDeveloperProposal({ id: registered.id, state: registered.state, lifecycleState: registered.lifecycleState, files, raw: responseText, searchedFiles, snapshots, verification: null, outcome: null, error: null, runtime: registered.runtime || null });
         }).catch((error) => setError((error as Error).message));
         developerProposalBuffersRef.current.delete(requestId);
         developerProposalFilesRef.current.delete(requestId);
@@ -1614,7 +1681,29 @@ function App() {
     const response = await fetch(`${HTTP_URL}/api/settings/providers`);
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Could not load providers.');
-    setConfiguredProviders(Array.isArray(data.providers) ? data.providers : []);
+    const providers = Array.isArray(data.providers) ? data.providers : [];
+    setConfiguredProviders(providers);
+    if (providers.length === 0) {
+      const persistedSecrets = readPersistedProviderSecrets();
+      const savedProviders = Object.entries(providerPresets).filter(([name]) => Boolean(persistedSecrets[name])).map(([name, preset]) => ({
+        label: preset.label,
+        adapterType: name,
+        apiKey: persistedSecrets[name],
+        model: preset.model,
+        baseURL: preset.baseURL,
+        enabled: true,
+      }));
+      for (const provider of savedProviders) {
+        await fetch(`${HTTP_URL}/api/settings/providers`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(provider),
+        });
+      }
+      const hydrated = await fetch(`${HTTP_URL}/api/settings/providers`);
+      const hydratedData = await hydrated.json();
+      if (hydrated.ok) setConfiguredProviders(Array.isArray(hydratedData.providers) ? hydratedData.providers : []);
+    }
   };
 
   const saveConfiguredProvider = async () => {
@@ -1639,6 +1728,9 @@ function App() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Could not save provider.');
+      const secrets = readPersistedProviderSecrets();
+      secrets[providerId] = providerKey;
+      writePersistedProviderSettings(providerId, data.providers || [], secrets);
       setConfiguredProviders(data.providers || []);
       setProviderKey('');
       setProviderLabel('');
@@ -1659,6 +1751,11 @@ function App() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Could not update provider.');
+      const secrets = readPersistedProviderSecrets();
+      if (changes.model && provider.adapterType && !provider.hasApiKey && typeof (changes as { apiKey?: string }).apiKey === 'string') {
+        secrets[provider.adapterType] = (changes as { apiKey?: string }).apiKey as string;
+      }
+      writePersistedProviderSettings(providerId, data.providers || [], secrets);
       setConfiguredProviders(data.providers || []);
     } catch (err) {
       setError((err as Error).message);
@@ -1671,6 +1768,9 @@ function App() {
       const response = await fetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Could not remove provider.');
+      const secrets = readPersistedProviderSecrets();
+      delete secrets[provider.adapterType];
+      writePersistedProviderSettings(providerId, data.providers || [], secrets);
       setConfiguredProviders(data.providers || []);
     } catch (err) {
       setError((err as Error).message);
@@ -1712,6 +1812,18 @@ function App() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Provider setup failed');
+      const secrets = readPersistedProviderSecrets();
+      secrets[providerId] = providerKey;
+      writePersistedProviderSettings(providerId, configuredProviders.length > 0 ? configuredProviders : [{
+        id: `provider-${providerId}`,
+        label: providerPresets[providerId].label,
+        adapterType: providerId,
+        model: providerModel,
+        baseURL: providerBaseURL,
+        enabled: true,
+        priority: 1,
+        status: 'unknown',
+      }], secrets);
       setHealth({ provider: data.provider, model: data.model });
       setProviderKey('');
       setSettingsOpen(false);
@@ -1772,6 +1884,206 @@ function App() {
     }
   };
 
+  const startGeneralTask = async () => {
+    const goal = generalGoal.trim();
+    if (!goal || generalBusy || generalTaskActive) return;
+    if (!window.electronAPI) {
+      setError('General Agent tasks require the Electron desktop app.');
+      return;
+    }
+    setGeneralBusy(true);
+    setError('');
+    try {
+      const created = await window.electronAPI.createGeneralTask({ goal });
+      const started = await window.electronAPI.startGeneralTask(created.taskId);
+      setGeneralTask(started);
+      setGeneralExecutionAction(null);
+      setGeneralConfirmation(null);
+      setGeneralVerificationEvidence('');
+      setGeneralClarification('');
+      setGeneralFollowUp('');
+      setGeneralGoal('');
+      setStatusMessage('General Agent task is ready for a browser plan.');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const stopGeneralTask = async () => {
+    if (!window.electronAPI || !generalTask || generalBusy) return;
+    setGeneralBusy(true);
+    try {
+      setGeneralTask(await window.electronAPI.stopGeneralTask(generalTask.taskId));
+      setStatusMessage('General Agent stopped. No pending action will continue.');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const reviseGeneralTask = async (message?: string) => {
+    const clarification = (message || generalClarification || generalFollowUp).trim();
+    if (!window.electronAPI || !generalTask || !clarification || generalBusy) return;
+    setGeneralBusy(true);
+    setError('');
+    try {
+      setGeneralTask(await window.electronAPI.replanGeneralTask(generalTask.taskId, { message: clarification }));
+      setGeneralClarification('');
+      setGeneralFollowUp('');
+      setStatusMessage('General Agent plan updated with your clarification.');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const toggleGeneralPause = async () => {
+    if (!window.electronAPI || !generalTask || generalBusy) return;
+    setGeneralBusy(true);
+    try {
+      const next = generalTask.paused
+        ? await window.electronAPI.resumeGeneralTask(generalTask.taskId)
+        : await window.electronAPI.pauseGeneralTask(generalTask.taskId);
+      setGeneralTask(next);
+      setStatusMessage(next.paused ? 'General Agent paused.' : 'General Agent resumed.');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const createGeneralBrowserSession = async () => {
+    if (!window.electronAPI || !generalTask || generalBusy) return;
+    setGeneralBusy(true);
+    setError('');
+    try {
+      const response = await window.electronAPI.createGeneralBrowserSession(generalTask.taskId);
+      setGeneralTask(response.task);
+      setStatusMessage(`Isolated browser session ${response.browserSessionId} is ready.`);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const performGeneralBrowserOperation = async (operation: string, target: Record<string, unknown> | string = {}) => {
+    if (!window.electronAPI || !generalTask || generalBusy) return;
+    setGeneralBusy(true);
+    setError('');
+    try {
+      const response = await window.electronAPI.generalBrowserOperation(generalTask.taskId, operation, target);
+      setGeneralTask(response.task);
+      setStatusMessage(`Browser ${operation} completed at observation ${String(response.observation.version || response.task.observationVersion)}.`);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const refreshGeneralExecutionAction = async () => {
+    if (!window.electronAPI || !generalTask?.executionActionId || generalBusy) return;
+    setGeneralBusy(true);
+    setError('');
+    try {
+      const response = await window.electronAPI.getGeneralExecutionAction(generalTask.taskId, generalTask.executionActionId);
+      setGeneralExecutionAction(response.action);
+      setGeneralTask(response.task);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const validateGeneralExecutionAction = async () => {
+    if (!window.electronAPI || !generalTask?.executionActionId || generalBusy) return;
+    setGeneralBusy(true);
+    setError('');
+    try {
+      const response = await window.electronAPI.validateGeneralExecutionAction(generalTask.taskId, generalTask.executionActionId);
+      setGeneralExecutionAction(response.action);
+      setGeneralTask(response.task);
+      setStatusMessage(response.action.state === 'WAITING_FOR_CONFIRMATION' ? 'Action is waiting for your confirmation.' : 'Action validated and ready to execute.');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const requestGeneralExecutionConfirmation = async () => {
+    if (!window.electronAPI || !generalTask?.executionActionId || generalBusy) return;
+    setGeneralBusy(true);
+    setError('');
+    try {
+      const response = await window.electronAPI.requestGeneralExecutionConfirmation(generalTask.taskId, generalTask.executionActionId);
+      setGeneralConfirmation(response.confirmation);
+      setGeneralTask(response.task);
+      const action = await window.electronAPI.getGeneralExecutionAction(generalTask.taskId, generalTask.executionActionId);
+      setGeneralExecutionAction(action.action);
+      setStatusMessage('Action prepared. Review the details before confirming.');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const confirmGeneralExecutionAction = async () => {
+    const confirmationId = generalConfirmation?.confirmationId;
+    if (!window.electronAPI || !generalTask?.executionActionId || typeof confirmationId !== 'string' || generalBusy) return;
+    setGeneralBusy(true);
+    setError('');
+    try {
+      const response = await window.electronAPI.confirmGeneralExecutionAction(generalTask.taskId, generalTask.executionActionId, confirmationId);
+      setGeneralExecutionAction(response.action);
+      setGeneralTask(response.task);
+      setGeneralConfirmation(null);
+      setStatusMessage('Action confirmed. Execution remains under your control.');
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
+  const runGeneralExecutionStep = async (step: 'execute' | 'observe' | 'verify' | 'recover') => {
+    if (!window.electronAPI || !generalTask?.executionActionId || generalBusy) return;
+    setGeneralBusy(true);
+    setError('');
+    try {
+      const actionId = generalTask.executionActionId;
+      const response = step === 'execute'
+        ? await window.electronAPI.executeGeneralExecutionAction(generalTask.taskId, actionId)
+        : step === 'observe'
+          ? await window.electronAPI.observeGeneralExecutionAction(generalTask.taskId, actionId)
+          : step === 'verify'
+            ? await window.electronAPI.verifyGeneralExecutionAction(generalTask.taskId, actionId, { evidence: generalVerificationEvidence.trim() })
+            : await window.electronAPI.recoverGeneralExecutionAction(generalTask.taskId, actionId);
+      setGeneralExecutionAction(response.action);
+      setGeneralTask(response.task);
+      if (step === 'verify') setStatusMessage(response.action.state === 'SUCCEEDED' ? 'Action verified successfully.' : 'Verification completed with limitations.');
+    } catch (err) {
+      setError((err as Error).message);
+      try {
+        const latest = await window.electronAPI.getGeneralExecutionAction(generalTask.taskId, generalTask.executionActionId);
+        setGeneralExecutionAction(latest.action);
+        setGeneralTask(latest.task);
+      } catch (refreshError) {
+        setError(`${(err as Error).message} ${(refreshError as Error).message}`);
+      }
+    } finally {
+      setGeneralBusy(false);
+    }
+  };
+
   // --- PDF upload ---
   const removePdf = () => {
     setPdfText('');
@@ -1817,6 +2129,7 @@ function App() {
   };
 
   const sessionActive = isRecording || isTranscribing || chatStreaming || messages.length > 0 || pipelineStatus === 'question' || pipelineStatus === 'thinking' || pipelineStatus === 'answer';
+  const generalTaskActive = Boolean(generalTask && !['COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'BLOCKED', 'FAILED', 'CANCELLED'].includes(generalTask.phase));
   const lastQuestion = [...messages].reverse().find((message) => message.role === 'user')?.content || '';
   const lastAnswer = [...messages].reverse().find((message) => message.role === 'assistant')?.content || '';
   const answeredSegments = messages.reduce<Array<{ question: string; answer: string }>>((segments, message, index) => {
@@ -1841,18 +2154,25 @@ function App() {
           <div className="flex items-center gap-2">
             <div className="flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5" aria-label="Application mode">
               <button
-                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming) setAppMode('assistant'); }}
-                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming}
+                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming && !generalTaskActive && !generalBusy) setAppMode('assistant'); }}
+                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming || generalTaskActive || generalBusy}
                 className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${appMode === 'assistant' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
               >
                 AI Assistant
               </button>
               <button
-                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming) setAppMode('developer'); }}
-                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming}
+                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming && !generalTaskActive && !generalBusy) setAppMode('developer'); }}
+                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming || generalTaskActive || generalBusy}
                 className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${appMode === 'developer' ? 'bg-sky-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
               >
                 Developer
+              </button>
+              <button
+                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming && !generalTaskActive && !generalBusy) setAppMode('general'); }}
+                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming || generalTaskActive || generalBusy}
+                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${appMode === 'general' ? 'bg-violet-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
+              >
+                General
               </button>
             </div>
             <div className={`${appMode === 'assistant' ? '' : 'hidden'} flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5`} aria-label="AI mode">
@@ -2208,7 +2528,199 @@ function App() {
       )}
 
       <main className="mx-auto flex min-h-[calc(100dvh-57px)] w-full max-w-3xl flex-col px-4 py-6">
-        {appMode === 'developer' ? (
+        {appMode === 'general' ? (
+          <section className="m-auto flex w-full max-w-3xl flex-1 flex-col rounded-2xl border border-violet-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7">
+            <div className="mb-5">
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-violet-300">General Agent Mode</p>
+              <h2 className="mt-1 text-xl font-semibold">External task runtime</h2>
+              <p className="mt-2 text-xs text-slate-500">Create a bounded task before browser tools are enabled. This runtime has its own session, task state, action limits, confirmation records, and login handoff status.</p>
+            </div>
+            {!generalTask && (
+              <div className="rounded-xl border border-slate-700 bg-slate-800/50 p-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">New task</p>
+                <textarea
+                  value={generalGoal}
+                  onChange={(event) => setGeneralGoal(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void startGeneralTask(); } }}
+                  placeholder="Example: Compare three JavaScript courses without purchasing anything."
+                  rows={3}
+                  className="mt-2 w-full resize-y rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-400"
+                />
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <p className="text-[11px] text-slate-500">No browser session or external action is created until this task starts.</p>
+                  <button onClick={() => void startGeneralTask()} disabled={!generalGoal.trim() || generalBusy} className="rounded-md bg-violet-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-violet-400 disabled:opacity-40">{generalBusy ? 'Starting...' : 'Start task'}</button>
+                </div>
+              </div>
+            )}
+            {generalTask && (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-[11px] font-semibold uppercase tracking-wider text-violet-200">Current task</p>
+                      <p className="mt-1 text-sm text-slate-100">{generalTask.goal}</p>
+                    </div>
+                    <span className="shrink-0 rounded-full border border-violet-500/40 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-violet-200">{generalTask.phase}</span>
+                  </div>
+                  <p className="mt-3 rounded-lg border border-violet-500/20 bg-slate-950/40 px-3 py-2 text-xs text-violet-100">{generalTask.progressMessage}</p>
+                  <div className="mt-4 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
+                    <div className="rounded-lg bg-slate-950/50 p-2"><p className="text-slate-500">Risk</p><p className="mt-1 text-slate-200">{generalTask.riskLevel}</p></div>
+                    <div className="rounded-lg bg-slate-950/50 p-2"><p className="text-slate-500">Site</p><p className="mt-1 truncate text-slate-200">{generalTask.currentSite || 'Not selected'}</p></div>
+                    <div className="rounded-lg bg-slate-950/50 p-2"><p className="text-slate-500">Actions</p><p className="mt-1 text-slate-200">{generalTask.actionCount} / {generalTask.bounds.maxActions}</p></div>
+                    <div className="rounded-lg bg-slate-950/50 p-2"><p className="text-slate-500">Login</p><p className="mt-1 text-slate-200">{generalTask.authenticationState}</p></div>
+                  </div>
+                  <details className="mt-3 rounded-lg border border-slate-700 bg-slate-950/20 p-3">
+                    <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wider text-slate-400">Show parsed request details</summary>
+                  {generalTask.categories.length > 0 && (
+                    <div className="mt-3 rounded-lg border border-violet-500/20 bg-slate-950/40 p-3">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-violet-300">Routed capabilities</p>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {generalTask.categories.map((category) => <span key={category} className="rounded-full border border-slate-700 px-2 py-1 text-[10px] text-slate-300">{category}</span>)}
+                      </div>
+                    </div>
+                  )}
+                  {generalTask.structuredRequirements && (
+                    <div className="mt-3 grid grid-cols-2 gap-2 text-[10px]">
+                      <div className="rounded-lg bg-slate-950/50 p-2"><p className="text-slate-500">Route</p><p className="mt-1 text-slate-200">{generalTask.structuredRequirements.origin || 'Unknown'} → {generalTask.structuredRequirements.destination || 'Unknown'}</p></div>
+                      <div className="rounded-lg bg-slate-950/50 p-2"><p className="text-slate-500">Travel date</p><p className="mt-1 text-slate-200">{generalTask.structuredRequirements.travelDate || 'Not specified'}</p></div>
+                      <div className="rounded-lg bg-slate-950/50 p-2"><p className="text-slate-500">Objective</p><p className="mt-1 text-slate-200">{generalTask.structuredRequirements.resultCount || 0} options · {generalTask.structuredRequirements.optimization}</p></div>
+                      <div className="rounded-lg bg-slate-950/50 p-2"><p className="text-slate-500">Policy</p><p className="mt-1 text-slate-200">{generalTask.structuredRequirements.executionPolicy} · Booking/payment blocked</p></div>
+                    </div>
+                  )}
+                  <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/40 p-2 text-[10px]">
+                    <p className="font-semibold uppercase tracking-wider text-slate-500">Runtime trace</p>
+                    <p className="mt-1 text-slate-400">{generalTask.trace.phase} · {generalTask.trace.intent || 'PENDING'} · {generalTask.trace.capability || 'UNROUTED'} · {generalTask.trace.provider || 'NO_PROVIDER'}</p>
+                    <p className="mt-1 text-slate-500">Node: {generalTask.trace.currentNode || 'NONE'} · Action: {generalTask.trace.action || 'NONE'} · Confirmation: {generalTask.trace.confirmationState} · Verification: {generalTask.trace.verificationState}</p>
+                  </div>
+                  </details>
+                  {generalTask.missingInformation.length > 0 && (
+                    <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-amber-200">Information needed before preparation</p>
+                      <div className="mt-2 space-y-1 text-[11px] text-amber-100">
+                        {generalTask.missingInformation.map((item) => <p key={item.id}><span className="font-medium">{item.prompt}</span> <span className="text-amber-200/70">({item.reason})</span></p>)}
+                      </div>
+                      <div className="mt-3 flex gap-2">
+                        <input value={generalClarification} onChange={(event) => setGeneralClarification(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void reviseGeneralTask(); } }} placeholder="Add the missing detail..." className="min-w-0 flex-1 rounded-md border border-amber-500/30 bg-slate-950 px-2 py-1.5 text-xs text-slate-100 outline-none focus:border-amber-300" />
+                        <button onClick={() => void reviseGeneralTask()} disabled={!generalClarification.trim() || generalBusy} className="rounded-md border border-amber-400/50 px-2 py-1.5 text-[11px] text-amber-100 disabled:opacity-40">Update plan</button>
+                      </div>
+                    </div>
+                  )}
+                  <div className="mt-3 flex gap-2">
+                    <input value={generalFollowUp} onChange={(event) => setGeneralFollowUp(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void reviseGeneralTask(); } }} placeholder="Refine the task, e.g. prefer AC sleeper buses" className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 outline-none focus:border-violet-400" />
+                    <button onClick={() => void reviseGeneralTask()} disabled={!generalFollowUp.trim() || generalBusy} className="rounded-md border border-violet-400/50 px-3 py-2 text-[11px] text-violet-100 disabled:opacity-40">Send</button>
+                  </div>
+                  <details className="mt-3 rounded-lg border border-slate-700 bg-slate-950/20 p-3">
+                    <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wider text-slate-400">Show browser and execution details</summary>
+                  {generalTask.plan && (
+                    <div className="mt-3 rounded-lg border border-slate-700 bg-slate-950/30 p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Task graph</p>
+                        <span className="text-[10px] text-slate-500">{generalTask.planningStatus}</span>
+                      </div>
+                      <div className="mt-2 space-y-1.5">
+                        {generalTask.plan.taskGraph.nodes.map((node) => <div key={node.id} className="flex items-center gap-2 text-[11px]"><span className={`h-1.5 w-1.5 rounded-full ${node.status === 'READY' ? 'bg-emerald-400' : node.status === 'BLOCKED' ? 'bg-amber-400' : 'bg-slate-600'}`} /><span className="text-slate-300">{node.title}</span><span className="ml-auto text-[10px] text-slate-600">{node.status}</span></div>)}
+                      </div>
+                    </div>
+                  )}
+                  <div className="mt-3 rounded-lg border border-sky-500/20 bg-sky-500/5 p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-sky-300">Isolated browser</p>
+                      <span className="text-[10px] text-slate-500">{generalTask.browserSessionId ? 'Session active' : 'No session'}</span>
+                    </div>
+                    {!generalTask.browserSessionId ? (
+                      <button onClick={() => void createGeneralBrowserSession()} disabled={generalBusy} className="mt-2 rounded-md border border-sky-400/40 px-2.5 py-1.5 text-[11px] text-sky-100 disabled:opacity-40">Create browser session</button>
+                    ) : (
+                      <>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          <input value={generalBrowserUrl} onChange={(event) => setGeneralBrowserUrl(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void performGeneralBrowserOperation('navigate', { url: generalBrowserUrl }); } }} placeholder="https://example.com" className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-100 outline-none focus:border-sky-300" />
+                          <button onClick={() => void performGeneralBrowserOperation('navigate', { url: generalBrowserUrl })} disabled={!generalBrowserUrl.trim() || generalBusy} className="rounded-md border border-sky-400/40 px-2.5 py-1.5 text-[11px] text-sky-100 disabled:opacity-40">Navigate</button>
+                          <button onClick={() => void performGeneralBrowserOperation('observe')} disabled={generalBusy} className="rounded-md border border-slate-600 px-2.5 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Observe</button>
+                        </div>
+                        {generalTask.lastObservation && (
+                          <div className="mt-3 rounded-md border border-slate-700 bg-slate-950/60 p-2 text-[11px]">
+                            <div className="flex flex-wrap gap-x-3 gap-y-1 text-slate-400">
+                              <span>{String(generalTask.lastObservation.title || 'Untitled page')}</span>
+                              <span>v{String(generalTask.lastObservation.version || generalTask.observationVersion)}</span>
+                              <span>Login: {String(generalTask.lastObservation.loginState || 'UNKNOWN')}</span>
+                              <span>Page: {String(generalTask.lastObservation.pageState || 'UNKNOWN')}</span>
+                            </div>
+                            <p className="mt-2 max-h-24 overflow-y-auto whitespace-pre-wrap text-slate-300">{String(generalTask.lastObservation.text || 'No visible text returned.')}</p>
+                            {Boolean(generalTask.lastObservation.errorState) && <p className="mt-2 text-amber-200">Intervention required: {String((generalTask.lastObservation.errorState as Record<string, unknown>).message || 'The page reported an error.')}</p>}
+                            {generalTask.lastObservation.loginState === 'LOGIN_REQUIRED' && <button onClick={() => void performGeneralBrowserOperation('takeover')} disabled={generalBusy} className="mt-2 rounded-md border border-amber-400/50 px-2.5 py-1.5 text-[11px] text-amber-100 disabled:opacity-40">Open for user takeover</button>}
+                            {Array.isArray(generalTask.lastObservation.interactiveElements) && generalTask.lastObservation.interactiveElements.length > 0 && (
+                              <p className="mt-2 text-slate-500">Interactive elements: {generalTask.lastObservation.interactiveElements.slice(0, 12).map((element) => {
+                                const item = element as Record<string, unknown>;
+                                return String(item.label || item.id || 'unnamed');
+                              }).join(' · ')}</p>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                  {generalTask.pendingAction && (
+                    <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-[11px] text-amber-100">
+                      <p>Pending {generalTask.pendingAction.tool} · {generalTask.pendingAction.riskLevel}</p>
+                      {generalTask.confirmationId && <p className="mt-1">Waiting for a confirmation bound to this task and action.</p>}
+                    </div>
+                  )}
+                  {generalTask.executionActionId && (
+                    <div className="mt-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 text-[11px]">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="font-semibold uppercase tracking-wider text-emerald-300">Prepared action</p>
+                        <button onClick={() => void refreshGeneralExecutionAction()} disabled={generalBusy} className="text-slate-400 hover:text-slate-200 disabled:opacity-40">Refresh</button>
+                      </div>
+                      {generalExecutionAction ? (
+                        <>
+                          <p className="mt-2 text-slate-200">{generalExecutionAction.capability} · {generalExecutionAction.provider} · {generalExecutionAction.operation}</p>
+                          <p className="mt-1 text-slate-400">Target: {typeof generalExecutionAction.target === 'string' ? generalExecutionAction.target : JSON.stringify(generalExecutionAction.target)}</p>
+                          <p className="mt-1 text-slate-400">State: {generalExecutionAction.state} · Risk: {generalExecutionAction.riskLevel}</p>
+                          <pre className="mt-2 max-h-24 overflow-y-auto whitespace-pre-wrap rounded bg-slate-950/70 p-2 text-[10px] text-slate-500">{JSON.stringify(generalExecutionAction.arguments, null, 2)}</pre>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {generalExecutionAction.state === 'PLANNED' && <button onClick={() => void validateGeneralExecutionAction()} disabled={generalBusy} className="rounded border border-slate-600 px-2 py-1 text-slate-300 disabled:opacity-40">Validate</button>}
+                            {generalExecutionAction.state === 'WAITING_FOR_CONFIRMATION' && <button onClick={() => void requestGeneralExecutionConfirmation()} disabled={generalBusy} className="rounded border border-amber-400/50 px-2 py-1 text-amber-100 disabled:opacity-40">Show confirmation</button>}
+                            {generalExecutionAction.state === 'EXECUTING' && <button onClick={() => void runGeneralExecutionStep('execute')} disabled={generalBusy} className="rounded border border-amber-400/50 px-2 py-1 text-amber-100 disabled:opacity-40">Execute</button>}
+                            {generalExecutionAction.state === 'OBSERVING' && <button onClick={() => void runGeneralExecutionStep('observe')} disabled={generalBusy} className="rounded border border-sky-400/50 px-2 py-1 text-sky-100 disabled:opacity-40">Observe result</button>}
+                            {generalExecutionAction.state === 'VERIFYING' && (
+                              <>
+                                <input value={generalVerificationEvidence} onChange={(event) => setGeneralVerificationEvidence(event.target.value)} placeholder="Verification evidence (optional)" className="min-w-[180px] flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-[10px] text-slate-200 outline-none" />
+                                <button onClick={() => void runGeneralExecutionStep('verify')} disabled={generalBusy} className="rounded border border-emerald-400/50 px-2 py-1 text-emerald-100 disabled:opacity-40">Verify</button>
+                              </>
+                            )}
+                            {['FAILED', 'BLOCKED'].includes(generalExecutionAction.state) && <button onClick={() => void runGeneralExecutionStep('recover')} disabled={generalBusy} className="rounded border border-amber-400/50 px-2 py-1 text-amber-100 disabled:opacity-40">Recover</button>}
+                          </div>
+                          {generalConfirmation && (
+                            <div className="mt-3 rounded border border-amber-400/40 bg-amber-500/10 p-2 text-amber-100">
+                              <p className="font-medium">Confirmation required</p>
+                              <p className="mt-1">{String(generalConfirmation.summary || 'Review this action before it runs.')}</p>
+                              <button onClick={() => void confirmGeneralExecutionAction()} disabled={generalBusy} className="mt-2 rounded border border-amber-300/60 px-2 py-1 text-amber-50 disabled:opacity-40">Confirm action</button>
+                            </div>
+                          )}
+                          {generalExecutionAction.failure && <p className="mt-2 text-rose-200">Failure: {String(generalExecutionAction.failure.message || generalExecutionAction.failure.classification || 'Execution failed.')}</p>}
+                          {generalExecutionAction.verification && <p className="mt-2 text-emerald-200">Verification evidence recorded.</p>}
+                        </>
+                      ) : <p className="mt-2 text-slate-500">Load the current action to review its lifecycle.</p>}
+                    </div>
+                  )}
+                  </details>
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    {!['COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'BLOCKED', 'FAILED', 'CANCELLED'].includes(generalTask.phase) && <button onClick={() => void toggleGeneralPause()} disabled={generalBusy} className="rounded-md border border-slate-600 px-3 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">{generalTask.paused ? 'Resume' : 'Pause'}</button>}
+                    {!['COMPLETED', 'CANCELLED'].includes(generalTask.phase) && <button onClick={() => void stopGeneralTask()} disabled={generalBusy} className="rounded-md border border-rose-400/50 px-3 py-1.5 text-[11px] text-rose-200 disabled:opacity-40">Stop Agent</button>}
+                    {!generalTaskActive && <button onClick={() => { setGeneralTask(null); setGeneralExecutionAction(null); setGeneralConfirmation(null); setGeneralVerificationEvidence(''); setGeneralClarification(''); setGeneralFollowUp(''); }} disabled={generalBusy} className="rounded-md border border-slate-600 px-3 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">New task</button>}
+                  </div>
+                </div>
+                <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/40 p-4">
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Runtime boundary</p>
+                  <ul className="mt-3 space-y-2 text-sm text-slate-300">
+                    <li>• General state is separate from Assistant audio/STT state.</li>
+                    <li>• Developer project, proposal, approval, and filesystem state are not available here.</li>
+                    <li>• Browser tools will use structured actions, bounded sessions, and confirmation before external effects.</li>
+                  </ul>
+                </div>
+              </div>
+            )}
+          </section>
+        ) : appMode === 'developer' ? (
           <section className="m-auto flex w-full max-w-3xl flex-1 flex-col rounded-2xl border border-sky-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7">
             <div className="mb-5">
               <p className="text-[11px] font-semibold uppercase tracking-wider text-sky-300">Developer Mode</p>
@@ -2273,6 +2785,9 @@ function App() {
                   <div>
                     <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-200">Proposed diff</p>
                     <p className="mt-1 text-[11px] text-slate-400">State: {developerProposal.lifecycleState || developerProposal.state || 'pending'} · main process validates every file before writing.</p>
+                    {developerProposal.runtime && (
+                      <p className="mt-1 text-[10px] text-emerald-300">Task phase: {developerProposal.runtime.phase || developerProposal.runtime.taskState || 'CREATED'} · plan v{developerProposal.runtime.planVersion || 1}</p>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     {developerProposal.state === 'awaiting_approval' && <button onClick={() => void approveDeveloperProposal()} disabled={developerBusy} className="rounded-md bg-amber-400 px-2 py-1 text-[11px] font-medium text-slate-950 disabled:opacity-40">Approve</button>}
