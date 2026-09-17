@@ -2,10 +2,10 @@
   "name": "ai-assistant-server",
   "version": "1.0.0",
   "type": "module",
-  "description": "Node.js AI service with direct LLM API, LangChain, PDF extraction, and WebSocket streaming",
+  "description": "Python AI service with direct LLM API, PDF extraction, and WebSocket streaming",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start": "python -m uvicorn src.index:app --host 0.0.0.0 --port 3001",
+    "dev": "python src/index.py"
   },
   "dependencies": {
     "@langchain/core": "^0.3.0",
@@ -20,3 +20,4 @@
     "ws": "^8.18.0"
   }
 }
+

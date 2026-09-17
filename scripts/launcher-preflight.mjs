@@ -14,10 +14,25 @@ function normalize(value) {
 }
 
 function isProjectProcess(processInfo) {
-  const command = normalize(processInfo.commandLine);
-  const cwd = normalize(processInfo.cwd);
-  return (command.includes(normalizedRoot) || cwd.includes(normalizedRoot))
-    && /(node|electron|vite|npm|npx)/i.test(processInfo.commandLine || '');
+  const command = normalize(processInfo.commandLine || '');
+  const cwd = normalize(processInfo.cwd || '');
+  const projectPatterns = [
+    normalizedRoot,
+    normalize(path.join(projectRoot, 'server', 'src', 'index.js')),
+    normalize(path.join(projectRoot, 'src', 'main.tsx')),
+    normalize(path.join(projectRoot, 'electron', 'main.cjs')),
+    'src/index.js',
+    'server/src/index.js',
+    'electron/main.cjs',
+    'vite',
+    'node_modules/.bin/vite',
+  ];
+
+  const looksLikeProjectRuntime = /(?:node|electron|vite|npm|npx)/i.test(processInfo.commandLine || '');
+  const matchesProjectPath = projectPatterns.some((pattern) => command.includes(pattern) || cwd.includes(pattern));
+  const matchesProjectEntrypoint = /(?:src\/index\.js|server\/src\/index\.js|electron\/main\.cjs|vite(?:\.cmd)?|npm(?:\.cmd)?)/i.test(command);
+
+  return looksLikeProjectRuntime && (matchesProjectPath || matchesProjectEntrypoint);
 }
 
 async function listeningPids(port) {
