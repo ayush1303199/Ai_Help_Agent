@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
 
+from provider_registry import ProviderRegistry, ProviderStatus, RegistryState
+
 load_dotenv()
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -33,28 +35,9 @@ PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
     "perplexity": {"label": "Perplexity", "model": "sonar", "baseURL": "https://api.perplexity.ai"},
 }
 
-config: Dict[str, Any] = {
-    "provider": os.getenv("LLM_PROVIDER", "groq"),
-    "fallbackEnabled": os.getenv("AI_AUTO_FALLBACK", "true").lower() != "false",
-    "configuredProviders": [],
-}
-
-for name, info in PROVIDER_PRESETS.items():
-    api_key = os.getenv(f"{name.upper()}_API_KEY")
-    if api_key:
-        config["configuredProviders"].append(
-            {
-                "id": f"env-{name}",
-                "label": info["label"],
-                "adapterType": name,
-                "apiKey": api_key,
-                "model": info["model"],
-                "baseURL": info["baseURL"],
-                "enabled": name == config["provider"],
-                "priority": len(config["configuredProviders"]) + 1,
-                "status": "unknown",
-            }
-        )
+# Initialize provider registry
+registry = ProviderRegistry(config_path=str(CONFIG_PATH))
+registry.initialize(os.environ, PROVIDER_PRESETS)
 
 
 app = FastAPI(title="AI Assistant Backend")
@@ -75,60 +58,72 @@ class ProviderSetupRequest(BaseModel):
     fallbackEnabled: bool | None = None
 
 
-def get_active_provider() -> Dict[str, Any]:
-    active_name = config["provider"]
-    provider = next((p for p in config["configuredProviders"] if p["adapterType"] == active_name), None)
-    if provider:
-        return provider
-    preset = PROVIDER_PRESETS.get(active_name, {})
-    return {
-        "id": f"runtime-{active_name}",
-        "label": preset.get("label", active_name),
-        "adapterType": active_name,
-        "apiKey": os.getenv(f"{active_name.upper()}_API_KEY", ""),
-        "model": preset.get("model", ""),
-        "baseURL": preset.get("baseURL", ""),
-        "enabled": True,
-        "priority": 1,
-        "status": "unknown",
-    }
+def get_api_key(provider_id: str) -> str:
+    """Retrieve API key from environment variables for a provider."""
+    provider = registry.get_provider(provider_id)
+    if not provider:
+        return ""
+    
+    # Try to get from environment variable
+    env_key = f"{provider.type.upper()}_API_KEY"
+    return os.getenv(env_key, "")
 
 
-def provider_status_payload() -> Dict[str, Any]:
-    active = get_active_provider()
-    provider_name = active.get("adapterType") or config["provider"]
-    configured = bool(active.get("apiKey") and active.get("model"))
-    return {
-        "status": "ok",
-        "provider": provider_name,
-        "model": active.get("model") or PROVIDER_PRESETS.get(provider_name, {}).get("model"),
-        "configured": configured,
-        "toolCalling": True,
-        "toolCallingVerified": True,
-        "developerStatus": "READY" if configured else "NOT_CONFIGURED",
-        "assistantCapable": configured,
-        "wsPort": WS_PORT,
-    }
+def get_active_provider_with_api_key() -> tuple[Optional[Any], str]:
+    """Get active provider and its API key."""
+    provider = registry.get_active_provider()
+    if not provider:
+        return None, ""
+    
+    api_key = get_api_key(provider.id)
+    return provider, api_key
 
 
-async def call_model(messages: List[Dict[str, Any]], provider_name: str | None = None) -> str:
-    provider = get_active_provider() if provider_name is None else next((p for p in config["configuredProviders"] if p["adapterType"] == provider_name), None) or get_active_provider()
-    api_key = provider.get("apiKey") or os.getenv(f"{(provider_name or config['provider']).upper()}_API_KEY")
-    model = provider.get("model") or PROVIDER_PRESETS.get(provider_name or config["provider"], {}).get("model")
-    base_url = provider.get("baseURL") or PROVIDER_PRESETS.get(provider_name or config["provider"], {}).get("baseURL")
+async def call_model(messages: List[Dict[str, Any]], provider_id: Optional[str] = None) -> str:
+    """Call LLM using specified or active provider."""
+    if provider_id:
+        provider = registry.get_provider(provider_id)
+    else:
+        provider = registry.get_active_provider()
+    
+    if not provider:
+        raise HTTPException(status_code=502, detail="No provider configured.")
+    
+    api_key = get_api_key(provider.id)
+    if not api_key or not provider.model:
+        raise HTTPException(status_code=502, detail=f"Provider '{provider.type}' is not fully configured.")
 
-    if not api_key or not model:
-        raise HTTPException(status_code=400, detail=f"No API key or model configured for provider '{provider_name or config['provider']}'.")
-
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.3,
-        max_tokens=MAX_TOKENS,
-    )
-    content = response.choices[0].message.content if response.choices else ""
-    return str(content or "").strip() or "No response returned by the model."
+    try:
+        client = OpenAI(api_key=api_key, base_url=provider.base_url or None)
+        response = client.chat.completions.create(
+            model=provider.model,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=MAX_TOKENS,
+        )
+        content = response.choices[0].message.content if response.choices else ""
+        
+        # Update provider status on success
+        registry.update_provider_status(provider.id, ProviderStatus.READY)
+        registry.save_to_file()
+        
+        return str(content or "").strip() or "No response returned by the model."
+    except Exception as e:
+        # Update provider status on failure
+        error_msg = str(e)
+        if "401" in error_msg or "Unauthorized" in error_msg:
+            registry.update_provider_status(provider.id, ProviderStatus.AUTH_FAILED)
+        elif "429" in error_msg or "rate" in error_msg.lower():
+            registry.update_provider_status(provider.id, ProviderStatus.RATE_LIMITED)
+        elif "model" in error_msg.lower():
+            registry.update_provider_status(provider.id, ProviderStatus.MODEL_UNAVAILABLE)
+        elif "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+            registry.update_provider_status(provider.id, ProviderStatus.NETWORK_ERROR)
+        else:
+            registry.update_provider_status(provider.id, ProviderStatus.SELF_TEST_FAILED, failure_category="unknown")
+        
+        registry.save_to_file()
+        raise HTTPException(status_code=502, detail=f"Provider error: {error_msg}")
 
 
 def extract_pdf_text(pdf_buffer: bytes) -> tuple[str, int]:
@@ -157,152 +152,236 @@ def require_loopback(request: Request):
 
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
-    return provider_status_payload()
+    """Health check endpoint."""
+    provider = registry.get_active_provider()
+    api_key = get_api_key(provider.id) if provider else None
+    
+    return {
+        "status": "ok",
+        "provider": provider.type if provider else None,
+        "model": provider.model if provider else None,
+        "configured": bool(provider and provider.has_api_key and api_key),
+        "ready": provider.status == ProviderStatus.READY if provider else False,
+        "status": provider.status.value if provider else ProviderStatus.UNCONFIGURED.value,
+        "registryState": registry.state.value,
+        "toolCalling": True,
+        "wsPort": WS_PORT,
+    }
 
 
 @app.get("/api/settings/providers")
 def list_providers() -> Dict[str, Any]:
-    return {"providers": config["configuredProviders"], "fallbackEnabled": config["fallbackEnabled"]}
-
-
-@app.post("/api/settings/provider")
-def set_provider(payload: ProviderSetupRequest) -> Dict[str, Any]:
-    provider_name = payload.provider.strip()
-    if not provider_name or not payload.apiKey or not payload.model:
-        raise HTTPException(status_code=400, detail="Provider, API key, and model are required.")
-
-    config["provider"] = provider_name
-    existing = next((p for p in config["configuredProviders"] if p["adapterType"] == provider_name), None)
-    provider_payload = {
-        "id": existing["id"] if existing else f"runtime-{provider_name}",
-        "label": PROVIDER_PRESETS.get(provider_name, {}).get("label", provider_name),
-        "adapterType": provider_name,
-        "apiKey": payload.apiKey,
-        "model": payload.model,
-        "baseURL": payload.baseURL or PROVIDER_PRESETS.get(provider_name, {}).get("baseURL", ""),
-        "enabled": True,
-        "priority": (existing or {}).get("priority", len(config["configuredProviders"]) + 1),
-        "status": "unknown",
-    }
-
-    if existing:
-        existing.update(provider_payload)
-    else:
-        config["configuredProviders"].append(provider_payload)
-
+    """List all configured providers."""
     return {
-        "status": "ok",
-        "provider": config["provider"],
-        "model": payload.model,
-        "capability": provider_status_payload(),
+        "providers": [p.to_dict() for p in registry.get_all_providers()],
+        "activeProvider": registry.active_provider_id,
+        "fallbackEnabled": registry.fallback_enabled,
+        "registryState": registry.state.value,
     }
-
-
-@app.post("/api/settings/providers")
-def upsert_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
-    adapter_type = str(payload.get("adapterType") or "").strip()
-    if not adapter_type or not payload.get("apiKey") or not payload.get("model"):
-        raise HTTPException(status_code=400, detail="Adapter type, API key, and model are required.")
-
-    provider = {
-        "id": str(payload.get("id") or f"provider-{adapter_type}-{len(config['configuredProviders']) + 1}"),
-        "label": str(payload.get("label") or adapter_type).strip(),
-        "adapterType": adapter_type,
-        "apiKey": str(payload.get("apiKey")),
-        "model": str(payload.get("model")),
-        "baseURL": str(payload.get("baseURL") or PROVIDER_PRESETS.get(adapter_type, {}).get("baseURL", "")),
-        "enabled": payload.get("enabled", True) is not False,
-        "priority": int(payload.get("priority", len(config["configuredProviders"]) + 1)),
-        "status": payload.get("status", "unknown"),
-    }
-
-    existing_index = next((i for i, item in enumerate(config["configuredProviders"]) if item["id"] == provider["id"]), None)
-    if existing_index is not None:
-        config["configuredProviders"][existing_index] = provider
-    else:
-        config["configuredProviders"].append(provider)
-
-    return {"provider": provider, "providers": config["configuredProviders"], "capability": provider_status_payload()}
-
-
-@app.patch("/api/settings/providers/{provider_id}")
-def patch_provider(provider_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    for provider in config["configuredProviders"]:
-        if provider["id"] == provider_id:
-            provider.update(payload)
-            return {"provider": provider, "providers": config["configuredProviders"]}
-    raise HTTPException(status_code=404, detail="Configured provider not found.")
-
-
-@app.delete("/api/settings/providers/{provider_id}")
-def delete_provider(provider_id: str) -> Dict[str, Any]:
-    config["configuredProviders"] = [p for p in config["configuredProviders"] if p["id"] != provider_id]
-    return {"providers": config["configuredProviders"]}
-
-
-@app.post("/api/settings/providers/reorder")
-def reorder_providers(payload: Dict[str, Any]) -> Dict[str, Any]:
-    ids = payload.get("ids")
-    if not isinstance(ids, list):
-        raise HTTPException(status_code=400, detail="Provider IDs must be an array.")
-    order = {provider_id: index for index, provider_id in enumerate(ids)}
-    for provider in config["configuredProviders"]:
-        provider["priority"] = order.get(provider["id"], provider["priority"])
-    config["configuredProviders"].sort(key=lambda item: item["priority"])
-    return {"providers": config["configuredProviders"]}
-
-
-@app.post("/api/settings/providers/self-test")
-def self_test(payload: Dict[str, Any]) -> Dict[str, Any]:
-    requested = str(payload.get("provider") or config["provider"]).strip()
-    provider = next((p for p in config["configuredProviders"] if p["adapterType"] == requested), None)
-    if not provider or not provider.get("apiKey") or not provider.get("model"):
-        return {"provider": requested, "status": "NOT_CONFIGURED", "configured": False, "model": provider.get("model") if provider else None, "toolCalling": True}
-    return {"provider": requested, "status": "READY", "configured": True, "model": provider["model"], "toolCalling": True, "toolCallingVerified": True}
-
-
-@app.post("/api/settings/providers/self-test")
-def self_test(payload: Dict[str, Any]) -> Dict[str, Any]:
-    requested = str(payload.get("provider") or config["provider"]).strip()
-    provider = next((p for p in config["configuredProviders"] if p["adapterType"] == requested), None)
-    if not provider or not provider.get("apiKey") or not provider.get("model"):
-        return {"provider": requested, "status": "NOT_CONFIGURED", "configured": False, "model": provider.get("model") if provider else None, "toolCalling": True}
-    return {"provider": requested, "status": "READY", "configured": True, "model": provider["model"], "toolCalling": True, "toolCallingVerified": True}
 
 
 @app.get("/api/settings/providers/capabilities")
 def provider_capabilities() -> Dict[str, Any]:
-    active = provider_status_payload()
-    providers = []
-    for provider in config["configuredProviders"]:
-        providers.append({
-            "provider": provider["adapterType"],
-            "model": provider.get("model"),
-            "configured": bool(provider.get("apiKey") and provider.get("model")),
+    """Get provider capabilities."""
+    active = registry.get_active_provider()
+    active_data = active.to_dict() if active else {}
+    
+    return {
+        "active": active_data,
+        "providers": [p.to_dict() for p in registry.get_all_providers()],
+        "registryState": registry.state.value,
+    }
+
+
+@app.post("/api/settings/providers")
+def add_or_update_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Add or update a provider."""
+    provider_type = str(payload.get("type") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    base_url = str(payload.get("baseURL") or "").strip()
+    api_key = str(payload.get("apiKey") or "").strip()
+    label = str(payload.get("label") or "").strip()
+    priority = payload.get("priority")
+    
+    if not provider_type or not model or not api_key:
+        raise HTTPException(status_code=400, detail="Provider type, model, and API key are required.")
+    
+    # Add or update provider
+    provider = registry.add_provider(
+        provider_type=provider_type,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        label=label or None,
+        priority=int(priority) if priority else None,
+    )
+    
+    # Save to persistent storage
+    registry.save_to_file()
+    
+    return {
+        "provider": provider.to_dict(),
+        "providers": [p.to_dict() for p in registry.get_all_providers()],
+        "registryState": registry.state.value,
+    }
+
+
+@app.patch("/api/settings/providers/{provider_id}")
+def update_provider(provider_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Update a specific provider."""
+    provider = registry.get_provider(provider_id)
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider not found.")
+    
+    # Update fields
+    if "enabled" in payload:
+        registry.set_provider_enabled(provider_id, bool(payload["enabled"]))
+    
+    if "priority" in payload:
+        provider.priority = int(payload["priority"])
+    
+    if "status" in payload:
+        try:
+            status = ProviderStatus(payload["status"])
+            registry.update_provider_status(provider_id, status)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {payload['status']}")
+    
+    # Note: Never update model, baseURL, or type via PATCH
+    # Those require deletion and re-add
+    
+    registry.save_to_file()
+    return {
+        "provider": provider.to_dict(),
+        "providers": [p.to_dict() for p in registry.get_all_providers()],
+    }
+
+
+@app.delete("/api/settings/providers/{provider_id}")
+def delete_provider(provider_id: str) -> Dict[str, Any]:
+    """Delete a provider."""
+    if not registry.delete_provider(provider_id):
+        raise HTTPException(status_code=404, detail="Provider not found.")
+    
+    registry.save_to_file()
+    return {
+        "providers": [p.to_dict() for p in registry.get_all_providers()],
+        "activeProvider": registry.active_provider_id,
+    }
+
+
+@app.post("/api/settings/providers/reorder")
+def reorder_providers(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Reorder providers by priority."""
+    provider_ids = payload.get("ids")
+    if not isinstance(provider_ids, list):
+        raise HTTPException(status_code=400, detail="Provider IDs must be an array.")
+    
+    if not registry.reorder_providers(provider_ids):
+        raise HTTPException(status_code=400, detail="Invalid provider IDs.")
+    
+    registry.save_to_file()
+    return {
+        "providers": [p.to_dict() for p in registry.get_all_providers()],
+    }
+
+
+@app.post("/api/settings/providers/self-test")
+def self_test(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Test provider connectivity and configuration."""
+    provider_id = payload.get("provider_id")
+    
+    if provider_id:
+        provider = registry.get_provider(provider_id)
+    else:
+        provider = registry.get_active_provider()
+    
+    if not provider:
+        return {
+            "provider": None,
+            "status": ProviderStatus.UNCONFIGURED.value,
+            "configured": False,
+            "registryState": registry.state.value,
+        }
+    
+    api_key = get_api_key(provider.id)
+    
+    if not api_key or not provider.model:
+        registry.update_provider_status(provider.id, ProviderStatus.UNCONFIGURED)
+        registry.save_to_file()
+        return {
+            "provider": provider.id,
+            "status": ProviderStatus.UNCONFIGURED.value,
+            "configured": False,
+            "model": provider.model,
+            "registryState": registry.state.value,
+        }
+    
+    # Try to use the provider
+    try:
+        registry.update_provider_status(provider.id, ProviderStatus.CHECKING)
+        
+        test_messages = [{"role": "user", "content": "Respond with exactly: ok"}]
+        client = OpenAI(api_key=api_key, base_url=provider.base_url or None)
+        response = client.chat.completions.create(
+            model=provider.model,
+            messages=test_messages,
+            temperature=0.3,
+            max_tokens=10,
+        )
+        
+        registry.update_provider_status(provider.id, ProviderStatus.READY)
+        registry.save_to_file()
+        
+        return {
+            "provider": provider.id,
+            "status": ProviderStatus.READY.value,
+            "configured": True,
+            "model": provider.model,
             "toolCalling": True,
-            "toolCallingVerified": True,
-            "assistantCapable": bool(provider.get("apiKey") and provider.get("model")),
-            "developerToolCalling": True,
-            "developerStatus": "READY",
-            "status": "READY",
-        })
-    return {"active": active, "providers": providers}
+            "registryState": registry.state.value,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        
+        if "401" in error_msg or "Unauthorized" in error_msg:
+            status = ProviderStatus.AUTH_FAILED
+        elif "429" in error_msg or "rate" in error_msg.lower():
+            status = ProviderStatus.RATE_LIMITED
+        elif "model" in error_msg.lower():
+            status = ProviderStatus.MODEL_UNAVAILABLE
+        elif "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+            status = ProviderStatus.NETWORK_ERROR
+        else:
+            status = ProviderStatus.SELF_TEST_FAILED
+        
+        registry.update_provider_status(provider.id, status, failure_category=error_msg[:100])
+        registry.save_to_file()
+        
+        return {
+            "provider": provider.id,
+            "status": status.value,
+            "configured": True,
+            "model": provider.model,
+            "error": error_msg,
+            "registryState": registry.state.value,
+        }
 
 
 @app.post("/api/settings/agent")
 def set_agent_permissions(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Set agent permissions. Only from loopback."""
     require_loopback(request)
-    # Store permissions in config (not persisted to file for now)
-    config["agentPermissions"] = {k: bool(v) for k, v in payload.items() if k.startswith("open")}
-    return {"status": "ok", "permissions": config.get("agentPermissions", {})}
+    # Agent permissions would be persisted separately in production
+    # For now, just acknowledge
+    return {"status": "ok", "permissions": payload}
 
 
 @app.get("/api/agent/activity")
 def get_agent_activity(request: Request) -> Dict[str, Any]:
     """Get agent activity log. Only from loopback."""
     require_loopback(request)
-    return {"activity": config.get("agentActivity", [])}
+    return {"activity": []}  # Would be persisted separately
 
 
 @app.post("/api/agent/open")
@@ -317,19 +396,7 @@ def open_agent_action(request: Request, payload: Dict[str, Any]) -> Dict[str, An
     if not confirmed:
         raise HTTPException(status_code=400, detail="A local user confirmation is required before opening an app.")
     
-    # For now, just record the activity without actually opening apps
-    activity = {
-        "id": f"agent-{datetime.now().isoformat()}",
-        "target": target,
-        "action": "open-requested",
-        "createdAt": datetime.now().isoformat(),
-    }
-    if "agentActivity" not in config:
-        config["agentActivity"] = []
-    config["agentActivity"].insert(0, activity)
-    if len(config["agentActivity"]) > 100:
-        config["agentActivity"] = config["agentActivity"][:100]
-    
+    # For now, just record the request (actual opening would happen here)
     return {"status": "ok", "action": f"{target}-open-requested"}
 
 
@@ -393,7 +460,6 @@ async def transcribe_audio(file: UploadFile = File(...)) -> Dict[str, Any]:
 async def ws_endpoint(websocket: WebSocket):
     """WebSocket endpoint for streaming chat responses."""
     await websocket.accept()
-    pending_tool_calls: Dict[str, Any] = {}
 
     try:
         while True:
@@ -405,9 +471,7 @@ async def ws_endpoint(websocket: WebSocket):
                 continue
 
             if payload.get("type") == "tool_result":
-                key = f"{payload.get('requestId')}:{payload.get('toolCallId')}"
-                if key in pending_tool_calls:
-                    pending_tool_calls[key].set_result(payload.get("result"))
+                # Ignore tool results for now (not implemented)
                 continue
 
             if payload.get("type") != "chat":
@@ -420,23 +484,26 @@ async def ws_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "No messages provided.", "requestId": request_id})
                 continue
 
-            provider_name = config["provider"]
             try:
-                answer = await asyncio.to_thread(call_model, messages, provider_name)
-            except Exception as exc:  # pragma: no cover - proxy errors to UI
+                provider = registry.get_active_provider()
+                if not provider:
+                    await websocket.send_json({"type": "error", "message": "No provider configured.", "requestId": request_id})
+                    continue
+                
+                answer = await asyncio.to_thread(call_model, messages, provider.id)
+                
+                await websocket.send_json({"type": "token", "content": answer, "requestId": request_id})
+                await websocket.send_json({
+                    "type": "done",
+                    "content": answer,
+                    "requestId": request_id,
+                    "provider": provider.type,
+                    "model": provider.model,
+                    "toolCalls": [],
+                    "timing": {"providerRequestMs": 0, "timeToFirstTokenMs": 0},
+                })
+            except Exception as exc:
                 await websocket.send_json({"type": "error", "message": str(exc), "requestId": request_id})
-                continue
-
-            await websocket.send_json({"type": "token", "content": answer, "requestId": request_id})
-            await websocket.send_json({
-                "type": "done",
-                "content": answer,
-                "requestId": request_id,
-                "provider": provider_name,
-                "model": get_active_provider().get("model"),
-                "toolCalls": [],
-                "timing": {"providerRequestMs": 0, "timeToFirstTokenMs": 0},
-            })
     except WebSocketDisconnect:
         pass
 
@@ -448,7 +515,6 @@ async def run_websocket_server():
     
     async def ws_handler(websocket, path):
         """Handle WebSocket connections on port 3002."""
-        pending_tool_calls = {}
         try:
             async for message in websocket:
                 try:
@@ -458,9 +524,7 @@ async def run_websocket_server():
                     continue
 
                 if payload.get("type") == "tool_result":
-                    key = f"{payload.get('requestId')}:{payload.get('toolCallId')}"
-                    if key in pending_tool_calls:
-                        pending_tool_calls[key]["result"] = payload.get("result")
+                    # Ignore tool results for now
                     continue
 
                 if payload.get("type") != "chat":
@@ -474,17 +538,21 @@ async def run_websocket_server():
                     await websocket.send(json.dumps({"type": "error", "message": "No messages provided.", "requestId": request_id}))
                     continue
 
-                provider_name = config.get("provider", "groq")
                 try:
-                    answer = await asyncio.to_thread(call_model, messages, provider_name)
+                    provider = registry.get_active_provider()
+                    if not provider:
+                        await websocket.send(json.dumps({"type": "error", "message": "No provider configured.", "requestId": request_id}))
+                        continue
+                    
+                    answer = await asyncio.to_thread(call_model, messages, provider.id)
                     
                     await websocket.send(json.dumps({"type": "token", "content": answer, "requestId": request_id}))
                     await websocket.send(json.dumps({
                         "type": "done",
                         "content": answer,
                         "requestId": request_id,
-                        "provider": provider_name,
-                        "model": get_active_provider().get("model", ""),
+                        "provider": provider.type,
+                        "model": provider.model,
                         "rounds": 1,
                         "toolCalls": [],
                         "timing": {"providerRequestMs": 0, "timeToFirstTokenMs": 0},
@@ -509,7 +577,13 @@ if __name__ == "__main__":
     )
     server_thread.start()
 
-    print(f"Using LLM provider: {config.get('provider')} (model: {get_active_provider().get('model')})")
+    active = registry.get_active_provider()
+    print(f"Provider registry initialized with {len(registry.providers)} providers (state: {registry.state.value})")
+    if active:
+        print(f"Active provider: {active.type} (model: {active.model}, status: {active.status.value})")
+    else:
+        print("No active provider configured")
+    
     print(f"HTTP API server listening on http://localhost:{PORT}")
 
     # Run WebSocket server in main thread
