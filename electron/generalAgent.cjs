@@ -107,6 +107,8 @@ function now() {
 function progressMessage(task) {
   const missing = task.plan?.missingInformation?.[0];
   if (missing) return missing.prompt;
+  if (task.providerError?.category === 'RATE_LIMIT') return 'Provider temporarily rate-limited. Please retry shortly.';
+  if (task.providerError) return 'The live provider could not complete this step. Please retry.';
   if (task.paused) return 'Paused. Resume when you are ready.';
   if (task.phase === 'CREATED') return 'Ready to understand your request.';
   if (task.phase === 'UNDERSTANDING') return 'Understanding your request...';
@@ -378,6 +380,8 @@ function createTask(ownerWebContentsId, input = {}) {
     observationVersion: 0,
     finalStatus: null,
     blockedReason: null,
+    assistantResponse: null,
+    providerError: null,
     paused: false,
     pausedFromPhase: null,
     history: [],
@@ -794,6 +798,39 @@ function observe(taskId, ownerWebContentsId, observation = {}) {
   return publicTask(task);
 }
 
+function recordModelResponse(taskId, ownerWebContentsId, input = {}) {
+  const task = getTask(taskId, ownerWebContentsId);
+  assertTaskActive(task);
+  const status = input.status === 'ERROR' ? 'ERROR' : 'COMPLETED';
+  const content = status === 'COMPLETED' ? safeText(input.content || '', 8000) : '';
+  const category = safeText(input.failureClassification || input.category || 'PROVIDER_ERROR', 80);
+  const message = safeText(input.error || '', 500);
+  task.assistantResponse = {
+    status,
+    content,
+    provider: input.provider ? safeText(input.provider, 120) : null,
+    model: input.model ? safeText(input.model, 160) : null,
+    source: 'LIVE_PROVIDER',
+    evidenceAvailable: Boolean(task.lastObservation || task.taskMemory.resultSetSummary),
+    requestId: input.requestId ? safeText(input.requestId, 100) : null,
+    receivedAt: now(),
+  };
+  task.providerError = status === 'ERROR'
+    ? { category, message: message || 'The live provider could not complete this step.', at: now() }
+    : null;
+  task.history.push({
+    type: status === 'ERROR' ? 'MODEL_ERROR' : 'MODEL_RESPONSE',
+    status,
+    provider: task.assistantResponse.provider,
+    model: task.assistantResponse.model,
+    failureClassification: status === 'ERROR' ? category : null,
+    at: task.assistantResponse.receivedAt,
+  });
+  if (task.history.length > 32) task.history.shift();
+  task.updatedAt = now();
+  return publicTask(task);
+}
+
 function prepareAction(taskId, ownerWebContentsId, name, rawArgs = {}) {
   const task = getTask(taskId, ownerWebContentsId);
   assertTaskActive(task);
@@ -1107,6 +1144,8 @@ function publicTask(task) {
     }),
     finalStatus: task.finalStatus,
     blockedReason: task.blockedReason,
+    assistantResponse: task.assistantResponse ? redact(task.assistantResponse) : null,
+    providerError: task.providerError ? redact(task.providerError) : null,
     paused: task.paused,
     bounds: { ...task.bounds },
     history: task.history.slice(-12).map(redact),
@@ -1153,6 +1192,7 @@ module.exports = {
   replanTask,
   prepareDeveloperHandoff,
   observe,
+  recordModelResponse,
   validateToolCall,
   prepareAction,
   beginAction,

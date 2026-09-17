@@ -153,6 +153,27 @@ const referenceTask = agent.replanTask(datedTask.taskId, ownerA, { message: 'Use
 assert.equal(referenceTask.planningStatus, 'NEEDS_INFORMATION');
 assert.equal(referenceTask.taskMemory.referenceResolution.status, 'PENDING_CONTEXT');
 assert.equal(referenceTask.missingInformation.some((item) => item.id === 'reference'), true);
+const responseTask = agent.recordModelResponse(datedTask.taskId, ownerA, {
+  status: 'COMPLETED',
+  content: 'The observed result is ready.',
+  provider: 'test-provider',
+  model: 'test-model',
+  requestId: 'runtime-response-test',
+});
+assert.equal(responseTask.assistantResponse.status, 'COMPLETED');
+assert.equal(responseTask.assistantResponse.content, 'The observed result is ready.');
+assert.equal(responseTask.assistantResponse.source, 'LIVE_PROVIDER');
+assert.equal(responseTask.providerError, null);
+const rateLimitedResponse = agent.recordModelResponse(datedTask.taskId, ownerA, {
+  status: 'ERROR',
+  category: 'RATE_LIMIT',
+  failureClassification: 'RATE_LIMIT',
+  error: 'Provider temporarily rate-limited.',
+  requestId: 'runtime-rate-limit-test',
+});
+assert.equal(rateLimitedResponse.phase, 'PLANNING');
+assert.equal(rateLimitedResponse.assistantResponse.status, 'ERROR');
+assert.equal(rateLimitedResponse.providerError.category, 'RATE_LIMIT');
 
 agent.stopTask(created.taskId, ownerA);
 assert.equal(agent.getTask(created.taskId, ownerA).phase, 'CANCELLED');

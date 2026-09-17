@@ -572,6 +572,8 @@ export function developerDecisionPrompt(request) {
       'read-only until a validated proposal is explicitly approved',
       'do not guess target files or dependencies',
       'respect project-root confinement and allow-listed verification',
+      'protect mode isolation between Developer, Assistant, and General Agent states',
+      'never delete or destroy project history, files, branches, credentials, or user data',
     ],
   });
   const runtimeState = createTaskRuntimeState({
@@ -591,9 +593,19 @@ export function developerDecisionPrompt(request) {
     'Mode: ' + plan.mode,
     'Task plan: ' + JSON.stringify(plan.taskPlan),
     'Task state: ' + JSON.stringify(runtimeState.summarize()),
+    'Developer Mode scope:',
+    '- Read and inspect only the selected project/workspace.',
+    '- Keep file operations confined to the selected project root and reject path traversal or absolute paths outside the root.',
+    '- Treat the developer environment as read-only until there is a validated proposal and explicit approval.',
+    '- Never modify, delete, or overwrite files, directories, branches, git history, credentials, secrets, logs, or backups.',
+    '- Never use destructive cleanup or deletion as a workaround for any problem.',
+    '- Before closing, restarting, or shutting down a running process, service, task, or connection, ask exactly: "Are you sure you want to close [process/task name]?" and continue only after explicit user confirmation: "yes".',
+    '- Keep Assistant, Developer, and General Agent state isolated; do not leak mutable state or credentials between modes.',
+    '- Only run allow-listed verification commands inside the selected project. Do not run arbitrary commands or commands that can mutate the project or system.',
     'For coding changes, search and read relevant files before proposing anything.',
     'Do not guess target files, symbols, dependencies, tests, or configuration. If evidence is missing, use another focused read step or ask a clarification.',
     'Never claim a change was applied. The current Developer Mode has no filesystem write capability.',
+    'If the task requires a change, propose the minimal safe change only after evidence is sufficient and the user explicitly approves it.',
   ].join('\n');
 }
 

@@ -91,7 +91,7 @@ export function validateToolCall(call) {
 
 export async function completeDeveloper({ messages, allowTools = true }) {
   let lastError;
-  for (const provider of providerOrder({ requireToolCalling: true })) {
+  for (const provider of providerOrder({ requireToolCalling: true, allowPreviouslyFailed: true })) {
     try {
       const response = await completeProvider({ provider, messages, tools: allowTools ? DEVELOPER_TOOLS : undefined });
       if (provider.id) setConfiguredProviderStatus(provider.id, 'ok');

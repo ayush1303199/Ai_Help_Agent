@@ -51,6 +51,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   resumeGeneralTask: (taskId) => ipcRenderer.invoke('general:task-resume', taskId),
   recoverGeneralTask: (taskId) => ipcRenderer.invoke('general:task-recover', taskId),
   observeGeneralTask: (taskId, observation) => ipcRenderer.invoke('general:observe', taskId, observation),
+  recordGeneralModelResponse: (taskId, input) => ipcRenderer.invoke('general:model-response', taskId, input),
   prepareGeneralAction: (taskId, name, args) => ipcRenderer.invoke('general:prepare-action', taskId, name, args),
   beginGeneralAction: (taskId) => ipcRenderer.invoke('general:begin-action', taskId),
   confirmGeneralAction: (taskId, confirmationId) => ipcRenderer.invoke('general:confirm-action', taskId, confirmationId),

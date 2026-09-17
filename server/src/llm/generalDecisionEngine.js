@@ -1,6 +1,8 @@
-import { setConfiguredProviderStatus } from '../config.js';
-import { completeProvider, isFallbackError, normalizeProviderError, providerOrder } from './provider.js';
+import { config, setConfiguredProviderStatus } from '../config.js';
+import { completeProvider, isFallbackError, normalizeProviderError, providerOrder, providerSupportsToolCalling } from './provider.js';
 import { GENERAL_TOOLS } from './generalTools.js';
+
+const RATE_LIMIT_RETRY_DELAY_MS = 30_000;
 
 function providerStatus(error) {
   if (error.category === 'RATE_LIMIT') return 'rate-limit';
@@ -12,7 +14,24 @@ function providerStatus(error) {
 
 export async function completeGeneral({ messages, allowTools = true, toolChoice = 'auto' }) {
   let lastError;
-  for (const provider of providerOrder({ requireToolCalling: allowTools })) {
+  let providers = providerOrder({ requireToolCalling: allowTools });
+  if (providers.length === 0) {
+    const rateLimited = config.configuredProviders.find((provider) => (
+      provider.enabled
+      && provider.apiKey
+      && provider.model
+      && provider.status === 'rate-limit'
+      && (!allowTools || providerSupportsToolCalling(provider.adapterType, provider.model))
+    ));
+    if (rateLimited) {
+      const lastCheckedAt = Number(rateLimited.lastCheckedAt || 0);
+      if (Date.now() - lastCheckedAt < RATE_LIMIT_RETRY_DELAY_MS) {
+        throw normalizeProviderError({ status: 429 }, rateLimited.label || rateLimited.adapterType);
+      }
+      providers = [rateLimited];
+    }
+  }
+  for (const provider of providers) {
     try {
       const response = await completeProvider({
         provider,

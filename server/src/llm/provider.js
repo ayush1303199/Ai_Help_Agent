@@ -105,14 +105,39 @@ export function providerSupportsToolCalling(provider, model) {
 function providerVerificationStatus(provider, model, configured) {
   if (!configured) return 'NOT_CONFIGURED';
   if (!providerSupportsToolCalling(provider, model)) return 'TOOL_CALL_UNSUPPORTED';
+
   const instances = config.configuredProviders
     .filter((candidate) => candidate.adapterType === provider && candidate.model === model);
-  if (instances.some((instance) => instance.status === 'ok' || instance.status === 'READY')) return 'READY';
-  const instance = instances.find((candidate) => candidate.status && candidate.status !== 'unknown');
-  if (instance) {
-    return String(instance.status).toUpperCase().replace(/-/g, '_');
+
+  if (instances.some((instance) => instance.status === 'ok' || instance.status === 'READY')) {
+    return 'READY';
   }
-  return 'UNVERIFIED';
+
+  const blocked = new Set([
+    'invalid-key',
+    'auth-error',
+    'tool-call-unsupported',
+    'model-unavailable',
+    'unsupported',
+  ]);
+
+  const transientStillConfigurable = instances.find((candidate) => {
+    const status = String(candidate.status || '').toLowerCase().replace(/_/g, '-');
+    return candidate.apiKey && candidate.model && !blocked.has(status);
+  });
+  if (transientStillConfigurable) {
+    return 'READY';
+  }
+
+  const explicitFailure = instances.find((candidate) => {
+    const status = String(candidate.status || '').toLowerCase().replace(/_/g, '-');
+    return status && status !== 'unknown' && status !== 'ready';
+  });
+  if (explicitFailure) {
+    return String(explicitFailure.status).toUpperCase().replace(/-/g, '_');
+  }
+
+  return 'READY';
 }
 
 function providerCapability(provider, model, configured) {
@@ -139,6 +164,13 @@ export function getProviderInfo() {
     developerStatus: capability.developerStatus,
     assistantCapable: capability.assistantCapable,
   };
+}
+
+export function getConfiguredProviderStatus(providerName = config.provider) {
+  const active = config[providerName];
+  if (!active?.apiKey || !active?.model || active.apiKey.includes('your_')) return 'NOT_CONFIGURED';
+  const configured = Boolean(active.apiKey && active.model && !active.apiKey.includes('your_'));
+  return providerVerificationStatus(providerName, active.model, configured);
 }
 export function getProviderCapabilities() {
   return Object.entries(PROVIDER_REGISTRY).map(([provider, metadata]) => {
@@ -248,16 +280,16 @@ export function isFallbackError(error) {
   return normalizeProviderError(error).retryable;
 }
 
-export function providerOrder({ requireToolCalling = false } = {}) {
+export function providerOrder({ requireToolCalling = false, allowPreviouslyFailed = false } = {}) {
   if (config.configuredProviders.length > 0) {
     let providers = config.configuredProviders
       .filter((provider) => provider.enabled && provider.apiKey && provider.model)
       .sort((a, b) => a.priority - b.priority);
     if (requireToolCalling) {
-      providers = providers.filter((provider) =>
-        providerSupportsToolCalling(provider.adapterType, provider.model) &&
-        (provider.status === 'ok' || provider.status === 'READY'),
-      );
+      providers = providers.filter((provider) => providerSupportsToolCalling(provider.adapterType, provider.model));
+      if (!allowPreviouslyFailed) {
+        providers = providers.filter((provider) => provider.status === 'ok' || provider.status === 'READY');
+      }
     }
     return config.fallbackEnabled ? providers : providers.slice(0, 1);
   }
@@ -273,7 +305,7 @@ export function providerOrder({ requireToolCalling = false } = {}) {
     }))
     .filter((provider) => !requireToolCalling || (
       providerSupportsToolCalling(provider.adapterType, provider.model) &&
-      (provider.status === 'ok' || provider.status === 'READY')
+      (allowPreviouslyFailed || provider.status === 'ok' || provider.status === 'READY')
     ));
 }
 

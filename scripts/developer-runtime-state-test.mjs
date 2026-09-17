@@ -2,9 +2,13 @@ import assert from 'node:assert/strict';
 import { buildReadPlan, createTaskRuntimeState, detectBadToolBehavior, evaluateCompletionState } from '../server/src/llm/developerDecisionEngine.js';
 
 const plan = buildReadPlan('Fix the login timeout bug.');
+const developerPrompt = (await import('../server/src/llm/developerDecisionEngine.js')).developerDecisionPrompt('Fix the login timeout bug.');
 assert.equal(plan.mode, 'AGENT');
 assert.equal(plan.runtimeState.phase, 'UNDERSTANDING');
 assert.ok(Array.isArray(plan.taskPlan.tasks));
+assert.match(developerPrompt, /selected project root/i);
+assert.match(developerPrompt, /Are you sure you want to close \[process\/task name\]\?/i);
+assert.match(developerPrompt, /Never modify, delete, or overwrite files/i);
 
 const runtime = createTaskRuntimeState({
   phase: 'CONTEXT_BUILDING',
