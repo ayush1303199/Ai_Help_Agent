@@ -14,6 +14,15 @@ const OBSERVE_SCRIPT = `(() => {
     type: String(element.type || element.tagName || 'element').slice(0, 40),
     enabled: !element.disabled
   }));
+  const results = [...document.querySelectorAll('a[href]')].map((anchor) => {
+    const url = String(anchor.href || '');
+    const title = String(anchor.innerText || anchor.textContent || '').replace(/\s+/g, ' ').trim();
+    const container = anchor.closest('article, li, [data-testid], div') || anchor.parentElement;
+    const snippet = String(container?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+    let source = '';
+    try { source = new URL(url).hostname; } catch {}
+    return { title, url, snippet, source };
+  }).filter((result) => (result.url.startsWith('http://') || result.url.startsWith('https://')) && result.title.length >= 4).slice(0, 30);
   const hasPasswordField = [...document.querySelectorAll('input')].some((element) => /password/i.test(String(element.type || '') + ' ' + String(element.name || '') + ' ' + String(element.id || '')));
   const hasLoginInput = [...document.querySelectorAll('input')].some((element) => /email|username|user/i.test(String(element.type || '') + ' ' + String(element.name || '') + ' ' + String(element.id || '')));
   const hasLoginPair = hasLoginInput && /sign in|log in|login|password/i.test(lowerText);
@@ -22,6 +31,7 @@ const OBSERVE_SCRIPT = `(() => {
     url: location.href,
     title: document.title,
     visibleText,
+    results,
     interactiveElements: elements,
     loginState: hasPasswordField || hasLoginPair ? 'LOGIN_REQUIRED' : 'UNKNOWN',
     pageState: captchaDetected ? 'CAPTCHA_REQUIRED' : document.readyState,
@@ -67,6 +77,12 @@ function safeObservation(session, data, screenshotReference = null) {
       message: bounded(data.errorState.message, 300),
       retryable: Boolean(data.errorState.retryable),
     } : null,
+    results: Array.isArray(data?.results) ? data.results.slice(0, 30).map((result) => ({
+      title: bounded(result?.title || result?.name || '', 300),
+      url: bounded(result?.url || '', 2048),
+      snippet: bounded(result?.snippet || result?.description || '', 600),
+      source: bounded(result?.source || '', 160),
+    })) : [],
     version,
   };
   session.state.observationVersion = version;
@@ -143,7 +159,26 @@ class ElectronBrowserAdapter {
     const window = await this._window(session);
     const url = safeUrl(typeof target === 'string' ? target : target.url);
     session.state.navigationCount += 1;
-    await window.loadURL(url);
+    try {
+      await window.loadURL(url);
+    } catch (error) {
+      const message = error && error.message ? String(error.message) : 'The page could not be loaded.';
+      return safeObservation(session, {
+        url,
+        title: '',
+        visibleText: '',
+        interactiveElements: [],
+        loginState: 'UNKNOWN',
+        pageState: 'LOAD_ERROR',
+        errorState: {
+          code: 'LOAD_ERROR',
+          message: /ERR_HTTP2_PROTOCOL_ERROR|ERR_CONNECTION|ERR_NAME_NOT_RESOLVED|ERR_CERT/i.test(message)
+            ? 'The page could not be loaded from the current network. The request was not completed, but the task remains bounded and user-visible.'
+            : message,
+          retryable: true,
+        },
+      });
+    }
     return this._observe(session, window);
   }
 

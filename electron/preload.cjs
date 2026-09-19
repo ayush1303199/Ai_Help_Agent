@@ -2,8 +2,24 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   openOverlay: () => ipcRenderer.invoke('overlay:open'),
+  showOverlay: () => ipcRenderer.invoke('overlay:show'),
+  hideOverlay: () => ipcRenderer.invoke('overlay:hide'),
   toggleOverlay: () => ipcRenderer.invoke('overlay:toggle'),
+  minimizeOverlay: () => ipcRenderer.invoke('overlay:minimize'),
+  expandOverlay: () => ipcRenderer.invoke('overlay:expand'),
   closeOverlay: () => ipcRenderer.invoke('overlay:close'),
+  getOverlayPreferences: () => ipcRenderer.invoke('overlay:get-preferences'),
+  setOverlayPreferences: (prefs) => ipcRenderer.invoke('overlay:set-preferences', prefs),
+  onOverlayState: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on('overlay:state', listener);
+    return () => ipcRenderer.removeListener('overlay:state', listener);
+  },
+  getOverlayBounds: () => ipcRenderer.invoke('overlay:get-bounds'),
+  setOverlayBounds: (bounds) => ipcRenderer.invoke('overlay:set-bounds', bounds),
+  setOverlayAlwaysOnTop: (alwaysOnTop) => ipcRenderer.invoke('overlay:set-always-on-top', alwaysOnTop),
+  focusOverlayAnswer: () => ipcRenderer.invoke('overlay:focus-answer'),
   chooseDeveloperProject: () => ipcRenderer.invoke('developer:choose-project'),
   clearDeveloperProject: () => ipcRenderer.invoke('developer:clear-project'),
   listDeveloperDirectory: (relativePath) => ipcRenderer.invoke('developer:list-directory', relativePath),

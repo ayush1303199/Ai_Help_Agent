@@ -59,7 +59,7 @@ const transitions = Object.freeze({
   WAITING_FOR_CONFIRMATION: ['EXECUTING', 'RECOVERING', 'CANCELLED', 'FAILED', 'BLOCKED'],
   EXECUTING: ['VERIFYING', 'RECOVERING', 'FAILED', 'CANCELLED', 'BLOCKED'],
   VERIFYING: ['PLANNING', 'RESEARCHING', 'COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'RECOVERING', 'FAILED', 'CANCELLED', 'BLOCKED'],
-  RECOVERING: ['PLANNING', 'RESEARCHING', 'WAITING_FOR_LOGIN', 'CANCELLED', 'FAILED', 'BLOCKED'],
+  RECOVERING: ['PLANNING', 'RESEARCHING', 'WAITING_FOR_LOGIN', 'COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'CANCELLED', 'FAILED', 'BLOCKED'],
   COMPLETED: ['RECOVERING'],
   COMPLETED_WITH_LIMITATIONS: ['RECOVERING'],
   BLOCKED: ['RECOVERING'],
@@ -107,14 +107,27 @@ function now() {
 function progressMessage(task) {
   const missing = task.plan?.missingInformation?.[0];
   if (missing) return missing.prompt;
+  if (task.providerError?.category === 'CONTEXT_TOO_LARGE' || task.providerError?.category === 'BLOCKED_CONTEXT_LIMIT') {
+    return 'The request was too large even after one safe context reduction. Browser activity was stopped.';
+  }
   if (task.providerError?.category === 'RATE_LIMIT') return 'Provider temporarily rate-limited. Please retry shortly.';
+  if (task.providerError?.category === 'TOOL_COMPATIBILITY') return 'The selected model cannot use the required browsing operation right now.';
   if (task.providerError) return 'The live provider could not complete this step. Please retry.';
   if (task.paused) return 'Paused. Resume when you are ready.';
   if (task.phase === 'CREATED') return 'Ready to understand your request.';
   if (task.phase === 'UNDERSTANDING') return 'Understanding your request...';
-  if (task.phase === 'PLANNING') return task.plan?.structuredRequirements?.actionIntent === 'RESEARCH'
-    ? 'Ready to search and compare safely.'
-    : 'Plan ready. Waiting for the next safe step.';
+  if (task.phase === 'PLANNING') {
+    const nextAction = task.plan?.nextAction;
+    if (nextAction === 'understand-goal') return 'Understanding your request...';
+    if (nextAction === 'select-capabilities') return 'Ready to search for options.';
+    if (nextAction === 'collect-evidence') return 'Searching for options...';
+    if (nextAction === 'compare-options') return 'Comparing results...';
+    if (nextAction === 'prepare-result') return 'Checking the best match...';
+    if (nextAction === 'verify-result') return 'Verifying the result...';
+    return task.plan?.structuredRequirements?.actionIntent === 'RESEARCH'
+      ? 'Searching for options...'
+      : 'Plan ready. Waiting for the next safe step.';
+  }
   if (task.phase === 'RESEARCHING') return 'Collecting relevant information...';
   if (task.phase === 'NAVIGATING') return 'Opening the requested page...';
   if (task.phase === 'WAITING_FOR_LOGIN') return 'Waiting for you to complete login.';
@@ -362,6 +375,12 @@ function createTask(ownerWebContentsId, input = {}) {
       selectedReferences: [],
       resultSet: [],
       resultSetSummary: null,
+      research: {
+        searchQueries: [],
+        candidates: [],
+        outcome: 'NOT_VERIFIED',
+        refinementLimit: 3,
+      },
       lastRefinement: null,
       conversationSummary: '',
       pendingAction: null,
@@ -382,6 +401,7 @@ function createTask(ownerWebContentsId, input = {}) {
     blockedReason: null,
     assistantResponse: null,
     providerError: null,
+    contextMetrics: null,
     paused: false,
     pausedFromPhase: null,
     history: [],
@@ -425,6 +445,22 @@ function applyPlan(task, plan) {
   task.taskMemory.confirmationState = task.confirmationId ? 'PENDING' : 'NONE';
   task.taskMemory.conversationSummary = [task.taskMemory.summary, ...task.requirements.slice(-3)].filter(Boolean).join(' ').slice(0, 1000);
   task.taskMemory.lastRefinement = plan.refinement || null;
+  const food = isFoodResearchTask(task) ? plan.structuredRequirements?.domainRequirements?.food : null;
+  if (food && task.taskMemory.research?.candidates?.length) {
+    const candidates = planner.evaluateFoodCandidates(task.taskMemory.research.candidates, food);
+    task.taskMemory.research.candidates = candidates;
+    task.taskMemory.research.outcome = planner.foodResearchOutcome(candidates);
+    task.taskMemory.resultSet = candidates.filter((candidate) => candidate.classification !== 'IRRELEVANT').slice(0, 12);
+    task.taskMemory.resultSetSummary = {
+      count: task.taskMemory.resultSet.length,
+      matchedCount: candidates.filter((candidate) => candidate.classification === 'MATCH').length,
+      partialCount: candidates.filter((candidate) => candidate.classification === 'PARTIAL_MATCH').length,
+      outcome: task.taskMemory.research.outcome,
+      source: 'UNTRUSTED_EXTERNAL_CONTENT',
+      updatedAt: now(),
+    };
+  }
+
   task.planningStatus = plan.status;
   task.riskLevel = plan.riskLevel;
   task.taskMemory.remaining = plan.taskGraph.nodes
@@ -432,6 +468,11 @@ function applyPlan(task, plan) {
     .map((node) => node.title)
     .slice(0, 12);
   task.updatedAt = now();
+}
+
+function isFoodResearchTask(task) {
+  const categories = Array.isArray(task?.plan?.categories) ? task.plan.categories : [];
+  return categories.includes('FOOD_RESEARCH') || categories.includes('FOOD');
 }
 
 function refreshPlanReadiness(task) {
@@ -477,9 +518,18 @@ function recordPlanPreparation(task, action) {
 
 function replanTask(taskId, ownerWebContentsId, input = {}) {
   const task = getTask(taskId, ownerWebContentsId);
-  assertTaskActive(task);
-  if (!['PLANNING', 'RECOVERING', 'VERIFYING'].includes(task.phase)) {
+  const wasTerminal = TERMINAL_PHASES.has(task.phase);
+  if (task.phase === 'CANCELLED') throw new Error('Cancelled General tasks cannot be replanned.');
+  if (!wasTerminal && !['PLANNING', 'RECOVERING', 'VERIFYING'].includes(task.phase)) {
     throw new Error(`General task cannot be replanned from ${task.phase}.`);
+  }
+  if (wasTerminal) {
+    transition(task, 'RECOVERING', { message: 'Follow-up request resumed the General task.' });
+    task.finalStatus = null;
+    task.blockedReason = null;
+    task.providerError = null;
+    task.assistantResponse = null;
+    task.contextMetrics = null;
   }
   const followUp = typeof input.message === 'string' ? input.message : typeof input.text === 'string' ? input.text : '';
   const followUpIntent = followUp ? planner.classifyIntent(followUp) : null;
@@ -522,6 +572,20 @@ function replanTask(taskId, ownerWebContentsId, input = {}) {
     task.plan.nextAction = 'ASK_FOR_REQUIRED_INFORMATION';
     task.planningStatus = 'NEEDS_INFORMATION';
   }
+  const requiresExternalConfirmation = Boolean(followUp)
+    && task.plan.missingInformation.length === 0
+    && (task.structuredRequirements?.actionIntent === 'EXECUTE'
+      || CONFIRMATION_RISKS.has(task.riskLevel));
+  if (requiresExternalConfirmation) {
+    if (task.phase !== 'PLANNING') {
+      transition(task, 'PLANNING', { message: 'External action requires an explicit confirmation gate.' });
+    }
+    prepareAction(taskId, ownerWebContentsId, 'click', {
+      target: followUp,
+      label: 'External action requested by the user.',
+    });
+    return publicTask(task);
+  }
   if (task.phase !== 'PLANNING') transition(task, 'PLANNING', { message: 'General task plan was revised.' });
   else task.history.push({ type: 'PLAN_REVISED', at: now(), planVersion: task.plan.version });
   return publicTask(task);
@@ -552,6 +616,23 @@ function ensureBrowserSession(task) {
     generalSessionId: task.sessionId,
     taskId: task.taskId,
   });
+}
+
+function closeTaskBrowser(task, ownerWebContentsId = task.ownerWebContentsId) {
+  if (!task.browserSessionId || !executionEngine.sessions.has(task.browserSessionId)) {
+    task.browserSessionId = null;
+    return;
+  }
+  try {
+    const closed = executionEngine.closeBrowserSession(task.browserSessionId, ownerWebContentsId, {
+      generalSessionId: task.sessionId,
+      taskId: task.taskId,
+    });
+    if (closed && typeof closed.then === 'function') closed.catch(() => undefined);
+  } catch {
+    // Terminal task state must not depend on renderer cleanup completing.
+  }
+  task.browserSessionId = null;
 }
 
 function publicExecutionAction(action) {
@@ -591,6 +672,27 @@ function taskTrace(task) {
 function rememberExternalResults(task, results) {
   if (!Array.isArray(results)) return;
   const safeResults = results.slice(0, 12).map((result) => redact(result));
+  const food = isFoodResearchTask(task) ? task.structuredRequirements?.domainRequirements?.food : null;
+  if (food) {
+    const existing = Array.isArray(task.taskMemory.research?.candidates)
+      ? task.taskMemory.research.candidates
+      : [];
+    const candidates = planner.evaluateFoodCandidates([...existing, ...safeResults], food);
+    task.taskMemory.research.candidates = candidates;
+    task.taskMemory.research.outcome = planner.foodResearchOutcome(candidates);
+    task.taskMemory.resultSet = candidates
+      .filter((candidate) => candidate.classification !== 'IRRELEVANT')
+      .slice(0, 12);
+    task.taskMemory.resultSetSummary = {
+      count: task.taskMemory.resultSet.length,
+      matchedCount: candidates.filter((candidate) => candidate.classification === 'MATCH').length,
+      partialCount: candidates.filter((candidate) => candidate.classification === 'PARTIAL_MATCH').length,
+      outcome: task.taskMemory.research.outcome,
+      source: 'UNTRUSTED_EXTERNAL_CONTENT',
+      updatedAt: now(),
+    };
+    return;
+  }
   task.taskMemory.resultSet = safeResults;
   task.taskMemory.resultSetSummary = {
     count: safeResults.length,
@@ -599,7 +701,52 @@ function rememberExternalResults(task, results) {
   };
 }
 
+function recordFoodSearchQuery(task, url) {
+  const food = isFoodResearchTask(task) ? task.structuredRequirements?.domainRequirements?.food : null;
+  if (!food) return null;
+  const query = planner.extractSearchQueryFromUrl(url);
+  if (!query) return null;
+  if (!Array.isArray(task.taskMemory.research?.searchQueries)) task.taskMemory.research.searchQueries = [];
+  if (!task.taskMemory.research.searchQueries.some((existing) => existing.toLowerCase() === query.toLowerCase())) {
+    task.taskMemory.research.searchQueries.push(query);
+  }
+  return query;
+}
+
+function foodSearchLimitObservation(task, url, message) {
+  return {
+    url: url || task.currentUrl,
+    title: '',
+    visibleText: '',
+    pageState: 'SEARCH_REFINEMENT_LIMIT',
+    loginState: 'UNKNOWN',
+    errorState: {
+      code: 'SEARCH_REFINEMENT_LIMIT',
+      message,
+      retryable: false,
+    },
+    results: [],
+    version: task.observationVersion,
+  };
+}
+
+function extractModelResultSet(content) {
+  const rows = [];
+  const pattern = /\|\s*(\d+)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|/g;
+  for (const match of String(content || '').matchAll(pattern)) {
+    rows.push({
+      index: Number(match[1]) - 1,
+      title: safeText(match[2], 300),
+      price: safeText(match[3], 80),
+      availability: safeText(match[4], 120),
+    });
+    if (rows.length >= 12) break;
+  }
+  return rows.filter((row) => row.index >= 0);
+}
+
 function syncExecutionTask(task, action, observation = null) {
+  if (TERMINAL_PHASES.has(task.phase)) return;
   task.executionActionId = action?.actionId || task.executionActionId;
   if (action?.state === 'WAITING_FOR_CONFIRMATION') task.taskMemory.confirmationState = 'PENDING';
   else if (action?.state === 'EXECUTING') task.taskMemory.confirmationState = 'CONFIRMED';
@@ -625,6 +772,7 @@ function syncExecutionTask(task, action, observation = null) {
     };
     task.taskMemory.observations.push(task.lastObservation);
     if (task.taskMemory.observations.length > 12) task.taskMemory.observations.shift();
+    recordFoodSearchQuery(task, observation.url);
     rememberExternalResults(task, observation.results);
     task.currentUrl = observation.url || task.currentUrl;
     task.currentSite = siteFromUrl(task.currentUrl);
@@ -645,6 +793,22 @@ function createExecutionBrowserSession(taskId, ownerWebContentsId) {
 function performBrowserOperation(taskId, ownerWebContentsId, operation, target = {}) {
   const task = getTask(taskId, ownerWebContentsId);
   assertTaskActive(task);
+  if (operation === 'navigate') {
+    const requestedUrl = typeof target === 'string' ? target : target?.url;
+    const query = planner.extractSearchQueryFromUrl(requestedUrl);
+    const food = isFoodResearchTask(task) ? task.structuredRequirements?.domainRequirements?.food : null;
+    if (food && query) {
+      const queries = task.taskMemory.research?.searchQueries || [];
+      if (queries.some((existing) => existing.toLowerCase() === query.toLowerCase())) {
+        const observation = foodSearchLimitObservation(task, requestedUrl, 'This search was already checked. Use a different, more specific query.');
+        return { observation: redact(observation), task: publicTask(task) };
+      }
+      if (queries.length >= 1 + Number(task.taskMemory.research?.refinementLimit || 3)) {
+        const observation = foodSearchLimitObservation(task, requestedUrl, 'The bounded search refinement limit was reached. The available evidence is being reported without claiming an unverified match.');
+        return { observation: redact(observation), task: publicTask(task) };
+      }
+    }
+  }
   const browser = ensureBrowserSession(task);
   const observation = executionEngine.browserOperation(browser.sessionId, ownerWebContentsId, operation, target, {
     generalSessionId: task.sessionId,
@@ -787,6 +951,7 @@ function observe(taskId, ownerWebContentsId, observation = {}) {
     url: task.currentUrl,
     site: task.currentSite,
     text,
+    results: Array.isArray(observation.results) ? observation.results.slice(0, 12).map((result) => redact(result)) : [],
     contentTrust: 'UNTRUSTED_EXTERNAL_CONTENT',
     at: now(),
   };
@@ -794,17 +959,27 @@ function observe(taskId, ownerWebContentsId, observation = {}) {
   task.lastObservation = safeObservation;
   task.taskMemory.observations.push(safeObservation);
   if (task.taskMemory.observations.length > 12) task.taskMemory.observations.shift();
+  recordFoodSearchQuery(task, task.currentUrl);
   task.updatedAt = now();
   return publicTask(task);
 }
 
 function recordModelResponse(taskId, ownerWebContentsId, input = {}) {
   const task = getTask(taskId, ownerWebContentsId);
+  if (TERMINAL_PHASES.has(task.phase) && input.status === 'ERROR' && task.phase !== 'CANCELLED') {
+    transition(task, 'RECOVERING', { message: 'A provider response arrived after the previous model response.' });
+    transition(task, 'PLANNING', { message: 'General task returned to planning for provider recovery.' });
+    task.finalStatus = null;
+    task.blockedReason = null;
+  }
   assertTaskActive(task);
   const status = input.status === 'ERROR' ? 'ERROR' : 'COMPLETED';
-  const content = status === 'COMPLETED' ? safeText(input.content || '', 8000) : '';
+  let content = status === 'COMPLETED' ? safeText(input.content || '', 8000) : '';
   const category = safeText(input.failureClassification || input.category || 'PROVIDER_ERROR', 80);
   const message = safeText(input.error || '', 500);
+  task.contextMetrics = input.contextMetrics && typeof input.contextMetrics === 'object'
+    ? redact(input.contextMetrics)
+    : task.contextMetrics;
   task.assistantResponse = {
     status,
     content,
@@ -827,6 +1002,81 @@ function recordModelResponse(taskId, ownerWebContentsId, input = {}) {
     at: task.assistantResponse.receivedAt,
   });
   if (task.history.length > 32) task.history.shift();
+  if (status === 'COMPLETED') {
+    const food = isFoodResearchTask(task) ? task.structuredRequirements?.domainRequirements?.food : null;
+    const hasFoodResearchEvidence = Boolean(
+      food
+      && (
+        task.taskMemory.research?.candidates?.length
+        || task.taskMemory.research?.searchQueries?.length
+      ),
+    );
+    if (hasFoodResearchEvidence) {
+      const candidates = task.taskMemory.research?.candidates || [];
+      task.taskMemory.research.outcome = planner.foodResearchOutcome(candidates);
+      content = planner.formatFoodResearchResponse(food, candidates);
+      task.assistantResponse.content = content;
+    }
+    const completedNodes = new Set(['select-capabilities', 'collect-evidence', 'compare-options', 'prepare-result', 'verify-result']);
+    const extractedResults = extractModelResultSet(content);
+    if (extractedResults.length > 0) {
+      task.taskMemory.resultSet = extractedResults;
+      task.taskMemory.resultSetSummary = {
+        count: extractedResults.length,
+        source: 'LIVE_PROVIDER_RESPONSE',
+        updatedAt: now(),
+      };
+    }
+    if (task.plan) {
+      for (const node of task.plan.taskGraph.nodes) {
+        if (completedNodes.has(node.id) && ['READY', 'PENDING'].includes(node.status)) node.status = 'COMPLETED';
+      }
+      task.plan.nextAction = task.plan.taskGraph.terminalNodeId;
+      task.planningStatus = 'COMPLETED';
+    }
+    task.taskMemory.completed.push(`model-response:${task.assistantResponse.requestId || now()}`);
+    task.taskMemory.remaining = [];
+    task.finalStatus = hasFoodResearchEvidence
+      ? task.taskMemory.research.outcome === 'MATCH' ? 'COMPLETED' : 'COMPLETED_WITH_LIMITATIONS'
+      : task.lastObservation || task.taskMemory.resultSetSummary
+        ? 'COMPLETED'
+        : 'COMPLETED_WITH_LIMITATIONS';
+    closeTaskBrowser(task);
+    transition(task, task.finalStatus, { message: 'General Agent produced a final response.' });
+  } else if (['CONTEXT_TOO_LARGE', 'BLOCKED_CONTEXT_LIMIT'].includes(category)) {
+    task.finalStatus = 'BLOCKED';
+    task.blockedReason = message || 'The provider rejected the request because its context limit was exceeded.';
+    task.planningStatus = 'BLOCKED_CONTEXT_LIMIT';
+    if (task.plan) {
+      const current = task.plan.taskGraph.nodes.find((node) => node.id === task.plan.nextAction);
+      if (current) current.status = 'BLOCKED';
+      task.plan.nextAction = 'BLOCKED_CONTEXT_LIMIT';
+      for (const node of task.plan.taskGraph.nodes) {
+        if (['READY', 'PENDING'].includes(node.status)) node.status = 'BLOCKED';
+      }
+    }
+    task.pendingAction = null;
+    task.confirmationId = null;
+    task.taskMemory.confirmationState = 'NONE';
+    closeTaskBrowser(task, ownerWebContentsId);
+    transition(task, 'BLOCKED', { reason: task.blockedReason, failureClassification: category });
+  } else {
+    task.finalStatus = 'FAILED';
+    task.planningStatus = 'FAILED';
+    if (task.plan) {
+      const current = task.plan.taskGraph.nodes.find((node) => node.id === task.plan.nextAction);
+      if (current) current.status = 'FAILED';
+      task.plan.nextAction = 'FAILED';
+      for (const node of task.plan.taskGraph.nodes) {
+        if (['READY', 'PENDING'].includes(node.status)) node.status = 'BLOCKED';
+      }
+    }
+    task.pendingAction = null;
+    task.confirmationId = null;
+    task.taskMemory.confirmationState = 'NONE';
+    closeTaskBrowser(task, ownerWebContentsId);
+    transition(task, 'FAILED', { reason: message || 'The live provider could not complete this step.', failureClassification: category });
+  }
   task.updatedAt = now();
   return publicTask(task);
 }
@@ -1038,6 +1288,7 @@ function stopTask(taskId, ownerWebContentsId) {
   if (task.phase !== 'CANCELLED') {
     task.pendingAction = null;
     task.confirmationId = null;
+    closeTaskBrowser(task, ownerWebContentsId);
     task.taskMemory.confirmationState = 'CANCELLED';
     task.paused = false;
     task.finalStatus = 'CANCELLED';
@@ -1128,6 +1379,7 @@ function publicTask(task) {
       preferences: task.taskMemory.preferences,
       selectedReferences: task.taskMemory.selectedReferences,
       resultSetSummary: task.taskMemory.resultSetSummary,
+      research: task.taskMemory.research,
       lastRefinement: task.taskMemory.lastRefinement,
       conversationSummary: task.taskMemory.conversationSummary,
       pendingAction: task.pendingAction ? {
@@ -1146,6 +1398,7 @@ function publicTask(task) {
     blockedReason: task.blockedReason,
     assistantResponse: task.assistantResponse ? redact(task.assistantResponse) : null,
     providerError: task.providerError ? redact(task.providerError) : null,
+    contextMetrics: task.contextMetrics ? redact(task.contextMetrics) : null,
     paused: task.paused,
     bounds: { ...task.bounds },
     history: task.history.slice(-12).map(redact),

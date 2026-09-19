@@ -26,6 +26,19 @@ assert.equal(researchPlan.preferences.ranking, 'BEST_VALUE');
 assert.equal(researchPlan.taskGraph.nodes.at(-1).action, 'verify');
 assert.ok(researchPlan.capabilityRoutes.some((route) => route.capability === 'PRODUCT_COMPARISON'));
 
+const pizzaPlan = planner.buildPlan({ goal: 'Find 60 rupees pizza without delivery.' });
+assert.ok(pizzaPlan.categories.includes('FOOD_RESEARCH'));
+assert.ok(!pizzaPlan.categories.includes('GENERAL_COMPUTER_TASK'));
+assert.equal(pizzaPlan.riskLevel, 'READ_ONLY');
+assert.equal(pizzaPlan.structuredRequirements.actionIntent, 'RESEARCH');
+assert.equal(pizzaPlan.structuredRequirements.domainRequirements.food.budget, 60);
+assert.equal(pizzaPlan.structuredRequirements.domainRequirements.food.deliveryExcluded, true);
+assert.equal(pizzaPlan.structuredRequirements.domainRequirements.food.purchase, false);
+assert.equal(pizzaPlan.structuredRequirements.domainRequirements.food.payment, false);
+assert.equal(pizzaPlan.structuredRequirements.executionPolicy, 'READ_ONLY');
+assert.equal(pizzaPlan.structuredRequirements.confirmationRequired, false);
+assert.equal(pizzaPlan.capabilityRoutes[0].capability, 'FOOD_RESEARCH');
+
 const travelPlan = planner.buildPlan({ goal: 'Book my bus to Jaipur tomorrow evening.' });
 assert.ok(travelPlan.categories.includes('BUS'));
 assert.ok(travelPlan.categories.includes('TRAVEL_BOOKING'));

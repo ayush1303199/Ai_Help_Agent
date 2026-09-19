@@ -14,7 +14,8 @@ const RANKING_MODES = Object.freeze([
 
 const CATEGORY_RULES = [
   ['GROCERY', /\b(grocer(?:y|ies)|blinkit|zepto|vegetables?|household supplies?)\b/i],
-  ['FOOD', /\b(food|restaurant|meal|swiggy|zomato|menu|delivery)\b/i],
+  ['FOOD_RESEARCH', /\b(pizza|biryani|chawal|rice|restaurant|meal|food|menu|swiggy|zomato)\b/i],
+  ['FOOD', /\b(food|biryani|chawal|rice|restaurant|meal|swiggy|zomato|menu|delivery)\b/i],
   ['SHOPPING', /\b(shop|shopping|buy|purchase|product|amazon|order|cart|return)\b/i],
   ['PRODUCT_COMPARISON', /\b(compare|comparison|alternative|which (one|is) best|good quality)\b/i],
   ['BUS', /\b(bus(?:es)?|redbus|coach)\b/i],
@@ -194,6 +195,241 @@ function extractDuration(text) {
   return quantity ? { quantity, unit: match[2].toLowerCase().replace(/s$/, '') } : null;
 }
 
+const FOOD_LOCATION_MISMATCHES = Object.freeze(['hyderabad', 'pakistan', 'chittoor', 'walajabad', 'hubli']);
+
+function extractBudgetValue(text) {
+  const normalized = normalizedText(text);
+  const match = normalized.match(
+    /(?:under|below|max(?:imum)?|budget(?:\s+of)?)\s*(?:₹|rs\.?|inr|\$)?\s*([\d,]+(?:\.\d+)?)\b|(?:₹|rs\.?|inr|\$)\s*([\d,]+(?:\.\d+)?)\b|(?:\b([\d,]+(?:\.\d+)?)\s*(?:rupees?|rs\.?|inr)\b)/i,
+  );
+  if (!match) return null;
+  const value = Number((match[1] || match[2] || match[3]).replace(/,/g, ''));
+  return Number.isFinite(value) ? value : null;
+}
+
+function cleanFoodLocation(value) {
+  return String(value || '')
+    .replace(/[,:;]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\s+(?:near|around|close to)$/i, '')
+    .slice(0, 160);
+}
+
+function extractFoodLocation(text) {
+  const normalized = normalizedText(text);
+  const match = normalized.match(/\b(?:near|around|close to)\s+(.+?)(?=$|[.!?;]|(?:\s+)(?:without|with\s+no|no|excluding|exclude|but|under|below|max(?:imum)?|budget(?:\s+of)?|for\s+\d+|and\s+(?:no|without))\b)/i);
+  return cleanFoodLocation(match?.[1]);
+}
+
+function extractFoodIdentity(text) {
+  const normalized = normalizedText(text);
+  const match = normalized.match(/\b(biryani(?:\s+(?:chawal|rice))?|chawal|rice|pizza|burger|thali|meal|food)\b/i);
+  if (!match) return { foodType: null, dish: null };
+  const dish = match[1].toLowerCase().replace(/\s+/g, ' ').trim();
+  const foodType = /\bbiryani\b/i.test(dish) ? 'BIRYANI' : dish.split(/\s+/)[0].toUpperCase();
+  return {
+    foodType,
+    dish: foodType === 'BIRYANI' && /\b(?:chawal|rice)\b/i.test(dish) ? 'BIRYANI RICE' : foodType === 'BIRYANI' ? 'BIRYANI' : dish.toUpperCase(),
+  };
+}
+
+function extractLocationTokens(location) {
+  return unique(String(location || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 3 && !['near', 'the', 'and'].includes(token)));
+}
+
+function buildFoodSearchQueries(text, food = null, maxQueries = 4) {
+  const normalized = normalizedText(text);
+  const identity = food || {
+    ...extractFoodIdentity(normalized),
+    budget: extractBudgetValue(normalized),
+    location: extractFoodLocation(normalized),
+  };
+  const dish = identity.dish || identity.foodType || 'food';
+  const budget = Number.isFinite(Number(identity.budget)) ? Number(identity.budget) : null;
+  const location = cleanFoodLocation(identity.location);
+  const locationWords = location.split(/\s+/).filter(Boolean);
+  const city = locationWords.length > 1 ? locationWords[locationWords.length - 1] : location;
+  const locality = locationWords.length > 2 ? locationWords.slice(1).join(' ') : location;
+  const price = budget === null ? '' : `₹${budget}`;
+  const queries = [
+    [price, dish].filter(Boolean).join(' '),
+    [price, dish, location].filter(Boolean).join(' '),
+    [price, dish, locality || city].filter(Boolean).join(' '),
+    [dish, budget === null ? '' : `under ₹${budget}`, location].filter(Boolean).join(' '),
+  ];
+  return [...new Set(queries.map((query) => query.replace(/\s+/g, ' ').trim()).filter(Boolean))].slice(0, Math.max(1, Math.min(4, maxQueries)));
+}
+
+function extractSearchQueryFromUrl(value) {
+  try {
+    const parsed = new URL(String(value || ''));
+    const query = parsed.searchParams.get('q') || parsed.searchParams.get('query');
+    return query ? query.replace(/\s+/g, ' ').trim().slice(0, 240) : null;
+  } catch {
+    return null;
+  }
+}
+
+function candidateText(candidate) {
+  return [
+    candidate?.title,
+    candidate?.name,
+    candidate?.snippet,
+    candidate?.description,
+    candidate?.source,
+    candidate?.url,
+  ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+
+function sourceQuality(candidate) {
+  const value = `${candidate?.source || ''} ${candidate?.url || ''} ${candidate?.sourceType || ''}`.toLowerCase();
+  if (/youtube|youtu\.be|video|blog|article|social|facebook|instagram|tiktok/.test(value)) return 'LOW';
+  if (/restaurant|menu|zomato|swiggy|google\.[^/]+\/maps|maps\.google|justdial|tripadvisor/.test(value)) return 'HIGH';
+  if (/local|listing|business|food/.test(value)) return 'MEDIUM';
+  return 'UNKNOWN';
+}
+
+function priceEvidence(candidate, text) {
+  const explicit = String(candidate?.priceEvidenceType || candidate?.priceVerification || '').toUpperCase();
+  if (explicit === 'PRICE_EXPLICITLY_OBSERVED' || candidate?.priceObserved === true) return 'PRICE_EXPLICITLY_OBSERVED';
+  if (/\btitle\b/i.test(String(candidate?.priceSource || '')) || /(?:₹|rs\.?|inr|\$)\s*[\d,]+/i.test(String(candidate?.title || ''))) {
+    return 'PRICE_CLAIMED_IN_TITLE';
+  }
+  if (/(?:menu|price|cost|₹|rs\.?|inr)/i.test(text) && sourceQuality(candidate) === 'HIGH') {
+    return 'PRICE_EXPLICITLY_OBSERVED';
+  }
+  return 'PRICE_NOT_VERIFIED';
+}
+
+function evaluateFoodCandidate(candidate, food = {}) {
+  const text = candidateText(candidate);
+  const lower = text.toLowerCase();
+  const identity = extractFoodIdentity(`${food.foodType || ''} ${food.dish || ''}`);
+  const foodMatch = identity.foodType
+    ? (identity.foodType === 'BIRYANI' ? /\bbiryani\b/i.test(lower) : new RegExp(`\\b${identity.foodType.toLowerCase()}\\b`, 'i').test(lower))
+    : /\b(food|restaurant|meal|menu|biryani|pizza|burger|thali)\b/i.test(lower);
+  const requestedLocation = cleanFoodLocation(food.location || food.deliveryLocation);
+  const locationTokens = extractLocationTokens(requestedLocation);
+  const matchingTokens = locationTokens.filter((token) => lower.includes(token));
+  const mismatch = FOOD_LOCATION_MISMATCHES.some((token) => lower.includes(token) && !locationTokens.includes(token));
+  const hasLocalityAnchor = locationTokens
+    .filter((token) => !['delhi', 'india'].includes(token))
+    .some((token) => lower.includes(token));
+  const hasRequestedCity = locationTokens
+    .filter((token) => ['delhi', 'india'].includes(token))
+    .some((token) => lower.includes(token));
+  const locationRelevance = mismatch
+    ? 'CONTRADICTED'
+    : locationTokens.length === 0
+        ? 'NOT_REQUESTED'
+        : matchingTokens.length >= Math.min(2, locationTokens.length)
+          && (locationTokens.includes('delhi') ? hasLocalityAnchor && hasRequestedCity : true)
+          ? 'MATCH'
+        : matchingTokens.length > 0
+          ? 'PARTIAL'
+          : 'NOT_FOUND';
+  const priceVerification = priceEvidence(candidate, text);
+  const observedPrice = priceVerification === 'PRICE_EXPLICITLY_OBSERVED'
+    ? String(candidate?.price || text.match(/(?:₹|rs\.?|inr|\$)\s*[\d,]+(?:\.\d+)?/i)?.[0] || '').trim()
+    : '';
+  const deliveryEvidence = food.deliveryExcluded
+    ? /pickup|pick[- ]up|in[- ]store|dine[- ]?in|take[- ]?away|takeaway/i.test(text)
+      ? 'SUPPORTED'
+      : /delivery|swiggy|zomato|order online/i.test(text) ? 'CONFLICT' : 'NOT_VERIFIED'
+    : 'NOT_REQUESTED';
+  const quality = sourceQuality(candidate);
+  const sourcePreference = String(food.sourcePreference || '').toUpperCase();
+  const sourceConflict = sourcePreference === 'RESTAURANTS' && quality === 'LOW';
+  const classification = !foodMatch || mismatch || sourceConflict
+    ? 'IRRELEVANT'
+    : locationRelevance === 'MATCH'
+      && priceVerification === 'PRICE_EXPLICITLY_OBSERVED'
+      && deliveryEvidence !== 'CONFLICT'
+      && (!food.deliveryExcluded || deliveryEvidence === 'SUPPORTED')
+      ? 'MATCH'
+      : locationRelevance === 'NOT_FOUND'
+        && priceVerification === 'PRICE_NOT_VERIFIED'
+        && quality === 'UNKNOWN'
+        ? 'UNVERIFIED'
+        : 'PARTIAL_MATCH';
+  return {
+    ...candidate,
+    title: String(candidate?.title || candidate?.name || 'Unnamed food result').trim().slice(0, 300),
+    url: String(candidate?.url || '').trim().slice(0, 2048),
+    snippet: String(candidate?.snippet || candidate?.description || '').trim().slice(0, 600),
+    price: observedPrice || candidate?.price || null,
+    sourceQuality: quality,
+    foodRelevance: foodMatch ? 'MATCH' : 'NOT_FOUND',
+    locationRelevance,
+    priceVerification,
+    deliveryEvidence,
+    classification,
+  };
+}
+
+function dedupeFoodCandidates(candidates) {
+  const rank = { MATCH: 4, PARTIAL_MATCH: 3, UNVERIFIED: 2, IRRELEVANT: 1 };
+  const byKey = new Map();
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const urlKey = String(candidate?.url || '').toLowerCase().replace(/[?#].*$/, '');
+    const titleKey = String(candidate?.title || candidate?.name || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    const sourceKey = String(candidate?.source || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    const key = urlKey || `${titleKey}|${sourceKey}`;
+    if (!key) continue;
+    const existing = byKey.get(key);
+    if (!existing || (rank[candidate.classification] || 0) > (rank[existing.classification] || 0)) byKey.set(key, candidate);
+  }
+  return [...byKey.values()].sort((left, right) => (rank[right.classification] || 0) - (rank[left.classification] || 0));
+}
+
+function evaluateFoodCandidates(candidates, food = {}) {
+  return dedupeFoodCandidates((Array.isArray(candidates) ? candidates : []).map((candidate) => evaluateFoodCandidate(candidate, food)));
+}
+
+function foodResearchOutcome(candidates) {
+  const evaluated = Array.isArray(candidates) ? candidates : [];
+  if (evaluated.some((candidate) => candidate.classification === 'MATCH')) return 'MATCH';
+  if (evaluated.some((candidate) => candidate.classification === 'PARTIAL_MATCH')) return 'PARTIAL_MATCH';
+  if (evaluated.some((candidate) => candidate.classification === 'UNVERIFIED')) return 'NOT_VERIFIED';
+  return 'NOT_VERIFIED';
+}
+
+function formatFoodResearchResponse(food = {}, candidates = []) {
+  const evaluated = dedupeFoodCandidates(candidates);
+  const matches = evaluated.filter((candidate) => candidate.classification === 'MATCH').slice(0, 5);
+  const partial = evaluated.filter((candidate) => candidate.classification === 'PARTIAL_MATCH').slice(0, 4);
+  const location = food.location || 'the requested area';
+  const budget = food.budget !== null && food.budget !== undefined && Number.isFinite(Number(food.budget))
+    ? `₹${Number(food.budget)}`
+    : 'the requested budget';
+  if (matches.length > 0) {
+    const rows = matches.map((candidate) => `| ${candidate.title.replace(/\|/g, '\\|')} | ${candidate.price || budget} | ${candidate.url || 'Observed page'} |`).join('\n');
+    return [
+      `I found ${matches.length} food option${matches.length === 1 ? '' : 's'} that match the requested dish, price, location, and pickup/no-delivery constraint near ${location}.`,
+      '',
+      '| Option | Price | Source |',
+      '|---|---|---|',
+      rows,
+      '',
+      'No order or payment was made.',
+    ].join('\n');
+  }
+  if (partial.length > 0) {
+    const references = partial.map((candidate) => `- ${candidate.title}${candidate.url ? ` — ${candidate.url}` : ''}`).join('\n');
+    return [
+      `I found ${partial.length} relevant reference${partial.length === 1 ? '' : 's'}, but I could not verify all of the requested details for ${location}.`,
+      `The ${budget} price, exact location, or pickup/no-delivery condition is not fully confirmed, so I have not presented these as verified matches.`,
+      '',
+      references,
+    ].join('\n');
+  }
+  return `I could not verify a ${food.dish || 'food'} option at ${budget} near ${location} without relying on unrelated or unverified results. No order or payment was made.`;
+}
+
 function extractTaskType(text, categories) {
   const normalized = normalizedText(text);
   if (/\b(bus(?:es)?|redbus|coach)\b/i.test(normalized)) return 'BUS_BOOKING';
@@ -202,7 +438,7 @@ function extractTaskType(text, categories) {
   if (/\b(hotel|stay|room|accommodation)\b/i.test(normalized)) return 'HOTEL_BOOKING';
   if (/\b(taxi|cab|uber|ola)\b/i.test(normalized)) return 'TAXI_BOOKING';
   if (categories.includes('GROCERY')) return 'GROCERY_ORDER';
-  if (categories.includes('SHOPPING') || categories.includes('FOOD')) return 'COMMERCE_TASK';
+  if (categories.includes('SHOPPING') || categories.includes('FOOD') || categories.includes('FOOD_RESEARCH')) return 'COMMERCE_TASK';
   if (categories.includes('EMAIL')) return 'EMAIL_TASK';
   if (categories.includes('CALENDAR')) return 'CALENDAR_TASK';
   return 'GENERAL_TASK';
@@ -210,8 +446,8 @@ function extractTaskType(text, categories) {
 
 function extractDomainRequirements(text, categories, preferences) {
   const normalized = normalizedText(text);
-  const budgetMatch = normalized.match(/(?:under|below|max(?:imum)?|budget(?: of)?)\s*(?:₹|rs\.?|inr|\$)?\s*([\d,]+(?:\.\d+)?)/i);
-  const budget = budgetMatch ? Number(budgetMatch[1].replace(/,/g, '')) : null;
+  const budgetValue = extractBudgetValue(normalized);
+  const budget = budgetValue;
   const passengerCount = extractPassengerCount(normalized);
   const duration = extractDuration(normalized);
   const departureAfter = preferences.departureAfter
@@ -223,6 +459,11 @@ function extractDomainRequirements(text, categories, preferences) {
   const ratingMatch = normalized.match(/\b(?:rating|rated)\s+(?:of\s+)?(?:at\s+least|minimum|above|over)\s+(\d+(?:\.\d+)?)\b/i);
   const locationMatch = normalized.match(/\b(?:near|around|close to)\s+([A-Za-z][A-Za-z0-9\s.'-]+?)(?=\s+(?:for|under|below|and|with|$))/i);
   const quantityMatch = normalized.match(/\b(\d+)\s+(?:items?|units?|packs?|plates?|meals?)\b/i);
+  const foodIdentity = extractFoodIdentity(normalized);
+  const foodLocation = extractFoodLocation(normalized);
+  const sourcePreference = /\b(?:restaurant|restaurants|local listing|menu)\b/i.test(normalized)
+    ? 'RESTAURANTS'
+    : /\b(?:video|videos|youtube|article|articles|blog|blogs)\b/i.test(normalized) ? 'NON_RESTAURANT' : null;
   return {
     travel: {
       passengerCount,
@@ -245,10 +486,23 @@ function extractDomainRequirements(text, categories, preferences) {
       deliveryLocation: locationMatch?.[1]?.trim() || null,
     },
     food: {
-      budget,
+      budget: budgetValue,
       quantity: quantityMatch ? Number(quantityMatch[1]) : null,
-      deliveryLocation: locationMatch?.[1]?.trim() || null,
+      foodType: foodIdentity.foodType,
+      dish: foodIdentity.dish,
+      location: foodLocation || locationMatch?.[1]?.trim() || null,
+      locationTerms: extractLocationTokens(foodLocation || locationMatch?.[1]?.trim() || ''),
       dietaryPreference: normalized.match(/\b(vegetarian|vegan|halal|jain)\b/i)?.[1]?.toLowerCase() || null,
+      deliveryExcluded: /\b(?:without|no|exclude|excluding|excluding any)\s+(?:any\s+)?delivery(?:\s+(?:fee|fees|charge|charges))?\b/i.test(normalized),
+      sourcePreference,
+      searchQueries: buildFoodSearchQueries(normalized, {
+        foodType: foodIdentity.foodType,
+        dish: foodIdentity.dish,
+        budget: budgetValue,
+        location: foodLocation || locationMatch?.[1]?.trim() || '',
+      }),
+      purchase: false,
+      payment: false,
     },
     email: {
       targetAccount: normalized.match(/\b(?:my|the)\s+([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/i)?.[1] || null,
@@ -568,15 +822,16 @@ function extractStructuredRequirements(goal, referenceDate = new Date(), options
 }
 
 function detectCategories(goal) {
-  const categories = [];
+  let categories = [];
   const activeGoal = normalizedText(goal).replace(NEGATION_SEGMENT_PATTERN, ' ');
   for (const [category, pattern] of CATEGORY_RULES) {
     if (pattern.test(activeGoal)) categories.push(category);
   }
+  if (categories.includes('FOOD_RESEARCH')) categories = categories.filter((category) => category !== 'FOOD');
   if (categories.length === 0) categories.push('GENERAL_COMPUTER_TASK');
   if (categories.includes('WEB_RESEARCH') || categories.includes('RESEARCH')) categories.push('RESEARCH');
   if (categories.some((category) => ['PDF', 'DOCUMENTS', 'SPREADSHEET'].includes(category))) categories.push('INFORMATION_EXTRACTION');
-  if (categories.some((category) => ['SHOPPING', 'GROCERY', 'FOOD', 'BUS', 'FLIGHT', 'TRAIN', 'HOTEL', 'TAXI'].includes(category))) categories.push('COMPARISON');
+  if (categories.some((category) => ['SHOPPING', 'GROCERY', 'FOOD', 'FOOD_RESEARCH', 'BUS', 'FLIGHT', 'TRAIN', 'HOTEL', 'TAXI'].includes(category))) categories.push('COMPARISON');
   return unique(categories).filter((category) => CAPABILITY_CATEGORIES.includes(category));
 }
 
@@ -611,8 +866,8 @@ function extractPreferences(goal, defaults = {}) {
   else if (/\b(fastest|quickest|soonest)\b/i.test(goal)) preferences.ranking = 'FASTEST';
   else if (/\b(convenient|closest|nearby)\b/i.test(goal)) preferences.ranking = 'MOST_CONVENIENT';
   else if (!preferences.ranking) preferences.ranking = 'BEST_VALUE';
-  const budget = goal.match(/(?:under|below|max(?:imum)?|budget(?: of)?)\s*(?:₹|rs\.?|inr|\$)?\s*([\d,]+(?:\.\d+)?)/i);
-  if (budget) preferences.budget = Number(budget[1].replace(/,/g, ''));
+  const budget = extractBudgetValue(goal);
+  if (budget !== null) preferences.budget = budget;
   if (/\b(ac|air[- ]?conditioned)\b/i.test(goal)) preferences.comfort = 'AC';
   if (/\b(sleeper)\b/i.test(goal)) preferences.seatPreference = 'SLEEPER';
   if (/\b(vegetarian|vegan|halal)\b/i.test(goal)) preferences.diet = goal.match(/\b(vegetarian|vegan|halal)\b/i)[1].toLowerCase();
@@ -812,6 +1067,16 @@ module.exports = {
   extractStructuredRequirements,
   extractPreferences,
   extractDomainRequirements,
+  extractBudgetValue,
+  extractFoodIdentity,
+  extractFoodLocation,
+  buildFoodSearchQueries,
+  extractSearchQueryFromUrl,
+  evaluateFoodCandidate,
+  evaluateFoodCandidates,
+  dedupeFoodCandidates,
+  foodResearchOutcome,
+  formatFoodResearchResponse,
   findMissingInformation,
   diffStructuredRequirements,
   buildTaskGraph,

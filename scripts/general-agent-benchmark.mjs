@@ -544,7 +544,7 @@ for (const [name, execute] of injectionCases) runCase('injectionDefense', name, 
 const crossCapabilityCases = [
   ['travel research and comparison', 'Research travel and compare a flight from Delhi to Mumbai.', ['FLIGHT', 'TRAVEL_RESEARCH', 'COMPARISON']],
   ['shopping and product comparison', 'Research and compare a laptop product under INR 70000.', ['SHOPPING', 'PRODUCT_COMPARISON', 'WEB_RESEARCH', 'COMPARISON']],
-  ['food and web research', 'Find vegetarian food delivery options.', ['FOOD', 'WEB_RESEARCH']],
+  ['food and web research', 'Find vegetarian food delivery options.', ['FOOD_RESEARCH', 'WEB_RESEARCH']],
   ['PDF extraction and summarization', 'Extract and summarize the PDF report.', ['PDF', 'INFORMATION_EXTRACTION', 'SUMMARIZATION']],
   ['email and summarization', 'Read my emails and summarize them.', ['EMAIL', 'SUMMARIZATION']],
   ['calendar and messaging planning', 'Schedule a calendar event and send a message.', ['CALENDAR', 'MESSAGING']],

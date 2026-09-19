@@ -92,6 +92,21 @@ const audioUpload = multer({
   limits: { fileSize: config.server.maxPdfMb * 1024 * 1024 },
 });
 
+const STT_TRANSCRIPTION_PROMPT = process.env.TRANSCRIPTION_PROMPT
+  || 'Technical vocabulary: Spring Boot, Spring Security, Java, JavaScript, TypeScript, React, Node.js, Python, FastAPI, OpenAI, Copilot, Groq, API, SQL, PostgreSQL, MySQL, Docker, Kubernetes, AWS, Azure, GitHub.';
+
+function classifySttError(error) {
+  const status = error?.status || error?.statusCode;
+  const message = String(error?.message || '').toLowerCase();
+  if (status === 401 || status === 403 || /unauthorized|forbidden|api key|authentication/.test(message)) return 'STT_AUTH_ERROR';
+  if (status === 429 || /rate limit|too many requests/.test(message)) return 'STT_RATE_LIMIT';
+  if (status === 400 || status === 422) return 'STT_BAD_REQUEST';
+  if (/unsupported|codec|mime|audio format/.test(message)) return 'STT_UNSUPPORTED_AUDIO';
+  if (/timeout|timed out/.test(message)) return 'STT_TIMEOUT';
+  if (/network|fetch|connection/.test(message)) return 'STT_NETWORK_ERROR';
+  return 'STT_UNKNOWN';
+}
+
 // --- Health / info endpoint ---
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -251,24 +266,50 @@ app.post('/api/extract-pdf', upload.single('file'), async (req, res) => {
 // POST /api/transcribe-audio with multipart form field "file"
 app.post('/api/transcribe-audio', audioUpload.single('file'), async (req, res) => {
   if (!req.file) {
-    return res.status(400).json({ error: 'No audio recording uploaded.' });
+    return res.status(400).json({ error: 'No audio recording uploaded.', classification: 'STT_BAD_REQUEST' });
   }
 
   try {
-    console.log(`[AUDIO] Audio chunk received (${req.file.size} bytes, ${req.file.mimetype || 'unknown format'})`);
-    console.log('[STT] Transcribing audio chunk');
+    const sttSession = req.get('X-STT-Session-ID') || 'unknown';
+    const segmentId = req.get('X-STT-Segment-ID') || 'unknown';
+    console.log(JSON.stringify({
+      event: 'STT_REQUEST_STARTED',
+      sttSession,
+      segmentId,
+      payloadBytes: req.file.size,
+      encoding: req.file.mimetype || 'unknown',
+    }));
     const active = config[config.provider];
     const client = new OpenAI({ apiKey: active.apiKey, baseURL: active.baseURL });
-    const transcript = await client.audio.transcriptions.create({
+    const transcriptionModel = process.env.TRANSCRIPTION_MODEL
+      || (config.provider === 'openai' ? 'whisper-1' : 'whisper-large-v3-turbo');
+    const transcriptionOptions = {
       file: await toFile(req.file.buffer, req.file.originalname || 'meeting.webm'),
-      model: process.env.TRANSCRIPTION_MODEL || 'whisper-large-v3-turbo',
+      model: transcriptionModel,
       response_format: 'text',
-    });
-    console.log(`[STT] Final transcript: "${String(transcript).slice(0, 240)}"`);
-    res.json({ text: transcript, confidence: null, isFinal: true });
+      prompt: STT_TRANSCRIPTION_PROMPT,
+      temperature: 0,
+    };
+    const transcriptionLanguage = process.env.TRANSCRIPTION_LANGUAGE?.trim();
+    if (transcriptionLanguage) transcriptionOptions.language = transcriptionLanguage;
+    const transcript = await client.audio.transcriptions.create(transcriptionOptions);
+    console.log(JSON.stringify({
+      event: 'STT_RESPONSE_RECEIVED',
+      sttSession,
+      segmentId,
+      status: 200,
+      transcriptLength: String(transcript).length,
+      classification: 'STT_SUCCESS',
+    }));
+    res.json({ text: transcript, confidence: null, isFinal: true, classification: 'STT_SUCCESS' });
   } catch (err) {
-    console.error('[STT] Speech-to-text failed:', err.message);
-    res.status(502).json({ error: `Audio transcription failed: ${err.message}` });
+    const classification = classifySttError(err);
+    console.error(JSON.stringify({
+      event: 'STT_RESPONSE_FAILED',
+      classification,
+      errorType: err?.constructor?.name || 'Error',
+    }));
+    res.status(502).json({ error: 'Audio transcription failed.', classification });
   }
 });
 

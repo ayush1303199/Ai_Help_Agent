@@ -23,6 +23,7 @@ class ProviderStatus(str, Enum):
     READY = "READY"                         # Healthy after last self-test
     CHECKING = "CHECKING"                   # Self-test in progress
     RATE_LIMITED = "RATE_LIMITED"           # Quota exhausted
+    REQUEST_TOO_LARGE = "REQUEST_TOO_LARGE" # Request exceeded provider limits
     AUTH_FAILED = "AUTH_FAILED"             # Invalid API key
     NETWORK_ERROR = "NETWORK_ERROR"         # Connection issue
     CAPACITY_ERROR = "CAPACITY_ERROR"       # Provider capacity exceeded
@@ -71,6 +72,7 @@ class ProviderInstance:
         result = {
             "id": self.id,
             "type": self.type,
+            "adapterType": self.type,
             "label": self.label,
             "model": self.model,
             "baseURL": self.base_url,
@@ -118,6 +120,9 @@ class ProviderRegistry:
     def __init__(self, config_path: Optional[str] = None):
         self.config_path = Path(config_path or Path.home() / ".ai-help-agent" / "provider-config.json")
         self.providers: Dict[str, ProviderInstance] = {}
+        # Secrets are available to the running process only. They are never
+        # serialized by ProviderInstance.to_dict() or save_to_file().
+        self._runtime_api_keys: Dict[str, str] = {}
         self.active_provider_id: Optional[str] = None
         self.fallback_enabled: bool = True
         self.state = RegistryState.LOADING
@@ -160,24 +165,26 @@ class ProviderRegistry:
         """Load provider configuration from persistent file."""
         if not self.config_path.exists():
             return
-        
+
         try:
             with open(self.config_path, 'r') as f:
                 data = json.load(f)
-            
-            # Handle both old and new formats
+
             providers_data = data.get("providers", [])
-            
+
             for provider_data in providers_data:
-                # Migrate old format (adapterType -> type)
                 if "adapterType" in provider_data and "type" not in provider_data:
                     provider_data["type"] = provider_data["adapterType"]
-                
-                # Strip API key from persisted data (never store secrets)
+
+                if "type" not in provider_data and "provider" in provider_data:
+                    provider_data["type"] = provider_data["provider"]
+
                 if "apiKey" in provider_data:
+                    api_key = str(provider_data.get("apiKey") or "").strip()
+                    if api_key:
+                        provider_data["hasApiKey"] = True
                     del provider_data["apiKey"]
-                
-                # Migrate old status values to new enum
+
                 old_status = provider_data.get("status", "UNCONFIGURED")
                 if old_status == "error":
                     provider_data["status"] = ProviderStatus.SELF_TEST_FAILED.value
@@ -185,15 +192,16 @@ class ProviderRegistry:
                     provider_data["status"] = ProviderStatus.CONFIGURED.value
                 elif old_status not in [s.value for s in ProviderStatus]:
                     provider_data["status"] = ProviderStatus.CONFIGURED.value
-                
-                # Set has_api_key based on presence (will be updated from env vars later)
-                provider_data["hasApiKey"] = False  # Will be updated during env merge
-                
+
+                provider_data["hasApiKey"] = bool(provider_data.get("hasApiKey", False))
+
                 provider = ProviderInstance.from_dict(provider_data)
-                self.providers[provider.id] = provider
-            
-            # Load active provider and fallback settings
+                if provider.id not in self.providers:
+                    self.providers[provider.id] = provider
+
             self.active_provider_id = data.get("activeProvider")
+            if self.active_provider_id and self.active_provider_id not in self.providers:
+                self.active_provider_id = next(iter(self.providers.keys())) if self.providers else None
             self.fallback_enabled = data.get("fallbackEnabled", True)
         except Exception as e:
             print(f"Error loading provider config from {self.config_path}: {e}")
@@ -204,18 +212,23 @@ class ProviderRegistry:
             api_key_env = f"{preset_name.upper()}_API_KEY"
             if api_key_env not in env_vars:
                 continue
-            
+
             api_key = env_vars[api_key_env]
-            
+
             # Check if this provider already exists
             existing = self._find_provider_by_type(preset_name)
-            
+
             if existing:
                 # Update existing provider from env vars
                 existing.has_api_key = bool(api_key)
+                if api_key:
+                    self._runtime_api_keys[existing.id] = api_key
                 existing.model = preset_info.get("model", existing.model)
                 existing.base_url = preset_info.get("baseURL", existing.base_url)
                 existing.label = preset_info.get("label", existing.label)
+                existing.enabled = True
+                if api_key:
+                    existing.status = ProviderStatus.CONFIGURED
             else:
                 # Create new provider from env vars
                 stable_id = self._generate_stable_id(preset_name, preset_info.get("baseURL", ""))
@@ -231,7 +244,9 @@ class ProviderRegistry:
                     status=ProviderStatus.CONFIGURED if api_key else ProviderStatus.UNCONFIGURED,
                 )
                 self.providers[provider.id] = provider
-                
+                if api_key:
+                    self._runtime_api_keys[provider.id] = api_key
+
                 # Set as active if this is first provider
                 if not self.active_provider_id:
                     self.active_provider_id = provider.id
@@ -323,20 +338,25 @@ class ProviderRegistry:
         """Add or update a provider."""
         # Check for existing provider with same type
         existing = self._find_provider_by_type(provider_type)
-        
+
         if existing:
             # Update existing
             existing.model = model
             existing.base_url = base_url
             existing.has_api_key = bool(api_key)
+            if api_key:
+                self._runtime_api_keys[existing.id] = api_key
             existing.label = label or existing.label
+            existing.enabled = True
             existing.status = ProviderStatus.CONFIGURED if api_key else ProviderStatus.UNCONFIGURED
+            if self.active_provider_id is None:
+                self.active_provider_id = existing.id
             return existing
         else:
             # Create new
             stable_id = self._generate_stable_id(provider_type, base_url)
             new_priority = priority or (max((p.priority for p in self.providers.values()), default=0) + 1)
-            
+
             provider = ProviderInstance(
                 provider_id=stable_id,
                 provider_type=provider_type,
@@ -348,13 +368,15 @@ class ProviderRegistry:
                 label=label or provider_type.capitalize(),
                 status=ProviderStatus.CONFIGURED if api_key else ProviderStatus.UNCONFIGURED,
             )
-            
+
             self.providers[provider.id] = provider
-            
+            if api_key:
+                self._runtime_api_keys[provider.id] = api_key
+
             # Set as active if first provider
             if not self.active_provider_id:
                 self.active_provider_id = provider.id
-            
+
             return provider
 
     def update_provider_status(
@@ -390,12 +412,17 @@ class ProviderRegistry:
             return False
         
         del self.providers[provider_id]
+        self._runtime_api_keys.pop(provider_id, None)
         
         # Update active provider if deleted
         if self.active_provider_id == provider_id:
             self.active_provider_id = next(iter(self.providers.keys())) if self.providers else None
         
         return True
+
+    def get_api_key(self, provider_id: str) -> str:
+        """Return a provider secret held only in the current process."""
+        return self._runtime_api_keys.get(provider_id, "")
 
     def get_provider(self, provider_id: str) -> Optional[ProviderInstance]:
         """Get a provider by ID."""

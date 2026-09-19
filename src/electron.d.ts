@@ -114,6 +114,21 @@ interface GeneralTaskState {
     receivedAt: string;
   } | null;
   providerError: { category: string; message: string; at: string } | null;
+  contextMetrics: {
+    estimatedInputChars?: number;
+    estimatedInputTokens?: number;
+    messageChars?: number;
+    toolSchemaChars?: number;
+    observationChars?: number;
+    budgetChars?: number;
+    budgetTokens?: number;
+    originalMessageCount?: number;
+    messageCount?: number;
+    compacted?: boolean;
+    compactionMode?: string;
+    retryCount?: number;
+    compactionStatus?: string;
+  } | null;
   actionCount: number;
   retryCount: number;
   navigationDepth: number;
@@ -174,11 +189,46 @@ interface GeneralExecutionAction {
   failure: Record<string, unknown> | null;
 }
 
+interface OverlayBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface OverlayRendererState {
+  answer?: string;
+  question?: string;
+  analysis?: string | string[] | null;
+  summary?: string | string[] | null;
+  actionItems?: unknown;
+  status?: string;
+  visibility: 'VISIBLE' | 'MINIMIZED' | 'HIDDEN';
+  lowVisibility: boolean;
+  autoHideEnabled: boolean;
+  autoHideDelay: number;
+  alwaysOnTop: boolean;
+  activeTab: 'answer' | 'analysis' | 'summary' | 'action-items';
+  bounds: OverlayBounds;
+  expandedBounds: OverlayBounds;
+}
+
 interface Window {
   electronAPI?: {
-    openOverlay: () => Promise<void>;
-    toggleOverlay: () => Promise<void>;
+    openOverlay: () => Promise<OverlayRendererState>;
+    showOverlay: () => Promise<OverlayRendererState>;
+    hideOverlay: () => Promise<OverlayRendererState>;
+    toggleOverlay: () => Promise<OverlayRendererState>;
+    minimizeOverlay: () => Promise<OverlayRendererState>;
+    expandOverlay: () => Promise<OverlayRendererState>;
     closeOverlay: () => Promise<void>;
+    getOverlayPreferences: () => Promise<OverlayRendererState>;
+    setOverlayPreferences: (prefs: Partial<{ lowVisibility: boolean; autoHideEnabled: boolean; autoHideDelay: number; alwaysOnTop: boolean; activeTab: 'answer' | 'analysis' | 'summary' | 'action-items' }>) => Promise<OverlayRendererState>;
+    getOverlayBounds: () => Promise<OverlayBounds>;
+    setOverlayBounds: (bounds: OverlayBounds) => Promise<OverlayRendererState>;
+    setOverlayAlwaysOnTop: (alwaysOnTop: boolean) => Promise<OverlayRendererState>;
+    onOverlayState: (callback: (state: OverlayRendererState) => void) => () => void;
+    focusOverlayAnswer: () => Promise<OverlayRendererState>;
     chooseDeveloperProject: () => Promise<{ canceled: boolean; projectRoot: string | null }>;
     clearDeveloperProject: () => Promise<void>;
     listDeveloperDirectory: (relativePath?: string) => Promise<Array<{ name: string; type: 'file' | 'directory' }>>;
@@ -257,7 +307,7 @@ interface Window {
     resumeGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
     recoverGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
     observeGeneralTask: (taskId: string, observation: { kind?: string; url?: string; text?: string; summary?: string }) => Promise<GeneralTaskState>;
-    recordGeneralModelResponse: (taskId: string, input: { status?: 'COMPLETED' | 'ERROR'; content?: string; provider?: string; model?: string; requestId?: string; failureClassification?: string; category?: string; error?: string }) => Promise<GeneralTaskState>;
+    recordGeneralModelResponse: (taskId: string, input: { status?: 'COMPLETED' | 'ERROR'; content?: string; provider?: string; model?: string; requestId?: string; failureClassification?: string; category?: string; error?: string; contextMetrics?: Record<string, unknown> | null }) => Promise<GeneralTaskState>;
     prepareGeneralAction: (taskId: string, name: string, args?: Record<string, unknown>) => Promise<{ requiresConfirmation: boolean; loginRequired?: boolean; confirmation?: { confirmationId: string; taskId: string; sessionId: string; actionId: string; site: string | null; target: string; riskLevel: string; summary: string; expiresAt: string }; task: GeneralTaskState }>;
     beginGeneralAction: (taskId: string) => Promise<GeneralTaskState>;
     confirmGeneralAction: (taskId: string, confirmationId: string) => Promise<GeneralTaskState>;

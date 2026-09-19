@@ -164,6 +164,7 @@ assert.equal(responseTask.assistantResponse.status, 'COMPLETED');
 assert.equal(responseTask.assistantResponse.content, 'The observed result is ready.');
 assert.equal(responseTask.assistantResponse.source, 'LIVE_PROVIDER');
 assert.equal(responseTask.providerError, null);
+assert.equal(responseTask.phase, 'COMPLETED_WITH_LIMITATIONS');
 const rateLimitedResponse = agent.recordModelResponse(datedTask.taskId, ownerA, {
   status: 'ERROR',
   category: 'RATE_LIMIT',
@@ -171,9 +172,34 @@ const rateLimitedResponse = agent.recordModelResponse(datedTask.taskId, ownerA, 
   error: 'Provider temporarily rate-limited.',
   requestId: 'runtime-rate-limit-test',
 });
-assert.equal(rateLimitedResponse.phase, 'PLANNING');
+assert.equal(rateLimitedResponse.phase, 'FAILED');
+assert.equal(rateLimitedResponse.finalStatus, 'FAILED');
+assert.equal(rateLimitedResponse.planningStatus, 'FAILED');
 assert.equal(rateLimitedResponse.assistantResponse.status, 'ERROR');
 assert.equal(rateLimitedResponse.providerError.category, 'RATE_LIMIT');
+
+const contextTask = agent.createTask(ownerB, { goal: 'Find cheap pizza without delivery.' });
+agent.startTask(contextTask.taskId, ownerB);
+const contextBrowser = agent.createExecutionBrowserSession(contextTask.taskId, ownerB);
+assert.ok(contextBrowser.browserSessionId);
+const blockedContext = agent.recordModelResponse(contextTask.taskId, ownerB, {
+  status: 'ERROR',
+  category: 'CONTEXT_TOO_LARGE',
+  failureClassification: 'CONTEXT_TOO_LARGE',
+  error: 'The request was too large after one retry.',
+  contextMetrics: { retryCount: 1, compactionStatus: 'BLOCKED_CONTEXT_LIMIT' },
+});
+assert.equal(blockedContext.phase, 'BLOCKED');
+assert.equal(blockedContext.finalStatus, 'BLOCKED');
+assert.equal(blockedContext.browserSessionId, null);
+assert.equal(blockedContext.contextMetrics.compactionStatus, 'BLOCKED_CONTEXT_LIMIT');
+assert.throws(
+  () => agent.performBrowserOperation(contextTask.taskId, ownerB, 'observe'),
+  /blocked/i,
+);
+const resumedContext = agent.replanTask(contextTask.taskId, ownerB, { message: 'Try again with the cheapest option.' });
+assert.equal(resumedContext.phase, 'PLANNING');
+assert.equal(resumedContext.providerError, null);
 
 agent.stopTask(created.taskId, ownerA);
 assert.equal(agent.getTask(created.taskId, ownerA).phase, 'CANCELLED');

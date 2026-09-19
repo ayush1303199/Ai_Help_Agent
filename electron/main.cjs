@@ -1,4 +1,4 @@
-const { app, BrowserWindow, desktopCapturer, session, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, desktopCapturer, session, ipcMain, dialog, globalShortcut, screen } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const developerFiles = require('./developerFiles.cjs');
@@ -25,8 +25,410 @@ function registerGeneralRenderer(event) {
   return ownerId;
 }
 
-// Keep Chromium cache in a writable app-specific directory on Windows.
-app.setPath('userData', path.join(app.getPath('temp'), 'ai-assistant-electron'));
+const OVERLAY_STATE_PATH = path.join(app.getPath('userData'), 'overlay-state.json');
+const OVERLAY_VISIBILITY_VALUES = new Set(['VISIBLE', 'MINIMIZED', 'HIDDEN']);
+const OVERLAY_TAB_VALUES = new Set(['answer', 'analysis', 'summary', 'action-items']);
+const OVERLAY_PREFERENCE_KEYS = new Set(['lowVisibility', 'autoHideEnabled', 'autoHideDelay', 'alwaysOnTop', 'activeTab']);
+const OVERLAY_MIN_WIDTH = 320;
+const OVERLAY_MIN_HEIGHT = 180;
+const OVERLAY_DEFAULT_WIDTH = 620;
+const OVERLAY_DEFAULT_HEIGHT = 420;
+const OVERLAY_MINI_WIDTH = 320;
+const OVERLAY_MINI_HEIGHT = 128;
+const defaultOverlayState = {
+  visibility: 'VISIBLE',
+  lowVisibility: false,
+  autoHideEnabled: true,
+  autoHideDelay: 5000,
+  alwaysOnTop: true,
+  activeTab: 'answer',
+  bounds: { x: 0, y: 0, width: OVERLAY_DEFAULT_WIDTH, height: OVERLAY_DEFAULT_HEIGHT },
+  expandedBounds: { x: 0, y: 0, width: OVERLAY_DEFAULT_WIDTH, height: OVERLAY_DEFAULT_HEIGHT },
+};
+let overlayState = { ...defaultOverlayState };
+const overlayShortcutMap = new Map();
+let overlayBoundsPersistTimer = null;
+let overlayWriteSequence = 0;
+let overlayWriteQueue = Promise.resolve();
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object') return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function assertPlainObject(value, name) {
+  if (!isPlainObject(value)) {
+    throw new TypeError(`${name} must be a plain object.`);
+  }
+  return value;
+}
+
+function clampNumber(value, min, max) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(Math.max(value, min), max);
+}
+
+function getDefaultOverlayBounds() {
+  const display = screen.getPrimaryDisplay();
+  const { workArea } = display;
+  const width = OVERLAY_DEFAULT_WIDTH;
+  const height = OVERLAY_DEFAULT_HEIGHT;
+  const x = clampNumber(workArea.x + Math.max(16, (workArea.width - width) / 2), workArea.x + 16, Math.max(workArea.x + 16, workArea.x + workArea.width - width - 16));
+  const y = clampNumber(workArea.y + Math.max(16, (workArea.height - height) / 2), workArea.y + 16, Math.max(workArea.y + 16, workArea.y + workArea.height - height - 16));
+  return { x, y, width, height };
+}
+
+function getNormalizedOverlayBounds(rawBounds = {}) {
+  const fallback = getDefaultOverlayBounds();
+  const source = isPlainObject(rawBounds) ? rawBounds : {};
+  const rawX = Number.isFinite(source.x) ? source.x : fallback.x;
+  const rawY = Number.isFinite(source.y) ? source.y : fallback.y;
+  const display = screen.getDisplayNearestPoint({ x: rawX, y: rawY }) || screen.getPrimaryDisplay();
+  const { workArea } = display;
+  const width = clampNumber(Number.isFinite(source.width) ? source.width : fallback.width, OVERLAY_MIN_WIDTH, Math.max(OVERLAY_MIN_WIDTH, workArea.width - 48));
+  const height = clampNumber(Number.isFinite(source.height) ? source.height : fallback.height, OVERLAY_MIN_HEIGHT, Math.max(OVERLAY_MIN_HEIGHT, workArea.height - 48));
+  const maxX = Math.max(workArea.x + 16, workArea.x + workArea.width - width - 16);
+  const maxY = Math.max(workArea.y + 16, workArea.y + workArea.height - height - 16);
+  const x = clampNumber(rawX, workArea.x + 16, maxX);
+  const y = clampNumber(rawY, workArea.y + 16, maxY);
+  return { x, y, width, height };
+}
+
+function getCompactOverlayBounds(bounds) {
+  const safeBounds = getNormalizedOverlayBounds(bounds);
+  return {
+    ...safeBounds,
+    width: Math.min(safeBounds.width, OVERLAY_MINI_WIDTH),
+    height: Math.min(safeBounds.height, OVERLAY_MINI_HEIGHT),
+  };
+}
+
+function normalizeOverlayState(rawState = {}) {
+  const source = isPlainObject(rawState) ? rawState : {};
+  const expandedBounds = getNormalizedOverlayBounds(
+    isPlainObject(source.expandedBounds) ? source.expandedBounds : source.bounds,
+  );
+  const visibility = OVERLAY_VISIBILITY_VALUES.has(source.visibility)
+    ? source.visibility
+    : defaultOverlayState.visibility;
+  const nextBounds = getNormalizedOverlayBounds(
+    isPlainObject(source.bounds)
+      ? source.bounds
+      : visibility === 'MINIMIZED'
+        ? getCompactOverlayBounds(expandedBounds)
+        : expandedBounds,
+  );
+  const nextState = {
+    ...defaultOverlayState,
+    visibility,
+    lowVisibility: typeof source.lowVisibility === 'boolean' ? source.lowVisibility : defaultOverlayState.lowVisibility,
+    autoHideEnabled: typeof source.autoHideEnabled === 'boolean' ? source.autoHideEnabled : defaultOverlayState.autoHideEnabled,
+    autoHideDelay: clampNumber(
+      Number.isFinite(source.autoHideDelay) ? source.autoHideDelay : defaultOverlayState.autoHideDelay,
+      500,
+      60000,
+    ),
+    alwaysOnTop: typeof source.alwaysOnTop === 'boolean' ? source.alwaysOnTop : defaultOverlayState.alwaysOnTop,
+    activeTab: OVERLAY_TAB_VALUES.has(source.activeTab) ? source.activeTab : defaultOverlayState.activeTab,
+    bounds: nextBounds,
+    expandedBounds,
+  };
+  return nextState;
+}
+
+function validateOverlayPreferences(prefs) {
+  assertPlainObject(prefs, 'Overlay preferences');
+  for (const key of Object.keys(prefs)) {
+    if (!OVERLAY_PREFERENCE_KEYS.has(key)) {
+      throw new TypeError(`Unsupported overlay preference: ${key}`);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(prefs, 'lowVisibility') && typeof prefs.lowVisibility !== 'boolean') {
+    throw new TypeError('lowVisibility must be a boolean.');
+  }
+  if (Object.prototype.hasOwnProperty.call(prefs, 'autoHideEnabled') && typeof prefs.autoHideEnabled !== 'boolean') {
+    throw new TypeError('autoHideEnabled must be a boolean.');
+  }
+  if (Object.prototype.hasOwnProperty.call(prefs, 'autoHideDelay')
+    && (!Number.isFinite(prefs.autoHideDelay) || typeof prefs.autoHideDelay !== 'number')) {
+    throw new TypeError('autoHideDelay must be a finite number.');
+  }
+  if (Object.prototype.hasOwnProperty.call(prefs, 'alwaysOnTop') && typeof prefs.alwaysOnTop !== 'boolean') {
+    throw new TypeError('alwaysOnTop must be a boolean.');
+  }
+  if (Object.prototype.hasOwnProperty.call(prefs, 'activeTab') && !OVERLAY_TAB_VALUES.has(prefs.activeTab)) {
+    throw new TypeError('activeTab is not supported.');
+  }
+  return prefs;
+}
+
+function validateOverlayBounds(bounds) {
+  assertPlainObject(bounds, 'Overlay bounds');
+  const expectedKeys = ['x', 'y', 'width', 'height'];
+  if (Object.keys(bounds).some((key) => !expectedKeys.includes(key))) {
+    throw new TypeError('Overlay bounds contain unsupported keys.');
+  }
+  for (const key of expectedKeys) {
+    if (typeof bounds[key] !== 'number' || !Number.isFinite(bounds[key])) {
+      throw new TypeError(`Overlay bounds.${key} must be a finite number.`);
+    }
+  }
+  return bounds;
+}
+
+async function readOverlayState() {
+  try {
+    const raw = await fs.readFile(OVERLAY_STATE_PATH, 'utf8');
+    if (!raw.trim()) return normalizeOverlayState({ bounds: getDefaultOverlayBounds(), expandedBounds: getDefaultOverlayBounds() });
+    const parsed = JSON.parse(raw);
+    return normalizeOverlayState(parsed);
+  } catch (error) {
+    if (error && error.code !== 'ENOENT') {
+      console.warn('[OVERLAY] state read failed:', error);
+    }
+    const bounds = getDefaultOverlayBounds();
+    return normalizeOverlayState({ bounds, expandedBounds: bounds });
+  }
+}
+
+function getOverlayStateForRenderer() {
+  return {
+    ...overlayState,
+    bounds: { ...overlayState.bounds },
+    expandedBounds: { ...overlayState.expandedBounds },
+  };
+}
+
+function publishOverlayState() {
+  if (!overlayWindow || overlayWindow.isDestroyed() || overlayWindow.webContents.isDestroyed()) return;
+  overlayWindow.webContents.send('overlay:state', getOverlayStateForRenderer());
+}
+
+async function persistOverlayState(nextState) {
+  const safeState = normalizeOverlayState(nextState);
+  overlayState = safeState;
+  publishOverlayState();
+  const writePath = `${OVERLAY_STATE_PATH}.${process.pid}.${overlayWriteSequence += 1}.tmp`;
+  overlayWriteQueue = overlayWriteQueue
+    .catch(() => undefined)
+    .then(async () => {
+      try {
+        await fs.mkdir(path.dirname(OVERLAY_STATE_PATH), { recursive: true });
+        await fs.writeFile(writePath, JSON.stringify(safeState, null, 2), 'utf8');
+        try {
+          await fs.rename(writePath, OVERLAY_STATE_PATH);
+        } catch (error) {
+          if (!['EEXIST', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+          await fs.rm(OVERLAY_STATE_PATH, { force: true });
+          await fs.rename(writePath, OVERLAY_STATE_PATH);
+        }
+      } catch (error) {
+        console.warn('[OVERLAY] state write failed:', error);
+        await fs.rm(writePath, { force: true }).catch(() => undefined);
+      }
+    });
+  await overlayWriteQueue;
+  return safeState;
+}
+
+function applyOverlayWindowState(nextState = overlayState, { reveal = false, focus = false } = {}) {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return nextState;
+  const safeState = normalizeOverlayState(nextState);
+  overlayWindow.setAlwaysOnTop(Boolean(safeState.alwaysOnTop));
+  const bounds = safeState.visibility === 'MINIMIZED'
+    ? getCompactOverlayBounds(safeState.bounds)
+    : getNormalizedOverlayBounds(safeState.bounds);
+  overlayWindow.setBounds(bounds, true);
+  if (reveal && safeState.visibility === 'HIDDEN') {
+    overlayWindow.hide();
+  } else if (reveal) {
+    if (overlayWindow.isMinimized()) overlayWindow.restore();
+    overlayWindow.show();
+    if (focus) overlayWindow.focus();
+  }
+  overlayState = safeState;
+  publishOverlayState();
+  return safeState;
+}
+
+function updateOverlayBoundsFromWindow() {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  const nextBounds = getNormalizedOverlayBounds(overlayWindow.getBounds());
+  const nextState = overlayState.visibility === 'MINIMIZED'
+    ? normalizeOverlayState({ ...overlayState, bounds: nextBounds })
+    : normalizeOverlayState({ ...overlayState, bounds: nextBounds, expandedBounds: nextBounds });
+  overlayState = nextState;
+  publishOverlayState();
+  if (overlayBoundsPersistTimer) clearTimeout(overlayBoundsPersistTimer);
+  overlayBoundsPersistTimer = setTimeout(() => {
+    overlayBoundsPersistTimer = null;
+    void persistOverlayState(overlayState);
+  }, 100);
+}
+
+async function showOverlayWindow() {
+  if (!overlayWindow || overlayWindow.isDestroyed()) {
+    await createOverlayWindow();
+  }
+  if (!overlayWindow || overlayWindow.isDestroyed()) return overlayState;
+  const expandedBounds = getNormalizedOverlayBounds(
+    overlayState.visibility === 'MINIMIZED' ? overlayState.expandedBounds : overlayState.bounds,
+  );
+  const nextState = normalizeOverlayState({
+    ...overlayState,
+    visibility: 'VISIBLE',
+    lowVisibility: false,
+    bounds: expandedBounds,
+    expandedBounds,
+  });
+  await persistOverlayState(nextState);
+  applyOverlayWindowState(nextState, { reveal: true, focus: true });
+  return nextState;
+}
+
+async function hideOverlayWindow() {
+  const nextState = normalizeOverlayState({ ...overlayState, visibility: 'HIDDEN', lowVisibility: true });
+  await persistOverlayState(nextState);
+  applyOverlayWindowState(nextState, { reveal: true });
+  return nextState;
+}
+
+async function toggleOverlayWindow() {
+  if (!overlayWindow || overlayWindow.isDestroyed()) {
+    return showOverlayWindow();
+  }
+  if (overlayState.visibility === 'HIDDEN') {
+    return showOverlayWindow();
+  }
+  if (overlayState.visibility === 'MINIMIZED') {
+    const expandedBounds = getNormalizedOverlayBounds(overlayState.expandedBounds);
+    const expandedState = normalizeOverlayState({
+      ...overlayState,
+      visibility: 'VISIBLE',
+      lowVisibility: false,
+      bounds: expandedBounds,
+      expandedBounds,
+    });
+    await persistOverlayState(expandedState);
+    applyOverlayWindowState(expandedState, { reveal: true, focus: true });
+    return expandedState;
+  }
+  return hideOverlayWindow();
+}
+
+async function minimizeOverlayWindow() {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return overlayState;
+  const expandedBounds = getNormalizedOverlayBounds(overlayState.expandedBounds || overlayState.bounds);
+  const compactBounds = getCompactOverlayBounds(expandedBounds);
+  const nextState = normalizeOverlayState({
+    ...overlayState,
+    visibility: 'MINIMIZED',
+    lowVisibility: true,
+    bounds: compactBounds,
+    expandedBounds,
+  });
+  await persistOverlayState(nextState);
+  applyOverlayWindowState(nextState, { reveal: true, focus: true });
+  return nextState;
+}
+
+async function expandOverlayWindow() {
+  if (!overlayWindow || overlayWindow.isDestroyed()) {
+    const expandedBounds = getNormalizedOverlayBounds(overlayState.expandedBounds || overlayState.bounds);
+    const nextState = normalizeOverlayState({
+      ...overlayState,
+      visibility: 'VISIBLE',
+      lowVisibility: false,
+      bounds: expandedBounds,
+      expandedBounds,
+    });
+    await persistOverlayState(nextState);
+    return showOverlayWindow();
+  }
+  const expandedBounds = getNormalizedOverlayBounds(overlayState.expandedBounds || overlayState.bounds);
+  const nextState = normalizeOverlayState({
+    ...overlayState,
+    visibility: 'VISIBLE',
+    lowVisibility: false,
+    bounds: expandedBounds,
+    expandedBounds,
+  });
+  await persistOverlayState(nextState);
+  applyOverlayWindowState(nextState, { reveal: true, focus: true });
+  return nextState;
+}
+
+async function setOverlayPreferences(prefs = {}) {
+  validateOverlayPreferences(prefs);
+  const nextState = normalizeOverlayState({ ...overlayState, ...prefs });
+  await persistOverlayState(nextState);
+  // Preference and opacity changes must not reveal or focus the overlay.
+  applyOverlayWindowState(nextState);
+  return nextState;
+}
+
+async function setOverlayBounds(bounds = overlayState.bounds) {
+  validateOverlayBounds(bounds);
+  const nextBounds = getNormalizedOverlayBounds(bounds);
+  const nextState = normalizeOverlayState({
+    ...overlayState,
+    bounds: overlayState.visibility === 'MINIMIZED' ? getCompactOverlayBounds(nextBounds) : nextBounds,
+    expandedBounds: nextBounds,
+  });
+  await persistOverlayState(nextState);
+  applyOverlayWindowState(nextState);
+  return nextState;
+}
+
+async function setOverlayAlwaysOnTop(alwaysOnTop) {
+  return setOverlayPreferences({ alwaysOnTop });
+}
+
+function registerOverlayShortcuts() {
+  const keyHandlers = [
+    { key: 'CommandOrControl+Shift+Space', action: async () => { const visible = overlayState.visibility === 'VISIBLE'; const hidden = overlayState.visibility === 'HIDDEN'; const next = hidden ? 'VISIBLE' : visible ? 'HIDDEN' : 'VISIBLE'; if (!overlayWindow || overlayWindow.isDestroyed()) { await showOverlayWindow(); return; } if (next === 'VISIBLE') { await showOverlayWindow(); } else { await hideOverlayWindow(); } } },
+    { key: 'CommandOrControl+Shift+M', action: async () => { if (!overlayWindow || overlayWindow.isDestroyed()) { await showOverlayWindow(); return; } if (overlayState.visibility === 'MINIMIZED') { await expandOverlayWindow(); } else { await minimizeOverlayWindow(); } } },
+    { key: 'CommandOrControl+Shift+A', action: async () => { if (!overlayWindow || overlayWindow.isDestroyed()) { await showOverlayWindow(); return; } await showOverlayWindow(); if (overlayWindow && !overlayWindow.isDestroyed()) { overlayWindow.focus(); } } },
+  ];
+
+  keyHandlers.forEach(({ key, action }) => {
+    try {
+      if (globalShortcut.isRegistered(key)) {
+        console.warn(`[OVERLAY] shortcut unavailable (already registered): ${key}`);
+        return;
+      }
+      const registered = globalShortcut.register(key, () => { void action(); });
+      if (registered) {
+        overlayShortcutMap.set(key, action);
+      } else {
+        console.warn(`[OVERLAY] shortcut unavailable: ${key}`);
+      }
+    } catch (error) {
+      console.warn(`[OVERLAY] shortcut conflict for ${key}:`, error);
+    }
+  });
+}
+
+function unregisterOverlayShortcuts() {
+  overlayShortcutMap.forEach((_action, key) => {
+    try {
+      globalShortcut.unregister(key);
+    } catch (error) {
+      console.warn(`[OVERLAY] shortcut unregister failed for ${key}:`, error);
+    }
+  });
+  overlayShortcutMap.clear();
+}
+
+function assertTrustedOverlaySender(event) {
+  const sender = event?.sender;
+  const isMainRenderer = Boolean(mainWindow && !mainWindow.isDestroyed() && sender === mainWindow.webContents);
+  const isOverlayRenderer = Boolean(overlayWindow && !overlayWindow.isDestroyed() && sender === overlayWindow.webContents);
+  if (!isMainRenderer && !isOverlayRenderer) {
+    throw new Error('Unauthorized overlay IPC sender.');
+  }
+}
 
 function createWindow() {
   const window = new BrowserWindow({
@@ -61,37 +463,78 @@ function createWindow() {
   return window;
 }
 
-function createOverlayWindow() {
+async function createOverlayWindow() {
   if (overlayWindow && !overlayWindow.isDestroyed()) {
-    overlayWindow.show();
-    overlayWindow.focus();
     return;
   }
 
-  const overlayCompositorOptions = process.platform === 'darwin'
-    ? { vibrancy: 'hud' }
-    : process.platform === 'win32'
-      ? { backgroundMaterial: 'acrylic' }
-      : {};
-
+  const bounds = getNormalizedOverlayBounds(overlayState.bounds || getDefaultOverlayBounds());
   overlayWindow = new BrowserWindow({
-    width: 620,
-    height: 420,
-    minWidth: 320,
-    minHeight: 180,
+    width: bounds.width,
+    height: bounds.height,
+    x: bounds.x,
+    y: bounds.y,
+    minWidth: OVERLAY_MIN_WIDTH,
+    minHeight: OVERLAY_MIN_HEIGHT,
     transparent: true,
     frame: false,
-    alwaysOnTop: true,
+    alwaysOnTop: Boolean(overlayState.alwaysOnTop),
     resizable: true,
     hasShadow: false,
+    show: false,
     backgroundColor: '#00000000',
-    ...overlayCompositorOptions,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
+  });
+
+  // Keep the overlay protected from supported screen-capture APIs just like
+  // the main window.
+  overlayWindow.setContentProtection(true);
+
+  overlayWindow.on('move', () => updateOverlayBoundsFromWindow());
+  overlayWindow.on('resize', () => updateOverlayBoundsFromWindow());
+  overlayWindow.on('show', () => {
+    if (overlayState.visibility === 'HIDDEN') {
+      overlayState = normalizeOverlayState({ ...overlayState, visibility: 'VISIBLE', lowVisibility: false });
+      void persistOverlayState(overlayState);
+    }
+    publishOverlayState();
+  });
+  overlayWindow.on('hide', () => {
+    if (overlayState.visibility !== 'HIDDEN') {
+      overlayState = normalizeOverlayState({ ...overlayState, visibility: 'HIDDEN', lowVisibility: true });
+      void persistOverlayState(overlayState);
+    }
+    publishOverlayState();
+  });
+  overlayWindow.on('minimize', () => {
+    const expandedBounds = getNormalizedOverlayBounds(overlayState.expandedBounds || overlayState.bounds);
+    overlayState = normalizeOverlayState({
+      ...overlayState,
+      visibility: 'MINIMIZED',
+      lowVisibility: true,
+      bounds: getCompactOverlayBounds(expandedBounds),
+      expandedBounds,
+    });
+    void persistOverlayState(overlayState);
+  });
+  overlayWindow.on('restore', () => {
+    if (overlayState.visibility === 'MINIMIZED') {
+      const expandedBounds = getNormalizedOverlayBounds(overlayState.expandedBounds || overlayState.bounds);
+      overlayState = normalizeOverlayState({
+        ...overlayState,
+        visibility: 'VISIBLE',
+        lowVisibility: false,
+        bounds: expandedBounds,
+        expandedBounds,
+      });
+      overlayWindow.setBounds(expandedBounds, true);
+      void persistOverlayState(overlayState);
+    }
   });
 
   const overlayUrl = isDev
@@ -101,14 +544,8 @@ function createOverlayWindow() {
   overlayWindow.on('closed', () => {
     overlayWindow = null;
   });
-}
-
-function toggleOverlayWindow() {
-  if (overlayWindow && !overlayWindow.isDestroyed()) {
-    overlayWindow.close();
-    return;
-  }
-  createOverlayWindow();
+  overlayState = normalizeOverlayState({ ...overlayState, bounds });
+  publishOverlayState();
 }
 
 app.whenReady().then(async () => {
@@ -121,14 +558,61 @@ app.whenReady().then(async () => {
   } catch (error) {
     console.error('[DEV][JOURNAL] startup reconciliation failed:', error);
   }
-  ipcMain.handle('overlay:open', () => {
-    createOverlayWindow();
+  ipcMain.handle('overlay:open', async (event) => {
+    assertTrustedOverlaySender(event);
+    return showOverlayWindow();
   });
-  ipcMain.handle('overlay:toggle', () => {
-    toggleOverlayWindow();
+  ipcMain.handle('overlay:show', async (event) => {
+    assertTrustedOverlaySender(event);
+    return showOverlayWindow();
   });
-  ipcMain.handle('overlay:close', () => {
+  ipcMain.handle('overlay:hide', async (event) => {
+    assertTrustedOverlaySender(event);
+    return hideOverlayWindow();
+  });
+  ipcMain.handle('overlay:toggle', async (event) => {
+    assertTrustedOverlaySender(event);
+    return toggleOverlayWindow();
+  });
+  ipcMain.handle('overlay:minimize', async (event) => {
+    assertTrustedOverlaySender(event);
+    return minimizeOverlayWindow();
+  });
+  ipcMain.handle('overlay:expand', async (event) => {
+    assertTrustedOverlaySender(event);
+    return expandOverlayWindow();
+  });
+  ipcMain.handle('overlay:close', (event) => {
+    assertTrustedOverlaySender(event);
     if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close();
+  });
+  ipcMain.handle('overlay:get-preferences', async (event) => {
+    assertTrustedOverlaySender(event);
+    return getOverlayStateForRenderer();
+  });
+  ipcMain.handle('overlay:set-preferences', async (event, prefs) => {
+    assertTrustedOverlaySender(event);
+    return setOverlayPreferences(prefs);
+  });
+  ipcMain.handle('overlay:get-bounds', async (event) => {
+    assertTrustedOverlaySender(event);
+    return { ...overlayState.bounds };
+  });
+  ipcMain.handle('overlay:set-bounds', async (event, bounds) => {
+    assertTrustedOverlaySender(event);
+    return setOverlayBounds(typeof bounds === 'undefined' ? overlayState.bounds : bounds);
+  });
+  ipcMain.handle('overlay:set-always-on-top', async (event, alwaysOnTop) => {
+    assertTrustedOverlaySender(event);
+    return setOverlayAlwaysOnTop(alwaysOnTop);
+  });
+  ipcMain.handle('overlay:focus-answer', async (event) => {
+    assertTrustedOverlaySender(event);
+    await showOverlayWindow();
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.focus();
+    }
+    return overlayState;
   });
   ipcMain.handle('developer:choose-project', (event) => {
     developerAgent.getSession(event.sender.id);
@@ -362,6 +846,8 @@ app.whenReady().then(async () => {
     callback({ video: source, audio: 'loopback' });
   });
 
+  overlayState = await readOverlayState();
+  registerOverlayShortcuts();
   mainWindow = createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -370,4 +856,9 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('will-quit', () => {
+  unregisterOverlayShortcuts();
+  globalShortcut.unregisterAll();
 });
