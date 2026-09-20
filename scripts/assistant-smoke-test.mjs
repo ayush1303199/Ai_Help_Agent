@@ -22,6 +22,8 @@ assert.deepEqual(transcriptUtils.detectQuestion('What? What?'), {
 assert.equal(transcriptUtils.prepareQuestion('uh...').qualityClassification, 'FILLER');
 assert.equal(transcriptUtils.prepareQuestion('What is the difference between...').qualityClassification, 'INCOMPLETE');
 assert.equal(transcriptUtils.prepareQuestion('What is Spring Boot?').acceptedQuestion, 'What is Spring Boot?');
+assert.equal(transcriptUtils.prepareTextRequest('Introduce yourself').acceptedQuestion, 'Introduce yourself');
+assert.equal(transcriptUtils.prepareTextRequest('Explain dependency injection in Spring.').acceptedQuestion, 'Explain dependency injection in Spring?');
 assert.equal(
   transcriptUtils.joinQuestionContinuation(
     'What is the difference between...',

@@ -26,6 +26,7 @@ import {
   cleanTranscript,
   joinQuestionContinuation,
   prepareQuestion,
+  prepareTextRequest,
   questionFingerprintForComparison,
   voiceSafeText,
   type PreparedQuestion,
@@ -34,6 +35,7 @@ import { resolveContext, truncateContextText } from './context/contextResolver';
 import { renderAnswerMarkdown } from './ui/answerMarkdown';
 import { AnswerSessionView } from './ui/AnswerSessionView';
 import { ConfiguredProvidersPanel } from './ui/ConfiguredProvidersPanel';
+import { ContextInputDialog } from './ui/ContextInputDialog';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -489,6 +491,8 @@ function App() {
     }
   });
   const [profilePreviewOpen, setProfilePreviewOpen] = useState(false);
+  const [profileDialogOpen, setProfileDialogOpen] = useState(false);
+  const [profileNameDraft, setProfileNameDraft] = useState('');
   const [meetingAudioMode, setMeetingAudioMode] = useState<MeetingAudioMode>('microphone');
   const [meetingMenuOpen, setMeetingMenuOpen] = useState(false);
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
@@ -903,9 +907,12 @@ function App() {
     }
 
     const suggestedName = sessionDocuments[0]?.name.replace(/\.pdf$/i, '') || 'Profile';
-    const profileName = window.prompt('Name this trained profile', suggestedName);
-    if (!profileName || !profileName.trim()) return;
+    setProfileNameDraft(suggestedName);
+    setProfileDialogOpen(true);
+    setError('');
+  }, [sessionDocuments]);
 
+  const completeProfileTraining = useCallback((profileName: string) => {
     const trimmedName = profileName.trim();
     const context = sessionDocuments
       .map((doc) => `Document: ${doc.name}\n${doc.text}`)
@@ -931,6 +938,8 @@ function App() {
     });
     setStatusMessage(`Profile "${trimmedName}" is ready.`);
     setError('');
+    setProfileDialogOpen(false);
+    setProfileNameDraft('');
   }, [sessionDocuments]);
 
   const handleWsMessage = useCallback((data: string) => {
@@ -1483,7 +1492,8 @@ function App() {
       return;
     }
 
-    const preparedQuestion = options.preparedQuestion || prepareQuestion(rawQuestion);
+    const preparedQuestion = options.preparedQuestion
+      || (question === input.trim() ? prepareTextRequest(rawQuestion) : prepareQuestion(rawQuestion));
     if (!preparedQuestion.acceptedQuestion) {
       setStatusMessage(inputQualityMessage(preparedQuestion.qualityClassification));
       return;
@@ -1830,11 +1840,25 @@ function App() {
     captureActiveRef.current = false;
     pendingPartialQuestionRef.current = '';
     pendingPartialRawTextRef.current = '';
+    pendingSegmentQueueRef.current = [];
+    pendingSegmentDurationQueueRef.current = [];
     if (segmentSilenceTimerRef.current) clearInterval(segmentSilenceTimerRef.current);
     segmentSilenceTimerRef.current = null;
     void segmentAudioContextRef.current?.close();
     segmentAudioContextRef.current = null;
-    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+      recorderRef.current.stop();
+    }
+    void electronAudioContextRef.current?.close();
+    electronAudioContextRef.current = null;
+    if (audioLevelTimerRef.current) clearInterval(audioLevelTimerRef.current);
+    audioLevelTimerRef.current = null;
+    setAudioLevel(0);
+    setAudioStatus('disabled');
     setIsRecording(false);
     setPipelineStatus('stopped');
     setMicrophoneStatus('off');
@@ -2170,11 +2194,7 @@ function App() {
       segmentHeardAudioRef.current = false;
       const segmentDurationMs = Math.max(0, Math.round(performance.now() - (segmentStartedAtRef.current || performance.now())));
       segmentStartedAtRef.current = 0;
-      if (captureActiveRef.current) {
-        recorder.start();
-        segmentStartedAtRef.current = performance.now();
-        console.log('[CAPTURE] Utterance segment started');
-      } else {
+      if (!captureActiveRef.current) {
         cleanup();
         stream.getTracks().forEach((track) => track.stop());
         recorderRef.current = null;
@@ -2187,7 +2207,17 @@ function App() {
         setAudioStatus('disabled');
         setMicrophoneStatus('off');
         setPipelineStatus('stopped');
+        logSttTrace(sttSession, 'CAPTURE_STOPPED', {
+          segmentDurationMs,
+          clearedQueuedSegments: pendingSegmentQueueRef.current.length,
+        });
+        pendingSegmentQueueRef.current = [];
+        pendingSegmentDurationQueueRef.current = [];
+        return;
       }
+      recorder.start();
+      segmentStartedAtRef.current = performance.now();
+      console.log('[CAPTURE] Utterance segment started');
       const audioSegment = new Blob(segment, { type: recorder.mimeType || 'audio/webm' });
       if (audioSegment.size > 0) {
         logSttTrace(sttSession, 'SEGMENT_CLOSED', {
@@ -2245,6 +2275,8 @@ function App() {
     setError('');
     pendingPartialQuestionRef.current = '';
     pendingPartialRawTextRef.current = '';
+    pendingSegmentQueueRef.current = [];
+    pendingSegmentDurationQueueRef.current = [];
     const sttSession = crypto.randomUUID();
     captureSessionIdRef.current = sttSession;
     logSttTrace(sttSession, 'CAPTURE_SESSION_STARTED', { requestedSources: ['microphone', 'system_audio'] });
@@ -2837,8 +2869,8 @@ function App() {
                     <button onClick={() => setContextMenuOpen(false)} className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200" aria-label="Close context panel"><X className="h-4 w-4" /></button>
                   </div>
                   {mode === 'direct' && (sessionDocuments.length > 0 || activeProfile) && (
-                    <p className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
-                      This context is available but not used while in Direct mode.
+                    <p className="mb-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-200">
+                      Selected session context is included in Direct mode requests when relevant.
                     </p>
                   )}
                   <input ref={resumeFileInputRef} type="file" accept="application/pdf" onChange={handleResumeUpload} className="hidden" />
@@ -3043,6 +3075,19 @@ function App() {
           {statusMessage}
         </div>
       )}
+
+      <ContextInputDialog
+        open={profileDialogOpen}
+        title="Name this trained profile"
+        description="Give this selected session context a reusable name. Cancel keeps the existing context unchanged."
+        label="Profile name"
+        initialValue={profileNameDraft}
+        onCancel={() => {
+          setProfileDialogOpen(false);
+          setProfileNameDraft('');
+        }}
+        onConfirm={completeProfileTraining}
+      />
 
       {historyOpen && (
         <div className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-slate-950/70 px-3 py-4 backdrop-blur-sm sm:px-4 sm:py-8" onMouseDown={() => setHistoryOpen(false)}>
@@ -3413,11 +3458,11 @@ function App() {
           <div className="flex items-center justify-between gap-2 rounded-xl border border-slate-700 bg-slate-800/60 px-3 py-2">
             <div className="min-w-0 flex-1">
               <p className="text-[11px] uppercase tracking-wide text-slate-500">Context mode</p>
-              <p className="text-sm font-medium text-slate-200">{mode === 'direct' ? 'Direct mode: profile and PDF context are ignored' : 'LangChain mode: profile and session docs are included'}</p>
+              <p className="text-sm font-medium text-slate-200">{mode === 'direct' ? 'Direct mode: selected session context is included when relevant' : 'LangChain mode: profile and session docs are included'}</p>
             </div>
             {mode === 'direct' && (sessionDocuments.length > 0 || !!activeProfile) && (
-              <div className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-medium text-amber-200">
-                Context unavailable
+              <div className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] font-medium text-emerald-200">
+                Context ready
               </div>
             )}
           </div>

@@ -30,8 +30,7 @@ export function resolveContext({
   contextCharBudget: number;
   profileCharBudget: number;
 }) {
-  if (mode === 'direct') return '';
-
+  void mode;
   const sections: string[] = [];
   if (activeProfile?.context) {
     sections.push(`Trained profile: ${activeProfile.name}\n${truncateContextText(activeProfile.context, profileCharBudget / 2)}`);
