@@ -31,6 +31,16 @@ import {
   voiceSafeText,
   type PreparedQuestion,
 } from './audio/transcriptUtils';
+import {
+  chooseMicrophoneDevice,
+  INTERVIEW_BACKGROUND_OPTIONS,
+  INTERVIEW_DOMAIN_OPTIONS,
+  microphoneDisplayLabel,
+  readPersistedInterviewContext,
+  writePersistedInterviewContext,
+  type InterviewContextConfig,
+} from './ai/interviewContext';
+import { buildInterviewSystemPrompt } from './ai/interviewSystemPrompt';
 import { resolveContext, truncateContextText } from './context/contextResolver';
 import { renderAnswerMarkdown } from './ui/answerMarkdown';
 import { AnswerSessionView } from './ui/AnswerSessionView';
@@ -115,7 +125,7 @@ function generalSafeObservationSummary(observation: Record<string, unknown> | nu
 
 type Mode = 'direct' | 'langchain';
 type AppMode = 'assistant' | 'developer' | 'general';
-type MeetingAudioMode = 'microphone' | 'meeting';
+type MeetingAudioMode = 'microphone' | 'system' | 'meeting';
 
 interface MeetingTranscript {
   id: string;
@@ -253,8 +263,8 @@ function validateUnifiedFile(lines: string[], original: string) {
 
 const HTTP_URL = 'http://localhost:3001';
 const WS_URL = 'ws://localhost:3002';
-const MAX_CHAT_HISTORY_MESSAGES = 8;
-const MAX_CHAT_MESSAGE_CHARS = 1600;
+const MAX_CHAT_HISTORY_MESSAGES = 4;
+const MAX_CHAT_MESSAGE_CHARS = 900;
 const MAX_CONTEXT_CHARS = 6000;
 const MAX_PDF_SIZE = 20 * 1024 * 1024;
 const PDF_CONTEXT_BUDGET_RATIO = 0.65;
@@ -264,24 +274,6 @@ const PDF_CONTEXT_CHAR_BUDGET = Math.floor(MAX_CONTEXT_CHARS * PDF_CONTEXT_BUDGE
 const PDF_UPLOAD_TIMEOUT_MS = 20000;
 const SYSTEM_AUDIO_SILENCE_MS = 1000;
 const SYSTEM_AUDIO_LEVEL_THRESHOLD = 2;
-const AI_SYSTEM_PROMPT = `You answer the user's latest accepted question.
-
-Input fidelity rules:
-- Answer the user's actual words and intent, not a familiar or guessed question.
-- Preserve technical terminology exactly as supplied. Do not invent missing words or silently correct uncertain speech.
-- Treat the message labeled CURRENT QUESTION as the primary target. Older messages are context only and must never override it.
-- If the current question is genuinely ambiguous or incomplete, ask one concise clarification instead of guessing.
-
-Answer policy:
-- Stay on topic and do not repeat the question unnecessarily.
-- For a simple question, give a direct answer and one useful detail.
-- For a technical question, give the direct answer, 2-4 important points, and one short, relevant example when useful.
-- For a complex question, give a short explanation, relevant example, and one caveat only when needed.
-- Stop when the question is answered. Do not add unrelated topics, automatic tutorials, tables, or generic sections unless requested.
-- Prioritize correctness, relevance, directness, useful examples, then conciseness.
-
-Use only the supplied conversation and context. Do not claim access to files, services, credentials, or test results that were not supplied.`;
-
 function compactMessageContent(content: string) {
   if (content.length <= MAX_CHAT_MESSAGE_CHARS) return content;
   return `${content.slice(0, MAX_CHAT_MESSAGE_CHARS)}\n[Earlier content omitted for speed]`;
@@ -290,6 +282,43 @@ function compactMessageContent(content: string) {
 function chatTitle(messages: Message[]) {
   const firstUserMessage = messages.find((message) => message.role === 'user')?.content.trim() || 'New conversation';
   return firstUserMessage.length > 52 ? `${firstUserMessage.slice(0, 52)}…` : firstUserMessage;
+}
+
+function overlayPlainText(content: string) {
+  return content
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[`*_>#]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildOverlaySummary(answer: string) {
+  const plainText = overlayPlainText(answer);
+  if (!plainText) return '';
+  const sentences = plainText.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [plainText];
+  return sentences.slice(0, 2).join(' ').trim();
+}
+
+function buildOverlayActionItems(answer: string) {
+  const items = answer
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^(?:[-*•]|\d+[.)])\s+/.test(line))
+    .map((line) => line.replace(/^(?:[-*•]|\d+[.)])\s+/, '').trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  return items.length ? items : ['No specific action items identified in this answer.'];
+}
+
+function buildOverlayAnalysis(question: string, answer: string) {
+  const summary = buildOverlaySummary(answer);
+  if (!summary) return '';
+  const wordCount = overlayPlainText(answer).split(/\s+/).filter(Boolean).length;
+  return [
+    question ? `Question focus: ${question}` : '',
+    `Response analysis: ${wordCount} words covering the requested topic.`,
+    `Key point: ${summary}`,
+  ].filter(Boolean).join('\n\n');
 }
 
 type SttFailureClassification =
@@ -497,12 +526,18 @@ function App() {
   const [meetingMenuOpen, setMeetingMenuOpen] = useState(false);
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const [jobDescription, setJobDescription] = useState('');
+  const [interviewConfig, setInterviewConfig] = useState<InterviewContextConfig>(() => readPersistedInterviewContext());
+  const [microphoneDevices, setMicrophoneDevices] = useState<MediaDeviceInfo[]>([]);
+  const [microphoneUnavailable, setMicrophoneUnavailable] = useState(false);
+  const [backgroundSearch, setBackgroundSearch] = useState('');
+  const [backgroundOptionsOpen, setBackgroundOptionsOpen] = useState(false);
   const [transcriptOpen, setTranscriptOpen] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [audioSourceLabel, setAudioSourceLabel] = useState('Not connected');
   const [audioLevel, setAudioLevel] = useState(0);
   const [audioStatus, setAudioStatus] = useState<'disabled' | 'connected' | 'testing'>('disabled');
+  const [systemAudioStatus, setSystemAudioStatus] = useState<'off' | 'connected' | 'testing'>('off');
   const [microphoneStatus, setMicrophoneStatus] = useState<'off' | 'connected'>('off');
   const [pipelineStatus, setPipelineStatus] = useState<'ready' | 'listening' | 'transcribing' | 'question' | 'thinking' | 'answer' | 'error' | 'stopped'>('ready');
   const [liveTranscript, setLiveTranscript] = useState('');
@@ -530,7 +565,11 @@ function App() {
   const [agentUrl, setAgentUrl] = useState('https://teams.microsoft.com');
   const [agentSaving, setAgentSaving] = useState(false);
   const [agentActivity, setAgentActivity] = useState<AgentActivity[]>([]);
-  const meetingSource = meetingAudioMode === 'meeting' ? 'Microphone + System Audio' : 'Microphone';
+  const meetingSource = meetingAudioMode === 'meeting'
+    ? 'Microphone + System Audio'
+    : meetingAudioMode === 'system'
+      ? 'System Audio'
+      : 'Microphone';
 
   const wsRef = useRef<WebSocket | null>(null);
   const wsConnectPromiseRef = useRef<Promise<WebSocket> | null>(null);
@@ -572,13 +611,22 @@ function App() {
   const pendingSegmentDurationQueueRef = useRef<number[]>([]);
   const segmentProcessorActiveRef = useRef(false);
   const acceptedQuestionHistoryRef = useRef<string[]>([]);
+  const acceptedQuestionRequestIdsRef = useRef(new Map<string, string>());
   const pendingPartialQuestionRef = useRef('');
   const pendingPartialRawTextRef = useRef('');
   const requestInProgressRef = useRef(false);
   const chatRequestIdRef = useRef('');
   const draftImproveRequestIdRef = useRef('');
   const overlayChannelRef = useRef<BroadcastChannel | null>(null);
-  const overlayStateRef = useRef({ answer: '', question: '', status: pipelineStatus });
+  const overlaySendMessageRef = useRef<((question: string) => Promise<void>) | null>(null);
+  const overlayStateRef = useRef({
+    answer: '',
+    question: '',
+    analysis: '',
+    summary: '',
+    actionItems: [] as string[],
+    status: pipelineStatus,
+  });
   const requestTimingRef = useRef(new Map<string, RequestTiming>());
 
   // --- Auto-scroll to bottom on new content ---
@@ -596,9 +644,13 @@ function App() {
     const latestQuestion = generalTask?.goal
       || [...messages].reverse().find((message) => message.role === 'user')?.content
       || '';
+    const answer = generalAnswer || assistantAnswer;
     overlayStateRef.current = {
-      answer: generalAnswer || assistantAnswer,
+      answer,
       question: latestQuestion,
+      analysis: buildOverlayAnalysis(latestQuestion, answer),
+      summary: buildOverlaySummary(answer),
+      actionItems: answer ? buildOverlayActionItems(answer) : [],
       status: generalBusy ? 'thinking' : generalAnswer ? 'answer' : pipelineStatus,
     };
     overlayChannelRef.current?.postMessage({ type: 'state', ...overlayStateRef.current });
@@ -616,6 +668,20 @@ function App() {
     channel.onmessage = (event) => {
       if (event.data?.type === 'overlay-ready') {
         channel.postMessage({ type: 'state', ...overlayStateRef.current });
+      }
+      if (event.data?.type === 'overlay-question') {
+        const question = typeof event.data.question === 'string'
+          ? event.data.question.trim().slice(0, 2000)
+          : '';
+        if (!question) return;
+        if (pendingChatRequestIdsRef.current.size > 0) {
+          channel.postMessage({
+            type: 'overlay-search-error',
+            message: 'Please wait for the current AI answer to finish.',
+          });
+          return;
+        }
+        void overlaySendMessageRef.current?.(question);
       }
     };
     return () => {
@@ -720,6 +786,50 @@ function App() {
     }
   }, [activeProfileId]);
 
+  useEffect(() => {
+    writePersistedInterviewContext(interviewConfig);
+  }, [interviewConfig]);
+
+  const refreshMicrophoneDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      setMicrophoneDevices([]);
+      setMicrophoneUnavailable(true);
+      return;
+    }
+    try {
+      const devices = (await navigator.mediaDevices.enumerateDevices())
+        .filter((device) => device.kind === 'audioinput' && Boolean(device.deviceId));
+      setMicrophoneDevices(devices);
+      if (!devices.length) {
+        setMicrophoneUnavailable(true);
+        setInterviewConfig((current) => current.microphoneDeviceId
+          ? { ...current, microphoneDeviceId: null }
+          : current);
+        return;
+      }
+      setMicrophoneUnavailable(false);
+      setInterviewConfig((current) => {
+        const selected = chooseMicrophoneDevice(
+          devices.map((device) => ({ deviceId: device.deviceId, label: device.label })),
+          current.microphoneDeviceId,
+        );
+        return selected === current.microphoneDeviceId
+          ? current
+          : { ...current, microphoneDeviceId: selected };
+      });
+    } catch {
+      setMicrophoneDevices([]);
+      setMicrophoneUnavailable(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshMicrophoneDevices();
+    const handleDeviceChange = () => { void refreshMicrophoneDevices(); };
+    navigator.mediaDevices?.addEventListener?.('devicechange', handleDeviceChange);
+    return () => navigator.mediaDevices?.removeEventListener?.('devicechange', handleDeviceChange);
+  }, [refreshMicrophoneDevices]);
+
   // Save only completed turns, so streaming tokens never cause storage writes.
   useEffect(() => {
     if (messages.length === 0 || messages.some((message) => message.streaming)) return;
@@ -791,6 +901,27 @@ function App() {
   }, [ensureWs]);
 
   const activeProfile = trainedProfiles.find((profile) => profile.id === activeProfileId) ?? null;
+  const { domain, background, microphoneDeviceId } = interviewConfig;
+  const selectedMicrophone = microphoneDevices.find((device) => device.deviceId === microphoneDeviceId) || null;
+  const selectedMicrophoneLabel = microphoneDisplayLabel(selectedMicrophone);
+  const microphoneDevicePresent = Boolean(selectedMicrophone);
+  const filteredBackgroundOptions = INTERVIEW_BACKGROUND_OPTIONS.filter((option) => (
+    !background.includes(option)
+    && (!backgroundSearch.trim() || option.toLowerCase().includes(backgroundSearch.trim().toLowerCase()))
+  ));
+
+  const selectDomain = (value: string) => {
+    setInterviewConfig((current) => ({ ...current, domain: value || null }));
+  };
+
+  const toggleBackground = (technology: string) => {
+    setInterviewConfig((current) => ({
+      ...current,
+      background: current.background.includes(technology)
+        ? current.background.filter((item) => item !== technology)
+        : [...current.background, technology],
+    }));
+  };
 
   const clearSessionContext = useCallback(() => {
     setSessionDocuments([]);
@@ -1194,6 +1325,17 @@ function App() {
       console.log(`[TIMING] Provider response received at: ${new Date().toISOString()} request=${msg.requestId} provider=${msg.timing?.providerRequestMs ?? 'unknown'}ms`);
       console.log(`[TIMING] Answer parsed/formatted at: ${new Date().toISOString()} request=${msg.requestId} elapsed=${timing ? Math.round(parsedAt - timing.sendMessageCalledAt) : 'unknown'}ms`);
       setPipelineStatus('answer');
+      if (answerText.trim()) {
+        overlayChannelRef.current?.postMessage({
+          type: 'state',
+          answer: answerText,
+          question: overlayStateRef.current.question,
+          analysis: buildOverlayAnalysis(overlayStateRef.current.question, answerText),
+          summary: buildOverlaySummary(answerText),
+          actionItems: buildOverlayActionItems(answerText),
+          status: 'answer',
+        });
+      }
       if (isDraftImprove) {
         setInput(String(msg.content || '').trim());
         setDraftImproving(false);
@@ -1202,6 +1344,7 @@ function App() {
       }
       flushStreamBuffer(String(msg.requestId), responseText);
       pendingChatRequestIdsRef.current.delete(String(msg.requestId));
+      releaseAcceptedQuestion(String(msg.requestId));
       liveRequestInFlightRef.current = false;
       setChatStreaming(pendingChatRequestIdsRef.current.size > 0);
       if (chatRequestIdRef.current === msg.requestId) chatRequestIdRef.current = '';
@@ -1301,6 +1444,7 @@ function App() {
         return;
       }
       pendingChatRequestIdsRef.current.delete(String(msg.requestId));
+      releaseAcceptedQuestion(String(msg.requestId));
       flushStreamBuffer(String(msg.requestId));
       liveRequestInFlightRef.current = false;
       setChatStreaming(pendingChatRequestIdsRef.current.size > 0);
@@ -1428,6 +1572,13 @@ function App() {
     return true;
   };
 
+  const releaseAcceptedQuestion = (requestId: string) => {
+    const fingerprint = acceptedQuestionRequestIdsRef.current.get(requestId);
+    if (!fingerprint) return;
+    acceptedQuestionRequestIdsRef.current.delete(requestId);
+    acceptedQuestionHistoryRef.current = acceptedQuestionHistoryRef.current.filter((item) => item !== fingerprint);
+  };
+
   const inputQualityMessage = (classification: PreparedQuestion['qualityClassification']) => {
     if (classification === 'INCOMPLETE') return 'Please finish the question before sending it.';
     if (classification === 'FILLER' || classification === 'REPEATED_NOISE' || classification === 'NOT_A_QUESTION') {
@@ -1518,6 +1669,7 @@ function App() {
     setChatStreaming(true);
     chatRequestIdRef.current = requestId;
     pendingChatRequestIdsRef.current.add(requestId);
+    acceptedQuestionRequestIdsRef.current.set(requestId, questionFingerprintForComparison(canonicalQuestion));
 
     try {
       const ws = await ensureWs();
@@ -1543,18 +1695,37 @@ function App() {
           contextCharBudget: PDF_CONTEXT_CHAR_BUDGET,
           profileCharBudget: PDF_CONTEXT_CHAR_BUDGET,
         });
+      const interviewContextActive = Boolean(resolvedContext.trim() || domain || background.length);
+      const directModeContextInstruction = mode === 'direct' && interviewContextActive
+        ? '\n\nDIRECT MODE ACTIVE CONTEXT:\nThe request includes the selected Resume, Job Description, profile, interview domain, and technical background when available. Use Resume/profile evidence for personal claims, Job Description for role requirements, and domain/background as interview focus only. Answer in first person as the user when the question is about their qualifications or introduction. Never switch to a generic ChatGPT identity.'
+        : '';
       console.log(`[TIMING] Context resolved at: ${new Date().toISOString()} request=${requestId} elapsed=${Math.round(performance.now() - contextStartedAt)}ms chars=${resolvedContext.length}`);
 
       ws.send(JSON.stringify({
         type: 'chat',
         requestId,
         mode,
-        messages: [{ role: 'system', content: AI_SYSTEM_PROMPT }, ...conversationHistory],
+        messages: [{
+          role: 'system',
+          content: `${buildInterviewSystemPrompt({
+            currentQuestion: canonicalQuestion,
+            hasCandidateContext: Boolean(resolvedContext.trim()),
+            domain,
+            background,
+          })}${directModeContextInstruction}`,
+        }, ...conversationHistory],
+        interviewContext: {
+          domain,
+          background,
+          microphoneConfigured: Boolean(microphoneDeviceId),
+          microphoneDevicePresent,
+        },
         // Archived transcripts remain available in the UI; only the current one is chat context.
         pdfContext: resolvedContext.slice(-MAX_CONTEXT_CHARS),
       }));
     } catch (err) {
       pendingChatRequestIdsRef.current.delete(requestId);
+      releaseAcceptedQuestion(requestId);
       liveRequestInFlightRef.current = false;
       setChatStreaming(pendingChatRequestIdsRef.current.size > 0);
       if (chatRequestIdRef.current === requestId) chatRequestIdRef.current = '';
@@ -1570,6 +1741,14 @@ function App() {
       });
     }
   };
+
+  overlaySendMessageRef.current = (question) => sendMessage(
+    question,
+    undefined,
+    question,
+    performance.now(),
+    { preparedQuestion: prepareTextRequest(question) },
+  );
 
   const sendDeveloperMessage = async () => {
     const question = developerInput.trim();
@@ -1859,6 +2038,7 @@ function App() {
     audioLevelTimerRef.current = null;
     setAudioLevel(0);
     setAudioStatus('disabled');
+    setSystemAudioStatus('off');
     setIsRecording(false);
     setPipelineStatus('stopped');
     setMicrophoneStatus('off');
@@ -1891,7 +2071,7 @@ function App() {
     // Chromium requires a video permission for display capture, so its video
     // track is stopped immediately and never sent to recording or STT.
     const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-    const audioTracks = displayStream.getAudioTracks();
+    const audioTracks = displayStream.getAudioTracks().filter((track) => track.readyState === 'live');
     if (audioTracks.length === 0) {
       displayStream.getTracks().forEach((track) => track.stop());
       throw new Error('No system audio source selected. Choose a tab, window, or screen and enable Share audio.');
@@ -1915,16 +2095,45 @@ function App() {
       throw new Error('Microphone capture is unavailable in this Electron build.');
     }
 
+    const audioConstraints: MediaTrackConstraints = {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      ...(microphoneDeviceId ? { deviceId: { exact: microphoneDeviceId } } : {}),
+    };
+    let stream: MediaStream;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: audioConstraints,
         video: false,
       });
+    } catch (error) {
+      const errorName = error instanceof DOMException
+        ? error.name
+        : (typeof error === 'object' && error !== null && 'name' in error ? String(error.name) : '');
+      const selectedDeviceUnavailable = Boolean(
+        microphoneDeviceId
+        && ['NotFoundError', 'OverconstrainedError'].includes(errorName),
+      );
+      if (!selectedDeviceUnavailable) throw error;
+      const availableDevices = (await navigator.mediaDevices.enumerateDevices())
+        .filter((device) => device.kind === 'audioinput' && Boolean(device.deviceId));
+      const fallbackDeviceId = chooseMicrophoneDevice(
+        availableDevices.map((device) => ({ deviceId: device.deviceId, label: device.label })),
+        null,
+      );
+      if (!fallbackDeviceId || fallbackDeviceId === microphoneDeviceId) throw error;
+      setInterviewConfig((current) => ({ ...current, microphoneDeviceId: fallbackDeviceId }));
+      setMicrophoneDevices(availableDevices);
+      setMicrophoneUnavailable(false);
+      setStatusMessage('The saved microphone is unavailable. Using the available default microphone.');
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { ...audioConstraints, deviceId: { exact: fallbackDeviceId } },
+        video: false,
+      });
+    }
+    try {
       const tracks = stream.getAudioTracks();
       const track = tracks[0];
       const settings = track?.getSettings?.() || {};
@@ -1959,32 +2168,51 @@ function App() {
     }
   };
 
-  const requestMeetingAudioStream = async (): Promise<{ stream: MediaStream; cleanup: () => void; systemAudio: boolean }> => {
-    const microphoneStream = await requestMicrophoneStream();
+  const requestMeetingAudioStream = async (): Promise<{
+    stream: MediaStream;
+    cleanup: () => void;
+    microphoneAudio: boolean;
+    systemAudio: boolean;
+  }> => {
+    const microphoneAudio = meetingAudioMode !== 'system';
+    const systemAudioRequested = meetingAudioMode !== 'microphone';
+    const microphoneStream = microphoneAudio ? await requestMicrophoneStream() : null;
     let systemStream: MediaStream | null = null;
     let systemAudio = false;
-    if (meetingAudioMode === 'meeting') {
+    if (systemAudioRequested) {
       try {
         systemStream = await requestSystemAudioStream();
         systemAudio = systemStream.getAudioTracks().some((track) => track.readyState === 'live');
       } catch (error) {
-        logSttTrace(captureSessionIdRef.current, 'SYSTEM_AUDIO_OPTIONAL_UNAVAILABLE', {
+        logSttTrace(captureSessionIdRef.current, 'SYSTEM_AUDIO_UNAVAILABLE', {
           classification: classifySttClientError(error),
         });
-        setStatusMessage('Microphone connected. System audio was not selected; microphone listening continues.');
+        microphoneStream?.getTracks().forEach((track) => track.stop());
+        setSystemAudioStatus('off');
+        throw new Error(systemAudioErrorMessage(error, 'capture'));
       }
     }
 
-    const sourceStreams = [microphoneStream, ...(systemStream && systemAudio ? [systemStream] : [])];
+    const sourceStreams = [
+      ...(microphoneStream ? [microphoneStream] : []),
+      ...(systemStream && systemAudio ? [systemStream] : []),
+    ];
+    if (sourceStreams.length === 0) {
+      throw new Error('No microphone or system-audio source is available.');
+    }
+    setMicrophoneStatus(microphoneStream ? 'connected' : 'off');
+    setSystemAudioStatus(systemAudio ? 'connected' : 'off');
     if (sourceStreams.length === 1) {
-      const microphoneLabel = microphoneStream.getAudioTracks()[0]?.label || 'Microphone';
-      setAudioSourceLabel(systemAudio ? `${microphoneLabel} + System Audio` : microphoneLabel);
+      const sourceLabel = sourceStreams[0].getAudioTracks()[0]?.label
+        || (systemAudio ? 'System Audio' : 'Microphone');
+      setAudioSourceLabel(sourceLabel);
       setAudioStatus('connected');
-      monitorSystemAudio(microphoneStream);
+      monitorSystemAudio(sourceStreams[0]);
       return {
-        stream: microphoneStream,
+        stream: sourceStreams[0],
+        microphoneAudio: Boolean(microphoneStream),
         systemAudio,
-        cleanup: () => microphoneStream.getTracks().forEach((track) => track.stop()),
+        cleanup: () => sourceStreams.forEach((source) => source.getTracks().forEach((track) => track.stop())),
       };
     }
 
@@ -1992,13 +2220,14 @@ function App() {
     await mixContext.resume().catch(() => undefined);
     const destination = mixContext.createMediaStreamDestination();
     sourceStreams.forEach((source) => mixContext.createMediaStreamSource(source).connect(destination));
-    const microphoneLabel = microphoneStream.getAudioTracks()[0]?.label || 'Microphone';
+    const microphoneLabel = microphoneStream?.getAudioTracks()[0]?.label || 'Microphone';
     const systemLabel = systemStream?.getAudioTracks()[0]?.label || 'System Audio';
     setAudioSourceLabel(`${microphoneLabel} + ${systemLabel}`);
     setAudioStatus('connected');
     monitorSystemAudio(destination.stream);
     return {
       stream: destination.stream,
+      microphoneAudio: Boolean(microphoneStream),
       systemAudio,
       cleanup: () => {
         sourceStreams.forEach((source) => source.getTracks().forEach((track) => track.stop()));
@@ -2151,7 +2380,7 @@ function App() {
         setPipelineStatus('thinking');
         logSttTrace(sttSession, 'AI_REQUEST_STARTED', { segmentId, questionLength: acceptedQuestion.length });
         const questionFinalizedAt = performance.now();
-        await sendMessage(acceptedQuestion, '', acceptedQuestion, questionFinalizedAt, {
+        await sendMessage(acceptedQuestion, undefined, acceptedQuestion, questionFinalizedAt, {
           preparedQuestion: {
             ...preparedQuestion,
             rawText: candidateRawText,
@@ -2279,13 +2508,24 @@ function App() {
     pendingSegmentDurationQueueRef.current = [];
     const sttSession = crypto.randomUUID();
     captureSessionIdRef.current = sttSession;
-    logSttTrace(sttSession, 'CAPTURE_SESSION_STARTED', { requestedSources: ['microphone', 'system_audio'] });
-    setStatusMessage('Requesting microphone access and an optional system-audio source...');
+    const requestedSources = meetingAudioMode === 'microphone'
+      ? ['microphone']
+      : meetingAudioMode === 'system'
+        ? ['system_audio']
+        : ['microphone', 'system_audio'];
+    logSttTrace(sttSession, 'CAPTURE_SESSION_STARTED', { requestedSources });
+    setStatusMessage(meetingAudioMode === 'microphone'
+      ? 'Requesting microphone access...'
+      : meetingAudioMode === 'system'
+        ? 'Requesting internal system-audio access...'
+        : 'Requesting microphone and internal system-audio access...');
     try {
       const capture = await requestMeetingAudioStream();
       recordAudioStream(capture.stream, capture.cleanup);
       setStatusMessage(capture.systemAudio
-        ? 'Microphone and system audio connected. Listening is ready.'
+        ? capture.microphoneAudio
+          ? 'Microphone and system audio connected. Listening is ready.'
+          : 'System audio connected. Listening is ready.'
         : 'Microphone connected. Listening is ready.');
       logSttTrace(sttSession, 'AUDIO_CAPTURE_READY', {
         systemAudio: capture.systemAudio,
@@ -2293,6 +2533,7 @@ function App() {
       });
     } catch (err) {
       setAudioStatus('disabled');
+      setSystemAudioStatus('off');
       setMicrophoneStatus('off');
       setAudioSourceLabel('Not connected');
       const classification = classifySttClientError(err);
@@ -2311,6 +2552,7 @@ function App() {
     try {
       stream = await requestSystemAudioStream();
       setAudioStatus('testing');
+      setSystemAudioStatus('testing');
       monitorSystemAudio(stream);
       await new Promise((resolve) => setTimeout(resolve, 2000));
       if (stream.getAudioTracks().some((track) => track.readyState === 'live')) {
@@ -2318,6 +2560,7 @@ function App() {
       }
     } catch (err) {
       setAudioStatus('disabled');
+      setSystemAudioStatus('off');
       setAudioSourceLabel('Not connected');
       setError(systemAudioErrorMessage(err, 'test'));
       setStatusMessage('');
@@ -2329,6 +2572,7 @@ function App() {
       audioLevelTimerRef.current = null;
       setAudioLevel(0);
       if (!isRecording) setAudioStatus('disabled');
+      if (!isRecording) setSystemAudioStatus('off');
       if (!isRecording && !error) setStatusMessage('');
     }
   };
@@ -2868,9 +3112,9 @@ function App() {
                     </div>
                     <button onClick={() => setContextMenuOpen(false)} className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200" aria-label="Close context panel"><X className="h-4 w-4" /></button>
                   </div>
-                  {mode === 'direct' && (sessionDocuments.length > 0 || activeProfile) && (
+                  {mode === 'direct' && (sessionDocuments.length > 0 || activeProfile || domain || background.length > 0) && (
                     <p className="mb-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-200">
-                      Selected session context is included in Direct mode requests when relevant.
+                      Interview context is attached to the next Direct mode request.
                     </p>
                   )}
                   <input ref={resumeFileInputRef} type="file" accept="application/pdf" onChange={handleResumeUpload} className="hidden" />
@@ -2894,6 +3138,119 @@ function App() {
                       </div>
                       <textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the job description here..." rows={4} className="w-full resize-y rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400" />
                       <button onClick={saveJobDescription} disabled={!jobDescription.trim()} className="mt-2 rounded-md bg-slate-700 px-2.5 py-1.5 text-[11px] text-slate-200 hover:bg-slate-600 disabled:opacity-40">Add pasted text</button>
+                    </div>
+                    <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                      <label htmlFor="interview-domain" className="block text-xs font-medium text-slate-200">Domain</label>
+                      <p className="mb-2 text-[11px] text-slate-500">Primary interview domain</p>
+                      <select
+                        id="interview-domain"
+                        value={domain ?? ''}
+                        onChange={(event) => selectDomain(event.target.value)}
+                        className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400"
+                      >
+                        <option value="">No domain selected</option>
+                        {INTERVIEW_DOMAIN_OPTIONS.map((option) => <option key={option} value={option}>{option}</option>)}
+                      </select>
+                    </div>
+                    <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <label htmlFor="technical-background-search" className="block text-xs font-medium text-slate-200">Background</label>
+                          <p className="mb-2 text-[11px] text-slate-500">Technologies and topics to focus on</p>
+                        </div>
+                        {background.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setInterviewConfig((current) => ({ ...current, background: [] }))}
+                            className="text-[11px] text-slate-400 hover:text-slate-200"
+                          >
+                            Clear all
+                          </button>
+                        )}
+                      </div>
+                      {background.length > 0 && (
+                        <div className="mb-2 flex flex-wrap gap-1.5" aria-label="Selected technical background">
+                          {background.map((technology) => (
+                            <span key={technology} className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-200">
+                              {technology}
+                              <button
+                                type="button"
+                                onClick={() => toggleBackground(technology)}
+                                aria-label={`Remove ${technology}`}
+                                className="rounded-full text-emerald-300 hover:text-white"
+                              >
+                                ×
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <input
+                        id="technical-background-search"
+                        value={backgroundSearch}
+                        onChange={(event) => {
+                          setBackgroundSearch(event.target.value);
+                          setBackgroundOptionsOpen(true);
+                        }}
+                        onFocus={() => setBackgroundOptionsOpen(true)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Escape') setBackgroundOptionsOpen(false);
+                        }}
+                        placeholder="Search technologies..."
+                        autoComplete="off"
+                        className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400"
+                      />
+                      {backgroundOptionsOpen && filteredBackgroundOptions.length > 0 && (
+                        <div className="mt-1 max-h-36 overflow-y-auto rounded-md border border-slate-700 bg-slate-900 p-1" role="listbox" aria-label="Technical background options">
+                          {filteredBackgroundOptions.map((option) => (
+                            <button
+                              key={option}
+                              type="button"
+                              role="option"
+                              aria-selected="false"
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() => {
+                                toggleBackground(option);
+                                setBackgroundSearch('');
+                                setBackgroundOptionsOpen(true);
+                              }}
+                              className="block w-full rounded px-2 py-1.5 text-left text-[11px] text-slate-300 hover:bg-slate-800 hover:text-emerald-200"
+                            >
+                              {option}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      {backgroundOptionsOpen && backgroundSearch.trim() && filteredBackgroundOptions.length === 0 && (
+                        <p className="mt-2 text-[11px] text-slate-500">No matching background option.</p>
+                      )}
+                    </div>
+                    <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+                      <label htmlFor="interview-microphone" className="block text-xs font-medium text-slate-200">Audio</label>
+                      <p className="mb-2 text-[11px] text-slate-500">Microphone</p>
+                      <select
+                        id="interview-microphone"
+                        value={microphoneDeviceId ?? ''}
+                        onChange={(event) => setInterviewConfig((current) => ({
+                          ...current,
+                          microphoneDeviceId: event.target.value || null,
+                        }))}
+                        disabled={microphoneUnavailable && microphoneDevices.length === 0}
+                        className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {microphoneDevices.length === 0 ? (
+                          <option value="">Microphone unavailable</option>
+                        ) : (
+                          microphoneDevices.map((device) => (
+                            <option key={device.deviceId} value={device.deviceId}>
+                              {microphoneDisplayLabel({ deviceId: device.deviceId, label: device.label })}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                      <p className="mt-2 text-[11px] text-slate-500">
+                        {microphoneUnavailable ? 'Microphone unavailable. Check permission or connect a device.' : `Selected: ${selectedMicrophoneLabel}`}
+                      </p>
                     </div>
                     {sessionDocuments.length > 0 && (
                       <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
@@ -2953,6 +3310,7 @@ function App() {
                     <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-400">Audio source</label>
                     <select value={meetingAudioMode} onChange={(event) => setMeetingAudioMode(event.target.value as MeetingAudioMode)} aria-label="Audio source" className="w-full rounded-md border border-slate-700 bg-slate-800 px-2 py-2 text-xs text-slate-200">
                       <option value="microphone">Microphone (spoken questions)</option>
+                      <option value="system">System / Internal Audio (meeting sound)</option>
                       <option value="meeting">Microphone + System / Internal Audio</option>
                     </select>
                     <div className="flex items-center justify-between text-xs">
@@ -2966,6 +3324,12 @@ function App() {
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-slate-400">Microphone</span>
                       <span className={`font-semibold ${microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}`}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-400">System audio</span>
+                      <span className={`font-semibold ${systemAudioStatus === 'connected' || systemAudioStatus === 'testing' ? 'text-emerald-300' : 'text-slate-500'}`}>
+                        {systemAudioStatus === 'testing' ? 'TESTING' : systemAudioStatus === 'connected' ? 'ON' : 'OFF'}
+                      </span>
                     </div>
                     <div>
                       <div className="mb-1 flex justify-between text-[10px] text-slate-500"><span>System audio level</span><span>{audioLevel}%</span></div>
@@ -3421,9 +3785,9 @@ function App() {
           <section className="m-auto w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900/80 p-6 shadow-2xl">
             <div className="mb-6 text-center"><h2 className="text-2xl font-semibold">Meeting AI Assistant</h2><p className="mt-2 text-sm text-slate-400">Listen to internal system audio and get concise answers.</p></div>
             <div className="space-y-4">
-              <label className="block text-xs font-medium uppercase tracking-wide text-slate-400">Audio source<select value={meetingAudioMode} onChange={(event) => setMeetingAudioMode(event.target.value as MeetingAudioMode)} aria-label="Audio source" className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-200"><option value="microphone">Microphone (spoken questions)</option><option value="meeting">Microphone + System / Internal Audio</option></select></label>
-              <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-sm"><div className="flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[12rem] truncate text-slate-200">{audioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span className="text-emerald-300">● {audioStatus === 'testing' ? 'Testing' : audioStatus === 'connected' ? 'Connected' : 'Ready'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className={`font-semibold ${microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}`}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-3"><div className="mb-1 flex justify-between text-[11px] text-slate-500"><span>Audio level</span><span>{audioLevel}%</span></div><div className="flex h-2 gap-1">{Array.from({ length: 10 }, (_, index) => <span key={index} className={`flex-1 rounded ${audioLevel >= (index + 1) * 10 ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}</div></div></div>
-              <p className="text-center text-[11px] text-slate-500">MICROPHONE + OPTIONAL SYSTEM AUDIO · Permission is requested before capture.</p>
+               <label className="block text-xs font-medium uppercase tracking-wide text-slate-400">Audio source<select value={meetingAudioMode} onChange={(event) => setMeetingAudioMode(event.target.value as MeetingAudioMode)} aria-label="Audio source" className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-200"><option value="microphone">Microphone (spoken questions)</option><option value="system">System / Internal Audio (meeting sound)</option><option value="meeting">Microphone + System / Internal Audio</option></select></label>
+              <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-sm"><div className="flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[12rem] truncate text-slate-200">{audioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span className="text-emerald-300">● {audioStatus === 'testing' ? 'Testing' : audioStatus === 'connected' ? 'Connected' : 'Ready'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className={`font-semibold ${microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}`}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">System audio</span><span className={`font-semibold ${systemAudioStatus === 'connected' || systemAudioStatus === 'testing' ? 'text-emerald-300' : 'text-slate-500'}`}>{systemAudioStatus === 'testing' ? 'TESTING' : systemAudioStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-3"><div className="mb-1 flex justify-between text-[11px] text-slate-500"><span>Audio level</span><span>{audioLevel}%</span></div><div className="flex h-2 gap-1">{Array.from({ length: 10 }, (_, index) => <span key={index} className={`flex-1 rounded ${audioLevel >= (index + 1) * 10 ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}</div></div></div>
+              <p className="text-center text-[11px] text-slate-500">Choose microphone, internal system audio, or both. System audio requires the Electron desktop app and a playback source.</p>
               <div className="flex gap-2"><button onClick={() => void testSystemAudio()} className="flex-1 rounded-lg border border-emerald-500/40 px-3 py-2.5 text-sm text-emerald-300 hover:bg-emerald-500/10">Test Audio</button><button onClick={() => void startMeetingCapture()} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2.5 text-sm font-medium text-slate-950 hover:bg-emerald-400">Start Listening</button></div>
               {error && <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs leading-relaxed text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
             </div>
@@ -3460,7 +3824,7 @@ function App() {
               <p className="text-[11px] uppercase tracking-wide text-slate-500">Context mode</p>
               <p className="text-sm font-medium text-slate-200">{mode === 'direct' ? 'Direct mode: selected session context is included when relevant' : 'LangChain mode: profile and session docs are included'}</p>
             </div>
-            {mode === 'direct' && (sessionDocuments.length > 0 || !!activeProfile) && (
+            {mode === 'direct' && (sessionDocuments.length > 0 || !!activeProfile || !!domain || background.length > 0) && (
               <div className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-[10px] font-medium text-emerald-200">
                 Context ready
               </div>

@@ -8,6 +8,15 @@ const developerContext = require('./developerContext.cjs');
 const developerBenchmark = require('./developerBenchmark.cjs');
 const generalAgent = require('./generalAgent.cjs');
 
+function ignoreBrokenOutputPipe(stream) {
+  stream.on('error', (error) => {
+    if (error?.code !== 'EPIPE') throw error;
+  });
+}
+
+ignoreBrokenOutputPipe(process.stdout);
+ignoreBrokenOutputPipe(process.stderr);
+
 const isDev = !app.isPackaged;
 let mainWindow = null;
 let overlayWindow = null;
@@ -28,7 +37,9 @@ function registerGeneralRenderer(event) {
 const OVERLAY_STATE_PATH = path.join(app.getPath('userData'), 'overlay-state.json');
 const OVERLAY_VISIBILITY_VALUES = new Set(['VISIBLE', 'MINIMIZED', 'HIDDEN']);
 const OVERLAY_TAB_VALUES = new Set(['answer', 'analysis', 'summary', 'action-items']);
-const OVERLAY_PREFERENCE_KEYS = new Set(['lowVisibility', 'autoHideEnabled', 'autoHideDelay', 'alwaysOnTop', 'activeTab']);
+const OVERLAY_PREFERENCE_KEYS = new Set(['lowVisibility', 'autoHideEnabled', 'autoHideDelay', 'alwaysOnTop', 'activeTab', 'opacity']);
+const OVERLAY_MIN_OPACITY = 0.2;
+const OVERLAY_MAX_OPACITY = 1;
 const OVERLAY_MIN_WIDTH = 320;
 const OVERLAY_MIN_HEIGHT = 180;
 const OVERLAY_DEFAULT_WIDTH = 620;
@@ -38,6 +49,7 @@ const OVERLAY_MINI_HEIGHT = 128;
 const defaultOverlayState = {
   visibility: 'VISIBLE',
   lowVisibility: false,
+  opacity: OVERLAY_MAX_OPACITY,
   autoHideEnabled: true,
   autoHideDelay: 5000,
   alwaysOnTop: true,
@@ -123,6 +135,11 @@ function normalizeOverlayState(rawState = {}) {
     ...defaultOverlayState,
     visibility,
     lowVisibility: typeof source.lowVisibility === 'boolean' ? source.lowVisibility : defaultOverlayState.lowVisibility,
+    opacity: clampNumber(
+      Number.isFinite(source.opacity) ? source.opacity : defaultOverlayState.opacity,
+      OVERLAY_MIN_OPACITY,
+      OVERLAY_MAX_OPACITY,
+    ),
     autoHideEnabled: typeof source.autoHideEnabled === 'boolean' ? source.autoHideEnabled : defaultOverlayState.autoHideEnabled,
     autoHideDelay: clampNumber(
       Number.isFinite(source.autoHideDelay) ? source.autoHideDelay : defaultOverlayState.autoHideDelay,
@@ -146,6 +163,10 @@ function validateOverlayPreferences(prefs) {
   }
   if (Object.prototype.hasOwnProperty.call(prefs, 'lowVisibility') && typeof prefs.lowVisibility !== 'boolean') {
     throw new TypeError('lowVisibility must be a boolean.');
+  }
+  if (Object.prototype.hasOwnProperty.call(prefs, 'opacity')
+    && (typeof prefs.opacity !== 'number' || !Number.isFinite(prefs.opacity))) {
+    throw new TypeError('opacity must be a finite number.');
   }
   if (Object.prototype.hasOwnProperty.call(prefs, 'autoHideEnabled') && typeof prefs.autoHideEnabled !== 'boolean') {
     throw new TypeError('autoHideEnabled must be a boolean.');
@@ -834,16 +855,31 @@ app.whenReady().then(async () => {
       return;
     }
 
-    const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] });
-    const source = sources[0];
-    if (!source) {
-      callback({});
-      return;
-    }
+    try {
+      const screenSources = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 1, height: 1 },
+      });
+      const windowSources = screenSources.length > 0
+        ? []
+        : await desktopCapturer.getSources({
+          types: ['window'],
+          thumbnailSize: { width: 1, height: 1 },
+        });
+      const source = screenSources[0] || windowSources[0];
+      if (!source) {
+        callback({});
+        return;
+      }
 
-    // Chromium's Windows loopback captures the selected display/window output,
-    // not the physical microphone. The renderer still discards the video track.
-    callback({ video: source, audio: 'loopback' });
+      // Chromium's Windows loopback captures the selected display/window
+      // output, not the physical microphone. The renderer discards the video
+      // track and records only the loopback audio track.
+      callback({ video: source, audio: 'loopback' });
+    } catch (error) {
+      console.error('[AUDIO] System-audio source setup failed:', error);
+      callback({});
+    }
   });
 
   overlayState = await readOverlayState();

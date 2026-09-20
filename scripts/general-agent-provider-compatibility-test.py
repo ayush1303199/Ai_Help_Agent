@@ -104,6 +104,44 @@ def main():
         else:
             raise AssertionError("provider tool-choice failures must retain TOOL_COMPATIBILITY classification")
 
+        retry_provider = SimpleNamespace(
+            id="retry-provider",
+            type="openai",
+            model="retry-model",
+            base_url="https://api.openai.example/v1",
+        )
+        retry_calls = []
+
+        class RateLimitProviderError(Exception):
+            status_code = 429
+
+        class RetryCompletions:
+            def create(self, **_request):
+                retry_calls.append(1)
+                if len(retry_calls) == 1:
+                    raise RateLimitProviderError("temporary rate limit")
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(role="assistant", content="Recovered after retry.")
+                        )
+                    ]
+                )
+
+        class RetryClient:
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=RetryCompletions())
+
+        index.provider_candidates = lambda _provider_id=None: [retry_provider]
+        index.OpenAI = RetryClient
+        message, selected = index.complete_model(
+            [{"role": "user", "content": "Retry this request once."}],
+            request_id="provider-retry-test",
+        )
+        assert selected.id == "retry-provider"
+        assert message["content"] == "Recovered after retry."
+        assert len(retry_calls) == 2, "transient provider failures must receive one bounded retry"
+
         print('{"runtime":"general-agent-provider-compatibility","classification":true,"boundedFallback":true,"configurationPreserved":true}')
     finally:
         index.provider_candidates = original["provider_candidates"]

@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { EyeOff, Minus, PanelTop, Sparkles, X } from 'lucide-react';
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { EyeOff, Minus, PanelTop, Plus, Search, Sparkles, X } from 'lucide-react';
 import { renderAnswerMarkdown } from './ui/answerMarkdown';
 
 type OverlayVisibility = 'VISIBLE' | 'MINIMIZED' | 'HIDDEN';
 type OverlayTab = 'answer' | 'analysis' | 'summary' | 'action-items';
 
 type OverlayBounds = { x: number; y: number; width: number; height: number };
+const OVERLAY_MIN_OPACITY = 0.2;
+const OVERLAY_MAX_OPACITY = 1;
+const OVERLAY_OPACITY_STEP = 0.1;
 
 type OverlayState = {
   answer?: string;
@@ -16,6 +19,7 @@ type OverlayState = {
   status?: string;
   visibility?: OverlayVisibility;
   lowVisibility?: boolean;
+  opacity?: number;
   autoHideEnabled?: boolean;
   autoHideDelay?: number;
   alwaysOnTop?: boolean;
@@ -33,6 +37,7 @@ const defaultOverlayState: OverlayState = {
   status: 'ready',
   visibility: 'VISIBLE',
   lowVisibility: false,
+  opacity: 1,
   autoHideEnabled: true,
   autoHideDelay: 5000,
   alwaysOnTop: true,
@@ -140,6 +145,9 @@ function mergeOverlayState(previous: OverlayState, incoming: unknown): OverlaySt
     next.visibility = incoming.visibility;
   }
   if (typeof incoming.lowVisibility === 'boolean') next.lowVisibility = incoming.lowVisibility;
+  if (typeof incoming.opacity === 'number' && Number.isFinite(incoming.opacity)) {
+    next.opacity = Math.min(OVERLAY_MAX_OPACITY, Math.max(OVERLAY_MIN_OPACITY, incoming.opacity));
+  }
   if (typeof incoming.autoHideEnabled === 'boolean') next.autoHideEnabled = incoming.autoHideEnabled;
   if (typeof incoming.autoHideDelay === 'number' && Number.isFinite(incoming.autoHideDelay)) {
     next.autoHideDelay = incoming.autoHideDelay;
@@ -166,11 +174,27 @@ export default function Overlay() {
   const [interactiveLowVisibility, setInteractiveLowVisibility] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [isFocused, setIsFocused] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [searchError, setSearchError] = useState('');
   const timerRef = useRef<number | null>(null);
+  const overlayChannelRef = useRef<BroadcastChannel | null>(null);
 
   const activeTab = state.activeTab ?? 'answer';
   const statusLabel = getStatusLabel(state.status);
   const effectiveLowVisibility = state.visibility === 'VISIBLE' && (state.lowVisibility === true || interactiveLowVisibility);
+  const opacity = state.opacity ?? 1;
+  const opacityPercent = Math.round(opacity * 100);
+  const visualOpacity = effectiveLowVisibility && !isHovered && !isFocused
+    ? Math.min(opacity, 0.38)
+    : opacity;
+
+  const adjustOpacity = (delta: number) => {
+    const nextOpacity = Math.min(
+      OVERLAY_MAX_OPACITY,
+      Math.max(OVERLAY_MIN_OPACITY, Math.round((opacity + delta) * 10) / 10),
+    );
+    if (nextOpacity !== opacity) void applyPreferences({ opacity: nextOpacity });
+  };
 
   const applyPreferences = useCallback(async (patch: Partial<OverlayState>) => {
     setState((previous) => mergeOverlayState(previous, patch));
@@ -202,6 +226,9 @@ export default function Overlay() {
       if (event.data.type === 'state') {
         setState((previous) => mergeOverlayState(previous, event.data));
       }
+      if (event.data.type === 'overlay-search-error' && typeof event.data.message === 'string') {
+        setSearchError(event.data.message);
+      }
       if (event.data.type === 'overlay-ready') {
         channel?.postMessage({ type: 'state' });
       }
@@ -211,6 +238,7 @@ export default function Overlay() {
       try {
         channel = new BroadcastChannel('meeting-ai-overlay');
         channel.onmessage = handleChannelMessage;
+        overlayChannelRef.current = channel;
         channel.postMessage({ type: 'overlay-ready' });
       } catch {
         channel = null;
@@ -232,8 +260,24 @@ export default function Overlay() {
         channel.onmessage = null;
         channel.close();
       }
+      overlayChannelRef.current = null;
     };
   }, []);
+
+  const submitOverlaySearch = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const question = searchText.trim();
+    if (!question) return;
+    if (!overlayChannelRef.current) {
+      setSearchError('AI search is unavailable. Reopen the assistant window and try again.');
+      return;
+    }
+    setState((previous) => ({ ...previous, activeTab: 'answer', status: 'thinking' }));
+    void applyPreferences({ activeTab: 'answer' });
+    overlayChannelRef.current.postMessage({ type: 'overlay-question', question });
+    setSearchText('');
+    setSearchError('');
+  };
 
   useEffect(() => {
     if (state.visibility !== 'VISIBLE' || !state.autoHideEnabled) {
@@ -305,6 +349,7 @@ export default function Overlay() {
   return (
     <main
       className={`overlay-shell ${effectiveLowVisibility ? 'overlay-shell-low-visibility' : ''}`}
+      style={{ opacity: visualOpacity }}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
       onFocusCapture={() => setIsFocused(true)}
@@ -319,6 +364,29 @@ export default function Overlay() {
           </div>
         </div>
         <div className="overlay-controls no-drag">
+          <div className="overlay-opacity-controls" aria-label="Overlay transparency controls">
+            <button
+              type="button"
+              className="overlay-icon-button"
+              aria-label="Decrease overlay opacity (more transparent)"
+              title="More transparent"
+              onClick={() => adjustOpacity(-OVERLAY_OPACITY_STEP)}
+              disabled={opacity <= OVERLAY_MIN_OPACITY}
+            >
+              <Minus size={14} />
+            </button>
+            <span className="overlay-opacity-label" aria-live="polite">Opacity {opacityPercent}%</span>
+            <button
+              type="button"
+              className="overlay-icon-button"
+              aria-label="Increase overlay opacity (less transparent)"
+              title="Less transparent"
+              onClick={() => adjustOpacity(OVERLAY_OPACITY_STEP)}
+              disabled={opacity >= OVERLAY_MAX_OPACITY}
+            >
+              <Plus size={14} />
+            </button>
+          </div>
           <button
             type="button"
             className="overlay-action-button"
@@ -356,6 +424,28 @@ export default function Overlay() {
           </button>
         ))}
       </div>
+
+      <form className="overlay-search no-drag" onSubmit={submitOverlaySearch}>
+        <label className="overlay-search-label" htmlFor="overlay-ai-search">Ask AI</label>
+        <div className="overlay-search-row">
+          <input
+            id="overlay-ai-search"
+            value={searchText}
+            onChange={(event) => {
+              setSearchText(event.target.value);
+              if (searchError) setSearchError('');
+            }}
+            placeholder="Search with AI..."
+            aria-label="Search with AI"
+            maxLength={2000}
+          />
+          <button type="submit" className="overlay-search-button" disabled={!searchText.trim()} aria-label="Send search to AI">
+            <Search size={15} />
+            <span>Ask</span>
+          </button>
+        </div>
+        {searchError && <p className="overlay-search-error" role="alert">{searchError}</p>}
+      </form>
 
       <section
         id={`overlay-panel-${activeTab}`}

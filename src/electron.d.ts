@@ -205,6 +205,7 @@ interface OverlayRendererState {
   status?: string;
   visibility: 'VISIBLE' | 'MINIMIZED' | 'HIDDEN';
   lowVisibility: boolean;
+  opacity: number;
   autoHideEnabled: boolean;
   autoHideDelay: number;
   alwaysOnTop: boolean;
@@ -223,7 +224,7 @@ interface Window {
     expandOverlay: () => Promise<OverlayRendererState>;
     closeOverlay: () => Promise<void>;
     getOverlayPreferences: () => Promise<OverlayRendererState>;
-    setOverlayPreferences: (prefs: Partial<{ lowVisibility: boolean; autoHideEnabled: boolean; autoHideDelay: number; alwaysOnTop: boolean; activeTab: 'answer' | 'analysis' | 'summary' | 'action-items' }>) => Promise<OverlayRendererState>;
+    setOverlayPreferences: (prefs: Partial<{ lowVisibility: boolean; opacity: number; autoHideEnabled: boolean; autoHideDelay: number; alwaysOnTop: boolean; activeTab: 'answer' | 'analysis' | 'summary' | 'action-items' }>) => Promise<OverlayRendererState>;
     getOverlayBounds: () => Promise<OverlayBounds>;
     setOverlayBounds: (bounds: OverlayBounds) => Promise<OverlayRendererState>;
     setOverlayAlwaysOnTop: (alwaysOnTop: boolean) => Promise<OverlayRendererState>;

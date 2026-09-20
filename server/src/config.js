@@ -14,9 +14,11 @@ function readPersistedProviderState() {
     const raw = fs.readFileSync(resolvedPath, 'utf8');
     const parsed = JSON.parse(raw);
     const providers = Array.isArray(parsed?.providers) ? parsed.providers : Array.isArray(parsed) ? parsed : [];
-    return { provider: parsed?.provider || null, providers };
+    const activeProvider = typeof parsed?.activeProvider === 'string' ? parsed.activeProvider : (typeof parsed?.provider === 'string' ? parsed.provider : null);
+    const fallbackEnabled = typeof parsed?.fallbackEnabled === 'boolean' ? parsed.fallbackEnabled : true;
+    return { provider: activeProvider, providers, fallbackEnabled };
   } catch {
-    return { provider: null, providers: [] };
+    return { provider: null, providers: [], fallbackEnabled: true };
   }
 }
 
@@ -25,11 +27,24 @@ function writePersistedProviderState() {
   const directory = path.dirname(resolvedPath);
   fs.mkdirSync(directory, { recursive: true });
   const payload = {
-    provider: config.provider,
+    version: 1,
     providers: config.configuredProviders.map((provider) => ({
-      ...provider,
-      apiKey: provider.apiKey || '',
+      id: provider.id,
+      type: provider.adapterType,
+      adapterType: provider.adapterType,
+      label: provider.label,
+      model: provider.model,
+      baseURL: provider.baseURL || '',
+      enabled: provider.enabled,
+      priority: provider.priority,
+      status: provider.status || 'unknown',
+      hasApiKey: Boolean(provider.apiKey),
+      lastCheckedAt: provider.lastCheckedAt || null,
+      ...(provider.lastError ? { failureCategory: provider.lastError } : {}),
     })),
+    activeProvider: config.provider,
+    fallbackEnabled: config.fallbackEnabled,
+    lastModifiedAt: new Date().toISOString(),
   };
   fs.writeFileSync(resolvedPath, JSON.stringify(payload, null, 2), 'utf8');
 }
@@ -94,20 +109,30 @@ for (const provider of providerNames) {
 }
 
 function hydratePersistedProviderState() {
-  const { provider, providers } = readPersistedProviderState();
+  const { provider, providers, fallbackEnabled } = readPersistedProviderState();
   if (!providers.length) return;
-  const hydrated = providers.filter((item) => item?.adapterType && item?.apiKey && item?.model);
+
+  config.fallbackEnabled = typeof fallbackEnabled === 'boolean' ? fallbackEnabled : config.fallbackEnabled;
+
+  const hydrated = providers.filter((item) => {
+    const adapterType = String(item?.adapterType || item?.type || '').trim();
+    const apiKey = typeof item?.apiKey === 'string' ? item.apiKey.trim() : '';
+    const hasApiKey = Boolean(apiKey || item?.hasApiKey);
+    return Boolean(adapterType && hasApiKey && item?.model);
+  });
   if (!hydrated.length) return;
 
   const existingByAdapter = new Map(config.configuredProviders.map((item) => [item.adapterType, item]));
   for (const item of hydrated) {
-    const adapterType = String(item.adapterType || '').trim();
-    if (!adapterType || !item.apiKey || !item.model) continue;
+    const adapterType = String(item.adapterType || item.type || '').trim();
+    const apiKey = typeof item.apiKey === 'string' ? item.apiKey.trim() : '';
+    const hasApiKey = Boolean(apiKey || item.hasApiKey);
+    if (!adapterType || !hasApiKey || !item.model) continue;
     const normalized = {
       id: item.id || `persisted-${adapterType}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       label: String(item.label || adapterType).trim(),
       adapterType,
-      apiKey: String(item.apiKey),
+      apiKey: apiKey || '',
       model: String(item.model),
       baseURL: String(item.baseURL || config[adapterType]?.baseURL || ''),
       enabled: item.enabled !== false,
@@ -121,13 +146,14 @@ function hydratePersistedProviderState() {
       config.configuredProviders.push(normalized);
       existingByAdapter.set(adapterType, normalized);
     }
-    config[adapterType] = { apiKey: normalized.apiKey, model: normalized.model, baseURL: normalized.baseURL || config[adapterType]?.baseURL };
+    config[adapterType] = { apiKey: normalized.apiKey || config[adapterType]?.apiKey, model: normalized.model, baseURL: normalized.baseURL || config[adapterType]?.baseURL };
     config.runtimeProviders[adapterType] = config[adapterType];
     if (normalized.enabled) config.provider = adapterType;
   }
 
-  if (provider && config[provider]) {
-    config.provider = provider;
+  const candidateProvider = typeof provider === 'string' ? provider : null;
+  if (candidateProvider && config[candidateProvider]) {
+    config.provider = candidateProvider;
   } else if (config.configuredProviders.length > 0) {
     config.provider = config.configuredProviders.find((item) => item.enabled)?.adapterType || config.configuredProviders[0].adapterType;
   }

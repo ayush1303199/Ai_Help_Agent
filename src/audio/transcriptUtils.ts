@@ -71,6 +71,15 @@ function isFiller(text: string) {
   return /^(?:uh+|um+|hmm+|hm+|okay|ok|yes|no|right|sure|the|a|an)[.!?]*$/i.test(text);
 }
 
+function isRepeatedSentenceNoise(text: string) {
+  const sentences = text
+    .split(/[.!?]+/)
+    .map((sentence) => sentence.trim().toLocaleLowerCase())
+    .filter(Boolean);
+  return sentences.length >= 2
+    && sentences.every((sentence) => sentence === sentences[0]);
+}
+
 function isIncomplete(text: string) {
   const withoutPunctuation = text.replace(/[.!?…]+$/g, '').trim();
   return /(?:\.\.\.|…)$/.test(text)
@@ -79,7 +88,8 @@ function isIncomplete(text: string) {
 }
 
 function isRepeatedNoise(text: string) {
-  return /^(what|huh|sorry|yes|no)(?:[.!?]?\s+\1)+[.!?]*$/i.test(text);
+  return /^(what|huh|sorry|yes|no)(?:[.!?]?\s+\1)+[.!?]*$/i.test(text)
+    || isRepeatedSentenceNoise(text);
 }
 
 function questionFingerprint(text: string) {
@@ -186,8 +196,10 @@ export function detectQuestion(text: string) {
   if (isRepeatedNoise(question) || isFiller(question) || isIncomplete(question)) {
     return { isQuestion: false, question: null };
   }
+  const requestSignal = /^(?:introduce yourself|tell me about yourself|describe yourself|walk me through yourself|tell me about|explain|describe|summarize|compare|review|analyze|show me|help me)\b/i;
   const isQuestion = /[?]$/.test(question)
     || /^(what|why|how|when|where|who|can|could|would|is|are|do|does|explain|tell me|compare|describe)\b/i.test(question)
+    || requestSignal.test(question)
     || question.split(/\s+/).length >= 4;
   return { isQuestion, question: isQuestion ? question : null };
 }

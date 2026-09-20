@@ -469,7 +469,9 @@ export function startWebSocketServer(port) {
           'If the current question is genuinely ambiguous or incomplete, ask one concise clarification instead of guessing. Stay on topic. ' +
           'For a simple question, give a direct answer and one useful detail; for a technical question, give 2-4 important points and one short relevant example when useful. ' +
           'Stop when answered and avoid filler, automatic tutorials, tables, and generic sections unless requested. ' +
-          'Use only supplied conversation and context; do not claim access to unavailable files, services, credentials, or test results.',
+          'Use only supplied conversation and context; do not claim access to unavailable files, services, credentials, or test results. ' +
+          'If the supplied context includes a resume, job description, or profile, treat it as the user\'s actual background and answer in first person when the question is about the user\'s experience or introduction. ' +
+          'Do not identify yourself as ChatGPT or a generic AI when the user is asking about their own profile. Do not invent experience, skills, or achievements not supported by the supplied context.',
       }, ...(messages || [])];
 
       if (pdfContext && pdfContext.trim()) {
@@ -478,7 +480,7 @@ export function startWebSocketServer(port) {
           role: 'system',
           content:
             'The following is supporting project context, code, meeting text, or document text provided by the user. ' +
-            'Use it only when it is relevant to answer their question.\n\n--- SUPPLIED CONTEXT ---\n' +
+            'Use it only when it is relevant to answer their question. If it contains a Resume, Job Description, or profile, answer as the user/candidate in first person and grounded in that context.\n\n--- SUPPLIED CONTEXT ---\n' +
             trimmed +
             '\n--- END SUPPLIED CONTEXT ---',
         });
