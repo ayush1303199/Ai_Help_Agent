@@ -5,11 +5,12 @@ const {
   INTERVIEW_BACKGROUND_OPTIONS,
   INTERVIEW_DOMAIN_OPTIONS,
   chooseMicrophoneDevice,
+  createCanonicalInterviewContext,
   microphoneDisplayLabel,
   normalizeMicrophoneDevices,
   normalizeInterviewContext,
 } = await import('../src/ai/interviewContext.ts');
-const { buildInterviewSystemPrompt } = await import('../src/ai/interviewSystemPrompt.ts');
+const { buildInterviewSystemPrompt, buildCanonicalInterviewSystemPrompt } = await import('../src/ai/interviewSystemPrompt.ts');
 const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
 
 const cases = [
@@ -47,6 +48,25 @@ assert.match(emptyPrompt, /INTERVIEW DOMAIN: Not specified/);
 assert.match(emptyPrompt, /TECHNICAL BACKGROUND: Not specified/);
 assert.match(emptyPrompt, /The message labeled CURRENT QUESTION is the primary target/);
 assert.match(emptyPrompt, /Technical Background is a focus signal/);
+
+const canonicalContext = createCanonicalInterviewContext({
+  currentQuestion: '  What is dependency injection?  ',
+  hasCandidateContext: true,
+  domain: 'Software Engineer',
+  background: ['Java', '', 'Spring Boot'],
+  customPrompt: 'Prefer concise examples.',
+});
+assert.deepEqual(canonicalContext, {
+  currentQuestion: 'What is dependency injection?',
+  hasCandidateContext: true,
+  domain: 'Software Engineer',
+  background: ['Java', 'Spring Boot'],
+  customPrompt: 'Prefer concise examples.',
+});
+const canonicalPrompt = buildCanonicalInterviewSystemPrompt(canonicalContext);
+assert.match(canonicalPrompt, /Current user request: What is dependency injection\?/);
+assert.match(canonicalPrompt, /Custom interview instruction: Prefer concise examples\./);
+assert.match(canonicalPrompt, /TECHNICAL BACKGROUND: Java, Spring Boot/);
 
 const normalized = normalizeInterviewContext({
   domain: 'Data Engineering',

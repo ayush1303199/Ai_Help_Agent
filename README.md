@@ -202,6 +202,34 @@ tested, and used as bounded fallbacks for transient provider failures. The
 active provider and non-secret provider metadata survive backend restarts in
 the user configuration file.
 
+Backend provider metadata is maintained in `server/src/provider_presets.py`,
+while renderer provider choices are maintained in `src/config/providerPresets.ts`.
+Runtime credentials remain outside source control.
+
+### Architecture map
+
+- `src/config/` — renderer runtime URLs, limits, and provider catalog.
+- `src/ai/interviewContext.ts` — domain/background catalogs, persisted context,
+  microphone device normalization/selection, and canonical interview context
+  construction.
+- `src/ai/interviewSystemPrompt.ts` — the canonical interview policy and
+  prompt builder used by Direct and voice requests.
+- `src/audio/` — transcript normalization and question preparation.
+- `src/audio/sttService.ts` — the existing STT HTTP request boundary and
+  response/error contract.
+- `src/documents/documentService.ts` — shared PDF validation, extraction
+  requests, and pasted Job Description normalization for Resume and Job
+  Description inputs.
+- `src/context/` — Resume, Job Description, profile, and document context
+  resolution.
+- `src/ui/` — answer, context, provider, confirmation, and overlay-facing UI.
+- `server/src/provider_presets.py` — backend provider catalog.
+- `server/src/provider_registry.py` — provider discovery, selection, health,
+  and fallback state.
+- `server/src/index.py` — HTTP/WebSocket boundary and request orchestration.
+- `electron/` — native window, display/overlay, IPC, and desktop capture
+  boundary.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -222,6 +250,23 @@ the user configuration file.
 | `TRANSCRIPTION_LANGUAGE` | provider default | Optional transcription language hint. |
 | `TRANSCRIPTION_PROMPT` | technical vocabulary prompt | Improve recognition of technical terms. |
 | `AI_AUTO_FALLBACK` | enabled | Set to `false` to disable provider fallback. |
+
+The renderer also accepts Vite environment overrides, so development, staging,
+and packaged launches do not need API URLs or client limits hardcoded in
+`App.tsx`:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `VITE_API_URL` | `http://localhost:3001` | HTTP API base URL. |
+| `VITE_WS_URL` | `ws://localhost:3002` | Chat WebSocket URL. |
+| `VITE_MAX_CHAT_HISTORY_MESSAGES` | `4` | Number of recent chat messages retained per request. |
+| `VITE_MAX_CHAT_MESSAGE_CHARS` | `900` | Maximum client-side chat message length. |
+| `VITE_MAX_CONTEXT_CHARS` | `6000` | Client-side context budget. |
+| `VITE_MAX_PDF_SIZE_BYTES` | `20971520` | Maximum client-side PDF size. |
+| `VITE_PDF_CONTEXT_BUDGET_RATIO` | `0.65` | Fraction of context budget available to extracted PDF text. |
+| `VITE_PDF_UPLOAD_TIMEOUT_MS` | `20000` | PDF upload timeout. |
+| `VITE_SYSTEM_AUDIO_SILENCE_MS` | `1000` | System-audio silence threshold. |
+| `VITE_SYSTEM_AUDIO_LEVEL_THRESHOLD` | `2` | System-audio level threshold. |
 
 ## Running the Application
 

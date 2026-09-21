@@ -31,8 +31,11 @@ import {
   voiceSafeText,
   type PreparedQuestion,
 } from './audio/transcriptUtils';
+import { transcribeAudioSegment } from './audio/sttService';
+import type { SttFailureClassification } from './audio/sttTypes';
 import {
   chooseMicrophoneDevice,
+  createCanonicalInterviewContext,
   INTERVIEW_BACKGROUND_OPTIONS,
   INTERVIEW_DOMAIN_OPTIONS,
   microphoneDisplayLabel,
@@ -42,8 +45,11 @@ import {
   type InterviewContextConfig,
   type MicrophoneDeviceOption,
 } from './ai/interviewContext';
-import { buildInterviewSystemPrompt } from './ai/interviewSystemPrompt';
+import { buildCanonicalInterviewSystemPrompt } from './ai/interviewSystemPrompt';
 import { resolveContext, truncateContextText } from './context/contextResolver';
+import { providerPresets, type ProviderId } from './config/providerPresets';
+import { runtimeConfig } from './config/runtimeConfig';
+import { createPastedDocument, extractPdfDocuments, type NormalizedDocument } from './documents/documentService';
 import { renderAnswerMarkdown } from './ui/answerMarkdown';
 import { AnswerSessionView } from './ui/AnswerSessionView';
 import { ConfiguredProvidersPanel } from './ui/ConfiguredProvidersPanel';
@@ -159,12 +165,7 @@ interface ChatSession {
   updatedAt: string;
 }
 
-interface SessionDocument {
-  id: string;
-  name: string;
-  text: string;
-  uploadedAt: number;
-}
+type SessionDocument = NormalizedDocument;
 
 interface TrainedProfile {
   id: string;
@@ -279,19 +280,18 @@ function validateUnifiedFile(lines: string[], original: string) {
   return hunkIndexes.length > 0;
 }
 
-const HTTP_URL = 'http://localhost:3001';
-const WS_URL = 'ws://localhost:3002';
-const MAX_CHAT_HISTORY_MESSAGES = 4;
-const MAX_CHAT_MESSAGE_CHARS = 900;
-const MAX_CONTEXT_CHARS = 6000;
-const MAX_PDF_SIZE = 20 * 1024 * 1024;
-const PDF_CONTEXT_BUDGET_RATIO = 0.65;
+const HTTP_URL = runtimeConfig.httpUrl;
+const WS_URL = runtimeConfig.wsUrl;
+const {
+  maxChatHistoryMessages: MAX_CHAT_HISTORY_MESSAGES,
+  maxChatMessageChars: MAX_CHAT_MESSAGE_CHARS,
+  maxContextChars: MAX_CONTEXT_CHARS,
+  pdfContextBudgetRatio: PDF_CONTEXT_BUDGET_RATIO,
+} = runtimeConfig.limits;
 const PDF_CONTEXT_CHAR_BUDGET = Math.floor(MAX_CONTEXT_CHARS * PDF_CONTEXT_BUDGET_RATIO);
 // Capture starts from the authorized microphone and can also include selected
 // system audio. Transcription begins only after a complete utterance ends.
-const PDF_UPLOAD_TIMEOUT_MS = 20000;
-const SYSTEM_AUDIO_SILENCE_MS = 1000;
-const SYSTEM_AUDIO_LEVEL_THRESHOLD = 2;
+const { systemSilenceMs: SYSTEM_AUDIO_SILENCE_MS, systemLevelThreshold: SYSTEM_AUDIO_LEVEL_THRESHOLD } = runtimeConfig.audio;
 function compactMessageContent(content: string) {
   if (content.length <= MAX_CHAT_MESSAGE_CHARS) return content;
   return `${content.slice(0, MAX_CHAT_MESSAGE_CHARS)}\n[Earlier content omitted for speed]`;
@@ -338,19 +338,6 @@ function buildOverlayAnalysis(question: string, answer: string) {
     `Key point: ${summary}`,
   ].filter(Boolean).join('\n\n');
 }
-
-type SttFailureClassification =
-  | 'AUDIO_PERMISSION'
-  | 'AUDIO_CAPTURE_NO_SIGNAL'
-  | 'AUDIO_ENCODING'
-  | 'STT_AUTH_ERROR'
-  | 'STT_BAD_REQUEST'
-  | 'STT_RATE_LIMIT'
-  | 'STT_TIMEOUT'
-  | 'STT_UNSUPPORTED_AUDIO'
-  | 'STT_NETWORK_ERROR'
-  | 'STT_RESPONSE_PARSE_ERROR'
-  | 'STT_UNKNOWN';
 
 function logSttTrace(sttSession: string, event: string, fields: Record<string, unknown> = {}) {
   console.info(`[STT_TRACE] ${JSON.stringify({ sttSession, event, ...fields })}`);
@@ -404,22 +391,6 @@ function systemAudioErrorMessage(error: unknown, action: 'capture' | 'test') {
   return `System audio ${action} failed: ${message}`;
 }
 
-const providerPresets = {
-  groq: { label: 'Groq', model: 'openai/gpt-oss-20b', baseURL: 'https://api.groq.com/openai/v1' },
-  openai: { label: 'OpenAI', model: 'gpt-4o-mini', baseURL: 'https://api.openai.com/v1' },
-  anthropic: { label: 'Claude (Anthropic)', model: 'claude-3-5-haiku-latest', baseURL: 'https://api.anthropic.com/v1' },
-  deepseek: { label: 'DeepSeek', model: 'deepseek-chat', baseURL: 'https://api.deepseek.com/v1' },
-  openrouter: { label: 'OpenRouter', model: 'openai/gpt-4o-mini', baseURL: 'https://openrouter.ai/api/v1' },
-  llama: { label: 'Llama / Together', model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo', baseURL: 'https://api.together.xyz/v1' },
-  mistral: { label: 'Mistral', model: 'mistral-small-latest', baseURL: 'https://api.mistral.ai/v1' },
-  gemini: { label: 'Gemini', model: 'gemini-3.6-flash', baseURL: 'https://generativelanguage.googleapis.com/v1beta' },
-  xai: { label: 'xAI Grok', model: 'grok-3-mini', baseURL: 'https://api.x.ai/v1' },
-  perplexity: { label: 'Perplexity', model: 'sonar', baseURL: 'https://api.perplexity.ai' },
-  fireworks: { label: 'Fireworks', model: 'accounts/fireworks/models/llama-v3p1-8b-instruct', baseURL: 'https://api.fireworks.ai/inference/v1' },
-  cerebras: { label: 'Cerebras', model: 'llama-3.3-70b', baseURL: 'https://api.cerebras.ai/v1' },
-  cohere: { label: 'Cohere', model: 'command-r7b-12-2024', baseURL: 'https://api.cohere.com/compatibility/v1' },
-  custom: { label: 'Custom OpenAI-compatible', model: '', baseURL: '' },
-} as const;
 const PERSISTED_PROVIDER_STORAGE_KEY = 'ai-help-agent-provider-settings-v1';
 const PERSISTED_PROVIDER_SECRET_KEY = 'ai-help-agent-provider-secrets-v1';
 
@@ -456,8 +427,6 @@ function writePersistedProviderSettings(activeProvider: string | null, providers
     // live server state when the browser can write local storage again.
   }
 }
-type ProviderId = keyof typeof providerPresets;
-
 const defaultAgentPermissions = { openTeams: false, openBrowser: false, openCamera: false, openChrome: false, openVSCode: false, openDesktop: false, openSourceTree: false, openSqlServer: false, openNotepad: false, openSublime: false };
 const allAgentPermissions = { openTeams: true, openBrowser: true, openCamera: true, openChrome: true, openVSCode: true, openDesktop: true, openSourceTree: true, openSqlServer: true, openNotepad: true, openSublime: true };
 const agentPermissionOptions = [
@@ -1090,7 +1059,7 @@ function App() {
     });
   }, [removeSessionDocuments, requestConfirmation]);
 
-  const handlePdfUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>, documentLabel = 'Session Document') => {
+  const handlePdfUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>, documentType: 'resume' | 'job-description' | 'session' = 'session') => {
     const files = Array.from(event.target.files || []);
     if (!files.length) return;
 
@@ -1099,49 +1068,14 @@ function App() {
     setStatusMessage('');
 
     try {
-      const extractedDocs: SessionDocument[] = [];
-      for (const file of files) {
-        if (!file.name.toLowerCase().endsWith('.pdf')) {
-          throw new Error('Only PDF files can be uploaded to the context area.');
-        }
-        if (file.size > MAX_PDF_SIZE) {
-          throw new Error(`${file.name} is larger than the 20MB PDF limit.`);
-        }
-
-        const formData = new FormData();
-        formData.append('file', file);
-        const controller = new AbortController();
-        const timeout = window.setTimeout(() => controller.abort(), PDF_UPLOAD_TIMEOUT_MS);
-        let response: Response;
-        try {
-          response = await fetch(`${HTTP_URL}/api/extract-pdf`, {
-            method: 'POST',
-            body: formData,
-            signal: controller.signal,
-          });
-        } finally {
-          window.clearTimeout(timeout);
-        }
-
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || `Failed to extract ${file.name}.`);
-        }
-
-        const extractedText = typeof data.text === 'string' ? data.text : '';
-        if (!extractedText.trim()) {
-          throw new Error(`${file.name} was not readable as text. Try a different PDF or an OCR-enabled file.`);
-        }
-
-        extractedDocs.push({
-          id: crypto.randomUUID(),
-          name: `${documentLabel}: ${file.name}`,
-          text: extractedText,
-          uploadedAt: Date.now(),
-        });
-      }
+      const extractedDocs = await extractPdfDocuments(files, documentType, runtimeConfig);
 
       if (!extractedDocs.length) return;
+      const documentLabel = documentType === 'resume'
+        ? 'Resume'
+        : documentType === 'job-description'
+          ? 'Job Description'
+          : 'Session Document';
       replaceSessionDocuments(documentLabel, extractedDocs);
       const combinedText = extractedDocs.map((doc) => doc.text).join('\n\n');
       setPdfText(combinedText);
@@ -1160,25 +1094,22 @@ function App() {
   }, [replaceSessionDocuments]);
 
   const handleResumeUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
-    void handlePdfUpload(event, 'Resume');
+    void handlePdfUpload(event, 'resume');
   }, [handlePdfUpload]);
 
   const handleJobDescriptionPdfUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
-    await handlePdfUpload(event, 'Job Description');
+    await handlePdfUpload(event, 'job-description');
   }, [handlePdfUpload]);
 
   const saveJobDescription = useCallback(() => {
     const text = jobDescription.trim();
     if (!text) return;
 
+    const pastedDocument = createPastedDocument(jobDescription);
+    if (!pastedDocument) return;
     setSessionDocuments((previous) => [
       ...previous.filter((document) => !document.name.startsWith('Job Description:')),
-      {
-        id: crypto.randomUUID(),
-        name: 'Job Description: Pasted text',
-        text,
-        uploadedAt: Date.now(),
-      },
+      pastedDocument,
     ]);
     setStatusMessage('Pasted job description added to session context.');
     setError('');
@@ -1883,12 +1814,12 @@ function App() {
         mode,
         messages: [{
           role: 'system',
-          content: `${buildInterviewSystemPrompt({
+          content: `${buildCanonicalInterviewSystemPrompt(createCanonicalInterviewContext({
             currentQuestion: canonicalQuestion,
             hasCandidateContext: Boolean(resolvedContext.trim()),
             domain,
             background,
-          })}${directModeContextInstruction}`,
+          }))}${directModeContextInstruction}`,
         }, ...conversationHistory],
         interviewContext: {
           domain,
@@ -2474,33 +2405,24 @@ function App() {
         if (segment.size === 0) {
           throw Object.assign(new Error('No audio signal was captured.'), { classification: 'AUDIO_CAPTURE_NO_SIGNAL' });
         }
-        const formData = new FormData();
-        formData.append('file', segment, payloadName);
-        const response = await fetch(`${HTTP_URL}/api/transcribe-audio`, {
-          method: 'POST',
-          body: formData,
-          headers: {
-            'X-STT-Session-ID': sttSession,
-            'X-STT-Segment-ID': segmentId,
-          },
-        });
-        let data: { text?: unknown; error?: string } = {};
+        let sttResponse: { text: string; status: number };
         try {
-          data = await response.json();
-        } catch {
-          if (!response.ok) {
-            throw Object.assign(new Error(`Transcription failed with HTTP ${response.status}.`), { classification: 'STT_RESPONSE_PARSE_ERROR' });
-          }
-        }
-        if (!response.ok) {
-          const classification = (data as { classification?: SttFailureClassification }).classification || 'STT_UNKNOWN';
+          sttResponse = await transcribeAudioSegment({
+            audio: segment,
+            endpoint: `${HTTP_URL}/api/transcribe-audio`,
+            sessionId: sttSession,
+            segmentId,
+            payloadName,
+          });
+        } catch (error) {
+          const classification = ((error as { classification?: SttFailureClassification }).classification || 'STT_UNKNOWN');
           logSttTrace(sttSession, 'STT_RESPONSE_FAILED', {
             segmentId,
-            status: response.status,
+            status: (error as { status?: number }).status || 0,
             classification,
             durationMs: Math.round(performance.now() - requestStartedAt),
           });
-          throw Object.assign(new Error(data.error || (data as { detail?: string }).detail || `Transcription failed with HTTP ${response.status}.`), { classification });
+          throw error;
         }
         if (captureSessionIdRef.current !== sttSession) {
           logSttTrace(sttSession, 'STALE_STT_CALLBACK_IGNORED', {
@@ -2509,14 +2431,14 @@ function App() {
           });
           return;
         }
-        const rawTranscript = String(data.text || '');
+        const rawTranscript = sttResponse.text;
         const transcriptNormalizationContext = {
           supportedTerms: [...background, ...(domain ? [domain] : [])],
         };
         const normalizedTranscript = cleanTranscript(rawTranscript, transcriptNormalizationContext);
         logSttTrace(sttSession, 'STT_RESPONSE_RECEIVED', {
           segmentId,
-          status: response.status,
+          status: sttResponse.status,
           durationMs: Math.round(performance.now() - requestStartedAt),
           rawTranscriptLength: rawTranscript.length,
           normalizedTranscriptLength: normalizedTranscript.length,

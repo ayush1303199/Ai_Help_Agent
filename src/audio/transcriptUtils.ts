@@ -112,13 +112,6 @@ export function voiceSafeText(text: string) {
     .trim();
 }
 
-function hasSupportedTerm(context: TranscriptNormalizationContext | undefined, term: string) {
-  const target = term.toLocaleLowerCase().replace(/[^a-z0-9]+/g, '');
-  return (context?.supportedTerms || []).some((supportedTerm) => (
-    supportedTerm.toLocaleLowerCase().replace(/[^a-z0-9]+/g, '') === target
-  ));
-}
-
 function normalizedTermKey(value: string) {
   return value.toLocaleLowerCase().replace(/[^a-z0-9]+/g, '');
 }

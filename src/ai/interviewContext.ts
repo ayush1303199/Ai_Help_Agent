@@ -96,6 +96,26 @@ export interface InterviewContextConfig {
   microphoneDeviceId: string | null;
 }
 
+export interface CanonicalInterviewContext {
+  currentQuestion: string;
+  hasCandidateContext: boolean;
+  domain: string | null;
+  background: string[];
+  customPrompt?: string | null;
+}
+
+export function createCanonicalInterviewContext(
+  input: Omit<CanonicalInterviewContext, 'background'> & { background?: readonly string[] },
+): CanonicalInterviewContext {
+  return {
+    currentQuestion: input.currentQuestion.trim(),
+    hasCandidateContext: Boolean(input.hasCandidateContext),
+    domain: input.domain?.trim() || null,
+    background: [...(input.background || [])].filter((item) => item.trim()),
+    customPrompt: input.customPrompt?.trim() || null,
+  };
+}
+
 export interface MicrophoneDeviceOption {
   deviceId: string;
   label: string;

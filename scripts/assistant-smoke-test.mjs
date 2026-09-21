@@ -92,7 +92,7 @@ assert.match(interviewPromptSource, /## Source priority and grounding/);
 assert.match(interviewPromptSource, /## Candidate interview persona/);
 assert.match(interviewPromptSource, /## Technical answers/);
 assert.match(interviewPromptSource, /## Question fidelity and response quality/);
-assert.match(appSource, /buildInterviewSystemPrompt\(/);
+assert.match(appSource, /buildCanonicalInterviewSystemPrompt\(/);
 assert.match(appSource, /question: latestQuestion/);
 
 const generalBranch = appSource.indexOf("{appMode === 'general' ?");
