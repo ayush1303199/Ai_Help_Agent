@@ -171,7 +171,7 @@ AI_MAX_TOKENS=384
 
 The Python service uses the configured provider preset model by default. The
 model, base URL, priority, enable/disable state, fallback behavior, and API key
-can be managed from **AI provider settings**. A custom OpenAI-compatible
+can be managed from **Configuration** (AI provider settings). A custom OpenAI-compatible
 provider can be added there without changing source code.
 Runtime provider configuration is persisted outside the repository, normally
 under:
@@ -504,6 +504,8 @@ scripts/
   assistant-smoke-test.mjs  Assistant and audio-path assertions
   interview-context-test.mjs
                             Context and microphone selection tests
+  configuration-ui-test.mjs
+                            Configuration action and modal wiring test
   interview-context-backend-test.py
                             Provider-boundary metadata test
 ```
@@ -523,6 +525,7 @@ Run the overlay and context UI checks:
 ```bash
 npm run test:overlay
 npm run test:context-dialog
+npm run test:configuration-ui
 ```
 
 Run the Developer Agent checks:
@@ -615,7 +618,7 @@ Confirm that ports 3001 and 3002 are not owned by an unrelated process.
 ### Provider errors or rate limits
 
 - Check `/api/health`.
-- Open AI provider settings and run a provider self-test.
+- Open Configuration and run a provider self-test.
 - Confirm the configured model supports the selected operation.
 - Configure a second provider and enable fallback when appropriate.
 - Retry after a provider rate limit window expires.

@@ -12,6 +12,36 @@ assert.equal(transcriptUtils.cleanTranscript('explain node.js and fastapi'), 'ex
 assert.equal(transcriptUtils.cleanTranscript('Explain dependency injection in Spring.'), 'Explain dependency injection in Spring?');
 assert.equal(transcriptUtils.cleanTranscript('What is Spring Boot???'), 'What is Spring Boot?');
 assert.equal(transcriptUtils.cleanTranscript('What is concurrent hashmap'), 'What is ConcurrentHashMap?');
+const interviewVocabulary = { supportedTerms: ['Spring Boot', 'Spring Security', 'Java'] };
+assert.equal(
+  transcriptUtils.cleanTranscript('What is dependency injection in the springboard', interviewVocabulary),
+  'What is dependency injection in the Spring Boot?',
+);
+assert.equal(
+  transcriptUtils.cleanTranscript('What a dependency injection in the string board', interviewVocabulary),
+  'What is dependency injection in the Spring Boot?',
+);
+assert.equal(
+  transcriptUtils.cleanTranscript('What is the tendency injection in the springboard', interviewVocabulary),
+  'What is the dependency injection in the Spring Boot?',
+);
+assert.equal(
+  transcriptUtils.cleanTranscript('What is a springboard', interviewVocabulary),
+  'What is a springboard?',
+);
+assert.equal(
+  transcriptUtils.cleanTranscript('Explain the tendency injection in the springboard', interviewVocabulary),
+  'Explain the dependency injection in the Spring Boot?',
+);
+const rawInterviewQuestion = 'Explain my experience with Java and Spring Boot.';
+const preparedInterviewQuestion = transcriptUtils.prepareQuestion(rawInterviewQuestion, interviewVocabulary);
+assert.equal(preparedInterviewQuestion.rawText, rawInterviewQuestion);
+assert.equal(preparedInterviewQuestion.normalizedText, 'Explain my experience with Java and Spring Boot?');
+assert.equal(preparedInterviewQuestion.acceptedQuestion, 'Explain my experience with Java and Spring Boot?');
+assert.equal(
+  transcriptUtils.prepareQuestion('I will explain my experience with Java and Spring Boot.', interviewVocabulary).acceptedQuestion,
+  null,
+);
 assert.doesNotMatch(await fs.readFile(new URL('../server/src/index.py', import.meta.url), 'utf8'), /Output only the transcript/);
 assert.deepEqual(transcriptUtils.detectQuestion('How are you?'), {
   isQuestion: true,
@@ -20,6 +50,14 @@ assert.deepEqual(transcriptUtils.detectQuestion('How are you?'), {
 assert.deepEqual(transcriptUtils.detectQuestion('What? What?'), {
   isQuestion: false,
   question: null,
+});
+assert.deepEqual(transcriptUtils.detectQuestion('random unrelated words here.'), {
+  isQuestion: false,
+  question: null,
+});
+assert.deepEqual(transcriptUtils.detectQuestion('What is Java?'), {
+  isQuestion: true,
+  question: 'What is Java?',
 });
 assert.equal(transcriptUtils.prepareQuestion('uh...').qualityClassification, 'FILLER');
 assert.equal(transcriptUtils.prepareQuestion('What is the difference between...').qualityClassification, 'INCOMPLETE');
@@ -77,6 +115,20 @@ assert.match(appSource, /Microphone and system audio connected/);
 assert.match(appSource, /System audio connected/);
 assert.match(appSource, /SYSTEM_AUDIO_UNAVAILABLE/);
 assert.doesNotMatch(appSource, /SYSTEM_AUDIO_OPTIONAL_UNAVAILABLE/);
+assert.match(appSource, /selectedDeviceConfigured/);
+assert.match(appSource, /selectedDevicePresent/);
+assert.match(appSource, /displayedAudioSourceLabel/);
+assert.match(appSource, /displayedAudioStatus/);
+assert.match(appSource, /const stopMeetingCapture = \(\) =>/);
+assert.match(appSource, /if \(captureActiveRef\.current \|\| captureSessionIdRef\.current\) return;/);
+assert.match(appSource, /captureSessionIdRef\.current = ''/);
+assert.match(appSource, /recorder\.state === 'recording'/);
+assert.match(appSource, /recorderRef\.current === recorder/);
+assert.match(appSource, /nextSegment\?\.sttSession === sttSession/);
+assert.match(appSource, /STALE_STT_CALLBACK_IGNORED/);
+assert.match(appSource, /setIsRecording\(false\);\s*setIsTranscribing\(false\);\s*setPipelineStatus\('stopped'\)/);
+assert.match(appSource, /isRecording \|\| isTranscribing \? <button type="button" onClick=\{stopMeetingCapture\}/);
+assert.match(appSource, /<button type="button" onClick=\{\(\) => void startMeetingCapture\(\)\}[^>]*>Start Listening<\/button>/);
 assert.match(electronMainSource, /setDisplayMediaRequestHandler/);
 assert.match(electronMainSource, /audio: 'loopback'/);
 assert.match(electronMainSource, /types: \['screen'\]/);

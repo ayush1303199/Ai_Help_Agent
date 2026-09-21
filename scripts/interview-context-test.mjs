@@ -6,6 +6,7 @@ const {
   INTERVIEW_DOMAIN_OPTIONS,
   chooseMicrophoneDevice,
   microphoneDisplayLabel,
+  normalizeMicrophoneDevices,
   normalizeInterviewContext,
 } = await import('../src/ai/interviewContext.ts');
 const { buildInterviewSystemPrompt } = await import('../src/ai/interviewSystemPrompt.ts');
@@ -64,6 +65,28 @@ assert.equal(INTERVIEW_BACKGROUND_OPTIONS.includes('All Technologies'), true);
 assert.equal(INTERVIEW_BACKGROUND_OPTIONS.includes('Swift (iOS)'), true);
 assert.equal(INTERVIEW_BACKGROUND_OPTIONS.includes('Kotlin (Android)'), true);
 assert.equal(INTERVIEW_BACKGROUND_OPTIONS.includes('Dart/Flutter'), true);
+const normalizedMicrophones = normalizeMicrophoneDevices([
+  { deviceId: 'default', label: 'Default Microphone (AB13X USB Audio)', groupId: 'ab13x' },
+  { deviceId: 'usb-ab13x', label: 'AB13X USB Audio', groupId: 'ab13x' },
+  { deviceId: 'realtek', label: 'Microphone Array (2- Realtek(R) Audio)', groupId: 'realtek' },
+]);
+assert.deepEqual(normalizedMicrophones.map((device) => device.deviceId), ['usb-ab13x', 'realtek']);
+assert.equal(normalizedMicrophones[0].isDefault, true);
+assert.equal(normalizedMicrophones[0].deviceId, 'usb-ab13x');
+assert.deepEqual(
+  normalizeMicrophoneDevices([
+    { deviceId: 'default', label: 'Default - AB13X USB Audio' },
+    { deviceId: 'usb-ab13x', label: 'AB13X USB Audio' },
+  ]).map((device) => device.deviceId),
+  ['usb-ab13x'],
+);
+assert.deepEqual(
+  normalizeMicrophoneDevices([
+    { deviceId: 'mic-a', label: 'Shared label', groupId: 'group-a' },
+    { deviceId: 'mic-b', label: 'Shared label', groupId: 'group-b' },
+  ]).map((device) => device.deviceId),
+  ['mic-a', 'mic-b'],
+);
 assert.equal(
   chooseMicrophoneDevice([
     { deviceId: 'default', label: 'Default' },
@@ -87,6 +110,7 @@ assert.equal(microphoneDisplayLabel(null), 'Microphone unavailable');
 assert.match(microphoneDisplayLabel({ deviceId: 'usb', label: 'AB13X USB Audio' }), /AB13X USB Audio/);
 assert.match(appSource, /readPersistedInterviewContext\(\)/);
 assert.match(appSource, /writePersistedInterviewContext\(interviewConfig\)/);
+assert.match(appSource, /normalizeMicrophoneDevices\(/);
 assert.match(appSource, />Background<\/label>/);
 assert.match(appSource, /enumerateDevices\(\)/);
 assert.match(appSource, /deviceId: \{ exact: microphoneDeviceId \}/);

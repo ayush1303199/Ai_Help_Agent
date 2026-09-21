@@ -99,6 +99,8 @@ export interface InterviewContextConfig {
 export interface MicrophoneDeviceOption {
   deviceId: string;
   label: string;
+  groupId?: string;
+  isDefault?: boolean;
 }
 
 const LEGACY_DOMAIN_ALIASES: Record<string, typeof INTERVIEW_DOMAIN_OPTIONS[number]> = {
@@ -165,16 +167,117 @@ export function writePersistedInterviewContext(config: InterviewContextConfig) {
   }
 }
 
+function normalizedMicrophoneLabel(label: string) {
+  return label
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase();
+}
+
+function microphoneLabelVariants(device: MicrophoneDeviceOption) {
+  const normalized = normalizedMicrophoneLabel(device.label);
+  if (!normalized) return [];
+  const variants = new Set([normalized]);
+  const defaultPrefix = normalized.replace(/^(?:default|communications)(?:\s+microphone)?\s*[-:]?\s*/i, '');
+  if (defaultPrefix && defaultPrefix !== normalized) variants.add(defaultPrefix);
+  const parenthetical = normalized.match(/\(([^()]+)\)\s*$/);
+  if (parenthetical?.[1]) variants.add(parenthetical[1].trim());
+  return [...variants];
+}
+
+function isDefaultMicrophone(device: MicrophoneDeviceOption) {
+  return device.isDefault === true || device.deviceId === 'default' || device.deviceId === 'communications';
+}
+
+function defaultRepresentsDevice(defaultDevice: MicrophoneDeviceOption, candidate: MicrophoneDeviceOption) {
+  if (defaultDevice.groupId && candidate.groupId && defaultDevice.groupId === candidate.groupId) return true;
+  const defaultVariants = microphoneLabelVariants(defaultDevice);
+  const candidateVariants = microphoneLabelVariants(candidate);
+  return defaultVariants.some((variant) => candidateVariants.includes(variant));
+}
+
+function sameMicrophoneDevice(left: MicrophoneDeviceOption, right: MicrophoneDeviceOption) {
+  if (left.deviceId === right.deviceId) return true;
+  if (left.groupId && right.groupId && left.groupId === right.groupId) return true;
+  return isDefaultMicrophone(left) && isDefaultMicrophone(right)
+    && defaultRepresentsDevice(left, right);
+}
+
+/**
+ * Convert browser/Electron audio-input records into the one selectable list
+ * used by Context and the Meeting Assistant. Chromium can expose a `default`
+ * pseudo-device alongside its physical input; when its group or label resolves
+ * to a physical input, keep only the physical device ID for capture.
+ */
+export function normalizeMicrophoneDevices(devices: MicrophoneDeviceOption[]) {
+  const byDeviceId = new Map<string, MicrophoneDeviceOption>();
+  for (const device of devices) {
+    const deviceId = device.deviceId.trim();
+    if (!deviceId) continue;
+    const next: MicrophoneDeviceOption = {
+      deviceId,
+      label: device.label.trim(),
+      groupId: device.groupId?.trim() || undefined,
+      isDefault: device.isDefault === true || deviceId === 'default' || deviceId === 'communications',
+    };
+    const existing = byDeviceId.get(deviceId);
+    byDeviceId.set(deviceId, existing
+      ? {
+        ...existing,
+        label: existing.label || next.label,
+        groupId: existing.groupId || next.groupId,
+        isDefault: existing.isDefault || next.isDefault,
+      }
+      : next);
+  }
+
+  const uniqueDevices = [...byDeviceId.values()];
+  const physicalDevices = uniqueDevices.filter((device) => !isDefaultMicrophone(device));
+  const defaultDevices = uniqueDevices.filter(isDefaultMicrophone);
+  const resolvedPseudoDeviceIds = new Set(
+    defaultDevices
+      .filter((defaultDevice) => physicalDevices.some((candidate) => defaultRepresentsDevice(defaultDevice, candidate)))
+      .map((defaultDevice) => defaultDevice.deviceId),
+  );
+  const resolvedDefaultIds = new Set(
+    defaultDevices
+      .flatMap((defaultDevice) => physicalDevices
+        .filter((candidate) => defaultRepresentsDevice(defaultDevice, candidate))
+        .map((candidate) => candidate.deviceId)),
+  );
+  const withoutResolvedPseudoDevices = uniqueDevices.filter((device) => !resolvedPseudoDeviceIds.has(device.deviceId));
+
+  const normalized: MicrophoneDeviceOption[] = [];
+  for (const device of withoutResolvedPseudoDevices) {
+    const resolvedPhysicalDefault = resolvedDefaultIds.has(device.deviceId);
+    const existing = normalized.find((candidate) => sameMicrophoneDevice(candidate, device));
+    if (existing) {
+      existing.label = existing.label || device.label;
+      existing.groupId = existing.groupId || device.groupId;
+      existing.isDefault = existing.isDefault || device.isDefault || resolvedPhysicalDefault;
+      continue;
+    }
+    normalized.push({
+      ...device,
+      isDefault: Boolean(device.isDefault || resolvedPhysicalDefault),
+    });
+  }
+
+  return normalized.sort((left, right) => Number(Boolean(right.isDefault)) - Number(Boolean(left.isDefault)));
+}
+
 export function chooseMicrophoneDevice(
   devices: MicrophoneDeviceOption[],
   savedDeviceId: string | null,
 ) {
-  const available = devices.filter((device) => device.deviceId);
+  const available = normalizeMicrophoneDevices(devices).filter((device) => device.deviceId);
   if (!available.length) return null;
   if (savedDeviceId && available.some((device) => device.deviceId === savedDeviceId)) return savedDeviceId;
   const namedDefault = available.find((device) => /AB13X USB Audio/i.test(device.label));
-  return namedDefault?.deviceId
-    || available.find((device) => device.deviceId === 'default')?.deviceId
+  if (namedDefault) return namedDefault.deviceId;
+  const resolvedDefault = available.find((device) => device.isDefault);
+  if (resolvedDefault) return resolvedDefault.deviceId;
+  return available.find((device) => device.deviceId === 'default')?.deviceId
     || available[0].deviceId;
 }
 

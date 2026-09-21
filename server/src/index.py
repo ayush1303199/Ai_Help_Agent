@@ -41,9 +41,13 @@ CONFIG_PATH = Path(os.getenv("AI_PROVIDER_CONFIG_PATH", Path.home() / ".ai-help-
 STT_TRANSCRIPTION_PROMPT = os.getenv(
     "TRANSCRIPTION_PROMPT",
     (
-        "Technical vocabulary: Spring Boot, Spring Security, Java, JavaScript, "
-        "TypeScript, React, Node.js, Python, FastAPI, OpenAI, Copilot, Groq, API, "
-        "SQL, PostgreSQL, MySQL, Docker, Kubernetes, AWS, Azure, GitHub."
+        "Transcribe only the words spoken in the audio. Do not paraphrase, complete, "
+        "or convert a request into a self-answer. Preserve clearly spoken technical "
+        "product names exactly. Technical vocabulary: Spring Boot, Spring Security, "
+        "dependency injection, Hibernate, JPA, Java, JavaScript, TypeScript, React, "
+        "React.js, Node.js, Python, FastAPI, OpenAI, Copilot, Groq, API, REST API, "
+        "Microservices, SQL, PostgreSQL, MySQL, Docker, Kubernetes, AWS, Azure, GitHub. "
+        "If a word is uncertain, return the audible wording instead of inventing a correction."
     ),
 )
 

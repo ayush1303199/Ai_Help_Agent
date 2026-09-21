@@ -36,15 +36,18 @@ import {
   INTERVIEW_BACKGROUND_OPTIONS,
   INTERVIEW_DOMAIN_OPTIONS,
   microphoneDisplayLabel,
+  normalizeMicrophoneDevices,
   readPersistedInterviewContext,
   writePersistedInterviewContext,
   type InterviewContextConfig,
+  type MicrophoneDeviceOption,
 } from './ai/interviewContext';
 import { buildInterviewSystemPrompt } from './ai/interviewSystemPrompt';
 import { resolveContext, truncateContextText } from './context/contextResolver';
 import { renderAnswerMarkdown } from './ui/answerMarkdown';
 import { AnswerSessionView } from './ui/AnswerSessionView';
 import { ConfiguredProvidersPanel } from './ui/ConfiguredProvidersPanel';
+import { ConfirmationDialog } from './ui/ConfirmationDialog';
 import { ContextInputDialog } from './ui/ContextInputDialog';
 
 interface Message {
@@ -56,6 +59,12 @@ interface Message {
 interface RequestTiming {
   questionFinalizedAt: number;
   sendMessageCalledAt: number;
+}
+
+interface PendingAudioSegment {
+  blob: Blob;
+  durationMs: number;
+  sttSession: string;
 }
 
 interface SendMessageOptions {
@@ -132,6 +141,7 @@ interface MeetingTranscript {
   source: string;
   text: string;
   rawText?: string;
+  normalizedText?: string;
   createdAt: string;
 }
 
@@ -178,6 +188,14 @@ interface ConfiguredProvider {
   developerToolCalling?: boolean;
   developerToolCallingVerified?: boolean;
   developerStatus?: string;
+}
+
+interface ConfirmationRequest {
+  title: string;
+  description: string;
+  confirmLabel?: string;
+  variant?: 'danger' | 'primary';
+  onConfirm: () => void | Promise<void>;
 }
 
 interface DeveloperSearchResult {
@@ -459,6 +477,7 @@ function App() {
   });
   const [activeChatId, setActiveChatId] = useState<string>(() => crypto.randomUUID());
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
   const [copiedItem, setCopiedItem] = useState('');
   const [chatStreaming, setChatStreaming] = useState(false);
   const [developerMessages, setDeveloperMessages] = useState<Message[]>([]);
@@ -522,12 +541,13 @@ function App() {
   const [profilePreviewOpen, setProfilePreviewOpen] = useState(false);
   const [profileDialogOpen, setProfileDialogOpen] = useState(false);
   const [profileNameDraft, setProfileNameDraft] = useState('');
+  const [profileTraining, setProfileTraining] = useState(false);
   const [meetingAudioMode, setMeetingAudioMode] = useState<MeetingAudioMode>('microphone');
   const [meetingMenuOpen, setMeetingMenuOpen] = useState(false);
   const [contextMenuOpen, setContextMenuOpen] = useState(false);
   const [jobDescription, setJobDescription] = useState('');
   const [interviewConfig, setInterviewConfig] = useState<InterviewContextConfig>(() => readPersistedInterviewContext());
-  const [microphoneDevices, setMicrophoneDevices] = useState<MediaDeviceInfo[]>([]);
+  const [microphoneDevices, setMicrophoneDevices] = useState<MicrophoneDeviceOption[]>([]);
   const [microphoneUnavailable, setMicrophoneUnavailable] = useState(false);
   const [backgroundSearch, setBackgroundSearch] = useState('');
   const [backgroundOptionsOpen, setBackgroundOptionsOpen] = useState(false);
@@ -556,6 +576,7 @@ function App() {
   const [providerModel, setProviderModel] = useState<string>(providerPresets.groq.model);
   const [providerBaseURL, setProviderBaseURL] = useState<string>(providerPresets.groq.baseURL);
   const [providerSaving, setProviderSaving] = useState(false);
+  const [providerRefreshing, setProviderRefreshing] = useState(false);
   const [configuredProviders, setConfiguredProviders] = useState<ConfiguredProvider[]>([]);
   const [providerLabel, setProviderLabel] = useState('');
   const [providerEnabled, setProviderEnabled] = useState(true);
@@ -564,6 +585,7 @@ function App() {
   const [agentPermissions, setAgentPermissions] = useState(defaultAgentPermissions);
   const [agentUrl, setAgentUrl] = useState('https://teams.microsoft.com');
   const [agentSaving, setAgentSaving] = useState(false);
+  const [agentActionTarget, setAgentActionTarget] = useState<string | null>(null);
   const [agentActivity, setAgentActivity] = useState<AgentActivity[]>([]);
   const meetingSource = meetingAudioMode === 'meeting'
     ? 'Microphone + System Audio'
@@ -577,6 +599,7 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const resumeFileInputRef = useRef<HTMLInputElement>(null);
   const jobDescriptionFileInputRef = useRef<HTMLInputElement>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const voiceBufferRef = useRef('');
@@ -607,9 +630,9 @@ function App() {
   const segmentStartedAtRef = useRef(0);
   const captureActiveRef = useRef(false);
   const captureSessionIdRef = useRef('');
-  const pendingSegmentQueueRef = useRef<Blob[]>([]);
-  const pendingSegmentDurationQueueRef = useRef<number[]>([]);
+  const pendingSegmentQueueRef = useRef<PendingAudioSegment[]>([]);
   const segmentProcessorActiveRef = useRef(false);
+  const segmentProcessorRef = useRef<(() => Promise<void>) | null>(null);
   const acceptedQuestionHistoryRef = useRef<string[]>([]);
   const acceptedQuestionRequestIdsRef = useRef(new Map<string, string>());
   const pendingPartialQuestionRef = useRef('');
@@ -628,6 +651,14 @@ function App() {
     status: pipelineStatus,
   });
   const requestTimingRef = useRef(new Map<string, RequestTiming>());
+
+  const requestConfirmation = useCallback((request: ConfirmationRequest) => {
+    setConfirmation(request);
+  }, []);
+
+  const closeConfirmation = useCallback(() => {
+    setConfirmation(null);
+  }, []);
 
   // --- Auto-scroll to bottom on new content ---
   useEffect(() => {
@@ -797,8 +828,15 @@ function App() {
       return;
     }
     try {
-      const devices = (await navigator.mediaDevices.enumerateDevices())
-        .filter((device) => device.kind === 'audioinput' && Boolean(device.deviceId));
+      const devices = normalizeMicrophoneDevices(
+        (await navigator.mediaDevices.enumerateDevices())
+          .filter((device) => device.kind === 'audioinput' && Boolean(device.deviceId))
+          .map((device) => ({
+            deviceId: device.deviceId,
+            label: device.label,
+            groupId: device.groupId,
+          })),
+      );
       setMicrophoneDevices(devices);
       if (!devices.length) {
         setMicrophoneUnavailable(true);
@@ -810,7 +848,7 @@ function App() {
       setMicrophoneUnavailable(false);
       setInterviewConfig((current) => {
         const selected = chooseMicrophoneDevice(
-          devices.map((device) => ({ deviceId: device.deviceId, label: device.label })),
+          devices,
           current.microphoneDeviceId,
         );
         return selected === current.microphoneDeviceId
@@ -840,15 +878,53 @@ function App() {
     ].slice(0, 30));
   }, [activeChatId, messages]);
 
+  const savedJobDescription = sessionDocuments.find((document) => document.name === 'Job Description: Pasted text')?.text || '';
+  const closeContextMenu = useCallback(() => {
+    setContextMenuOpen(false);
+    setBackgroundOptionsOpen(false);
+    setBackgroundSearch('');
+    setJobDescription(savedJobDescription);
+  }, [savedJobDescription]);
+
+  const openContextMenu = useCallback(() => {
+    setJobDescription(savedJobDescription);
+    setContextMenuOpen(true);
+  }, [savedJobDescription]);
+
   useEffect(() => {
-    if (!settingsOpen) return;
+    if (!settingsOpen && !historyOpen) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setSettingsOpen(false);
+      if (event.key !== 'Escape') return;
+      if (confirmation || profileDialogOpen) return;
+      if (settingsOpen && (providerSaving || agentSaving)) return;
+      if (settingsOpen) setSettingsOpen(false);
+      if (historyOpen) setHistoryOpen(false);
     };
 
     document.addEventListener('keydown', closeOnEscape);
     return () => document.removeEventListener('keydown', closeOnEscape);
-  }, [settingsOpen]);
+  }, [agentSaving, confirmation, historyOpen, profileDialogOpen, providerSaving, settingsOpen]);
+
+  useEffect(() => {
+    if ((!contextMenuOpen && !meetingMenuOpen) || confirmation || profileDialogOpen) return;
+    const closePopoverOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (contextMenuOpen) closeContextMenu();
+      if (meetingMenuOpen) setMeetingMenuOpen(false);
+    };
+    const closeContextOnOutsidePointer = (event: MouseEvent) => {
+      if (!contextMenuOpen || !(event.target instanceof Node)) return;
+      const target = event.target as Element;
+      if (contextMenuRef.current?.contains(target) || target.closest('[data-context-toggle]')) return;
+      closeContextMenu();
+    };
+    document.addEventListener('keydown', closePopoverOnEscape);
+    document.addEventListener('mousedown', closeContextOnOutsidePointer);
+    return () => {
+      document.removeEventListener('keydown', closePopoverOnEscape);
+      document.removeEventListener('mousedown', closeContextOnOutsidePointer);
+    };
+  }, [closeContextMenu, confirmation, contextMenuOpen, meetingMenuOpen, profileDialogOpen]);
 
   // --- Fetch health info on mount ---
   useEffect(() => {
@@ -905,6 +981,20 @@ function App() {
   const selectedMicrophone = microphoneDevices.find((device) => device.deviceId === microphoneDeviceId) || null;
   const selectedMicrophoneLabel = microphoneDisplayLabel(selectedMicrophone);
   const microphoneDevicePresent = Boolean(selectedMicrophone);
+  const configuredMicrophoneLabel = microphoneDevicePresent ? selectedMicrophoneLabel : 'Microphone unavailable';
+  const configuredAudioSourceLabel = meetingAudioMode === 'system'
+    ? 'System Audio'
+    : meetingAudioMode === 'meeting'
+      ? `${configuredMicrophoneLabel} + System Audio`
+      : configuredMicrophoneLabel;
+  const displayedAudioSourceLabel = isRecording || audioStatus === 'connected'
+    ? audioSourceLabel
+    : configuredAudioSourceLabel;
+  const displayedAudioStatus = audioStatus === 'testing'
+    ? 'Testing'
+    : isRecording
+      ? 'Listening'
+      : 'Ready';
   const filteredBackgroundOptions = INTERVIEW_BACKGROUND_OPTIONS.filter((option) => (
     !background.includes(option)
     && (!backgroundSearch.trim() || option.toLowerCase().includes(backgroundSearch.trim().toLowerCase()))
@@ -934,14 +1024,71 @@ function App() {
     setStatusMessage('Session context cleared.');
   }, []);
 
+  const requestClearSessionContext = useCallback(() => {
+    requestConfirmation({
+      title: 'Clear session uploads?',
+      description: 'This removes the uploaded Resume and Job Description from the current session. Trained profiles are kept.',
+      confirmLabel: 'Clear uploads',
+      onConfirm: clearSessionContext,
+    });
+  }, [clearSessionContext, requestConfirmation]);
+
   const deleteProfile = useCallback((profileId: string) => {
     const profile = trainedProfiles.find((item) => item.id === profileId);
-    if (profile && !window.confirm(`Delete trained profile "${profile.name}"?`)) return;
-    setTrainedProfiles((prev) => prev.filter((profile) => profile.id !== profileId));
-    setActiveProfileId((current) => (current === profileId ? null : current));
-    setProfilePreviewOpen(false);
-    setStatusMessage('Profile deleted.');
-  }, [trainedProfiles]);
+    if (!profile) return;
+    requestConfirmation({
+      title: 'Delete trained profile?',
+      description: `Delete "${profile.name}" permanently? The currently uploaded session documents will not be changed.`,
+      confirmLabel: 'Delete profile',
+      onConfirm: () => {
+        setTrainedProfiles((prev) => prev.filter((item) => item.id !== profileId));
+        setActiveProfileId((current) => (current === profileId ? null : current));
+        setProfilePreviewOpen(false);
+        setStatusMessage('Profile deleted.');
+      },
+    });
+  }, [requestConfirmation, trainedProfiles]);
+
+  const replaceSessionDocuments = useCallback((documentLabel: string, documents: SessionDocument[]) => {
+    setSessionDocuments((previous) => [
+      ...previous.filter((document) => !document.name.startsWith(`${documentLabel}:`)),
+      ...documents,
+    ]);
+  }, []);
+
+  const removeSessionDocuments = useCallback((documentLabel: string) => {
+    setSessionDocuments((previous) => {
+      const next = previous.filter((document) => !document.name.startsWith(`${documentLabel}:`));
+      setPdfText(next.map((document) => document.text).join('\n\n'));
+      return next;
+    });
+    if (documentLabel === 'Resume') setPdfName('');
+    if (documentLabel === 'Job Description') setJobDescription('');
+  }, []);
+
+  const requestRemoveResume = useCallback(() => {
+    requestConfirmation({
+      title: 'Remove Resume?',
+      description: 'Remove the current Resume from this session context. The Job Description and trained profiles will remain.',
+      confirmLabel: 'Remove Resume',
+      onConfirm: () => {
+        removeSessionDocuments('Resume');
+        setStatusMessage('Resume removed from session context.');
+      },
+    });
+  }, [removeSessionDocuments, requestConfirmation]);
+
+  const requestRemoveJobDescription = useCallback(() => {
+    requestConfirmation({
+      title: 'Remove Job Description?',
+      description: 'Remove the current Job Description from this session context. The Resume will remain.',
+      confirmLabel: 'Remove Job Description',
+      onConfirm: () => {
+        removeSessionDocuments('Job Description');
+        setStatusMessage('Job Description removed from session context.');
+      },
+    });
+  }, [removeSessionDocuments, requestConfirmation]);
 
   const handlePdfUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>, documentLabel = 'Session Document') => {
     const files = Array.from(event.target.files || []);
@@ -965,12 +1112,16 @@ function App() {
         formData.append('file', file);
         const controller = new AbortController();
         const timeout = window.setTimeout(() => controller.abort(), PDF_UPLOAD_TIMEOUT_MS);
-        const response = await fetch(`${HTTP_URL}/api/extract-pdf`, {
-          method: 'POST',
-          body: formData,
-          signal: controller.signal,
-        });
-        window.clearTimeout(timeout);
+        let response: Response;
+        try {
+          response = await fetch(`${HTTP_URL}/api/extract-pdf`, {
+            method: 'POST',
+            body: formData,
+            signal: controller.signal,
+          });
+        } finally {
+          window.clearTimeout(timeout);
+        }
 
         const data = await response.json();
         if (!response.ok) {
@@ -991,20 +1142,22 @@ function App() {
       }
 
       if (!extractedDocs.length) return;
-      setSessionDocuments((prev) => [...prev, ...extractedDocs]);
+      replaceSessionDocuments(documentLabel, extractedDocs);
       const combinedText = extractedDocs.map((doc) => doc.text).join('\n\n');
       setPdfText(combinedText);
       if (documentLabel === 'Resume') {
         setPdfName(extractedDocs.map((doc) => doc.name).join(', '));
       }
+      if (documentLabel === 'Job Description') setJobDescription('');
       setStatusMessage(`${extractedDocs.length} PDF document${extractedDocs.length > 1 ? 's were' : ' was'} added to session context.`);
     } catch (err) {
       setError((err as Error).message);
     } finally {
       setPdfLoading(false);
+      event.target.value = '';
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
-  }, []);
+  }, [replaceSessionDocuments]);
 
   const handleResumeUpload = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     void handlePdfUpload(event, 'Resume');
@@ -1019,7 +1172,7 @@ function App() {
     if (!text) return;
 
     setSessionDocuments((previous) => [
-      ...previous.filter((document) => !document.name.startsWith('Job Description: Pasted')),
+      ...previous.filter((document) => !document.name.startsWith('Job Description:')),
       {
         id: crypto.randomUUID(),
         name: 'Job Description: Pasted text',
@@ -1043,35 +1196,44 @@ function App() {
     setError('');
   }, [sessionDocuments]);
 
-  const completeProfileTraining = useCallback((profileName: string) => {
+  const completeProfileTraining = useCallback(async (profileName: string) => {
+    if (profileTraining) return;
+    setProfileTraining(true);
     const trimmedName = profileName.trim();
-    const context = sessionDocuments
-      .map((doc) => `Document: ${doc.name}\n${doc.text}`)
-      .join('\n\n');
-    const summary = `Session context from ${sessionDocuments.length} document${sessionDocuments.length > 1 ? 's' : ''}.`;
+    try {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      const context = sessionDocuments
+        .map((doc) => `Document: ${doc.name}\n${doc.text}`)
+        .join('\n\n');
+      const summary = `Session context from ${sessionDocuments.length} document${sessionDocuments.length > 1 ? 's' : ''}.`;
 
-    setTrainedProfiles((prev) => {
-      const normalized = trimmedName.toLowerCase();
-      const existingIndex = prev.findIndex((profile) => profile.name.toLowerCase() === normalized);
-      const profile: TrainedProfile = {
-        id: existingIndex >= 0 ? prev[existingIndex].id : crypto.randomUUID(),
-        name: trimmedName,
-        summary,
-        context: truncateContextText(context, MAX_CONTEXT_CHARS),
-        createdAt: Date.now(),
-      };
-      if (existingIndex >= 0) {
-        const next = [...prev];
-        next[existingIndex] = profile;
-        return next;
-      }
-      return [profile, ...prev];
-    });
-    setStatusMessage(`Profile "${trimmedName}" is ready.`);
-    setError('');
-    setProfileDialogOpen(false);
-    setProfileNameDraft('');
-  }, [sessionDocuments]);
+      setTrainedProfiles((prev) => {
+        const normalized = trimmedName.toLowerCase();
+        const existingIndex = prev.findIndex((profile) => profile.name.toLowerCase() === normalized);
+        const profile: TrainedProfile = {
+          id: existingIndex >= 0 ? prev[existingIndex].id : crypto.randomUUID(),
+          name: trimmedName,
+          summary,
+          context: truncateContextText(context, MAX_CONTEXT_CHARS),
+          createdAt: Date.now(),
+        };
+        if (existingIndex >= 0) {
+          const next = [...prev];
+          next[existingIndex] = profile;
+          return next;
+        }
+        return [profile, ...prev];
+      });
+      setStatusMessage(`Profile "${trimmedName}" is ready.`);
+      setError('');
+      setProfileDialogOpen(false);
+      setProfileNameDraft('');
+    } catch (err) {
+      setError(`Training failed: ${(err as Error).message}`);
+    } finally {
+      setProfileTraining(false);
+    }
+  }, [profileTraining, sessionDocuments]);
 
   const handleWsMessage = useCallback((data: string) => {
     const msg = JSON.parse(data);
@@ -1602,44 +1764,58 @@ function App() {
     if (/^open\s+(to\s+)?(team|teams|microsoft\s+teams)\s*$/i.test(rawQuestion)) {
       setInput('');
       setError('');
-      if (!window.confirm('Open Microsoft Teams?')) return;
-      try {
-        const response = await fetch(`${HTTP_URL}/api/agent/open`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ target: 'teams', confirmed: true }),
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Opening Teams was blocked. Enable Allow open Teams in AI Settings.');
-        setMessages((prev) => [...prev,
-          { role: 'user', content: rawQuestion },
-          { role: 'assistant', content: 'Opening Microsoft Teams.' },
-        ]);
-      } catch (err) {
-        setError((err as Error).message);
-      }
+      requestConfirmation({
+        title: 'Open Microsoft Teams?',
+        description: 'The local agent will open Microsoft Teams. It will not place a call or send a message.',
+        confirmLabel: 'Open Teams',
+        variant: 'primary',
+        onConfirm: async () => {
+          try {
+            const response = await fetch(`${HTTP_URL}/api/agent/open`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ target: 'teams', confirmed: true }),
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Opening Teams was blocked. Enable Allow open Teams in AI Settings.');
+            setMessages((prev) => [...prev,
+              { role: 'user', content: rawQuestion },
+              { role: 'assistant', content: 'Opening Microsoft Teams.' },
+            ]);
+          } catch (err) {
+            setError((err as Error).message);
+          }
+        },
+      });
       return;
     }
 
     if (/^call\s+(to\s+)?anurag\s*$/i.test(rawQuestion)) {
       setInput('');
       setError('');
-      if (!window.confirm('Open Microsoft Teams? The agent will not place a call or send a message.')) return;
-      try {
-        const response = await fetch(`${HTTP_URL}/api/agent/open`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ target: 'teams', confirmed: true }),
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Opening Teams was blocked. Enable the Teams permission first.');
-        setMessages((prev) => [...prev,
-          { role: 'user', content: rawQuestion },
-          { role: 'assistant', content: 'Teams is open. I cannot place a call by display name alone. Confirm Anurag\'s Teams contact or click the call button in Teams.' },
-        ]);
-      } catch (err) {
-        setError((err as Error).message);
-      }
+      requestConfirmation({
+        title: 'Open Microsoft Teams?',
+        description: 'Teams will open so you can place the call yourself. The assistant will not call or message anyone automatically.',
+        confirmLabel: 'Open Teams',
+        variant: 'primary',
+        onConfirm: async () => {
+          try {
+            const response = await fetch(`${HTTP_URL}/api/agent/open`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ target: 'teams', confirmed: true }),
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Opening Teams was blocked. Enable the Teams permission first.');
+            setMessages((prev) => [...prev,
+              { role: 'user', content: rawQuestion },
+              { role: 'assistant', content: 'Teams is open. I cannot place a call by display name alone. Confirm Anurag\'s Teams contact or click the call button in Teams.' },
+            ]);
+          } catch (err) {
+            setError((err as Error).message);
+          }
+        },
+      });
       return;
     }
 
@@ -2016,21 +2192,33 @@ function App() {
   };
 
   const stopMeetingCapture = () => {
+    const sttSession = captureSessionIdRef.current;
+    const recorder = recorderRef.current;
+    const stream = streamRef.current;
+    logSttTrace(sttSession || 'none', 'CAPTURE_STOP_REQUESTED', {
+      captureState: captureActiveRef.current ? 'live' : 'inactive',
+      sessionGeneration: sttSession || 'none',
+      recorderState: recorder?.state || 'missing',
+      microphoneTrackCount: stream?.getAudioTracks().length || 0,
+      systemAudioTrackCount: stream?.getAudioTracks().length || 0,
+      stopRequested: true,
+    });
     captureActiveRef.current = false;
+    captureSessionIdRef.current = '';
     pendingPartialQuestionRef.current = '';
     pendingPartialRawTextRef.current = '';
     pendingSegmentQueueRef.current = [];
-    pendingSegmentDurationQueueRef.current = [];
     if (segmentSilenceTimerRef.current) clearInterval(segmentSilenceTimerRef.current);
     segmentSilenceTimerRef.current = null;
     void segmentAudioContextRef.current?.close();
     segmentAudioContextRef.current = null;
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
+    recorderRef.current = null;
+    streamRef.current = null;
+    if (recorder && recorder.state === 'recording') {
+      recorder.stop();
     }
-    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
-      recorderRef.current.stop();
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
     }
     void electronAudioContextRef.current?.close();
     electronAudioContextRef.current = null;
@@ -2039,7 +2227,9 @@ function App() {
     setAudioLevel(0);
     setAudioStatus('disabled');
     setSystemAudioStatus('off');
+    setStatusMessage('');
     setIsRecording(false);
+    setIsTranscribing(false);
     setPipelineStatus('stopped');
     setMicrophoneStatus('off');
   };
@@ -2081,8 +2271,10 @@ function App() {
     return systemStream;
   };
 
-  const requestMicrophoneStream = async (): Promise<MediaStream> => {
+  const requestMicrophoneStream = async (): Promise<{ stream: MediaStream; deviceId: string | null; label: string }> => {
     const sttSession = captureSessionIdRef.current;
+    let captureDeviceId = microphoneDeviceId;
+    let captureDeviceLabel = configuredMicrophoneLabel;
     let permission = 'unknown';
     try {
       permission = (await navigator.permissions.query({ name: 'microphone' as PermissionName })).state;
@@ -2117,16 +2309,24 @@ function App() {
         && ['NotFoundError', 'OverconstrainedError'].includes(errorName),
       );
       if (!selectedDeviceUnavailable) throw error;
-      const availableDevices = (await navigator.mediaDevices.enumerateDevices())
-        .filter((device) => device.kind === 'audioinput' && Boolean(device.deviceId));
-      const fallbackDeviceId = chooseMicrophoneDevice(
-        availableDevices.map((device) => ({ deviceId: device.deviceId, label: device.label })),
-        null,
+      const availableDevices = normalizeMicrophoneDevices(
+        (await navigator.mediaDevices.enumerateDevices())
+          .filter((device) => device.kind === 'audioinput' && Boolean(device.deviceId))
+          .map((device) => ({
+            deviceId: device.deviceId,
+            label: device.label,
+            groupId: device.groupId,
+          })),
       );
+      const fallbackDeviceId = chooseMicrophoneDevice(availableDevices, null);
       if (!fallbackDeviceId || fallbackDeviceId === microphoneDeviceId) throw error;
       setInterviewConfig((current) => ({ ...current, microphoneDeviceId: fallbackDeviceId }));
       setMicrophoneDevices(availableDevices);
       setMicrophoneUnavailable(false);
+      captureDeviceId = fallbackDeviceId;
+      captureDeviceLabel = microphoneDisplayLabel(
+        availableDevices.find((device) => device.deviceId === fallbackDeviceId) || null,
+      );
       setStatusMessage('The saved microphone is unavailable. Using the available default microphone.');
       stream = await navigator.mediaDevices.getUserMedia({
         audio: { ...audioConstraints, deviceId: { exact: fallbackDeviceId } },
@@ -2144,6 +2344,9 @@ function App() {
         audioTrackState: track?.readyState || 'missing',
         enabled: track?.enabled ?? false,
         muted: track?.muted ?? false,
+        selectedDeviceConfigured: Boolean(captureDeviceId),
+        selectedDevicePresent: captureDeviceLabel !== 'Microphone unavailable',
+        captureState: live ? 'live' : 'missing',
         deviceIdPresent: Boolean(settings.deviceId),
         sampleRate: settings.sampleRate || null,
         channelCount: settings.channelCount || null,
@@ -2153,7 +2356,7 @@ function App() {
         throw new Error('Microphone stream was created without a live audio track.');
       }
       setMicrophoneStatus('connected');
-      return stream;
+      return { stream, deviceId: captureDeviceId, label: captureDeviceLabel };
     } catch (error) {
       const classification = classifySttClientError(error) === 'STT_UNKNOWN'
         ? 'AUDIO_PERMISSION'
@@ -2176,7 +2379,8 @@ function App() {
   }> => {
     const microphoneAudio = meetingAudioMode !== 'system';
     const systemAudioRequested = meetingAudioMode !== 'microphone';
-    const microphoneStream = microphoneAudio ? await requestMicrophoneStream() : null;
+    const microphoneCapture = microphoneAudio ? await requestMicrophoneStream() : null;
+    const microphoneStream = microphoneCapture?.stream || null;
     let systemStream: MediaStream | null = null;
     let systemAudio = false;
     if (systemAudioRequested) {
@@ -2203,9 +2407,7 @@ function App() {
     setMicrophoneStatus(microphoneStream ? 'connected' : 'off');
     setSystemAudioStatus(systemAudio ? 'connected' : 'off');
     if (sourceStreams.length === 1) {
-      const sourceLabel = sourceStreams[0].getAudioTracks()[0]?.label
-        || (systemAudio ? 'System Audio' : 'Microphone');
-      setAudioSourceLabel(sourceLabel);
+      setAudioSourceLabel(systemAudio ? 'System Audio' : microphoneCapture?.label || configuredMicrophoneLabel);
       setAudioStatus('connected');
       monitorSystemAudio(sourceStreams[0]);
       return {
@@ -2220,9 +2422,7 @@ function App() {
     await mixContext.resume().catch(() => undefined);
     const destination = mixContext.createMediaStreamDestination();
     sourceStreams.forEach((source) => mixContext.createMediaStreamSource(source).connect(destination));
-    const microphoneLabel = microphoneStream?.getAudioTracks()[0]?.label || 'Microphone';
-    const systemLabel = systemStream?.getAudioTracks()[0]?.label || 'System Audio';
-    setAudioSourceLabel(`${microphoneLabel} + ${systemLabel}`);
+    setAudioSourceLabel(`${microphoneCapture?.label || configuredMicrophoneLabel} + System Audio`);
     setAudioStatus('connected');
     monitorSystemAudio(destination.stream);
     return {
@@ -2249,10 +2449,14 @@ function App() {
       : new MediaRecorder(stream);
     const sttSession = captureSessionIdRef.current;
     const chunks: Blob[] = [];
+    const isCurrentSession = () => captureActiveRef.current
+      && captureSessionIdRef.current === sttSession
+      && recorderRef.current === recorder;
     recorder.ondataavailable = (event) => {
       if (event.data.size > 0) chunks.push(event.data);
     };
     const processSegment = async (segment: Blob, segmentDurationMs: number) => {
+      if (captureSessionIdRef.current !== sttSession) return;
       const segmentId = crypto.randomUUID();
       setIsTranscribing(true);
       setPipelineStatus('transcribing');
@@ -2298,30 +2502,46 @@ function App() {
           });
           throw Object.assign(new Error(data.error || (data as { detail?: string }).detail || `Transcription failed with HTTP ${response.status}.`), { classification });
         }
+        if (captureSessionIdRef.current !== sttSession) {
+          logSttTrace(sttSession, 'STALE_STT_CALLBACK_IGNORED', {
+            segmentId,
+            stopRequested: true,
+          });
+          return;
+        }
         const rawTranscript = String(data.text || '');
-        const transcript = cleanTranscript(rawTranscript);
+        const transcriptNormalizationContext = {
+          supportedTerms: [...background, ...(domain ? [domain] : [])],
+        };
+        const normalizedTranscript = cleanTranscript(rawTranscript, transcriptNormalizationContext);
         logSttTrace(sttSession, 'STT_RESPONSE_RECEIVED', {
           segmentId,
           status: response.status,
           durationMs: Math.round(performance.now() - requestStartedAt),
           rawTranscriptLength: rawTranscript.length,
-          transcriptLength: transcript.length,
+          normalizedTranscriptLength: normalizedTranscript.length,
         });
-        if (!transcript) {
+        if (!normalizedTranscript) {
           throw Object.assign(new Error('No speech detected.'), { classification: 'AUDIO_CAPTURE_NO_SIGNAL' });
         }
         const pendingQuestion = pendingPartialQuestionRef.current;
         const pendingRawText = pendingPartialRawTextRef.current;
         const continuedQuestion = pendingQuestion
-          ? joinQuestionContinuation(pendingQuestion, transcript)
+          ? joinQuestionContinuation(pendingQuestion, normalizedTranscript, transcriptNormalizationContext)
           : null;
-        const candidateText = continuedQuestion || transcript;
+        const candidateText = continuedQuestion || normalizedTranscript;
         const candidateRawText = continuedQuestion && pendingRawText
           ? `${pendingRawText} ${rawTranscript}`.replace(/\s+/g, ' ').trim()
           : rawTranscript;
-        const preparedQuestion = prepareQuestion(candidateText);
+        const preparedQuestion = {
+          ...prepareQuestion(candidateText, transcriptNormalizationContext),
+          rawText: candidateRawText,
+        };
         logSttTrace(sttSession, 'TRANSCRIPT_PROCESSED', {
           segmentId,
+          rawTranscript: candidateRawText,
+          normalizedTranscript: preparedQuestion.normalizedText,
+          finalQuestion: preparedQuestion.acceptedQuestion,
           transcriptLength: preparedQuestion.normalizedText.length,
           questionDetected: Boolean(preparedQuestion.acceptedQuestion),
           qualityClassification: preparedQuestion.qualityClassification,
@@ -2339,7 +2559,7 @@ function App() {
           } else {
             pendingPartialQuestionRef.current = '';
             pendingPartialRawTextRef.current = '';
-            setStatusMessage('');
+            setStatusMessage(inputQualityMessage(preparedQuestion.qualityClassification));
             logSttTrace(sttSession, 'TRANSCRIPT_REJECTED', {
               segmentId,
               transcriptLength: preparedQuestion.normalizedText.length,
@@ -2374,6 +2594,7 @@ function App() {
           id: crypto.randomUUID(),
           source: meetingSource,
           rawText: candidateRawText,
+          normalizedText: preparedQuestion.normalizedText,
           text: acceptedQuestion,
           createdAt: new Date().toISOString(),
         }, ...current]);
@@ -2388,6 +2609,13 @@ function App() {
           duplicateChecked: true,
         });
       } catch (err) {
+        if (captureSessionIdRef.current !== sttSession) {
+          logSttTrace(sttSession, 'STALE_STT_CALLBACK_IGNORED', {
+            segmentId,
+            stopRequested: true,
+          });
+          return;
+        }
         const classification = ((err as { classification?: SttFailureClassification }).classification
           || classifySttClientError(err)) as SttFailureClassification;
         logSttTrace(sttSession, 'STT_PIPELINE_FAILED', {
@@ -2398,7 +2626,7 @@ function App() {
         setPipelineStatus('error');
         setError(sttUserError(classification, err instanceof Error ? err.message : String(err)));
       } finally {
-        setIsTranscribing(false);
+        if (captureSessionIdRef.current === sttSession) setIsTranscribing(false);
       }
     };
 
@@ -2408,40 +2636,37 @@ function App() {
       requestInProgressRef.current = true;
       try {
         while (pendingSegmentQueueRef.current.length > 0) {
+          if (captureSessionIdRef.current !== sttSession) break;
           const nextSegment = pendingSegmentQueueRef.current.shift();
-          if (nextSegment) await processSegment(nextSegment, pendingSegmentDurationQueueRef.current.shift() || 0);
+          if (nextSegment?.sttSession === sttSession) {
+            await processSegment(nextSegment.blob, nextSegment.durationMs);
+          }
         }
       } finally {
         requestInProgressRef.current = false;
         segmentProcessorActiveRef.current = false;
-        if (captureActiveRef.current) setPipelineStatus('listening');
+        if (isCurrentSession()) setPipelineStatus('listening');
+        const nextProcessor = segmentProcessorRef.current;
+        if (nextProcessor && nextProcessor !== processPendingSegments && captureActiveRef.current) {
+          void nextProcessor();
+        }
       }
     };
+    segmentProcessorRef.current = processPendingSegments;
 
     recorder.onstop = () => {
       const segment = chunks.splice(0, chunks.length);
       segmentHeardAudioRef.current = false;
       const segmentDurationMs = Math.max(0, Math.round(performance.now() - (segmentStartedAtRef.current || performance.now())));
       segmentStartedAtRef.current = 0;
-      if (!captureActiveRef.current) {
+      if (!isCurrentSession()) {
         cleanup();
         stream.getTracks().forEach((track) => track.stop());
-        recorderRef.current = null;
-        streamRef.current = null;
-        void electronAudioContextRef.current?.close();
-        electronAudioContextRef.current = null;
-        if (audioLevelTimerRef.current) clearInterval(audioLevelTimerRef.current);
-        audioLevelTimerRef.current = null;
-        setAudioLevel(0);
-        setAudioStatus('disabled');
-        setMicrophoneStatus('off');
-        setPipelineStatus('stopped');
         logSttTrace(sttSession, 'CAPTURE_STOPPED', {
           segmentDurationMs,
           clearedQueuedSegments: pendingSegmentQueueRef.current.length,
+          stale: true,
         });
-        pendingSegmentQueueRef.current = [];
-        pendingSegmentDurationQueueRef.current = [];
         return;
       }
       recorder.start();
@@ -2454,8 +2679,11 @@ function App() {
           segmentBytes: audioSegment.size,
           encoding: audioSegment.type || recorder.mimeType || 'unknown',
         });
-        pendingSegmentQueueRef.current.push(audioSegment);
-        pendingSegmentDurationQueueRef.current.push(segmentDurationMs);
+        pendingSegmentQueueRef.current.push({
+          blob: audioSegment,
+          durationMs: segmentDurationMs,
+          sttSession,
+        });
         void processPendingSegments();
       } else {
         logSttTrace(sttSession, 'SEGMENT_DISCARDED', {
@@ -2501,11 +2729,11 @@ function App() {
   };
 
   const startMeetingCapture = async () => {
+    if (captureActiveRef.current || captureSessionIdRef.current) return;
     setError('');
     pendingPartialQuestionRef.current = '';
     pendingPartialRawTextRef.current = '';
     pendingSegmentQueueRef.current = [];
-    pendingSegmentDurationQueueRef.current = [];
     const sttSession = crypto.randomUUID();
     captureSessionIdRef.current = sttSession;
     const requestedSources = meetingAudioMode === 'microphone'
@@ -2521,6 +2749,17 @@ function App() {
         : 'Requesting microphone and internal system-audio access...');
     try {
       const capture = await requestMeetingAudioStream();
+      if (captureSessionIdRef.current !== sttSession) {
+        capture.cleanup();
+        capture.stream.getTracks().forEach((track) => track.stop());
+        if (!captureSessionIdRef.current) {
+          setAudioStatus('disabled');
+          setSystemAudioStatus('off');
+          setMicrophoneStatus('off');
+          setAudioSourceLabel('Not connected');
+        }
+        return;
+      }
       recordAudioStream(capture.stream, capture.cleanup);
       setStatusMessage(capture.systemAudio
         ? capture.microphoneAudio
@@ -2532,6 +2771,8 @@ function App() {
         audioTracks: capture.stream.getAudioTracks().length,
       });
     } catch (err) {
+      if (captureSessionIdRef.current !== sttSession) return;
+      captureSessionIdRef.current = '';
       setAudioStatus('disabled');
       setSystemAudioStatus('off');
       setMicrophoneStatus('off');
@@ -2602,7 +2843,7 @@ function App() {
     setProviderBaseURL(providerPresets[value].baseURL);
   };
 
-  const refreshConfiguredProviders = useCallback(async () => {
+  const loadConfiguredProviders = useCallback(async () => {
     const response = await fetch(`${HTTP_URL}/api/settings/providers`);
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Could not load providers.');
@@ -2659,10 +2900,21 @@ function App() {
     }
   }, []);
 
-  useEffect(() => {
-    void refreshConfiguredProviders().catch((err) => {
+  const refreshConfiguredProviders = useCallback(async () => {
+    setProviderRefreshing(true);
+    setError('');
+    try {
+      await loadConfiguredProviders();
+    } catch (err) {
       setError(`Could not load providers: ${(err as Error).message}`);
-    });
+      throw err;
+    } finally {
+      setProviderRefreshing(false);
+    }
+  }, [loadConfiguredProviders]);
+
+  useEffect(() => {
+    void refreshConfiguredProviders().catch(() => undefined);
   }, [refreshConfiguredProviders, settingsOpen]);
 
   const saveConfiguredProvider = async () => {
@@ -2721,19 +2973,25 @@ function App() {
     }
   };
 
-  const deleteConfiguredProvider = async (provider: ConfiguredProvider) => {
-    if (!window.confirm(`Remove provider "${provider.label}"?`)) return;
-    try {
-      const response = await fetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Could not remove provider.');
-      const secrets = readPersistedProviderSecrets();
-      delete secrets[provider.adapterType];
-      writePersistedProviderSettings(providerId, data.providers || [], secrets);
-      setConfiguredProviders(data.providers || []);
-    } catch (err) {
-      setError((err as Error).message);
-    }
+  const deleteConfiguredProvider = (provider: ConfiguredProvider) => {
+    requestConfirmation({
+      title: 'Remove provider?',
+      description: `Remove "${provider.label}" from the runtime provider list?`,
+      confirmLabel: 'Remove provider',
+      onConfirm: async () => {
+        try {
+          const response = await fetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Could not remove provider.');
+          const secrets = readPersistedProviderSecrets();
+          delete secrets[provider.adapterType];
+          writePersistedProviderSettings(providerId, data.providers || [], secrets);
+          setConfiguredProviders(data.providers || []);
+        } catch (err) {
+          setError((err as Error).message);
+        }
+      },
+    });
   };
 
   const moveConfiguredProvider = async (provider: ConfiguredProvider, direction: -1 | 1) => {
@@ -2806,6 +3064,7 @@ function App() {
   };
 
   const saveAgentPermissions = async (nextPermissions = agentPermissions) => {
+    const previousPermissions = agentPermissions;
     setAgentPermissions(nextPermissions);
     setAgentSaving(true);
     try {
@@ -2817,13 +3076,14 @@ function App() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Permission update failed');
     } catch (err) {
+      setAgentPermissions(previousPermissions);
       setError((err as Error).message);
     } finally {
       setAgentSaving(false);
     }
   };
 
-  const loadAgentActivity = async () => {
+  const loadAgentActivity = useCallback(async () => {
     try {
       const response = await fetch(`${HTTP_URL}/api/agent/activity`);
       const data = await response.json();
@@ -2831,28 +3091,52 @@ function App() {
     } catch {
       // The log is optional; action controls remain available if it is offline.
     }
-  };
+  }, []);
+
+  const openConfiguration = useCallback(() => {
+    setSettingsOpen(true);
+  }, []);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    void loadAgentActivity();
+  }, [loadAgentActivity, settingsOpen]);
 
   const enableAllAgentPermissions = () => {
-    if (!window.confirm('Enable every allowed app and browser action? Each action will still require confirmation before it runs.')) return;
-    void saveAgentPermissions(allAgentPermissions);
+    requestConfirmation({
+      title: 'Enable all allowed controls?',
+      description: 'This enables every allow-listed desktop and browser control. Each external action will still require a separate confirmation.',
+      confirmLabel: 'Enable controls',
+      variant: 'primary',
+      onConfirm: () => saveAgentPermissions(allAgentPermissions),
+    });
   };
 
-  const runAgentAction = async (target: string) => {
+  const runAgentAction = (target: string) => {
     const label = agentPermissionOptions.find(([, , optionTarget]) => optionTarget === target)?.[1] || target;
-    if (!window.confirm(`Open ${label}?`)) return;
-    try {
-      const response = await fetch(`${HTTP_URL}/api/agent/open`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ target, url: agentUrl, confirmed: true }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Action blocked');
-      await loadAgentActivity();
-    } catch (err) {
-      setError((err as Error).message);
-    }
+    requestConfirmation({
+      title: `Open ${label}?`,
+      description: 'The desktop agent will open the selected application or URL. No message, call, purchase, or destructive action will be performed.',
+      confirmLabel: 'Open',
+      variant: 'primary',
+      onConfirm: async () => {
+        setAgentActionTarget(target);
+        try {
+          const response = await fetch(`${HTTP_URL}/api/agent/open`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ target, url: agentUrl, confirmed: true }),
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Action blocked');
+          await loadAgentActivity();
+        } catch (err) {
+          setError((err as Error).message);
+        } finally {
+          setAgentActionTarget(null);
+        }
+      },
+    });
   };
 
   const startGeneralTask = async () => {
@@ -2979,11 +3263,7 @@ function App() {
 
   // --- PDF upload ---
   const removePdf = () => {
-    setPdfText('');
-    setPdfName('');
-    setSessionDocuments([]);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-    setStatusMessage('Session document cleared.');
+    requestRemoveResume();
   };
 
   const copyText = async (text: string, item: string) => {
@@ -3017,9 +3297,18 @@ function App() {
     setHistoryOpen(false);
   };
 
-  const clearChat = () => {
-    startNewChat();
-  };
+  const requestClearChat = useCallback(() => {
+    if (!messages.length) {
+      startNewChat();
+      return;
+    }
+    requestConfirmation({
+      title: 'Clear chat?',
+      description: 'This removes the current conversation from the visible chat and starts a new chat. Saved history is not deleted.',
+      confirmLabel: 'Clear chat',
+      onConfirm: startNewChat,
+    });
+  }, [messages.length, requestConfirmation]);
 
   const sessionActive = isRecording || isTranscribing || chatStreaming || messages.length > 0 || pipelineStatus === 'question' || pipelineStatus === 'thinking' || pipelineStatus === 'answer';
   const generalTaskActive = Boolean(generalTask && !['COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'BLOCKED', 'FAILED', 'CANCELLED'].includes(generalTask.phase));
@@ -3095,22 +3384,26 @@ function App() {
             >
               Overlay
             </button>
-            {appMode === 'assistant' && sessionActive && <button onClick={() => setMeetingMenuOpen((open) => !open)} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
+            {appMode === 'assistant' && sessionActive && <button type="button" onClick={() => setMeetingMenuOpen((open) => !open)} aria-expanded={meetingMenuOpen} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
             <div className={`${appMode === 'assistant' ? '' : 'hidden'} relative`}>
               <button
-                onClick={() => setContextMenuOpen((open) => !open)}
+                type="button"
+                data-context-toggle
+                onClick={() => (contextMenuOpen ? closeContextMenu() : openContextMenu())}
+                aria-expanded={contextMenuOpen}
+                aria-haspopup="dialog"
                 className={`rounded-lg border px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400 ${contextMenuOpen ? 'border-emerald-400 bg-emerald-500/10' : 'border-slate-700'}`}
               >
                 Context
               </button>
               {contextMenuOpen && (
-                <div className="absolute right-0 top-11 z-20 max-h-[calc(100vh-5rem)] w-[min(23rem,calc(100vw-2rem))] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl">
+                <div ref={contextMenuRef} className="absolute right-0 top-11 z-20 max-h-[calc(100vh-5rem)] w-[min(23rem,calc(100vw-2rem))] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl" role="dialog" aria-modal="false" aria-label="Session context">
                   <div className="mb-3 flex items-start justify-between gap-3">
                     <div>
                       <p className="text-sm font-semibold">Session context</p>
                       <p className="text-xs text-slate-500">Resume and job description context</p>
                     </div>
-                    <button onClick={() => setContextMenuOpen(false)} className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200" aria-label="Close context panel"><X className="h-4 w-4" /></button>
+                    <button type="button" onClick={closeContextMenu} className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200" aria-label="Close context panel"><X className="h-4 w-4" /></button>
                   </div>
                   {mode === 'direct' && (sessionDocuments.length > 0 || activeProfile || domain || background.length > 0) && (
                     <p className="mb-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-200">
@@ -3123,21 +3416,27 @@ function App() {
                     <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
                       <div className="mb-2 flex items-center justify-between">
                         <p className="text-xs font-medium text-slate-200">Resume / document</p>
-                        <button onClick={() => resumeFileInputRef.current?.click()} disabled={pdfLoading} className="rounded-md border border-emerald-500/40 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
+                        <button type="button" onClick={() => resumeFileInputRef.current?.click()} disabled={pdfLoading} className="rounded-md border border-emerald-500/40 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
                           {pdfLoading ? 'Reading...' : 'Upload PDF'}
                         </button>
                       </div>
-                      <p className="text-[11px] text-slate-500">{pdfName || 'No resume uploaded'}</p>
+                      <div className="flex items-center gap-2">
+                        <p className="min-w-0 flex-1 truncate text-[11px] text-slate-500">{pdfName || 'No resume uploaded'}</p>
+                        {pdfName && <button type="button" onClick={requestRemoveResume} disabled={pdfLoading} className="shrink-0 text-[11px] text-rose-300 hover:text-rose-200 disabled:opacity-40">Remove</button>}
+                      </div>
                     </div>
                     <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
                       <div className="mb-2 flex items-center justify-between">
                         <p className="text-xs font-medium text-slate-200">Job Description</p>
-                        <button onClick={() => jobDescriptionFileInputRef.current?.click()} disabled={pdfLoading} className="rounded-md border border-emerald-500/40 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
+                        <button type="button" onClick={() => jobDescriptionFileInputRef.current?.click()} disabled={pdfLoading} className="rounded-md border border-emerald-500/40 px-2 py-1 text-[11px] text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40">
                           Upload PDF
                         </button>
                       </div>
-                      <textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the job description here..." rows={4} className="w-full resize-y rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400" />
-                      <button onClick={saveJobDescription} disabled={!jobDescription.trim()} className="mt-2 rounded-md bg-slate-700 px-2.5 py-1.5 text-[11px] text-slate-200 hover:bg-slate-600 disabled:opacity-40">Add pasted text</button>
+                      <textarea id="job-description" value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the job description here..." rows={4} className="w-full resize-y rounded-md border border-slate-700 bg-slate-900 px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-400" />
+                      <div className="mt-2 flex items-center gap-2">
+                        <button type="button" onClick={saveJobDescription} disabled={!jobDescription.trim()} className="rounded-md bg-slate-700 px-2.5 py-1.5 text-[11px] text-slate-200 hover:bg-slate-600 disabled:opacity-40">Add pasted text</button>
+                        {sessionDocuments.some((document) => document.name.startsWith('Job Description:')) && <button type="button" onClick={requestRemoveJobDescription} disabled={pdfLoading} className="text-[11px] text-rose-300 hover:text-rose-200 disabled:opacity-40">Remove</button>}
+                      </div>
                     </div>
                     <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3">
                       <label htmlFor="interview-domain" className="block text-xs font-medium text-slate-200">Domain</label>
@@ -3243,7 +3542,7 @@ function App() {
                         ) : (
                           microphoneDevices.map((device) => (
                             <option key={device.deviceId} value={device.deviceId}>
-                              {microphoneDisplayLabel({ deviceId: device.deviceId, label: device.label })}
+                              {microphoneDisplayLabel(device)}
                             </option>
                           ))
                         )}
@@ -3265,21 +3564,21 @@ function App() {
                         <option value="none">None (Normal)</option>
                         {trainedProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
                       </select>
-                      <button onClick={trainProfile} disabled={pdfLoading || sessionDocuments.length === 0} className="rounded-md bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400 disabled:opacity-40">Train</button>
+                      <button type="button" onClick={trainProfile} disabled={pdfLoading || profileTraining || sessionDocuments.length === 0} className="rounded-md bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400 disabled:opacity-40">{profileTraining ? 'Training...' : 'Train'}</button>
                     </div>
                     {activeProfile && (
                       <div className="flex items-center justify-between rounded-md border border-slate-700 bg-slate-800/60 px-2.5 py-2">
                         <span className="truncate text-[11px] text-slate-300">Active: {activeProfile.name}</span>
-                        <button onClick={() => deleteProfile(activeProfile.id)} className="ml-2 shrink-0 text-[11px] text-rose-300 hover:text-rose-200">Delete profile</button>
+                        <button type="button" onClick={() => deleteProfile(activeProfile.id)} className="ml-2 shrink-0 text-[11px] text-rose-300 hover:text-rose-200">Delete profile</button>
                       </div>
                     )}
-                    {(sessionDocuments.length > 0 || activeProfile) && <button onClick={clearSessionContext} className="text-[11px] text-slate-400 hover:text-slate-200">Clear session upload</button>}
+                    {(sessionDocuments.length > 0 || activeProfile) && <button type="button" onClick={requestClearSessionContext} className="text-[11px] text-slate-400 hover:text-slate-200">Clear session upload</button>}
                   </div>
                 </div>
               )}
             </div>
-            <button onClick={() => { setSettingsOpen(true); void loadAgentActivity(); }} className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="Settings"><Settings className="h-4 w-4" /></button>
-            <button onClick={() => setHistoryOpen(true)} className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="History"><History className="h-4 w-4" /></button>
+            <button type="button" onClick={openConfiguration} aria-label="Configuration" className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="Configuration"><Settings className="h-4 w-4" /></button>
+            <button type="button" onClick={() => setHistoryOpen(true)} aria-label="Open chat history" className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="History"><History className="h-4 w-4" /></button>
           </div>
         </div>
       </header>
@@ -3319,7 +3618,7 @@ function App() {
                     </div>
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-slate-400">Input device</span>
-                      <span className="max-w-[11rem] truncate text-right text-slate-200">{audioSourceLabel}</span>
+                      <span className="max-w-[11rem] truncate text-right text-slate-200">{displayedAudioSourceLabel}</span>
                     </div>
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-slate-400">Microphone</span>
@@ -3342,11 +3641,11 @@ function App() {
                   <div className="mt-3 flex gap-2">
                     {!isRecording && !isTranscribing ? (
                       <>
-                        <button onClick={() => void testSystemAudio()} className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/10"><MonitorUp className="h-3.5 w-3.5" /> Test Audio</button>
-                        <button onClick={() => void startMeetingCapture()} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-xs font-medium text-white hover:bg-blue-400"><MonitorUp className="h-3.5 w-3.5" /> Start Listening</button>
+                        <button type="button" onClick={() => void testSystemAudio()} className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/10"><MonitorUp className="h-3.5 w-3.5" /> Test Audio</button>
+                        <button type="button" onClick={() => void startMeetingCapture()} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-xs font-medium text-white hover:bg-blue-400"><MonitorUp className="h-3.5 w-3.5" /> Start Listening</button>
                       </>
                     ) : (
-                      <button onClick={stopMeetingCapture} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-slate-700 px-3 py-2 text-xs font-medium text-white hover:bg-slate-600"><Square className="h-3 w-3" /> Stop Listening</button>
+                      <button type="button" onClick={stopMeetingCapture} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-slate-700 px-3 py-2 text-xs font-medium text-white hover:bg-slate-600"><Square className="h-3 w-3" /> Stop Listening</button>
                     )}
                     {liveTranscript && <button onClick={saveMeetingTranscript} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:bg-emerald-500/10">Save</button>}
                   </div>
@@ -3410,9 +3709,11 @@ function App() {
               </button>
             </div>
             <button
-              onClick={() => { setSettingsOpen(true); void loadAgentActivity(); }}
+              type="button"
+              onClick={openConfiguration}
+              aria-label="Configuration"
               className="rounded-lg border border-slate-700 bg-slate-800 p-2 text-slate-300 hover:border-emerald-400 hover:text-emerald-300"
-              title="AI provider settings"
+              title="Configuration"
             >
               <Settings className="h-4 w-4" />
             </button>
@@ -3446,19 +3747,34 @@ function App() {
         description="Give this selected session context a reusable name. Cancel keeps the existing context unchanged."
         label="Profile name"
         initialValue={profileNameDraft}
+        confirmLabel="Train profile"
         onCancel={() => {
+          if (profileTraining) return;
           setProfileDialogOpen(false);
           setProfileNameDraft('');
         }}
         onConfirm={completeProfileTraining}
       />
 
+      <ConfirmationDialog
+        open={Boolean(confirmation)}
+        title={confirmation?.title || ''}
+        description={confirmation?.description || ''}
+        confirmLabel={confirmation?.confirmLabel}
+        variant={confirmation?.variant}
+        onCancel={closeConfirmation}
+        onConfirm={async () => {
+          await confirmation?.onConfirm();
+          setConfirmation(null);
+        }}
+      />
+
       {historyOpen && (
-        <div className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-slate-950/70 px-3 py-4 backdrop-blur-sm sm:px-4 sm:py-8" onMouseDown={() => setHistoryOpen(false)}>
+        <div className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-slate-950/70 px-3 py-4 backdrop-blur-sm sm:px-4 sm:py-8" role="presentation" onMouseDown={() => setHistoryOpen(false)}>
           <div className="my-auto w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl sm:p-5" role="dialog" aria-modal="true" aria-label="Chat history" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="mb-4 flex items-center justify-between"><div><h2 className="text-lg font-semibold">Chat history</h2><p className="text-xs text-slate-400">Saved locally on this device</p></div><button onClick={() => setHistoryOpen(false)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white"><X className="h-4 w-4" /></button></div>
-            <div className="mb-3 flex gap-2"><button onClick={startNewChat} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400">New chat</button><button onClick={copyConversation} disabled={!messages.length} className="rounded-lg border border-slate-600 px-3 py-2 text-xs text-slate-200 hover:border-emerald-400 disabled:opacity-40">{copiedItem === 'conversation' ? 'Copied' : 'Copy chat'}</button></div>
-            {chatHistory.length === 0 ? <p className="rounded-lg border border-dashed border-slate-700 p-4 text-center text-xs text-slate-500">Completed conversations appear here.</p> : <div className="max-h-80 space-y-2 overflow-y-auto">{chatHistory.map((session) => <button key={session.id} onClick={() => openHistorySession(session)} className="block w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-left hover:border-emerald-400"><span className="block truncate text-sm text-slate-200">{session.title}</span><span className="mt-1 block text-[11px] text-slate-500">{new Date(session.updatedAt).toLocaleString()}</span></button>)}</div>}
+            <div className="mb-4 flex items-center justify-between"><div><h2 className="text-lg font-semibold">Chat history</h2><p className="text-xs text-slate-400">Saved locally on this device</p></div><button type="button" onClick={() => setHistoryOpen(false)} aria-label="Close chat history" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white"><X className="h-4 w-4" /></button></div>
+            <div className="mb-3 flex gap-2"><button type="button" onClick={requestClearChat} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400">New chat</button><button type="button" onClick={copyConversation} disabled={!messages.length} className="rounded-lg border border-slate-600 px-3 py-2 text-xs text-slate-200 hover:border-emerald-400 disabled:opacity-40">{copiedItem === 'conversation' ? 'Copied' : 'Copy chat'}</button></div>
+            {chatHistory.length === 0 ? <p className="rounded-lg border border-dashed border-slate-700 p-4 text-center text-xs text-slate-500">Completed conversations appear here.</p> : <div className="max-h-80 space-y-2 overflow-y-auto">{chatHistory.map((session) => <button type="button" key={session.id} onClick={() => openHistorySession(session)} className="block w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-left hover:border-emerald-400"><span className="block truncate text-sm text-slate-200">{session.title}</span><span className="mt-1 block text-[11px] text-slate-500">{new Date(session.updatedAt).toLocaleString()}</span></button>)}</div>}
           </div>
         </div>
       )}
@@ -3467,25 +3783,24 @@ function App() {
         <div
           className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-slate-950/70 px-3 py-4 backdrop-blur-sm sm:px-4 sm:py-8"
           role="presentation"
-          onMouseDown={() => setSettingsOpen(false)}
         >
           <div
             className="my-auto max-h-[calc(100vh-2rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl sm:p-5"
             role="dialog"
             aria-modal="true"
-            aria-labelledby="settings-title"
+            aria-labelledby="configuration-title"
             onMouseDown={(event) => event.stopPropagation()}
           >
             <div className="mb-5 flex items-start justify-between">
               <div>
-                <h2 id="settings-title" className="text-lg font-semibold">AI provider settings</h2>
+                <h2 id="configuration-title" className="text-lg font-semibold">Configuration</h2>
                 <p className="mt-1 text-xs text-slate-400">Choose a provider and connect its API key at runtime.</p>
               </div>
-              <button onClick={() => setSettingsOpen(false)} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white"><X className="h-4 w-4" /></button>
+              <button type="button" onClick={() => { if (!providerSaving && !agentSaving) setSettingsOpen(false); }} disabled={providerSaving || agentSaving} aria-label="Close configuration" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"><X className="h-4 w-4" /></button>
             </div>
             <div className="mb-5 grid grid-cols-2 rounded-lg border border-slate-700 bg-slate-800 p-1">
-              <button onClick={() => setSettingsTab('providers')} className={`rounded-md px-3 py-2 text-xs font-medium ${settingsTab === 'providers' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'}`}>AI Providers</button>
-              <button onClick={() => setSettingsTab('permissions')} className={`rounded-md px-3 py-2 text-xs font-medium ${settingsTab === 'permissions' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'}`}>Permissions</button>
+              <button type="button" onClick={() => setSettingsTab('providers')} className={`rounded-md px-3 py-2 text-xs font-medium ${settingsTab === 'providers' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'}`}>AI Providers</button>
+              <button type="button" onClick={() => setSettingsTab('permissions')} className={`rounded-md px-3 py-2 text-xs font-medium ${settingsTab === 'permissions' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'}`}>Permissions</button>
             </div>
             {settingsTab === 'providers' && (
               <>
@@ -3494,6 +3809,7 @@ function App() {
               providerLabel={providerLabel}
               providerEnabled={providerEnabled}
               providerSaving={providerSaving}
+              providerRefreshing={providerRefreshing}
               onRefresh={() => void refreshConfiguredProviders()}
               onMove={(provider, direction) => void moveConfiguredProvider(provider, direction)}
               onToggle={(provider) => void updateConfiguredProviderState(provider, { enabled: !provider.enabled })}
@@ -3505,7 +3821,7 @@ function App() {
             <label className="mb-2 block text-xs font-medium text-slate-300">Provider integrations</label>
             <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
               {Object.entries(providerPresets).map(([id, preset]) => (
-                <button key={id} onClick={() => chooseProvider(id as ProviderId)} className={`rounded-lg border px-2 py-2 text-left text-xs transition-colors ${providerId === id ? 'border-emerald-400 bg-emerald-500/10 text-emerald-300' : 'border-slate-700 bg-slate-800 text-slate-300 hover:border-slate-500'}`}>
+                <button type="button" key={id} onClick={() => chooseProvider(id as ProviderId)} className={`rounded-lg border px-2 py-2 text-left text-xs transition-colors ${providerId === id ? 'border-emerald-400 bg-emerald-500/10 text-emerald-300' : 'border-slate-700 bg-slate-800 text-slate-300 hover:border-slate-500'}`}>
                   {preset.label}
                 </button>
               ))}
@@ -3522,7 +3838,7 @@ function App() {
             </label>
             <div className="flex items-center justify-between gap-3">
               <p className="text-[11px] leading-relaxed text-slate-500">The key is sent to the local server and is not saved in browser storage.</p>
-              <button onClick={saveProviderSettings} disabled={providerSaving} className="flex shrink-0 items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-medium text-slate-950 hover:bg-emerald-400 disabled:opacity-50">{providerSaving && <Loader2 className="h-4 w-4 animate-spin" />} Connect</button>
+              <button type="button" onClick={saveProviderSettings} disabled={providerSaving} className="flex shrink-0 items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-medium text-slate-950 hover:bg-emerald-400 disabled:opacity-50">{providerSaving && <Loader2 className="h-4 w-4 animate-spin" />} Connect</button>
             </div>
               </>
             )}
@@ -3530,13 +3846,13 @@ function App() {
               <div>
                 <p className="text-sm font-medium text-slate-200">Desktop permissions</p>
                 <p className="mb-3 mt-1 text-[11px] text-slate-500">Only allow-listed apps and valid browser URLs can open. Every action requires a local confirmation; delete, password, arbitrary-command, shutdown, and system-change actions are blocked.</p>
-                <button onClick={enableAllAgentPermissions} disabled={agentSaving} className="mb-3 w-full rounded-lg border border-emerald-500/50 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50">Enable all allowed controls</button>
+                <button type="button" onClick={enableAllAgentPermissions} disabled={agentSaving} className="mb-3 w-full rounded-lg border border-emerald-500/50 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50">{agentSaving ? 'Saving controls...' : 'Enable all allowed controls'}</button>
                 <div className="space-y-2">
                   {agentPermissionOptions.map(([permission, label, target]) => (
                     <div key={permission} className="flex items-center justify-between gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2">
                       <span className="text-xs text-slate-200">{label}</span>
                       <div className="flex items-center gap-2">
-                        <button onClick={() => void runAgentAction(target)} disabled={!agentPermissions[permission as keyof typeof agentPermissions]} className="rounded-md border border-slate-600 px-2 py-1 text-[11px] text-slate-300 hover:border-emerald-400 disabled:cursor-not-allowed disabled:opacity-35">Open</button>
+                        <button type="button" onClick={() => runAgentAction(target)} disabled={!agentPermissions[permission as keyof typeof agentPermissions] || agentActionTarget === target || agentSaving} className="rounded-md border border-slate-600 px-2 py-1 text-[11px] text-slate-300 hover:border-emerald-400 disabled:cursor-not-allowed disabled:opacity-35">{agentActionTarget === target ? 'Opening...' : 'Open'}</button>
                         <input type="checkbox" checked={agentPermissions[permission as keyof typeof agentPermissions]} onChange={(event) => void saveAgentPermissions({ ...agentPermissions, [permission]: event.target.checked })} disabled={agentSaving} className="h-4 w-4 accent-emerald-500" />
                       </div>
                     </div>
@@ -3545,7 +3861,7 @@ function App() {
                 <input value={agentUrl} onChange={(event) => setAgentUrl(event.target.value)} placeholder="https://example.com" className="mt-3 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-100 outline-none focus:border-sky-400" />
                 <p className="mt-3 text-[11px] leading-relaxed text-slate-500">For Teams calls or messages, the agent can prepare a draft and open Teams, but it will not call or send without your confirmation.</p>
                 <div className="mt-4 border-t border-slate-800 pt-3">
-                  <div className="mb-2 flex items-center justify-between"><p className="text-xs font-medium text-slate-300">Recent agent activity</p><button onClick={() => void loadAgentActivity()} className="text-[11px] text-emerald-300 hover:text-emerald-200">Refresh</button></div>
+                  <div className="mb-2 flex items-center justify-between"><p className="text-xs font-medium text-slate-300">Recent agent activity</p><button type="button" onClick={() => void loadAgentActivity()} className="text-[11px] text-emerald-300 hover:text-emerald-200">Refresh</button></div>
                   {agentActivity.length === 0 ? <p className="text-[11px] text-slate-500">No actions requested in this server session.</p> : <div className="max-h-28 space-y-1 overflow-y-auto">{agentActivity.slice(0, 10).map((item) => <p key={item.id} className="rounded bg-slate-800 px-2 py-1 text-[11px] text-slate-400">{item.target} · {item.action} · {new Date(item.createdAt).toLocaleTimeString()}</p>)}</div>}
                 </div>
               </div>
@@ -3786,19 +4102,19 @@ function App() {
             <div className="mb-6 text-center"><h2 className="text-2xl font-semibold">Meeting AI Assistant</h2><p className="mt-2 text-sm text-slate-400">Listen to internal system audio and get concise answers.</p></div>
             <div className="space-y-4">
                <label className="block text-xs font-medium uppercase tracking-wide text-slate-400">Audio source<select value={meetingAudioMode} onChange={(event) => setMeetingAudioMode(event.target.value as MeetingAudioMode)} aria-label="Audio source" className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-200"><option value="microphone">Microphone (spoken questions)</option><option value="system">System / Internal Audio (meeting sound)</option><option value="meeting">Microphone + System / Internal Audio</option></select></label>
-              <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-sm"><div className="flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[12rem] truncate text-slate-200">{audioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span className="text-emerald-300">● {audioStatus === 'testing' ? 'Testing' : audioStatus === 'connected' ? 'Connected' : 'Ready'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className={`font-semibold ${microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}`}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">System audio</span><span className={`font-semibold ${systemAudioStatus === 'connected' || systemAudioStatus === 'testing' ? 'text-emerald-300' : 'text-slate-500'}`}>{systemAudioStatus === 'testing' ? 'TESTING' : systemAudioStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-3"><div className="mb-1 flex justify-between text-[11px] text-slate-500"><span>Audio level</span><span>{audioLevel}%</span></div><div className="flex h-2 gap-1">{Array.from({ length: 10 }, (_, index) => <span key={index} className={`flex-1 rounded ${audioLevel >= (index + 1) * 10 ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}</div></div></div>
+              <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-sm"><div className="flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[12rem] truncate text-slate-200">{displayedAudioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span className="text-emerald-300">● {displayedAudioStatus}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className={`font-semibold ${microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}`}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">System audio</span><span className={`font-semibold ${systemAudioStatus === 'connected' || systemAudioStatus === 'testing' ? 'text-emerald-300' : 'text-slate-500'}`}>{systemAudioStatus === 'testing' ? 'TESTING' : systemAudioStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-3"><div className="mb-1 flex justify-between text-[11px] text-slate-500"><span>Audio level</span><span>{audioLevel}%</span></div><div className="flex h-2 gap-1">{Array.from({ length: 10 }, (_, index) => <span key={index} className={`flex-1 rounded ${audioLevel >= (index + 1) * 10 ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}</div></div></div>
               <p className="text-center text-[11px] text-slate-500">Choose microphone, internal system audio, or both. System audio requires the Electron desktop app and a playback source.</p>
-              <div className="flex gap-2"><button onClick={() => void testSystemAudio()} className="flex-1 rounded-lg border border-emerald-500/40 px-3 py-2.5 text-sm text-emerald-300 hover:bg-emerald-500/10">Test Audio</button><button onClick={() => void startMeetingCapture()} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2.5 text-sm font-medium text-slate-950 hover:bg-emerald-400">Start Listening</button></div>
+              <div className="flex gap-2"><button type="button" onClick={() => void testSystemAudio()} className="flex-1 rounded-lg border border-emerald-500/40 px-3 py-2.5 text-sm text-emerald-300 hover:bg-emerald-500/10">Test Audio</button><button type="button" onClick={() => void startMeetingCapture()} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2.5 text-sm font-medium text-slate-950 hover:bg-emerald-400">Start Listening</button></div>
               {error && <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs leading-relaxed text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
             </div>
           </section>
         ) : (
           <section className="flex flex-1 flex-col">
-            {meetingMenuOpen && <div className="mb-4 rounded-xl border border-slate-700 bg-slate-900 p-4 text-xs"><div className="flex justify-between"><span className="text-slate-400">Audio source</span><span>{meetingAudioMode === 'meeting' ? 'Microphone + System / Internal Audio' : 'Microphone'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[14rem] truncate">{audioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className={microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span></div><button onClick={stopMeetingCapture} className="mt-3 rounded-lg border border-slate-600 px-3 py-2 text-slate-300 hover:border-rose-400">Stop Listening</button></div>}
+            {meetingMenuOpen && <div className="mb-4 rounded-xl border border-slate-700 bg-slate-900 p-4 text-xs"><div className="flex justify-between"><span className="text-slate-400">Audio source</span><span>{meetingAudioMode === 'meeting' ? 'Microphone + System / Internal Audio' : meetingAudioMode === 'system' ? 'System / Internal Audio' : 'Microphone'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[14rem] truncate">{displayedAudioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span>{displayedAudioStatus}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className={microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">System audio</span><span className={systemAudioStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}>{systemAudioStatus === 'connected' ? 'ON' : 'OFF'}</span></div>{isRecording || isTranscribing ? <button type="button" onClick={stopMeetingCapture} className="mt-3 rounded-lg border border-slate-600 px-3 py-2 text-slate-300 hover:border-rose-400">Stop Listening</button> : <button type="button" onClick={() => void startMeetingCapture()} className="mt-3 rounded-lg border border-emerald-500/40 px-3 py-2 text-emerald-300 hover:border-emerald-400">Start Listening</button>}</div>}
             <div className="mb-5 text-center"><p className={`text-sm font-medium ${statusTone}`}>● {statusLabel}</p><p className="mt-2 text-xs text-slate-500">{pipelineStatus === 'listening' ? 'Listening for a question' : pipelineStatus === 'thinking' ? 'Generating answer...' : 'Your answer will appear below'}</p></div>
             <div className="mb-4"><p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-slate-500">Last heard</p><p className="truncate text-sm text-slate-300">{liveTranscript || 'Waiting for speech...'}</p></div>
             <AnswerSessionView lastQuestion={lastQuestion} lastAnswer={lastAnswer} isThinking={pipelineStatus === 'thinking'} answeredSegments={answeredSegments} />
-            <div className="mt-4 flex items-center justify-between"><button onClick={() => setTranscriptOpen((open) => !open)} className="text-xs text-emerald-300 hover:text-emerald-200">{transcriptOpen ? 'Hide full transcript' : 'View full transcript'}</button><button onClick={stopMeetingCapture} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-rose-400">Stop Listening</button></div>
+            <div className="mt-4 flex items-center justify-between"><button type="button" onClick={() => setTranscriptOpen((open) => !open)} className="text-xs text-emerald-300 hover:text-emerald-200">{transcriptOpen ? 'Hide full transcript' : 'View full transcript'}</button>{isRecording || isTranscribing ? <button type="button" onClick={stopMeetingCapture} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-rose-400">Stop Listening</button> : <button type="button" onClick={() => void startMeetingCapture()} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:border-emerald-400">Start Listening</button>}</div>
             {transcriptOpen && <div className="mt-3 max-h-48 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">{liveTranscript || 'No transcript captured yet.'}</div>}
             {error && <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
             <div className="mt-5 flex gap-2"><input value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Ask a text question..." className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-emerald-400" /><button onClick={() => void sendMessage()} disabled={!input.trim() || chatStreaming} className="rounded-lg bg-emerald-500 px-4 text-sm font-medium text-slate-950 disabled:opacity-40">Send</button></div>
@@ -3929,7 +4245,7 @@ function App() {
           )}
           {sessionDocuments.length > 0 && (
             <button
-              onClick={clearSessionContext}
+              onClick={requestClearSessionContext}
               className="text-xs text-slate-400 hover:text-slate-200"
             >
               Clear session documents
@@ -4018,7 +4334,7 @@ function App() {
         {/* Input bar */}
         <div className="mt-4 flex gap-2 items-end">
           <button
-            onClick={clearChat}
+            onClick={requestClearChat}
             className="p-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 hover:text-slate-200 transition-colors flex-shrink-0"
             title="Clear chat"
           >

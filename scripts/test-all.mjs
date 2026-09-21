@@ -9,6 +9,7 @@ const scripts = [
   'assistant-smoke-test.mjs',
   'interview-context-test.mjs',
   'context-dialog-test.mjs',
+  'configuration-ui-test.mjs',
   'overlay-static-test.mjs',
   'general-agent-runtime-test.mjs',
   'general-agent-capability-test.mjs',
