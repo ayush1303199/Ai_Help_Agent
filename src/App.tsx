@@ -108,6 +108,19 @@ function generalUserFailureMessage(category?: string | null) {
   return 'The AI provider could not complete this request. I am not claiming the task is complete.';
 }
 
+function chatUserFailureMessage(category?: string | null, providerMessage?: string | null) {
+  if (category === 'RATE_LIMIT') {
+    return 'The AI provider is temporarily rate-limited. Your question was not completed; please retry shortly.';
+  }
+  if (category === 'CONTEXT_TOO_LARGE' || category === 'BLOCKED_CONTEXT_LIMIT') {
+    return 'This question included too much context. The request was not completed.';
+  }
+  if (category === 'NETWORK_ERROR' || category === 'CAPACITY_ERROR') {
+    return 'The AI provider is temporarily unavailable. Your question was not completed.';
+  }
+  return providerMessage || 'The AI provider could not complete this request. I am not claiming the task is complete.';
+}
+
 function generalUserProgressMessage(message?: string | null) {
   if (!message) return 'Working on it now.';
   const normalized = message
@@ -1574,16 +1587,20 @@ function App() {
       liveRequestInFlightRef.current = false;
       setChatStreaming(pendingChatRequestIdsRef.current.size > 0);
       if (chatRequestIdRef.current === msg.requestId) chatRequestIdRef.current = '';
+      const failureClassification = typeof msg.failureClassification === 'string'
+        ? msg.failureClassification
+        : undefined;
+      const userFailureMessage = chatUserFailureMessage(failureClassification, typeof msg.message === 'string' ? msg.message : null);
       setMessages((prev) => {
         const next = [...prev];
         const message = next.find((item) => item.role === 'assistant' && item.requestId === msg.requestId);
         if (message && message.streaming) {
-          message.content = `Error: ${msg.message}`;
+          message.content = `Error: ${userFailureMessage}`;
           message.streaming = false;
         }
         return [...next];
       });
-      setError(msg.message);
+      setError(userFailureMessage);
       setPipelineStatus('error');
     }
   }, [developerProjectRoot, flushDeveloperStreamBuffer, flushStreamBuffer, voiceReplies]);
