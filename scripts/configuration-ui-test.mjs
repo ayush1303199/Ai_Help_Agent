@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
 const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const headerActionsSource = await fs.readFile(new URL('../src/ui/header/HeaderActions.tsx', import.meta.url), 'utf8');
 
 assert.match(appSource, /const openConfiguration = useCallback\(\(\) => \{\s*setSettingsOpen\(true\);\s*\}, \[\]\);/);
 assert.match(appSource, /onClick=\{openConfiguration\}/);
@@ -10,7 +11,10 @@ assert.doesNotMatch(
   /onClick=\{\(\) => \{\s*setSettingsOpen\(true\);\s*void loadAgentActivity\(\);\s*\}\}/,
 );
 
-const configurationButtons = [...appSource.matchAll(/<button(?=[^>]*aria-label="Configuration")[^>]*>[\s\S]*?<\/button>/g)];
+const configurationButtons = [
+  ...appSource.matchAll(/<button(?=[^>]*aria-label="Configuration")[^>]*>[\s\S]*?<\/button>/g),
+  ...headerActionsSource.matchAll(/<button(?=[^>]*aria-label=\{label\})[^>]*>[\s\S]*?<\/button>/g),
+];
 assert.equal(configurationButtons.length, 2, 'both visible header variants must expose Configuration');
 for (const match of configurationButtons) {
   assert.match(match[0], /type="button"/);

@@ -23,7 +23,9 @@ export const runtimeConfig = {
     pdfUploadTimeoutMs: Number(importMetaEnv.VITE_PDF_UPLOAD_TIMEOUT_MS) || 20000,
   },
   audio: {
-    systemSilenceMs: Number(importMetaEnv.VITE_SYSTEM_AUDIO_SILENCE_MS) || 1000,
+    systemSilenceMs: Number(importMetaEnv.VITE_SYSTEM_AUDIO_SILENCE_MS) || 2000,
     systemLevelThreshold: Number(importMetaEnv.VITE_SYSTEM_AUDIO_LEVEL_THRESHOLD) || 2,
+    continuationTimeoutMs: Number(importMetaEnv.VITE_AUDIO_CONTINUATION_TIMEOUT_MS) || 3000,
+    continuationMaxChars: Number(importMetaEnv.VITE_AUDIO_CONTINUATION_MAX_CHARS) || 240,
   },
 } as const;

@@ -136,6 +136,7 @@ const requirementCases = [
   ['resolves next weekday', 'Travel next Friday.', { travelDate: '2026-11-06' }],
   ['extracts top count', 'Find the top 5 buses.', { resultCount: 5 }],
   ['extracts numeric best count', 'Find 5 best buses.', { resultCount: 5 }],
+  ['extracts word count for courses', 'Find three free AI/ML courses.', { resultCount: 3 }],
   ['extracts options count', 'Find options for 4 options.', { resultCount: 4 }],
   ['extracts best value ranking', 'Find the cheapest reasonable bus.', { optimization: 'BEST_VALUE', 'preferences.ranking': 'BEST_VALUE' }],
   ['extracts best rated ranking', 'Find the best rated bus.', { optimization: 'BEST_RATED', 'preferences.ranking': 'BEST_RATED' }],

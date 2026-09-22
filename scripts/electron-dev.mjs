@@ -3,6 +3,7 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { portOpen } from './launcher-preflight.mjs';
 
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
@@ -124,8 +125,22 @@ process.once('SIGINT', () => void shutdown(0));
 process.once('SIGTERM', () => void shutdown(0));
 
 try {
-  start(npmCommand, ['run', 'server:dev']);
-  start(viteCommand, ['--port', '5174', '--strictPort']);
+  const backendAlreadyRunning = await portOpen(3001);
+  const websocketAlreadyRunning = await portOpen(3002);
+  const frontendAlreadyRunning = await portOpen(5174);
+
+  if (!backendAlreadyRunning || !websocketAlreadyRunning) {
+    start(npmCommand, ['run', 'server:dev']);
+  } else {
+    console.log('[DEV] Reusing the existing backend on ports 3001 and 3002.');
+  }
+
+  if (!frontendAlreadyRunning) {
+    start(viteCommand, ['--port', '5174', '--strictPort']);
+  } else {
+    console.log('[DEV] Reusing the existing Vite frontend on port 5174.');
+  }
+
   await Promise.all([
     waitForTcp(5174),
     waitForHttp('http://localhost:3001/api/health'),

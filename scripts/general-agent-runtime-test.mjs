@@ -172,11 +172,24 @@ const rateLimitedResponse = agent.recordModelResponse(datedTask.taskId, ownerA, 
   error: 'Provider temporarily rate-limited.',
   requestId: 'runtime-rate-limit-test',
 });
-assert.equal(rateLimitedResponse.phase, 'FAILED');
-assert.equal(rateLimitedResponse.finalStatus, 'FAILED');
-assert.equal(rateLimitedResponse.planningStatus, 'FAILED');
+assert.equal(rateLimitedResponse.phase, 'WAITING_FOR_PROVIDER');
+assert.equal(rateLimitedResponse.finalStatus, null);
+assert.equal(rateLimitedResponse.planningStatus, 'WAITING_FOR_PROVIDER');
 assert.equal(rateLimitedResponse.assistantResponse.status, 'ERROR');
 assert.equal(rateLimitedResponse.providerError.category, 'RATE_LIMIT');
+assert.equal(rateLimitedResponse.providerError.retryable, true);
+const partialResponse = agent.recordModelResponse(datedTask.taskId, ownerA, {
+  status: 'PARTIAL',
+  category: 'RATE_LIMIT',
+  failureClassification: 'RATE_LIMIT',
+  content: 'Observed course evidence is preserved.',
+  error: 'Provider synthesis is temporarily unavailable.',
+  requestId: 'runtime-partial-test',
+});
+assert.equal(partialResponse.phase, 'COMPLETED_WITH_LIMITATIONS');
+assert.equal(partialResponse.finalStatus, 'COMPLETED_WITH_LIMITATIONS');
+assert.equal(partialResponse.assistantResponse.status, 'PARTIAL');
+assert.equal(partialResponse.assistantResponse.source, 'BROWSER_EVIDENCE_FALLBACK');
 
 const contextTask = agent.createTask(ownerB, { goal: 'Find cheap pizza without delivery.' });
 agent.startTask(contextTask.taskId, ownerB);

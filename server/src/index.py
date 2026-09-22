@@ -3,15 +3,12 @@ import hashlib
 import json
 import math
 import os
-import uuid
 import threading
 import time
-import webbrowser
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from datetime import datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Request
@@ -23,52 +20,28 @@ import httpx
 
 from provider_registry import ProviderRegistry, ProviderStatus, RegistryState
 from provider_presets import PROVIDER_PRESETS
+from backend_config import (
+    APP_ROOT, CONFIG_PATH, GENERAL_CONTEXT_CHAR_BUDGET, GENERAL_CONTEXT_MESSAGE_CHARS,
+    MAX_MODEL_INPUT_CHARS, MAX_MODEL_MESSAGE_CHARS, MAX_MODEL_SYSTEM_CHARS, MAX_PDF_MB,
+    MAX_TOKENS, PORT, PROVIDER_RETRY_ATTEMPTS, PROVIDER_RETRY_MAX_SECONDS,
+    STT_TRANSCRIPTION_PROMPT, WS_PORT,
+)
+from provider_service import (
+    get_active_provider_with_api_key as resolve_active_provider,
+    get_api_key as resolve_api_key,
+    get_stt_provider as resolve_stt_provider,
+    provider_operation_capabilities,
+)
+from agent_control_service import AgentControlService
+from stt_service import SttService
 
 load_dotenv()
-
-APP_ROOT = Path(__file__).resolve().parent.parent
-PORT = int(os.getenv("PORT", "3001"))
-WS_PORT = int(os.getenv("WS_PORT", "3002"))
-MAX_PDF_MB = int(os.getenv("MAX_PDF_MB", "10"))
-MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "384"))
-PROVIDER_RETRY_ATTEMPTS = 1
-PROVIDER_RETRY_MAX_SECONDS = 4.0
-MAX_MODEL_INPUT_CHARS = int(os.getenv("AI_MAX_INPUT_CHARS", "14000"))
-MAX_MODEL_MESSAGE_CHARS = int(os.getenv("AI_MAX_MESSAGE_CHARS", "1800"))
-MAX_MODEL_SYSTEM_CHARS = int(os.getenv("AI_MAX_SYSTEM_CHARS", "13000"))
-GENERAL_CONTEXT_CHAR_BUDGET = int(os.getenv("AI_GENERAL_CONTEXT_CHARS", "18000"))
-GENERAL_CONTEXT_MESSAGE_CHARS = int(os.getenv("AI_GENERAL_MESSAGE_CHARS", "2200"))
-CONFIG_PATH = Path(os.getenv("AI_PROVIDER_CONFIG_PATH", Path.home() / ".ai-help-agent" / "provider-config.json"))
-STT_TRANSCRIPTION_PROMPT = os.getenv(
-    "TRANSCRIPTION_PROMPT",
-    (
-        "Transcribe only the words spoken in the audio. Do not paraphrase, complete, "
-        "or convert a request into a self-answer. Preserve clearly spoken technical "
-        "product names exactly. Technical vocabulary: Spring Boot, Spring Security, "
-        "dependency injection, Hibernate, JPA, Java, JavaScript, TypeScript, React, "
-        "React.js, Node.js, Python, FastAPI, OpenAI, Copilot, Groq, API, REST API, "
-        "Microservices, SQL, PostgreSQL, MySQL, Docker, Kubernetes, AWS, Azure, GitHub. "
-        "If a word is uncertain, return the audible wording instead of inventing a correction."
-    ),
-)
 
 # Initialize provider registry
 registry = ProviderRegistry(config_path=str(CONFIG_PATH))
 registry.initialize(os.environ, PROVIDER_PRESETS)
-agent_permissions: Dict[str, bool] = {
-    "openTeams": False,
-    "openBrowser": False,
-    "openCamera": False,
-    "openChrome": False,
-    "openVSCode": False,
-    "openDesktop": False,
-    "openSourceTree": False,
-    "openSqlServer": False,
-    "openNotepad": False,
-    "openSublime": False,
-}
-agent_activity: List[Dict[str, Any]] = []
-MAX_AGENT_ACTIVITY = 100
+agent_control = AgentControlService()
+stt_service: SttService
 
 
 app = FastAPI(title="AI Assistant Backend")
@@ -90,42 +63,15 @@ class ProviderSetupRequest(BaseModel):
 
 
 def get_api_key(provider_id: str) -> str:
-    """Retrieve API key from environment variables for a provider."""
-    provider = registry.get_provider(provider_id)
-    if not provider:
-        return ""
-
-    runtime_value = registry.get_api_key(provider_id)
-    if runtime_value:
-        return runtime_value
-
-    env_key = f"{provider.type.upper()}_API_KEY"
-    env_value = os.getenv(env_key, "").strip()
-    if env_value:
-        return env_value
-
-    # Backward-compatible fallback: look for a persisted provider secret under the
-    # same adapter type in the local config file if this provider was saved earlier.
-    try:
-        config_data = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
-    except Exception:
-        config_data = {}
-
-    for entry in config_data.get("providers", []):
-        if str(entry.get("type") or entry.get("adapterType") or "").lower() == provider.type.lower() and str(entry.get("apiKey") or "").strip():
-            return str(entry.get("apiKey") or "").strip()
-
-    return ""
+    return resolve_api_key(registry, CONFIG_PATH, provider_id)
 
 
 def get_active_provider_with_api_key() -> tuple[Optional[Any], str]:
-    """Get active provider and its API key."""
-    provider = registry.get_active_provider()
-    if not provider:
-        return None, ""
-    
-    api_key = get_api_key(provider.id)
-    return provider, api_key
+    return resolve_active_provider(registry, CONFIG_PATH)
+
+
+def get_stt_provider() -> Optional[Any]:
+    return resolve_stt_provider(registry)
 
 
 def call_model(
@@ -237,21 +183,64 @@ def compact_general_context(
         item["content"] = content
         normalized.append(item)
 
+    call_names: Dict[str, str] = {}
+    for item in normalized:
+        for call in item.get("tool_calls") or []:
+            function = call.get("function") or {}
+            call_id = str(call.get("id") or "")
+            name = str(function.get("name") or "")
+            if call_id and name:
+                call_names[call_id] = name
+    for item in normalized:
+        if item.get("role") == "tool" and not item.get("name"):
+            name = call_names.get(str(item.get("tool_call_id") or ""))
+            if name:
+                item["name"] = name
+
     tool_chars = len(json.dumps(tools or [], ensure_ascii=False, separators=(",", ":")))
     message_budget = max(2400, GENERAL_CONTEXT_CHAR_BUDGET - tool_chars)
     system_messages = normalized[:1] if normalized and normalized[0].get("role") == "system" else []
     remaining = normalized[len(system_messages):]
     kept: List[Dict[str, Any]] = []
+    kept_ids: set[int] = set()
     used = sum(len(_message_content_text(item.get("content"))) for item in system_messages)
-    for item in reversed(remaining):
-        item_size = len(_message_content_text(item.get("content"))) + len(
-            json.dumps(item.get("tool_calls") or [], ensure_ascii=False, separators=(",", ":"))
+    kept_indexes: set[int] = set()
+    for index in range(len(remaining) - 1, -1, -1):
+        item = remaining[index]
+        related = [item]
+        related_indexes = [index]
+        if item.get("role") == "tool":
+            call_id = str(item.get("tool_call_id") or "")
+            if call_id:
+                matching = next(
+                    (
+                        candidate
+                        for candidate in range(index - 1, -1, -1)
+                        if any(
+                            str(call.get("id") or "") == call_id
+                            for call in (remaining[candidate].get("tool_calls") or [])
+                        )
+                    ),
+                    None,
+                )
+                if matching is not None:
+                    related.insert(0, remaining[matching])
+                    related_indexes.insert(0, matching)
+        if any(candidate in kept_indexes for candidate in related_indexes):
+            continue
+        item_size = sum(
+            len(_message_content_text(candidate.get("content")))
+            + len(json.dumps(candidate.get("tool_calls") or [], ensure_ascii=False, separators=(",", ":")))
+            for candidate in related
         )
         if kept and used + item_size > message_budget:
             continue
-        kept.append(item)
+        kept.extend(related)
+        kept_indexes.update(related_indexes)
+        kept_ids.update(id(candidate) for candidate in related)
         used += item_size
-    compacted = system_messages + list(reversed(kept))
+    kept.sort(key=lambda item: normalized.index(item))
+    compacted = system_messages + kept
     metrics = estimate_general_context(compacted, tools)
     metrics.update({
         "originalMessageCount": len(messages),
@@ -391,6 +380,16 @@ def is_tool_compatibility_error(error: Exception) -> bool:
         "tools are not supported",
         "unsupported tool",
     ))
+
+
+def is_invalid_tool_call_error(error: Exception) -> bool:
+    """Identify a model-emitted tool that was not present in the request schema."""
+    detail = str(getattr(error, "detail", "") or error).lower()
+    return (
+        "tool_use_failed" in detail
+        or "tool call validation failed" in detail
+        or "not in request.tools" in detail
+    )
 
 
 def provider_tool_compatibility(
@@ -702,52 +701,6 @@ def require_loopback(request: Request):
         raise HTTPException(status_code=403, detail="Desktop controls are available only from this computer.")
 
 
-def record_agent_activity(target: str) -> None:
-    agent_activity.insert(0, {
-        "id": str(uuid.uuid4()),
-        "target": target,
-        "action": "open-requested",
-        "createdAt": datetime.now().isoformat(),
-    })
-    del agent_activity[MAX_AGENT_ACTIVITY:]
-
-
-def open_local_target(target: str, url: str = "") -> None:
-    """Open one of the explicitly allow-listed local targets."""
-    commands = {
-        "teams": ("openTeams", "msteams:"),
-        "camera": ("openCamera", "microsoft.windows.camera:"),
-        "chrome": ("openChrome", "chrome:"),
-        "vscode": ("openVSCode", "code:"),
-        "desktop": ("openDesktop", str(Path.home() / "Desktop")),
-        "sourcetree": ("openSourceTree", "sourcetree:"),
-        "sqlserver": ("openSqlServer", "ssms:"),
-        "notepad": ("openNotepad", "notepad.exe"),
-        "sublime": ("openSublime", "sublime_text:"),
-    }
-    if target == "browser":
-        if not agent_permissions["openBrowser"]:
-            raise HTTPException(status_code=403, detail="Open browser permission is disabled.")
-        if not isinstance(url, str) or not url or not url.lower().startswith(("http://", "https://")):
-            raise HTTPException(status_code=400, detail="Only http and https URLs are allowed.")
-        webbrowser.open(url, new=0, autoraise=False)
-        record_agent_activity(target)
-        return
-
-    if target not in commands:
-        raise HTTPException(status_code=400, detail="Unsupported safe action.")
-    permission, command = commands[target]
-    if not agent_permissions[permission]:
-        raise HTTPException(status_code=403, detail=f"Permission to open {target} is disabled.")
-
-    if command.endswith(".exe") and os.name == "nt":
-        os.startfile(command)
-    else:
-        os.startfile(command) if hasattr(os, "startfile") else webbrowser.open(command, new=0, autoraise=False)
-    record_agent_activity(target)
-
-
-
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
     """Health check endpoint."""
@@ -760,9 +713,12 @@ def health() -> Dict[str, Any]:
         ProviderStatus.READY,
         ProviderStatus.SELF_TEST_FAILED,
     }
+    # `has_api_key` is persisted metadata and may remain true after the secret
+    # is removed. Runtime readiness must require the actual resolved key.
+    runtime_configured = bool(provider and api_key)
     ready = bool(
         provider
-        and configured
+        and runtime_configured
         and provider.enabled
         and registry.state is RegistryState.READY
         and provider.status in ready_statuses
@@ -772,11 +728,14 @@ def health() -> Dict[str, Any]:
         "status": provider.status.value if provider else ProviderStatus.UNCONFIGURED.value,
         "provider": provider.type if provider else None,
         "model": provider.model if provider else None,
-        "configured": configured,
+        "configured": runtime_configured,
         "ready": ready,
         "registryState": registry.state.value,
         "toolCalling": True,
         "toolCallingVerified": ready,
+        "capabilities": provider_operation_capabilities(provider),
+        "sttProvider": registry.stt_provider_id,
+        "sttReady": bool(get_stt_provider() and get_api_key(get_stt_provider().id)),
         "assistantCapable": configured,
         "developerStatus": provider.status.value if provider else ProviderStatus.UNCONFIGURED.value,
         "wsPort": WS_PORT,
@@ -791,6 +750,7 @@ def list_providers() -> Dict[str, Any]:
         item = provider.to_dict()
         item["apiKey"] = ""
         item["adapterType"] = provider.type
+        item["capabilities"] = provider_operation_capabilities(provider)
         providers.append(item)
     return {
         "providers": providers,
@@ -805,15 +765,19 @@ def provider_capabilities() -> Dict[str, Any]:
     """Get provider capabilities."""
     active = registry.get_active_provider()
     active_data = active.to_dict() if active else {}
+    active_data["capabilities"] = provider_operation_capabilities(active)
     providers = []
     for provider in registry.get_all_providers():
         item = provider.to_dict()
         item["apiKey"] = ""
         item["adapterType"] = provider.type
+        item["capabilities"] = provider_operation_capabilities(provider)
         providers.append(item)
 
     return {
         "active": active_data,
+        "sttProvider": registry.stt_provider_id,
+        "stt": get_stt_provider().to_dict() if get_stt_provider() else None,
         "providers": providers,
         "registryState": registry.state.value,
     }
@@ -875,6 +839,10 @@ def add_or_update_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     if isinstance(payload.get("fallbackEnabled"), bool):
         registry.fallback_enabled = payload["fallbackEnabled"]
+    if isinstance(payload.get("sttProvider"), str):
+        selected = registry.get_provider(payload["sttProvider"])
+        if selected and provider_operation_capabilities(selected)["stt"]:
+            registry.stt_provider_id = selected.id
 
     registry.save_to_file()
 
@@ -890,6 +858,7 @@ def add_or_update_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
         "providers": providers,
         "activeProvider": registry.active_provider_id,
         "fallbackEnabled": registry.fallback_enabled,
+        "sttProvider": registry.stt_provider_id,
         "registryState": registry.state.value,
     }
 
@@ -1078,17 +1047,14 @@ def self_test(payload: Dict[str, Any]) -> Dict[str, Any]:
 def set_agent_permissions(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Set agent permissions. Only from loopback."""
     require_loopback(request)
-    for key in agent_permissions:
-        if key in payload:
-            agent_permissions[key] = bool(payload[key])
-    return {"status": "ok", "permissions": dict(agent_permissions)}
+    return {"status": "ok", "permissions": agent_control.update_permissions(payload)}
 
 
 @app.get("/api/agent/activity")
 def get_agent_activity(request: Request) -> Dict[str, Any]:
     """Get agent activity log. Only from loopback."""
     require_loopback(request)
-    return {"activity": list(agent_activity)}
+    return {"activity": list(agent_control.activity)}
 
 
 @app.post("/api/agent/open")
@@ -1103,7 +1069,7 @@ def open_agent_action(request: Request, payload: Dict[str, Any]) -> Dict[str, An
     if not confirmed:
         raise HTTPException(status_code=400, detail="A local user confirmation is required before opening an app.")
 
-    open_local_target(target, url)
+    agent_control.open_target(target, url)
     return {"status": "ok", "action": f"{target}-open-requested"}
 
 
@@ -1131,133 +1097,12 @@ async def extract_pdf(file: UploadFile = File(...)) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"PDF extraction failed: {str(e)}")
 
 
-def classify_stt_error(error: Exception) -> str:
-    """Classify an STT failure without exposing provider internals."""
-    status = getattr(error, "status_code", None)
-    message = str(error).lower()
-    if status in (401, 403) or any(token in message for token in ("unauthorized", "forbidden", "api key", "authentication")):
-        return "STT_AUTH_ERROR"
-    if status == 429 or "rate limit" in message or "too many requests" in message:
-        return "STT_RATE_LIMIT"
-    if status in (400, 422):
-        return "STT_BAD_REQUEST"
-    if "unsupported" in message or "codec" in message or "mime" in message or "audio format" in message:
-        return "STT_UNSUPPORTED_AUDIO"
-    if isinstance(error, (TimeoutError, httpx.TimeoutException)) or "timeout" in message or "timed out" in message:
-        return "STT_TIMEOUT"
-    if isinstance(error, (ConnectionError, httpx.ConnectError, httpx.NetworkError)) or "connection" in message or "network" in message:
-        return "STT_NETWORK_ERROR"
-    return "STT_UNKNOWN"
-
-
 @app.post("/api/transcribe-audio")
 async def transcribe_audio(
     request: Request,
     file: UploadFile = File(...),
 ) -> Dict[str, Any]:
-    """Transcribe one completed audio segment using the active provider."""
-    stt_session = request.headers.get("x-stt-session-id", str(uuid.uuid4()))
-    segment_id = request.headers.get("x-stt-segment-id", "unknown")
-    if not file.filename:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "No audio recording uploaded.", "classification": "STT_BAD_REQUEST"},
-        )
-
-    started_at = datetime.now().timestamp()
-    try:
-        contents = await file.read()
-        payload_size = len(contents)
-        print(json.dumps({
-            "event": "STT_REQUEST_STARTED",
-            "sttSession": stt_session,
-            "segmentId": segment_id,
-            "payloadBytes": payload_size,
-            "encoding": file.content_type or "unknown",
-        }))
-        if payload_size == 0:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "No audio signal was captured.", "classification": "AUDIO_CAPTURE_NO_SIGNAL"},
-            )
-        if payload_size > MAX_PDF_MB * 1024 * 1024:
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"File exceeds {MAX_PDF_MB}MB limit.", "classification": "STT_BAD_REQUEST"},
-            )
-        provider = registry.get_active_provider()
-        if not provider:
-            return JSONResponse(
-                status_code=502,
-                content={"error": "Speech-to-text provider is not configured.", "classification": "STT_AUTH_ERROR"},
-            )
-
-        api_key = get_api_key(provider.id)
-        if not api_key:
-            return JSONResponse(
-                status_code=502,
-                content={"error": "Speech-to-text provider is not configured.", "classification": "STT_AUTH_ERROR"},
-            )
-
-        client = OpenAI(api_key=api_key, base_url=provider.base_url or None)
-        transcription_model = os.getenv("TRANSCRIPTION_MODEL") or (
-            "whisper-1" if provider.type.lower() == "openai" else "whisper-large-v3-turbo"
-        )
-        from io import BytesIO
-        transcription_options: Dict[str, Any] = {
-            "file": (file.filename, BytesIO(contents), file.content_type or "audio/webm"),
-            "model": transcription_model,
-            "response_format": "text",
-            "prompt": STT_TRANSCRIPTION_PROMPT,
-            "temperature": 0,
-        }
-        transcription_language = os.getenv("TRANSCRIPTION_LANGUAGE", "").strip()
-        if transcription_language:
-            transcription_options["language"] = transcription_language
-
-        for attempt in range(PROVIDER_RETRY_ATTEMPTS + 1):
-            try:
-                transcript = client.audio.transcriptions.create(**transcription_options)
-                break
-            except Exception as error:
-                if attempt >= PROVIDER_RETRY_ATTEMPTS or not is_provider_retryable(error):
-                    raise
-                time.sleep(provider_retry_delay_seconds(error, attempt))
-        text = str(transcript).strip()
-        duration_ms = round((datetime.now().timestamp() - started_at) * 1000)
-        print(json.dumps({
-            "event": "STT_RESPONSE_RECEIVED",
-            "sttSession": stt_session,
-            "segmentId": segment_id,
-            "status": 200,
-            "durationMs": duration_ms,
-            "transcriptLength": len(text),
-            "classification": "STT_SUCCESS",
-        }))
-        return {
-            "text": text,
-            "confidence": None,
-            "isFinal": True,
-            "classification": "STT_SUCCESS",
-        }
-    except Exception as error:
-        classification = classify_stt_error(error)
-        duration_ms = round((datetime.now().timestamp() - started_at) * 1000)
-        print(json.dumps({
-            "event": "STT_RESPONSE_FAILED",
-            "sttSession": stt_session,
-            "segmentId": segment_id,
-            "durationMs": duration_ms,
-            "classification": classification,
-            "errorType": type(error).__name__,
-        }))
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": "Audio transcription failed.",
-                "classification": classification,
-            },
-        )
+    return await stt_service.transcribe(request, file)
 
 
 DEVELOPER_TOOLS = [
@@ -1524,6 +1369,17 @@ def is_provider_retryable(error: Exception) -> bool:
     return isinstance(error, (TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError))
 
 
+stt_service = SttService(
+    get_provider=get_stt_provider,
+    get_api_key=get_api_key,
+    transcription_prompt=STT_TRANSCRIPTION_PROMPT,
+    max_upload_mb=MAX_PDF_MB,
+    retry_attempts=PROVIDER_RETRY_ATTEMPTS,
+    retry_delay=provider_retry_delay_seconds,
+    retryable=is_provider_retryable,
+)
+
+
 def is_context_limit_error(error: Exception) -> bool:
     detail = str(getattr(error, "detail", "") or error).lower()
     status_code = getattr(error, "status_code", None)
@@ -1737,9 +1593,20 @@ def compact_general_tool_result(result: Any) -> str:
     task_memory = task.get("taskMemory") if isinstance(task.get("taskMemory"), dict) else {}
     research = task_memory.get("research") if isinstance(task_memory.get("research"), dict) else {}
     candidates = research.get("candidates") if isinstance(research.get("candidates"), list) else []
+    result_set = task_memory.get("resultSet") if isinstance(task_memory.get("resultSet"), list) else []
+    normalized_candidates = []
+    seen_candidate_keys = set()
+    for candidate in [*candidates, *result_set]:
+        if not isinstance(candidate, dict):
+            continue
+        key = str(candidate.get("url") or candidate.get("title") or candidate.get("name") or "").strip().casefold()
+        if not key or key in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(key)
+        normalized_candidates.append(candidate)
 
     compact_candidates = []
-    for candidate in candidates[:12]:
+    for candidate in normalized_candidates[:12]:
         if not isinstance(candidate, dict):
             continue
         compact_candidates.append({
@@ -1769,7 +1636,10 @@ def compact_general_tool_result(result: Any) -> str:
             "pageState": observation.get("pageState"),
             "errorState": observation.get("errorState"),
             "visibleText": str(observation.get("visibleText") or "")[:2400],
-            "results": observation.get("results", [])[:12] if isinstance(observation.get("results"), list) else [],
+            "results": (
+                (observation.get("results") if isinstance(observation.get("results"), list) else [])
+                + normalized_candidates
+            )[:12],
         },
         "foodResearch": {
             "outcome": research.get("outcome"),
@@ -1777,8 +1647,366 @@ def compact_general_tool_result(result: Any) -> str:
             "candidates": compact_candidates,
             "resultSetSummary": task_memory.get("resultSetSummary"),
         },
+        "resultSetSummary": task_memory.get("resultSetSummary"),
     }
     return json.dumps(compact, ensure_ascii=False)[:7000]
+
+
+def general_evidence_fallback(messages: List[Dict[str, Any]]) -> str:
+    """Return bounded browser evidence when final provider synthesis is unavailable."""
+    observations: List[Dict[str, Any]] = []
+    for item in messages:
+        content = str(item.get("content") or "")
+        if item.get("role") == "tool":
+            try:
+                payload = json.loads(content)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            observation = payload.get("observation") if isinstance(payload, dict) else None
+            if isinstance(observation, dict):
+                observations.append(observation)
+        elif item.get("role") == "system" and "UNTRUSTED_EXTERNAL_CONTENT" in content:
+            lines = content.splitlines()
+            values: Dict[str, str] = {}
+            active_key = ""
+            for line in lines:
+                key, separator, value = line.partition(":")
+                if separator and key in {"URL", "Title", "Visible text"}:
+                    active_key = key
+                    values[key] = value.strip()
+                elif active_key == "Visible text":
+                    values[active_key] = f"{values.get(active_key, '')}\n{line}".strip()
+            if values:
+                observations.append({
+                    "url": values.get("URL", ""),
+                    "title": values.get("Title", ""),
+                    "visibleText": values.get("Visible text", ""),
+                    "results": [],
+                })
+
+    if not observations:
+        return ""
+
+    blocked = any(
+        str(observation.get("pageState") or "").upper() in {"CAPTCHA_REQUIRED", "LOAD_ERROR"}
+        or "sorry" in str(observation.get("url") or "").lower()
+        or "captcha" in str(observation.get("visibleText") or "").lower()
+        or _is_general_search_page(str(observation.get("url") or ""))
+        for observation in observations
+    )
+    lines = [
+        "I could not complete the requested course search.",
+        "The search provider was rate-limited and the browser search page was blocked before course result cards were observed."
+        if blocked
+        else "The AI provider was rate-limited before it could summarize the observed results.",
+    ]
+    seen: set[str] = set()
+    for observation in observations[-3:]:
+        title = str(observation.get("title") or "").strip()
+        url = str(observation.get("url") or "").strip()
+        visible_text = str(observation.get("visibleText") or "").strip()
+        results = observation.get("results") if isinstance(observation.get("results"), list) else []
+        search_page = _is_general_search_page(url)
+        blocked_page = "sorry" in url.lower() or "captcha" in url.lower()
+        if title and not search_page and not blocked_page and title not in seen:
+            lines.append(f"- {title}")
+            seen.add(title)
+        if url and url not in seen and not search_page and not blocked_page:
+            lines.append(f"  Source: {url}")
+            seen.add(url)
+        for result in results[:6]:
+            if not isinstance(result, dict):
+                continue
+            result_title = str(result.get("title") or result.get("name") or "").strip()
+            result_url = str(result.get("url") or "").strip()
+            snippet = str(result.get("snippet") or result.get("description") or "").strip()
+            detail = " — ".join(part for part in (result_title, snippet) if part)
+            if detail and detail not in seen:
+                lines.append(f"- {detail[:500]}")
+                seen.add(detail)
+            if result_url and result_url not in seen:
+                lines.append(f"  Source: {result_url}")
+                seen.add(result_url)
+        if visible_text and not results and not search_page and not blocked_page:
+            lines.append(f"- {visible_text[:700]}")
+
+    return "\n".join(lines)
+
+
+def _is_general_search_page(url: str) -> bool:
+    """Keep search-engine result pages out of user-facing evidence."""
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    host = parsed.netloc.lower().split(":", 1)[0]
+    path = parsed.path.lower().rstrip("/") or "/"
+    if host in {"google.com", "www.google.com"} and path.startswith("/search"):
+        return True
+    if host in {"bing.com", "www.bing.com"} and path.startswith("/search"):
+        return True
+    if host in {"duckduckgo.com", "www.duckduckgo.com", "html.duckduckgo.com"}:
+        return path in {"/", "/html"} and bool(parsed.query)
+    if host in {"search.yahoo.com"} and path.startswith("/search"):
+        return True
+    return False
+
+
+def has_blocked_general_observation(messages: List[Dict[str, Any]]) -> bool:
+    """Detect browser blocks so research can switch sources before finalizing."""
+    for item in messages:
+        if not isinstance(item, dict) or item.get("role") != "tool":
+            continue
+        try:
+            payload = json.loads(str(item.get("content") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        observation = payload.get("observation") if isinstance(payload, dict) else None
+        if not isinstance(observation, dict):
+            continue
+        if str(observation.get("pageState") or "").upper() in {"CAPTCHA_REQUIRED", "LOAD_ERROR"}:
+            return True
+        if "sorry" in str(observation.get("url") or "").lower():
+            return True
+        if "captcha" in str(observation.get("visibleText") or "").lower():
+            return True
+        if _is_general_search_page(str(observation.get("url") or "")):
+            results = observation.get("results")
+            if not isinstance(results, list) or not results:
+                return True
+    return False
+
+
+def requested_general_result_count(messages: List[Dict[str, Any]]) -> Optional[int]:
+    """Read the planner-provided result target without coupling to a domain."""
+    text = "\n".join(
+        str(item.get("content") or "")
+        for item in messages
+        if isinstance(item, dict) and item.get("role") in {"user", "system"}
+    )
+    match = re.search(r"Requested result count:\s*(\d+)", text, re.IGNORECASE)
+    if not match:
+        return None
+    count = int(match.group(1))
+    return count if count > 0 else None
+
+
+def general_search_url(messages: List[Dict[str, Any]], attempt: int) -> Optional[str]:
+    """Build a bounded, generic search URL when the provider stops too early."""
+    goal = next(
+        (
+            str(item.get("content") or "").strip()
+            for item in messages
+            if isinstance(item, dict) and item.get("role") == "user" and str(item.get("content") or "").strip()
+        ),
+        "",
+    )
+    if not goal:
+        return None
+    variants = (
+        goal,
+        f"{goal} free online official course",
+        f"{goal} open courseware no purchase",
+    )
+    query = variants[min(max(attempt, 0), len(variants) - 1)]
+    return f"https://duckduckgo.com/?q={quote_plus(query)}"
+
+
+def _general_research_request(messages: List[Dict[str, Any]]) -> str:
+    return next(
+        (
+            str(item.get("content") or "").strip()
+            for item in messages
+            if isinstance(item, dict) and item.get("role") == "user" and str(item.get("content") or "").strip()
+        ),
+        "",
+    )
+
+
+def _general_research_terms(request: str) -> List[str]:
+    stop_words = {
+        "find", "show", "give", "list", "three", "four", "five", "latest", "current",
+        "official", "reliable", "best", "free", "without", "purchase", "online", "about",
+        "available", "sources", "source", "information", "the", "for", "and", "with", "from",
+        "to", "of", "in", "on", "a", "an", "course", "courses", "class", "classes", "tutorial",
+        "tutorials", "training", "resource", "resources",
+    }
+    terms = [
+        term for term in re.findall(r"[a-z0-9][a-z0-9+#.-]{1,}", request.lower())
+        if term not in stop_words
+    ]
+    if "ai" in terms:
+        terms.extend(["artificial intelligence", "machine learning", "deep learning"])
+    if "ml" in terms:
+        terms.extend(["machine learning", "deep learning"])
+    return list(dict.fromkeys(terms))
+
+
+def general_research_candidates(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Extract distinct, evidence-backed source candidates for a General Agent research request."""
+    request = _general_research_request(messages)
+    terms = _general_research_terms(request)
+    requires_free = bool(re.search(r"\bfree\b|\bwithout (?:a )?purchase\b|\bno cost\b", request, re.IGNORECASE))
+    candidates: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for item in messages:
+        if not isinstance(item, dict) or item.get("role") != "tool":
+            continue
+        try:
+            payload = json.loads(str(item.get("content") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        observation = payload.get("observation") if isinstance(payload, dict) else None
+        if not isinstance(observation, dict):
+            continue
+        page_url = str(observation.get("url") or "").strip()
+        page_title = str(observation.get("title") or "").strip()
+        page_text = str(observation.get("visibleText") or "").strip()
+        entries = observation.get("results") if isinstance(observation.get("results"), list) else []
+        if not entries and page_url and not _is_general_search_page(page_url):
+            entries = [{
+                "title": page_title,
+                "url": page_url,
+                "snippet": page_text,
+                "source": urlparse(page_url).netloc,
+            }]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            title = str(entry.get("title") or entry.get("name") or "").strip()
+            url = str(entry.get("url") or "").strip()
+            snippet = str(entry.get("snippet") or entry.get("description") or "").strip()
+            evidence = " ".join(part for part in (title, snippet, page_text) if part)
+            lowered = evidence.lower()
+            if not title or not url or _is_general_search_page(url):
+                continue
+            if terms and not any(term in lowered for term in terms):
+                continue
+            free_match = re.search(r"\b(free|freely available|open courseware|open access|no cost|without charge|audit for free)\b", lowered)
+            purchase_match = re.search(
+                r"\b(must purchase|paid course|payment required|subscription required)\b|(?<!no )\bpurchase required\b",
+                lowered,
+            )
+            if requires_free and (not free_match or purchase_match):
+                continue
+            identity = url.casefold()
+            if identity in seen:
+                continue
+            seen.add(identity)
+            source = str(entry.get("source") or "").strip()
+            if not source:
+                source = urlparse(url).netloc
+            candidates.append({
+                "title": title[:300],
+                "provider": source[:160],
+                "url": url[:2048],
+                "relevanceEvidence": "Requested topic terms were observed in the source title or page evidence.",
+                "freeAccessEvidence": free_match.group(0) if free_match else "No purchase constraint was requested.",
+                "purchaseEvidence": "No purchase requirement was observed in the page evidence." if requires_free else "Purchase constraint not requested.",
+                "details": snippet[:700],
+            })
+            if len(candidates) >= 12:
+                return candidates
+    return candidates
+
+
+def observed_general_result_count(messages: List[Dict[str, Any]]) -> int:
+    """Count distinct observed result cards/pages already returned by browser tools."""
+    identities: set[str] = set()
+    reported_count = 0
+    for item in messages:
+        if not isinstance(item, dict) or item.get("role") != "tool":
+            continue
+        try:
+            payload = json.loads(str(item.get("content") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        observation = payload.get("observation") if isinstance(payload, dict) else None
+        summary = payload.get("resultSetSummary") if isinstance(payload, dict) else None
+        if isinstance(summary, dict):
+            try:
+                reported_count = max(reported_count, int(summary.get("count") or 0))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(observation, dict):
+            results = observation.get("results")
+            if isinstance(results, list):
+                for result in results:
+                    if not isinstance(result, dict):
+                        continue
+                    title = str(result.get("title") or result.get("name") or "").strip()
+                    url = str(result.get("url") or "").strip()
+                    identity = (url or title).lower()
+                    if title and identity:
+                        identities.add(identity)
+    return max(len(identities), reported_count)
+
+
+def verified_general_result_count(messages: List[Dict[str, Any]]) -> int:
+    """Count evidence-backed candidates for General Agent research requests."""
+    return len(general_research_candidates(messages)) if _general_research_request(messages) else observed_general_result_count(messages)
+
+
+def general_research_results_markdown(messages: List[Dict[str, Any]]) -> str:
+    candidates = general_research_candidates(messages)
+    if not candidates:
+        return ""
+    lines = ["", "## Verified research results", ""]
+    for index, candidate in enumerate(candidates, 1):
+        lines.extend([
+            f"{index}. **{candidate['title']}**",
+            f"   - Provider/platform: {candidate['provider']}",
+            f"   - URL: {candidate['url']}",
+            f"   - AI/ML relevance: {candidate['relevanceEvidence']}",
+            f"   - Free/access evidence: {candidate['freeAccessEvidence']}",
+            f"   - Purchase requirement evidence: {candidate['purchaseEvidence']}",
+        ])
+        if candidate["details"]:
+            lines.append(f"   - Details: {candidate['details']}")
+    return "\n".join(lines)
+
+
+def general_observed_results_markdown(messages: List[Dict[str, Any]]) -> str:
+    """Render every distinct browser result as a bounded Markdown list."""
+    results: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for item in messages:
+        if not isinstance(item, dict) or item.get("role") != "tool":
+            continue
+        try:
+            payload = json.loads(str(item.get("content") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        observation = payload.get("observation") if isinstance(payload, dict) else None
+        candidates = observation.get("results") if isinstance(observation, dict) else None
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            title = str(candidate.get("title") or candidate.get("name") or "").strip()
+            url = str(candidate.get("url") or "").strip()
+            snippet = str(candidate.get("snippet") or candidate.get("description") or "").strip()
+            identity = (url or title).casefold()
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            results.append({"title": title or "Untitled result", "url": url, "snippet": snippet})
+            if len(results) >= 12:
+                break
+        if len(results) >= 12:
+            break
+    if not results:
+        return ""
+    lines = ["", "## All observed results", ""]
+    for index, result in enumerate(results, 1):
+        title = result["title"].replace("[", "\\[").replace("]", "\\]")
+        lines.append(f"{index}. **{title}**")
+        if result["url"]:
+            lines.append(f"   - Source: {result['url']}")
+        if result["snippet"]:
+            lines.append(f"   - Details: {result['snippet'][:600]}")
+    return "\n".join(lines)
 
 
 def food_refinement_instruction(result: Any) -> Optional[Dict[str, str]]:
@@ -1854,6 +2082,11 @@ async def run_tool_loop(
             "instead of claiming success. For list or comparison requests, preserve every field the "
             "user asked for from the latest observation, including each requested title, price, date, "
             "location, or availability value; do not omit observed values in the final answer. "
+            "For web research requests, return exactly the requested number of distinct verified "
+            "sources when the evidence supports them. Preserve each title, provider, direct URL, "
+            "topic relevance evidence, and evidence for every explicit user constraint. Search-page "
+            "titles, navigation chrome, and generic snippets are not sources; never claim a constraint "
+            "is satisfied without explicit observed evidence. "
             "For ordinary informational or technical questions, answer completely but compactly: "
             "lead with the direct answer, add 2-4 key points, one short example or practical use "
             "when it helps, and one caveat only when relevant. Avoid filler and long essays unless "
@@ -1872,6 +2105,51 @@ async def run_tool_loop(
     context_retry_count = 0
     context_metrics: Dict[str, Any] = {}
     forced_food_refinement: Optional[Dict[str, str]] = None
+    forced_general_search_count = 0
+    application_tool_only = False
+
+    async def force_general_search() -> bool:
+        nonlocal forced_general_search_count
+        if developer or "navigate" not in allowed:
+            return False
+        if forced_general_search_count >= 3:
+            return False
+        url = general_search_url(messages, forced_general_search_count)
+        if not url:
+            return False
+        forced_general_search_count += 1
+        tool_call_id = f"bounded-search-{round_number}-{forced_general_search_count}"
+        tool_calls.append({
+            "name": "navigate",
+            "arguments": {"url": url},
+            "round": round_number + 1,
+        })
+        await send_connection_message(send_json, state, {
+            "type": "tool_call",
+            "requestId": request_id,
+            "toolCallId": tool_call_id,
+            "name": "navigate",
+            "arguments": {"url": url},
+        })
+        messages.append({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": "navigate",
+                    "arguments": json.dumps({"url": url}),
+                },
+            }],
+        })
+        result = await wait_for_tool_result(state, request_id, tool_call_id)
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "name": "navigate",
+            "content": compact_general_tool_result(result),
+        })
+        return True
 
     async def complete_general_context(
         current_messages: List[Dict[str, Any]],
@@ -1913,6 +2191,16 @@ async def run_tool_loop(
                 )
                 return message, selected_provider
             except Exception as error:
+                if tool_choice == "required" and request_tools and is_tool_compatibility_error(error):
+                    return await asyncio.to_thread(
+                        complete_model,
+                        current_messages,
+                        None,
+                        request_tools,
+                        "auto",
+                        allow_tool_compatibility_fallback=True,
+                        request_id=request_id,
+                    )
                 if not is_context_limit_error(error):
                     raise
                 if context_retry_count >= 1:
@@ -1932,17 +2220,84 @@ async def run_tool_loop(
                     f"{forced_food_refinement['url']}. Do not answer yet and do not repeat an earlier query."
                 ),
             })
-        message, provider = await complete_general_context(
-            messages,
-            tools,
-            "required" if (
+        try:
+            requested_count = requested_general_result_count(messages)
+            observed_count = verified_general_result_count(messages)
+            if (
+                application_tool_only
+                and not developer
+                and requested_count
+                and observed_count < int(requested_count)
+                and await force_general_search()
+            ):
+                continue
+            needs_more_evidence = (
                 not developer
-                and (
-                    (round_number == 0 and not payload.get("generalContinuation"))
-                    or forced_food_refinement
-                )
-            ) else "auto",
-        )
+                and bool(requested_count)
+                and observed_count < int(requested_count)
+                and round_number > 0
+            )
+            message, provider = await complete_general_context(
+                messages,
+                None if application_tool_only else tools,
+                "required" if needs_more_evidence else "auto",
+            )
+        except Exception as error:
+            if (
+                not developer
+                and is_tool_compatibility_error(error)
+                and not application_tool_only
+                and await force_general_search()
+            ):
+                application_tool_only = True
+                continue
+            if (
+                not developer
+                and is_invalid_tool_call_error(error)
+                and not application_tool_only
+                and await force_general_search()
+            ):
+                application_tool_only = True
+                continue
+            if (
+                not developer
+                and is_fallback_error(error)
+                and has_blocked_general_observation(messages)
+                and await force_general_search()
+            ):
+                continue
+            fallback_content = ""
+            if (
+                not developer
+                and application_tool_only
+                and (is_tool_compatibility_error(error) or is_invalid_tool_call_error(error))
+            ):
+                fallback_content = general_research_results_markdown(messages)
+            if not developer and is_fallback_error(error):
+                fallback_content = fallback_content or general_research_results_markdown(messages)
+                if not fallback_content:
+                    fallback_content = general_evidence_fallback(messages)
+            if not fallback_content:
+                raise
+            await send_connection_message(send_json, state, {
+                "type": "token",
+                "content": fallback_content,
+                "requestId": request_id,
+            })
+            await send_connection_message(send_json, state, {
+                "type": "done",
+                "content": fallback_content,
+                "requestId": request_id,
+                "provider": None,
+                "model": None,
+                "degraded": True,
+                "failureClassification": "RATE_LIMIT",
+                "rounds": max((item["round"] for item in tool_calls), default=0),
+                "toolCalls": tool_calls,
+                "contextMetrics": context_metrics,
+                "timing": {"providerRequestMs": 0, "timeToFirstTokenMs": 0},
+            })
+            return
         messages.append(message)
         calls = message.get("tool_calls") or []
         if not calls:
@@ -1959,6 +2314,25 @@ async def run_tool_loop(
                     tool_choice=None,
                 )
                 break
+            if (
+                not developer
+                and requested_count
+                and observed_count < requested_count
+                and round_number < max_rounds - 1
+            ):
+                messages.pop()
+                if await force_general_search():
+                    continue
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"Evidence target not met: observed {observed_count} distinct result(s), "
+                        f"but the user requested {requested_count}. Do not finalize yet. "
+                        "Use the navigate tool with a different, specific public search URL to "
+                        "collect more distinct results. Do not repeat a URL already searched."
+                    ),
+                })
+                continue
             if forced_food_refinement and not developer and round_number < max_rounds - 1:
                 continue
             final_message = message
@@ -1997,11 +2371,30 @@ async def run_tool_loop(
         # Do not send an explicit `tool_choice: none` to providers whose models
         # may still emit a tool call while finalizing. Omitting the field is the
         # portable no-tools request and avoids the Groq incompatibility path.
-        final_message, provider = await complete_general_context(messages, None, None)
+        try:
+            final_message, provider = await complete_general_context(messages, None, None)
+        except Exception as error:
+            if not developer and (is_tool_compatibility_error(error) or is_invalid_tool_call_error(error)):
+                evidence_content = general_research_results_markdown(messages)
+                if not evidence_content:
+                    evidence_content = general_evidence_fallback(messages)
+                if evidence_content:
+                    final_message = {"content": evidence_content}
+                else:
+                    raise
+            else:
+                raise
 
     content = str(final_message.get("content") or "").strip()
     if not content:
-        raise RuntimeError("Provider returned no final response.")
+        content = general_research_results_markdown(messages)
+        if not content:
+            content = general_evidence_fallback(messages)
+        if not content:
+            raise RuntimeError("Provider returned no final response and the browser produced no usable evidence.")
+    if not developer:
+        research_markdown = general_research_results_markdown(messages)
+        content = f"{content}{research_markdown or general_observed_results_markdown(messages)}"
     await send_connection_message(send_json, state, {"type": "token", "content": content, "requestId": request_id})
     await send_connection_message(send_json, state, {
         "type": "done",

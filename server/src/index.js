@@ -100,6 +100,7 @@ function classifySttError(error) {
   const message = String(error?.message || '').toLowerCase();
   if (status === 401 || status === 403 || /unauthorized|forbidden|api key|authentication/.test(message)) return 'STT_AUTH_ERROR';
   if (status === 429 || /rate limit|too many requests/.test(message)) return 'STT_RATE_LIMIT';
+  if ([404, 405, 501].includes(status) || /not found|method not allowed|transcription is not supported|audio transcription/.test(message)) return 'STT_PROVIDER_ERROR';
   if (status === 400 || status === 422) return 'STT_BAD_REQUEST';
   if (/unsupported|codec|mime|audio format/.test(message)) return 'STT_UNSUPPORTED_AUDIO';
   if (/timeout|timed out/.test(message)) return 'STT_TIMEOUT';

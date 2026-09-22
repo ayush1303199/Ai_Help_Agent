@@ -22,7 +22,17 @@ const OBSERVE_SCRIPT = `(() => {
     let source = '';
     try { source = new URL(url).hostname; } catch {}
     return { title, url, snippet, source };
-  }).filter((result) => (result.url.startsWith('http://') || result.url.startsWith('https://')) && result.title.length >= 4).slice(0, 30);
+  }).filter((result) => {
+    if (!(result.url.startsWith('http://') || result.url.startsWith('https://')) || result.title.length < 4) return false;
+    try {
+      const resultHost = new URL(result.url).hostname;
+      const pageHost = location.hostname;
+      return resultHost !== pageHost
+        && !/google\.[^/]+$|bing\.com$|duckduckgo\.com$|search\.yahoo\.com$/i.test(resultHost);
+    } catch {
+      return false;
+    }
+  }).slice(0, 30);
   const hasPasswordField = [...document.querySelectorAll('input')].some((element) => /password/i.test(String(element.type || '') + ' ' + String(element.name || '') + ' ' + String(element.id || '')));
   const hasLoginInput = [...document.querySelectorAll('input')].some((element) => /email|username|user/i.test(String(element.type || '') + ' ' + String(element.name || '') + ' ' + String(element.id || '')));
   const hasLoginPair = hasLoginInput && /sign in|log in|login|password/i.test(lowerText);

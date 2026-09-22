@@ -19,6 +19,7 @@
     "test:assistant-smoke": "node --experimental-strip-types scripts/assistant-smoke-test.mjs",
     "test:document-service": "node --experimental-strip-types scripts/document-service-test.mjs",
     "test:stt-service": "node --experimental-strip-types scripts/stt-service-test.mjs",
+    "test:backend-services": "python scripts/backend-services-test.py",
     "test:interview-context": "node --experimental-strip-types scripts/interview-context-test.mjs",
     "test:context-dialog": "node scripts/context-dialog-test.mjs",
     "test:configuration-ui": "node scripts/configuration-ui-test.mjs",

@@ -24,6 +24,18 @@ const scripts = [
   'phase8-protocol-test.mjs',
 ];
 
+const backendResult = await new Promise((resolve) => {
+  const child = spawn('python', ['scripts/backend-services-test.py'], {
+    stdio: 'inherit',
+    windowsHide: true,
+  });
+  child.on('error', (error) => resolve({ code: 1, error }));
+  child.on('close', (code) => resolve({ code: code ?? 1 }));
+});
+if (backendResult.code !== 0) {
+  console.error('Test failed: backend-services-test.py');
+  process.exitCode = backendResult.code;
+} else {
 for (const script of scripts) {
   const result = await new Promise((resolve) => {
     const child = spawn(process.execPath, [path.join('scripts', script)], {
@@ -38,4 +50,5 @@ for (const script of scripts) {
     process.exitCode = result.code;
     break;
   }
+}
 }

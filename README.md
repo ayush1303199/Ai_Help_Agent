@@ -265,7 +265,7 @@ and packaged launches do not need API URLs or client limits hardcoded in
 | `VITE_MAX_PDF_SIZE_BYTES` | `20971520` | Maximum client-side PDF size. |
 | `VITE_PDF_CONTEXT_BUDGET_RATIO` | `0.65` | Fraction of context budget available to extracted PDF text. |
 | `VITE_PDF_UPLOAD_TIMEOUT_MS` | `20000` | PDF upload timeout. |
-| `VITE_SYSTEM_AUDIO_SILENCE_MS` | `1000` | System-audio silence threshold. |
+| `VITE_SYSTEM_AUDIO_SILENCE_MS` | `2000` | Silence after speech before an utterance is submitted to STT and the AI assistant. |
 | `VITE_SYSTEM_AUDIO_LEVEL_THRESHOLD` | `2` | System-audio level threshold. |
 
 ## Running the Application

@@ -733,9 +733,13 @@ function extractRoute(text) {
 
 function extractResultCount(text) {
   const normalized = normalizedText(text);
-  const match = normalized.match(/(?:best|top)\s+(\d+)\b|\b(\d+)\s+(?:best|top)\b|\bfor\s+(\d+)\s+options?\b/i);
+  const match = normalized.match(
+    /(?:best|top|free|available|recommend(?:ed)?)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b|\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:best|top|free|available|courses?|options?|results?|choices?)\b|\bfor\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+options?\b/i,
+  );
   if (!match) return null;
-  const value = Number(match[1] || match[2] || match[3]);
+  const words = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+  const rawValue = match[1] || match[2] || match[3];
+  const value = Number(rawValue) || words[String(rawValue || '').toLowerCase()] || null;
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 

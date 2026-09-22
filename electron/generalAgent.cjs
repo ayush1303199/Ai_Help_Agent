@@ -15,6 +15,7 @@ const PHASES = Object.freeze([
   'WAITING_FOR_CONFIRMATION',
   'EXECUTING',
   'VERIFYING',
+  'WAITING_FOR_PROVIDER',
   'COMPLETED',
   'COMPLETED_WITH_LIMITATIONS',
   'BLOCKED',
@@ -51,14 +52,15 @@ const TERMINAL_PHASES = new Set([
 const transitions = Object.freeze({
   CREATED: ['UNDERSTANDING', 'CANCELLED'],
   UNDERSTANDING: ['PLANNING', 'RESEARCHING', 'WAITING_FOR_LOGIN', 'CANCELLED', 'FAILED', 'BLOCKED'],
-  PLANNING: ['RESEARCHING', 'NAVIGATING', 'PREPARING_ACTION', 'WAITING_FOR_LOGIN', 'COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'CANCELLED', 'FAILED', 'BLOCKED'],
-  RESEARCHING: ['PLANNING', 'NAVIGATING', 'PREPARING_ACTION', 'VERIFYING', 'WAITING_FOR_LOGIN', 'COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'CANCELLED', 'FAILED', 'BLOCKED'],
+  PLANNING: ['RESEARCHING', 'NAVIGATING', 'PREPARING_ACTION', 'WAITING_FOR_LOGIN', 'WAITING_FOR_PROVIDER', 'COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'CANCELLED', 'FAILED', 'BLOCKED'],
+  RESEARCHING: ['PLANNING', 'NAVIGATING', 'PREPARING_ACTION', 'VERIFYING', 'WAITING_FOR_LOGIN', 'WAITING_FOR_PROVIDER', 'COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'CANCELLED', 'FAILED', 'BLOCKED'],
   NAVIGATING: ['RESEARCHING', 'PLANNING', 'PREPARING_ACTION', 'WAITING_FOR_LOGIN', 'CANCELLED', 'FAILED', 'BLOCKED'],
   WAITING_FOR_LOGIN: ['PLANNING', 'RECOVERING', 'FAILED', 'CANCELLED', 'BLOCKED'],
   PREPARING_ACTION: ['WAITING_FOR_CONFIRMATION', 'EXECUTING', 'CANCELLED', 'FAILED', 'BLOCKED'],
   WAITING_FOR_CONFIRMATION: ['EXECUTING', 'RECOVERING', 'CANCELLED', 'FAILED', 'BLOCKED'],
   EXECUTING: ['VERIFYING', 'RECOVERING', 'FAILED', 'CANCELLED', 'BLOCKED'],
-  VERIFYING: ['PLANNING', 'RESEARCHING', 'COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'RECOVERING', 'FAILED', 'CANCELLED', 'BLOCKED'],
+  VERIFYING: ['PLANNING', 'RESEARCHING', 'WAITING_FOR_PROVIDER', 'COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'RECOVERING', 'FAILED', 'CANCELLED', 'BLOCKED'],
+  WAITING_FOR_PROVIDER: ['RECOVERING', 'RESEARCHING', 'COMPLETED_WITH_LIMITATIONS', 'FAILED', 'CANCELLED', 'BLOCKED'],
   RECOVERING: ['PLANNING', 'RESEARCHING', 'WAITING_FOR_LOGIN', 'COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'CANCELLED', 'FAILED', 'BLOCKED'],
   COMPLETED: ['RECOVERING'],
   COMPLETED_WITH_LIMITATIONS: ['RECOVERING'],
@@ -135,6 +137,7 @@ function progressMessage(task) {
   if (task.phase === 'WAITING_FOR_CONFIRMATION') return 'Waiting for your confirmation before any external action.';
   if (task.phase === 'EXECUTING') return 'Executing the confirmed action...';
   if (task.phase === 'VERIFYING') return 'Verifying the result...';
+  if (task.phase === 'WAITING_FOR_PROVIDER') return 'The provider is unavailable. Your task is preserved for retry.';
   if (task.phase === 'RECOVERING') return 'Recovering safely from the last step...';
   if (task.phase === 'COMPLETED') return 'Task completed.';
   if (task.phase === 'COMPLETED_WITH_LIMITATIONS') return 'Task completed with limitations.';
@@ -470,6 +473,36 @@ function applyPlan(task, plan) {
   task.updatedAt = now();
 }
 
+function adaptResearchPlan(task) {
+  if (!task.plan || !task.lastObservation) return;
+  const evidenceNode = task.plan.taskGraph.nodes.find((node) => node.id === 'collect-evidence');
+  if (!evidenceNode) return;
+  const requested = Number(task.structuredRequirements?.resultCount || 0);
+  const observed = Array.isArray(task.taskMemory.resultSet) ? task.taskMemory.resultSet.length : 0;
+  const needsMoreEvidence = requested > 0 && observed < requested;
+  evidenceNode.status = needsMoreEvidence ? 'READY' : 'COMPLETED';
+  const comparisonNode = task.plan.taskGraph.nodes.find((node) => node.id === 'compare-options');
+  if (comparisonNode && !needsMoreEvidence) comparisonNode.status = 'READY';
+  task.plan.nextAction = needsMoreEvidence
+    ? 'collect-evidence'
+    : comparisonNode ? 'compare-options' : 'prepare-result';
+  task.plan.version = (task.plan.version || 0) + 1;
+  task.taskMemory.lastRefinement = {
+    reason: needsMoreEvidence
+      ? `The latest observation contained ${observed} of ${requested} requested result(s); research continues.`
+      : 'The latest observation satisfied the requested evidence target; the plan can synthesize the result.',
+    observedResultCount: observed,
+    requestedResultCount: requested || null,
+    observationVersion: task.lastObservation.version,
+    at: now(),
+  };
+  task.taskMemory.remaining = task.plan.taskGraph.nodes
+    .filter((node) => ['READY', 'PENDING'].includes(node.status))
+    .map((node) => node.title)
+    .slice(0, 12);
+  task.updatedAt = now();
+}
+
 function isFoodResearchTask(task) {
   const categories = Array.isArray(task?.plan?.categories) ? task.plan.categories : [];
   return categories.includes('FOOD_RESEARCH') || categories.includes('FOOD');
@@ -693,11 +726,51 @@ function rememberExternalResults(task, results) {
     };
     return;
   }
-  task.taskMemory.resultSet = safeResults;
+  const existing = Array.isArray(task.taskMemory.resultSet) ? task.taskMemory.resultSet : [];
+  const merged = [...existing, ...safeResults];
+  const identities = new Set();
+  const normalized = merged.filter((result) => {
+    const identity = String(result?.url || result?.title || result?.name || '').trim().toLowerCase();
+    if (!identity || identities.has(identity)) return false;
+    identities.add(identity);
+    return true;
+  }).slice(0, 12);
+  task.taskMemory.resultSet = normalized;
+  if (task.plan?.currentIntent === 'RESEARCH' || task.plan?.intent === 'RESEARCH') {
+    task.taskMemory.research.candidates = normalized;
+    task.taskMemory.research.outcome = normalized.length > 0 ? 'OBSERVED' : 'NOT_VERIFIED';
+  }
   task.taskMemory.resultSetSummary = {
-    count: safeResults.length,
+    count: normalized.length,
     source: 'UNTRUSTED_EXTERNAL_CONTENT',
     updatedAt: now(),
+  };
+}
+
+function normalizeResearchPageCandidate(observation) {
+  if (!observation || typeof observation !== 'object') return null;
+  const url = String(observation.url || '').trim();
+  const title = String(observation.title || '').trim();
+  const visibleText = String(observation.visibleText || '').trim();
+  if (!url || !title || !visibleText || /^https?:\/\/(?:www\.)?(?:google|bing|duckduckgo|search\.yahoo)\./i.test(url)) return null;
+  if (/(?:[?&](?:q|query)=|\/search(?:\/|$))/i.test(url)) return null;
+  let source = '';
+  try {
+    source = new URL(url).hostname;
+  } catch {
+    return null;
+  }
+  return {
+    title: title.slice(0, 300),
+    url: url.slice(0, 2048),
+    snippet: visibleText.slice(0, 600),
+    source,
+    evidence: {
+      title: title.slice(0, 300),
+      pageText: visibleText.slice(0, 1200),
+      observedAt: now(),
+    },
+    verificationStatus: 'OBSERVED_PAGE',
   };
 }
 
@@ -774,6 +847,9 @@ function syncExecutionTask(task, action, observation = null) {
     if (task.taskMemory.observations.length > 12) task.taskMemory.observations.shift();
     recordFoodSearchQuery(task, observation.url);
     rememberExternalResults(task, observation.results);
+    const pageCandidate = normalizeResearchPageCandidate(observation);
+    if (pageCandidate) rememberExternalResults(task, [pageCandidate]);
+    adaptResearchPlan(task);
     task.currentUrl = observation.url || task.currentUrl;
     task.currentSite = siteFromUrl(task.currentUrl);
   }
@@ -956,6 +1032,8 @@ function observe(taskId, ownerWebContentsId, observation = {}) {
     at: now(),
   };
   rememberExternalResults(task, observation.results);
+  const pageCandidate = normalizeResearchPageCandidate(observation);
+  if (pageCandidate) rememberExternalResults(task, [pageCandidate]);
   task.lastObservation = safeObservation;
   task.taskMemory.observations.push(safeObservation);
   if (task.taskMemory.observations.length > 12) task.taskMemory.observations.shift();
@@ -973,8 +1051,8 @@ function recordModelResponse(taskId, ownerWebContentsId, input = {}) {
     task.blockedReason = null;
   }
   assertTaskActive(task);
-  const status = input.status === 'ERROR' ? 'ERROR' : 'COMPLETED';
-  let content = status === 'COMPLETED' ? safeText(input.content || '', 8000) : '';
+  const status = ['ERROR', 'PARTIAL'].includes(input.status) ? input.status : 'COMPLETED';
+  let content = status !== 'ERROR' ? safeText(input.content || '', 8000) : '';
   const category = safeText(input.failureClassification || input.category || 'PROVIDER_ERROR', 80);
   const message = safeText(input.error || '', 500);
   task.contextMetrics = input.contextMetrics && typeof input.contextMetrics === 'object'
@@ -985,16 +1063,16 @@ function recordModelResponse(taskId, ownerWebContentsId, input = {}) {
     content,
     provider: input.provider ? safeText(input.provider, 120) : null,
     model: input.model ? safeText(input.model, 160) : null,
-    source: 'LIVE_PROVIDER',
+    source: status === 'PARTIAL' ? 'BROWSER_EVIDENCE_FALLBACK' : 'LIVE_PROVIDER',
     evidenceAvailable: Boolean(task.lastObservation || task.taskMemory.resultSetSummary),
     requestId: input.requestId ? safeText(input.requestId, 100) : null,
     receivedAt: now(),
   };
-  task.providerError = status === 'ERROR'
+  task.providerError = ['ERROR', 'PARTIAL'].includes(status)
     ? { category, message: message || 'The live provider could not complete this step.', at: now() }
     : null;
   task.history.push({
-    type: status === 'ERROR' ? 'MODEL_ERROR' : 'MODEL_RESPONSE',
+    type: status === 'ERROR' ? 'MODEL_ERROR' : status === 'PARTIAL' ? 'PARTIAL_EVIDENCE' : 'MODEL_RESPONSE',
     status,
     provider: task.assistantResponse.provider,
     model: task.assistantResponse.model,
@@ -1002,7 +1080,7 @@ function recordModelResponse(taskId, ownerWebContentsId, input = {}) {
     at: task.assistantResponse.receivedAt,
   });
   if (task.history.length > 32) task.history.shift();
-  if (status === 'COMPLETED') {
+  if (status === 'COMPLETED' || status === 'PARTIAL') {
     const food = isFoodResearchTask(task) ? task.structuredRequirements?.domainRequirements?.food : null;
     const hasFoodResearchEvidence = Boolean(
       food
@@ -1036,7 +1114,9 @@ function recordModelResponse(taskId, ownerWebContentsId, input = {}) {
     }
     task.taskMemory.completed.push(`model-response:${task.assistantResponse.requestId || now()}`);
     task.taskMemory.remaining = [];
-    task.finalStatus = hasFoodResearchEvidence
+    task.finalStatus = status === 'PARTIAL'
+      ? 'COMPLETED_WITH_LIMITATIONS'
+      : hasFoodResearchEvidence
       ? task.taskMemory.research.outcome === 'MATCH' ? 'COMPLETED' : 'COMPLETED_WITH_LIMITATIONS'
       : task.lastObservation || task.taskMemory.resultSetSummary
         ? 'COMPLETED'
@@ -1060,6 +1140,15 @@ function recordModelResponse(taskId, ownerWebContentsId, input = {}) {
     task.taskMemory.confirmationState = 'NONE';
     closeTaskBrowser(task, ownerWebContentsId);
     transition(task, 'BLOCKED', { reason: task.blockedReason, failureClassification: category });
+  } else if (category === 'RATE_LIMIT' || category === 'TEMPORARILY_UNAVAILABLE') {
+    task.finalStatus = null;
+    task.planningStatus = 'WAITING_FOR_PROVIDER';
+    task.providerError.retryable = true;
+    if (task.plan) task.plan.nextAction = 'WAITING_FOR_PROVIDER';
+    transition(task, 'WAITING_FOR_PROVIDER', {
+      reason: message || 'The provider is temporarily unavailable.',
+      failureClassification: category,
+    });
   } else {
     task.finalStatus = 'FAILED';
     task.planningStatus = 'FAILED';

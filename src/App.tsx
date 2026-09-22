@@ -55,6 +55,15 @@ import { AnswerSessionView } from './ui/AnswerSessionView';
 import { ConfiguredProvidersPanel } from './ui/ConfiguredProvidersPanel';
 import { ConfirmationDialog } from './ui/ConfirmationDialog';
 import { ContextInputDialog } from './ui/ContextInputDialog';
+import { CodingAgentPage } from './features/coding/CodingAgentPage';
+import { CodingAgentWorkspace } from './features/coding/CodingAgentWorkspace';
+import { GeneralAgentPage } from './features/general/GeneralAgentPage';
+import { GeneralAgentWorkspace } from './features/general/GeneralAgentWorkspace';
+import { MeetingAssistantWorkspace } from './features/meeting/MeetingAssistantWorkspace';
+import { AppHeader } from './ui/header/AppHeader';
+import { ContextButton, ContextPanel, HistoryButton, OverlayButton, SettingsButton } from './ui/header/HeaderActions';
+import { ModeControls } from './ui/header/ModeControls';
+import type { AppMode, AssistantMode, MeetingAudioMode } from './app/appTypes';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -124,23 +133,31 @@ function generalUserStatus(task: GeneralTaskState) {
 function generalSafeObservationSummary(observation: Record<string, unknown> | null | undefined) {
   if (!observation) return 'I checked the relevant page and am narrowing the best result.';
   const title = typeof observation.title === 'string' && observation.title.trim() ? observation.title.trim() : null;
+  const url = typeof observation.url === 'string' ? observation.url.toLowerCase() : '';
+  const results = Array.isArray(observation.results) ? observation.results : [];
   const pageState = typeof observation.pageState === 'string' ? observation.pageState : null;
   const errorState = observation.errorState && typeof observation.errorState === 'object'
     ? (observation.errorState as Record<string, unknown>)
     : null;
-  const message = errorState && typeof errorState.message === 'string' && errorState.message.trim()
-    ? errorState.message.trim()
-    : ((pageState === 'BLOCKED' || pageState === 'SECURITY_BLOCK')
-      ? 'The page blocked automated access, so I switched to a safer option.'
-      : title
-        ? `I checked ${title} and narrowed it to the most relevant result.`
-        : 'I checked the relevant page and narrowed it to the best option.');
+  let message = 'I checked the relevant page and narrowed it to the best option.';
+  if (errorState && typeof errorState.message === 'string' && errorState.message.trim()) {
+    message = errorState.message.trim();
+  } else if (pageState === 'BLOCKED' || pageState === 'SECURITY_BLOCK') {
+    message = 'The page blocked automated access, so I switched to a safer option.';
+  } else if (
+    (url.includes('google.com/search')
+      || url.includes('bing.com/search')
+      || url.includes('duckduckgo.com/?q=')
+      || url.includes('duckduckgo.com/html/?q=')
+      || url.includes('search.yahoo.com/search'))
+    && results.length === 0
+  ) {
+    message = 'The search page did not expose usable result cards, so I have not treated it as a course result.';
+  } else if (title) {
+    message = `I checked ${title} and narrowed it to the most relevant result.`;
+  }
   return message;
 }
-
-type Mode = 'direct' | 'langchain';
-type AppMode = 'assistant' | 'developer' | 'general';
-type MeetingAudioMode = 'microphone' | 'system' | 'meeting';
 
 interface MeetingTranscript {
   id: string;
@@ -189,6 +206,7 @@ interface ConfiguredProvider {
   developerToolCalling?: boolean;
   developerToolCallingVerified?: boolean;
   developerStatus?: string;
+  capabilities?: { chat?: boolean; stt?: boolean };
 }
 
 interface ConfirmationRequest {
@@ -291,7 +309,12 @@ const {
 const PDF_CONTEXT_CHAR_BUDGET = Math.floor(MAX_CONTEXT_CHARS * PDF_CONTEXT_BUDGET_RATIO);
 // Capture starts from the authorized microphone and can also include selected
 // system audio. Transcription begins only after a complete utterance ends.
-const { systemSilenceMs: SYSTEM_AUDIO_SILENCE_MS, systemLevelThreshold: SYSTEM_AUDIO_LEVEL_THRESHOLD } = runtimeConfig.audio;
+const {
+  systemSilenceMs: SYSTEM_AUDIO_SILENCE_MS,
+  systemLevelThreshold: SYSTEM_AUDIO_LEVEL_THRESHOLD,
+  continuationTimeoutMs: AUDIO_CONTINUATION_TIMEOUT_MS,
+  continuationMaxChars: AUDIO_CONTINUATION_MAX_CHARS,
+} = runtimeConfig.audio;
 function compactMessageContent(content: string) {
   if (content.length <= MAX_CHAT_MESSAGE_CHARS) return content;
   return `${content.slice(0, MAX_CHAT_MESSAGE_CHARS)}\n[Earlier content omitted for speed]`;
@@ -374,6 +397,9 @@ function sttUserError(classification: SttFailureClassification, fallback: string
       return 'The speech-to-text provider could not be reached. Check the connection and try again.';
     case 'STT_RESPONSE_PARSE_ERROR':
       return 'The speech-to-text response was invalid. Please try again.';
+    case 'STT_PROVIDER_ERROR':
+    case 'STT_PROVIDER_UNSUPPORTED':
+      return 'The active provider does not support speech transcription. Configure a speech-capable provider and try again.';
     default:
       return fallback;
   }
@@ -482,14 +508,14 @@ function App() {
   const [generalBusy, setGeneralBusy] = useState(false);
   const [appMode, setAppMode] = useState<AppMode>('assistant');
   const [draftImproving, setDraftImproving] = useState(false);
-  const [mode, setMode] = useState<Mode>('direct');
+  const [mode, setMode] = useState<AssistantMode>('direct');
   const [pdfText, setPdfText] = useState('');
   const [pdfName, setPdfName] = useState('');
   const [pdfLoading, setPdfLoading] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
-  const [health, setHealth] = useState<{ provider: string; model: string } | null>(null);
+  const [health, setHealth] = useState<{ provider: string; model: string; sttReady?: boolean; sttProvider?: string } | null>(null);
   const [sessionDocuments, setSessionDocuments] = useState<SessionDocument[]>([]);
   const [trainedProfiles, setTrainedProfiles] = useState<TrainedProfile[]>(() => {
     try {
@@ -602,10 +628,12 @@ function App() {
   const pendingSegmentQueueRef = useRef<PendingAudioSegment[]>([]);
   const segmentProcessorActiveRef = useRef(false);
   const segmentProcessorRef = useRef<(() => Promise<void>) | null>(null);
+  const segmentCloseInProgressRef = useRef(false);
   const acceptedQuestionHistoryRef = useRef<string[]>([]);
   const acceptedQuestionRequestIdsRef = useRef(new Map<string, string>());
   const pendingPartialQuestionRef = useRef('');
   const pendingPartialRawTextRef = useRef('');
+  const pendingPartialTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestInProgressRef = useRef(false);
   const chatRequestIdRef = useRef('');
   const draftImproveRequestIdRef = useRef('');
@@ -1327,10 +1355,12 @@ function App() {
         generalRequestResolversRef.current.delete(requestId);
         const record = taskId && window.electronAPI
           ? window.electronAPI.recordGeneralModelResponse(taskId, {
-            status: 'COMPLETED',
+            status: msg.degraded ? 'PARTIAL' : 'COMPLETED',
             content: responseText,
             provider: typeof msg.provider === 'string' ? msg.provider : undefined,
             model: typeof msg.model === 'string' ? msg.model : undefined,
+            category: typeof msg.failureClassification === 'string' ? msg.failureClassification : undefined,
+            failureClassification: typeof msg.failureClassification === 'string' ? msg.failureClassification : undefined,
             contextMetrics: msg.contextMetrics,
             requestId,
           })
@@ -1338,7 +1368,9 @@ function App() {
         void record.then((task) => {
           setGeneralTask(task);
           setGeneralBusy(false);
-          setStatusMessage('Live General Agent answer received.');
+          setStatusMessage(task.assistantResponse?.status === 'PARTIAL'
+            ? 'Verified browser evidence was preserved; provider synthesis is temporarily unavailable.'
+            : 'Live General Agent answer received.');
           resolver?.resolve(task);
         }).catch((recordError) => {
           setGeneralBusy(false);
@@ -1594,6 +1626,7 @@ function App() {
           'Internal routing summary for this bounded General task. Use it to choose the smallest safe read-only path.',
           `Intent: ${requirements.intent || 'RESEARCH'}`,
           `Capability: ${requestTask.categories[0] || 'WEB_RESEARCH'}`,
+          `Requested result count: ${String(requirements.resultCount || 'as many as the user requested')}`,
           `Allowed actions: ${(requirements.allowedActions || []).join(', ') || 'SEARCH, SHOW'}`,
           `Budget: ${String(requirements.domainRequirements?.food?.budget ?? requirements.domainRequirements?.shopping?.budget ?? 'not specified')}`,
           `Delivery excluded: ${String(Boolean(requirements.domainRequirements?.food?.deliveryExcluded))}`,
@@ -1604,6 +1637,7 @@ function App() {
           `Food search queries (use in order, at most one initial query plus three refinements): ${Array.isArray(requirements.domainRequirements?.food?.searchQueries) ? requirements.domainRequirements.food.searchQueries.join(' || ') : 'derive a specific query from the request'}`,
           'For food research, evaluate every observed candidate for food, exact location, explicit price evidence, source quality, and the no-delivery constraint. A video title or generic article is not proof of a current local price.',
           'Do not report irrelevant locations or unverified prices as matches. If the first search is broad, refine with a new query rather than repeating the same URL. If all four checks cannot be supported, say that the result is not verified.',
+          `Return exactly the requested number of distinct results when the request specifies a count. Do not stop after the first result when more verified results can be collected.`,
           'Purchase: false',
           'Payment: false',
           'Never claim completion without observed evidence.',
@@ -1673,9 +1707,9 @@ function App() {
   };
 
   const inputQualityMessage = (classification: PreparedQuestion['qualityClassification']) => {
-    if (classification === 'INCOMPLETE') return 'Please finish the question before sending it.';
+    if (classification === 'INCOMPLETE') return 'Please finish the request before sending it.';
     if (classification === 'FILLER' || classification === 'REPEATED_NOISE' || classification === 'NOT_A_QUESTION') {
-      return 'I did not detect a complete question or request.';
+      return 'I did not detect a complete request.';
     }
     return '';
   };
@@ -2138,6 +2172,8 @@ function App() {
     captureSessionIdRef.current = '';
     pendingPartialQuestionRef.current = '';
     pendingPartialRawTextRef.current = '';
+    if (pendingPartialTimeoutRef.current) clearTimeout(pendingPartialTimeoutRef.current);
+    pendingPartialTimeoutRef.current = null;
     pendingSegmentQueueRef.current = [];
     if (segmentSilenceTimerRef.current) clearInterval(segmentSilenceTimerRef.current);
     segmentSilenceTimerRef.current = null;
@@ -2448,6 +2484,10 @@ function App() {
         }
         const pendingQuestion = pendingPartialQuestionRef.current;
         const pendingRawText = pendingPartialRawTextRef.current;
+        if (pendingQuestion && pendingPartialTimeoutRef.current) {
+          clearTimeout(pendingPartialTimeoutRef.current);
+          pendingPartialTimeoutRef.current = null;
+        }
         const continuedQuestion = pendingQuestion
           ? joinQuestionContinuation(pendingQuestion, normalizedTranscript, transcriptNormalizationContext)
           : null;
@@ -2465,19 +2505,42 @@ function App() {
           normalizedTranscript: preparedQuestion.normalizedText,
           finalQuestion: preparedQuestion.acceptedQuestion,
           transcriptLength: preparedQuestion.normalizedText.length,
-          questionDetected: Boolean(preparedQuestion.acceptedQuestion),
+          requestDetected: Boolean(preparedQuestion.acceptedQuestion),
           qualityClassification: preparedQuestion.qualityClassification,
           continuation: Boolean(continuedQuestion),
         });
         if (!preparedQuestion.acceptedQuestion) {
           if (preparedQuestion.qualityClassification === 'INCOMPLETE') {
-            pendingPartialQuestionRef.current = preparedQuestion.normalizedText;
-            pendingPartialRawTextRef.current = candidateRawText;
-            setStatusMessage('Please finish the question before I send it.');
-            logSttTrace(sttSession, 'PARTIAL_QUESTION_WAITING', {
-              segmentId,
-              transcriptLength: preparedQuestion.normalizedText.length,
-            });
+            if (preparedQuestion.normalizedText.length <= AUDIO_CONTINUATION_MAX_CHARS) {
+              pendingPartialQuestionRef.current = preparedQuestion.normalizedText;
+              pendingPartialRawTextRef.current = candidateRawText;
+              pendingPartialTimeoutRef.current = setTimeout(() => {
+                if (captureSessionIdRef.current !== sttSession) return;
+                pendingPartialQuestionRef.current = '';
+                pendingPartialRawTextRef.current = '';
+                pendingPartialTimeoutRef.current = null;
+                setStatusMessage('The incomplete request timed out. Please try again.');
+                logSttTrace(sttSession, 'PARTIAL_REQUEST_EXPIRED', {
+                  segmentId,
+                  transcriptLength: preparedQuestion.normalizedText.length,
+                });
+              }, AUDIO_CONTINUATION_TIMEOUT_MS);
+              setStatusMessage('Please finish the request before I send it.');
+              logSttTrace(sttSession, 'PARTIAL_REQUEST_WAITING', {
+                segmentId,
+                transcriptLength: preparedQuestion.normalizedText.length,
+                timeoutMs: AUDIO_CONTINUATION_TIMEOUT_MS,
+              });
+            } else {
+              pendingPartialQuestionRef.current = '';
+              pendingPartialRawTextRef.current = '';
+              setStatusMessage('The request was too long to continue safely. Please try again.');
+              logSttTrace(sttSession, 'PARTIAL_REQUEST_REJECTED', {
+                segmentId,
+                transcriptLength: preparedQuestion.normalizedText.length,
+                maxChars: AUDIO_CONTINUATION_MAX_CHARS,
+              });
+            }
           } else {
             pendingPartialQuestionRef.current = '';
             pendingPartialRawTextRef.current = '';
@@ -2494,6 +2557,8 @@ function App() {
         }
         pendingPartialQuestionRef.current = '';
         pendingPartialRawTextRef.current = '';
+        if (pendingPartialTimeoutRef.current) clearTimeout(pendingPartialTimeoutRef.current);
+        pendingPartialTimeoutRef.current = null;
         const acceptedQuestion = preparedQuestion.acceptedQuestion;
         if (!rememberAcceptedQuestion(acceptedQuestion)) {
           logSttTrace(sttSession, 'DUPLICATE_TRANSCRIPT_IGNORED', {
@@ -2506,7 +2571,7 @@ function App() {
           return;
         }
         setPipelineStatus('question');
-        logSttTrace(sttSession, 'QUESTION_DETECTED', {
+        logSttTrace(sttSession, 'REQUEST_DETECTED', {
           segmentId,
           transcriptLength: acceptedQuestion.length,
           continuation: Boolean(continuedQuestion),
@@ -2577,6 +2642,13 @@ function App() {
     segmentProcessorRef.current = processPendingSegments;
 
     recorder.onstop = () => {
+      if (segmentCloseInProgressRef.current) {
+        logSttTrace(sttSession, 'DUPLICATE_SEGMENT_CLOSE_IGNORED', {
+          recorderState: recorder.state,
+        });
+        return;
+      }
+      segmentCloseInProgressRef.current = true;
       const segment = chunks.splice(0, chunks.length);
       segmentHeardAudioRef.current = false;
       const segmentDurationMs = Math.max(0, Math.round(performance.now() - (segmentStartedAtRef.current || performance.now())));
@@ -2592,6 +2664,11 @@ function App() {
         return;
       }
       recorder.start();
+      setTimeout(() => {
+        if (captureSessionIdRef.current === sttSession && recorderRef.current === recorder) {
+          segmentCloseInProgressRef.current = false;
+        }
+      }, 0);
       segmentStartedAtRef.current = performance.now();
       console.log('[CAPTURE] Utterance segment started');
       const audioSegment = new Blob(segment, { type: recorder.mimeType || 'audio/webm' });
@@ -2616,6 +2693,7 @@ function App() {
       }
     };
     recorder.start();
+    segmentCloseInProgressRef.current = false;
     captureActiveRef.current = true;
     segmentStartedAtRef.current = performance.now();
     logSttTrace(sttSession, 'SEGMENT_STARTED', { encoding: recorder.mimeType || 'unknown' });
@@ -2652,9 +2730,24 @@ function App() {
 
   const startMeetingCapture = async () => {
     if (captureActiveRef.current || captureSessionIdRef.current) return;
+    try {
+      const healthResponse = await fetch(`${HTTP_URL}/api/health`);
+      const healthData = await healthResponse.json();
+      if (!healthResponse.ok || healthData.sttReady === false) {
+        setError('Speech transcription is unavailable. Configure a speech-capable STT provider before starting the microphone.');
+        setStatusMessage('');
+        return;
+      }
+    } catch (error) {
+      setError(`Could not verify speech transcription readiness: ${(error as Error).message}`);
+      setStatusMessage('');
+      return;
+    }
     setError('');
     pendingPartialQuestionRef.current = '';
     pendingPartialRawTextRef.current = '';
+    if (pendingPartialTimeoutRef.current) clearTimeout(pendingPartialTimeoutRef.current);
+    pendingPartialTimeoutRef.current = null;
     pendingSegmentQueueRef.current = [];
     const sttSession = crypto.randomUUID();
     captureSessionIdRef.current = sttSession;
@@ -3249,84 +3342,33 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-100">
-      <header className="sticky top-0 z-10 border-b border-slate-800/80 bg-slate-950/90 px-4 py-3 backdrop-blur">
-        <div className="mx-auto flex max-w-3xl items-center justify-between">
+      <AppHeader>
           <div className="flex items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-400"><Bot className="h-5 w-5 text-slate-950" /></div>
             <div><h1 className="text-sm font-semibold">Meeting AI Assistant</h1><p className={`text-[11px] ${statusTone}`}>● {statusLabel}</p></div>
           </div>
           <div className="flex items-center gap-2">
-            <div className="flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5" aria-label="Application mode">
-              <button
-                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming && !generalTaskActive && !generalBusy) setAppMode('assistant'); }}
-                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming || generalTaskActive || generalBusy}
-                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${appMode === 'assistant' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
-              >
-                AI Assistant
-              </button>
-              <button
-                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming && !generalTaskActive && !generalBusy) setAppMode('developer'); }}
-                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming || generalTaskActive || generalBusy}
-                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${appMode === 'developer' ? 'bg-sky-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
-              >
-                Developer
-              </button>
-              <button
-                onClick={() => { if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming && !generalTaskActive && !generalBusy) setAppMode('general'); }}
-                disabled={isRecording || isTranscribing || chatStreaming || developerStreaming || generalTaskActive || generalBusy}
-                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${appMode === 'general' ? 'bg-violet-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
-              >
-                General
-              </button>
-            </div>
-            <div className={`${appMode === 'assistant' ? '' : 'hidden'} flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5`} aria-label="AI mode">
-              <button
-                onClick={() => setMode('direct')}
-                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${mode === 'direct' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'}`}
-              >
-                Direct
-              </button>
-              <button
-                onClick={() => setMode('langchain')}
-                className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${mode === 'langchain' ? 'bg-teal-500 text-slate-950' : 'text-slate-400 hover:text-slate-200'}`}
-              >
-                LangChain
-              </button>
-            </div>
-            <button
-              onClick={() => {
-                if (window.electronAPI) {
-                  void window.electronAPI.toggleOverlay();
-                } else {
-                  setError('Overlay mode is available in the Electron desktop app.');
-                }
+            <ModeControls
+              appMode={appMode}
+              assistantMode={mode}
+              disabled={isRecording || isTranscribing || chatStreaming || developerStreaming || generalTaskActive || generalBusy}
+              onAppModeChange={(nextMode) => {
+                if (!isRecording && !isTranscribing && !chatStreaming && !developerStreaming && !generalTaskActive && !generalBusy) setAppMode(nextMode);
               }}
-              className={`${appMode === 'assistant' ? '' : 'hidden'} rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400`}
-              title="Open transparent answer overlay"
-            >
-              Overlay
-            </button>
+              onAssistantModeChange={setMode}
+            />
+            <OverlayButton visible={appMode === 'assistant'} onClick={() => {
+              if (window.electronAPI) {
+                void window.electronAPI.toggleOverlay();
+              } else {
+                setError('Overlay mode is available in the Electron desktop app.');
+              }
+            }} />
             {appMode === 'assistant' && sessionActive && <button type="button" onClick={() => setMeetingMenuOpen((open) => !open)} aria-expanded={meetingMenuOpen} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
             <div className={`${appMode === 'assistant' ? '' : 'hidden'} relative`}>
-              <button
-                type="button"
-                data-context-toggle
-                onClick={() => (contextMenuOpen ? closeContextMenu() : openContextMenu())}
-                aria-expanded={contextMenuOpen}
-                aria-haspopup="dialog"
-                className={`rounded-lg border px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400 ${contextMenuOpen ? 'border-emerald-400 bg-emerald-500/10' : 'border-slate-700'}`}
-              >
-                Context
-              </button>
+              <ContextButton open={contextMenuOpen} onClick={() => (contextMenuOpen ? closeContextMenu() : openContextMenu())} />
               {contextMenuOpen && (
-                <div ref={contextMenuRef} className="absolute right-0 top-11 z-20 max-h-[calc(100vh-5rem)] w-[min(23rem,calc(100vw-2rem))] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl" role="dialog" aria-modal="false" aria-label="Session context">
-                  <div className="mb-3 flex items-start justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-semibold">Session context</p>
-                      <p className="text-xs text-slate-500">Resume and job description context</p>
-                    </div>
-                    <button type="button" onClick={closeContextMenu} className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200" aria-label="Close context panel"><X className="h-4 w-4" /></button>
-                  </div>
+                <ContextPanel ref={contextMenuRef} onClose={closeContextMenu}>
                   {mode === 'direct' && (sessionDocuments.length > 0 || activeProfile || domain || background.length > 0) && (
                     <p className="mb-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-200">
                       Interview context is attached to the next Direct mode request.
@@ -3496,14 +3538,13 @@ function App() {
                     )}
                     {(sessionDocuments.length > 0 || activeProfile) && <button type="button" onClick={requestClearSessionContext} className="text-[11px] text-slate-400 hover:text-slate-200">Clear session upload</button>}
                   </div>
-                </div>
+                </ContextPanel>
               )}
             </div>
-            <button type="button" onClick={openConfiguration} aria-label="Configuration" className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="Configuration"><Settings className="h-4 w-4" /></button>
-            <button type="button" onClick={() => setHistoryOpen(true)} aria-label="Open chat history" className="rounded-lg border border-slate-700 p-2 text-slate-300 hover:border-emerald-400" title="History"><History className="h-4 w-4" /></button>
+            <SettingsButton onClick={openConfiguration} />
+            <HistoryButton onClick={() => setHistoryOpen(true)} />
           </div>
-        </div>
-      </header>
+      </AppHeader>
       {/* Header */}
       <header className="hidden border-b border-slate-700/50 bg-slate-900/80 backdrop-blur-md sticky top-0 z-10">
         <div className="mx-auto flex max-w-4xl flex-wrap items-center justify-between gap-3 px-4 py-3">
@@ -3526,6 +3567,25 @@ function App() {
                       <p className="text-xs text-slate-500">Listen and save searchable notes</p>
                     </div>
                     <span className={`text-xs ${pipelineStatus === 'listening' ? 'text-rose-300' : pipelineStatus === 'transcribing' ? 'text-amber-300' : pipelineStatus === 'thinking' ? 'text-blue-300' : pipelineStatus === 'answer' ? 'text-emerald-300' : 'text-slate-500'}`}>● {pipelineStatus === 'listening' ? 'Listening...' : pipelineStatus === 'transcribing' ? 'Transcribing...' : pipelineStatus === 'question' ? 'Question detected' : pipelineStatus === 'thinking' ? 'Thinking...' : pipelineStatus === 'answer' ? 'Answer ready' : 'Ready'}</span>
+                  </div>
+                  {transcripts.length > 0 && (
+                    <div className="mb-3 border-b border-slate-800 pb-3">
+                      <div className="mb-2 flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-2 py-1.5"><Search className="h-3.5 w-3.5 text-slate-500" /><input value={transcriptSearch} onChange={(event) => setTranscriptSearch(event.target.value)} placeholder="Search saved transcripts" className="w-full bg-transparent text-xs text-slate-200 outline-none placeholder:text-slate-500" /></div>
+                      <div className="max-h-20 space-y-1 overflow-y-auto">
+                        {filteredTranscripts.map((item) => <button key={item.id} onClick={() => setInput(`Summarize the ${item.source} meeting and list the action items.`)} className="block w-full truncate rounded-md px-2 py-1.5 text-left text-xs text-slate-300 hover:bg-slate-800"><span className="text-emerald-300">{item.source}</span> {item.text}</button>)}
+                      </div>
+                    </div>
+                  )}
+                  <div className="mb-3 flex gap-2">
+                    {!isRecording && !isTranscribing ? (
+                      <>
+                        <button type="button" onClick={() => void testSystemAudio()} className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/10"><MonitorUp className="h-3.5 w-3.5" /> Test Audio</button>
+                        <button type="button" onClick={() => void startMeetingCapture()} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-xs font-medium text-white hover:bg-blue-400"><MonitorUp className="h-3.5 w-3.5" /> Start Listening</button>
+                      </>
+                    ) : (
+                      <button type="button" onClick={stopMeetingCapture} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-slate-700 px-3 py-2 text-xs font-medium text-white hover:bg-slate-600"><Square className="h-3 w-3" /> Stop Listening</button>
+                    )}
+                    {liveTranscript && <button onClick={saveMeetingTranscript} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:bg-emerald-500/10">Save</button>}
                   </div>
                   <div className="space-y-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
                     <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-400">Audio source</label>
@@ -3560,26 +3620,7 @@ function App() {
                     </div>
                   </div>
                   <p className="mt-2 text-[10px] leading-relaxed text-slate-500">Microphone is captured with permission for spoken questions. System audio is optional; choose a playback source in the operating-system capture dialog when available.</p>
-                  <div className="mt-3 flex gap-2">
-                    {!isRecording && !isTranscribing ? (
-                      <>
-                        <button type="button" onClick={() => void testSystemAudio()} className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/10"><MonitorUp className="h-3.5 w-3.5" /> Test Audio</button>
-                        <button type="button" onClick={() => void startMeetingCapture()} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-xs font-medium text-white hover:bg-blue-400"><MonitorUp className="h-3.5 w-3.5" /> Start Listening</button>
-                      </>
-                    ) : (
-                      <button type="button" onClick={stopMeetingCapture} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-slate-700 px-3 py-2 text-xs font-medium text-white hover:bg-slate-600"><Square className="h-3 w-3" /> Stop Listening</button>
-                    )}
-                    {liveTranscript && <button onClick={saveMeetingTranscript} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:bg-emerald-500/10">Save</button>}
-                  </div>
                   {liveTranscript && <p className="mt-2 max-h-16 overflow-y-auto rounded-lg bg-slate-950/60 p-2 text-[11px] leading-relaxed text-slate-300">{liveTranscript}</p>}
-                  {transcripts.length > 0 && (
-                    <div className="mt-3 border-t border-slate-800 pt-3">
-                      <div className="mb-2 flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-2 py-1.5"><Search className="h-3.5 w-3.5 text-slate-500" /><input value={transcriptSearch} onChange={(event) => setTranscriptSearch(event.target.value)} placeholder="Search saved transcripts" className="w-full bg-transparent text-xs text-slate-200 outline-none placeholder:text-slate-500" /></div>
-                      <div className="max-h-20 space-y-1 overflow-y-auto">
-                        {filteredTranscripts.map((item) => <button key={item.id} onClick={() => setInput(`Summarize the ${item.source} meeting and list the action items.`)} className="block w-full truncate rounded-md px-2 py-1.5 text-left text-xs text-slate-300 hover:bg-slate-800"><span className="text-emerald-300">{item.source}</span> {item.text}</button>)}
-                      </div>
-                    </div>
-                  )}
                 </div>
               )}
             </div>
@@ -3794,253 +3835,106 @@ function App() {
 
       <main className="mx-auto flex min-h-[calc(100dvh-57px)] w-full max-w-3xl flex-col px-4 py-6">
         {appMode === 'general' ? (
-          <section className="m-auto flex w-full max-w-3xl flex-1 flex-col rounded-2xl border border-violet-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7">
+          <GeneralAgentPage>
             <div className="mb-5">
               <p className="text-[11px] font-semibold uppercase tracking-wider text-violet-300">General Agent</p>
               <h2 className="mt-1 text-xl font-semibold">What do you want me to do?</h2>
               <p className="mt-2 text-xs text-slate-500">Describe the outcome naturally. I will choose a bounded, read-only path and ask before any external action.</p>
             </div>
-            {!generalTask && (
-              <div className="rounded-xl border border-slate-700 bg-slate-800/50 p-3">
-                <textarea
-                  value={generalGoal}
-                  onChange={(event) => setGeneralGoal(event.target.value)}
-                  onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void startGeneralTask(); } }}
-                  placeholder="Type naturally..."
-                  rows={3}
-                  className="mt-2 w-full resize-y rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-violet-400"
-                />
-                <div className="mt-3 flex items-center justify-between gap-3">
-                  <p className="text-[11px] text-slate-500">No external action is taken without your confirmation.</p>
-                  <button onClick={() => void startGeneralTask()} disabled={!generalGoal.trim() || generalBusy} className="flex items-center gap-2 rounded-md bg-violet-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-violet-400 disabled:opacity-40">{generalBusy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}Send</button>
-                </div>
-              </div>
-            )}
-            {generalTask && (
-              <div className="space-y-4">
-                <div className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-slate-100">{generalTask.goal}</p>
-                    </div>
-                  </div>
-                  <p className="mt-3 rounded-lg border border-violet-500/20 bg-slate-950/40 px-3 py-2 text-xs text-violet-100">{generalUserStatus(generalTask)}</p>
-                  {generalBusy && (
-                    <div className="mt-3 rounded-lg border border-sky-500/20 bg-sky-500/5 px-3 py-2 text-xs text-sky-100">
-                      {generalUserProgressMessage(generalTask.progressMessage)}
-                    </div>
-                  )}
-                  {generalTask.assistantResponse?.status === 'COMPLETED' && generalTask.assistantResponse.content && (
-                    <div className="mt-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-300">Live agent answer</p>
-                        <span className="text-[10px] text-slate-500">
-                          {generalTask.assistantResponse.evidenceAvailable ? 'Browser evidence captured' : 'No browser evidence'}
-                        </span>
-                      </div>
-                      <div className="mt-2 text-sm leading-relaxed text-slate-100">
-                        {renderAnswerMarkdown(generalTask.assistantResponse.content)}
-                      </div>
-                      <p className="mt-2 text-[10px] text-slate-500">Source: {generalTask.assistantResponse.evidenceAvailable ? 'Verified from the current page.' : 'Live provider response.'}</p>
-                    </div>
-                  )}
-                  {generalTask.providerError && (
-                    <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="font-medium">The request was not completed</p>
-                        <button onClick={() => void retryGeneralAgent()} disabled={generalBusy} className="rounded-md border border-amber-300/50 px-2 py-1 text-[11px] text-amber-100 hover:bg-amber-500/10 disabled:opacity-40">Retry live agent</button>
-                      </div>
-                      <p className="mt-1">{generalUserFailureMessage(generalTask.providerError.category)}</p>
-                    </div>
-                  )}
-                  {generalTask.phase === 'WAITING_FOR_CONFIRMATION' && generalTask.pendingAction && (
-                    <div className="mt-3 rounded-lg border border-amber-400/40 bg-amber-500/10 p-3 text-xs text-amber-100">
-                      <p className="font-medium">Confirmation required before this external action.</p>
-                      <p className="mt-1">Requested action: {generalTask.pendingAction.target}. Nothing was sent, booked, or purchased.</p>
-                    </div>
-                  )}
-                  {generalTask.lastObservation && (
-                    <div className="mt-3 rounded-lg border border-violet-500/20 bg-slate-950/40 p-3 text-xs text-slate-200">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-violet-300">Page check</p>
-                      <p className="mt-2 text-sm text-slate-100">{generalSafeObservationSummary(generalTask.lastObservation)}</p>
-                    </div>
-                  )}
-                  {generalTask.missingInformation.length > 0 && (
-                    <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-amber-200">Information needed before preparation</p>
-                      <div className="mt-2 space-y-1 text-[11px] text-amber-100">
-                        {generalTask.missingInformation.map((item) => <p key={item.id}><span className="font-medium">{item.prompt}</span> <span className="text-amber-200/70">({item.reason})</span></p>)}
-                      </div>
-                      <div className="mt-3 flex gap-2">
-                        <input value={generalClarification} onChange={(event) => setGeneralClarification(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void reviseGeneralTask(); } }} placeholder="Add the missing detail..." className="min-w-0 flex-1 rounded-md border border-amber-500/30 bg-slate-950 px-2 py-1.5 text-xs text-slate-100 outline-none focus:border-amber-300" />
-                        <button onClick={() => void reviseGeneralTask()} disabled={!generalClarification.trim() || generalBusy} className="rounded-md border border-amber-400/50 px-2 py-1.5 text-[11px] text-amber-100 disabled:opacity-40">Update plan</button>
-                      </div>
-                    </div>
-                  )}
-                  <div className="mt-3 flex gap-2">
-                    <input value={generalFollowUp} onChange={(event) => setGeneralFollowUp(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void reviseGeneralTask(); } }} placeholder="Refine the task, e.g. prefer AC sleeper buses" className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 outline-none focus:border-violet-400" />
-                    <button onClick={() => void reviseGeneralTask()} disabled={!generalFollowUp.trim() || generalBusy} className="rounded-md border border-violet-400/50 px-3 py-2 text-[11px] text-violet-100 disabled:opacity-40">Send</button>
-                  </div>
-                  {generalTask.pendingAction && (
-                    <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-[11px] text-amber-100">
-                      <p className="font-medium">I’m ready to take the next safe step when you confirm it.</p>
-                      {generalTask.confirmationId && <p className="mt-1">Nothing has been sent or purchased yet.</p>}
-                    </div>
-                  )}
-                  {generalTask.executionActionId && (
-                    <div className="mt-3 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3 text-[11px] text-slate-200">
-                      <p className="font-medium text-violet-200">I’m preparing the safest next step for this request.</p>
-                    </div>
-                  )}
-                  <div className="mt-4 flex flex-wrap gap-2">
-                    {!['COMPLETED', 'COMPLETED_WITH_LIMITATIONS', 'BLOCKED', 'FAILED', 'CANCELLED'].includes(generalTask.phase) && <button onClick={() => void toggleGeneralPause()} disabled={generalBusy} className="rounded-md border border-slate-600 px-3 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">{generalTask.paused ? 'Resume' : 'Pause'}</button>}
-                    {!['COMPLETED', 'CANCELLED'].includes(generalTask.phase) && <button onClick={() => void stopGeneralTask()} disabled={generalBusy} className="rounded-md border border-rose-400/50 px-3 py-1.5 text-[11px] text-rose-200 disabled:opacity-40">Stop Agent</button>}
-                    {!generalTaskActive && <button onClick={() => { setGeneralTask(null); setGeneralClarification(''); setGeneralFollowUp(''); }} disabled={generalBusy} className="rounded-md border border-slate-600 px-3 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">New task</button>}
-                  </div>
-                </div>
-              </div>
-            )}
-          </section>
+            <GeneralAgentWorkspace
+              generalTask={generalTask}
+              generalGoal={generalGoal}
+              generalClarification={generalClarification}
+              generalFollowUp={generalFollowUp}
+              generalBusy={generalBusy}
+              generalTaskActive={generalTaskActive}
+              onGoalChange={setGeneralGoal}
+              onClarificationChange={setGeneralClarification}
+              onFollowUpChange={setGeneralFollowUp}
+              onStartTask={() => void startGeneralTask()}
+              onRetry={() => void retryGeneralAgent()}
+              onRevise={() => void reviseGeneralTask()}
+              onTogglePause={() => void toggleGeneralPause()}
+              onStop={() => void stopGeneralTask()}
+              onNewTask={() => { setGeneralTask(null); setGeneralClarification(''); setGeneralFollowUp(''); }}
+              generalUserStatus={generalUserStatus}
+              generalUserProgressMessage={generalUserProgressMessage}
+              generalUserFailureMessage={generalUserFailureMessage}
+              generalSafeObservationSummary={generalSafeObservationSummary}
+            />
+          </GeneralAgentPage>
         ) : appMode === 'developer' ? (
-          <section className="m-auto flex w-full max-w-3xl flex-1 flex-col rounded-2xl border border-sky-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7">
+          <CodingAgentPage>
             <div className="mb-5">
               <p className="text-[11px] font-semibold uppercase tracking-wider text-sky-300">Developer Mode</p>
               <h2 className="mt-1 text-xl font-semibold">Coding assistant</h2>
               <p className="mt-2 text-xs text-slate-500">Read and search are automatic. Source writes happen only through a validated proposal after you explicitly approve it; verification uses allow-listed project scripts.</p>
             </div>
-            <div className="mb-5 rounded-xl border border-slate-700 bg-slate-800/50 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Project</p>
-                  <p className="truncate text-xs text-slate-300">{developerProjectRoot || 'No project folder selected'}</p>
-                </div>
-                <div className="flex shrink-0 gap-2">
-                  <button onClick={() => void chooseDeveloperProject()} disabled={developerBusy || developerStreaming} className="rounded-md border border-sky-500/50 px-2 py-1.5 text-[11px] text-sky-300 disabled:opacity-40">Select folder</button>
-                  {developerProjectRoot && <button onClick={() => void clearDeveloperProject()} disabled={developerBusy || developerStreaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Clear</button>}
-                </div>
-              </div>
-              {developerProjectRoot && <div className="mt-3 space-y-2">
-                <div className="flex gap-2">
-                  <input value={developerPath} onChange={(event) => setDeveloperPath(event.target.value)} placeholder="Relative path (.)" className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400" />
-                  <button onClick={() => void listDeveloperDirectory()} disabled={developerBusy || developerStreaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">List</button>
-                  <button onClick={() => void readDeveloperFile()} disabled={developerBusy || developerStreaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Read file</button>
-                </div>
-                {developerDirectory.length > 0 && <div className="max-h-32 overflow-y-auto rounded-md border border-slate-700 bg-slate-950 p-2">{developerDirectory.map((entry) => <button key={`${entry.type}-${entry.name}`} onClick={() => setDeveloperPath(developerPath === '.' ? entry.name : `${developerPath.replace(/[\\/]+$/, '')}/${entry.name}`)} className="block w-full truncate px-1 py-1 text-left text-[11px] text-slate-300 hover:text-sky-300">{entry.type === 'directory' ? '📁' : '📄'} {entry.name}</button>)}</div>}
-                {developerFilePath && <pre className="max-h-48 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] leading-relaxed text-slate-300">{developerFileContent}</pre>}
-                <div className="border-t border-slate-700 pt-2">
-                  <div className="flex gap-2">
-                    <input value={developerSearchQuery} onChange={(event) => setDeveloperSearchQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void searchDeveloperCode(); } }} placeholder="Search filenames and code..." className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400" />
-                    <button onClick={() => void searchDeveloperCode()} disabled={developerBusy || developerStreaming || !developerSearchQuery.trim()} className="rounded-md border border-sky-500/50 px-2 py-1.5 text-[11px] text-sky-300 disabled:opacity-40">Search</button>
-                  </div>
-                  {developerSearchResults.length > 0 && <div className="mt-2 max-h-40 overflow-y-auto rounded-md border border-slate-700 bg-slate-950 p-2">{developerSearchResults.map((result, index) => <button key={`${result.path}-${result.line}-${index}`} onClick={() => { setDeveloperPath(result.path); if (result.line > 0) void readDeveloperFile(result.path); }} className="block w-full truncate px-1 py-1 text-left text-[11px] text-slate-300 hover:text-sky-300">{result.path}{result.line > 0 ? `:${result.line}` : ''} · {result.text}</button>)}</div>}
-                </div>
-                <div className="border-t border-slate-700 pt-3">
-                  <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Proposal-only code changes</p>
-                  <p className="mb-2 text-[11px] leading-relaxed text-slate-500">Search and read context is captured twice before the assistant proposes a minimal patch. Nothing is written to disk.</p>
-                  <input
-                    value={developerProposalSearchQuery}
-                    onChange={(event) => setDeveloperProposalSearchQuery(event.target.value)}
-                    placeholder="Search query for relevant files"
-                    className="mb-2 w-full rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400"
-                  />
-                  <textarea
-                    value={developerChangeRequest}
-                    onChange={(event) => setDeveloperChangeRequest(event.target.value)}
-                    placeholder="Describe the code change to propose..."
-                    rows={3}
-                    className="w-full resize-y rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400"
-                  />
-                  <button
-                    onClick={() => void generateDeveloperProposal()}
-                    disabled={developerBusy || developerStreaming || !developerProposalSearchQuery.trim() || !developerChangeRequest.trim()}
-                    className="mt-2 rounded-md border border-amber-500/50 px-2 py-1.5 text-[11px] text-amber-200 disabled:opacity-40"
-                  >
-                    {developerBusy ? 'Preparing proposal...' : 'Generate proposal'}
-                  </button>
-                </div>
-              </div>}
-            </div>
-            {developerProposal && (
-              <section className="mb-5 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-200">Proposed diff</p>
-                    <p className="mt-1 text-[11px] text-slate-400">State: {developerProposal.lifecycleState || developerProposal.state || 'pending'} · main process validates every file before writing.</p>
-                    {developerProposal.runtime && (
-                      <p className="mt-1 text-[10px] text-emerald-300">Task phase: {developerProposal.runtime.phase || developerProposal.runtime.taskState || 'CREATED'} · plan v{developerProposal.runtime.planVersion || 1}</p>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {developerProposal.state === 'awaiting_approval' && <button onClick={() => void approveDeveloperProposal()} disabled={developerBusy} className="rounded-md bg-amber-400 px-2 py-1 text-[11px] font-medium text-slate-950 disabled:opacity-40">Approve</button>}
-                    {developerProposal.state === 'approved' && <button onClick={() => void applyDeveloperProposal()} disabled={developerBusy} className="rounded-md bg-emerald-400 px-2 py-1 text-[11px] font-medium text-slate-950 disabled:opacity-40">Apply and verify</button>}
-                    {developerProposal.state === 'completed' && <button onClick={() => void undoDeveloperProposal()} disabled={developerBusy} className="rounded-md border border-rose-400/60 px-2 py-1 text-[11px] text-rose-200 disabled:opacity-40">Undo</button>}
-                    <button onClick={() => setDeveloperProposal(null)} className="text-[11px] text-slate-400 hover:text-slate-200">Discard</button>
-                  </div>
-                </div>
-                <p className="mt-2 text-[11px] text-slate-500">Re-read files: {developerProposal.searchedFiles.join(', ')}</p>
-                {developerProposal.files.length > 0 ? (
-                  <div className="mt-3 space-y-3">
-                    {developerProposal.files.map((file) => (
-                      <div key={file.path} className="overflow-hidden rounded-md border border-slate-700 bg-slate-950">
-                        <p className="border-b border-slate-700 px-2 py-1.5 text-xs font-medium text-slate-200">{file.path}</p>
-                        <pre className="max-h-80 overflow-auto p-2 text-[11px] leading-relaxed text-slate-300">{file.lines.map((line, index) => <span key={`${file.path}-${index}`} className={`block ${line.startsWith('+') && !line.startsWith('+++') ? 'bg-emerald-500/10 text-emerald-200' : line.startsWith('-') && !line.startsWith('---') ? 'bg-rose-500/10 text-rose-200' : 'text-slate-400'}`}>{line || ' '}</span>)}</pre>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <pre className="mt-3 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] text-slate-300">{developerProposal.raw || 'No safe changes proposed.'}</pre>
-                )}
-                {developerProposal.verification && (
-                  <div className={`mt-3 rounded-md border p-2 text-[11px] ${developerProposal.verification.status === 'PASS' || developerProposal.verification.status === 'NOT_AVAILABLE' ? 'border-emerald-500/30 text-emerald-200' : 'border-rose-500/30 text-rose-200'}`}>
-                    <p>Verification: {developerProposal.verification.status || 'UNKNOWN'}</p>
-                    {developerProposal.verification.reason && <p className="mt-1 text-slate-400">{developerProposal.verification.reason}</p>}
-                    {developerProposal.verification.attempts?.filter((attempt) => !attempt.ok).map((attempt, index) => (
-                      <p key={`${attempt.check || 'check'}-${index}`} className="mt-1 text-rose-200">
-                        {attempt.check || 'check'}: {attempt.classification || 'failed'}{attempt.extracted?.file ? ` · ${attempt.extracted.file}${attempt.extracted.line ? `:${attempt.extracted.line}` : ''}` : ''}
-                      </p>
-                    ))}
-                  </div>
-                )}
-                {developerProposal.error && <p className="mt-2 text-[11px] text-rose-300">{developerProposal.error}</p>}
-              </section>
-            )}
-            <div className="flex-1 space-y-4 overflow-y-auto">
-              {developerMessages.length === 0 && <p className="rounded-lg border border-dashed border-slate-700 p-5 text-center text-sm text-slate-500">Ask a coding question to get started.</p>}
-              {developerMessages.map((message, index) => (
-                <article key={message.requestId || `${message.role}-${index}`} className={`rounded-xl border p-4 ${message.role === 'user' ? 'border-slate-700 bg-slate-800/60' : 'border-sky-500/20 bg-slate-950/60'}`}>
-                  <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">{message.role === 'user' ? 'You' : 'Developer assistant'}</p>
-                  {message.role === 'assistant' ? <div className="text-sm leading-relaxed text-slate-100">{renderAnswerMarkdown(message.content || (message.streaming ? 'Thinking...' : 'No answer yet.'))}</div> : <p className="whitespace-pre-wrap text-sm text-slate-200">{message.content}</p>}
-                </article>
-              ))}
-            </div>
-            <div className="mt-5 flex gap-2">
-              <input value={developerInput} onChange={(event) => setDeveloperInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendDeveloperMessage(); } }} placeholder="Ask a coding question..." className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-sky-400" />
-              <button onClick={() => void sendDeveloperMessage()} disabled={!developerInput.trim() || developerStreaming || developerBusy} className="rounded-lg bg-sky-500 px-4 text-sm font-medium text-slate-950 disabled:opacity-40">Send</button>
-            </div>
-            {developerMessages.length > 0 && <button onClick={() => { setDeveloperMessages([]); setDeveloperInput(''); }} className="mt-3 self-start text-xs text-slate-400 hover:text-slate-200">Clear developer conversation</button>}
-          </section>
-        ) : !sessionActive ? (
-          <section className="m-auto w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900/80 p-6 shadow-2xl">
-            <div className="mb-6 text-center"><h2 className="text-2xl font-semibold">Meeting AI Assistant</h2><p className="mt-2 text-sm text-slate-400">Listen to internal system audio and get concise answers.</p></div>
-            <div className="space-y-4">
-               <label className="block text-xs font-medium uppercase tracking-wide text-slate-400">Audio source<select value={meetingAudioMode} onChange={(event) => setMeetingAudioMode(event.target.value as MeetingAudioMode)} aria-label="Audio source" className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-slate-200"><option value="microphone">Microphone (spoken questions)</option><option value="system">System / Internal Audio (meeting sound)</option><option value="meeting">Microphone + System / Internal Audio</option></select></label>
-              <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-sm"><div className="flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[12rem] truncate text-slate-200">{displayedAudioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span className="text-emerald-300">● {displayedAudioStatus}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className={`font-semibold ${microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}`}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">System audio</span><span className={`font-semibold ${systemAudioStatus === 'connected' || systemAudioStatus === 'testing' ? 'text-emerald-300' : 'text-slate-500'}`}>{systemAudioStatus === 'testing' ? 'TESTING' : systemAudioStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-3"><div className="mb-1 flex justify-between text-[11px] text-slate-500"><span>Audio level</span><span>{audioLevel}%</span></div><div className="flex h-2 gap-1">{Array.from({ length: 10 }, (_, index) => <span key={index} className={`flex-1 rounded ${audioLevel >= (index + 1) * 10 ? 'bg-emerald-400' : 'bg-slate-700'}`} />)}</div></div></div>
-              <p className="text-center text-[11px] text-slate-500">Choose microphone, internal system audio, or both. System audio requires the Electron desktop app and a playback source.</p>
-              <div className="flex gap-2"><button type="button" onClick={() => void testSystemAudio()} className="flex-1 rounded-lg border border-emerald-500/40 px-3 py-2.5 text-sm text-emerald-300 hover:bg-emerald-500/10">Test Audio</button><button type="button" onClick={() => void startMeetingCapture()} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2.5 text-sm font-medium text-slate-950 hover:bg-emerald-400">Start Listening</button></div>
-              {error && <div role="alert" className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs leading-relaxed text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
-            </div>
-          </section>
+            <CodingAgentWorkspace
+              messages={developerMessages}
+              input={developerInput}
+              projectRoot={developerProjectRoot}
+              directory={developerDirectory}
+              path={developerPath}
+              filePath={developerFilePath}
+              fileContent={developerFileContent}
+              searchQuery={developerSearchQuery}
+              searchResults={developerSearchResults}
+              proposalSearchQuery={developerProposalSearchQuery}
+              changeRequest={developerChangeRequest}
+              proposal={developerProposal}
+              busy={developerBusy}
+              streaming={developerStreaming}
+              onInputChange={setDeveloperInput}
+              onProjectPathChange={setDeveloperPath}
+              onSearchQueryChange={setDeveloperSearchQuery}
+              onProposalSearchQueryChange={setDeveloperProposalSearchQuery}
+              onChangeRequestChange={setDeveloperChangeRequest}
+              onSelectProject={() => void chooseDeveloperProject()}
+              onClearProject={() => void clearDeveloperProject()}
+              onListDirectory={() => void listDeveloperDirectory()}
+              onReadFile={(filePath) => void readDeveloperFile(filePath)}
+              onSearch={() => void searchDeveloperCode()}
+              onGenerateProposal={() => void generateDeveloperProposal()}
+              onApproveProposal={() => void approveDeveloperProposal()}
+              onApplyProposal={() => void applyDeveloperProposal()}
+              onUndoProposal={() => void undoDeveloperProposal()}
+              onDiscardProposal={() => setDeveloperProposal(null)}
+              onSendMessage={() => void sendDeveloperMessage()}
+              onClearMessages={() => { setDeveloperMessages([]); setDeveloperInput(''); }}
+            />
+          </CodingAgentPage>
         ) : (
-          <section className="flex flex-1 flex-col">
-            {meetingMenuOpen && <div className="mb-4 rounded-xl border border-slate-700 bg-slate-900 p-4 text-xs"><div className="flex justify-between"><span className="text-slate-400">Audio source</span><span>{meetingAudioMode === 'meeting' ? 'Microphone + System / Internal Audio' : meetingAudioMode === 'system' ? 'System / Internal Audio' : 'Microphone'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[14rem] truncate">{displayedAudioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span>{displayedAudioStatus}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className={microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">System audio</span><span className={systemAudioStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}>{systemAudioStatus === 'connected' ? 'ON' : 'OFF'}</span></div>{isRecording || isTranscribing ? <button type="button" onClick={stopMeetingCapture} className="mt-3 rounded-lg border border-slate-600 px-3 py-2 text-slate-300 hover:border-rose-400">Stop Listening</button> : <button type="button" onClick={() => void startMeetingCapture()} className="mt-3 rounded-lg border border-emerald-500/40 px-3 py-2 text-emerald-300 hover:border-emerald-400">Start Listening</button>}</div>}
-            <div className="mb-5 text-center"><p className={`text-sm font-medium ${statusTone}`}>● {statusLabel}</p><p className="mt-2 text-xs text-slate-500">{pipelineStatus === 'listening' ? 'Listening for a question' : pipelineStatus === 'thinking' ? 'Generating answer...' : 'Your answer will appear below'}</p></div>
-            <div className="mb-4"><p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-slate-500">Last heard</p><p className="truncate text-sm text-slate-300">{liveTranscript || 'Waiting for speech...'}</p></div>
-            <AnswerSessionView lastQuestion={lastQuestion} lastAnswer={lastAnswer} isThinking={pipelineStatus === 'thinking'} answeredSegments={answeredSegments} />
-            <div className="mt-4 flex items-center justify-between"><button type="button" onClick={() => setTranscriptOpen((open) => !open)} className="text-xs text-emerald-300 hover:text-emerald-200">{transcriptOpen ? 'Hide full transcript' : 'View full transcript'}</button>{isRecording || isTranscribing ? <button type="button" onClick={stopMeetingCapture} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-rose-400">Stop Listening</button> : <button type="button" onClick={() => void startMeetingCapture()} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:border-emerald-400">Start Listening</button>}</div>
-            {transcriptOpen && <div className="mt-3 max-h-48 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">{liveTranscript || 'No transcript captured yet.'}</div>}
-            {error && <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
-            <div className="mt-5 flex gap-2"><input value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="Ask a text question..." className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-emerald-400" /><button onClick={() => void sendMessage()} disabled={!input.trim() || chatStreaming} className="rounded-lg bg-emerald-500 px-4 text-sm font-medium text-slate-950 disabled:opacity-40">Send</button></div>
-          </section>
+          <MeetingAssistantWorkspace
+            sessionActive={sessionActive}
+            meetingAudioMode={meetingAudioMode}
+            displayedAudioSourceLabel={displayedAudioSourceLabel}
+            displayedAudioStatus={displayedAudioStatus}
+            microphoneStatus={microphoneStatus}
+            systemAudioStatus={systemAudioStatus}
+            audioLevel={audioLevel}
+            meetingMenuOpen={meetingMenuOpen}
+            statusTone={statusTone}
+            statusLabel={statusLabel}
+            pipelineStatus={pipelineStatus}
+            liveTranscript={liveTranscript}
+            lastQuestion={lastQuestion}
+            lastAnswer={lastAnswer}
+            answeredSegments={answeredSegments}
+            transcriptOpen={transcriptOpen}
+            error={error}
+            input={input}
+            isRecording={isRecording}
+            isTranscribing={isTranscribing}
+            chatStreaming={chatStreaming}
+            onAudioModeChange={setMeetingAudioMode}
+            onTestAudio={() => void testSystemAudio()}
+            onStartCapture={() => void startMeetingCapture()}
+            onStopCapture={stopMeetingCapture}
+            onTranscriptToggle={() => setTranscriptOpen((open) => !open)}
+            onInputChange={setInput}
+            onSendMessage={() => void sendMessage()}
+          />
         )}
       </main>
 

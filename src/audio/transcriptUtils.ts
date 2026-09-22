@@ -96,6 +96,24 @@ function isRepeatedNoise(text: string) {
     || isRepeatedSentenceNoise(text);
 }
 
+function hasMeaningfulRequestContent(text: string) {
+  const stopWords = new Set([
+    'a', 'an', 'and', 'are', 'be', 'but', 'for', 'from', 'have', 'i', 'in',
+    'is', 'it', 'me', 'of', 'on', 'or', 'the', 'this', 'to', 'with', 'you',
+  ]);
+  const words = text
+    .replace(/[.!?]+$/g, '')
+    .toLocaleLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  const meaningfulWords = new Set(words.filter((word) => !stopWords.has(word)));
+  return meaningfulWords.size >= 2;
+}
+
+function isDeclarativeStatement(text: string) {
+  return /^(?:i\s+(?:am|will|can|would|have|have to|am going to|will be)|i['’](?:m|ll))\b/i.test(text);
+}
+
 const questionOpening = /^(?:what|why|how|when|where|who|which|can|could|would|is|are|do|does|explain|tell me|compare|describe|summarize|review|analyze|show me|help me|please\s+(?:tell me|explain|describe))\b/i;
 
 function questionFingerprint(text: string) {
@@ -296,13 +314,21 @@ export function prepareQuestion(rawText: string, context?: TranscriptNormalizati
     return { rawText: raw, normalizedText: normalized, acceptedQuestion: null, qualityClassification: 'INCOMPLETE' };
   }
   const detected = detectQuestion(normalized);
-  if (!detected.isQuestion || !detected.question) {
+  if (detected.isQuestion && detected.question) {
+    return {
+      rawText: raw,
+      normalizedText: normalized,
+      acceptedQuestion: detected.question,
+      qualityClassification: 'ACCEPTED',
+    };
+  }
+  if (isDeclarativeStatement(normalized) || !hasMeaningfulRequestContent(normalized)) {
     return { rawText: raw, normalizedText: normalized, acceptedQuestion: null, qualityClassification: 'NOT_A_QUESTION' };
   }
   return {
     rawText: raw,
     normalizedText: normalized,
-    acceptedQuestion: detected.question,
+    acceptedQuestion: normalized,
     qualityClassification: 'ACCEPTED',
   };
 }
@@ -340,10 +366,7 @@ export function joinQuestionContinuation(
   if (!isIncomplete(previous)) return null;
   const previousText = cleanTranscript(previous, context).replace(/[.!?…]+$/g, '').trim();
   const currentText = cleanTranscript(current, context);
-  if (!previousText || !currentText || /^(what|why|how|when|where|who|can|could|would|is|are|do|does|explain|tell me|compare|describe)\b/i.test(currentText)) {
-    return null;
-  }
-  if (!/(?:\b(?:between|of|in|for|to|and|or|with|from|the|a|an|difference)\s*)$/i.test(previousText)) {
+  if (!previousText || !currentText || isIncomplete(currentText) || !hasMeaningfulRequestContent(currentText)) {
     return null;
   }
   return cleanTranscript(`${previousText} ${currentText}`, context);

@@ -104,7 +104,7 @@ interface GeneralTaskState {
   observationVersion: number;
   lastObservation: Record<string, unknown> | null;
   assistantResponse: {
-    status: 'COMPLETED' | 'ERROR';
+    status: 'COMPLETED' | 'PARTIAL' | 'ERROR';
     content: string;
     provider: string | null;
     model: string | null;
@@ -308,7 +308,7 @@ interface Window {
     resumeGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
     recoverGeneralTask: (taskId: string) => Promise<GeneralTaskState>;
     observeGeneralTask: (taskId: string, observation: { kind?: string; url?: string; text?: string; summary?: string }) => Promise<GeneralTaskState>;
-    recordGeneralModelResponse: (taskId: string, input: { status?: 'COMPLETED' | 'ERROR'; content?: string; provider?: string; model?: string; requestId?: string; failureClassification?: string; category?: string; error?: string; contextMetrics?: Record<string, unknown> | null }) => Promise<GeneralTaskState>;
+    recordGeneralModelResponse: (taskId: string, input: { status?: 'COMPLETED' | 'PARTIAL' | 'ERROR'; content?: string; provider?: string; model?: string; requestId?: string; failureClassification?: string; category?: string; error?: string; contextMetrics?: Record<string, unknown> | null }) => Promise<GeneralTaskState>;
     prepareGeneralAction: (taskId: string, name: string, args?: Record<string, unknown>) => Promise<{ requiresConfirmation: boolean; loginRequired?: boolean; confirmation?: { confirmationId: string; taskId: string; sessionId: string; actionId: string; site: string | null; target: string; riskLevel: string; summary: string; expiresAt: string }; task: GeneralTaskState }>;
     beginGeneralAction: (taskId: string) => Promise<GeneralTaskState>;
     confirmGeneralAction: (taskId: string, confirmationId: string) => Promise<GeneralTaskState>;

@@ -108,17 +108,28 @@ async function processInfo(pid) {
 }
 
 function portOpen(port) {
+  const hosts = ['localhost', '127.0.0.1', '::1'];
   return new Promise((resolve) => {
-    const socket = net.createConnection({ host: '127.0.0.1', port });
-    socket.once('connect', () => {
-      socket.destroy();
-      resolve(true);
-    });
-    socket.once('error', () => resolve(false));
-    socket.setTimeout(250, () => {
-      socket.destroy();
-      resolve(false);
-    });
+    let pending = hosts.length;
+    let open = false;
+    for (const host of hosts) {
+      const socket = net.createConnection({ host, port });
+      socket.once('connect', () => {
+        open = true;
+        socket.destroy();
+        resolve(true);
+      });
+      socket.once('error', () => {
+        socket.destroy();
+        pending -= 1;
+        if (!open && pending === 0) resolve(false);
+      });
+      socket.setTimeout(250, () => {
+        socket.destroy();
+        pending -= 1;
+        if (!open && pending === 0) resolve(false);
+      });
+    }
   });
 }
 
@@ -147,32 +158,17 @@ async function stopOwnedProcess(info) {
 }
 
 async function preflight() {
-  const unknown = [];
+  const occupied = [];
   for (const port of ports) {
     const pids = await listeningPids(port);
     for (const pid of pids) {
       const info = await processInfo(pid);
-      if (!info || !isProjectProcess(info)) {
-        unknown.push({ port, pid, command: info?.commandLine || 'unavailable' });
-        continue;
-      }
-      console.log(`Stopping stale project process ${pid} on port ${port}.`);
-      await stopOwnedProcess(info);
+      occupied.push({ port, pid, command: info?.commandLine || 'unavailable' });
     }
   }
 
-  if (unknown.length) {
-    for (const conflict of unknown) {
-      console.error(`Port ${conflict.port} is in use by an unknown process (PID ${conflict.pid}).`);
-      console.error(`Refusing to stop it: ${conflict.command}`);
-    }
-    throw new Error('Launcher preflight failed because one or more ports are owned by unknown processes.');
-  }
-
-  for (const port of ports) {
-    if (await portOpen(port)) {
-      throw new Error(`Port ${port} is still occupied after stopping project processes.`);
-    }
+  for (const conflict of occupied) {
+    console.log(`Reusing service already listening on port ${conflict.port} (PID ${conflict.pid}).`);
   }
 }
 
@@ -183,4 +179,4 @@ if (process.argv[1] && normalize(fileURLToPath(import.meta.url)) === normalize(p
   });
 }
 
-export { preflight, isProjectProcess };
+export { preflight, isProjectProcess, portOpen };

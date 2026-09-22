@@ -3,6 +3,9 @@ import fs from 'node:fs/promises';
 
 const transcriptUtils = await import('../src/audio/transcriptUtils.ts');
 const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const appTypesSource = await fs.readFile(new URL('../src/app/appTypes.ts', import.meta.url), 'utf8');
+const modeControlsSource = await fs.readFile(new URL('../src/ui/header/ModeControls.tsx', import.meta.url), 'utf8');
+const meetingWorkspaceSource = await fs.readFile(new URL('../src/features/meeting/MeetingAssistantWorkspace.tsx', import.meta.url), 'utf8');
 const electronMainSource = await fs.readFile(new URL('../electron/main.cjs', import.meta.url), 'utf8');
 const interviewPromptSource = await fs.readFile(new URL('../src/ai/interviewSystemPrompt.ts', import.meta.url), 'utf8');
 
@@ -66,6 +69,14 @@ assert.equal(transcriptUtils.prepareQuestion('Introduce yourself.').acceptedQues
 assert.equal(transcriptUtils.prepareQuestion('Technical vocabulary. Technical vocabulary. Technical vocabulary.').qualityClassification, 'REPEATED_NOISE');
 assert.equal(transcriptUtils.prepareTextRequest('Introduce yourself').acceptedQuestion, 'Introduce yourself');
 assert.equal(transcriptUtils.prepareTextRequest('Explain dependency injection in Spring.').acceptedQuestion, 'Explain dependency injection in Spring?');
+assert.equal(transcriptUtils.prepareQuestion('Explain artificial intelligence.').acceptedQuestion, 'Explain artificial intelligence?');
+assert.equal(transcriptUtils.prepareQuestion('Tell me how Spring Boot works.').acceptedQuestion, 'Tell me how Spring Boot works?');
+assert.equal(transcriptUtils.prepareQuestion('I need help debugging this code.').acceptedQuestion, 'I need help debugging this code.');
+assert.equal(transcriptUtils.prepareQuestion('The first is the first.').acceptedQuestion, null);
+assert.equal(
+  transcriptUtils.joinQuestionContinuation('Can you explain...', 'how Spring Boot dependency injection works?'),
+  'Can you explain how Spring Boot dependency injection works?',
+);
 assert.equal(
   transcriptUtils.joinQuestionContinuation(
     'What is the difference between...',
@@ -79,11 +90,11 @@ assert.equal(
 );
 assert.equal(transcriptUtils.voiceSafeText('  a   complete   answer  '), 'a complete answer');
 
-assert.match(appSource, /type AppMode = 'assistant' \| 'developer' \| 'general';/);
+assert.match(appTypesSource, /export type AppMode = 'assistant' \| 'developer' \| 'general';/);
 assert.match(appSource, /useState<AppMode>\('assistant'\)/);
-assert.match(appSource, /setAppMode\('assistant'\)/);
-assert.match(appSource, /setAppMode\('developer'\)/);
-assert.match(appSource, /setAppMode\('general'\)/);
+assert.match(modeControlsSource, /onAppModeChange\('assistant'\)/);
+assert.match(modeControlsSource, /onAppModeChange\('developer'\)/);
+assert.match(modeControlsSource, /onAppModeChange\('general'\)/);
 assert.match(appSource, /\{appMode === 'general' \?[\s\S]+appMode === 'developer' \?/);
 assert.match(appSource, /const \[messages, setMessages\]/);
 assert.match(appSource, /const \[developerMessages, setDeveloperMessages\]/);
@@ -107,10 +118,10 @@ assert.match(appSource, /DUPLICATE_TRANSCRIPT_IGNORED/);
 assert.match(appSource, /rawText: candidateRawText/);
 assert.match(appSource, /acceptedQuestionRequestIdsRef/);
 assert.match(appSource, /releaseAcceptedQuestion\(String\(msg\.requestId\)\)/);
-assert.match(appSource, /type MeetingAudioMode = 'microphone' \| 'system' \| 'meeting';/);
+assert.match(appTypesSource, /export type MeetingAudioMode = 'microphone' \| 'system' \| 'meeting';/);
 assert.match(appSource, /const microphoneAudio = meetingAudioMode !== 'system';/);
 assert.match(appSource, /const systemAudioRequested = meetingAudioMode !== 'microphone';/);
-assert.match(appSource, /System \/ Internal Audio \(meeting sound\)/);
+assert.match(meetingWorkspaceSource, /System \/ Internal Audio \(meeting sound\)/);
 assert.match(appSource, /Microphone and system audio connected/);
 assert.match(appSource, /System audio connected/);
 assert.match(appSource, /SYSTEM_AUDIO_UNAVAILABLE/);
@@ -127,8 +138,8 @@ assert.match(appSource, /recorderRef\.current === recorder/);
 assert.match(appSource, /nextSegment\?\.sttSession === sttSession/);
 assert.match(appSource, /STALE_STT_CALLBACK_IGNORED/);
 assert.match(appSource, /setIsRecording\(false\);\s*setIsTranscribing\(false\);\s*setPipelineStatus\('stopped'\)/);
-assert.match(appSource, /isRecording \|\| isTranscribing \? <button type="button" onClick=\{stopMeetingCapture\}/);
-assert.match(appSource, /<button type="button" onClick=\{\(\) => void startMeetingCapture\(\)\}[^>]*>Start Listening<\/button>/);
+assert.match(meetingWorkspaceSource, /isRecording \|\| isTranscribing \? <button type="button" onClick=\{onStopCapture\}/);
+assert.match(meetingWorkspaceSource, /<button type="button" onClick=\{onStartCapture\}[^>]*>Start Listening<\/button>/);
 assert.match(electronMainSource, /setDisplayMediaRequestHandler/);
 assert.match(electronMainSource, /audio: 'loopback'/);
 assert.match(electronMainSource, /types: \['screen'\]/);

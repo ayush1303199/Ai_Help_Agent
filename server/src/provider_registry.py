@@ -124,6 +124,7 @@ class ProviderRegistry:
         # serialized by ProviderInstance.to_dict() or save_to_file().
         self._runtime_api_keys: Dict[str, str] = {}
         self.active_provider_id: Optional[str] = None
+        self.stt_provider_id: Optional[str] = None
         self.fallback_enabled: bool = True
         self.state = RegistryState.LOADING
         self.error: Optional[str] = None
@@ -203,6 +204,7 @@ class ProviderRegistry:
             if self.active_provider_id and self.active_provider_id not in self.providers:
                 self.active_provider_id = next(iter(self.providers.keys())) if self.providers else None
             self.fallback_enabled = data.get("fallbackEnabled", True)
+            self.stt_provider_id = data.get("sttProvider")
         except Exception as e:
             print(f"Error loading provider config from {self.config_path}: {e}")
 
@@ -317,6 +319,7 @@ class ProviderRegistry:
                     )
                 ],
                 "activeProvider": self.active_provider_id,
+                "sttProvider": self.stt_provider_id,
                 "fallbackEnabled": self.fallback_enabled,
                 "lastModifiedAt": datetime.now().isoformat(),
             }
