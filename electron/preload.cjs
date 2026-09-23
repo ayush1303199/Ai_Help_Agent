@@ -20,6 +20,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setOverlayBounds: (bounds) => ipcRenderer.invoke('overlay:set-bounds', bounds),
   setOverlayAlwaysOnTop: (alwaysOnTop) => ipcRenderer.invoke('overlay:set-always-on-top', alwaysOnTop),
   focusOverlayAnswer: () => ipcRenderer.invoke('overlay:focus-answer'),
+  captureScreen: () => ipcRenderer.invoke('screen:capture'),
+  onScreenReadShortcut: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = () => callback();
+    ipcRenderer.on('screen:read-shortcut', listener);
+    return () => ipcRenderer.removeListener('screen:read-shortcut', listener);
+  },
   chooseDeveloperProject: () => ipcRenderer.invoke('developer:choose-project'),
   clearDeveloperProject: () => ipcRenderer.invoke('developer:clear-project'),
   listDeveloperDirectory: (relativePath) => ipcRenderer.invoke('developer:list-directory', relativePath),

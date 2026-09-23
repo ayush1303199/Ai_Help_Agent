@@ -230,6 +230,8 @@ interface Window {
     setOverlayAlwaysOnTop: (alwaysOnTop: boolean) => Promise<OverlayRendererState>;
     onOverlayState: (callback: (state: OverlayRendererState) => void) => () => void;
     focusOverlayAnswer: () => Promise<OverlayRendererState>;
+    captureScreen: () => Promise<string>;
+    onScreenReadShortcut: (callback: () => void) => () => void;
     chooseDeveloperProject: () => Promise<{ canceled: boolean; projectRoot: string | null }>;
     clearDeveloperProject: () => Promise<void>;
     listDeveloperDirectory: (relativePath?: string) => Promise<Array<{ name: string; type: 'file' | 'directory' }>>;

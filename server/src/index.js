@@ -11,6 +11,7 @@ import {
   reorderConfiguredProviders,
   setAgentPermissions,
   setFallbackEnabled,
+  setConfiguredProviderStatus,
   setRuntimeProvider,
   updateConfiguredProvider,
   upsertConfiguredProvider,
@@ -54,9 +55,7 @@ function storeSelfTestStatus(adapterType, model, result) {
   const storedStatus = result.status === 'READY' ? 'ok' : String(result.status || 'unknown').toLowerCase().replace(/_/g, '-');
   for (const provider of config.configuredProviders) {
     if (provider.adapterType === adapterType && (!model || provider.model === model)) {
-      provider.status = storedStatus;
-      provider.lastError = result.status === 'READY' ? '' : (result.reason || result.status || '');
-      provider.lastCheckedAt = Date.now();
+      setConfiguredProviderStatus(provider.id, storedStatus, result.status === 'READY' ? '' : (result.reason || result.status || ''));
     }
   }
 }

@@ -184,6 +184,7 @@ export default function Overlay() {
   const effectiveLowVisibility = state.visibility === 'VISIBLE' && (state.lowVisibility === true || interactiveLowVisibility);
   const opacity = state.opacity ?? 1;
   const opacityPercent = Math.round(opacity * 100);
+  const searchBusy = state.status === 'thinking' || state.status === 'transcribing';
   const visualOpacity = effectiveLowVisibility && !isHovered && !isFocused
     ? Math.min(opacity, 0.38)
     : opacity;
@@ -439,9 +440,9 @@ export default function Overlay() {
             aria-label="Search with AI"
             maxLength={2000}
           />
-          <button type="submit" className="overlay-search-button" disabled={!searchText.trim()} aria-label="Send search to AI">
+          <button type="submit" className="overlay-search-button" disabled={!searchText.trim() || searchBusy} aria-label="Send search to AI">
             <Search size={15} />
-            <span>Ask</span>
+            <span>{searchBusy ? 'Waiting…' : 'Ask'}</span>
           </button>
         </div>
         {searchError && <p className="overlay-search-error" role="alert">{searchError}</p>}

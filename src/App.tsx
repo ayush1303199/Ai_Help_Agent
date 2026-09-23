@@ -21,7 +21,7 @@ import {
   X,
   Zap
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import {
   cleanTranscript,
   joinQuestionContinuation,
@@ -50,8 +50,6 @@ import { resolveContext, truncateContextText } from './context/contextResolver';
 import { providerPresets, type ProviderId } from './config/providerPresets';
 import { runtimeConfig } from './config/runtimeConfig';
 import { createPastedDocument, extractPdfDocuments, type NormalizedDocument } from './documents/documentService';
-import { renderAnswerMarkdown } from './ui/answerMarkdown';
-import { AnswerSessionView } from './ui/AnswerSessionView';
 import { ConfiguredProvidersPanel } from './ui/ConfiguredProvidersPanel';
 import { ConfirmationDialog } from './ui/ConfirmationDialog';
 import { ContextInputDialog } from './ui/ContextInputDialog';
@@ -60,10 +58,13 @@ import { CodingAgentWorkspace } from './features/coding/CodingAgentWorkspace';
 import { GeneralAgentPage } from './features/general/GeneralAgentPage';
 import { GeneralAgentWorkspace } from './features/general/GeneralAgentWorkspace';
 import { MeetingAssistantWorkspace } from './features/meeting/MeetingAssistantWorkspace';
+import { ChatHistoryModal } from './features/history/ChatHistoryModal';
+import { useScreenReader } from './features/screen-reading/useScreenReader';
 import { AppHeader } from './ui/header/AppHeader';
-import { ContextButton, ContextPanel, HistoryButton, OverlayButton, SettingsButton } from './ui/header/HeaderActions';
+import { ContextButton, ContextPanel, FontSizeControls, HistoryButton, OverlayButton, ScreenReadingToggle, SettingsButton } from './ui/header/HeaderActions';
 import { ModeControls } from './ui/header/ModeControls';
 import type { AppMode, AssistantMode, MeetingAudioMode } from './app/appTypes';
+import { historyTitle, readHistory, removeHistorySession, searchHistory, upsertHistory, writeHistory, type HistoryMode } from './history/historyService';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -85,6 +86,7 @@ interface PendingAudioSegment {
 interface SendMessageOptions {
   preparedQuestion?: PreparedQuestion;
   duplicateChecked?: boolean;
+  screenImage?: string;
 }
 
 interface GeneralModelMessage {
@@ -193,6 +195,7 @@ interface ChatSession {
   title: string;
   messages: Message[];
   updatedAt: string;
+  mode: HistoryMode;
 }
 
 type SessionDocument = NormalizedDocument;
@@ -333,11 +336,6 @@ function compactMessageContent(content: string) {
   return `${content.slice(0, MAX_CHAT_MESSAGE_CHARS)}\n[Earlier content omitted for speed]`;
 }
 
-function chatTitle(messages: Message[]) {
-  const firstUserMessage = messages.find((message) => message.role === 'user')?.content.trim() || 'New conversation';
-  return firstUserMessage.length > 52 ? `${firstUserMessage.slice(0, 52)}…` : firstUserMessage;
-}
-
 function overlayPlainText(content: string) {
   return content
     .replace(/```[\s\S]*?```/g, ' ')
@@ -475,16 +473,10 @@ const agentPermissionOptions = [
 function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
-  const [chatHistory, setChatHistory] = useState<ChatSession[]>(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem('chat-history') || '[]');
-      return Array.isArray(saved) ? saved : [];
-    } catch {
-      return [];
-    }
-  });
+  const [chatHistory, setChatHistory] = useState<ChatSession[]>(readHistory);
   const [activeChatId, setActiveChatId] = useState<string>(() => crypto.randomUUID());
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historySearch, setHistorySearch] = useState('');
   const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
   const [copiedItem, setCopiedItem] = useState('');
   const [chatStreaming, setChatStreaming] = useState(false);
@@ -720,6 +712,7 @@ function App() {
             type: 'overlay-search-error',
             message: 'Please wait for the current AI answer to finish.',
           });
+
           return;
         }
         void overlaySendMessageRef.current?.(question);
@@ -791,7 +784,9 @@ function App() {
   }, [transcripts]);
 
   useEffect(() => {
-    localStorage.setItem('chat-history', JSON.stringify(chatHistory));
+    if (!writeHistory(chatHistory)) {
+      setError('Chat history could not be saved because browser storage is full or unavailable.');
+    }
   }, [chatHistory]);
 
   useEffect(() => {
@@ -880,13 +875,41 @@ function App() {
 
   // Save only completed turns, so streaming tokens never cause storage writes.
   useEffect(() => {
-    if (messages.length === 0 || messages.some((message) => message.streaming)) return;
+    const hasCompletedTurn = messages.some((message, index) => (
+      message.role === 'user'
+      && messages[index + 1]?.role === 'assistant'
+      && Boolean(messages[index + 1]?.content.trim())
+      && !messages[index + 1]?.streaming
+    ));
+    if (!hasCompletedTurn || messages.some((message) => message.streaming)) return;
     const savedMessages = messages.map(({ role, content }) => ({ role, content }));
-    setChatHistory((previous) => [
-      { id: activeChatId, title: chatTitle(savedMessages), messages: savedMessages, updatedAt: new Date().toISOString() },
-      ...previous.filter((session) => session.id !== activeChatId),
-    ].slice(0, 30));
+    const historyEntry: ChatSession = { id: activeChatId, mode: 'assistant', title: historyTitle(savedMessages), messages: savedMessages, updatedAt: new Date().toISOString() };
+    setChatHistory((previous) => upsertHistory(previous, historyEntry));
   }, [activeChatId, messages]);
+
+  useEffect(() => {
+    const hasCompletedTurn = developerMessages.some((message, index) => (
+      message.role === 'user'
+      && developerMessages[index + 1]?.role === 'assistant'
+      && Boolean(developerMessages[index + 1]?.content.trim())
+      && !developerMessages[index + 1]?.streaming
+    ));
+    if (!hasCompletedTurn || developerMessages.some((message) => message.streaming)) return;
+    const savedMessages = developerMessages.map(({ role, content }) => ({ role, content }));
+    const historyEntry: ChatSession = { id: `coding-${activeChatId}`, mode: 'developer', title: historyTitle(savedMessages), messages: savedMessages, updatedAt: new Date().toISOString() };
+    setChatHistory((previous) => upsertHistory(previous, historyEntry));
+  }, [activeChatId, developerMessages]);
+
+  useEffect(() => {
+    const response = generalTask?.assistantResponse;
+    if (!generalTask || !response?.content || !['COMPLETED', 'COMPLETED_WITH_LIMITATIONS'].includes(generalTask.phase)) return;
+    const savedMessages: Message[] = [
+      { role: 'user', content: generalTask.goal },
+      { role: 'assistant', content: response.content },
+    ];
+    const historyEntry: ChatSession = { id: `general-${generalTask.taskId}`, mode: 'general', title: historyTitle(savedMessages), messages: savedMessages, updatedAt: new Date().toISOString() };
+    setChatHistory((previous) => upsertHistory(previous, historyEntry));
+  }, [generalTask]);
 
   const savedJobDescription = sessionDocuments.find((document) => document.name === 'Job Description: Pasted text')?.text || '';
   const closeContextMenu = useCallback(() => {
@@ -1840,7 +1863,12 @@ function App() {
         ...previousConversation,
         {
           role: 'user' as const,
-          content: `CURRENT QUESTION:\n${canonicalQuestion}\n\nTASK:\nAnswer this question directly. Stay on topic, preserve its terminology, and ask one concise clarification only if it is genuinely ambiguous.`,
+          content: options.screenImage
+            ? [
+              { type: 'text', text: `${canonicalQuestion}\n\nRead the attached shared-screen image. Identify any visible interview or meeting question and answer it directly. If no question is visible, say so.` },
+              { type: 'image_url', image_url: { url: options.screenImage } },
+            ]
+            : `CURRENT QUESTION:\n${canonicalQuestion}\n\nTASK:\nAnswer this question directly. Stay on topic, preserve its terminology, and ask one concise clarification only if it is genuinely ambiguous.`,
         },
       ];
       const contextStartedAt = performance.now();
@@ -1888,6 +1916,14 @@ function App() {
       setChatStreaming(pendingChatRequestIdsRef.current.size > 0);
       if (chatRequestIdRef.current === requestId) chatRequestIdRef.current = '';
       setPipelineStatus('error');
+      overlayChannelRef.current?.postMessage({
+        type: 'overlay-search-error',
+        message: `AI search failed: ${(err as Error).message}`,
+      });
+      overlayChannelRef.current?.postMessage({
+        type: 'state',
+        status: 'error',
+      });
       setMessages((prev) => {
         const next = [...prev];
         const message = next.find((item) => item.role === 'assistant' && item.requestId === requestId);
@@ -1907,6 +1943,20 @@ function App() {
     performance.now(),
     { preparedQuestion: prepareTextRequest(question) },
   );
+
+  const { readScreen: readSharedScreen, screenReading, enabled: screenReadingEnabled, setEnabled: setScreenReadingEnabled } = useScreenReader({
+    disabled: chatStreaming,
+    onError: setError,
+    onScreenCaptured: async (image) => {
+      await sendMessage(
+        'Read the visible question on my shared meeting screen and answer it.',
+        undefined,
+        undefined,
+        performance.now(),
+        { duplicateChecked: true, screenImage: image },
+      );
+    },
+  });
 
   const sendDeveloperMessage = async () => {
     const question = developerInput.trim();
@@ -3322,12 +3372,58 @@ function App() {
   };
 
   const openHistorySession = (session: ChatSession) => {
-    setActiveChatId(session.id);
-    setMessages(session.messages.map((message) => ({ ...message, streaming: false })));
+    const restoredMessages = session.messages.map((message) => ({ ...message, streaming: false }));
+    if (session.mode === 'developer') {
+      setAppMode('developer');
+      setDeveloperMessages(restoredMessages);
+      setDeveloperInput('');
+    } else {
+      setAppMode('assistant');
+      setActiveChatId(session.id);
+      setMessages(restoredMessages);
+    }
     setInput('');
     setError('');
     setHistoryOpen(false);
   };
+
+  const deleteHistorySession = (sessionId: string) => {
+    setChatHistory((previous) => removeHistorySession(previous, sessionId));
+    if (activeChatId === sessionId) {
+      setMessages([]);
+      setInput('');
+      setError('');
+      setActiveChatId(crypto.randomUUID());
+    }
+  };
+
+  const requestDeleteHistorySession = (session: ChatSession) => {
+    requestConfirmation({
+      title: 'Delete this conversation?',
+      description: 'This permanently removes the selected conversation from local history.',
+      confirmLabel: 'Delete',
+      onConfirm: () => deleteHistorySession(session.id),
+    });
+  };
+
+  const requestDeleteAllHistory = useCallback(() => {
+    if (chatHistory.length === 0) return;
+    requestConfirmation({
+      title: 'Delete all chat history?',
+      description: 'This permanently removes every saved conversation from local history and clears the current chat.',
+      confirmLabel: 'Delete all',
+      onConfirm: () => {
+        setChatHistory([]);
+        setMessages([]);
+        setInput('');
+        setError('');
+        setActiveChatId(crypto.randomUUID());
+        setHistoryOpen(false);
+      },
+    });
+  }, [chatHistory.length, requestConfirmation]);
+
+  const filteredChatHistory = searchHistory(chatHistory, historySearch);
 
   const requestClearChat = useCallback(() => {
     if (!messages.length) {
@@ -3357,14 +3453,23 @@ function App() {
   const statusLabel = pipelineStatus === 'listening' ? 'Listening...' : pipelineStatus === 'transcribing' ? 'Transcribing...' : pipelineStatus === 'question' ? 'Question detected' : pipelineStatus === 'thinking' ? 'Thinking...' : pipelineStatus === 'answer' ? 'Answer ready' : pipelineStatus === 'stopped' ? 'Stopped' : 'Ready';
   const statusTone = pipelineStatus === 'error' ? 'text-rose-300' : pipelineStatus === 'answer' ? 'text-emerald-300' : 'text-sky-300';
 
+  const [fontScale, setFontScale] = useState(() => {
+    const saved = Number(localStorage.getItem('ui-font-scale'));
+    return Number.isFinite(saved) && saved >= 0.9 && saved <= 1.2 ? saved : 1;
+  });
+
+  useEffect(() => {
+    localStorage.setItem('ui-font-scale', String(fontScale));
+  }, [fontScale]);
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-100">
+    <div className="app-shell min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-100" style={{ '--app-font-scale': fontScale } as CSSProperties}>
       <AppHeader>
-          <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-[1_1_12rem] items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-400"><Bot className="h-5 w-5 text-slate-950" /></div>
-            <div><h1 className="text-sm font-semibold">Meeting AI Assistant</h1><p className={`text-[11px] ${statusTone}`}>● {statusLabel}</p></div>
+            <div className="min-w-0"><h1 className="break-words text-sm font-semibold">Meeting AI Assistant</h1><p className={`truncate text-[11px] ${statusTone}`}>● {statusLabel}</p></div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-[3_1_34rem] flex-wrap items-center justify-end gap-2">
             <ModeControls
               appMode={appMode}
               assistantMode={mode}
@@ -3381,7 +3486,8 @@ function App() {
                 setError('Overlay mode is available in the Electron desktop app.');
               }
             }} />
-            {appMode === 'assistant' && sessionActive && <button type="button" onClick={() => setMeetingMenuOpen((open) => !open)} aria-expanded={meetingMenuOpen} className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
+            {appMode === 'assistant' && <ScreenReadingToggle enabled={screenReadingEnabled} onClick={() => setScreenReadingEnabled(!screenReadingEnabled)} />}
+            {appMode === 'assistant' && sessionActive && <button type="button" onClick={() => setMeetingMenuOpen((open) => !open)} aria-expanded={meetingMenuOpen} className="ui-button border border-slate-700 text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
             <div className={`${appMode === 'assistant' ? '' : 'hidden'} relative`}>
               <ContextButton open={contextMenuOpen} onClick={() => (contextMenuOpen ? closeContextMenu() : openContextMenu())} />
               {contextMenuOpen && (
@@ -3560,6 +3666,7 @@ function App() {
             </div>
             <SettingsButton onClick={openConfiguration} />
             <HistoryButton onClick={() => setHistoryOpen(true)} />
+            <FontSizeControls value={fontScale} onChange={setFontScale} />
           </div>
       </AppHeader>
       {/* Header */}
@@ -3749,27 +3856,23 @@ function App() {
         }}
       />
 
-      {historyOpen && (
-        <div className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-slate-950/70 px-3 py-4 backdrop-blur-sm sm:px-4 sm:py-8" role="presentation" onMouseDown={() => setHistoryOpen(false)}>
-          <div className="my-auto w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl sm:p-5" role="dialog" aria-modal="true" aria-label="Chat history" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="mb-4 flex items-center justify-between"><div><h2 className="text-lg font-semibold">Chat history</h2><p className="text-xs text-slate-400">Saved locally on this device</p></div><button type="button" onClick={() => setHistoryOpen(false)} aria-label="Close chat history" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white"><X className="h-4 w-4" /></button></div>
-            <div className="mb-3 flex gap-2"><button type="button" onClick={requestClearChat} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400">New chat</button><button type="button" onClick={copyConversation} disabled={!messages.length} className="rounded-lg border border-slate-600 px-3 py-2 text-xs text-slate-200 hover:border-emerald-400 disabled:opacity-40">{copiedItem === 'conversation' ? 'Copied' : 'Copy chat'}</button></div>
-            {chatHistory.length === 0 ? <p className="rounded-lg border border-dashed border-slate-700 p-4 text-center text-xs text-slate-500">Completed conversations appear here.</p> : <div className="max-h-80 space-y-2 overflow-y-auto">{chatHistory.map((session) => <button type="button" key={session.id} onClick={() => openHistorySession(session)} className="block w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-left hover:border-emerald-400"><span className="block truncate text-sm text-slate-200">{session.title}</span><span className="mt-1 block text-[11px] text-slate-500">{new Date(session.updatedAt).toLocaleString()}</span></button>)}</div>}
-          </div>
-        </div>
-      )}
+      {historyOpen && <ChatHistoryModal sessions={chatHistory} filteredSessions={filteredChatHistory} search={historySearch} copiedItem={copiedItem} hasCurrentMessages={messages.length > 0} onSearchChange={setHistorySearch} onClose={() => setHistoryOpen(false)} onNewChat={requestClearChat} onCopyChat={copyConversation} onDeleteAll={requestDeleteAllHistory} onOpenSession={openHistorySession} onDeleteSession={requestDeleteHistorySession} />}
 
       {settingsOpen && (
         <div
           className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-slate-950/70 px-3 py-4 backdrop-blur-sm sm:px-4 sm:py-8"
           role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !providerSaving && !agentSaving) setSettingsOpen(false);
+          }}
         >
           <div
-            className="my-auto max-h-[calc(100vh-2rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl sm:p-5"
+            className="my-auto max-h-[calc(100vh-2rem)] w-full max-w-3xl overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl sm:p-5 lg:p-6"
             role="dialog"
             aria-modal="true"
             aria-labelledby="configuration-title"
             onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => event.stopPropagation()}
           >
             <div className="mb-5 flex items-start justify-between">
               <div>
@@ -3778,7 +3881,7 @@ function App() {
               </div>
               <button type="button" onClick={() => { if (!providerSaving && !agentSaving) setSettingsOpen(false); }} disabled={providerSaving || agentSaving} aria-label="Close configuration" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"><X className="h-4 w-4" /></button>
             </div>
-            <div className="mb-5 grid grid-cols-2 rounded-lg border border-slate-700 bg-slate-800 p-1">
+            <div className="mb-5 grid grid-cols-2 gap-1 rounded-lg border border-slate-700 bg-slate-800 p-1">
               <button type="button" onClick={() => setSettingsTab('providers')} className={`rounded-md px-3 py-2 text-xs font-medium ${settingsTab === 'providers' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'}`}>AI Providers</button>
               <button type="button" onClick={() => setSettingsTab('permissions')} className={`rounded-md px-3 py-2 text-xs font-medium ${settingsTab === 'permissions' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'}`}>Permissions</button>
             </div>
@@ -3799,7 +3902,7 @@ function App() {
               onAdd={() => void saveConfiguredProvider()}
             />
             <label className="mb-2 block text-xs font-medium text-slate-300">Provider integrations</label>
-            <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
+            <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
               {Object.entries(providerPresets).map(([id, preset]) => (
                 <button type="button" key={id} onClick={() => chooseProvider(id as ProviderId)} className={`rounded-lg border px-2 py-2 text-left text-xs transition-colors ${providerId === id ? 'border-emerald-400 bg-emerald-500/10 text-emerald-300' : 'border-slate-700 bg-slate-800 text-slate-300 hover:border-slate-500'}`}>
                   {preset.label}
@@ -3951,6 +4054,9 @@ function App() {
             onTranscriptToggle={() => setTranscriptOpen((open) => !open)}
             onInputChange={setInput}
             onSendMessage={() => void sendMessage()}
+            onReadScreen={() => void readSharedScreen()}
+            screenReading={screenReading}
+            screenReadingEnabled={screenReadingEnabled}
           />
         )}
       </main>

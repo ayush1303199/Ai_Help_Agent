@@ -2,6 +2,9 @@
   "name": "vite-react-typescript-starter",
   "private": true,
   "version": "0.0.0",
+  "description": "AI Help Agent desktop assistant",
+  "author": "AI Help Agent",
+  "repository": "https://github.com/ayush1303199/Ai_Help_Agent",
   "type": "module",
   "scripts": {
     "dev": "npm run electron:dev",
@@ -10,6 +13,8 @@
     "server:dev": "npm --prefix server run dev",
     "electron:dev": "npm run preflight && node scripts/electron-dev.mjs",
     "electron:start": "electron electron/main.cjs",
+    "desktop:build": "npm run build:backend && npm run build && electron-builder --win nsis --publish never",
+    "build:backend": "node scripts/build-backend.mjs",
     "build": "vite build",
     "test": "node scripts/test-all.mjs",
     "test:phase8": "node scripts/phase8-protocol-test.mjs",
@@ -56,6 +61,7 @@
     "concurrently": "^10.0.5",
     "cross-env": "^10.1.0",
     "electron": "^44.3.0",
+    "electron-builder": "^26.0.12",
     "eslint": "^9.9.1",
     "eslint-plugin-react-hooks": "^5.1.0-rc.0",
     "eslint-plugin-react-refresh": "^0.4.11",
@@ -66,5 +72,38 @@
     "typescript-eslint": "^8.3.0",
     "vite": "^5.4.2",
     "wait-on": "^9.1.0"
+  },
+  "build": {
+    "appId": "com.aihelpagent.desktop",
+    "productName": "AI Help Agent",
+    "asar": true,
+    "publish": {
+      "provider": "generic",
+      "url": "https://example.invalid/ai-help-agent"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "server/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/backend-dist/ai-help-agent-backend",
+        "to": "backend"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
   }
 }

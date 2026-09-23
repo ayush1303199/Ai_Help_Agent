@@ -44,7 +44,7 @@ function ModeButton({ active, activeClass, disabled = false, onClick, children }
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${active ? activeClass : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
+      className={`ui-button rounded-md px-2.5 text-[11px] font-medium transition-colors ${active ? activeClass : 'text-slate-400 hover:text-slate-200'} disabled:cursor-not-allowed disabled:opacity-50`}
     >
       {children}
     </button>

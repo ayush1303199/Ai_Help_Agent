@@ -11,6 +11,7 @@ node_modules
 server/src/__pycache__/
 dist
 dist-ssr
+build
 *.local
 
 .vscode/*

@@ -9,6 +9,10 @@ from typing import Any, Callable, Dict, Optional
 import httpx
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
+from python_compat import configure_runtime_warnings
+
+configure_runtime_warnings()
+
 from openai import OpenAI
 
 

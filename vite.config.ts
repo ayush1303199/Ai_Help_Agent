@@ -38,6 +38,9 @@ function contentSecurityPolicyPlugin(command: 'build' | 'serve') {
 
 // https://vitejs.dev/config/
 export default defineConfig(({ command }) => ({
+  // Electron loads the production entrypoint from file://, so bundled assets
+  // must resolve relative to dist/index.html rather than the filesystem root.
+  base: command === 'build' ? './' : '/',
   plugins: [react(), contentSecurityPolicyPlugin(command)],
   resolve: {
     alias: {

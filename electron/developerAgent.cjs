@@ -72,15 +72,31 @@ function journalTask(task) {
     outcome: redact(task.outcome),
   };
 }
+async function renameWithRetry(source, target, attempts = 4) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await fs.rename(source, target);
+      return;
+    } catch (error) {
+      const retryable = ['EPERM', 'EBUSY', 'ENOTEMPTY'].includes(error.code);
+      if (!retryable || attempt === attempts - 1) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
+}
 function persistJournal(reason = 'mutation') {
   const targetPath = journalPath;
   if (!targetPath) return journalQueue;
   journalQueue = journalQueue.then(async () => {
     const payload = JSON.stringify({ version: 1, updatedAt: now(), reason, lastEventSequence: eventSequence, tasks: [...registry.values()].map(journalTask) }, null, 2);
-    const temp = `${targetPath}.tmp`;
+    const temp = `${targetPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
     await fs.mkdir(path.dirname(targetPath), { recursive: true });
-    await fs.writeFile(temp, payload, 'utf8');
-    await fs.rename(temp, targetPath);
+    try {
+      await fs.writeFile(temp, payload, 'utf8');
+      await renameWithRetry(temp, targetPath);
+    } finally {
+      await fs.rm(temp, { force: true }).catch(() => {});
+    }
   }).catch((error) => { journalError = error; });
   return journalQueue;
 }

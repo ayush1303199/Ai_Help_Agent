@@ -63,7 +63,7 @@ const css = await fs.readFile(new URL('../src/index.css', import.meta.url), 'utf
 assert.match(css, /\.overlay-search\s*\{/);
 assert.match(css, /\.overlay-shell\s*\{[\s\S]*?background:\s*linear-gradient/i);
 assert.doesNotMatch(css, /backdrop-filter|filter:\s*blur\s*\(/i);
-assert.match(css, /\.overlay-view\s*\{[\s\S]*?background:\s*rgba\(8,\s*69,\s*137,\s*0\.07\)/);
+assert.match(css, /\.overlay-view\s*\{[\s\S]*?background:\s*rgba\(2,\s*6,\s*23,\s*0\.48\)/);
 assert.match(overlay, /typeof BroadcastChannel !== 'undefined'/);
 assert.match(overlay, /channel\.close\(\)/);
 assert.match(overlay, /aria-controls=\{`overlay-panel-\$\{tab\.id\}`\}/);

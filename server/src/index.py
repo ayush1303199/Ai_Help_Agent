@@ -14,6 +14,10 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from python_compat import configure_runtime_warnings
+
+configure_runtime_warnings()
+
 from openai import OpenAI
 from pydantic import BaseModel
 import httpx

@@ -1,4 +1,6 @@
 const { app, BrowserWindow, desktopCapturer, session, ipcMain, dialog, globalShortcut, screen } = require('electron');
+const { spawn } = require('node:child_process');
+const net = require('node:net');
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const developerFiles = require('./developerFiles.cjs');
@@ -18,6 +20,8 @@ ignoreBrokenOutputPipe(process.stdout);
 ignoreBrokenOutputPipe(process.stderr);
 
 const isDev = !app.isPackaged;
+let backendProcess = null;
+let isQuitting = false;
 let mainWindow = null;
 let overlayWindow = null;
 const developerIndexCaches = new Map();
@@ -62,6 +66,67 @@ const overlayShortcutMap = new Map();
 let overlayBoundsPersistTimer = null;
 let overlayWriteSequence = 0;
 let overlayWriteQueue = Promise.resolve();
+
+function waitForPort(port, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const socket = net.createConnection({ host: '127.0.0.1', port });
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve();
+      });
+      socket.once('error', () => {
+        socket.destroy();
+        if (Date.now() >= deadline) reject(new Error(`Timed out waiting for backend port ${port}.`));
+        else setTimeout(attempt, 250);
+      });
+      socket.setTimeout(1000, () => socket.destroy());
+    };
+    attempt();
+  });
+}
+
+function isPortOpen(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.setTimeout(500, () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
+}
+
+async function startPackagedBackend() {
+  if (isDev || backendProcess) return;
+  const [httpReady, websocketReady] = await Promise.all([isPortOpen(3001), isPortOpen(3002)]);
+  if (httpReady && websocketReady) return;
+  const backendExecutable = process.platform === 'win32'
+    ? path.join(process.resourcesPath, 'backend', 'ai-help-agent-backend.exe')
+    : path.join(process.resourcesPath, 'backend', 'ai-help-agent-backend');
+  backendProcess = spawn(backendExecutable, [], {
+    cwd: path.dirname(backendExecutable),
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  backendProcess.once('exit', (code) => {
+    if (code && !isQuitting) {
+      dialog.showErrorBox('AI Assistant backend stopped', `The backend exited before the application was ready (code ${code}).`);
+    }
+    backendProcess = null;
+  });
+  await waitForPort(3001);
+  await waitForPort(3002);
+}
 
 function isPlainObject(value) {
   if (value === null || typeof value !== 'object') return false;
@@ -408,9 +473,20 @@ async function setOverlayAlwaysOnTop(alwaysOnTop) {
 
 function registerOverlayShortcuts() {
   const keyHandlers = [
+    { key: 'CommandOrControl+Shift+C', action: async () => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        mainWindow = createWindow();
+      }
+      mainWindow.show();
+      mainWindow.focus();
+    } },
     { key: 'CommandOrControl+Shift+Space', action: async () => { const visible = overlayState.visibility === 'VISIBLE'; const hidden = overlayState.visibility === 'HIDDEN'; const next = hidden ? 'VISIBLE' : visible ? 'HIDDEN' : 'VISIBLE'; if (!overlayWindow || overlayWindow.isDestroyed()) { await showOverlayWindow(); return; } if (next === 'VISIBLE') { await showOverlayWindow(); } else { await hideOverlayWindow(); } } },
     { key: 'CommandOrControl+Shift+M', action: async () => { if (!overlayWindow || overlayWindow.isDestroyed()) { await showOverlayWindow(); return; } if (overlayState.visibility === 'MINIMIZED') { await expandOverlayWindow(); } else { await minimizeOverlayWindow(); } } },
     { key: 'CommandOrControl+Shift+A', action: async () => { if (!overlayWindow || overlayWindow.isDestroyed()) { await showOverlayWindow(); return; } await showOverlayWindow(); if (overlayWindow && !overlayWindow.isDestroyed()) { overlayWindow.focus(); } } },
+    { key: 'CommandOrControl+Shift+R', action: async () => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('screen:read-shortcut');
+      if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.webContents.send('screen:read-shortcut');
+    } },
   ];
 
   keyHandlers.forEach(({ key, action }) => {
@@ -459,6 +535,7 @@ function createWindow() {
     minHeight: 620,
     backgroundColor: '#0b1020',
     autoHideMenuBar: true,
+    skipTaskbar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -469,6 +546,14 @@ function createWindow() {
 
   // Windows uses this to exclude the AI window from supported screen capture APIs.
   window.setContentProtection(true);
+
+  // Closing the main UI should keep the assistant and overlay alive in the
+  // background. The process exits only during the explicit app quit flow.
+  window.on('close', (event) => {
+    if (isQuitting) return;
+    event.preventDefault();
+    window.hide();
+  });
 
   if (isDev) {
     window.loadURL(process.env.ELECTRON_DEV_URL || 'http://localhost:5174');
@@ -501,6 +586,7 @@ async function createOverlayWindow() {
     frame: false,
     alwaysOnTop: Boolean(overlayState.alwaysOnTop),
     resizable: true,
+    skipTaskbar: true,
     hasShadow: false,
     show: false,
     backgroundColor: '#00000000',
@@ -570,6 +656,13 @@ async function createOverlayWindow() {
 }
 
 app.whenReady().then(async () => {
+  try {
+    await startPackagedBackend();
+  } catch (error) {
+    dialog.showErrorBox('AI Assistant backend unavailable', `The Python backend could not start.\n\n${error.message}`);
+    app.quit();
+    return;
+  }
   developerAgent.configureDurability({
     journalFile: path.join(app.getPath('userData'), 'developer-task-journal.json'),
     auditFile: path.join(app.getPath('userData'), 'developer-audit.jsonl'),
@@ -634,6 +727,17 @@ app.whenReady().then(async () => {
       overlayWindow.focus();
     }
     return overlayState;
+  });
+  ipcMain.handle('screen:capture', async (event) => {
+    assertTrustedOverlaySender(event);
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: 1600, height: 900 },
+      fetchWindowIcons: false,
+    });
+    const source = sources[0];
+    if (!source?.thumbnail || source.thumbnail.isEmpty()) throw new Error('No screen could be captured.');
+    return source.thumbnail.toDataURL();
   });
   ipcMain.handle('developer:choose-project', (event) => {
     developerAgent.getSession(event.sender.id);
@@ -895,6 +999,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('will-quit', () => {
+  isQuitting = true;
+  if (backendProcess && !backendProcess.killed) backendProcess.kill();
   unregisterOverlayShortcuts();
   globalShortcut.unregisterAll();
 });

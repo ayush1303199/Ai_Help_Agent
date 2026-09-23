@@ -31,7 +31,8 @@ export class ProviderError extends Error {
     this.kind = kind;
     this.provider = provider;
     this.status = status;
-    this.retryable = ['quota', 'rate_limit', 'capacity', 'network', 'timeout', 'service_unavailable'].includes(kind);
+    // An expired/revoked key should not stop a configured fallback chain.
+    this.retryable = ['invalid_key', 'quota', 'rate_limit', 'capacity', 'network', 'timeout', 'service_unavailable'].includes(kind);
   }
 }
 
@@ -448,8 +449,16 @@ export function buildGeminiContents(messages = []) {
     }
     leading = false;
     if (role === 'user' || role === 'developer') {
-      const text = contentToText(message.content);
-      if (text) appendGeminiPart(contents, 'user', { text });
+      const parts = Array.isArray(message.content) ? message.content : [{ type: 'text', text: contentToText(message.content) }];
+      for (const part of parts) {
+        if (part?.type === 'image_url' && part.image_url?.url) {
+          const match = String(part.image_url.url).match(/^data:(image\/[^;]+);base64,(.+)$/);
+          if (match) appendGeminiPart(contents, 'user', { inlineData: { mimeType: match[1], data: match[2] } });
+        } else {
+          const text = typeof part === 'string' ? part : part?.text || '';
+          if (text) appendGeminiPart(contents, 'user', { text });
+        }
+      }
       continue;
     }
     if (role === 'assistant') {
