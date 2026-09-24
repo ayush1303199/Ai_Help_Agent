@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 
 const scripts = [
+  'architecture-boundary-test.mjs',
+  'developer-pipeline-contract-test.mjs',
   'developer-agent-test.mjs',
   'developer-gates-test.mjs',
   'developer-lifecycle-test.mjs',
