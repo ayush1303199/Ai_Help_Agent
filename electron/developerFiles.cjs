@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { detectProject, PROJECT_MANIFESTS, VERIFICATION_PROFILES } = require('./coding-pipeline/detect/projectDetector.cjs');
 
 const MAX_FILE_BYTES = 512 * 1024;
 const MAX_SEARCH_RESULTS = 100;
@@ -23,28 +24,6 @@ const NETWORK_POLICY = Object.freeze({ mode: 'restricted', outbound: 'not-grante
 const SENSITIVE_NAME_PATTERN = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
 const SENSITIVE_DIRECTORY_NAMES = new Set(['.ssh', '.aws', '.azure', '.config']);
 const LOW_VALUE_PATH_PATTERN = /(?:^|[\\/])(?:\.idea|assets?|fonts?|vendor|node_modules|dist|build|coverage|tmp|cache)(?:[\\/]|$)|\.(?:ttf|woff2?|eot|map|min\.(?:js|css))$/i;
-const PROJECT_MANIFESTS = [
-  { type: 'node', language: 'javascript', files: ['package.json'], extensions: ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'], priority: 100 },
-  { type: 'php', language: 'php', files: ['composer.json'], extensions: ['.php'], priority: 95 },
-  { type: 'java-maven', language: 'java', files: ['pom.xml'], extensions: ['.java'], priority: 90 },
-  { type: 'java-gradle', language: 'java', files: ['build.gradle', 'build.gradle.kts'], extensions: ['.java', '.kt'], priority: 89 },
-  { type: 'go', language: 'go', files: ['go.mod'], extensions: ['.go'], priority: 88 },
-  { type: 'ruby', language: 'ruby', files: ['Gemfile'], extensions: ['.rb'], priority: 87 },
-  { type: 'dotnet', language: 'dotnet', files: ['*.csproj', '*.sln'], extensions: ['.cs', '.fs', '.vb'], priority: 86 },
-  { type: 'rust', language: 'rust', files: ['Cargo.toml'], extensions: ['.rs'], priority: 85 },
-  { type: 'python', language: 'python', files: ['requirements.txt', 'pyproject.toml'], extensions: ['.py'], priority: 84 },
-];
-const VERIFICATION_PROFILES = {
-  node: { checks: ['test', 'lint', 'build'], fallbacks: [] },
-  php: { checks: ['phpunit', 'composer-test', 'php-lint'], fallbacks: ['php-lint'] },
-  'java-maven': { checks: ['maven-test', 'maven-build'], fallbacks: [] },
-  'java-gradle': { checks: ['gradle-test', 'gradle-build'], fallbacks: [] },
-  go: { checks: ['go-test', 'go-vet', 'go-build'], fallbacks: [] },
-  ruby: { checks: ['ruby-test', 'ruby-lint'], fallbacks: [] },
-  dotnet: { checks: ['dotnet-test', 'dotnet-build'], fallbacks: [] },
-  rust: { checks: ['cargo-test', 'cargo-clippy', 'cargo-build'], fallbacks: [] },
-  python: { checks: ['python-test', 'python-lint'], fallbacks: [] },
-};
 const CHECK_COMMANDS = {
   'maven-test': { executable: 'mvn', args: ['test'] },
   'maven-build': { executable: 'mvn', args: ['package', '-DskipTests'] },
@@ -353,51 +332,7 @@ async function runGit(args, ownerWebContentsId) {
   return { args, stdout, stderr };
 }
 
-function manifestMatches(name, pattern) {
-  if (pattern.startsWith('*')) return name.toLowerCase().endsWith(pattern.slice(1).toLowerCase());
-  return name.toLowerCase() === pattern.toLowerCase();
-}
-async function detectProjectType(root) {
-  const files = new Set();
-  const rootFiles = new Set();
-  const extensions = new Map();
-  async function walk(relativeDirectory, depth = 0) {
-    if (depth > 8) return;
-    let directory;
-    try { directory = await fs.readdir(path.join(root, relativeDirectory), { withFileTypes: true }); } catch { return; }
-    for (const entry of directory) {
-      if (isIgnoredName(entry.name) || isSensitivePath(entry.name)) continue;
-      const relative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
-      if (entry.isDirectory()) await walk(relative, depth + 1);
-      else if (entry.isFile()) {
-        files.add(entry.name);
-        if (relativeDirectory === '.') rootFiles.add(entry.name);
-        const extension = path.extname(entry.name).toLowerCase();
-        if (extension) extensions.set(extension, (extensions.get(extension) || 0) + 1);
-      }
-    }
-  }
-  await walk('.');
-  const detected = PROJECT_MANIFESTS
-    .map((profile) => ({ profile, matches: profile.files.filter((file) => [...rootFiles].some((name) => manifestMatches(name, file))) }))
-    .filter((item) => item.matches.length)
-    .sort((a, b) => b.profile.priority - a.profile.priority)[0];
-  const profile = detected?.profile || [...PROJECT_MANIFESTS]
-    .map((item) => ({ item, count: item.extensions.reduce((sum, ext) => sum + (extensions.get(ext) || 0), 0) }))
-    .sort((a, b) => b.count - a.count || b.item.priority - a.item.priority)[0]?.item;
-  const type = profile?.type || 'unknown';
-  return {
-    type,
-    language: profile?.language || 'unknown',
-    manifest: detected?.matches[0] || null,
-    confidence: detected ? 'manifest' : profile ? 'extension-guess' : 'unknown',
-    profile: VERIFICATION_PROFILES[type] || { checks: [], fallbacks: [] },
-    hasPhpUnitConfig: rootFiles.has('phpunit.xml') || rootFiles.has('phpunit.xml.dist'),
-    composer: rootFiles.has('composer.json') ? 'composer.json' : null,
-    hasPackageJson: rootFiles.has('package.json'),
-    extensions: profile?.extensions || [],
-  };
-}
+const detectProjectType = detectProject;
 
 function classifyProjectSignals({ hasPackageJson = false, composer = false, hasPhpFile = false, hasPhpUnitConfig = false } = {}) {
   return { isPhp: !hasPackageJson && Boolean(composer || hasPhpFile), hasPhpUnitConfig };

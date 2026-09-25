@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { INDEX_STAGE, runIndexStage } = require('./coding-pipeline/index/indexStage.cjs');
 
 const SUPPORTED = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.php', '.java', '.kt', '.go', '.rb', '.cs', '.fs', '.vb', '.rs', '.py']);
 const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo', '.cache', 'logs', 'tmp', 'temp']);
@@ -242,4 +243,8 @@ async function assertWithinRoot(rootInput, relativePath) {
   if (!inside(root, target)) throw new Error('Path is outside the indexed root.');
   return target;
 }
-module.exports = { SUPPORTED, parseSource, buildIndex, buildRepositoryMap, searchSymbols, definitions, relationships, findReferences, inside, assertWithinRoot, isIgnoredName, isSensitivePath };
+module.exports = {
+  SUPPORTED, parseSource, buildIndex, buildRepositoryMap, searchSymbols, definitions, relationships,
+  findReferences, inside, assertWithinRoot, isIgnoredName, isSensitivePath,
+  INDEX_STAGE, runIndexStage,
+};
