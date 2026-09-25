@@ -1,5 +1,5 @@
 const { performance } = require('node:perf_hooks');
-const { parseRuntimeFailure, redactRuntimeValue, classifyProjectSignals } = require('./developerFiles.cjs');
+const { parseRuntimeFailure, redactRuntimeValue, classifyProjectSignals, PROJECT_MANIFESTS, VERIFICATION_PROFILES } = require('./developerFiles.cjs');
 
 function clamp(value, min = 0, max = 1) {
   if (!Number.isFinite(value)) return min;
@@ -212,6 +212,18 @@ function runCodingAgentBenchmark() {
       name: 'project-type-node-vs-php',
       passed: classifyProjectSignals({ hasPackageJson: true, composer: true, hasPhpFile: true }).isPhp === false
         && classifyProjectSignals({ composer: true, hasPhpFile: true, hasPhpUnitConfig: true }).isPhp === true,
+    },
+    {
+      name: 'generic-java-go-profile-selection',
+      passed: PROJECT_MANIFESTS.find((item) => item.files.includes('pom.xml'))?.type === 'java-maven'
+        && PROJECT_MANIFESTS.find((item) => item.files.includes('go.mod'))?.language === 'go'
+        && VERIFICATION_PROFILES['java-maven']?.checks.includes('maven-test')
+        && VERIFICATION_PROFILES.go?.checks.includes('go-test'),
+    },
+    {
+      name: 'generic-stack-location-patterns',
+      passed: parseRuntimeFailure('panic: failed\nmain.go:17:4').frames[0]?.line === 17
+        && parseRuntimeFailure('Build failed at src/Main.java(22)').frames[0]?.line === 22,
     },
   ];
   results.push(...runtimeCases.map((item) => ({ ...item, status: item.passed ? 'strong' : 'weak', regression: false, score: item.passed ? 1 : 0 })));

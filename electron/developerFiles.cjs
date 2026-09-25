@@ -23,6 +23,46 @@ const NETWORK_POLICY = Object.freeze({ mode: 'restricted', outbound: 'not-grante
 const SENSITIVE_NAME_PATTERN = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
 const SENSITIVE_DIRECTORY_NAMES = new Set(['.ssh', '.aws', '.azure', '.config']);
 const LOW_VALUE_PATH_PATTERN = /(?:^|[\\/])(?:\.idea|assets?|fonts?|vendor|node_modules|dist|build|coverage|tmp|cache)(?:[\\/]|$)|\.(?:ttf|woff2?|eot|map|min\.(?:js|css))$/i;
+const PROJECT_MANIFESTS = [
+  { type: 'node', language: 'javascript', files: ['package.json'], extensions: ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'], priority: 100 },
+  { type: 'php', language: 'php', files: ['composer.json'], extensions: ['.php'], priority: 95 },
+  { type: 'java-maven', language: 'java', files: ['pom.xml'], extensions: ['.java'], priority: 90 },
+  { type: 'java-gradle', language: 'java', files: ['build.gradle', 'build.gradle.kts'], extensions: ['.java', '.kt'], priority: 89 },
+  { type: 'go', language: 'go', files: ['go.mod'], extensions: ['.go'], priority: 88 },
+  { type: 'ruby', language: 'ruby', files: ['Gemfile'], extensions: ['.rb'], priority: 87 },
+  { type: 'dotnet', language: 'dotnet', files: ['*.csproj', '*.sln'], extensions: ['.cs', '.fs', '.vb'], priority: 86 },
+  { type: 'rust', language: 'rust', files: ['Cargo.toml'], extensions: ['.rs'], priority: 85 },
+  { type: 'python', language: 'python', files: ['requirements.txt', 'pyproject.toml'], extensions: ['.py'], priority: 84 },
+];
+const VERIFICATION_PROFILES = {
+  node: { checks: ['test', 'lint', 'build'], fallbacks: [] },
+  php: { checks: ['phpunit', 'composer-test', 'php-lint'], fallbacks: ['php-lint'] },
+  'java-maven': { checks: ['maven-test', 'maven-build'], fallbacks: [] },
+  'java-gradle': { checks: ['gradle-test', 'gradle-build'], fallbacks: [] },
+  go: { checks: ['go-test', 'go-vet', 'go-build'], fallbacks: [] },
+  ruby: { checks: ['ruby-test', 'ruby-lint'], fallbacks: [] },
+  dotnet: { checks: ['dotnet-test', 'dotnet-build'], fallbacks: [] },
+  rust: { checks: ['cargo-test', 'cargo-clippy', 'cargo-build'], fallbacks: [] },
+  python: { checks: ['python-test', 'python-lint'], fallbacks: [] },
+};
+const CHECK_COMMANDS = {
+  'maven-test': { executable: 'mvn', args: ['test'] },
+  'maven-build': { executable: 'mvn', args: ['package', '-DskipTests'] },
+  'gradle-test': { executable: process.platform === 'win32' ? 'gradlew.bat' : './gradlew', args: ['test'] },
+  'gradle-build': { executable: process.platform === 'win32' ? 'gradlew.bat' : './gradlew', args: ['build'] },
+  'go-test': { executable: 'go', args: ['test', './...'] },
+  'go-vet': { executable: 'go', args: ['vet', './...'] },
+  'go-build': { executable: 'go', args: ['build', './...'] },
+  'ruby-test': { executable: 'bundle', args: ['exec', 'rspec'] },
+  'ruby-lint': { executable: 'rubocop', args: [] },
+  'dotnet-test': { executable: 'dotnet', args: ['test', '--no-restore'] },
+  'dotnet-build': { executable: 'dotnet', args: ['build', '--no-restore'] },
+  'cargo-test': { executable: 'cargo', args: ['test'] },
+  'cargo-clippy': { executable: 'cargo', args: ['clippy', '--', '-D', 'warnings'] },
+  'cargo-build': { executable: 'cargo', args: ['build'] },
+  'python-test': { executable: 'python', args: ['-m', 'pytest'] },
+  'python-lint': { executable: 'python', args: ['-m', 'compileall', '-q', '.'] },
+};
 
 const projectRoots = new Map();
 
@@ -238,15 +278,17 @@ function parseRuntimeFailure(output) {
     /(?:at\s+(?:[^()\r\n]+\s+\()?|File\s+["'])([A-Za-z]:[\\/][^()\r\n"']+|\/[^()\r\n"']+|[^()\s:"']+\.[cm]?[jt]sx?|[^()\s:"']+\.py):(\d+)(?::(\d+))?/g,
     /File\s+["']([^"']+)["'],\s*line\s+(\d+)/g,
     /(?:PHP\s+(?:Fatal error|Parse error|Warning|Notice):.*?\s+in\s+|#\d+\s+)([A-Za-z]:[\\/][^()\r\n]+|\/[^()\r\n]+|[^()\s:()]+\.php)\s*(?:on line\s+|\()(\d+)/gi,
-    /([A-Za-z]:[\\/][^()\r\n]+|\/[^()\r\n]+|[^()\s:()]+\.php):(\d+)(?::(\d+))?/gi,
+    /([A-Za-z]:[\\/][^()\r\n]+|\/[^()\r\n]+|[^()\s:()]+\.(?:php|java|kt|go|rb|cs|fs|vb|rs|py|js|jsx|ts|tsx))(?::(\d+)|\((\d+)(?::(\d+))?\))/gi,
   ];
   patterns.forEach((pattern) => {
     let match;
     while ((match = pattern.exec(text)) && frames.length < MAX_RUNTIME_FRAMES) {
-      const frameKey = `${match[1]}:${match[2]}:${match[3] || ''}`;
+      const line = Number(match[2] || match[3]);
+      const column = match[4] ? Number(match[4]) : (match[3] && match[2] ? Number(match[3]) : null);
+      const frameKey = `${match[1]}:${line}:${column || ''}`;
       if (seen.has(frameKey)) continue;
       seen.add(frameKey);
-      frames.push({ file: match[1], line: Number(match[2]), column: match[3] ? Number(match[3]) : null });
+      frames.push({ file: match[1], line, column });
     }
   });
   const message = text.split(/\r?\n/).map((line) => line.trim())
@@ -311,31 +353,50 @@ async function runGit(args, ownerWebContentsId) {
   return { args, stdout, stderr };
 }
 
+function manifestMatches(name, pattern) {
+  if (pattern.startsWith('*')) return name.toLowerCase().endsWith(pattern.slice(1).toLowerCase());
+  return name.toLowerCase() === pattern.toLowerCase();
+}
 async function detectProjectType(root) {
-  let hasPhpFile = false;
-  let hasPhpUnitConfig = false;
-  let composer = null;
-  let hasPackageJson = false;
-  try { await fs.stat(path.join(root, 'package.json')); hasPackageJson = true; } catch {}
+  const files = new Set();
+  const rootFiles = new Set();
+  const extensions = new Map();
   async function walk(relativeDirectory, depth = 0) {
-    if (depth > 8 || hasPhpFile && hasPhpUnitConfig && composer) return;
-    const directory = await fs.readdir(path.join(root, relativeDirectory), { withFileTypes: true });
+    if (depth > 8) return;
+    let directory;
+    try { directory = await fs.readdir(path.join(root, relativeDirectory), { withFileTypes: true }); } catch { return; }
     for (const entry of directory) {
       if (isIgnoredName(entry.name) || isSensitivePath(entry.name)) continue;
       const relative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
-      if (entry.isDirectory()) {
-        await walk(relative, depth + 1);
-        continue;
+      if (entry.isDirectory()) await walk(relative, depth + 1);
+      else if (entry.isFile()) {
+        files.add(entry.name);
+        if (relativeDirectory === '.') rootFiles.add(entry.name);
+        const extension = path.extname(entry.name).toLowerCase();
+        if (extension) extensions.set(extension, (extensions.get(extension) || 0) + 1);
       }
-      if (!entry.isFile()) continue;
-      const lower = entry.name.toLowerCase();
-      if (lower === 'composer.json') composer = relative;
-      if (lower === 'phpunit.xml' || lower === 'phpunit.xml.dist') hasPhpUnitConfig = true;
-      if (lower.endsWith('.php')) hasPhpFile = true;
     }
   }
   await walk('.');
-  return { ...classifyProjectSignals({ hasPackageJson, composer: Boolean(composer), hasPhpFile, hasPhpUnitConfig }), composer, hasPackageJson };
+  const detected = PROJECT_MANIFESTS
+    .map((profile) => ({ profile, matches: profile.files.filter((file) => [...rootFiles].some((name) => manifestMatches(name, file))) }))
+    .filter((item) => item.matches.length)
+    .sort((a, b) => b.profile.priority - a.profile.priority)[0];
+  const profile = detected?.profile || [...PROJECT_MANIFESTS]
+    .map((item) => ({ item, count: item.extensions.reduce((sum, ext) => sum + (extensions.get(ext) || 0), 0) }))
+    .sort((a, b) => b.count - a.count || b.item.priority - a.item.priority)[0]?.item;
+  const type = profile?.type || 'unknown';
+  return {
+    type,
+    language: profile?.language || 'unknown',
+    manifest: detected?.matches[0] || null,
+    confidence: detected ? 'manifest' : profile ? 'extension-guess' : 'unknown',
+    profile: VERIFICATION_PROFILES[type] || { checks: [], fallbacks: [] },
+    hasPhpUnitConfig: rootFiles.has('phpunit.xml') || rootFiles.has('phpunit.xml.dist'),
+    composer: rootFiles.has('composer.json') ? 'composer.json' : null,
+    hasPackageJson: rootFiles.has('package.json'),
+    extensions: profile?.extensions || [],
+  };
 }
 
 function classifyProjectSignals({ hasPackageJson = false, composer = false, hasPhpFile = false, hasPhpUnitConfig = false } = {}) {
@@ -378,7 +439,7 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
   if (typeof script !== 'string' || !/^[a-z][a-z0-9:_-]{0,31}$/i.test(script)) throw new Error('Verification script name is invalid.');
   const projectType = await detectProjectType(root);
   let phpCommand = null;
-  if (projectType.isPhp) {
+  if (projectType.type === 'php') {
     if (script === 'phpunit' && projectType.hasPhpUnitConfig
       && await hasProjectExecutable(root, process.platform === 'win32' ? 'vendor/bin/phpunit.bat' : 'vendor/bin/phpunit')) {
       phpCommand = { executable: process.platform === 'win32' ? 'vendor\\bin\\phpunit.bat' : './vendor/bin/phpunit', args: [] };
@@ -429,6 +490,35 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
       ? 'PHPUnit is not installed for this project (vendor/bin/phpunit not found); php-lint fallback used.'
       : null;
     return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, reason, networkPolicy: NETWORK_POLICY, lintFiles: phpCommand.lintFiles };
+  }
+  if (projectType.type !== 'node') {
+    const commandSpec = CHECK_COMMANDS[script];
+    if (!commandSpec || !projectType.profile.checks.includes(script)) {
+      throw new Error(`Verification check "${script}" is not available for detected project type "${projectType.type}".`);
+    }
+    const startedAt = Date.now();
+    const safeEnv = safeEnvironment(process.env);
+    const child = spawn(commandSpec.executable, commandSpec.args, { cwd: root, shell: false, windowsHide: true, env: safeEnv });
+    let stdout = ''; let stderr = '';
+    const appendBounded = (current, chunk) => current.length >= MAX_OUTPUT_CHARS ? current : (current + chunk.toString()).slice(0, MAX_OUTPUT_CHARS);
+    child.stdout.on('data', (chunk) => { stdout = appendBounded(stdout, chunk); });
+    child.stderr.on('data', (chunk) => { stderr = appendBounded(stderr, chunk); });
+    const result = await new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); };
+      const timer = setTimeout(() => { child.kill(); finish({ timedOut: true, exitCode: null }); }, MAX_COMMAND_DURATION_MS);
+      child.on('error', (error) => finish({ error: error.message, exitCode: null }));
+      child.on('close', (code) => finish({ exitCode: code }));
+    });
+    const durationMs = Date.now() - startedAt;
+    if (result.error) {
+      const missing = /enoent|not found/i.test(result.error);
+      return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: missing ? `${commandSpec.executable} not found in PATH.` : redactOutput(result.error), reason: missing ? `NOT_AVAILABLE (${commandSpec.executable} not found in PATH)` : null, spawnError: true, durationMs, networkPolicy: NETWORK_POLICY };
+    }
+    if (result.timedOut) return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
+    const ok = result.exitCode === 0;
+    await appendAudit(root, 'run_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
+    return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence: ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options), networkPolicy: NETWORK_POLICY };
   }
   let packageJson;
   try {
@@ -534,7 +624,7 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
 async function getVerificationScripts(ownerWebContentsId, requested = []) {
   const root = await validateProjectRoot(ownerWebContentsId);
   const projectType = await detectProjectType(root);
-  if (projectType.isPhp) {
+  if (projectType.type === 'php') {
     const composer = await readComposer(root, projectType.composer);
     const available = [];
     const phpunitPath = process.platform === 'win32' ? 'vendor/bin/phpunit.bat' : 'vendor/bin/phpunit';
@@ -561,6 +651,10 @@ async function getVerificationScripts(ownerWebContentsId, requested = []) {
         ? 'PHPUnit is not installed for this project (vendor/bin/phpunit not found); using php-lint fallback.'
         : scripts.length ? (missing.length ? `Verification checks are unavailable: ${missing.join(', ')}.` : null) : 'NOT_AVAILABLE (PHP verification tools/configuration unavailable).',
     };
+  }
+  if (projectType.type !== 'node') {
+    const checks = projectType.profile.checks || [];
+    return { scripts: checks, missing: [], reason: checks.length ? null : `NOT_AVAILABLE (no verification profile for detected project type "${projectType.type}")`, projectType: projectType.type, language: projectType.language, confidence: projectType.confidence };
   }
   let packageJson;
   try {
@@ -611,4 +705,6 @@ module.exports = {
   getVerificationScripts, resolveWithinRoot, clearProject, releaseProject,
   assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY, isSensitivePath,
   redactRuntimeValue, parseRuntimeFailure, mapRuntimeSource, classifyProjectSignals,
+  PROJECT_MANIFESTS, VERIFICATION_PROFILES,
+  detectProjectType,
 };

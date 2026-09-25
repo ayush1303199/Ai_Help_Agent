@@ -541,7 +541,9 @@ function normalizeCommandResult(result) {
   };
 }
 function commandPolicy(script) {
-  const allowed = new Set(['lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify', 'phpunit', 'composer-test', 'php-lint']);
+  const allowed = new Set(['lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify', 'phpunit', 'composer-test', 'php-lint',
+    'maven-test', 'maven-build', 'gradle-test', 'gradle-build', 'go-test', 'go-vet', 'go-build', 'ruby-test', 'ruby-lint',
+    'dotnet-test', 'dotnet-build', 'cargo-test', 'cargo-clippy', 'cargo-build', 'python-test', 'python-lint']);
   if (typeof script !== 'string' || !allowed.has(script)) throw new Error('Verification command is not permitted.');
   return { script, approvalRequired: true, arbitraryShell: false };
 }

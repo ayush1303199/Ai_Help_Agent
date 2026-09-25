@@ -11,6 +11,8 @@ function isLowValuePath(value) {
   return /(?:^|\/)(?:\.idea|assets?|fonts?|vendor|node_modules|dist|build|coverage|tmp|cache)(?:\/|$)/.test(normalized)
     || /\.(?:ttf|woff2?|eot|map|min\.(?:js|css))$/.test(normalized);
 }
+const SOURCE_EXTENSIONS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.php', '.java', '.kt', '.go', '.rb', '.cs', '.fs', '.vb', '.rs', '.py']);
+const SOURCE_DIRECTORIES = /(?:^|\/)(?:src|app|lib|cmd|internal|pkg|controllers?|models?|views?|services?|components?|modules?|routes?|crates?)(?:\/|$)/i;
 function rankResults(results, query) {
   const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
   return [...results].map((item, index) => {
@@ -26,7 +28,8 @@ function rankResults(results, query) {
       + (path.toLowerCase().includes('src/') || path.toLowerCase().includes('/src') ? 4 : 0)
       + (path.toLowerCase().includes('electron') ? 5 : 0)
       + (path.toLowerCase().includes('server') ? 4 : 0)
-      + (/\.(?:php|inc)$/.test(normalizedPath) ? 5 : 0)
+      + (SOURCE_EXTENSIONS.has(normalizedPath.slice(normalizedPath.lastIndexOf('.'))) ? 5 : 0)
+      + (SOURCE_DIRECTORIES.test(normalizedPath) ? 6 : 0)
       - (isLowValuePath(normalizedPath) ? 18 : 0)
       - (/\.(?:ttf|woff2?|eot|map|min\.(?:js|css))$/.test(normalizedPath) ? 12 : 0)
       + (name && terms.some((term) => name.toLowerCase().includes(term)) ? 8 : 0);

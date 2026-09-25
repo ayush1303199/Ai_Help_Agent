@@ -2,7 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SUPPORTED = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.php']);
+const SUPPORTED = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.php', '.java', '.kt', '.go', '.rb', '.cs', '.fs', '.vb', '.rs', '.py']);
 const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo', '.cache', 'logs', 'tmp', 'temp']);
 const sensitiveNames = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
 const sensitiveDirectories = new Set(['.ssh', '.aws', '.azure', '.config']);
@@ -49,7 +49,7 @@ function parseSource(relativePath, content) {
     path: relativePath, hash: digest(content), symbols, imports, exports, definitions, references,
     dependencyEdges: imports.map((item) => ({ from: relativePath, to: item.source, line: item.line })),
     capabilities: { symbols: true, imports: true, exports: true, definitions: true, references: true,
-    typeResolution: false, guaranteedCallGraph: false, languages: ['javascript', 'typescript', 'php'] },
+    typeResolution: false, guaranteedCallGraph: false,     languages: ['javascript', 'typescript', 'php', 'java', 'go', 'ruby', 'dotnet', 'rust', 'python'] },
     unsupported: ['type resolution', 'guaranteed call graph'],
   };
 }
@@ -92,6 +92,12 @@ async function readProjectMetadata(root) {
         const lowerName = entry.name.toLowerCase();
         const relative = path.relative(root, path.join(directory, entry.name)).replace(/\\/g, '/');
         if (lowerName.endsWith('.php')) languages.add('php');
+        if (lowerName.endsWith('.java') || lowerName.endsWith('.kt')) languages.add('java');
+        if (lowerName.endsWith('.go')) languages.add('go');
+        if (lowerName.endsWith('.rb')) languages.add('ruby');
+        if (lowerName.endsWith('.cs') || lowerName.endsWith('.fs') || lowerName.endsWith('.vb')) languages.add('dotnet');
+        if (lowerName.endsWith('.rs')) languages.add('rust');
+        if (lowerName.endsWith('.py')) languages.add('python');
         if (lowerName.endsWith('.ts') || lowerName.endsWith('.tsx') || lowerName.endsWith('.js') || lowerName.endsWith('.jsx')) languages.add(lowerName.endsWith('.ts') || lowerName.endsWith('.tsx') ? 'typescript' : 'javascript');
         if (REPO_CONFIG_FILES.has(entry.name) || lowerName.endsWith('.config.js') || lowerName.endsWith('.config.ts') || lowerName.endsWith('.config.mjs') || lowerName.endsWith('.config.cjs')) configFiles.push(relative);
         if (entry.name === 'package.json' || entry.name === 'tsconfig.json' || entry.name === 'vite.config.ts' || entry.name === 'vite.config.js' || entry.name === 'electron' || relative.includes('/electron/')) featureHints.add(entry.name);
