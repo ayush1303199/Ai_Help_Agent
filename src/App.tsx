@@ -64,7 +64,7 @@ import { AppHeader } from './ui/header/AppHeader';
 import { ContextButton, ContextPanel, FontSizeControls, HistoryButton, OverlayButton, ScreenReadingToggle, SettingsButton } from './ui/header/HeaderActions';
 import { ModeControls } from './ui/header/ModeControls';
 import type { AppMode, AssistantMode, MeetingAudioMode } from './app/appTypes';
-import { historyTitle, readHistory, removeHistorySession, searchHistory, upsertHistory, writeHistory, type HistoryMode } from './history/historyService';
+import { compactDeveloperSession, historyTitle, readDeveloperConversationStates, readHistory, removeHistorySession, searchHistory, upsertDeveloperConversationState, upsertHistory, writeDeveloperConversationStates, writeHistory, type DeveloperConversationState, type DeveloperPatchRecord, type HistoryMode } from './history/historyService';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -196,6 +196,23 @@ interface ChatSession {
   messages: Message[];
   updatedAt: string;
   mode: HistoryMode;
+  projectRoot?: string | null;
+  pendingPlan?: Record<string, unknown> | null;
+  appliedPatchLog?: DeveloperPatchRecord[];
+  providerNeutralSummary?: string;
+  lastUsedProvider?: { id?: string; label?: string; model?: string; changedAt?: string } | null;
+}
+
+function completedTurnEntries(messages: Message[]): Array<{ index: number; messages: Message[] }> {
+  const entries: Array<{ index: number; messages: Message[] }> = [];
+  for (let index = 0; index < messages.length - 1; index += 1) {
+    const user = messages[index];
+    const assistant = messages[index + 1];
+    if (user.role !== 'user' || assistant.role !== 'assistant' || assistant.streaming || !assistant.content.trim()) continue;
+    entries.push({ index, messages: [{ role: 'user', content: user.content }, { role: 'assistant', content: assistant.content }] });
+    index += 1;
+  }
+  return entries;
 }
 
 type SessionDocument = NormalizedDocument;
@@ -492,6 +509,9 @@ function App() {
   const [developerSearchResults, setDeveloperSearchResults] = useState<DeveloperSearchResult[]>([]);
   const [developerProposalSearchQuery, setDeveloperProposalSearchQuery] = useState('');
   const [developerChangeRequest, setDeveloperChangeRequest] = useState('');
+  const [developerAppliedPatchLog, setDeveloperAppliedPatchLog] = useState<DeveloperPatchRecord[]>([]);
+  const [developerLastProvider, setDeveloperLastProvider] = useState<{ id?: string; label?: string; model?: string; changedAt?: string } | null>(null);
+  const [developerConversationStates, setDeveloperConversationStates] = useState<DeveloperConversationState[]>(readDeveloperConversationStates);
   const [developerProposal, setDeveloperProposal] = useState<{
     id?: string;
     state?: string;
@@ -790,6 +810,12 @@ function App() {
   }, [chatHistory]);
 
   useEffect(() => {
+    if (!writeDeveloperConversationStates(developerConversationStates)) {
+      setError('Coding session context could not be saved because browser storage is full or unavailable.');
+    }
+  }, [developerConversationStates]);
+
+  useEffect(() => {
     const secretMap = readPersistedProviderSecrets();
     if (configuredProviders.length > 0) {
       writePersistedProviderSettings(providerId, configuredProviders.map((provider) => ({
@@ -875,30 +901,59 @@ function App() {
 
   // Save only completed turns, so streaming tokens never cause storage writes.
   useEffect(() => {
-    const hasCompletedTurn = messages.some((message, index) => (
-      message.role === 'user'
-      && messages[index + 1]?.role === 'assistant'
-      && Boolean(messages[index + 1]?.content.trim())
-      && !messages[index + 1]?.streaming
-    ));
-    if (!hasCompletedTurn || messages.some((message) => message.streaming)) return;
-    const savedMessages = messages.map(({ role, content }) => ({ role, content }));
-    const historyEntry: ChatSession = { id: activeChatId, mode: 'assistant', title: historyTitle(savedMessages), messages: savedMessages, updatedAt: new Date().toISOString() };
-    setChatHistory((previous) => upsertHistory(previous, historyEntry));
+    const turns = completedTurnEntries(messages);
+    if (!turns.length || messages.some((message) => message.streaming)) return;
+    setChatHistory((previous) => {
+      const withoutCurrentConversation = previous.filter((session) => session.id !== activeChatId
+        && !session.id.startsWith(`${activeChatId}-turn-`));
+      return turns.reduce((sessions, turn) => {
+        const savedMessages = turn.messages.map(({ role, content }) => ({ role, content }));
+        return upsertHistory(sessions, {
+          id: `${activeChatId}-turn-${turn.index}`,
+          mode: 'assistant',
+          title: historyTitle(savedMessages),
+          messages: savedMessages,
+          updatedAt: new Date().toISOString(),
+        });
+      }, withoutCurrentConversation);
+    });
   }, [activeChatId, messages]);
 
   useEffect(() => {
-    const hasCompletedTurn = developerMessages.some((message, index) => (
-      message.role === 'user'
-      && developerMessages[index + 1]?.role === 'assistant'
-      && Boolean(developerMessages[index + 1]?.content.trim())
-      && !developerMessages[index + 1]?.streaming
-    ));
-    if (!hasCompletedTurn || developerMessages.some((message) => message.streaming)) return;
-    const savedMessages = developerMessages.map(({ role, content }) => ({ role, content }));
-    const historyEntry: ChatSession = { id: `coding-${activeChatId}`, mode: 'developer', title: historyTitle(savedMessages), messages: savedMessages, updatedAt: new Date().toISOString() };
-    setChatHistory((previous) => upsertHistory(previous, historyEntry));
-  }, [activeChatId, developerMessages]);
+    const turns = completedTurnEntries(developerMessages);
+    if (!turns.length || developerMessages.some((message) => message.streaming)) return;
+    const conversationId = `coding-${activeChatId}`;
+    setChatHistory((previous) => {
+      const withoutCurrentConversation = previous.filter((session) => session.id !== conversationId
+        && !session.id.startsWith(`${conversationId}-turn-`));
+      return turns.reduce((sessions, turn) => {
+        const savedMessages = turn.messages.map(({ role, content }) => ({ role, content }));
+        return upsertHistory(sessions, {
+          id: `${conversationId}-turn-${turn.index}`,
+          mode: 'developer',
+          title: historyTitle(savedMessages),
+          messages: savedMessages,
+          updatedAt: new Date().toISOString(),
+        });
+      }, withoutCurrentConversation);
+    });
+    const sessionState: DeveloperConversationState = {
+      id: conversationId,
+      messages: developerMessages.map(({ role, content }) => ({ role, content })),
+      updatedAt: new Date().toISOString(),
+      projectRoot: developerProjectRoot,
+      pendingPlan: developerProposal?.runtime ? { ...developerProposal.runtime } : null,
+      appliedPatchLog: developerAppliedPatchLog,
+      providerNeutralSummary: compactDeveloperSession({
+        messages: developerMessages.map(({ role, content }) => ({ role, content })),
+        projectRoot: developerProjectRoot,
+        pendingPlan: developerProposal?.runtime ? { ...developerProposal.runtime } : null,
+        appliedPatchLog: developerAppliedPatchLog,
+      }).summary,
+      lastUsedProvider: developerLastProvider,
+    };
+    setDeveloperConversationStates((previous) => upsertDeveloperConversationState(previous, sessionState));
+  }, [activeChatId, developerAppliedPatchLog, developerLastProvider, developerMessages, developerProjectRoot, developerProposal]);
 
   useEffect(() => {
     const response = generalTask?.assistantResponse;
@@ -1475,6 +1530,14 @@ function App() {
             ? { ...message, content: responseText || message.content, streaming: false }
             : message,
         ));
+        if (typeof msg.provider === 'string' || typeof msg.model === 'string') {
+          setDeveloperLastProvider({
+            id: typeof msg.provider === 'string' ? msg.provider : undefined,
+            label: typeof msg.provider === 'string' ? msg.provider : undefined,
+            model: typeof msg.model === 'string' ? msg.model : undefined,
+            changedAt: new Date().toISOString(),
+          });
+        }
         return;
       }
       const timing = requestTimingRef.current.get(msg.requestId);
@@ -1975,9 +2038,28 @@ function App() {
     const requestId = crypto.randomUUID();
     const userMsg: Message = { role: 'user', content: question };
     const assistantMsg: Message = { role: 'assistant', content: '', streaming: true, requestId };
-    const conversationHistory = [...developerMessages, userMsg]
-      .slice(-MAX_CHAT_HISTORY_MESSAGES)
-      .map((message) => ({ role: message.role, content: compactMessageContent(message.content) }));
+    const conversationId = `coding-${activeChatId}`;
+    const persistedCodingSession = developerConversationStates.find((session) => session.id === conversationId);
+    const sessionSnapshot = {
+      messages: [...(persistedCodingSession?.messages || developerMessages), userMsg]
+        .map((message) => ({ role: message.role, content: compactMessageContent(message.content) })),
+      projectRoot: persistedCodingSession?.projectRoot ?? developerProjectRoot,
+      pendingPlan: persistedCodingSession?.pendingPlan ?? (developerProposal?.runtime ? { ...developerProposal.runtime } : null),
+      appliedPatchLog: persistedCodingSession?.appliedPatchLog || developerAppliedPatchLog,
+      providerNeutralSummary: persistedCodingSession?.providerNeutralSummary,
+    };
+    const compactedSession = compactDeveloperSession(sessionSnapshot, {
+      maxTokens: Math.max(512, Math.floor(MAX_CONTEXT_CHARS / 4)),
+      lastMessageCount: MAX_CHAT_HISTORY_MESSAGES,
+    });
+    const conversationHistory = compactedSession.messages;
+    const currentProvider = health
+      ? { id: health.provider, label: health.provider, model: health.model, changedAt: new Date().toISOString() }
+      : null;
+    if (currentProvider && developerLastProvider && (currentProvider.id !== developerLastProvider.id || currentProvider.model !== developerLastProvider.model)) {
+      setStatusMessage('Coding session context restored after provider switch.');
+    }
+    if (currentProvider) setDeveloperLastProvider(currentProvider);
 
     setDeveloperMessages((previous) => [...previous, userMsg, assistantMsg]);
     setDeveloperInput('');
@@ -2004,6 +2086,18 @@ function App() {
               'Keep Assistant, Developer, and General Agent state isolated; do not leak state or credentials across modes.',
               'Use the supplied read-only tools to inspect and explain the project. Never claim to have modified files or run commands unless the user explicitly approves a validated proposal and the runtime permits it.',
               'Prefer the smallest necessary inspection, answer accurately, and state uncertainty clearly when evidence is incomplete.',
+            ].join('\n'),
+          },
+          {
+            role: 'system',
+            content: [
+              'Use this provider-neutral Coding session context as durable state. It is not a provider transcript.',
+              `Project root: ${compactedSession.projectRoot || 'not selected'}`,
+              `Pending plan/runtime: ${JSON.stringify(compactedSession.pendingPlan || null)}`,
+              `Applied patch log: ${JSON.stringify(compactedSession.appliedPatchLog)}`,
+              `Current indexed context: ${JSON.stringify(developerProposal?.searchedFiles || [])}`,
+              `Compaction applied: ${compactedSession.compacted}; estimated tokens: ${compactedSession.estimatedTokens}`,
+              'Preserve this state when continuing after a provider switch. Never claim a patch was applied unless the log says it was applied and verified.',
             ].join('\n'),
           },
           ...conversationHistory,
@@ -2175,6 +2269,15 @@ function App() {
     setDeveloperBusy(true);
     try {
       const result = await window.electronAPI.applyDeveloperProposal(developerProposal.id);
+      if (result.state === 'completed') {
+        setDeveloperAppliedPatchLog((previous) => [...previous, {
+          proposalId: developerProposal.id,
+          files: developerProposal.files.map((file) => file.path),
+          state: result.state,
+          appliedAt: new Date().toISOString(),
+          verification: result.verification?.status,
+        }]);
+      }
       setDeveloperProposal((current) => current ? {
         ...current,
         state: result.state,
@@ -3376,10 +3479,15 @@ function App() {
     if (session.mode === 'developer') {
       setAppMode('developer');
       setDeveloperMessages(restoredMessages);
+      setActiveChatId(session.id.replace(/^coding-/, '').split('-turn-')[0] || crypto.randomUUID());
+      const conversationState = developerConversationStates.find((state) => state.id === session.id.replace(/-turn-\d+$/, ''));
+      setDeveloperProjectRoot(conversationState?.projectRoot || session.projectRoot || null);
+      setDeveloperAppliedPatchLog(conversationState?.appliedPatchLog || session.appliedPatchLog || []);
+      setDeveloperLastProvider(conversationState?.lastUsedProvider || session.lastUsedProvider || null);
       setDeveloperInput('');
     } else {
       setAppMode('assistant');
-      setActiveChatId(session.id);
+      setActiveChatId(session.id.split('-turn-')[0] || crypto.randomUUID());
       setMessages(restoredMessages);
     }
     setInput('');

@@ -180,13 +180,13 @@ export function CodingAgentWorkspace({
       )}
       <div className="flex-1 space-y-4 overflow-y-auto">
         {messages.length === 0 && <p className="rounded-lg border border-dashed border-slate-700 p-5 text-center text-sm text-slate-500">Ask a coding question to get started.</p>}
-        {messages.map((message, index) => <article key={message.requestId || `${message.role}-${index}`} className={`rounded-xl border p-4 ${message.role === 'user' ? 'border-slate-700 bg-slate-800/60' : 'border-sky-500/20 bg-slate-950/60'}`}><p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">{message.role === 'user' ? 'You' : 'Developer assistant'}</p>{message.role === 'assistant' ? <div className="text-sm leading-relaxed text-slate-100">{renderAnswerMarkdown(message.content || (message.streaming ? 'Thinking...' : 'No answer yet.'))}</div> : <p className="whitespace-pre-wrap text-sm text-slate-200">{message.content}</p>}</article>)}
+        {messages.map((message, index) => <article key={message.requestId || `${message.role}-${index}`} className={`rounded-xl border p-4 ${message.role === 'user' ? 'border-slate-700 bg-slate-800/60' : 'border-sky-500/20 bg-slate-950/60'}`}><p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">{message.role === 'user' ? 'You' : 'Coding Agent'}</p>{message.role === 'assistant' ? <div className="text-sm leading-relaxed text-slate-100">{renderAnswerMarkdown(message.content || (message.streaming ? 'Thinking...' : 'No answer yet.'))}</div> : <p className="whitespace-pre-wrap text-sm text-slate-200">{message.content}</p>}</article>)}
       </div>
       <div className="mt-5 flex gap-2">
         <input value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSendMessage(); } }} placeholder="Ask a coding question..." className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-sky-400" />
         <button onClick={onSendMessage} disabled={!input.trim() || streaming || busy} className="rounded-lg bg-sky-500 px-4 text-sm font-medium text-slate-950 disabled:opacity-40">Send</button>
       </div>
-      {messages.length > 0 && <button onClick={onClearMessages} className="mt-3 self-start text-xs text-slate-400 hover:text-slate-200">Clear developer conversation</button>}
+      {messages.length > 0 && <button onClick={onClearMessages} className="mt-3 self-start text-xs text-slate-400 hover:text-slate-200">Clear coding conversation</button>}
     </>
   );
 }
