@@ -22,6 +22,7 @@ const CREDENTIAL_ENV_PATTERN = /(?:key|token|secret|pass|credential|auth|private
 const NETWORK_POLICY = Object.freeze({ mode: 'restricted', outbound: 'not-granted-by-verification-layer' });
 const SENSITIVE_NAME_PATTERN = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
 const SENSITIVE_DIRECTORY_NAMES = new Set(['.ssh', '.aws', '.azure', '.config']);
+const LOW_VALUE_PATH_PATTERN = /(?:^|[\\/])(?:\.idea|assets?|fonts?|vendor|node_modules|dist|build|coverage|tmp|cache)(?:[\\/]|$)|\.(?:ttf|woff2?|eot|map|min\.(?:js|css))$/i;
 
 const projectRoots = new Map();
 
@@ -148,6 +149,7 @@ async function searchCode(query, ownerWebContentsId) {
       if (results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES) return;
       const childRelative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
       if (isIgnoredName(entry.name) || isSensitivePath(childRelative)) continue;
+      if (LOW_VALUE_PATH_PATTERN.test(childRelative)) continue;
       if (entry.isDirectory()) {
         await walk(childRelative);
         continue;
@@ -184,6 +186,27 @@ async function searchCode(query, ownerWebContentsId) {
   }
 
   await walk('.');
+  if (results.length === 0) {
+    async function addPhpScope(relativeDirectory, depth = 0) {
+      if (depth > 6 || results.length >= 40) return;
+      const directory = await resolveProjectPath(relativeDirectory, ownerWebContentsId);
+      const entries = await fs.readdir(directory.target, { withFileTypes: true });
+      for (const entry of entries) {
+        if (results.length >= 40 || isIgnoredName(entry.name) || isSensitivePath(entry.name)) continue;
+        const childRelative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
+        if (LOW_VALUE_PATH_PATTERN.test(childRelative)) continue;
+        if (entry.isDirectory()) {
+          if (depth < 4) await addPhpScope(childRelative, depth + 1);
+          continue;
+        }
+        if (entry.isFile() && /\.php$/i.test(entry.name)
+          && /(?:controllers?|models?|views?|services?|modules?|components?)/i.test(childRelative)) {
+          results.push({ path: childRelative, line: 0, text: entry.name, matchType: 'scope-fallback', relationship: 'scope' });
+        }
+      }
+    }
+    await addPhpScope('.');
+  }
   const result = { query, results, filesVisited, truncated: results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES };
   await appendAudit(root, 'search_code', query, 'success');
   return result;
@@ -329,6 +352,16 @@ async function readComposer(root, relativePath) {
   }
 }
 
+async function hasProjectExecutable(root, relativePath) {
+  try {
+    const target = await resolveWithinRoot(root, relativePath);
+    const stat = await fs.stat(target.target);
+    return stat.isFile();
+  } catch {
+    return false;
+  }
+}
+
 async function findChangedPhpFiles(root) {
   return new Promise((resolve) => {
     const child = spawn('git', ['status', '--porcelain', '--', '*.php'], { cwd: root, shell: false, windowsHide: true });
@@ -346,8 +379,11 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
   const projectType = await detectProjectType(root);
   let phpCommand = null;
   if (projectType.isPhp) {
-    if (script === 'phpunit' && projectType.hasPhpUnitConfig) {
+    if (script === 'phpunit' && projectType.hasPhpUnitConfig
+      && await hasProjectExecutable(root, process.platform === 'win32' ? 'vendor/bin/phpunit.bat' : 'vendor/bin/phpunit')) {
       phpCommand = { executable: process.platform === 'win32' ? 'vendor\\bin\\phpunit.bat' : './vendor/bin/phpunit', args: [] };
+    } else if (script === 'phpunit' && projectType.hasPhpUnitConfig) {
+      throw new Error('PHPUnit is not installed for this project (vendor/bin/phpunit not found); use php-lint instead.');
     } else if (script === 'composer-test' && projectType.composer) {
       const composer = await readComposer(root, projectType.composer);
       if (typeof composer?.scripts?.test === 'string' && composer.scripts.test.trim()
@@ -388,7 +424,11 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
     const ok = result.exitCode === 0;
     await appendAudit(root, 'run_php_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
     const runtimeEvidence = ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options);
-    return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, networkPolicy: NETWORK_POLICY, lintFiles: phpCommand.lintFiles };
+    const phpunitPath = process.platform === 'win32' ? 'vendor/bin/phpunit.bat' : 'vendor/bin/phpunit';
+    const reason = script === 'php-lint' && projectType.hasPhpUnitConfig && !await hasProjectExecutable(root, phpunitPath)
+      ? 'PHPUnit is not installed for this project (vendor/bin/phpunit not found); php-lint fallback used.'
+      : null;
+    return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, reason, networkPolicy: NETWORK_POLICY, lintFiles: phpCommand.lintFiles };
   }
   let packageJson;
   try {
@@ -497,7 +537,9 @@ async function getVerificationScripts(ownerWebContentsId, requested = []) {
   if (projectType.isPhp) {
     const composer = await readComposer(root, projectType.composer);
     const available = [];
-    if (projectType.hasPhpUnitConfig) available.push('phpunit');
+    const phpunitPath = process.platform === 'win32' ? 'vendor/bin/phpunit.bat' : 'vendor/bin/phpunit';
+    const phpunitInstalled = projectType.hasPhpUnitConfig && await hasProjectExecutable(root, phpunitPath);
+    if (phpunitInstalled) available.push('phpunit');
     if (typeof composer?.scripts?.test === 'string' && composer.scripts.test.trim()
       && !UNSAFE_SCRIPT_PATTERN.test(composer.scripts.test)) available.push('composer-test');
     available.push('php-lint');
@@ -505,12 +547,19 @@ async function getVerificationScripts(ownerWebContentsId, requested = []) {
     const requestedNames = hasRequestedScripts
       ? requested.map((script) => String(script).trim().toLowerCase())
       : available;
-    const scripts = [...new Set(requestedNames)].filter((script) => available.includes(script));
-    const missing = hasRequestedScripts ? [...new Set(requestedNames)].filter((script) => !scripts.includes(script)) : [];
+    const unavailablePhpUnit = requestedNames.includes('phpunit') && !phpunitInstalled;
+    const fallbackRequested = unavailablePhpUnit || (!hasRequestedScripts && !available.includes('phpunit'));
+    const scripts = [...new Set([...requestedNames, ...(fallbackRequested ? ['php-lint'] : [])])]
+      .filter((script) => available.includes(script) || script === 'php-lint');
+    const missing = hasRequestedScripts
+      ? [...new Set(requestedNames)].filter((script) => !scripts.includes(script) && script !== 'phpunit')
+      : [];
     return {
       scripts,
       missing,
-      reason: scripts.length ? (missing.length ? `Verification checks are unavailable: ${missing.join(', ')}.` : null) : 'NOT_AVAILABLE (PHP verification tools/configuration unavailable).',
+      reason: unavailablePhpUnit
+        ? 'PHPUnit is not installed for this project (vendor/bin/phpunit not found); using php-lint fallback.'
+        : scripts.length ? (missing.length ? `Verification checks are unavailable: ${missing.join(', ')}.` : null) : 'NOT_AVAILABLE (PHP verification tools/configuration unavailable).',
     };
   }
   let packageJson;

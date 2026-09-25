@@ -6,10 +6,16 @@ function normalizeRoot(root) {
   const value = typeof root === 'string' && root.trim() ? root.trim() : '__global__';
   return value.replace(/\\/g, '/');
 }
+function isLowValuePath(value) {
+  const normalized = String(value || '').replace(/\\/g, '/').toLowerCase();
+  return /(?:^|\/)(?:\.idea|assets?|fonts?|vendor|node_modules|dist|build|coverage|tmp|cache)(?:\/|$)/.test(normalized)
+    || /\.(?:ttf|woff2?|eot|map|min\.(?:js|css))$/.test(normalized);
+}
 function rankResults(results, query) {
   const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
   return [...results].map((item, index) => {
     const path = String(item.path || '');
+    const normalizedPath = path.replace(/\\/g, '/').toLowerCase();
     const name = String(item.name || '');
     const text = String(item.text || item.content || '');
     const haystack = `${path} ${text} ${name}`.toLowerCase();
@@ -20,6 +26,9 @@ function rankResults(results, query) {
       + (path.toLowerCase().includes('src/') || path.toLowerCase().includes('/src') ? 4 : 0)
       + (path.toLowerCase().includes('electron') ? 5 : 0)
       + (path.toLowerCase().includes('server') ? 4 : 0)
+      + (/\.(?:php|inc)$/.test(normalizedPath) ? 5 : 0)
+      - (isLowValuePath(normalizedPath) ? 18 : 0)
+      - (/\.(?:ttf|woff2?|eot|map|min\.(?:js|css))$/.test(normalizedPath) ? 12 : 0)
       + (name && terms.some((term) => name.toLowerCase().includes(term)) ? 8 : 0);
     if (item.relationship === 'definition') score += 6;
     if (item.relationship === 'reference') score += 4;
@@ -41,6 +50,7 @@ function assembleContext({ query, results = [], files = [], maxTokens = 4000, ro
   const ranked = rankResults(results, query);
   const selected = []; const selectedPaths = new Set(); let used = 0;
   for (const item of ranked) {
+    if (isLowValuePath(item.path)) continue;
     if (selectedPaths.has(item.path)) continue;
     const text = String(item.text || item.content || '');
     const cost = tokens(text);

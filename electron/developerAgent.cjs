@@ -533,6 +533,7 @@ function classifyFailureCategory(result) {
 function normalizeCommandResult(result) {
   return { ok: Boolean(result?.ok), script: String(result?.script || ''), exitCode: result?.exitCode ?? null,
     stdout: String(result?.stdout || ''), stderr: String(result?.stderr || ''), durationMs: Number(result?.durationMs || 0),
+    reason: result?.reason ? String(result.reason).slice(0, 500) : null,
     failure: result?.ok ? null : classifyFailure(result),
     classification: result?.ok ? null : classifyFailureCategory(result),
     cancelled: Boolean(result?.cancelled),

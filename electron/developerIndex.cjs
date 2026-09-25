@@ -2,7 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SUPPORTED = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs']);
+const SUPPORTED = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.php']);
 const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo', '.cache', 'logs', 'tmp', 'temp']);
 const sensitiveNames = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
 const sensitiveDirectories = new Set(['.ssh', '.aws', '.azure', '.config']);
@@ -32,10 +32,11 @@ function parseSource(relativePath, content) {
   const references = [];
   const lines = content.split(/\r?\n/);
   lines.forEach((line, index) => {
-    const declaration = line.match(/\b(?:export\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)/);
+    const declaration = line.match(/\b(?:export\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)|\b(?:class|function)\s+([A-Za-z_][\w]*)/);
     if (declaration) {
+      const name = declaration[1] || declaration[2];
       const kind = symbolKind(line.match(/\b(function|class|interface|type|enum|const|let|var)\b/));
-      const symbol = { name: declaration[1], kind, path: relativePath, line: index + 1, column: Math.max(0, line.indexOf(declaration[1])) + 1 };
+      const symbol = { name, kind, path: relativePath, line: index + 1, column: Math.max(0, line.indexOf(name)) + 1 };
       symbols.push(symbol); definitions.push(symbol);
       if (/^\s*export\b/.test(line)) exports.push({ name: declaration[1], path: relativePath, line: index + 1 });
     }
@@ -48,8 +49,8 @@ function parseSource(relativePath, content) {
     path: relativePath, hash: digest(content), symbols, imports, exports, definitions, references,
     dependencyEdges: imports.map((item) => ({ from: relativePath, to: item.source, line: item.line })),
     capabilities: { symbols: true, imports: true, exports: true, definitions: true, references: true,
-      typeResolution: false, guaranteedCallGraph: false, languages: ['javascript', 'typescript'] },
-    unsupported: ['type resolution', 'guaranteed call graph', 'non-JavaScript/TypeScript languages'],
+    typeResolution: false, guaranteedCallGraph: false, languages: ['javascript', 'typescript', 'php'] },
+    unsupported: ['type resolution', 'guaranteed call graph'],
   };
 }
 
@@ -90,6 +91,7 @@ async function readProjectMetadata(root) {
       } else if (entry.isFile()) {
         const lowerName = entry.name.toLowerCase();
         const relative = path.relative(root, path.join(directory, entry.name)).replace(/\\/g, '/');
+        if (lowerName.endsWith('.php')) languages.add('php');
         if (lowerName.endsWith('.ts') || lowerName.endsWith('.tsx') || lowerName.endsWith('.js') || lowerName.endsWith('.jsx')) languages.add(lowerName.endsWith('.ts') || lowerName.endsWith('.tsx') ? 'typescript' : 'javascript');
         if (REPO_CONFIG_FILES.has(entry.name) || lowerName.endsWith('.config.js') || lowerName.endsWith('.config.ts') || lowerName.endsWith('.config.mjs') || lowerName.endsWith('.config.cjs')) configFiles.push(relative);
         if (entry.name === 'package.json' || entry.name === 'tsconfig.json' || entry.name === 'vite.config.ts' || entry.name === 'vite.config.js' || entry.name === 'electron' || relative.includes('/electron/')) featureHints.add(entry.name);
