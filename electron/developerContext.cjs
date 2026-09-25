@@ -60,6 +60,16 @@ function assembleContext({ query, results = [], files = [], maxTokens = 4000, ro
   cache.set(key, context);
   return { ...context, cached: false };
 }
+function assembleRuntimeEvidenceContext(evidence = {}, maxTokens = 1800) {
+  const budget = Math.max(64, Math.min(Number(maxTokens) || 1800, 4000));
+  const mapped = Array.isArray(evidence.mapped) ? evidence.mapped.slice(0, 8) : [];
+  const lines = [
+    `[runtime-observed] ${String(evidence.message || 'Runtime failure captured.').slice(0, 1000)}`,
+    ...mapped.map((item) => `[mapped] ${item.file}:${item.line}${item.column ? `:${item.column}` : ''}\n${(item.source || []).map((line) => `${line.line}: ${line.text}`).join('\n')}`),
+  ];
+  const content = lines.join('\n').slice(0, budget * 4);
+  return { content, tokenCount: tokens(content), budget, observed: Boolean(evidence.observed), redacted: evidence.redacted !== false };
+}
 function invalidateContextCache(root = null) {
   if (root === null || root === undefined) {
     cache.clear();
@@ -71,4 +81,4 @@ function invalidateContextCache(root = null) {
     if (value && value.root === scopedRoot) cache.delete(key);
   }
 }
-module.exports = { tokens, rankResults, assembleContext, invalidateContextCache };
+module.exports = { tokens, rankResults, assembleContext, assembleRuntimeEvidenceContext, invalidateContextCache };

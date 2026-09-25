@@ -57,6 +57,7 @@ export function createTaskRuntimeState(initial = {}) {
       failures: Array.isArray(initial?.taskMemory?.failures) ? [...initial.taskMemory.failures] : [],
       negativeFindings: Array.isArray(initial?.taskMemory?.negativeFindings) ? [...initial.taskMemory.negativeFindings] : [],
       repairRounds: Number(initial?.taskMemory?.repairRounds || 0),
+      runtimeEvidence: initial?.taskMemory?.runtimeEvidence || null,
     },
     history: Array.isArray(initial.history) ? [...initial.history] : [],
     lastUpdated: initial.lastUpdated || new Date().toISOString(),
@@ -149,6 +150,21 @@ export function createTaskRuntimeState(initial = {}) {
       if (this.taskMemory.failures.length > 12) this.taskMemory.failures.shift();
       this.lastUpdated = new Date().toISOString();
       return this.metrics.repairAttempts;
+    },
+    recordRuntimeEvidence(evidence = {}) {
+      this.taskMemory.runtimeEvidence = {
+        status: evidence.status || 'unavailable',
+        observed: Boolean(evidence.observed),
+        message: String(evidence.message || '').slice(0, 1000),
+        mapped: Array.isArray(evidence.mapped) ? evidence.mapped.slice(0, 12) : [],
+        frameCount: Array.isArray(evidence.frames) ? evidence.frames.length : 0,
+        redacted: evidence.redacted !== false,
+        debugger: { requested: Boolean(evidence.debugger?.requested), captured: false },
+      };
+      this.observations.push({ kind: 'RUNTIME_EVIDENCE', ...this.taskMemory.runtimeEvidence, at: new Date().toISOString() });
+      if (this.observations.length > 24) this.observations.shift();
+      this.lastUpdated = new Date().toISOString();
+      return this.taskMemory.runtimeEvidence;
     },
     summarize() {
       return {

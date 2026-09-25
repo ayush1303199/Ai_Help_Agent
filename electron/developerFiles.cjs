@@ -12,6 +12,8 @@ function isIgnoredName(name) {
 }
 const MAX_COMMAND_DURATION_MS = 120000;
 const MAX_OUTPUT_CHARS = 12000;
+const MAX_RUNTIME_FRAMES = 12;
+const MAX_RUNTIME_SOURCE_LINES = 9;
 const SAFE_SCRIPT_NAMES = new Set(['lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify']);
 const UNSAFE_SCRIPT_PATTERN = /[;&|<>`]|\$\(|\b(?:npm|npm\.cmd|yarn|pnpm|npx|git|rm|del|erase|format|powershell|cmd|install|publish|deploy|release|commit|push|reset|clean|generate|fix|update|write)\b/i;
 const SAFE_COMMAND_PATTERN = /^\s*(?:tsc|eslint|vite|vitest|jest|mocha|ava|biome|webpack|rollup|next)(?:\s|$)/i;
@@ -197,6 +199,70 @@ function limitOutput(value) {
 function redactOutput(value) {
   return limitOutput(value).replace(/(sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]+|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)/gi, '[REDACTED]');
 }
+function redactRuntimeValue(value, key = '') {
+  if (CREDENTIAL_ENV_PATTERN.test(key) || /authorization|cookie|session/i.test(key)) return '[REDACTED]';
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => redactRuntimeValue(item, key));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).slice(0, 40).map(([childKey, childValue]) => [childKey, redactRuntimeValue(childValue, childKey)]));
+  }
+  return redactOutput(String(value ?? '')).slice(0, 1000);
+}
+function parseRuntimeFailure(output) {
+  const text = String(output || '');
+  const frames = [];
+  const seen = new Set();
+  const patterns = [
+    /(?:at\s+(?:[^()\r\n]+\s+\()?|File\s+["'])([A-Za-z]:[\\/][^()\r\n"']+|\/[^()\r\n"']+|[^()\s:"']+\.[cm]?[jt]sx?|[^()\s:"']+\.py):(\d+)(?::(\d+))?/g,
+    /File\s+["']([^"']+)["'],\s*line\s+(\d+)/g,
+  ];
+  patterns.forEach((pattern) => {
+    let match;
+    while ((match = pattern.exec(text)) && frames.length < MAX_RUNTIME_FRAMES) {
+      const frameKey = `${match[1]}:${match[2]}:${match[3] || ''}`;
+      if (seen.has(frameKey)) continue;
+      seen.add(frameKey);
+      frames.push({ file: match[1], line: Number(match[2]), column: match[3] ? Number(match[3]) : null });
+    }
+  });
+  const message = text.split(/\r?\n/).map((line) => line.trim())
+    .find((line) => line && !/^(?:at\s|file\s|npm\s+(?:error|warn))/i.test(line)) || '';
+  return { message: redactOutput(message).slice(0, 1000), frames, frameCount: frames.length };
+}
+async function mapRuntimeSource(root, runtimeFailure) {
+  const mapped = [];
+  for (const frame of runtimeFailure.frames || []) {
+    try {
+      const absolute = path.isAbsolute(frame.file) ? frame.file : path.resolve(root, frame.file);
+      if (!isInsideRoot(root, await realPathOrParent(absolute))) continue;
+      const relative = path.relative(root, absolute);
+      if (isSensitivePath(relative)) continue;
+      const target = await resolveWithinRoot(root, relative);
+      const lines = (await fs.readFile(target.target, 'utf8')).split(/\r?\n/);
+      const start = Math.max(0, frame.line - 1 - Math.floor(MAX_RUNTIME_SOURCE_LINES / 2));
+      const end = Math.min(lines.length, start + MAX_RUNTIME_SOURCE_LINES);
+      mapped.push({ file: relative, line: frame.line, column: frame.column, source: lines.slice(start, end).map((text, index) => ({ line: start + index + 1, text: redactOutput(text).slice(0, 240) })) });
+    } catch {
+      // Omit missing, inaccessible, or sensitive source locations.
+    }
+  }
+  return mapped;
+}
+async function enrichRuntimeEvidence(root, stdout, stderr, options = {}) {
+  const runtimeFailure = parseRuntimeFailure(`${stderr}\n${stdout}`);
+  return {
+    status: 'captured',
+    observed: true,
+    message: runtimeFailure.message,
+    frames: runtimeFailure.frames,
+    mapped: await mapRuntimeSource(root, runtimeFailure),
+    redacted: true,
+    debugger: {
+      requested: Boolean(options.debuggerCapture),
+      captured: false,
+      reason: options.debuggerCapture ? 'Debugger locals capture requires a separately approved hook.' : 'Debugger locals capture is off by default.',
+    },
+  };
+}
 function safeEnvironment(env = process.env) {
   return Object.fromEntries(Object.entries(env)
     .filter(([key]) => SAFE_ENV_KEYS.has(key) && !CREDENTIAL_ENV_PATTERN.test(key)));
@@ -320,7 +386,8 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
   const ok = result.exitCode === 0;
   console.info(`[DEV][VERIFY] project=${project} script=${script} exitCode=${result.exitCode} durationMs=${durationMs} success=${ok}`);
   await appendAudit(root, 'run_command', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
-  return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, networkPolicy: NETWORK_POLICY };
+  const runtimeEvidence = ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options);
+  return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, networkPolicy: NETWORK_POLICY };
 }
 
 async function getVerificationScripts(ownerWebContentsId, requested = []) {
@@ -373,4 +440,5 @@ module.exports = {
   chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit,
   getVerificationScripts, resolveWithinRoot, clearProject, releaseProject,
   assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY, isSensitivePath,
+  redactRuntimeValue, parseRuntimeFailure, mapRuntimeSource,
 };

@@ -1,4 +1,5 @@
 const { performance } = require('node:perf_hooks');
+const { parseRuntimeFailure, redactRuntimeValue } = require('./developerFiles.cjs');
 
 function clamp(value, min = 0, max = 1) {
   if (!Number.isFinite(value)) return min;
@@ -182,6 +183,21 @@ function runCodingAgentBenchmark() {
       score: metrics.agentEfficiency,
     };
   });
+  const runtimeCases = [
+    {
+      name: 'runtime-node-stack-mapping',
+      passed: parseRuntimeFailure('TypeError: boom\n    at run (src/app.js:12:8)').frames[0]?.line === 12,
+    },
+    {
+      name: 'runtime-python-traceback-mapping',
+      passed: parseRuntimeFailure('Traceback\n  File "src/app.py", line 7, in main').frames[0]?.line === 7,
+    },
+    {
+      name: 'runtime-locals-redaction',
+      passed: redactRuntimeValue({ apiKey: 'sk-test-secret', value: 'safe' }).apiKey === '[REDACTED]',
+    },
+  ];
+  results.push(...runtimeCases.map((item) => ({ ...item, status: item.passed ? 'strong' : 'weak', regression: false, score: item.passed ? 1 : 0 })));
   return {
     name: 'coding-agent-quality',
     total: results.length,

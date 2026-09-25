@@ -536,6 +536,7 @@ function normalizeCommandResult(result) {
     failure: result?.ok ? null : classifyFailure(result),
     classification: result?.ok ? null : classifyFailureCategory(result),
     cancelled: Boolean(result?.cancelled),
+    runtimeEvidence: result?.runtimeEvidence || null,
   };
 }
 function commandPolicy(script) {
@@ -596,6 +597,7 @@ function diagnoseObservation(observation, metadata = {}) {
     classification: observation.classification || classifyFailureCategory(observation),
     environmentFailure: environment.has(observation.classification || classifyFailureCategory(observation)),
     location: observation.extracted,
+    runtimeEvidence: observation.runtimeEvidence || null,
     context: { workspace: metadata.workspace || null, branch: metadata.branch || null },
   };
 }
