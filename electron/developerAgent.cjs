@@ -540,7 +540,7 @@ function normalizeCommandResult(result) {
   };
 }
 function commandPolicy(script) {
-  const allowed = new Set(['lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify']);
+  const allowed = new Set(['lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify', 'phpunit', 'composer-test', 'php-lint']);
   if (typeof script !== 'string' || !allowed.has(script)) throw new Error('Verification command is not permitted.');
   return { script, approvalRequired: true, arbitraryShell: false };
 }

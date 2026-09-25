@@ -1,5 +1,5 @@
 const { performance } = require('node:perf_hooks');
-const { parseRuntimeFailure, redactRuntimeValue } = require('./developerFiles.cjs');
+const { parseRuntimeFailure, redactRuntimeValue, classifyProjectSignals } = require('./developerFiles.cjs');
 
 function clamp(value, min = 0, max = 1) {
   if (!Number.isFinite(value)) return min;
@@ -195,6 +195,23 @@ function runCodingAgentBenchmark() {
     {
       name: 'runtime-locals-redaction',
       passed: redactRuntimeValue({ apiKey: 'sk-test-secret', value: 'safe' }).apiKey === '[REDACTED]',
+    },
+    {
+      name: 'runtime-php-fatal-mapping',
+      passed: parseRuntimeFailure('PHP Fatal error: boom in app/controllers/SiteController.php on line 42').frames[0]?.line === 42,
+    },
+    {
+      name: 'runtime-phpunit-failure-mapping',
+      passed: parseRuntimeFailure('There was 1 failure:\n1) SiteTest::testIndex\napp/tests/SiteTest.php:18').frames[0]?.file === 'app/tests/SiteTest.php',
+    },
+    {
+      name: 'runtime-php-superglobal-redaction',
+      passed: redactRuntimeValue({ '$_ENV': { DB_PASSWORD: 'hidden' }, '$_SERVER': 'hidden' }).$_ENV === '[REDACTED]',
+    },
+    {
+      name: 'project-type-node-vs-php',
+      passed: classifyProjectSignals({ hasPackageJson: true, composer: true, hasPhpFile: true }).isPhp === false
+        && classifyProjectSignals({ composer: true, hasPhpFile: true, hasPhpUnitConfig: true }).isPhp === true,
     },
   ];
   results.push(...runtimeCases.map((item) => ({ ...item, status: item.passed ? 'strong' : 'weak', regression: false, score: item.passed ? 1 : 0 })));

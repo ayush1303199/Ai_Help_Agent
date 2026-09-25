@@ -197,10 +197,10 @@ function limitOutput(value) {
   return `${text.slice(0, head)}\n... output truncated ...\n${text.slice(-tail)}`;
 }
 function redactOutput(value) {
-  return limitOutput(value).replace(/(sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]+|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)/gi, '[REDACTED]');
+  return limitOutput(value).replace(/(sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]+|(?:api[_-]?key|token|secret|password|credential)\s*[:=]\s*\S+|\$_(?:ENV|SERVER)\s*\[[^\]]+\]\s*=>\s*[^\r\n]+)/gi, '[REDACTED]');
 }
 function redactRuntimeValue(value, key = '') {
-  if (CREDENTIAL_ENV_PATTERN.test(key) || /authorization|cookie|session/i.test(key)) return '[REDACTED]';
+  if (CREDENTIAL_ENV_PATTERN.test(key) || /authorization|cookie|session|^\$_(?:env|server)$/i.test(key)) return '[REDACTED]';
   if (Array.isArray(value)) return value.slice(0, 20).map((item) => redactRuntimeValue(item, key));
   if (value && typeof value === 'object') {
     return Object.fromEntries(Object.entries(value).slice(0, 40).map(([childKey, childValue]) => [childKey, redactRuntimeValue(childValue, childKey)]));
@@ -214,6 +214,8 @@ function parseRuntimeFailure(output) {
   const patterns = [
     /(?:at\s+(?:[^()\r\n]+\s+\()?|File\s+["'])([A-Za-z]:[\\/][^()\r\n"']+|\/[^()\r\n"']+|[^()\s:"']+\.[cm]?[jt]sx?|[^()\s:"']+\.py):(\d+)(?::(\d+))?/g,
     /File\s+["']([^"']+)["'],\s*line\s+(\d+)/g,
+    /(?:PHP\s+(?:Fatal error|Parse error|Warning|Notice):.*?\s+in\s+|#\d+\s+)([A-Za-z]:[\\/][^()\r\n]+|\/[^()\r\n]+|[^()\s:()]+\.php)\s*(?:on line\s+|\()(\d+)/gi,
+    /([A-Za-z]:[\\/][^()\r\n]+|\/[^()\r\n]+|[^()\s:()]+\.php):(\d+)(?::(\d+))?/gi,
   ];
   patterns.forEach((pattern) => {
     let match;
@@ -225,7 +227,7 @@ function parseRuntimeFailure(output) {
     }
   });
   const message = text.split(/\r?\n/).map((line) => line.trim())
-    .find((line) => line && !/^(?:at\s|file\s|npm\s+(?:error|warn))/i.test(line)) || '';
+    .find((line) => line && !/^(?:at\s|file\s|npm\s+(?:error|warn)|#\d+\s)/i.test(line)) || '';
   return { message: redactOutput(message).slice(0, 1000), frames, frameCount: frames.length };
 }
 async function mapRuntimeSource(root, runtimeFailure) {
@@ -286,9 +288,108 @@ async function runGit(args, ownerWebContentsId) {
   return { args, stdout, stderr };
 }
 
+async function detectProjectType(root) {
+  let hasPhpFile = false;
+  let hasPhpUnitConfig = false;
+  let composer = null;
+  let hasPackageJson = false;
+  try { await fs.stat(path.join(root, 'package.json')); hasPackageJson = true; } catch {}
+  async function walk(relativeDirectory, depth = 0) {
+    if (depth > 8 || hasPhpFile && hasPhpUnitConfig && composer) return;
+    const directory = await fs.readdir(path.join(root, relativeDirectory), { withFileTypes: true });
+    for (const entry of directory) {
+      if (isIgnoredName(entry.name) || isSensitivePath(entry.name)) continue;
+      const relative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
+      if (entry.isDirectory()) {
+        await walk(relative, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const lower = entry.name.toLowerCase();
+      if (lower === 'composer.json') composer = relative;
+      if (lower === 'phpunit.xml' || lower === 'phpunit.xml.dist') hasPhpUnitConfig = true;
+      if (lower.endsWith('.php')) hasPhpFile = true;
+    }
+  }
+  await walk('.');
+  return { ...classifyProjectSignals({ hasPackageJson, composer: Boolean(composer), hasPhpFile, hasPhpUnitConfig }), composer, hasPackageJson };
+}
+
+function classifyProjectSignals({ hasPackageJson = false, composer = false, hasPhpFile = false, hasPhpUnitConfig = false } = {}) {
+  return { isPhp: !hasPackageJson && Boolean(composer || hasPhpFile), hasPhpUnitConfig };
+}
+
+async function readComposer(root, relativePath) {
+  if (!relativePath) return null;
+  try {
+    const file = await resolveWithinRoot(root, relativePath);
+    return JSON.parse(await fs.readFile(file.target, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+async function findChangedPhpFiles(root) {
+  return new Promise((resolve) => {
+    const child = spawn('git', ['status', '--porcelain', '--', '*.php'], { cwd: root, shell: false, windowsHide: true });
+    let output = '';
+    child.stdout.on('data', (chunk) => { output = `${output}${chunk}`.slice(0, MAX_OUTPUT_CHARS); });
+    child.on('error', () => resolve([]));
+    child.on('close', () => resolve(output.split(/\r?\n/).map((item) => item.slice(3).trim())
+      .filter((item) => item && /\.php$/i.test(item) && !isSensitivePath(item)).slice(0, 20)));
+  });
+}
+
 async function runVerification(script, ownerWebContentsId, options = {}) {
   const root = await validateProjectRoot(ownerWebContentsId);
   if (typeof script !== 'string' || !/^[a-z][a-z0-9:_-]{0,31}$/i.test(script)) throw new Error('Verification script name is invalid.');
+  const projectType = await detectProjectType(root);
+  let phpCommand = null;
+  if (projectType.isPhp) {
+    if (script === 'phpunit' && projectType.hasPhpUnitConfig) {
+      phpCommand = { executable: process.platform === 'win32' ? 'vendor\\bin\\phpunit.bat' : './vendor/bin/phpunit', args: [] };
+    } else if (script === 'composer-test' && projectType.composer) {
+      const composer = await readComposer(root, projectType.composer);
+      if (typeof composer?.scripts?.test === 'string' && composer.scripts.test.trim()
+        && !UNSAFE_SCRIPT_PATTERN.test(composer.scripts.test)) {
+        phpCommand = { executable: process.platform === 'win32' ? 'composer.bat' : 'composer', args: ['run-script', 'test'] };
+      }
+    } else if (script === 'php-lint') {
+      const changedFiles = await findChangedPhpFiles(root);
+      if (!changedFiles.length) throw new Error('NOT_AVAILABLE (no changed PHP files available for syntax lint).');
+      phpCommand = { executable: 'php', args: changedFiles.map((file) => ['-l', file]).flat(), lintFiles: changedFiles };
+    }
+    if (!phpCommand) throw new Error('PHP verification is not available for the selected project or requested check.');
+  }
+  if (phpCommand) {
+    const startedAt = Date.now();
+    const safeEnv = safeEnvironment(process.env);
+    const child = process.platform === 'win32' && /\.(?:bat|cmd)$/i.test(phpCommand.executable)
+      ? spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `${phpCommand.executable} ${phpCommand.args.join(' ')}`], { cwd: root, windowsHide: true, env: safeEnv })
+      : spawn(phpCommand.executable, phpCommand.args, { cwd: root, shell: false, windowsHide: true, env: safeEnv });
+    let stdout = '';
+    let stderr = '';
+    const appendBounded = (current, chunk) => current.length >= MAX_OUTPUT_CHARS ? current : (current + chunk.toString()).slice(0, MAX_OUTPUT_CHARS);
+    child.stdout.on('data', (chunk) => { stdout = appendBounded(stdout, chunk); });
+    child.stderr.on('data', (chunk) => { stderr = appendBounded(stderr, chunk); });
+    const result = await new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); };
+      const timer = setTimeout(() => { child.kill(); finish({ timedOut: true, exitCode: null }); }, MAX_COMMAND_DURATION_MS);
+      child.on('error', (error) => finish({ error: error.message, exitCode: null }));
+      child.on('close', (code) => finish({ exitCode: code }));
+    });
+    const durationMs = Date.now() - startedAt;
+    if (result.timedOut) return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
+    if (result.error) {
+      const missing = /enoent|not found/i.test(result.error);
+      return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: missing ? `${phpCommand.executable} not found in PATH.` : redactOutput(result.error), durationMs, spawnError: true, reason: missing ? `NOT_AVAILABLE (${phpCommand.executable} not found in PATH)` : undefined, networkPolicy: NETWORK_POLICY };
+    }
+    const ok = result.exitCode === 0;
+    await appendAudit(root, 'run_php_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
+    const runtimeEvidence = ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options);
+    return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, networkPolicy: NETWORK_POLICY, lintFiles: phpCommand.lintFiles };
+  }
   let packageJson;
   try {
     const packageFile = await resolveWithinRoot(root, 'package.json');
@@ -392,6 +493,26 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
 
 async function getVerificationScripts(ownerWebContentsId, requested = []) {
   const root = await validateProjectRoot(ownerWebContentsId);
+  const projectType = await detectProjectType(root);
+  if (projectType.isPhp) {
+    const composer = await readComposer(root, projectType.composer);
+    const available = [];
+    if (projectType.hasPhpUnitConfig) available.push('phpunit');
+    if (typeof composer?.scripts?.test === 'string' && composer.scripts.test.trim()
+      && !UNSAFE_SCRIPT_PATTERN.test(composer.scripts.test)) available.push('composer-test');
+    available.push('php-lint');
+    const hasRequestedScripts = Array.isArray(requested) && requested.length > 0;
+    const requestedNames = hasRequestedScripts
+      ? requested.map((script) => String(script).trim().toLowerCase())
+      : available;
+    const scripts = [...new Set(requestedNames)].filter((script) => available.includes(script));
+    const missing = hasRequestedScripts ? [...new Set(requestedNames)].filter((script) => !scripts.includes(script)) : [];
+    return {
+      scripts,
+      missing,
+      reason: scripts.length ? (missing.length ? `Verification checks are unavailable: ${missing.join(', ')}.` : null) : 'NOT_AVAILABLE (PHP verification tools/configuration unavailable).',
+    };
+  }
   let packageJson;
   try {
     const packageFile = await resolveWithinRoot(root, 'package.json');
@@ -440,5 +561,5 @@ module.exports = {
   chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit,
   getVerificationScripts, resolveWithinRoot, clearProject, releaseProject,
   assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY, isSensitivePath,
-  redactRuntimeValue, parseRuntimeFailure, mapRuntimeSource,
+  redactRuntimeValue, parseRuntimeFailure, mapRuntimeSource, classifyProjectSignals,
 };
