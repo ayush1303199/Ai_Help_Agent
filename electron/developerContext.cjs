@@ -8,7 +8,7 @@ function normalizeRoot(root) {
 }
 function rankResults(results, query) {
   const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
-  return [...results].map((item) => {
+  return [...results].map((item, index) => {
     const path = String(item.path || '');
     const name = String(item.name || '');
     const text = String(item.text || item.content || '');
@@ -21,9 +21,13 @@ function rankResults(results, query) {
       + (path.toLowerCase().includes('electron') ? 5 : 0)
       + (path.toLowerCase().includes('server') ? 4 : 0)
       + (name && terms.some((term) => name.toLowerCase().includes(term)) ? 8 : 0);
+    if (item.relationship === 'definition') score += 6;
+    if (item.relationship === 'reference') score += 4;
+    if (item.relationship === 'import') score += 3;
+    if (item.relatedTo) score += 2;
     const symbolBoost = /(?:function|class|component|hook|service|provider|model|context|route|index)/i.test(path + ' ' + name);
     if (symbolBoost) score += 3;
-    return { ...item, score };
+    return { ...item, score, rank: index };
   }).sort((a, b) => b.score - a.score || String(a.path).localeCompare(String(b.path)) || (a.line || 0) - (b.line || 0));
 }
 function assembleContext({ query, results = [], files = [], maxTokens = 4000, root = '__global__' } = {}) {
@@ -35,14 +39,24 @@ function assembleContext({ query, results = [], files = [], maxTokens = 4000, ro
   const key = digest(JSON.stringify({ root: scopedRoot, query, results, files, maxTokens }));
   if (cache.has(key)) return { ...cache.get(key), cached: true, root: scopedRoot };
   const ranked = rankResults(results, query);
-  const selected = []; let used = 0;
+  const selected = []; const selectedPaths = new Set(); let used = 0;
   for (const item of ranked) {
+    if (selectedPaths.has(item.path)) continue;
     const text = String(item.text || item.content || '');
     const cost = tokens(text);
     if (used + cost > maxTokens) continue;
     selected.push(item); used += cost;
+    selectedPaths.add(item.path);
   }
-  const context = { root: scopedRoot, query, tokenCount: used, budget: maxTokens, items: selected, diversity: new Set(selected.map((item) => item.path)).size };
+  const candidatePaths = [...new Set(ranked.map((item) => item.path).filter(Boolean))];
+  const context = {
+    root: scopedRoot, query, tokenCount: used, budget: maxTokens, items: selected,
+    diversity: selectedPaths.size,
+    candidateCount: candidatePaths.length,
+    selectedCount: selected.length,
+    coverage: candidatePaths.length ? Number((selected.length / candidatePaths.length).toFixed(3)) : 0,
+    selectionReason: 'ranked path, symbol, relationship, and architecture relevance',
+  };
   cache.set(key, context);
   return { ...context, cached: false };
 }

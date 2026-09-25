@@ -70,6 +70,13 @@ export const DEVELOPER_TOOLS = Object.freeze([
 ]);
 
 const TOOL_NAMES = new Set(DEVELOPER_TOOLS.map((tool) => tool.function.name));
+const MAX_RELATIVE_PATH_LENGTH = 512;
+const MAX_QUERY_LENGTH = 200;
+
+function assertBoundedString(value, field, maxLength) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} must be a non-empty string.`);
+  if (value.length > maxLength) throw new Error(`${field} exceeds the ${maxLength}-character limit.`);
+}
 
 export function validateToolCall(call) {
   const name = call?.function?.name;
@@ -77,12 +84,13 @@ export function validateToolCall(call) {
   let args;
   try { args = JSON.parse(call.function.arguments || '{}'); } catch { throw new Error('Developer tool arguments must be valid JSON.'); }
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Developer tool arguments must be an object.');
-  if (name === 'read_file' && typeof args.relativePath !== 'string') throw new Error('read_file requires a relative path.');
-  if (name === 'search_code' && typeof args.query !== 'string') throw new Error('search_code requires a query.');
-  if (name === 'search_symbols' && (typeof args.query !== 'string' || args.query.length > 200)) throw new Error('search_symbols requires a bounded query.');
+  if (name === 'list_directory' && args.relativePath !== undefined) assertBoundedString(args.relativePath, 'list_directory relativePath', MAX_RELATIVE_PATH_LENGTH);
+  if (name === 'read_file') assertBoundedString(args.relativePath, 'read_file relativePath', MAX_RELATIVE_PATH_LENGTH);
+  if (name === 'search_code') assertBoundedString(args.query, 'search_code query', MAX_QUERY_LENGTH);
+  if (name === 'search_symbols') assertBoundedString(args.query, 'search_symbols query', MAX_QUERY_LENGTH);
   if (name === 'get_repository_map' && Object.keys(args).length > 0) throw new Error('get_repository_map accepts no arguments.');
-  if (name === 'find_references' && (typeof args.query !== 'string' || args.query.length > 200)) throw new Error('find_references requires a bounded query.');
-  if (name === 'get_context' && (typeof args.query !== 'string' || args.query.length > 200)) throw new Error('get_context requires a bounded query.');
+  if (name === 'find_references') assertBoundedString(args.query, 'find_references query', MAX_QUERY_LENGTH);
+  if (name === 'get_context') assertBoundedString(args.query, 'get_context query', MAX_QUERY_LENGTH);
   if (name === 'get_context' && args.maxTokens !== undefined && (!Number.isInteger(args.maxTokens) || args.maxTokens < 64 || args.maxTokens > 12000)) throw new Error('get_context maxTokens is out of range.');
   if (name === 'run_command' && typeof args.script !== 'string') throw new Error('run_command requires a script name.');
   if (name === 'list_directory' && args.relativePath !== undefined && typeof args.relativePath !== 'string') throw new Error('list_directory relativePath must be a string.');
@@ -95,7 +103,12 @@ export async function completeDeveloper({ messages, allowTools = true }) {
     try {
       const response = await completeProvider({ provider, messages, tools: allowTools ? DEVELOPER_TOOLS : undefined });
       if (provider.id) setConfiguredProviderStatus(provider.id, 'ok');
-      return response.choices?.[0]?.message || {};
+      const message = response.choices?.[0]?.message;
+      if (!message || typeof message !== 'object') throw new Error('Developer provider returned an empty response.');
+      if (allowTools && !message.content && !Array.isArray(message.tool_calls)) {
+        throw new Error('Developer provider returned neither an answer nor a tool call.');
+      }
+      return message;
     } catch (error) {
       lastError = normalizeProviderError(error, provider.label || provider.adapterType || provider);
       if (provider.id) {

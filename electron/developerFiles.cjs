@@ -5,7 +5,11 @@ const { spawn } = require('node:child_process');
 const MAX_FILE_BYTES = 512 * 1024;
 const MAX_SEARCH_RESULTS = 100;
 const MAX_SEARCH_FILES = 2000;
-const IGNORED_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', '.dev-mode-audit.log']);
+const IGNORED_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', 'logs', 'tmp', 'temp', '.dev-mode-audit.log']);
+function isIgnoredName(name) {
+  const normalized = String(name || '').toLowerCase();
+  return IGNORED_NAMES.has(normalized) || normalized.startsWith('.developer-journal-') || normalized.endsWith('.log');
+}
 const MAX_COMMAND_DURATION_MS = 120000;
 const MAX_OUTPUT_CHARS = 12000;
 const SAFE_SCRIPT_NAMES = new Set(['lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify']);
@@ -14,12 +18,19 @@ const SAFE_COMMAND_PATTERN = /^\s*(?:tsc|eslint|vite|vitest|jest|mocha|ava|biome
 const SAFE_ENV_KEYS = new Set(['PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'ComSpec', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'CI']);
 const CREDENTIAL_ENV_PATTERN = /(?:key|token|secret|pass|credential|auth|private|cookie|session|client[_-]?secret|access[_-]?id)/i;
 const NETWORK_POLICY = Object.freeze({ mode: 'restricted', outbound: 'not-granted-by-verification-layer' });
+const SENSITIVE_NAME_PATTERN = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
+const SENSITIVE_DIRECTORY_NAMES = new Set(['.ssh', '.aws', '.azure', '.config']);
 
 const projectRoots = new Map();
 
 function isInsideRoot(root, target) {
   const relative = path.relative(root, target);
   return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function isSensitivePath(relativePath) {
+  const segments = String(relativePath || '').replace(/\\/g, '/').split('/').filter(Boolean);
+  return segments.some((segment) => SENSITIVE_DIRECTORY_NAMES.has(segment.toLowerCase()) || SENSITIVE_NAME_PATTERN.test(segment));
 }
 
 async function realPathOrParent(target) {
@@ -43,6 +54,8 @@ async function resolveWithinRoot(root, requestedPath = '.') {
   if (!isInsideRoot(canonicalRoot, realTarget)) {
     throw new Error('Access denied: the requested path is outside the selected project.');
   }
+  const relative = path.relative(canonicalRoot, realTarget);
+  if (isSensitivePath(relative)) throw new Error('Access denied: sensitive project files are not available to the Coding Agent.');
   return { root: canonicalRoot, target: realTarget };
 }
 
@@ -101,7 +114,7 @@ async function listDirectory(relativePath = '.', ownerWebContentsId) {
   if (!stat.isDirectory()) throw new Error('The requested path is not a directory.');
   const entries = await fs.readdir(target, { withFileTypes: true });
   const result = entries
-    .filter((entry) => !IGNORED_NAMES.has(entry.name))
+    .filter((entry) => !isIgnoredName(entry.name) && !isSensitivePath(entry.name))
     .map((entry) => ({ name: entry.name, type: entry.isDirectory() ? 'directory' : 'file' }))
     .sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
   await appendAudit(root, 'list_directory', relativePath, 'success');
@@ -131,8 +144,8 @@ async function searchCode(query, ownerWebContentsId) {
     const entries = await fs.readdir(directory.target, { withFileTypes: true });
     for (const entry of entries) {
       if (results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES) return;
-      if (IGNORED_NAMES.has(entry.name)) continue;
       const childRelative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
+      if (isIgnoredName(entry.name) || isSensitivePath(childRelative)) continue;
       if (entry.isDirectory()) {
         await walk(childRelative);
         continue;
@@ -359,5 +372,5 @@ function getProjectRoot(ownerWebContentsId = null) {
 module.exports = {
   chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit,
   getVerificationScripts, resolveWithinRoot, clearProject, releaseProject,
-  assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY,
+  assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY, isSensitivePath,
 };

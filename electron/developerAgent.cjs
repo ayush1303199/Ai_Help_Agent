@@ -35,6 +35,7 @@ const transitions = {
   undone: ['reading', 'cancelled'],
 };
 const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
+const SENSITIVE_PATH_PATTERN = /(?:^|[\\/])(?:\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.config|id_rsa(?:\..*)?|[^\\/]+\.(?:pem|key|p12|pfx|crt|cer|der))$/i;
 const registry = new Map();
 const sessions = new Map();
 let locked = false;
@@ -262,6 +263,7 @@ async function safePath(root, relative) {
   if (typeof relative !== 'string' || !relative || path.isAbsolute(relative)) throw new Error('Proposal paths must be relative.');
   const clean = relative.replace(/\\/g, '/');
   if (clean.split('/').includes('..') || clean.startsWith('/')) throw new Error('Proposal path traversal is denied.');
+  if (SENSITIVE_PATH_PATTERN.test(clean)) throw new Error('Sensitive files cannot be changed by the Coding Agent.');
   const target = path.resolve(root, clean);
   let entry;
   try { entry = await fs.lstat(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }

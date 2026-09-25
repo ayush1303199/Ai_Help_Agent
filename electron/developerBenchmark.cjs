@@ -119,4 +119,76 @@ async function runCodeGates(gates = []) {
     provider: 'code-side',
   };
 }
-module.exports = { discoverProviders, benchmark, buildAgentMetrics, compareBenchmarkSnapshots, runCodeGates };
+
+function runCodingAgentBenchmark() {
+  const cases = [
+    {
+      name: 'focused-context',
+      current: {
+        taskSuccessRate: 1, firstAttemptSuccessRate: 1, verificationPassRate: 1,
+        contextPrecision: 0.9, contextRecall: 0.8, tokenEfficiency: 0.85,
+        toolCalls: 4, usefulToolCalls: 4, duplicateToolCalls: 0, unnecessaryToolCalls: 0,
+        filesRead: 3, usefulFilesRead: 3, irrelevantFilesRead: 0, filesChanged: 1,
+      },
+      expected: { status: 'strong', regression: false },
+    },
+    {
+      name: 'duplicate-read-regression',
+      current: {
+        taskSuccessRate: 0.8, verificationPassRate: 0.7,
+        contextPrecision: 0.7, contextRecall: 0.6, tokenEfficiency: 0.5,
+        toolCalls: 8, usefulToolCalls: 4, duplicateToolCalls: 3, unnecessaryToolCalls: 2,
+        filesRead: 7, usefulFilesRead: 4, irrelevantFilesRead: 3, filesChanged: 2,
+      },
+      previous: {
+        taskSuccessRate: 0.8, verificationPassRate: 0.7,
+        contextPrecision: 0.7, contextRecall: 0.6, tokenEfficiency: 0.5,
+        toolCalls: 5, usefulToolCalls: 4, duplicateToolCalls: 0, unnecessaryToolCalls: 0,
+        filesRead: 4, usefulFilesRead: 4, irrelevantFilesRead: 0, filesChanged: 2,
+      },
+      expected: { status: 'acceptable', regression: true },
+    },
+    {
+      name: 'false-completion',
+      current: {
+        taskSuccessRate: 0.2, verificationPassRate: 0, falseCompletionRate: 1,
+        contextPrecision: 0.3, contextRecall: 0.2, tokenEfficiency: 0.2,
+        toolCalls: 3, usefulToolCalls: 1, filesRead: 2, irrelevantFilesRead: 1,
+      },
+      expected: { status: 'weak', regression: false },
+    },
+    {
+      name: 'repair-and-verify',
+      current: {
+        taskSuccessRate: 0.9, firstAttemptSuccessRate: 0.5, repairSuccessRate: 1,
+        verificationPassRate: 1, averageRepairAttempts: 1,
+        contextPrecision: 0.8, contextRecall: 0.8, tokenEfficiency: 0.75,
+        toolCalls: 6, usefulToolCalls: 5, repairAttempts: 1, filesRead: 4,
+        usefulFilesRead: 4, filesChanged: 2,
+      },
+      expected: { status: 'strong', regression: false },
+    },
+  ];
+  const results = cases.map((item) => {
+    const metrics = buildAgentMetrics(item.current);
+    const comparison = item.previous ? compareBenchmarkSnapshots(item.current, item.previous) : null;
+    const passed = metrics.status === item.expected.status
+      && (comparison ? comparison.regression === item.expected.regression : true);
+    return {
+      name: item.name,
+      passed,
+      status: metrics.status,
+      regression: comparison?.regression || false,
+      score: metrics.agentEfficiency,
+    };
+  });
+  return {
+    name: 'coding-agent-quality',
+    total: results.length,
+    passed: results.filter((result) => result.passed).length,
+    failed: results.filter((result) => !result.passed),
+    results,
+  };
+}
+
+module.exports = { discoverProviders, benchmark, buildAgentMetrics, compareBenchmarkSnapshots, runCodeGates, runCodingAgentBenchmark };

@@ -31,7 +31,13 @@ interface Proposal {
     attempts?: Array<{ check?: string; ok?: boolean; classification?: string; extracted?: { file?: string | null; line?: number | null } }>;
   } | null;
   error?: string | null;
-  runtime?: { phase?: string; taskState?: string; planVersion?: number } | null;
+  runtime?: {
+    phase?: string;
+    taskState?: string;
+    planVersion?: number;
+    history?: Array<{ phase?: string; message?: string; at?: string }>;
+    metrics?: { filesRead?: number; filesChanged?: number; verificationRuns?: number; confidence?: string };
+  } | null;
 }
 
 interface CodingAgentWorkspaceProps {
@@ -150,10 +156,23 @@ export function CodingAgentWorkspace({
               {proposal.state === 'awaiting_approval' && <button onClick={onApproveProposal} disabled={busy} className="rounded-md bg-amber-400 px-2 py-1 text-[11px] font-medium text-slate-950 disabled:opacity-40">Approve</button>}
               {proposal.state === 'approved' && <button onClick={onApplyProposal} disabled={busy} className="rounded-md bg-emerald-400 px-2 py-1 text-[11px] font-medium text-slate-950 disabled:opacity-40">Apply and verify</button>}
               {proposal.state === 'completed' && <button onClick={onUndoProposal} disabled={busy} className="rounded-md border border-rose-400/60 px-2 py-1 text-[11px] text-rose-200 disabled:opacity-40">Undo</button>}
-              <button onClick={onDiscardProposal} className="text-[11px] text-slate-400 hover:text-slate-200">Discard</button>
+              <button onClick={onDiscardProposal} className="text-[11px] text-slate-400 hover:text-slate-200">Reject / discard</button>
             </div>
           </div>
           <p className="mt-2 text-[11px] text-slate-500">Re-read files: {proposal.searchedFiles.join(', ')}</p>
+          {proposal.runtime?.metrics && <div className="mt-3 grid grid-cols-2 gap-2 rounded-md border border-slate-700 bg-slate-950 p-2 text-[10px] text-slate-400 sm:grid-cols-4">
+            <span>Files read: {proposal.runtime.metrics.filesRead || 0}</span>
+            <span>Files changed: {proposal.runtime.metrics.filesChanged || 0}</span>
+            <span>Checks: {proposal.runtime.metrics.verificationRuns || 0}</span>
+            <span>Confidence: {proposal.runtime.metrics.confidence || 'LOW'}</span>
+          </div>}
+          {proposal.runtime?.history && proposal.runtime.history.length > 0 && <div className="mt-3 rounded-md border border-slate-700 bg-slate-950 p-2">
+            <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500">Agent activity</p>
+            <div className="space-y-1.5">{proposal.runtime.history.slice(-8).map((event, index) => <div key={`${event.phase || 'event'}-${event.at || index}`} className="flex gap-2 text-[10px] text-slate-400">
+              <span className="w-28 shrink-0 font-medium text-sky-300">{event.phase || 'EVENT'}</span>
+              <span>{event.message || 'Lifecycle event recorded.'}</span>
+            </div>)}</div>
+          </div>}
           {proposal.files.length > 0 ? <div className="mt-3 space-y-3">{proposal.files.map((file) => <div key={file.path} className="overflow-hidden rounded-md border border-slate-700 bg-slate-950"><p className="border-b border-slate-700 px-2 py-1.5 text-xs font-medium text-slate-200">{file.path}</p><pre className="max-h-80 overflow-auto p-2 text-[11px] leading-relaxed text-slate-300">{file.lines.map((line, index) => <span key={`${file.path}-${index}`} className={`block ${line.startsWith('+') && !line.startsWith('+++') ? 'bg-emerald-500/10 text-emerald-200' : line.startsWith('-') && !line.startsWith('---') ? 'bg-rose-500/10 text-rose-200' : 'text-slate-400'}`}>{line || ' '}</span>)}</pre></div>)}</div> : <pre className="mt-3 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] text-slate-300">{proposal.raw || 'No safe changes proposed.'}</pre>}
           {proposal.verification && <div className={`mt-3 rounded-md border p-2 text-[11px] ${proposal.verification.status === 'PASS' || proposal.verification.status === 'NOT_AVAILABLE' ? 'border-emerald-500/30 text-emerald-200' : 'border-rose-500/30 text-rose-200'}`}><p>Verification: {proposal.verification.status || 'UNKNOWN'}</p>{proposal.verification.reason && <p className="mt-1 text-slate-400">{proposal.verification.reason}</p>}{proposal.verification.attempts?.filter((attempt) => !attempt.ok).map((attempt, index) => <p key={`${attempt.check || 'check'}-${index}`} className="mt-1 text-rose-200">{attempt.check || 'check'}: {attempt.classification || 'failed'}{attempt.extracted?.file ? ` · ${attempt.extracted.file}${attempt.extracted.line ? `:${attempt.extracted.line}` : ''}` : ''}</p>)}</div>}
           {proposal.error && <p className="mt-2 text-[11px] text-rose-300">{proposal.error}</p>}

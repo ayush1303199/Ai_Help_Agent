@@ -3,7 +3,17 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const SUPPORTED = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs']);
-const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo', '.cache']);
+const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo', '.cache', 'logs', 'tmp', 'temp']);
+const sensitiveNames = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
+const sensitiveDirectories = new Set(['.ssh', '.aws', '.azure', '.config']);
+function isIgnoredName(name) {
+  const normalized = String(name || '').toLowerCase();
+  return ignored.has(normalized) || normalized.startsWith('.developer-journal-') || normalized.endsWith('.log');
+}
+function isSensitivePath(relativePath) {
+  return String(relativePath || '').replace(/\\/g, '/').split('/').filter(Boolean)
+    .some((segment) => sensitiveDirectories.has(segment.toLowerCase()) || sensitiveNames.test(segment));
+}
 const digest = (text) => crypto.createHash('sha256').update(text).digest('hex');
 const REPO_CONFIG_FILES = new Set(['package.json', 'tsconfig.json', 'tsconfig.app.json', 'vite.config.js', 'vite.config.ts', 'vite.config.mjs', 'eslint.config.js', 'eslint.config.mjs', 'playwright.config.js', 'playwright.config.ts', 'README.md', 'README.MD', '.gitignore']);
 
@@ -36,6 +46,7 @@ function parseSource(relativePath, content) {
   });
   return {
     path: relativePath, hash: digest(content), symbols, imports, exports, definitions, references,
+    dependencyEdges: imports.map((item) => ({ from: relativePath, to: item.source, line: item.line })),
     capabilities: { symbols: true, imports: true, exports: true, definitions: true, references: true,
       typeResolution: false, guaranteedCallGraph: false, languages: ['javascript', 'typescript'] },
     unsupported: ['type resolution', 'guaranteed call graph', 'non-JavaScript/TypeScript languages'],
@@ -66,8 +77,8 @@ async function readProjectMetadata(root) {
     for (const entry of currentEntries) {
       const normalizedName = entry.name.toLowerCase();
       if (entry.isDirectory()) {
-        if (ignored.has(normalizedName) || normalizedName.startsWith('.')) continue;
         const relative = path.relative(root, path.join(directory, entry.name)).replace(/\\/g, '/');
+        if (isIgnoredName(normalizedName) || isSensitivePath(relative) || normalizedName.startsWith('.')) continue;
         directoryNames.add(relative);
         if (['src', 'app', 'client', 'server', 'electron', 'scripts', 'tests', 'test', '__tests__', 'lib'].includes(entry.name)) {
           sourceDirectories.push(relative);
@@ -113,6 +124,7 @@ async function readProjectMetadata(root) {
   return {
     root,
     packageManager,
+    packageScripts: packageJson?.scripts && typeof packageJson.scripts === 'object' ? { ...packageJson.scripts } : {},
     languages: [...languages].sort(),
     frameworks: [...featureHints].sort(),
     type: 'repository-map',
@@ -135,8 +147,9 @@ async function buildRepositoryMap(rootInput, previous = null) {
   const metadata = await readProjectMetadata(root);
   const directorySummary = metadata.directorySummary;
   const structure = directorySummary.slice(0, 200).map((entry) => ({ path: entry, type: entry.includes('.') ? 'file' : 'directory' }));
+  const scripts = metadata.packageScripts || {};
   const cacheKey = digest(JSON.stringify({ root, metadata }));
-  return { root, generatedAt: new Date().toISOString(), cacheKey, ...metadata, structure, previousCacheHit: Boolean(previous && previous.cacheKey === cacheKey) };
+  return { root, generatedAt: new Date().toISOString(), cacheKey, ...metadata, scripts, structure, previousCacheHit: Boolean(previous && previous.cacheKey === cacheKey) };
 }
 
 async function buildIndex(rootInput, previous = null) {
@@ -144,8 +157,9 @@ async function buildIndex(rootInput, previous = null) {
   const files = [];
   const walk = async (directory) => {
     for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
-      if (ignored.has(entry.name)) continue;
       const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute).replace(/\\/g, '/');
+      if (isIgnoredName(entry.name) || isSensitivePath(relative)) continue;
       if (entry.isDirectory()) {
         const canonical = await fs.realpath(absolute);
         if (!inside(root, canonical) || canonical !== absolute) continue;
@@ -163,6 +177,12 @@ async function buildIndex(rootInput, previous = null) {
     const oldEntry = old[relative];
     indexed[relative] = oldEntry?.hash === digest(content) ? oldEntry : parseSource(relative, content);
   }
+  const dependencyEdges = Object.values(indexed).flatMap((file) => file.dependencyEdges || []);
+  const dependencyGraph = {
+    nodes: Object.keys(indexed),
+    edges: dependencyEdges.slice(0, 2000),
+    capabilities: { staticImports: true, resolvedPaths: false, dynamicImports: false },
+  };
   const cacheHits = files.filter((absolute) => {
     const relative = path.relative(root, absolute).replace(/\\/g, '/');
     return Boolean(old[relative] && old[relative].hash === indexed[relative].hash);
@@ -172,6 +192,7 @@ async function buildIndex(rootInput, previous = null) {
     cacheHits,
     capabilities: { parser: 'deterministic-regex', typeResolution: false, guaranteedCallGraph: false,
       supportedExtensions: [...SUPPORTED] },
+    dependencyGraph,
     repositoryMap: await buildRepositoryMap(root),
   };
 }
@@ -213,4 +234,4 @@ async function assertWithinRoot(rootInput, relativePath) {
   if (!inside(root, target)) throw new Error('Path is outside the indexed root.');
   return target;
 }
-module.exports = { SUPPORTED, parseSource, buildIndex, buildRepositoryMap, searchSymbols, definitions, relationships, findReferences, inside, assertWithinRoot };
+module.exports = { SUPPORTED, parseSource, buildIndex, buildRepositoryMap, searchSymbols, definitions, relationships, findReferences, inside, assertWithinRoot, isIgnoredName, isSensitivePath };

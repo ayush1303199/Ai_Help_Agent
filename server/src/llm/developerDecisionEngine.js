@@ -3,6 +3,7 @@ const INTENTS = Object.freeze([
   'FEATURE_REQUEST', 'REFACTOR', 'OPTIMIZATION', 'TEST_REQUEST',
   'DOCUMENTATION', 'PROJECT_ANALYSIS', 'ARCHITECTURE_ANALYSIS',
   'CONFIGURATION_CHANGE', 'DEPENDENCY_CHANGE', 'MULTI_FILE_CHANGE',
+  'CODE_REVIEW', 'RUN_AND_CHECK',
 ]);
 
 const WRITE_INTENTS = new Set([
@@ -276,7 +277,18 @@ export function buildTaskPlan(request, evidence = {}) {
 
   return {
     mode: resolveAgentMode(request),
+    intent: classification.intent,
+    risk: classification.risk,
+    writeRequired: classification.writeRequired,
     goal: classification.writeRequired ? 'Fix or implement the requested change safely.' : 'Answer the developer question using repository evidence.',
+    assumptions: classification.writeRequired
+      ? ['The selected project root is authoritative.', 'No write occurs before explicit approval.']
+      : ['The answer must be limited to inspected repository evidence.'],
+    riskControls: classification.risk === 'critical'
+      ? ['Require explicit target confirmation before proposing.', 'Never expose or modify credentials or destructive targets.']
+      : classification.risk === 'high'
+        ? ['Inspect configuration and tests before proposing.', 'Report uncertainty when runtime evidence is unavailable.']
+        : ['Keep the change or answer bounded to the requested scope.'],
     tasks: taskList,
     dependencies: taskList.map((_, index) => index === 0 ? [] : [taskList[index - 1]]),
     terms: uniqueTerms,
@@ -390,7 +402,9 @@ export function classifyDeveloperRequest(input) {
   const text = normalized(input);
   const lower = text.toLowerCase();
   let intent = 'QUESTION';
-  if (/\b(architecture|system design|dependencies flow)\b/.test(lower)) intent = 'ARCHITECTURE_ANALYSIS';
+  if (/\b(review|review the code|code review|audit)\b/.test(lower)) intent = 'CODE_REVIEW';
+  else if (/\b(run|execute|check|verify|validate)\b/.test(lower) && /\b(test|tests|lint|typecheck|build|check|verification|verify)\b/.test(lower)) intent = 'RUN_AND_CHECK';
+  else if (/\b(architecture|system design|dependencies flow)\b/.test(lower)) intent = 'ARCHITECTURE_ANALYSIS';
   else if (/\b(project|repository|repo) (overview|analysis|structure)\b/.test(lower)) intent = 'PROJECT_ANALYSIS';
   else if (/\b(config|configuration|environment variable)\b/.test(lower)) intent = 'CONFIGURATION_CHANGE';
   else if (/\b(dependenc|package|library)\b/.test(lower)) intent = 'DEPENDENCY_CHANGE';
@@ -462,9 +476,10 @@ export function evaluateUnderstanding({ request, evidence = {} }) {
   const behaviorLocated = Boolean(evidence.behaviorLocated);
   const dependenciesUnderstood = Boolean(evidence.dependenciesUnderstood);
   const testsLocated = Boolean(evidence.testsLocated);
+  const rootCauseIdentified = Boolean(evidence.rootCauseIdentified);
   const scope = evaluateScope(evidence);
   const writeReady = !classification.writeRequired || (
-    targetIdentified && behaviorLocated && dependenciesUnderstood && testsLocated && scope.state !== 'SCOPE_BLOCKED'
+    targetIdentified && behaviorLocated && rootCauseIdentified && dependenciesUnderstood && testsLocated && scope.state !== 'SCOPE_BLOCKED'
   );
   const state = !targetIdentified && classification.writeRequired
     ? 'INSUFFICIENT'
@@ -475,6 +490,7 @@ export function evaluateUnderstanding({ request, evidence = {} }) {
     behaviorLocated,
     dependenciesUnderstood,
     testsLocated,
+    rootCauseIdentified,
     scope,
     state,
     writeReady,
@@ -516,16 +532,31 @@ export function clarificationDecision(evidence = {}) {
 }
 
 export function updateEvidence(evidence, toolName, result) {
-  const next = { ...evidence, filesRead: [...(evidence.filesRead || [])], searches: evidence.searches || 0 };
-  if (!result?.ok) return next;
+  const next = {
+    ...evidence,
+    filesRead: [...(evidence.filesRead || [])],
+    searches: Number(evidence.searches || 0),
+    toolResults: Number(evidence.toolResults || 0) + 1,
+    failedTools: Number(evidence.failedTools || 0),
+  };
+  if (!result?.ok) {
+    next.failedTools += 1;
+    return next;
+  }
   if (toolName === 'read_file' && result.data?.path) {
     if (!next.filesRead.includes(result.data.path)) next.filesRead.push(result.data.path);
     next.targetIdentified = true;
     next.behaviorLocated = true;
     const path = String(result.data.path).toLowerCase();
     const content = String(result.data.content || '');
-    next.dependenciesUnderstood = next.dependenciesUnderstood || /(?:package\.json|composer\.json|pom\.xml|requirements\.txt|pyproject\.toml|cargo\.toml|go\.mod|tsconfig|config|import\s|require\()/i.test(path + '\n' + content);
+    const imports = [...content.matchAll(/(?:from\s+|import\s+|require\(\s*|include\s+)(['"`])([^'"`]+)\1/g)].map((match) => match[2]);
+    next.imports = [...new Set([...(next.imports || []), ...imports])].slice(0, 80);
+    next.dependenciesUnderstood = next.dependenciesUnderstood
+      || imports.length > 0
+      || /(?:package\.json|composer\.json|pom\.xml|requirements\.txt|pyproject\.toml|cargo\.toml|go\.mod|tsconfig|config)/i.test(path);
     next.testsLocated = next.testsLocated || /(?:test|spec|__tests__)/i.test(path);
+    next.rootCauseIdentified = next.rootCauseIdentified
+      || (next.targetIdentified && next.behaviorLocated && /(?:error|bug|fail|issue|root cause|throw|catch|timeout|undefined|null)/i.test(content));
   }
   if (toolName === 'search_code' || toolName === 'search_symbols' || toolName === 'get_context') {
     next.searches += 1;
@@ -554,14 +585,15 @@ export function evidenceContinuationPrompt(request, evidence) {
       candidatePaths: evidence.candidatePaths || [],
       targetIdentified: Boolean(evidence.targetIdentified),
       behaviorLocated: Boolean(evidence.behaviorLocated),
+      rootCauseIdentified: Boolean(evidence.rootCauseIdentified),
       dependenciesUnderstood: Boolean(evidence.dependenciesUnderstood),
       testsLocated: Boolean(evidence.testsLocated),
-    })}. Read the most relevant candidate, dependency/configuration, and test files next. Do not claim readiness.`;
+    })}. Read the most relevant candidate, dependency/configuration, and test files next. Confirm the root cause from evidence before proposing. Do not repeat a tool call with the same arguments, and do not inspect unrelated files. Do not claim readiness.`;
   }
   if (understanding.writeRequired && evidence.ambiguous && (evidence.filesRead || []).length === 0) {
     return 'Multiple candidate targets were found. Inspect enough candidates to determine whether one target is authoritative; if ambiguity remains, ask the user to clarify rather than proposing a change.';
   }
-  return `Evidence state: ${understanding.state}. Stop reading unrelated files. Answer the user, or enter the existing proposal flow only if the evidence supports it.`;
+  return `Evidence state: ${understanding.state}. Stop reading unrelated files. If the target and behavior are clear, answer now or enter the existing proposal flow; otherwise make one focused read only. Never repeat an already successful tool call unless new evidence requires it.`;
 }
 
 export function developerDecisionPrompt(request) {
@@ -602,7 +634,7 @@ export function developerDecisionPrompt(request) {
     '- Before closing, restarting, or shutting down a running process, service, task, or connection, ask exactly: "Are you sure you want to close [process/task name]?" and continue only after explicit user confirmation: "yes".',
     '- Keep Assistant, Developer, and General Agent state isolated; do not leak mutable state or credentials between modes.',
     '- Only run allow-listed verification commands inside the selected project. Do not run arbitrary commands or commands that can mutate the project or system.',
-    'For coding changes, search and read relevant files before proposing anything.',
+    'For coding changes, search and read relevant files before proposing anything. Prefer one repository-map or symbol/search call, then only the highest-value files; stop when target, behavior, dependencies, and tests are sufficiently understood.',
     'Do not guess target files, symbols, dependencies, tests, or configuration. If evidence is missing, use another focused read step or ask a clarification.',
     'Never claim a change was applied. The current Developer Mode has no filesystem write capability.',
     'If the task requires a change, propose the minimal safe change only after evidence is sufficient and the user explicitly approves it.',
