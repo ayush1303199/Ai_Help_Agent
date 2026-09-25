@@ -70,6 +70,15 @@ function assembleRuntimeEvidenceContext(evidence = {}, maxTokens = 1800) {
   const content = lines.join('\n').slice(0, budget * 4);
   return { content, tokenCount: tokens(content), budget, observed: Boolean(evidence.observed), redacted: evidence.redacted !== false };
 }
+function assemblePreferenceContext(preferences = [], maxTokens = 600) {
+  const budget = Math.max(64, Math.min(Number(maxTokens) || 600, 1200));
+  const content = preferences.filter((item) => item && item.enabled && typeof item.text === 'string')
+    .slice(0, 20)
+    .map((item) => `- [${String(item.category || 'other').slice(0, 32)}] ${item.text.slice(0, 240)}`)
+    .join('\n')
+    .slice(0, budget * 4);
+  return { content: content ? `[user-style-guidance]\n${content}` : '', tokenCount: tokens(content), budget };
+}
 function invalidateContextCache(root = null) {
   if (root === null || root === undefined) {
     cache.clear();
@@ -81,4 +90,4 @@ function invalidateContextCache(root = null) {
     if (value && value.root === scopedRoot) cache.delete(key);
   }
 }
-module.exports = { tokens, rankResults, assembleContext, assembleRuntimeEvidenceContext, invalidateContextCache };
+module.exports = { tokens, rankResults, assembleContext, assembleRuntimeEvidenceContext, assemblePreferenceContext, invalidateContextCache };

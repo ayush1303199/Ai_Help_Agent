@@ -1,4 +1,5 @@
 import { renderAnswerMarkdown } from '../../ui/answerMarkdown';
+import type { CodingPreference } from '../../history/historyService';
 
 interface CodingMessage {
   role: 'user' | 'assistant';
@@ -72,6 +73,9 @@ interface CodingAgentWorkspaceProps {
   onDiscardProposal: () => void;
   onSendMessage: () => void;
   onClearMessages: () => void;
+  codingPreferences: CodingPreference[];
+  onToggleCodingPreference: (id: string) => void;
+  onResetCodingPreferences: () => void;
 }
 
 export function CodingAgentWorkspace({
@@ -106,6 +110,9 @@ export function CodingAgentWorkspace({
   onDiscardProposal,
   onSendMessage,
   onClearMessages,
+  codingPreferences,
+  onToggleCodingPreference,
+  onResetCodingPreferences,
 }: CodingAgentWorkspaceProps) {
   return (
     <>
@@ -144,6 +151,13 @@ export function CodingAgentWorkspace({
           </div>
         </div>}
       </div>
+      <section className="mb-5 rounded-xl border border-slate-700 bg-slate-800/30 p-3">
+        <div className="flex items-center justify-between gap-2">
+          <div><p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Coding preferences</p><p className="mt-1 text-[11px] text-slate-400">Only explicit recurring style corrections are remembered.</p></div>
+          {codingPreferences.length > 0 && <button onClick={onResetCodingPreferences} className="text-[11px] text-rose-300 hover:text-rose-200">Reset all</button>}
+        </div>
+        {codingPreferences.length === 0 ? <p className="mt-2 text-xs text-slate-500">No saved preferences.</p> : <div className="mt-2 space-y-1">{codingPreferences.map((preference) => <label key={preference.id} className="flex items-start gap-2 text-xs text-slate-300"><input type="checkbox" checked={preference.enabled} onChange={() => onToggleCodingPreference(preference.id)} className="mt-0.5" /><span><span className="mr-2 text-[10px] uppercase text-sky-300">{preference.category}</span>{preference.text}</span></label>)}</div>}
+      </section>
       {proposal && (
         <section className="mb-5 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
           <div className="flex items-center justify-between gap-3">

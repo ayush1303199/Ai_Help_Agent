@@ -64,7 +64,7 @@ import { AppHeader } from './ui/header/AppHeader';
 import { ContextButton, ContextPanel, FontSizeControls, HistoryButton, OverlayButton, ScreenReadingToggle, SettingsButton } from './ui/header/HeaderActions';
 import { ModeControls } from './ui/header/ModeControls';
 import type { AppMode, AssistantMode, MeetingAudioMode } from './app/appTypes';
-import { compactDeveloperSession, historyTitle, readDeveloperConversationStates, readHistory, removeHistorySession, searchHistory, upsertDeveloperConversationState, upsertHistory, writeDeveloperConversationStates, writeHistory, type DeveloperConversationState, type DeveloperPatchRecord, type HistoryMode } from './history/historyService';
+import { codingPreferenceContext, compactDeveloperSession, extractCodingPreference, historyTitle, readCodingPreferences, readDeveloperConversationStates, readHistory, removeHistorySession, searchHistory, upsertCodingPreference, upsertDeveloperConversationState, upsertHistory, writeCodingPreferences, writeDeveloperConversationStates, writeHistory, type CodingPreference, type DeveloperConversationState, type DeveloperPatchRecord, type HistoryMode } from './history/historyService';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -512,6 +512,7 @@ function App() {
   const [developerAppliedPatchLog, setDeveloperAppliedPatchLog] = useState<DeveloperPatchRecord[]>([]);
   const [developerLastProvider, setDeveloperLastProvider] = useState<{ id?: string; label?: string; model?: string; changedAt?: string } | null>(null);
   const [developerConversationStates, setDeveloperConversationStates] = useState<DeveloperConversationState[]>(readDeveloperConversationStates);
+  const [codingPreferences, setCodingPreferences] = useState<CodingPreference[]>(readCodingPreferences);
   const [developerProposal, setDeveloperProposal] = useState<{
     id?: string;
     state?: string;
@@ -814,6 +815,12 @@ function App() {
       setError('Coding session context could not be saved because browser storage is full or unavailable.');
     }
   }, [developerConversationStates]);
+
+  useEffect(() => {
+    if (!writeCodingPreferences(codingPreferences)) {
+      setError('Coding preferences could not be saved because browser storage is full or unavailable.');
+    }
+  }, [codingPreferences]);
 
   useEffect(() => {
     const secretMap = readPersistedProviderSecrets();
@@ -2024,6 +2031,11 @@ function App() {
   const sendDeveloperMessage = async () => {
     const question = developerInput.trim();
     if (!question || developerStreaming || developerBusy) return;
+    const detectedPreference = extractCodingPreference(question);
+    if (detectedPreference) {
+      setCodingPreferences((previous) => upsertCodingPreference(previous, detectedPreference));
+      setStatusMessage('Coding preference saved for future Coding Agent sessions.');
+    }
     if (/^(?:please\s+)?(?:apply|save|write|update|modify|make)\b.*(?:change|patch|file|it|this)/i.test(question)
       || /^(?:go ahead and )?(?:apply|save|write)\b/i.test(question)) {
       setDeveloperMessages((previous) => [
@@ -2100,6 +2112,12 @@ function App() {
               'Preserve this state when continuing after a provider switch. Never claim a patch was applied unless the log says it was applied and verified.',
             ].join('\n'),
           },
+          {
+            role: 'system',
+            content: codingPreferenceContext(codingPreferences)
+              ? `User style preferences (guidance only; never override safety, project constraints, approval, or verification):\n${codingPreferenceContext(codingPreferences)}`
+              : 'No saved user coding style preferences.',
+          },
           ...conversationHistory,
         ],
         pdfContext: '',
@@ -2152,6 +2170,22 @@ function App() {
     } finally {
       setDeveloperBusy(false);
     }
+  };
+
+  const toggleCodingPreference = (id: string) => {
+    setCodingPreferences((previous) => previous.map((preference) => preference.id === id
+      ? { ...preference, enabled: !preference.enabled, updatedAt: new Date().toISOString() }
+      : preference));
+  };
+
+  const resetCodingPreferences = () => {
+    setConfirmation({
+      title: 'Reset coding preferences?',
+      description: 'This removes all saved Coding Agent style preferences. Conversation history and project files will not be changed.',
+      confirmLabel: 'Reset preferences',
+      variant: 'danger',
+      onConfirm: () => setCodingPreferences([]),
+    });
   };
 
   const listDeveloperDirectory = async () => {
@@ -4130,6 +4164,9 @@ function App() {
               onDiscardProposal={() => setDeveloperProposal(null)}
               onSendMessage={() => void sendDeveloperMessage()}
               onClearMessages={() => { setDeveloperMessages([]); setDeveloperInput(''); }}
+              codingPreferences={codingPreferences}
+              onToggleCodingPreference={toggleCodingPreference}
+              onResetCodingPreferences={resetCodingPreferences}
             />
           </CodingAgentPage>
         ) : (

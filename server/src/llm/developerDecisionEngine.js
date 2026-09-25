@@ -35,6 +35,11 @@ export function createTaskRuntimeState(initial = {}) {
       waste: Number(initial?.contextQuality?.waste || 0),
       selectionReason: initial?.contextQuality?.selectionReason || '',
     },
+    preferences: Array.isArray(initial.preferences) ? initial.preferences.slice(0, 20).map((preference) => ({
+      category: String(preference?.category || 'other').slice(0, 32),
+      text: String(preference?.text || '').slice(0, 240),
+      enabled: preference?.enabled !== false,
+    })) : [],
     metrics: {
       toolCalls: Number(initial?.metrics?.toolCalls || 0),
       usefulToolCalls: Number(initial?.metrics?.usefulToolCalls || 0),
@@ -166,6 +171,13 @@ export function createTaskRuntimeState(initial = {}) {
       this.lastUpdated = new Date().toISOString();
       return this.taskMemory.runtimeEvidence;
     },
+    setStylePreferences(preferences = []) {
+      this.preferences = preferences.filter((preference) => preference && preference.enabled !== false)
+        .slice(0, 20)
+        .map((preference) => ({ category: String(preference.category || 'other').slice(0, 32), text: String(preference.text || '').slice(0, 240), enabled: true }));
+      this.observations.push({ kind: 'STYLE_PREFERENCES_APPLIED', count: this.preferences.length, at: new Date().toISOString() });
+      return this.preferences;
+    },
     summarize() {
       return {
         phase: this.phase,
@@ -178,6 +190,7 @@ export function createTaskRuntimeState(initial = {}) {
         assumptions: [...this.assumptions],
         decisionLog: [...this.decisionLog].slice(-10),
         contextQuality: { ...this.contextQuality },
+        preferences: [...this.preferences],
         observations: [...this.observations].slice(-10),
         history: [...this.history].slice(-10),
         lastUpdated: this.lastUpdated,
