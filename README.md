@@ -533,7 +533,12 @@ electron/
   preload.cjs               Context-isolated renderer API
 
 src/
-  App.tsx                   Main assistant UI and capture pipeline
+  App.tsx                   Shared app shell, provider/context services, navigation, and history
+  features/
+    assistant/              Assistant page, conversation UI, controller, and transport
+    meeting/                 Meeting page, audio/STT controller, and transport
+    general/                 General page, task controller, and transport
+    coding/                  Coding page, workspace, and Developer pipeline controller
   Overlay.tsx               Answer overlay UI
   audio/transcriptUtils.ts  Transcript cleanup and question detection
   ai/interviewContext.ts    Domain, Background, microphone persistence

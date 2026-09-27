@@ -6,7 +6,9 @@ const projectRoot = process.cwd();
 const sourceExtensions = /\.(?:cjs|js|jsx|mjs|py|ts|tsx)$/;
 const appSource = fs.readFileSync(path.join(projectRoot, 'src', 'App.tsx'), 'utf8');
 const generalControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'general', 'useGeneralAgentController.ts'), 'utf8');
+const generalPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'general', 'GeneralAgentPage.tsx'), 'utf8');
 const codingControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'coding', 'useCodingAgentController.ts'), 'utf8');
+const codingPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'coding', 'CodingAgentPage.tsx'), 'utf8');
 const meetingControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'useMeetingAssistantController.ts'), 'utf8');
 const meetingPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'MeetingAssistantPage.tsx'), 'utf8');
 const meetingTransportSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'meetingTransport.ts'), 'utf8');
@@ -133,7 +135,10 @@ const codingMeetingFixtureViolations = findCrossAgentImports([
   },
 ]);
 assert.equal(codingMeetingFixtureViolations.length, 2, 'The boundary checker must reject imports between Coding and Meeting.');
-assert.match(appSource, /useGeneralAgentController\(\)/, 'App composition must mount the General Agent controller.');
+assert.match(generalPageSource, /useGeneralAgentController\(\)/, 'The General Agent page must own its controller lifecycle.');
+assert.match(generalPageSource, /<GeneralAgentWorkspace/, 'The General Agent page must render its own workspace.');
+assert.match(generalPageSource, /onHistoryEntry\(/, 'General Agent history records must leave the page through a typed callback.');
+assert.doesNotMatch(appSource, /useGeneralAgentController/, 'App composition must not construct the General Agent controller.');
 assert.doesNotMatch(
   appSource,
   /createGeneralTask|generalBrowserOperation|recordGeneralModelResponse|runGeneralAgentRequest|pendingGeneralRequestIdsRef/,
@@ -141,7 +146,8 @@ assert.doesNotMatch(
 );
 assert.match(generalControllerSource, /new WebSocket\(GENERAL_WS_URL\)/, 'General Agent must own its WebSocket connection.');
 assert.match(generalControllerSource, /mode: 'general'[\s\S]*general: true/, 'General requests must use the General-only protocol contract.');
-assert.match(appSource, /useMeetingAssistantController\(/, 'App composition must mount the Meeting Assistant controller.');
+assert.match(meetingPageSource, /useMeetingAssistantController\(/, 'The Meeting Assistant page must own its controller lifecycle.');
+assert.doesNotMatch(appSource, /useMeetingAssistantController/, 'App composition must not construct the Meeting Assistant controller.');
 assert.match(
   meetingControllerSource,
   /const sendQuestion = async[\s\S]*transport\.send\(buildChatRequest\(/,
@@ -151,15 +157,16 @@ assert.match(meetingTransportSource, /agent: 'meeting'/, 'Meeting transport must
 assert.match(meetingPageSource, /<MeetingAssistantWorkspace \{\.\.\.workspace\} \/>/, 'Meeting must have a feature-owned page boundary.');
 assert.match(appSource, /appMode === 'meeting'/, 'Meeting must have an independent application page route.');
 assert.doesNotMatch(appSource, /generalAnswer \|\| assistantAnswer|generalBusy \? 'thinking' : generalAnswer/, 'Assistant overlay status must not consume General Agent state.');
-assert.match(appSource, /useAssistantAgentController\(/, 'App composition must mount the Assistant controller.');
-assert.match(assistantPageSource, /<AssistantAgentWorkspace \{\.\.\.workspace\} \/>/, 'Assistant must have a feature-owned page boundary.');
+assert.match(assistantPageSource, /useAssistantAgentController\(/, 'The Assistant page must own its controller lifecycle.');
+assert.doesNotMatch(appSource, /useAssistantAgentController/, 'App composition must not construct the Assistant controller.');
+assert.match(assistantPageSource, /<AssistantAgentWorkspace[\s\S]*\{\.\.\.workspace\}/, 'Assistant must have a feature-owned page boundary.');
 assert.match(assistantWorkspaceSource, /export function AssistantAgentWorkspace/, 'Assistant chat presentation must stay in its feature folder.');
 assert.match(appSource, /<AssistantAgentPage/, 'App must route Assistant rendering through its feature-owned page.');
 assert.match(assistantControllerSource, /new AssistantAgentTransport\(/, 'Assistant Agent must own its transport lifecycle.');
 assert.match(assistantTransportSource, /ASSISTANT_WS_URL = .*\/assistant/, 'Assistant transport must use its isolated endpoint.');
 assert.match(assistantTransportSource, /agent: 'assistant'/, 'Assistant transport must identify its own endpoint.');
 assert.doesNotMatch(appSource, /new WebSocket|wsRef|wsConnectPromiseRef|handleWsMessage|pendingChatRequestIdsRef|draftImproveRequestIdRef/, 'Assistant WebSocket lifecycle and request routing must stay in the Assistant feature.');
-assert.match(appSource, /buildChatRequest:/, 'App must provide Meeting context through an injected request-builder contract.');
+assert.match(appSource, /buildChatRequest=\{buildMeetingChatRequest\}/, 'App must provide Meeting context through an injected request-builder contract.');
 assert.doesNotMatch(
   appSource,
   /transcribeAudioSegment|MediaRecorder|getUserMedia|segmentProcessorRef|captureSessionIdRef|pendingPartialQuestionRef|const (?:start|stop)MeetingCapture|const requestMeetingAudioStream/,
@@ -175,6 +182,8 @@ assert.doesNotMatch(
   /CodingAgentTransport|developerSocket|codingWebSocket|proposal_ready|awaiting_approval|developer\.readFiles|developer\.applyPatch|developer\.verify|const \[(?:developerMessages|developerInput|developerStreaming|developerProposal|developerActivity|codingMessages|codingInput|codingProposal),/,
   'Coding Agent transport, state, and proposal lifecycle must stay in the Coding feature.',
 );
+assert.match(codingPageSource, /useCodingAgentController\(/, 'The Coding Agent page must own its controller lifecycle.');
+assert.doesNotMatch(appSource, /useCodingAgentController/, 'App composition must not construct the Coding Agent controller.');
 assert.match(codingControllerSource, /new CodingAgentTransport\(\)/, 'Coding Agent must own its transport lifecycle.');
 assert.match(meetingControllerSource, /transcribeAudioSegment\(/, 'Meeting Assistant must own its STT processing lifecycle.');
 assert.match(meetingControllerSource, /const \[meetingAudioMode, setMeetingAudioMode\]/, 'Meeting Assistant must own audio source state.');

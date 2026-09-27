@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { cleanTranscript, joinQuestionContinuation, prepareQuestion, type PreparedQuestion } from '../../audio/transcriptUtils';
 import { transcribeAudioSegment } from '../../audio/sttService';
 import type { SttFailureClassification } from '../../audio/sttTypes';
@@ -1001,10 +1001,10 @@ export function useMeetingAssistantController({
     setLiveTranscript('');
   };
 
-  const filteredTranscripts = transcripts.filter((item) =>
+  const filteredTranscripts = useMemo(() => transcripts.filter((item) =>
     item.text.toLowerCase().includes(transcriptSearch.toLowerCase()) ||
     item.source.toLowerCase().includes(transcriptSearch.toLowerCase()),
-  );
+  ), [transcriptSearch, transcripts]);
 
   useEffect(() => () => {
     captureActiveRef.current = false;

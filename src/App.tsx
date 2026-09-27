@@ -16,7 +16,7 @@ import {
   Zap
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
-import { prepareTextRequest, questionFingerprintForComparison, type PreparedQuestion } from './audio/transcriptUtils';
+import { questionFingerprintForComparison, type PreparedQuestion } from './audio/transcriptUtils';
 import {
   createCanonicalInterviewContext,
   INTERVIEW_BACKGROUND_OPTIONS,
@@ -53,23 +53,74 @@ import { ConfiguredProvidersPanel } from './ui/ConfiguredProvidersPanel';
 import { ConfirmationDialog } from './ui/ConfirmationDialog';
 import { ContextInputDialog } from './ui/ContextInputDialog';
 import { CodingAgentPage } from './features/coding/CodingAgentPage';
-import { useCodingAgentController } from './features/coding/useCodingAgentController';
+import type { CodingHistoryRestoreRequest } from './features/coding/CodingAgentPage';
 import { GeneralAgentPage } from './features/general/GeneralAgentPage';
-import { useGeneralAgentController } from './features/general/useGeneralAgentController';
 import { AssistantAgentPage } from './features/assistant/AssistantAgentPage';
+import type { AssistantControllerSnapshot } from './features/assistant/AssistantAgentPage';
 import { MeetingAssistantPage } from './features/meeting/MeetingAssistantPage';
-import { useMeetingAssistantController } from './features/meeting/useMeetingAssistantController';
-import { useAssistantAgentController, type AssistantMessage } from './features/assistant/useAssistantAgentController';
-import type { AssistantChatRequest } from './features/assistant/assistantTransport';
+import type { MeetingControllerSnapshot } from './features/meeting/MeetingAssistantPage';
+import type { MeetingChatMessage, MeetingChatRequest } from './features/meeting/meetingTransport';
+import type { AssistantChatMessage, AssistantChatRequest } from './features/assistant/assistantTransport';
 import { ChatHistoryModal } from './features/history/ChatHistoryModal';
 import { useScreenReader } from './features/screen-reading/useScreenReader';
 import { AppHeader } from './ui/header/AppHeader';
 import { ContextButton, ContextPanel, FontSizeControls, HistoryButton, OverlayButton, ScreenReadingToggle, SettingsButton } from './ui/header/HeaderActions';
 import { ModeControls } from './ui/header/ModeControls';
 import type { AppMode, AssistantMode, MeetingAudioMode } from './app/appTypes';
-import { historyTitle, readHistory, removeHistorySession, searchHistory, upsertHistory, writeHistory, type HistoryMode } from './history/historyService';
+import { historyTitle, readHistory, removeHistorySession, searchHistory, upsertHistory, writeHistory, type HistoryMode, type HistorySession } from './history/historyService';
 
-type Message = AssistantMessage;
+type Message = AssistantControllerSnapshot['messages'][number];
+
+const EMPTY_ASSISTANT_MESSAGES: AssistantControllerSnapshot['messages'] = [];
+const IGNORE_ASSISTANT_MESSAGES: AssistantControllerSnapshot['setMessages'] = () => {};
+const IGNORE_ASSISTANT_INPUT: AssistantControllerSnapshot['setInput'] = () => {};
+const IGNORE_ASSISTANT_SEND: AssistantControllerSnapshot['sendMessage'] = async () => {};
+const EMPTY_MEETING_CONTROLLER: MeetingControllerSnapshot = {
+  meetingAudioMode: 'microphone',
+  setMeetingAudioMode: () => {},
+  meetingMenuOpen: false,
+  setMeetingMenuOpen: () => {},
+  microphoneDevices: [],
+  microphoneUnavailable: false,
+  transcriptOpen: false,
+  setTranscriptOpen: () => {},
+  isRecording: false,
+  isTranscribing: false,
+  audioSourceLabel: '',
+  audioLevel: 0,
+  audioStatus: 'disabled',
+  systemAudioStatus: 'off',
+  microphoneStatus: 'off',
+  pipelineStatus: 'ready',
+  setPipelineStatus: () => {},
+  input: '',
+  setInput: () => {},
+  chatBusy: false,
+  answeredSegments: [],
+  meetingError: '',
+  meetingStatusMessage: '',
+  reportError: () => {},
+  lastQuestion: '',
+  lastAnswer: '',
+  liveTranscript: '',
+  transcripts: [],
+  transcriptSearch: '',
+  setTranscriptSearch: () => {},
+  filteredTranscripts: [],
+  selectedMicrophone: null,
+  selectedMicrophoneLabel: '',
+  microphoneDevicePresent: false,
+  configuredMicrophoneLabel: '',
+  displayedAudioSourceLabel: '',
+  displayedAudioStatus: '',
+  refreshMicrophoneDevices: async () => {},
+  stopMeetingCapture: () => {},
+  startMeetingCapture: async () => {},
+  testSystemAudio: async () => {},
+  saveMeetingTranscript: () => undefined,
+  sendQuestion: async () => {},
+  sendTypedQuestion: () => undefined,
+};
 
 interface AgentActivity {
   id: string;
@@ -153,48 +204,10 @@ const HTTP_URL = runtimeConfig.httpUrl;
 const CUSTOM_PROVIDER_MODEL = '__custom_provider_model__';
 const {
   maxChatHistoryMessages: MAX_CHAT_HISTORY_MESSAGES,
-  maxChatMessageChars: MAX_CHAT_MESSAGE_CHARS,
   maxContextChars: MAX_CONTEXT_CHARS,
   pdfContextBudgetRatio: PDF_CONTEXT_BUDGET_RATIO,
 } = runtimeConfig.limits;
 const PDF_CONTEXT_CHAR_BUDGET = Math.floor(MAX_CONTEXT_CHARS * PDF_CONTEXT_BUDGET_RATIO);
-function overlayPlainText(content: string) {
-  return content
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/[`*_>#]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function buildOverlaySummary(answer: string) {
-  const plainText = overlayPlainText(answer);
-  if (!plainText) return '';
-  const sentences = plainText.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [plainText];
-  return sentences.slice(0, 2).join(' ').trim();
-}
-
-function buildOverlayActionItems(answer: string) {
-  const items = answer
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => /^(?:[-*•]|\d+[.)])\s+/.test(line))
-    .map((line) => line.replace(/^(?:[-*•]|\d+[.)])\s+/, '').trim())
-    .filter(Boolean)
-    .slice(0, 8);
-  return items.length ? items : ['No specific action items identified in this answer.'];
-}
-
-function buildOverlayAnalysis(question: string, answer: string) {
-  const summary = buildOverlaySummary(answer);
-  if (!summary) return '';
-  const wordCount = overlayPlainText(answer).split(/\s+/).filter(Boolean).length;
-  return [
-    question ? `Question focus: ${question}` : '',
-    `Response analysis: ${wordCount} words covering the requested topic.`,
-    `Key point: ${summary}`,
-  ].filter(Boolean).join('\n\n');
-}
-
 function providerResponseError(data: Record<string, unknown>, fallback: string): string {
   if (typeof data.error === 'string') return data.error;
   if (typeof data.detail === 'string') return data.detail;
@@ -224,12 +237,12 @@ function App() {
   const [error, setError] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
   const [health, setHealth] = useState<{ provider: string; model: string; sttReady?: boolean; sttProvider?: string } | null>(null);
-  const coding = useCodingAgentController({
-    provider: health ? { id: health.provider, label: health.provider, model: health.model } : null,
-    maxContextChars: MAX_CONTEXT_CHARS,
-    maxHistoryMessages: MAX_CHAT_HISTORY_MESSAGES,
-    maxMessageChars: MAX_CHAT_MESSAGE_CHARS,
-  });
+  const [assistantController, setAssistantController] = useState<AssistantControllerSnapshot | null>(null);
+  const [meetingController, setMeetingController] = useState<MeetingControllerSnapshot | null>(null);
+  const [codingBusy, setCodingBusy] = useState(false);
+  const [codingRestoreRequest, setCodingRestoreRequest] = useState<CodingHistoryRestoreRequest | null>(null);
+  const codingRestoreKeyRef = useRef(0);
+  const [generalBusy, setGeneralBusy] = useState(false);
   const [sessionDocuments, setSessionDocuments] = useState<SessionDocument[]>([]);
   const [trainedProfiles, setTrainedProfiles] = useState<TrainedProfile[]>(() => {
     try {
@@ -290,23 +303,32 @@ function App() {
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const activeProfile = trainedProfiles.find((profile) => profile.id === activeProfileId) ?? null;
   const acceptedQuestionHistoryRef = useRef<string[]>([]);
-  const rememberAcceptedQuestion = (question: string) => {
+  const rememberAcceptedQuestion = useCallback((question: string) => {
     const fingerprint = questionFingerprintForComparison(question);
     const history = acceptedQuestionHistoryRef.current;
     if (!fingerprint || history.includes(fingerprint)) return false;
     acceptedQuestionHistoryRef.current = [...history, fingerprint].slice(-5);
     return true;
-  };
-  const meeting = useMeetingAssistantController({
-    interviewConfig,
-    setInterviewConfig,
-    refreshConfiguredProviders: () => refreshConfiguredProviders(),
-    shouldAcceptQuestion: (question) => rememberAcceptedQuestion(question),
-    buildChatRequest: (question, history, screenImage) => {
+  }, []);
+  const meeting = meetingController ?? EMPTY_MEETING_CONTROLLER;
+  const {
+    meetingAudioMode, setMeetingAudioMode, meetingMenuOpen, setMeetingMenuOpen,
+    microphoneDevices, microphoneUnavailable, selectedMicrophoneLabel, microphoneDevicePresent,
+    isRecording, isTranscribing, audioLevel, audioStatus, systemAudioStatus, microphoneStatus,
+    pipelineStatus, chatBusy: meetingChatBusy, reportError: reportMeetingError,
+    answeredSegments: meetingAnsweredSegments, liveTranscript, transcripts, transcriptSearch,
+    setTranscriptSearch, filteredTranscripts, displayedAudioSourceLabel, startMeetingCapture,
+    stopMeetingCapture, testSystemAudio, saveMeetingTranscript, sendQuestion: sendMeetingQuestion,
+  } = meeting;
+  const buildMeetingChatRequest = useCallback((
+    question: string,
+    history: MeetingChatMessage[],
+    screenImage?: string,
+  ): MeetingChatRequest => {
       const resolvedContext = resolveContext({
         mode,
         sessionDocuments,
-        activeProfile: trainedProfiles.find((profile) => profile.id === activeProfileId) ?? null,
+        activeProfile,
         contextCharBudget: PDF_CONTEXT_CHAR_BUDGET,
         profileCharBudget: PDF_CONTEXT_CHAR_BUDGET,
       });
@@ -347,57 +369,14 @@ function App() {
         pdfContext: resolvedContext.slice(-MAX_CONTEXT_CHARS),
       };
     },
-  });
-  const {
-    meetingAudioMode,
-    setMeetingAudioMode,
-    meetingMenuOpen,
-    setMeetingMenuOpen,
-    microphoneDevices,
-    microphoneUnavailable,
-    selectedMicrophoneLabel,
-    microphoneDevicePresent,
-    transcriptOpen,
-    setTranscriptOpen,
-    isRecording,
-    isTranscribing,
-    audioLevel,
-    audioStatus,
-    systemAudioStatus,
-    microphoneStatus,
-    pipelineStatus,
-    input: meetingInput,
-    setInput: setMeetingInput,
-    chatBusy: meetingChatBusy,
-    meetingError,
-    reportError: reportMeetingError,
-    meetingStatusMessage,
-    answeredSegments: meetingAnsweredSegments,
-    lastQuestion: meetingLastQuestion,
-    lastAnswer: meetingLastAnswer,
-    liveTranscript,
-    transcripts,
-    transcriptSearch,
-    setTranscriptSearch,
-    filteredTranscripts,
-    displayedAudioSourceLabel,
-    displayedAudioStatus,
-    startMeetingCapture,
-    stopMeetingCapture,
-    testSystemAudio,
-    saveMeetingTranscript,
-    sendQuestion: sendMeetingQuestion,
-    sendTypedQuestion,
-  } = meeting;
-  const assistant = useAssistantAgentController({
-    mode,
-    input: '',
-    maxHistoryMessages: MAX_CHAT_HISTORY_MESSAGES,
-    maxMessageChars: MAX_CHAT_MESSAGE_CHARS,
-    setError,
-    setStatus: setStatusMessage,
-    voiceReplies,
-    buildChatRequest: (question, history, screenImage, contextOverride): AssistantChatRequest => {
+    [activeProfile, interviewConfig, mode, sessionDocuments],
+  );
+  const buildAssistantChatRequest = useCallback((
+    question: string,
+    history: AssistantChatMessage[],
+    screenImage?: string,
+    contextOverride?: string,
+  ): AssistantChatRequest => {
       const resolvedContext = contextOverride !== undefined
         ? contextOverride
         : resolveContext({
@@ -444,40 +423,22 @@ function App() {
         pdfContext: resolvedContext.slice(-MAX_CONTEXT_CHARS),
       };
     },
-  });
-  const {
-    messages,
-    setMessages,
-    input,
-    setInput,
-    chatStreaming,
-    pipelineStatus: assistantPipelineStatus,
-    draftImproving,
-    connected,
-    sendMessage: sendAssistantMessage,
-    improveDraft,
-  } = assistant;
-  const overlayChannelRef = useRef<BroadcastChannel | null>(null);
-  const overlayStateRef = useRef({
-    answer: '',
-    question: '',
-    analysis: '',
-    summary: '',
-    actionItems: [] as string[],
-    status: 'ready' as 'ready' | 'listening' | 'transcribing' | 'question' | 'thinking' | 'answer' | 'error' | 'stopped',
-  });
-  const generalAgent = useGeneralAgentController();
-  const {
-    task: generalTask,
-    goal: generalGoal,
-    clarification: generalClarification,
-    followUp: generalFollowUp,
-    busy: generalBusy,
-    taskActive: generalTaskActive,
-  } = generalAgent;
-
+    [activeProfile, interviewConfig, mode, microphoneDevicePresent, sessionDocuments],
+  );
+  const messages = assistantController?.messages ?? EMPTY_ASSISTANT_MESSAGES;
+  const setMessages: AssistantControllerSnapshot['setMessages'] = assistantController?.setMessages ?? IGNORE_ASSISTANT_MESSAGES;
+  const input = assistantController?.input ?? '';
+  const setInput: AssistantControllerSnapshot['setInput'] = assistantController?.setInput ?? IGNORE_ASSISTANT_INPUT;
+  const chatStreaming = assistantController?.chatStreaming ?? false;
+  const assistantPipelineStatus = assistantController?.pipelineStatus ?? 'ready';
+  const connected = assistantController?.connected ?? false;
+  const sendAssistantMessage: AssistantControllerSnapshot['sendMessage'] = assistantController?.sendMessage ?? IGNORE_ASSISTANT_SEND;
   const requestConfirmation = useCallback((request: ConfirmationRequest) => {
     setConfirmation(request);
+  }, []);
+
+  const addGeneralHistoryEntry = useCallback((entry: HistorySession) => {
+    setChatHistory((previous) => upsertHistory(previous, entry));
   }, []);
 
   const closeConfirmation = useCallback(() => {
@@ -490,62 +451,6 @@ function App() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
-
-  useEffect(() => {
-    const assistantAnswer = [...messages].reverse().find((message) => message.role === 'assistant')?.content || '';
-    const latestQuestion = [...messages].reverse().find((message) => message.role === 'user')?.content || '';
-    overlayStateRef.current = {
-      answer: assistantAnswer,
-      question: latestQuestion,
-      analysis: buildOverlayAnalysis(latestQuestion, assistantAnswer),
-      summary: buildOverlaySummary(assistantAnswer),
-      actionItems: assistantAnswer ? buildOverlayActionItems(assistantAnswer) : [],
-      status: assistantPipelineStatus,
-    };
-    overlayChannelRef.current?.postMessage({ type: 'state', ...overlayStateRef.current });
-  }, [assistantPipelineStatus, messages]);
-
-  useEffect(() => {
-    if (typeof BroadcastChannel === 'undefined') return;
-    let channel: BroadcastChannel;
-    try {
-      channel = new BroadcastChannel('meeting-ai-overlay');
-    } catch {
-      return;
-    }
-    overlayChannelRef.current = channel;
-    channel.onmessage = (event) => {
-      if (event.data?.type === 'overlay-ready') {
-        channel.postMessage({ type: 'state', ...overlayStateRef.current });
-      }
-      if (event.data?.type === 'overlay-question') {
-        const question = typeof event.data.question === 'string'
-          ? event.data.question.trim().slice(0, 2000)
-          : '';
-        if (!question) return;
-        if (appMode !== 'assistant') {
-          channel.postMessage({
-            type: 'overlay-search-error',
-            message: 'Switch to the AI Assistant page to use the Assistant overlay.',
-          });
-          return;
-        }
-        if (chatStreaming) {
-          channel.postMessage({
-            type: 'overlay-search-error',
-            message: 'Please wait for the current AI answer to finish.',
-          });
-
-          return;
-        }
-        void sendAssistantMessage(question, undefined, question, performance.now(), { preparedQuestion: prepareTextRequest(question) });
-      }
-    };
-    return () => {
-      channel.close();
-      overlayChannelRef.current = null;
-    };
-  }, [appMode, chatStreaming, sendAssistantMessage]);
 
   useEffect(() => {
     if (!writeHistory(chatHistory)) {
@@ -620,17 +525,6 @@ function App() {
       }, withoutCurrentConversation);
     });
   }, [activeChatId, messages]);
-
-  useEffect(() => {
-    const response = generalTask?.assistantResponse;
-    if (!generalTask || !response?.content || !['COMPLETED', 'COMPLETED_WITH_LIMITATIONS'].includes(generalTask.phase)) return;
-    const savedMessages: Message[] = [
-      { role: 'user', content: generalTask.goal },
-      { role: 'assistant', content: response.content },
-    ];
-    const historyEntry: ChatSession = { id: `general-${generalTask.taskId}`, mode: 'general', title: historyTitle(savedMessages), messages: savedMessages, updatedAt: new Date().toISOString() };
-    setChatHistory((previous) => upsertHistory(previous, historyEntry));
-  }, [generalTask]);
 
   const savedJobDescription = sessionDocuments.find((document) => document.name === 'Job Description: Pasted text')?.text || '';
   const closeContextMenu = useCallback(() => {
@@ -1609,7 +1503,7 @@ function App() {
     if (session.mode === 'developer') {
       setAppMode('developer');
       setActiveChatId(session.id.replace(/^coding-/, '').split('-turn-')[0] || crypto.randomUUID());
-      coding.restoreHistory(session);
+      setCodingRestoreRequest({ key: ++codingRestoreKeyRef.current, session });
     } else {
       setAppMode('assistant');
       setActiveChatId(session.id.split('-turn-')[0] || crypto.randomUUID());
@@ -1678,11 +1572,10 @@ function App() {
       ? pipelineStatus
       : appMode === 'general'
         ? generalBusy ? 'thinking' : 'ready'
-        : coding.workspace.streaming ? 'thinking' : 'ready';
+        : codingBusy ? 'thinking' : 'ready';
   const statusLabel = statusPipeline === 'listening' ? 'Listening...' : statusPipeline === 'transcribing' ? 'Transcribing...' : statusPipeline === 'question' ? 'Question detected' : statusPipeline === 'thinking' ? 'Thinking...' : statusPipeline === 'answer' ? 'Answer ready' : statusPipeline === 'stopped' ? 'Stopped' : statusPipeline === 'error' ? 'Unable to connect' : 'Ready';
   const statusTone = statusPipeline === 'error' ? 'text-rose-300' : statusPipeline === 'answer' ? 'text-emerald-300' : 'text-sky-300';
   const pageTitle = appMode === 'assistant' ? 'AI Assistant' : appMode === 'meeting' ? 'Meeting AI Assistant' : appMode === 'developer' ? 'Coding Agent' : 'General Agent';
-  const meetingStatusLabel = meetingStatusMessage || (pipelineStatus === 'listening' ? 'Listening...' : pipelineStatus === 'transcribing' ? 'Transcribing...' : pipelineStatus === 'question' ? 'Question detected' : pipelineStatus === 'thinking' ? 'Thinking...' : pipelineStatus === 'answer' ? 'Answer ready' : pipelineStatus === 'stopped' ? 'Stopped' : pipelineStatus === 'error' ? 'Unable to connect' : 'Ready');
 
   const [fontScale, setFontScale] = useState(() => {
     const saved = Number(localStorage.getItem('ui-font-scale'));
@@ -2213,84 +2106,29 @@ function App() {
       )}
 
       <main className={`${appMode === 'assistant' ? 'hidden' : 'mx-auto flex min-h-[calc(100dvh-57px)] w-full max-w-3xl flex-col px-4 py-6'}`}>
-        {appMode === 'general' ? (
-          <GeneralAgentPage
-            workspace={{
-              generalTask: generalTask,
-              generalGoal: generalGoal,
-              generalClarification: generalClarification,
-              generalFollowUp: generalFollowUp,
-              generalBusy: generalBusy,
-              generalTaskActive: generalTaskActive,
-              generalError: generalAgent.error,
-              generalStatusMessage: generalAgent.statusMessage,
-              onGoalChange: generalAgent.setGoal,
-              onClarificationChange: generalAgent.setClarification,
-              onFollowUpChange: generalAgent.setFollowUp,
-              onStartTask: () => void generalAgent.startTask(),
-              onRetry: () => void generalAgent.retry(),
-              onRevise: () => void generalAgent.revise(),
-              onTogglePause: () => void generalAgent.togglePause(),
-              onStop: () => void generalAgent.stop(),
-              onNewTask: generalAgent.newTask,
-            }}
-          />
-        ) : appMode === 'developer' ? (
-          <CodingAgentPage
-            workspace={{
-              ...coding.workspace,
-              onResetCodingPreferences: () => setConfirmation({
-                title: 'Reset coding preferences?',
-                description: 'This removes all saved Coding Agent style preferences. Conversation history and project files will not be changed.',
-                confirmLabel: 'Reset preferences',
-                variant: 'danger',
-                onConfirm: coding.workspace.onResetCodingPreferences,
-              }),
-            }}
-          />
-        ) : appMode === 'meeting' ? (
-          <MeetingAssistantPage
-            workspace={{
-              sessionActive,
-              meetingAudioMode,
-              displayedAudioSourceLabel,
-              displayedAudioStatus,
-              microphoneStatus,
-              systemAudioStatus,
-              audioLevel,
-              meetingMenuOpen,
-              statusTone: pipelineStatus === 'error' ? 'text-rose-300' : pipelineStatus === 'answer' ? 'text-emerald-300' : 'text-sky-300',
-              statusLabel: meetingStatusLabel,
-              pipelineStatus,
-              liveTranscript,
-              lastQuestion: meetingLastQuestion,
-              lastAnswer: meetingLastAnswer,
-              answeredSegments: meetingAnsweredSegments,
-              transcripts,
-              transcriptSearch,
-              filteredTranscripts,
-              transcriptOpen,
-              error: meetingError,
-              input: meetingInput,
-              isRecording,
-              isTranscribing,
-              chatStreaming: meetingChatBusy,
-              onAudioModeChange: setMeetingAudioMode,
-              onTestAudio: () => void testSystemAudio(),
-              onStartCapture: () => void startMeetingCapture(),
-              onStopCapture: stopMeetingCapture,
-              onTranscriptToggle: () => setTranscriptOpen((open) => !open),
-              onTranscriptSearchChange: setTranscriptSearch,
-              onUseTranscript: (transcript) => setMeetingInput(`Summarize the ${transcript.source} meeting and list the action items.`),
-              onSaveTranscript: saveMeetingTranscript,
-              onInputChange: setMeetingInput,
-              onSendMessage: sendTypedQuestion,
-              onReadScreen: () => void readSharedScreen(),
-              screenReading,
-              screenReadingEnabled,
-            }}
-          />
-        ) : null}
+        <GeneralAgentPage
+          active={appMode === 'general'}
+          onBusyChange={setGeneralBusy}
+          onHistoryEntry={addGeneralHistoryEntry}
+        />
+        <CodingAgentPage
+          active={appMode === 'developer'}
+          provider={health ? { id: health.provider, label: health.provider, model: health.model } : null}
+          restoreRequest={codingRestoreRequest}
+          onBusyChange={setCodingBusy}
+        />
+        <MeetingAssistantPage
+          active={appMode === 'meeting'}
+          interviewConfig={interviewConfig}
+          setInterviewConfig={setInterviewConfig}
+          refreshConfiguredProviders={refreshConfiguredProviders}
+          shouldAcceptQuestion={rememberAcceptedQuestion}
+          buildChatRequest={buildMeetingChatRequest}
+          screenReading={screenReading}
+          screenReadingEnabled={screenReadingEnabled}
+          onReadScreen={() => void readSharedScreen()}
+          onControllerChange={setMeetingController}
+        />
       </main>
 
       {/* Main content */}
@@ -2425,25 +2263,24 @@ function App() {
         </div>
 
       </div>}
-      {appMode === 'assistant' && (
-        <AssistantAgentPage
-          workspace={{
-            messages,
-            input,
-            error,
-            draftImproving,
-            chatStreaming,
-            copiedItem,
-            scrollRef,
-            onInputChange: setInput,
-            onSend: () => void sendMessage(),
-            onImproveDraft: () => void improveDraft(),
-            onClearChat: requestClearChat,
-            onCopyMessage: copyText,
-            onSuggestion: setInput,
-          }}
-        />
-      )}
+      <AssistantAgentPage
+        active={appMode === 'assistant'}
+        mode={mode}
+        voiceReplies={voiceReplies}
+        setError={setError}
+        setStatus={setStatusMessage}
+        buildChatRequest={buildAssistantChatRequest}
+        onControllerChange={setAssistantController}
+        workspace={{
+          error,
+          copiedItem,
+          scrollRef,
+          onSend: () => void sendMessage(),
+          onClearChat: requestClearChat,
+          onCopyMessage: copyText,
+          onSuggestion: setInput,
+        }}
+      />
     </div>
   );
 }
