@@ -12,7 +12,7 @@ const OBSERVE_SCRIPT = `(() => {
     role: String(element.getAttribute('role') || element.tagName || 'unknown').slice(0, 40),
     label: String(element.getAttribute('aria-label') || element.innerText || element.getAttribute('placeholder') || element.name || element.id || '').trim().slice(0, 200),
     type: String(element.type || element.tagName || 'element').slice(0, 40),
-    enabled: !element.disabled
+    enabled: !element.disabled && element.getAttribute('aria-disabled') !== 'true' && element.getClientRects().length > 0
   }));
   const results = [...document.querySelectorAll('a[href]')].map((anchor) => {
     const url = String(anchor.href || '');
@@ -64,6 +64,13 @@ function safeUrl(value) {
 function safeTarget(value) {
   if (typeof value === 'string') return bounded(value, 200);
   return bounded(value?.target || value?.id || value?.label || value?.field || '', 200);
+}
+
+function safeTargets(value) {
+  const candidates = typeof value === 'string'
+    ? [value]
+    : [value?.target, value?.id, value?.label, value?.field];
+  return [...new Set(candidates.map((candidate) => bounded(candidate, 200).trim()).filter(Boolean))];
 }
 
 function safeObservation(session, data, screenshotReference = null) {
@@ -198,12 +205,20 @@ class ElectronBrowserAdapter {
 
   async click(session, target = {}) {
     const window = await this._window(session);
-    const requested = safeTarget(target);
+    const requested = safeTargets(target);
     const script = `(() => {
       const requested = ${JSON.stringify(requested)};
+      const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
+      const normalizedRequests = requested.map(normalize).filter(Boolean);
+      if (normalizedRequests.length === 0) return false;
       const elements = [...document.querySelectorAll('button, a, input, select, textarea, [role="button"]')];
-      const element = elements.find((candidate) => [candidate.id, candidate.name, candidate.getAttribute('aria-label'), candidate.getAttribute('placeholder'), candidate.innerText].some((value) => String(value || '').trim() === requested));
-      if (!element || element.disabled) return false;
+      const matches = elements.filter((candidate) => {
+        if (candidate.disabled || candidate.getAttribute('aria-disabled') === 'true' || candidate.getClientRects().length === 0) return false;
+        const labels = [candidate.id, candidate.name, candidate.getAttribute('aria-label'), candidate.getAttribute('placeholder'), candidate.innerText || candidate.textContent].map(normalize);
+        return normalizedRequests.some((request) => labels.includes(request));
+      });
+      if (matches.length !== 1) return false;
+      const element = matches[0];
       element.click();
       return true;
     })()`;

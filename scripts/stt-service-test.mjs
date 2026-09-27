@@ -21,11 +21,15 @@ try {
   assert.equal(request.url, 'http://localhost:3001/api/transcribe-audio');
   assert.equal(request.options.headers['X-STT-Session-ID'], 'session-1');
   assert.equal(request.options.headers['X-STT-Segment-ID'], 'segment-1');
+  assert.equal(request.options.headers['X-STT-Source'], 'microphone');
 
-  globalThis.fetch = async () => new Response(
-    JSON.stringify({ error: 'Provider rejected audio', classification: 'STT_BAD_REQUEST' }),
-    { status: 400 },
-  );
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return new Response(
+      JSON.stringify({ error: 'Provider rejected audio', classification: 'STT_BAD_REQUEST' }),
+      { status: 400 },
+    );
+  };
   await assert.rejects(
     () => transcribeAudioSegment({
       audio: new Blob(['audio']),
@@ -33,11 +37,13 @@ try {
       sessionId: 'session-1',
       segmentId: 'segment-2',
       payloadName: 'meeting.webm',
+      source: 'video',
     }),
     (error) => error.message === 'Provider rejected audio'
       && error.classification === 'STT_BAD_REQUEST'
       && error.status === 400,
   );
+  assert.equal(request.options.headers['X-STT-Source'], 'video');
 
   await assert.rejects(
     () => transcribeAudioSegment({

@@ -19,6 +19,7 @@ export function ModeControls({
     <>
       <div className="flex items-center rounded-lg border border-slate-700 bg-slate-800 p-0.5" aria-label="Application mode">
         <ModeButton active={appMode === 'assistant'} activeClass="bg-emerald-500 text-slate-950" disabled={disabled} onClick={() => onAppModeChange('assistant')}>AI Assistant</ModeButton>
+        <ModeButton active={appMode === 'meeting'} activeClass="bg-teal-500 text-slate-950" disabled={disabled} onClick={() => onAppModeChange('meeting')}>Meeting</ModeButton>
         <ModeButton active={appMode === 'developer'} activeClass="bg-sky-500 text-slate-950" disabled={disabled} onClick={() => onAppModeChange('developer')}>Developer</ModeButton>
         <ModeButton active={appMode === 'general'} activeClass="bg-violet-500 text-slate-950" disabled={disabled} onClick={() => onAppModeChange('general')}>General</ModeButton>
       </div>

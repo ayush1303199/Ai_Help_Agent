@@ -23,18 +23,27 @@ from pydantic import BaseModel
 import httpx
 
 from provider_registry import ProviderRegistry, ProviderStatus, RegistryState
+from provider_model_contract import (
+    provider_capability_states,
+    provider_model_error,
+    provider_model_is_valid,
+)
 from provider_presets import PROVIDER_PRESETS
 from backend_config import (
     APP_ROOT, CONFIG_PATH, GENERAL_CONTEXT_CHAR_BUDGET, GENERAL_CONTEXT_MESSAGE_CHARS,
     MAX_MODEL_INPUT_CHARS, MAX_MODEL_MESSAGE_CHARS, MAX_MODEL_SYSTEM_CHARS, MAX_PDF_MB,
     MAX_TOKENS, PORT, PROVIDER_RETRY_ATTEMPTS, PROVIDER_RETRY_MAX_SECONDS,
-    STT_TRANSCRIPTION_PROMPT, WS_PORT,
+    CODING_WS_PORT, STT_TRANSCRIPTION_PROMPT, WS_PORT,
 )
+from coding_websocket import run_coding_websocket_server
 from provider_service import (
     get_active_provider_with_api_key as resolve_active_provider,
     get_api_key as resolve_api_key,
     get_stt_provider as resolve_stt_provider,
+    get_stt_provider_candidate as resolve_stt_provider_candidate,
     provider_operation_capabilities,
+    redact_provider_error,
+    classify_provider_error,
 )
 from agent_control_service import AgentControlService
 from stt_service import SttService
@@ -75,7 +84,35 @@ def get_active_provider_with_api_key() -> tuple[Optional[Any], str]:
 
 
 def get_stt_provider() -> Optional[Any]:
-    return resolve_stt_provider(registry)
+    return resolve_stt_provider(registry, get_api_key)
+
+
+def get_speech_capable_provider_candidate() -> Optional[Any]:
+    return resolve_stt_provider_candidate(registry)
+
+
+def provider_response_data(provider: Any) -> Dict[str, Any]:
+    """Serialize provider metadata with key availability derived from this process."""
+    data = provider.to_dict()
+    has_api_key = bool(get_api_key(provider.id))
+    data["hasApiKey"] = has_api_key
+    if not has_api_key and provider.status in {
+        ProviderStatus.CONFIGURED,
+        ProviderStatus.ENABLED,
+        ProviderStatus.READY,
+        ProviderStatus.CHECKING,
+    }:
+        data["status"] = ProviderStatus.UNCONFIGURED.value
+    capabilities = provider_operation_capabilities(provider)
+    data["capabilities"] = capabilities
+    data["capabilityStates"] = provider_capability_states(provider.type, provider.model)
+    data["assistantCapable"] = bool(
+        has_api_key
+        and capabilities["chat"]
+        and provider_model_is_valid(provider.type, provider.model, provider.base_url)
+    )
+    data["developerToolCalling"] = capabilities["toolCalling"]
+    return data
 
 
 def call_model(
@@ -269,7 +306,10 @@ def provider_status_for_error(error: Exception) -> ProviderStatus:
         return ProviderStatus.AUTH_FAILED
     if status_code == 413 or "413" in error_msg or "request too large" in lower_message or "too many tokens" in lower_message:
         return ProviderStatus.REQUEST_TOO_LARGE
-    if status_code == 429 or "429" in error_msg or "rate" in lower_message or "quota" in lower_message:
+    if status_code == 429 or "429" in error_msg or any(
+        phrase in lower_message
+        for phrase in ("rate limit", "rate_limit", "too many requests", "quota", "resource exhausted")
+    ):
         return ProviderStatus.RATE_LIMITED
     if status_code in (500, 502, 503, 504) or "capacity" in lower_message or "503" in error_msg:
         return ProviderStatus.CAPACITY_ERROR
@@ -417,10 +457,19 @@ def provider_tool_compatibility(
 class ProviderRequestError(RuntimeError):
     """HTTP provider failure with a status code for consistent classification."""
 
-    def __init__(self, provider_type: str, status_code: int, body: str):
+    def __init__(
+        self,
+        provider_type: str,
+        status_code: int,
+        body: str,
+        request_capture: Optional[Dict[str, str]] = None,
+        sensitive_values: tuple[str, ...] = (),
+    ):
         self.provider_type = provider_type
         self.status_code = status_code
-        super().__init__(f"{provider_type} returned HTTP {status_code}: {body[:500]}")
+        self.response_body = redact_provider_error(body, sensitive_values)
+        self.request_capture = request_capture
+        super().__init__(f"{provider_type} returned HTTP {status_code}: {self.response_body}")
 
 
 def _message_content_text(content: Any) -> str:
@@ -435,11 +484,43 @@ def _message_content_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def _post_provider_json(provider_type: str, url: str, headers: Dict[str, str], body: Dict[str, Any]) -> Dict[str, Any]:
+def _post_provider_json(
+    provider_type: str,
+    url: str,
+    headers: Dict[str, str],
+    body: Dict[str, Any],
+    capture_request: bool = False,
+) -> Dict[str, Any]:
+    request_capture: Optional[Dict[str, str]] = None
+    sensitive_headers = tuple(
+        value
+        for name, value in headers.items()
+        if any(marker in name.lower() for marker in ("authorization", "api-key", "token", "secret"))
+    )
+    if capture_request:
+        serialized_body = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        request_capture = {
+            "method": "POST",
+            "url": url,
+            "body": redact_provider_error(serialized_body, sensitive_headers),
+        }
     with httpx.Client(timeout=60.0) as client:
-        response = client.post(url, headers=headers, json=body)
+        if request_capture:
+            response = client.post(
+                url,
+                headers=headers,
+                content=serialized_body.encode("utf-8"),
+            )
+        else:
+            response = client.post(url, headers=headers, json=body)
     if response.status_code >= 400:
-        raise ProviderRequestError(provider_type, response.status_code, response.text)
+        raise ProviderRequestError(
+            provider_type,
+            response.status_code,
+            response.text,
+            request_capture,
+            sensitive_headers,
+        )
     try:
         payload = response.json()
     except ValueError as error:
@@ -562,7 +643,12 @@ def _gemini_contents(messages: List[Dict[str, Any]]) -> tuple[str, List[Dict[str
                     arguments = json.loads(function.get("arguments") or "{}")
                 except json.JSONDecodeError:
                     arguments = {}
-                append_part("model", {"functionCall": {"name": name, "args": arguments}})
+                function_call = {"name": name, "args": arguments}
+                thought_signature = call.get("thought_signature") or call.get("thoughtSignature")
+                function_part = {"functionCall": function_call}
+                if isinstance(thought_signature, str) and thought_signature:
+                    function_part["thoughtSignature"] = thought_signature
+                append_part("model", function_part)
         elif role == "tool":
             call_id = str(message.get("tool_call_id") or "")
             name = str(message.get("name") or tool_names.get(call_id) or "")
@@ -577,6 +663,25 @@ def _gemini_contents(messages: List[Dict[str, Any]]) -> tuple[str, List[Dict[str
     return "\n\n".join(filter(None, system_parts)), contents
 
 
+def _sanitize_gemini_schema(schema: Any) -> Any:
+    if not isinstance(schema, dict):
+        return schema
+    sanitized: Dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in {"additionalProperties", "$schema"}:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            sanitized[key] = {
+                name: _sanitize_gemini_schema(child)
+                for name, child in value.items()
+            }
+        elif key == "items":
+            sanitized[key] = _sanitize_gemini_schema(value)
+        else:
+            sanitized[key] = value
+    return sanitized
+
+
 def _gemini_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     declarations: List[Dict[str, Any]] = []
     for tool in tools or []:
@@ -584,7 +689,9 @@ def _gemini_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]
         declarations.append({
             "name": function.get("name"),
             "description": function.get("description") or "",
-            "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+            "parameters": _sanitize_gemini_schema(
+                function.get("parameters") or {"type": "object", "properties": {}}
+            ),
         })
     return declarations
 
@@ -599,14 +706,18 @@ def _normalize_gemini_response(payload: Dict[str, Any]) -> Dict[str, Any]:
             text_parts.append(str(part["text"]))
         function_call = part.get("functionCall") or {}
         if function_call.get("name"):
-            tool_calls.append({
+            tool_call = {
                 "id": str(function_call.get("id") or f"gemini-call-{index + 1}"),
                 "type": "function",
                 "function": {
                     "name": str(function_call["name"]),
                     "arguments": json.dumps(function_call.get("args") or {}, ensure_ascii=False),
                 },
-            })
+            }
+            thought_signature = part.get("thoughtSignature")
+            if isinstance(thought_signature, str) and thought_signature:
+                tool_call["thought_signature"] = thought_signature
+            tool_calls.append(tool_call)
     return {
         "role": "assistant",
         "content": "".join(text_parts) or None,
@@ -620,6 +731,7 @@ def _native_complete(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]],
     tool_choice: Optional[str],
+    capture_request: bool = False,
 ) -> Dict[str, Any]:
     provider_type = provider.type.lower()
     if provider_type == "anthropic":
@@ -661,6 +773,7 @@ def _native_complete(
             f"{provider.base_url.rstrip('/')}/models/{provider.model}:generateContent",
             {"x-goog-api-key": api_key, "content-type": "application/json"},
             body,
+            capture_request=capture_request,
         )
         return _normalize_gemini_response(payload)
 
@@ -743,6 +856,7 @@ def health() -> Dict[str, Any]:
         "assistantCapable": configured,
         "developerStatus": provider.status.value if provider else ProviderStatus.UNCONFIGURED.value,
         "wsPort": WS_PORT,
+        "codingWsPort": CODING_WS_PORT,
     }
 
 
@@ -751,7 +865,7 @@ def list_providers() -> Dict[str, Any]:
     """List all configured providers."""
     providers = []
     for provider in registry.get_all_providers():
-        item = provider.to_dict()
+        item = provider_response_data(provider)
         item["apiKey"] = ""
         item["adapterType"] = provider.type
         item["capabilities"] = provider_operation_capabilities(provider)
@@ -760,19 +874,78 @@ def list_providers() -> Dict[str, Any]:
         "providers": providers,
         "activeProvider": registry.active_provider_id,
         "fallbackEnabled": registry.fallback_enabled,
+        "sttProvider": registry.stt_provider_id,
+        "effectiveSttProvider": get_stt_provider().id if get_stt_provider() else None,
         "registryState": registry.state.value,
     }
+
+
+@app.get("/api/settings/providers/{provider_id}/models")
+def list_provider_models(provider_id: str) -> Dict[str, Any]:
+    """List provider models available to this configured Gemini credential."""
+    provider = registry.get_provider(provider_id)
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider not found.")
+    if provider.type.lower() != "gemini":
+        raise HTTPException(status_code=400, detail="Live model discovery is only available for Gemini.")
+
+    api_key = get_api_key(provider.id)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="The provider has no available API key.")
+
+    try:
+        response = httpx.get(
+            f"{provider.base_url.rstrip('/')}/models",
+            headers={"x-goog-api-key": api_key},
+            params={"pageSize": 100},
+            timeout=15.0,
+        )
+    except httpx.RequestError as error:
+        raise HTTPException(status_code=502, detail="Could not reach the Gemini model catalog.") from error
+
+    if response.status_code != 200:
+        diagnostic = classify_provider_error(response.status_code, response.text, (api_key,))
+        raise HTTPException(
+            status_code=response.status_code if 400 <= response.status_code < 500 else 502,
+            detail={
+                "code": diagnostic["category"],
+                "message": diagnostic["reason"],
+            },
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise HTTPException(status_code=502, detail="Gemini returned an invalid model catalog response.") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("models", []), list):
+        raise HTTPException(status_code=502, detail="Gemini returned an invalid model catalog response.")
+
+    models = []
+    for model in payload.get("models", []):
+        if not isinstance(model, dict):
+            continue
+        name = model.get("name")
+        methods = model.get("supportedGenerationMethods")
+        if not isinstance(name, str) or not name.startswith("models/") or not isinstance(methods, list):
+            continue
+        if "generateContent" not in methods:
+            continue
+        models.append({
+            "id": name.removeprefix("models/"),
+            "supportedGenerationMethods": [method for method in methods if isinstance(method, str)],
+        })
+    return {"provider": provider.id, "models": models}
 
 
 @app.get("/api/settings/providers/capabilities")
 def provider_capabilities() -> Dict[str, Any]:
     """Get provider capabilities."""
     active = registry.get_active_provider()
-    active_data = active.to_dict() if active else {}
+    active_data = provider_response_data(active) if active else {}
     active_data["capabilities"] = provider_operation_capabilities(active)
     providers = []
     for provider in registry.get_all_providers():
-        item = provider.to_dict()
+        item = provider_response_data(provider)
         item["apiKey"] = ""
         item["adapterType"] = provider.type
         item["capabilities"] = provider_operation_capabilities(provider)
@@ -781,7 +954,7 @@ def provider_capabilities() -> Dict[str, Any]:
     return {
         "active": active_data,
         "sttProvider": registry.stt_provider_id,
-        "stt": get_stt_provider().to_dict() if get_stt_provider() else None,
+        "stt": provider_response_data(get_stt_provider()) if get_stt_provider() else None,
         "providers": providers,
         "registryState": registry.state.value,
     }
@@ -798,14 +971,24 @@ def legacy_provider_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
     api_key = str(payload.get("apiKey") or "").strip()
     if not provider_type or not model or not api_key:
         raise HTTPException(status_code=400, detail="Provider, API key, and model are required.")
-
-    provider = registry.add_provider(
-        provider_type=provider_type,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        label=str(payload.get("label") or "").strip() or None,
+    configuration_error = provider_model_error(
+        provider_type,
+        model,
+        str(payload.get("baseURL") or ""),
     )
+    if configuration_error:
+        raise HTTPException(status_code=400, detail=configuration_error)
+
+    try:
+        provider = registry.add_provider(
+            provider_type=provider_type,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            label=str(payload.get("label") or "").strip() or None,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=getattr(error, "details", str(error))) from error
     registry.set_active_provider(provider.id)
     if isinstance(payload.get("fallbackEnabled"), bool):
         registry.fallback_enabled = payload["fallbackEnabled"]
@@ -829,18 +1012,37 @@ def add_or_update_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
     api_key = str(payload.get("apiKey") or "").strip()
     label = str(payload.get("label") or "").strip()
     priority = payload.get("priority")
+    if priority is not None:
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail="Provider priority must be an integer.") from error
+        if priority < 1:
+            raise HTTPException(status_code=400, detail="Provider priority must be positive.")
+    provider_id = str(payload.get("providerId") or "").strip() or None
+    create_new = payload.get("createNew") is True
+    enabled = payload.get("enabled") if isinstance(payload.get("enabled"), bool) else None
 
-    if not provider_type or not model or not api_key:
-        raise HTTPException(status_code=400, detail="Provider type, model, and API key are required.")
+    if not provider_type or not model or (not api_key and not provider_id):
+        raise HTTPException(status_code=400, detail="Provider type and model are required; a new provider also needs an API key.")
+    configuration_error = provider_model_error(provider_type, model, base_url)
+    if configuration_error:
+        raise HTTPException(status_code=400, detail=configuration_error)
 
-    provider = registry.add_provider(
-        provider_type=provider_type,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        label=label or None,
-        priority=int(priority) if priority else None,
-    )
+    try:
+        provider = registry.add_provider(
+            provider_type=provider_type,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            label=label or None,
+            priority=priority,
+            provider_id=provider_id,
+            create_new=create_new,
+            enabled=enabled,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=getattr(error, "details", str(error))) from error
     if isinstance(payload.get("fallbackEnabled"), bool):
         registry.fallback_enabled = payload["fallbackEnabled"]
     if isinstance(payload.get("sttProvider"), str):
@@ -852,18 +1054,49 @@ def add_or_update_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     providers = []
     for item in registry.get_all_providers():
-        data = item.to_dict()
+        data = provider_response_data(item)
         data["adapterType"] = item.type
         data["apiKey"] = ""
         providers.append(data)
 
     return {
-        "provider": provider.to_dict(),
+        "provider": provider_response_data(provider),
         "providers": providers,
         "activeProvider": registry.active_provider_id,
         "fallbackEnabled": registry.fallback_enabled,
         "sttProvider": registry.stt_provider_id,
+        "effectiveSttProvider": get_stt_provider().id if get_stt_provider() else None,
         "registryState": registry.state.value,
+    }
+
+
+@app.patch("/api/settings/stt-provider")
+def update_stt_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Select an explicit speech provider, or restore automatic priority selection."""
+    selected_id = payload.get("providerId")
+    if selected_id in (None, ""):
+        registry.stt_provider_id = None
+    elif not isinstance(selected_id, str):
+        raise HTTPException(status_code=400, detail="Speech provider ID must be a string or null.")
+    else:
+        provider = registry.get_provider(selected_id)
+        if not provider or not provider_operation_capabilities(provider)["stt"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Select a configured OpenAI or Groq speech provider.",
+            )
+        if not provider.enabled:
+            raise HTTPException(status_code=400, detail="The selected speech provider is disabled.")
+        if not get_api_key(provider.id):
+            raise HTTPException(status_code=400, detail="The selected speech provider has no available API key.")
+        registry.stt_provider_id = provider.id
+
+    registry.save_to_file()
+    effective_provider = get_stt_provider()
+    return {
+        "sttProvider": registry.stt_provider_id,
+        "effectiveSttProvider": effective_provider.id if effective_provider else None,
+        "sttReady": effective_provider is not None,
     }
 
 
@@ -874,30 +1107,101 @@ def update_provider(provider_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found.")
 
-    if "enabled" in payload:
-        registry.set_provider_enabled(provider_id, bool(payload["enabled"]))
-
+    model = str(payload.get("model", provider.model)).strip()
+    base_url = str(payload.get("baseURL", provider.base_url)).strip()
+    label: Optional[str] = None
+    if "label" in payload:
+        label = str(payload.get("label") or "").strip()
+        if not label:
+            raise HTTPException(status_code=400, detail="Provider label cannot be empty.")
+    enabled_value = payload.get("enabled")
+    if "enabled" in payload and not isinstance(enabled_value, bool):
+        raise HTTPException(status_code=400, detail="Provider enabled must be a boolean.")
+    priority_value: Optional[int] = None
     if "priority" in payload:
-        provider.priority = int(payload["priority"])
-
+        try:
+            priority_value = int(payload["priority"])
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail="Provider priority must be an integer.") from error
+        if priority_value < 1:
+            raise HTTPException(status_code=400, detail="Provider priority must be positive.")
+    status_value: Optional[ProviderStatus] = None
     if "status" in payload:
         try:
-            status = ProviderStatus(payload["status"])
-            registry.update_provider_status(provider_id, status)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid status: {payload['status']}")
+            status_value = ProviderStatus(payload["status"])
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {payload['status']}") from error
+    if "model" in payload or "baseURL" in payload:
+        configuration_error = provider_model_error(provider.type, model, base_url)
+        if configuration_error:
+            raise HTTPException(status_code=400, detail=configuration_error)
+    if "model" in payload:
+        provider.model = model
+        provider.configuration_error = None
+        provider.failure_category = None
+        if provider.status == ProviderStatus.CONFIGURATION_INVALID:
+            provider.status = ProviderStatus.CONFIGURED if provider.has_api_key else ProviderStatus.UNCONFIGURED
+    if "baseURL" in payload:
+        provider.base_url = base_url
+    if label is not None:
+        provider.label = label
+
+    if "apiKey" in payload:
+        api_key = str(payload.get("apiKey") or "").strip()
+        if api_key:
+            registry.set_api_key(provider_id, api_key)
+
+    if enabled_value is not None:
+        registry.set_provider_enabled(provider_id, enabled_value)
+
+    if priority_value is not None:
+        provider.priority = priority_value
+        ordered = sorted(registry.providers.values(), key=lambda item: (item.priority, item.id))
+        for index, item in enumerate(ordered, start=1):
+            item.priority = index
+
+    if status_value is not None:
+        registry.update_provider_status(provider_id, status_value)
 
     registry.save_to_file()
     providers = []
     for item in registry.get_all_providers():
-        data = item.to_dict()
+        data = provider_response_data(item)
         data["adapterType"] = item.type
         data["apiKey"] = ""
         providers.append(data)
     return {
-        "provider": provider.to_dict(),
+        "provider": provider_response_data(provider),
         "providers": providers,
+        "activeProvider": registry.active_provider_id,
     }
+
+
+@app.patch("/api/settings/active-provider")
+def set_active_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Select an enabled provider with a valid provider/model configuration."""
+    provider_id = payload.get("providerId")
+    if not isinstance(provider_id, str) or not registry.set_active_provider(provider_id):
+        raise HTTPException(status_code=400, detail="Only enabled, valid provider instances can be active.")
+    registry.save_to_file()
+    return {
+        "activeProvider": registry.active_provider_id,
+        "providers": [
+            {**provider_response_data(item), "adapterType": item.type, "apiKey": ""}
+            for item in registry.get_all_providers()
+        ],
+    }
+
+
+@app.patch("/api/settings/fallback")
+def set_provider_fallback(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Update the global provider-fallback preference."""
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="Fallback enabled must be a boolean.")
+    registry.fallback_enabled = enabled
+    registry.save_to_file()
+    return {"fallbackEnabled": registry.fallback_enabled}
 
 
 @app.delete("/api/settings/providers/{provider_id}")
@@ -909,13 +1213,15 @@ def delete_provider(provider_id: str) -> Dict[str, Any]:
     registry.save_to_file()
     providers = []
     for item in registry.get_all_providers():
-        data = item.to_dict()
+        data = provider_response_data(item)
         data["adapterType"] = item.type
         data["apiKey"] = ""
         providers.append(data)
     return {
         "providers": providers,
         "activeProvider": registry.active_provider_id,
+        "sttProvider": registry.stt_provider_id,
+        "effectiveSttProvider": get_stt_provider().id if get_stt_provider() else None,
     }
 
 
@@ -932,12 +1238,13 @@ def reorder_providers(payload: Dict[str, Any]) -> Dict[str, Any]:
     registry.save_to_file()
     providers = []
     for item in registry.get_all_providers():
-        data = item.to_dict()
+        data = provider_response_data(item)
         data["adapterType"] = item.type
         data["apiKey"] = ""
         providers.append(data)
     return {
         "providers": providers,
+        "activeProvider": registry.active_provider_id,
     }
 
 
@@ -956,6 +1263,23 @@ def self_test(payload: Dict[str, Any]) -> Dict[str, Any]:
             "provider": None,
             "status": ProviderStatus.UNCONFIGURED.value,
             "configured": False,
+            "registryState": registry.state.value,
+        }
+
+    configuration_error = provider_model_error(provider.type, provider.model, provider.base_url)
+    if configuration_error:
+        registry.update_provider_status(
+            provider.id,
+            ProviderStatus.CONFIGURATION_INVALID,
+            failure_category=configuration_error["code"],
+        )
+        return {
+            "provider": provider.id,
+            "status": ProviderStatus.CONFIGURATION_INVALID.value,
+            "configured": bool(provider.has_api_key),
+            "model": provider.model,
+            "configurationValid": False,
+            "configurationError": configuration_error,
             "registryState": registry.state.value,
         }
     
@@ -985,7 +1309,13 @@ def self_test(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
             },
         }]
-        response, _ = complete_model(test_messages, provider.id, test_tool, "required")
+        response, _ = complete_model(
+            test_messages,
+            provider.id,
+            test_tool,
+            "required",
+            capture_provider_request=True,
+        )
         tool_calls = response.get("tool_calls") or []
         if not tool_calls:
             registry.update_provider_status(
@@ -1014,7 +1344,13 @@ def self_test(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "content": json.dumps({"ok": True}),
             },
         ]
-        continuation, _ = complete_model(continuation_messages, provider.id, None, None)
+        continuation, _ = complete_model(
+            continuation_messages,
+            provider.id,
+            None,
+            None,
+            capture_provider_request=True,
+        )
         if continuation.get("tool_calls"):
             raise RuntimeError("Provider did not complete after the tool response.")
         
@@ -1030,11 +1366,33 @@ def self_test(payload: Dict[str, Any]) -> Dict[str, Any]:
             "registryState": registry.state.value,
         }
     except Exception as e:
-        error_msg = str(e)
+        provider_error = e
+        cause = e.__cause__
+        while cause is not None:
+            if isinstance(cause, ProviderRequestError):
+                provider_error = cause
+                break
+            cause = cause.__cause__
+        raw_response = getattr(provider_error, "response_body", str(e))
+        error_msg = redact_provider_error(raw_response, (api_key,))
         
-        status = provider_status_for_error(e)
-        
-        registry.update_provider_status(provider.id, status, failure_category=error_msg[:100])
+        status = provider_status_for_error(provider_error)
+        diagnostic = classify_provider_error(
+            getattr(provider_error, "status_code", None)
+            or getattr(provider_error, "status", None)
+            or getattr(e, "status_code", None),
+            raw_response,
+            (api_key,),
+        )
+        request_capture = getattr(provider_error, "request_capture", None)
+        if request_capture:
+            diagnostic["requestCapture"] = request_capture
+        registry.update_provider_status(
+            provider.id,
+            status,
+            failure_category=error_msg,
+            failure_diagnostic=diagnostic,
+        )
         registry.save_to_file()
         
         return {
@@ -1043,6 +1401,8 @@ def self_test(payload: Dict[str, Any]) -> Dict[str, Any]:
             "configured": True,
             "model": provider.model,
             "error": error_msg,
+            "failureCategory": diagnostic["category"],
+            "failureDetails": diagnostic,
             "registryState": registry.state.value,
         }
 
@@ -1283,10 +1643,56 @@ def _message_dict(message: Any) -> Dict[str, Any]:
         return message.model_dump(exclude_none=True)
     if isinstance(message, dict):
         return message
-    return {
+    normalized = {
         "role": getattr(message, "role", "assistant"),
         "content": getattr(message, "content", "") or "",
     }
+    for field in ("tool_calls", "reasoning_content", "reasoning", "output_text", "text"):
+        value = getattr(message, field, None)
+        if value is not None:
+            normalized[field] = value
+    return normalized
+
+
+def _text_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts).strip()
+    return ""
+
+
+def _normalize_message_text(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Use provider alternate text only when standard content is absent."""
+    if _text_value(message.get("content")) or message.get("tool_calls"):
+        return message
+    for field in ("output_text", "text"):
+        text = _text_value(message.get(field))
+        if text:
+            normalized = dict(message)
+            normalized["content"] = text
+            normalized["_content_source"] = field
+            return normalized
+    return message
+
+
+def _message_shape(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Return field names and lengths only; never log provider content."""
+    shape: Dict[str, Any] = {"fields": sorted(str(key) for key in message.keys())}
+    for field, value in message.items():
+        if isinstance(value, str):
+            shape[f"{field}Length"] = len(value)
+        elif isinstance(value, list):
+            shape[f"{field}Count"] = len(value)
+    return shape
 
 
 def _tool_call_args(call: Dict[str, Any], allowed: set[str]) -> tuple[str, Dict[str, Any]]:
@@ -1309,11 +1715,23 @@ def provider_candidates(provider_id: Optional[str] = None) -> List[Any]:
     if provider_id:
         requested = registry.get_provider(provider_id)
         if requested:
+            if not requested.enabled:
+                raise HTTPException(status_code=400, detail="The requested provider is disabled.")
+            configuration_error = provider_model_error(
+                requested.type,
+                requested.model,
+                requested.base_url,
+            )
+            if configuration_error:
+                raise HTTPException(status_code=400, detail=configuration_error)
             candidates.append(requested)
         return candidates
 
     active = registry.get_active_provider()
     if active:
+        configuration_error = provider_model_error(active.type, active.model, active.base_url)
+        if configuration_error:
+            raise HTTPException(status_code=400, detail=configuration_error)
         candidates.append(active)
     for provider in registry.get_eligible_providers():
         if provider.id not in {item.id for item in candidates}:
@@ -1327,9 +1745,11 @@ def provider_failure_classification(error: Exception) -> str:
         return "TOOL_COMPATIBILITY"
     if is_context_limit_error(error):
         return "CONTEXT_TOO_LARGE"
+    detail = str(getattr(error, "detail", "") or error).lower()
+    if "quota" in detail or "billing" in detail:
+        return "QUOTA_EXCEEDED"
     if is_fallback_error(error):
         return "RATE_LIMIT"
-    detail = str(getattr(error, "detail", "") or error).lower()
     if "unauthorized" in detail or "forbidden" in detail or "invalid api key" in detail or "auth" in detail:
         return "AUTH_FAILED"
     if "connection" in detail or "timeout" in detail or "network" in detail:
@@ -1373,14 +1793,20 @@ def is_provider_retryable(error: Exception) -> bool:
     return isinstance(error, (TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError))
 
 
+def is_stt_retryable(error: Exception) -> bool:
+    """Include response-wrapped HTTP status codes for STT provider retries."""
+    return SttService._status_code(error) in (408, 409, 425, 429, 500, 502, 503, 504) or is_provider_retryable(error)
+
+
 stt_service = SttService(
     get_provider=get_stt_provider,
+    get_speech_capable_provider=get_speech_capable_provider_candidate,
     get_api_key=get_api_key,
     transcription_prompt=STT_TRANSCRIPTION_PROMPT,
     max_upload_mb=MAX_PDF_MB,
     retry_attempts=PROVIDER_RETRY_ATTEMPTS,
     retry_delay=provider_retry_delay_seconds,
-    retryable=is_provider_retryable,
+    retryable=is_stt_retryable,
 )
 
 
@@ -1405,6 +1831,7 @@ def complete_model(
     allow_tool_compatibility_fallback: bool = False,
     request_id: Optional[str] = None,
     trace_metadata: Optional[Dict[str, Any]] = None,
+    capture_provider_request: bool = False,
 ) -> tuple[Dict[str, Any], Any]:
     """Complete one provider request and return the normalized message."""
     candidates = provider_candidates(provider_id)
@@ -1451,7 +1878,14 @@ def complete_model(
                         provider.type.lower() == "gemini"
                         and provider.base_url.rstrip("/").endswith("/openai")
                     ):
-                        message = _native_complete(provider, api_key, request["messages"], tools, tool_choice)
+                        message = _native_complete(
+                            provider,
+                            api_key,
+                            request["messages"],
+                            tools,
+                            tool_choice,
+                            capture_request=capture_provider_request,
+                        )
                     else:
                         client = OpenAI(api_key=api_key, base_url=provider.base_url or None)
                         response = client.chat.completions.create(**request)
@@ -1465,7 +1899,25 @@ def complete_model(
                             tool_choice=tool_choice,
                             trace_metadata=trace_metadata,
                         )
-                        message = _message_dict(response.choices[0].message if response.choices else {})
+                        raw_message = _message_dict(response.choices[0].message if response.choices else {})
+                        if not _text_value(raw_message.get("content")) and not raw_message.get("tool_calls"):
+                            print(
+                                "[GENERAL_PROVIDER_RESPONSE_SHAPE] "
+                                + json.dumps(_message_shape(raw_message), ensure_ascii=False, separators=(",", ":")),
+                                flush=True,
+                            )
+                        message = _normalize_message_text(raw_message)
+                        content_source = message.pop("_content_source", None)
+                        if content_source:
+                            print(
+                                "[GENERAL_PROVIDER_TEXT_FALLBACK] "
+                                + json.dumps(
+                                    {"sourceField": content_source},
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
+                                flush=True,
+                            )
                         if not message.get("content") and not message.get("tool_calls"):
                             trace_provider_request(
                                 request_id,
@@ -1476,6 +1928,9 @@ def complete_model(
                                 tools=tools,
                                 tool_choice=tool_choice,
                                 trace_metadata=trace_metadata,
+                            )
+                            raise ValueError(
+                                "Provider response contained neither text nor tool calls."
                             )
                     break
                 except Exception as error:
@@ -1515,7 +1970,7 @@ def complete_model(
             compatibility_failure = is_tool_compatibility_error(error)
             status = ProviderStatus.SELF_TEST_FAILED if compatibility_failure else provider_status_for_error(error)
             if not compatibility_failure:
-                registry.update_provider_status(provider.id, status, failure_category=error_msg[:100])
+                registry.update_provider_status(provider.id, status, failure_category=error_msg)
                 registry.save_to_file()
             if is_tool_compatibility_error(error):
                 if (
@@ -2545,6 +3000,8 @@ async def process_chat_payload(payload: Dict[str, Any], send_json, state: Dict[s
             message = "The selected AI model cannot use the required browsing operation right now. I'm not claiming the task is complete."
         elif failure_classification == "RATE_LIMIT":
             message = "The AI provider is temporarily unavailable because of a rate limit. The task was not completed."
+        elif failure_classification == "QUOTA_EXCEEDED":
+            message = "The AI provider reports that its quota is exhausted. Check provider usage, billing or plan, and quota reset timing; the task was not completed."
         elif failure_classification in {"NETWORK_ERROR", "CAPACITY_ERROR"}:
             message = "The AI provider is temporarily unavailable. The task was not completed."
         elif isinstance(error, HTTPException):
@@ -2562,7 +3019,12 @@ async def process_chat_payload(payload: Dict[str, Any], send_json, state: Dict[s
         })
 
 
-async def handle_connection_payload(raw: str, send_json, state: Dict[str, Any]) -> None:
+async def handle_connection_payload(
+    raw: str,
+    send_json,
+    state: Dict[str, Any],
+    expected_agent: Optional[str] = None,
+) -> None:
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -2584,6 +3046,37 @@ async def handle_connection_payload(raw: str, send_json, state: Dict[str, Any]) 
             "message": f"Unknown message type: {payload.get('type')}",
         })
         return
+    requested_general = payload.get("mode") == "general" and payload.get("general") is True
+    requested_agent = str(payload.get("agent") or ("general" if requested_general else "assistant"))
+    requested_developer = payload.get("developer") is True or payload.get("mode") == "developer"
+    if expected_agent and requested_agent != expected_agent:
+        await send_connection_message(send_json, state, {
+            "type": "error",
+            "message": f"The {expected_agent.title()} endpoint accepts only {expected_agent.title()} Agent requests.",
+            "requestId": str(payload.get("requestId") or ""),
+        })
+        return
+    if expected_agent == "general" and not requested_general:
+        await send_connection_message(send_json, state, {
+            "type": "error",
+            "message": "The General Agent endpoint accepts only General Agent requests.",
+            "requestId": str(payload.get("requestId") or ""),
+        })
+        return
+    if expected_agent == "assistant" and requested_general:
+        await send_connection_message(send_json, state, {
+            "type": "error",
+            "message": "General Agent requests must use the dedicated General Agent endpoint.",
+            "requestId": str(payload.get("requestId") or ""),
+        })
+        return
+    if expected_agent in {"assistant", "meeting"} and (requested_general or requested_developer):
+        await send_connection_message(send_json, state, {
+            "type": "error",
+            "message": f"The {expected_agent.title()} endpoint accepts only {expected_agent.title()} chat requests.",
+            "requestId": str(payload.get("requestId") or ""),
+        })
+        return
 
     task = asyncio.create_task(process_chat_payload(payload, send_json, state))
     state["tasks"].add(task)
@@ -2600,9 +3093,17 @@ async def close_connection_state(state: Dict[str, Any]) -> None:
             future.cancel()
 
 
-@app.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for streaming chat responses."""
+def websocket_agent_for_path(request_path: str) -> str:
+    if request_path in {"/", "/assistant"}:
+        return "assistant"
+    if request_path == "/meeting":
+        return "meeting"
+    if request_path == "/general":
+        return "general"
+    raise ValueError("Unknown agent endpoint.")
+
+
+async def serve_agent_websocket(websocket: WebSocket, expected_agent: str):
     await websocket.accept()
     state = new_connection_state()
 
@@ -2611,11 +3112,35 @@ async def ws_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            await handle_connection_payload(await websocket.receive_text(), send_json, state)
+            await handle_connection_payload(
+                await websocket.receive_text(),
+                send_json,
+                state,
+                expected_agent=expected_agent,
+            )
     except WebSocketDisconnect:
         pass
     finally:
         await close_connection_state(state)
+
+
+@app.websocket("/ws")
+@app.websocket("/ws/assistant")
+async def ws_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for Assistant chat responses."""
+    await serve_agent_websocket(websocket, "assistant")
+
+
+@app.websocket("/ws/meeting")
+async def meeting_ws_endpoint(websocket: WebSocket):
+    """WebSocket endpoint dedicated to Meeting Assistant requests."""
+    await serve_agent_websocket(websocket, "meeting")
+
+
+@app.websocket("/ws/general")
+async def general_ws_endpoint(websocket: WebSocket):
+    """WebSocket endpoint dedicated to General Agent requests."""
+    await serve_agent_websocket(websocket, "general")
 
 
 async def run_websocket_server():
@@ -2624,16 +3149,27 @@ async def run_websocket_server():
     from websockets.exceptions import ConnectionClosed
     from websockets.server import serve
     
-    async def ws_handler(websocket, path):
+    async def ws_handler(websocket):
         """Handle WebSocket connections on port 3002."""
         state = new_connection_state()
+        request_path = getattr(websocket, "path", "/")
+        try:
+            expected_agent = websocket_agent_for_path(request_path)
+        except ValueError:
+            await websocket.close(code=1008, reason="Unknown agent endpoint.")
+            return
 
         async def send_json(payload: Dict[str, Any]) -> None:
             await websocket.send(json.dumps(payload))
 
         try:
             async for message in websocket:
-                await handle_connection_payload(message, send_json, state)
+                await handle_connection_payload(
+                    message,
+                    send_json,
+                    state,
+                    expected_agent=expected_agent,
+                )
         except ConnectionClosed:
             # Browser tabs and validation clients may close without a close
             # frame; this is a normal end of a task-scoped connection.
@@ -2644,6 +3180,13 @@ async def run_websocket_server():
     async with serve(ws_handler, "0.0.0.0", WS_PORT):
         print(f"WebSocket server listening on ws://localhost:{WS_PORT}")
         await asyncio.Future()  # run forever
+
+
+async def run_all_websocket_servers():
+    await asyncio.gather(
+        run_websocket_server(),
+        run_coding_websocket_server(CODING_WS_PORT, registry, CONFIG_PATH),
+    )
 
 
 if __name__ == "__main__":
@@ -2667,6 +3210,6 @@ if __name__ == "__main__":
 
     # Run WebSocket server in main thread
     try:
-        asyncio.run(run_websocket_server())
+        asyncio.run(run_all_websocket_servers())
     except KeyboardInterrupt:
         print("Shutting down...")

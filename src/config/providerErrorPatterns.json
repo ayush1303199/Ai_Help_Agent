@@ -1,0 +1,38 @@
+[
+  {
+    "category": "INVALID_OR_MISSING_KEY",
+    "status_codes": [401, 403],
+    "keywords": ["key", "auth", "credential", "unauthorized", "forbidden"],
+    "reason": "The provider rejected authentication. Check the saved API key and provider permissions."
+  },
+  {
+    "category": "QUOTA_EXCEEDED",
+    "status_codes": [429],
+    "keywords": ["quota", "rate limit", "rate_limit", "too many requests", "resource exhausted"],
+    "reason": "The provider reports quota or rate limits. Check usage, account billing or plan, and the quota reset window."
+  },
+  {
+    "category": "BILLING_REQUIRED",
+    "status_codes": [402],
+    "keywords": ["billing", "payment", "credit", "subscription"],
+    "reason": "The provider requires billing or payment setup for this request."
+  },
+  {
+    "category": "INVALID_MODEL_OR_REQUEST_FORMAT",
+    "status_codes": [400],
+    "keywords": ["model", "not found", "invalid", "unsupported", "malformed", "format"],
+    "reason": "The provider rejected the model or request format. Verify the model ID and request compatibility."
+  },
+  {
+    "category": "MODEL_UNAVAILABLE",
+    "status_codes": [404],
+    "keywords": ["model"],
+    "reason": "The provider could not find this model or does not support the requested operation. Choose a model supported by the provider."
+  },
+  {
+    "category": "PROVIDER_SERVICE_UNAVAILABLE",
+    "status_codes": [500, 501, 502, 503, 504, 505, 507],
+    "keywords": ["timeout", "timed out", "temporarily unavailable", "overloaded"],
+    "reason": "The provider service is unavailable or the request timed out. Check provider health and retry later."
+  }
+]

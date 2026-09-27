@@ -1,0 +1,215 @@
+{
+  "groq": {
+    "displayName": "Groq",
+    "baseURL": "https://api.groq.com/openai/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "openai/gpt-oss-20b",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "capabilities": { "stt": "SUPPORTED" },
+    "models": [
+      { "id": "openai/gpt-oss-20b", "displayName": "GPT-OSS 20B", "supportsToolCalling": true },
+      { "id": "llama-3.3-70b-versatile", "displayName": "Llama 3.3 70B Versatile", "supportsToolCalling": true },
+      { "id": "llama-3.1-8b-instant", "displayName": "Llama 3.1 8B Instant", "supportsToolCalling": true },
+      { "id": "mixtral-8x7b-32768", "displayName": "Mixtral 8x7B", "supportsToolCalling": true }
+    ]
+  },
+  "openai": {
+    "displayName": "OpenAI",
+    "baseURL": "https://api.openai.com/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "gpt-4o-mini",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "capabilities": { "stt": "SUPPORTED" },
+    "models": [
+      { "id": "gpt-4o-mini", "displayName": "GPT-4o mini", "supportsToolCalling": true },
+      { "id": "gpt-4.1-mini", "displayName": "GPT-4.1 mini", "supportsToolCalling": true },
+      { "id": "gpt-4.1", "displayName": "GPT-4.1", "supportsToolCalling": true },
+      { "id": "o3-mini", "displayName": "o3 mini", "supportsToolCalling": true }
+    ]
+  },
+  "anthropic": {
+    "displayName": "Claude (Anthropic)",
+    "baseURL": "https://api.anthropic.com/v1",
+    "adapter": "anthropic",
+    "defaultModel": "claude-3-5-haiku-latest",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "claude-3-5-haiku-latest", "displayName": "Claude 3.5 Haiku", "supportsToolCalling": true },
+      { "id": "claude-3-7-sonnet-latest", "displayName": "Claude 3.7 Sonnet", "supportsToolCalling": true },
+      { "id": "claude-sonnet-4-20250514", "displayName": "Claude Sonnet 4", "supportsToolCalling": true }
+    ]
+  },
+  "deepseek": {
+    "displayName": "DeepSeek",
+    "baseURL": "https://api.deepseek.com/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "deepseek-chat",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "deepseek-chat", "displayName": "DeepSeek Chat", "supportsToolCalling": true },
+      { "id": "deepseek-reasoner", "displayName": "DeepSeek Reasoner", "supportsToolCalling": true }
+    ]
+  },
+  "openrouter": {
+    "displayName": "OpenRouter",
+    "baseURL": "https://openrouter.ai/api/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "openai/gpt-4o-mini",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "openai/gpt-4o-mini", "displayName": "OpenAI GPT-4o mini", "supportsToolCalling": true },
+      { "id": "anthropic/claude-3.7-sonnet", "displayName": "Anthropic Claude 3.7 Sonnet", "supportsToolCalling": true },
+      { "id": "google/gemini-2.5-flash", "displayName": "Google Gemini 2.5 Flash", "supportsToolCalling": true }
+    ]
+  },
+  "llama": {
+    "displayName": "Llama / Together",
+    "baseURL": "https://api.together.xyz/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "displayName": "Llama 3.3 70B Instruct Turbo", "supportsToolCalling": true }
+    ]
+  },
+  "mistral": {
+    "displayName": "Mistral",
+    "baseURL": "https://api.mistral.ai/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "mistral-small-latest",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "mistral-small-latest", "displayName": "Mistral Small", "supportsToolCalling": true },
+      { "id": "mistral-large-latest", "displayName": "Mistral Large", "supportsToolCalling": true }
+    ]
+  },
+  "gemini": {
+    "displayName": "Gemini",
+    "baseURL": "https://generativelanguage.googleapis.com/v1beta",
+    "adapter": "gemini",
+    "defaultModel": "gemini-3.6-flash",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "capabilities": { "stt": "SUPPORTED" },
+    "models": [
+      { "id": "gemini-3.6-flash", "displayName": "Gemini 3.6 Flash", "supportsToolCalling": true },
+      { "id": "gemini-3.0-flash", "displayName": "Gemini 3.0 Flash", "supportsToolCalling": true },
+      { "id": "gemini-3.0-pro", "displayName": "Gemini 3.0 Pro", "supportsToolCalling": true },
+      { "id": "gemini-3.1-flash", "displayName": "Gemini 3.1 Flash", "supportsToolCalling": true },
+      { "id": "gemini-3.1-pro", "displayName": "Gemini 3.1 Pro", "supportsToolCalling": true },
+      { "id": "gemini-3.2-flash", "displayName": "Gemini 3.2 Flash", "supportsToolCalling": true },
+      { "id": "gemini-3.2-pro", "displayName": "Gemini 3.2 Pro", "supportsToolCalling": true },
+      { "id": "gemini-3.3-flash", "displayName": "Gemini 3.3 Flash", "supportsToolCalling": true },
+      { "id": "gemini-3.3-pro", "displayName": "Gemini 3.3 Pro", "supportsToolCalling": true },
+      { "id": "gemini-3.4-flash", "displayName": "Gemini 3.4 Flash", "supportsToolCalling": true },
+      { "id": "gemini-3.4-pro", "displayName": "Gemini 3.4 Pro", "supportsToolCalling": true },
+      { "id": "gemini-3.5-flash", "displayName": "Gemini 3.5 Flash", "supportsToolCalling": true },
+      { "id": "gemini-3.5-pro", "displayName": "Gemini 3.5 Pro", "supportsToolCalling": true },
+      { "id": "gemini-2.5-pro", "displayName": "Gemini 2.5 Pro", "supportsToolCalling": true },
+      { "id": "gemini-2.5-flash", "displayName": "Gemini 2.5 Flash", "supportsToolCalling": true },
+      { "id": "gemini-2.0-flash", "displayName": "Gemini 2.0 Flash", "supportsToolCalling": true },
+      { "id": "gemini-2.0-flash-lite", "displayName": "Gemini 2.0 Flash Lite", "supportsToolCalling": true },
+      { "id": "gemini-2.0-pro", "displayName": "Gemini 2.0 Pro", "supportsToolCalling": true }
+    ]
+  },
+  "xai": {
+    "displayName": "xAI Grok",
+    "baseURL": "https://api.x.ai/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "grok-3-mini",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "grok-3-mini", "displayName": "Grok 3 mini", "supportsToolCalling": true },
+      { "id": "grok-3", "displayName": "Grok 3", "supportsToolCalling": true }
+    ]
+  },
+  "perplexity": {
+    "displayName": "Perplexity",
+    "baseURL": "https://api.perplexity.ai",
+    "adapter": "openai-compatible",
+    "defaultModel": "sonar",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "sonar", "displayName": "Sonar", "supportsToolCalling": true },
+      { "id": "sonar-pro", "displayName": "Sonar Pro", "supportsToolCalling": true }
+    ]
+  },
+  "fireworks": {
+    "displayName": "Fireworks",
+    "baseURL": "https://api.fireworks.ai/inference/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "accounts/fireworks/models/llama-v3p1-8b-instruct",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "accounts/fireworks/models/llama-v3p1-8b-instruct", "displayName": "Llama 3.1 8B Instruct", "supportsToolCalling": true }
+    ]
+  },
+  "cerebras": {
+    "displayName": "Cerebras",
+    "baseURL": "https://api.cerebras.ai/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "llama-3.3-70b",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "llama-3.3-70b", "displayName": "Llama 3.3 70B", "supportsToolCalling": true }
+    ]
+  },
+  "cohere": {
+    "displayName": "Cohere",
+    "baseURL": "https://api.cohere.com/compatibility/v1",
+    "adapter": "cohere",
+    "defaultModel": "command-r7b-12-2024",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "command-r7b-12-2024", "displayName": "Command R7B", "supportsToolCalling": true },
+      { "id": "command-r-plus", "displayName": "Command R+", "supportsToolCalling": true }
+    ]
+  },
+  "custom": {
+    "displayName": "Custom OpenAI-compatible",
+    "baseURL": "",
+    "adapter": "openai-compatible",
+    "defaultModel": "",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "customModelAllowed": true,
+    "capabilities": { "stt": "UNKNOWN" },
+    "models": []
+  },
+  "together": {
+    "displayName": "Together",
+    "baseURL": "https://api.together.xyz/v1",
+    "adapter": "openai-compatible",
+    "defaultModel": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "models": [
+      { "id": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "displayName": "Llama 3.3 70B Instruct Turbo", "supportsToolCalling": true }
+    ],
+    "showInUI": false
+  },
+  "custom-openai": {
+    "displayName": "Custom OpenAI-compatible",
+    "baseURL": "",
+    "adapter": "openai-compatible",
+    "defaultModel": "",
+    "authentication": { "type": "apiKey" },
+    "endpoint": { "required": true, "configurable": true },
+    "customModelAllowed": true,
+    "capabilities": { "stt": "UNKNOWN" },
+    "models": [],
+    "showInUI": false
+  }
+}

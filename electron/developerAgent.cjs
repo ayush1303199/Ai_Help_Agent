@@ -38,6 +38,7 @@ const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const SENSITIVE_PATH_PATTERN = /(?:^|[\\/])(?:\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.config|id_rsa(?:\..*)?|[^\\/]+\.(?:pem|key|p12|pfx|crt|cer|der))$/i;
 const registry = new Map();
 const sessions = new Map();
+const conversationTurns = new Map();
 let locked = false;
 let journalPath = null;
 let auditPath = null;
@@ -127,6 +128,55 @@ function transition(task, next) {
   const previous = task.state;
   task.state = next; task.updatedAt = now();
   recordMutation(task, 'state_transition', { from: previous, to: next });
+  if (task.conversationTurnId) {
+    const turn = conversationTurns.get(task.conversationTurnId);
+    if (turn && turn.ownerWebContentsId === task.ownerWebContentsId) {
+      turn.state = next;
+      turn.updatedAt = task.updatedAt;
+      recordMutation(turn, 'conversation_state_transition', { from: previous, to: next });
+    }
+  }
+}
+function assertConversationOwner(turn, owner) {
+  if (!turn || !owner || turn.sessionId !== owner.sessionId || turn.ownerWebContentsId !== owner.ownerWebContentsId) {
+    throw new Error('Coding conversation turn is not owned by this renderer session.');
+  }
+}
+function beginConversationTurn({ root, scope = '.', request, sessionId, ownerWebContentsId }) {
+  if (!sessionId || ownerWebContentsId === undefined) throw new Error('Developer session ownership is required.');
+  if (typeof request !== 'string' || !request.trim() || request.length > 4000) throw new Error('Coding request is invalid or too long.');
+  const turn = {
+    turnId: crypto.randomUUID(), sessionId, ownerWebContentsId, root, scope,
+    state: 'reading', createdAt: now(), updatedAt: now(),
+  };
+  conversationTurns.set(turn.turnId, turn);
+  recordMutation(turn, 'conversation_turn_started', { scope });
+  return { turnId: turn.turnId, state: turn.state };
+}
+function advanceConversationTurn(turnId, next, owner, details = {}) {
+  const turn = conversationTurns.get(turnId);
+  assertConversationOwner(turn, owner);
+  const allowed = {
+    reading: ['understanding', 'failed', 'cancelled'],
+    understanding: ['proposal_ready', 'completed', 'failed', 'cancelled'],
+    proposal_ready: ['awaiting_approval', 'failed', 'cancelled'],
+    awaiting_approval: ['approved', 'failed', 'cancelled'],
+    approved: ['applying', 'failed', 'cancelled'],
+    applying: ['verifying', 'recovering', 'failed', 'cancelled'],
+    verifying: ['completed', 'recovering', 'failed', 'cancelled'],
+    recovering: ['failed', 'verifying', 'cancelled'],
+    completed: [],
+    failed: [],
+    cancelled: [],
+  };
+  if (!allowed[turn.state]?.includes(next)) throw new Error(`Invalid conversation transition: ${turn.state} -> ${next}`);
+  const previous = turn.state;
+  turn.state = next;
+  turn.updatedAt = now();
+  recordMutation(turn, 'conversation_state_transition', {
+    from: previous, to: next, phase: details.phase, fileCount: details.fileCount,
+  });
+  return { turnId: turn.turnId, state: turn.state, updatedAt: turn.updatedAt };
 }
 function assertOwner(task, owner) {
   if (!owner || task.sessionId !== owner.sessionId || task.ownerWebContentsId !== owner.ownerWebContentsId) {
@@ -187,12 +237,20 @@ function resumeSession(ownerWebContentsId, sessionId) {
   }
   sessions.set(ownerWebContentsId, sessionId);
   for (const task of registry.values()) if (task.sessionId === sessionId) task.ownerWebContentsId = ownerWebContentsId;
+  for (const turn of conversationTurns.values()) if (turn.sessionId === sessionId) turn.ownerWebContentsId = ownerWebContentsId;
   const task = [...registry.values()].find((item) => item.sessionId === sessionId);
   recordMutation(task, 'session_resumed', { ownerWebContentsId });
   return sessionId;
 }
 function releaseSession(ownerWebContentsId) {
   cancelSession(ownerWebContentsId);
+  for (const turn of conversationTurns.values()) {
+    if (turn.ownerWebContentsId === ownerWebContentsId && !['completed', 'failed', 'cancelled'].includes(turn.state)) {
+      turn.state = 'cancelled';
+      turn.updatedAt = now();
+      recordMutation(turn, 'conversation_turn_cancelled', {});
+    }
+  }
   sessions.delete(ownerWebContentsId);
 }
 function cancelSession(ownerWebContentsId) {
@@ -249,6 +307,7 @@ function publicTask(task) {
     approval: task.approval ? { approvedAt: task.approval.approvedAt, actor: task.approval.actor } : null,
     progress: task.progress, verification: task.verification || null, verificationScript: task.verificationScript || null,
     verificationScripts: task.verificationScripts || [],
+    scope: task.scope || '.',
     outcome: task.outcome || null, error: task.error || null,
     runtime: runtimeState(task),
     durability: { journalError: journalError?.message || null, auditError: auditError?.message || null },
@@ -315,16 +374,23 @@ function applyFilePatch(original, lines) {
 
 async function createProposal({
   root: inputRoot, raw, expectedSnapshots = [], sessionId, ownerWebContentsId,
-  workspace = {}, verificationScript = null, verificationScripts = [],
+  workspace = {}, verificationScript = null, verificationScripts = [], scope = '.', conversationTurnId = null,
 }) {
   if (!sessionId || ownerWebContentsId === undefined) throw new Error('Developer session ownership is required.');
+  const root = await fs.realpath(inputRoot);
+  if (conversationTurnId) {
+    const turn = conversationTurns.get(conversationTurnId);
+    assertConversationOwner(turn, { sessionId, ownerWebContentsId });
+    if (turn.state !== 'understanding' || await fs.realpath(turn.root) !== root || turn.scope !== scope) {
+      throw new Error('Coding conversation is not ready to register a proposal for this project scope.');
+    }
+  }
   if (verificationScript !== null) commandPolicy(verificationScript);
   const requestedScripts = [
     ...(Array.isArray(verificationScripts) ? verificationScripts : []),
     ...(verificationScript ? [verificationScript] : []),
   ];
   const safeVerificationScripts = [...new Set(requestedScripts.map((script) => commandPolicy(script).script))];
-  const root = await fs.realpath(inputRoot);
   const files = parsePatch(raw); const unique = new Set(); const before = []; const changes = [];
   for (const file of files) {
     if (unique.has(file.path)) throw new Error('Proposal contains duplicate files.');
@@ -339,6 +405,8 @@ async function createProposal({
   }
   const task = {
     taskId: crypto.randomUUID(), sessionId, ownerWebContentsId, root,
+    conversationTurnId,
+    scope: scope || '.',
     proposalId: crypto.randomUUID(),
     workspace: { root, name: workspace.name || path.basename(root), branch: workspace.branch || null },
     raw, files: changes, before,
@@ -360,12 +428,19 @@ async function createProposal({
     },
     createdAt: now(), updatedAt: now(),
   };
+  if (conversationTurnId) {
+    const turn = conversationTurns.get(conversationTurnId);
+    turn.state = 'proposal_ready';
+    turn.updatedAt = now();
+    recordMutation(turn, 'conversation_state_transition', { from: 'understanding', to: 'proposal_ready', fileCount: changes.length });
+  }
   registry.set(task.taskId, task); recordMutation(task, 'proposal_registered', { proposalId: task.proposalId });
   transition(task, 'awaiting_approval'); return publicTask(task);
 }
 function getTask(taskId, owner) { const task = registry.get(taskId); if (!task) throw new Error('Unknown Developer task.'); assertOwner(task, owner); return task; }
 function approve(taskId, owner) {
   const task = getTask(taskId, owner);
+  if (task.state !== 'awaiting_approval') throw new Error('Only a proposal awaiting approval can be approved.');
   task.approval = { approvedAt: now(), actor: 'renderer-session' };
   task.runtime = task.runtime || {};
   task.runtime.phase = 'AWAITING_APPROVAL';
@@ -374,6 +449,18 @@ function approve(taskId, owner) {
   task.runtime.lastUpdated = now();
   transition(task, 'approved');
   recordMutation(task, 'proposal_approved', { proposalId: task.proposalId || taskId, actor: task.approval.actor });
+  return publicTask(task);
+}
+function reject(taskId, owner) {
+  const task = getTask(taskId, owner);
+  if (task.state !== 'awaiting_approval') throw new Error('Only a proposal awaiting approval can be rejected.');
+  task.runtime = task.runtime || {};
+  task.runtime.phase = 'CANCELLED';
+  task.runtime.taskState = 'CANCELLED';
+  task.runtime.history = [...(task.runtime.history || []), { phase: 'CANCELLED', at: now(), message: 'User rejected the proposal.' }].slice(-20);
+  task.runtime.lastUpdated = now();
+  transition(task, 'cancelled');
+  recordMutation(task, 'proposal_rejected', { proposalId: task.proposalId || taskId });
   return publicTask(task);
 }
 async function writeAndVerify(task, files) {
@@ -721,11 +808,11 @@ function isCancellationRequested(taskId, owner) {
   return Boolean(task.cancelRequested);
 }
 function resetForTest() {
-  registry.clear(); sessions.clear(); locked = false; journalError = null; auditError = null;
+  registry.clear(); sessions.clear(); conversationTurns.clear(); locked = false; journalError = null; auditError = null;
   journalQueue = Promise.resolve(); auditQueue = Promise.resolve();
 }
 module.exports = {
-  STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, createProposal, approve, apply, undo,
+  STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, beginConversationTurn, advanceConversationTurn, createProposal, approve, reject, apply, undo,
   getTask: (id, owner) => publicTask(getTask(id, owner)), getTaskForTest, normalizeCommandResult,
   classifyFailure, classifyFailureCategory, commandPolicy, selectVerificationChecks, extractFailure, normalizeObservation,
   diagnoseObservation, executeVerificationLoop, runVerificationChecks, runEngineeringLoop, isCancellationRequested,

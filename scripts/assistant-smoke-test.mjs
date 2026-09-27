@@ -6,6 +6,13 @@ const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 
 const appTypesSource = await fs.readFile(new URL('../src/app/appTypes.ts', import.meta.url), 'utf8');
 const modeControlsSource = await fs.readFile(new URL('../src/ui/header/ModeControls.tsx', import.meta.url), 'utf8');
 const meetingWorkspaceSource = await fs.readFile(new URL('../src/features/meeting/MeetingAssistantWorkspace.tsx', import.meta.url), 'utf8');
+const meetingControllerSource = await fs.readFile(new URL('../src/features/meeting/useMeetingAssistantController.ts', import.meta.url), 'utf8');
+const meetingTransportSource = await fs.readFile(new URL('../src/features/meeting/meetingTransport.ts', import.meta.url), 'utf8');
+const assistantControllerSource = await fs.readFile(new URL('../src/features/assistant/useAssistantAgentController.ts', import.meta.url), 'utf8');
+const assistantTransportSource = await fs.readFile(new URL('../src/features/assistant/assistantTransport.ts', import.meta.url), 'utf8');
+const codingPageSource = await fs.readFile(new URL('../src/features/coding/CodingAgentPage.tsx', import.meta.url), 'utf8');
+const generalPageSource = await fs.readFile(new URL('../src/features/general/GeneralAgentPage.tsx', import.meta.url), 'utf8');
+const generalControllerSource = await fs.readFile(new URL('../src/features/general/useGeneralAgentController.ts', import.meta.url), 'utf8');
 const electronMainSource = await fs.readFile(new URL('../electron/main.cjs', import.meta.url), 'utf8');
 const interviewPromptSource = await fs.readFile(new URL('../src/ai/interviewSystemPrompt.ts', import.meta.url), 'utf8');
 
@@ -68,6 +75,8 @@ assert.equal(transcriptUtils.prepareQuestion('What is Spring Boot?').acceptedQue
 assert.equal(transcriptUtils.prepareQuestion('Introduce yourself.').acceptedQuestion, 'Introduce yourself.');
 assert.equal(transcriptUtils.prepareQuestion('Technical vocabulary. Technical vocabulary. Technical vocabulary.').qualityClassification, 'REPEATED_NOISE');
 assert.equal(transcriptUtils.prepareTextRequest('Introduce yourself').acceptedQuestion, 'Introduce yourself');
+assert.equal(transcriptUtils.prepareTextRequest('hi').acceptedQuestion, 'hi');
+assert.equal(transcriptUtils.prepareTextRequest('weather today').acceptedQuestion, 'weather today');
 assert.equal(transcriptUtils.prepareTextRequest('Explain dependency injection in Spring.').acceptedQuestion, 'Explain dependency injection in Spring?');
 assert.equal(transcriptUtils.prepareQuestion('Explain artificial intelligence.').acceptedQuestion, 'Explain artificial intelligence?');
 assert.equal(transcriptUtils.prepareQuestion('Tell me how Spring Boot works.').acceptedQuestion, 'Tell me how Spring Boot works?');
@@ -90,15 +99,45 @@ assert.equal(
 );
 assert.equal(transcriptUtils.voiceSafeText('  a   complete   answer  '), 'a complete answer');
 
-assert.match(appTypesSource, /export type AppMode = 'assistant' \| 'developer' \| 'general';/);
+assert.match(appTypesSource, /export type AppMode = 'assistant' \| 'meeting' \| 'developer' \| 'general';/);
 assert.match(appSource, /useState<AppMode>\('assistant'\)/);
 assert.match(modeControlsSource, /onAppModeChange\('assistant'\)/);
+assert.match(modeControlsSource, /onAppModeChange\('meeting'\)/);
 assert.match(modeControlsSource, /onAppModeChange\('developer'\)/);
 assert.match(modeControlsSource, /onAppModeChange\('general'\)/);
 assert.match(appSource, /\{appMode === 'general' \?[\s\S]+appMode === 'developer' \?/);
-assert.match(appSource, /const \[messages, setMessages\]/);
-assert.match(appSource, /const \[developerMessages, setDeveloperMessages\]/);
-assert.match(appSource, /const \[generalTask, setGeneralTask\]/);
+assert.match(appSource, /useGeneralAgentController\(\)/);
+assert.doesNotMatch(appSource, /const \[generalTask, setGeneralTask\]|runGeneralAgentRequest|pendingGeneralRequestIdsRef|type: 'chat',\s*mode: 'general'/);
+assert.match(appSource, /useMeetingAssistantController\(/);
+assert.match(appSource, /appMode === 'meeting' \? \(/);
+assert.match(appSource, /<MeetingAssistantPage/);
+assert.match(
+  appSource,
+  /buildChatRequest:\s*\(question,\s*history,\s*screenImage,\s*contextOverride\)/,
+);
+assert.match(meetingControllerSource, /sendTypedQuestion/);
+assert.match(meetingControllerSource, /new MeetingAgentTransport\(\)/);
+assert.match(meetingControllerSource, /transport\.send\(buildChatRequest\(/);
+assert.match(meetingTransportSource, /agent: 'meeting'/);
+assert.doesNotMatch(appSource, /transcribeAudioSegment|MediaRecorder|getUserMedia|segmentProcessorRef|captureSessionIdRef|pendingPartialQuestionRef/);
+assert.match(codingPageSource, /from '\.\/CodingAgentWorkspace'/);
+assert.match(codingPageSource, /<CodingAgentWorkspace \{\.\.\.workspace\} \/>/);
+assert.match(generalPageSource, /from '\.\/GeneralAgentWorkspace'/);
+assert.match(generalPageSource, /<GeneralAgentWorkspace \{\.\.\.workspace\} \/>/);
+assert.match(generalControllerSource, /const \[task, setTask\] = useState<GeneralTaskState \| null>/);
+assert.match(generalControllerSource, /GENERAL_WS_URL = .*\/general/);
+assert.match(generalControllerSource, /new WebSocket\(GENERAL_WS_URL\)/);
+assert.match(appSource, /useAssistantAgentController\(/);
+assert.match(assistantControllerSource, /const \[messages, setMessages\]/);
+assert.match(assistantControllerSource, /sendMessage = useCallback/);
+assert.match(assistantControllerSource, /improveDraft = useCallback/);
+assert.match(assistantTransportSource, /ASSISTANT_WS_URL = .*\/assistant/);
+assert.match(assistantTransportSource, /agent: 'assistant'/);
+assert.doesNotMatch(appSource, /new WebSocket|wsRef|ensureWs|handleWsMessage/);
+assert.match(appSource, /if \(appMode === 'meeting'\)[\s\S]*sendMeetingQuestion[\s\S]*sendAssistantMessage/);
+assert.doesNotMatch(appSource, /generalAnswer \|\| assistantAnswer/);
+assert.match(appSource, /onAppModeChange=\{setAppMode\}/);
+assert.match(appSource, /useCodingAgentController\(/);
 assert.match(interviewPromptSource, /## Source priority and grounding/);
 assert.match(interviewPromptSource, /## Candidate interview persona/);
 assert.match(interviewPromptSource, /## Technical answers/);
@@ -108,36 +147,50 @@ assert.match(appSource, /question: latestQuestion/);
 
 const generalBranch = appSource.indexOf("{appMode === 'general' ?");
 const developerBranch = appSource.indexOf(") : appMode === 'developer' ?");
-const assistantCapture = appSource.lastIndexOf('startMeetingCapture()');
+const meetingCapture = appSource.lastIndexOf('startMeetingCapture()');
 assert.ok(generalBranch >= 0 && developerBranch > generalBranch, 'application modes must have isolated render branches');
-assert.ok(assistantCapture > developerBranch, 'Assistant capture controls must remain in the Assistant render branch');
+assert.ok(meetingCapture > developerBranch, 'Meeting capture controls must remain in the Meeting render branch');
 assert.match(appSource, /CURRENT QUESTION:/);
 assert.match(appSource, /DIRECT MODE ACTIVE CONTEXT:/);
 assert.match(interviewPromptSource, /do not say "I am ChatGPT"/i);
-assert.match(appSource, /DUPLICATE_TRANSCRIPT_IGNORED/);
-assert.match(appSource, /rawText: candidateRawText/);
-assert.match(appSource, /acceptedQuestionRequestIdsRef/);
-assert.match(appSource, /releaseAcceptedQuestion\(String\(msg\.requestId\)\)/);
+assert.match(meetingControllerSource, /DUPLICATE_TRANSCRIPT_IGNORED/);
+assert.match(meetingControllerSource, /rawText: candidateRawText/);
+assert.match(assistantControllerSource, /releaseAcceptedQuestion/);
 assert.match(appTypesSource, /export type MeetingAudioMode = 'microphone' \| 'system' \| 'meeting';/);
-assert.match(appSource, /const microphoneAudio = meetingAudioMode !== 'system';/);
-assert.match(appSource, /const systemAudioRequested = meetingAudioMode !== 'microphone';/);
+assert.match(meetingControllerSource, /const microphoneAudio = meetingAudioMode !== 'system';/);
+assert.match(meetingControllerSource, /const systemAudioRequested = meetingAudioMode !== 'microphone';/);
 assert.match(meetingWorkspaceSource, /System \/ Internal Audio \(meeting sound\)/);
-assert.match(appSource, /Microphone and system audio connected/);
-assert.match(appSource, /System audio connected/);
-assert.match(appSource, /SYSTEM_AUDIO_UNAVAILABLE/);
-assert.doesNotMatch(appSource, /SYSTEM_AUDIO_OPTIONAL_UNAVAILABLE/);
-assert.match(appSource, /selectedDeviceConfigured/);
-assert.match(appSource, /selectedDevicePresent/);
-assert.match(appSource, /displayedAudioSourceLabel/);
-assert.match(appSource, /displayedAudioStatus/);
-assert.match(appSource, /const stopMeetingCapture = \(\) =>/);
-assert.match(appSource, /if \(captureActiveRef\.current \|\| captureSessionIdRef\.current\) return;/);
-assert.match(appSource, /captureSessionIdRef\.current = ''/);
-assert.match(appSource, /recorder\.state === 'recording'/);
-assert.match(appSource, /recorderRef\.current === recorder/);
-assert.match(appSource, /nextSegment\?\.sttSession === sttSession/);
-assert.match(appSource, /STALE_STT_CALLBACK_IGNORED/);
-assert.match(appSource, /setIsRecording\(false\);\s*setIsTranscribing\(false\);\s*setPipelineStatus\('stopped'\)/);
+assert.doesNotMatch(meetingWorkspaceSource, /Click a website button or result|Review click/);
+assert.match(meetingWorkspaceSource, /Ask the assistant\.\.\./);
+assert.doesNotMatch(appSource, /browserClickTarget|requestBrowserButtonClick/);
+assert.doesNotMatch(electronMainSource, /browser:click-confirmed-target|browserClickService|Confirm browser click/);
+assert.match(meetingControllerSource, /Microphone and system audio connected/);
+assert.match(meetingControllerSource, /System audio connected/);
+assert.match(meetingControllerSource, /SYSTEM_AUDIO_UNAVAILABLE/);
+assert.doesNotMatch(meetingControllerSource, /SYSTEM_AUDIO_OPTIONAL_UNAVAILABLE/);
+assert.match(meetingControllerSource, /selectedDeviceConfigured/);
+assert.match(meetingControllerSource, /selectedDevicePresent/);
+assert.match(meetingControllerSource, /displayedAudioSourceLabel/);
+assert.match(meetingControllerSource, /displayedAudioStatus/);
+assert.match(meetingControllerSource, /const stopMeetingCapture = \(\) =>/);
+assert.match(meetingControllerSource, /if \(captureActiveRef\.current \|\| captureSessionIdRef\.current\) return;/);
+const meetingCaptureStart = meetingControllerSource.indexOf('const startMeetingCapture = async () =>');
+const meetingCaptureReadiness = meetingControllerSource.indexOf('await refreshProviders();', meetingCaptureStart);
+const meetingCaptureHealthCheck = meetingControllerSource.indexOf("fetch(`${HTTP_URL}/api/health`)", meetingCaptureStart);
+assert.ok(
+  meetingCaptureStart >= 0 && meetingCaptureReadiness > meetingCaptureStart && meetingCaptureHealthCheck > meetingCaptureReadiness,
+  'Meeting capture must rehydrate persisted provider credentials before checking STT readiness.',
+);
+assert.match(meetingControllerSource, /No speech-capable provider key is available to this desktop session/);
+assert.match(meetingControllerSource, /No enabled provider with speech-transcription support is available/);
+assert.match(meetingControllerSource, /speech-to-text provider key is missing or was rejected/);
+assert.doesNotMatch(meetingControllerSource, /The active provider does not support speech transcription/);
+assert.match(meetingControllerSource, /captureSessionIdRef\.current = ''/);
+assert.match(meetingControllerSource, /recorder\.state === 'recording'/);
+assert.match(meetingControllerSource, /recorderRef\.current === recorder/);
+assert.match(meetingControllerSource, /nextSegment\?\.sttSession === sttSession/);
+assert.match(meetingControllerSource, /STALE_STT_CALLBACK_IGNORED/);
+assert.match(meetingControllerSource, /setIsRecording\(false\);\s*setIsTranscribing\(false\);\s*setPipelineStatus\('stopped'\)/);
 assert.match(meetingWorkspaceSource, /isRecording \|\| isTranscribing \? <button type="button" onClick=\{onStopCapture\}/);
 assert.match(meetingWorkspaceSource, /<button type="button" onClick=\{onStartCapture\}[^>]*>Start Listening<\/button>/);
 assert.match(electronMainSource, /setDisplayMediaRequestHandler/);
@@ -147,8 +200,8 @@ assert.match(electronMainSource, /types: \['screen'\]/);
 console.log(JSON.stringify({
   smoke: 'assistant-mode',
   transcriptPipeline: true,
-  modeSwitches: ['assistant', 'developer', 'general'],
+  modeSwitches: ['assistant', 'meeting', 'developer', 'general'],
   stateIsolation: true,
-  audioCaptureAssistantOnly: true,
+  audioCaptureMeetingOnly: true,
   audioSources: ['microphone', 'system', 'microphone+system'],
 }));

@@ -11,7 +11,7 @@ app.setPath('userData', require('node:path').join(require('node:os').tmpdir(), `
 app.on('window-all-closed', (event) => event.preventDefault());
 
 const API_HEALTH_URL = 'http://127.0.0.1:3001/api/health';
-const WS_URL = 'ws://127.0.0.1:3002';
+const WS_URL = 'ws://127.0.0.1:3002/general';
 const REQUEST_TIMEOUT_MS = 120000;
 const INJECTION_PAGE = `<!doctype html>
   <title>Untrusted catalog</title>

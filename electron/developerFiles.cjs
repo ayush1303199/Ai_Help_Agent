@@ -1,5 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const os = require('node:os');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { detectProject, PROJECT_MANIFESTS, VERIFICATION_PROFILES } = require('./coding-pipeline/detect/projectDetector.cjs');
 
@@ -15,6 +17,27 @@ const MAX_COMMAND_DURATION_MS = 120000;
 const MAX_OUTPUT_CHARS = 12000;
 const MAX_RUNTIME_FRAMES = 12;
 const MAX_RUNTIME_SOURCE_LINES = 9;
+const PROJECT_DISCOVERY_MAX_DEPTH = 3;
+const PROJECT_DISCOVERY_TIMEOUT_MS = 5000;
+const PROJECT_DISCOVERY_MAX_DIRECTORIES = 2000;
+const PROJECT_DISCOVERY_MAX_MATCHES = 20;
+const PROJECT_DISCOVERY_EXCLUDED_NAMES = new Set([
+  ...IGNORED_NAMES,
+  '.ssh',
+  '.aws',
+  '.azure',
+  '.config',
+  '.venv',
+  'venv',
+  'vendor',
+  'windows',
+  'program files',
+  'program files (x86)',
+  'programdata',
+  'appdata',
+  '$recycle.bin',
+  'system volume information',
+]);
 const SAFE_SCRIPT_NAMES = new Set(['lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify']);
 const UNSAFE_SCRIPT_PATTERN = /[;&|<>`]|\$\(|\b(?:npm|npm\.cmd|yarn|pnpm|npx|git|rm|del|erase|format|powershell|cmd|install|publish|deploy|release|commit|push|reset|clean|generate|fix|update|write)\b/i;
 const SAFE_COMMAND_PATTERN = /^\s*(?:tsc|eslint|vite|vitest|jest|mocha|ava|biome|webpack|rollup|next)(?:\s|$)/i;
@@ -44,6 +67,8 @@ const CHECK_COMMANDS = {
 };
 
 const projectRoots = new Map();
+const projectDiscoveryMatches = new Map();
+let auditDirectory = null;
 
 function isInsideRoot(root, target) {
   const relative = path.relative(root, target);
@@ -53,6 +78,186 @@ function isInsideRoot(root, target) {
 function isSensitivePath(relativePath) {
   const segments = String(relativePath || '').replace(/\\/g, '/').split('/').filter(Boolean);
   return segments.some((segment) => SENSITIVE_DIRECTORY_NAMES.has(segment.toLowerCase()) || SENSITIVE_NAME_PATTERN.test(segment));
+}
+
+function isExcludedDiscoveryPath(target) {
+  return path.resolve(target).split(/[\\/]/).filter(Boolean)
+    .some((segment) => PROJECT_DISCOVERY_EXCLUDED_NAMES.has(segment.toLowerCase()));
+}
+
+function getProjectDiscoveryRoots() {
+  const home = os.homedir();
+  const defaults = [
+    path.join(home, 'eclipse-workspace'),
+    path.join(home, 'source', 'repos'),
+    path.join(home, 'Documents', 'GitHub'),
+    path.join(home, 'Documents', 'Projects'),
+    path.join(home, 'Documents', 'source', 'repos'),
+    path.join(home, 'Projects'),
+    path.join(home, 'workspace'),
+    path.join(home, 'code'),
+  ];
+  if (process.platform === 'win32') {
+    defaults.push('C:\\xampp\\htdocs', 'C:\\wamp64\\www', 'C:\\laragon\\www');
+  } else {
+    defaults.push(path.join(home, 'Sites'), '/var/www/html');
+  }
+  const configured = String(process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS || '')
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const roots = [];
+  for (const entry of [...defaults, ...configured]) {
+    const isNetworkPath = process.platform === 'win32' && /^\\\\/.test(entry);
+    if (!path.isAbsolute(entry) || isNetworkPath) {
+      throw new Error(`Invalid Coding project discovery root: ${entry}`);
+    }
+    const root = path.resolve(entry);
+    const driveRoot = path.parse(root).root;
+    if (root.toLowerCase() === driveRoot.toLowerCase() || isExcludedDiscoveryPath(root)) {
+      throw new Error(`Invalid Coding project discovery root: ${root}`);
+    }
+    if (!roots.some((existing) => existing.toLowerCase() === root.toLowerCase())) roots.push(root);
+  }
+  return roots;
+}
+
+async function discoverProjectByName(projectName, ownerWebContentsId) {
+  if (ownerWebContentsId === undefined) throw new Error('Developer project ownership is required.');
+  const name = typeof projectName === 'string' ? projectName.trim() : '';
+  if (!name || name.length > 512) {
+    throw new TypeError('Coding project name must be a bounded folder name.');
+  }
+  const pendingMatches = projectDiscoveryMatches.get(ownerWebContentsId) || [];
+  if (path.isAbsolute(name)) {
+    const selected = pendingMatches.find((match) => match.toLowerCase() === path.resolve(name).toLowerCase());
+    if (!selected) throw new Error('The selected project path was not one of the discovered matches.');
+    projectRoots.set(ownerWebContentsId, selected);
+    projectDiscoveryMatches.delete(ownerWebContentsId);
+    try {
+      await validateProjectRoot(ownerWebContentsId);
+    } catch (error) {
+      projectRoots.delete(ownerWebContentsId);
+      throw error;
+    }
+    return { matches: [selected], projectRoot: selected, roots: [] };
+  }
+  if (name.length > 128 || name === '.' || name === '..'
+    || path.basename(name) !== name || /[<>:"/\\|?*\u0000-\u001f]/.test(name)) {
+    throw new TypeError('Coding project name must be a bounded folder name.');
+  }
+
+  const roots = getProjectDiscoveryRoots();
+  const deadline = Date.now() + PROJECT_DISCOVERY_TIMEOUT_MS;
+  const targetName = name.toLocaleLowerCase();
+  const matches = new Set();
+  const queue = [];
+  let visitedDirectories = 0;
+  let timedOut = false;
+  let directoryLimitReached = false;
+  const inaccessible = new Set(['ENOENT', 'EACCES', 'EPERM', 'ENOTDIR']);
+
+  for (const root of roots) {
+    if (Date.now() >= deadline) {
+      timedOut = true;
+      break;
+    }
+    try {
+      const canonicalRoot = await fs.realpath(root);
+      if (isExcludedDiscoveryPath(canonicalRoot)) continue;
+      const stat = await fs.stat(canonicalRoot);
+      if (!stat.isDirectory()) continue;
+      queue.push({ directory: canonicalRoot, depth: 0 });
+    } catch (error) {
+      if (!inaccessible.has(error.code)) throw error;
+    }
+  }
+
+  while (queue.length) {
+    if (Date.now() >= deadline) {
+      timedOut = true;
+      break;
+    }
+    if (visitedDirectories >= PROJECT_DISCOVERY_MAX_DIRECTORIES) {
+      directoryLimitReached = true;
+      break;
+    }
+    const current = queue.shift();
+    if (current.depth >= PROJECT_DISCOVERY_MAX_DEPTH) continue;
+    visitedDirectories += 1;
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      timedOut = true;
+      break;
+    }
+    let timer;
+    let entries;
+    try {
+      entries = await Promise.race([
+        fs.readdir(current.directory, { withFileTypes: true }),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(null), remainingMs); }),
+      ]);
+    } catch (error) {
+      if (!inaccessible.has(error.code)) throw error;
+      continue;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (!entries) {
+      timedOut = true;
+      break;
+    }
+
+    for (const entry of entries) {
+      if (Date.now() >= deadline) {
+        timedOut = true;
+        break;
+      }
+      if (!entry.isDirectory() || PROJECT_DISCOVERY_EXCLUDED_NAMES.has(entry.name.toLowerCase())) continue;
+      const candidate = path.join(current.directory, entry.name);
+      const depth = current.depth + 1;
+      if (entry.name.toLocaleLowerCase() === targetName) {
+        try {
+          const canonicalCandidate = await fs.realpath(candidate);
+          const stat = await fs.stat(canonicalCandidate);
+          if (stat.isDirectory() && !isExcludedDiscoveryPath(canonicalCandidate)) matches.add(canonicalCandidate);
+        } catch (error) {
+          if (!inaccessible.has(error.code)) throw error;
+        }
+      }
+      if (depth < PROJECT_DISCOVERY_MAX_DEPTH) queue.push({ directory: candidate, depth });
+    }
+  }
+
+  if (timedOut || directoryLimitReached) {
+    projectDiscoveryMatches.delete(ownerWebContentsId);
+    return {
+      matches: [...matches].sort().slice(0, PROJECT_DISCOVERY_MAX_MATCHES),
+      projectRoot: null,
+      roots,
+      timedOut,
+      directoryLimitReached,
+    };
+  }
+
+  const found = [...matches].sort().slice(0, PROJECT_DISCOVERY_MAX_MATCHES);
+  const projectRoot = found.length === 1 ? found[0] : null;
+  if (projectRoot) {
+    projectDiscoveryMatches.delete(ownerWebContentsId);
+    projectRoots.set(ownerWebContentsId, projectRoot);
+    try {
+      await validateProjectRoot(ownerWebContentsId);
+    } catch (error) {
+      projectRoots.delete(ownerWebContentsId);
+      throw error;
+    }
+  } else if (found.length > 1) {
+    projectDiscoveryMatches.set(ownerWebContentsId, found);
+  } else {
+    projectDiscoveryMatches.delete(ownerWebContentsId);
+  }
+  return { matches: found, projectRoot, roots, timedOut: false, directoryLimitReached: false };
 }
 
 async function realPathOrParent(target) {
@@ -102,16 +307,41 @@ async function validateProjectRoot(ownerWebContentsId) {
 }
 
 function appendAudit(root, tool, target, result) {
+  const destination = auditDirectory || path.join(os.homedir(), '.ai-help-agent', 'developer-audit');
+  const rootKey = crypto.createHash('sha256').update(path.resolve(root)).digest('hex');
   return fs.appendFile(
-    path.join(root, '.dev-mode-audit.log'),
+    path.join(destination, `${rootKey}.jsonl`),
     `${new Date().toISOString()}\ttool=${tool}\ttarget=${JSON.stringify(target)}\tresult=${result}\n`,
     'utf8',
-  ).catch(() => {});
+  ).catch(async (error) => {
+    if (error.code !== 'ENOENT') {
+      console.error(`[DEVELOPER_AUDIT] Failed to append audit event: ${error.message}`);
+      return;
+    }
+    try {
+      await fs.mkdir(destination, { recursive: true });
+      await fs.appendFile(
+        path.join(destination, `${rootKey}.jsonl`),
+        `${new Date().toISOString()}\ttool=${tool}\ttarget=${JSON.stringify(target)}\tresult=${result}\n`,
+        'utf8',
+      );
+    } catch (writeError) {
+      console.error(`[DEVELOPER_AUDIT] Failed to initialize audit storage: ${writeError.message}`);
+    }
+  });
 }
 
 async function resolveProjectPath(relativePath = '.', ownerWebContentsId) {
   const root = await validateProjectRoot(ownerWebContentsId);
   return resolveWithinRoot(root, relativePath);
+}
+
+async function resolveProjectScope(ownerWebContentsId, relativePath = '.') {
+  const requested = String(relativePath || '.').trim() || '.';
+  const resolved = await resolveProjectPath(requested, ownerWebContentsId);
+  const stat = await fs.stat(resolved.target);
+  if (!stat.isDirectory()) throw new Error('Proposal scope must be a directory.');
+  return path.relative(resolved.root, resolved.target).replace(/\\/g, '/') || '.';
 }
 
 async function chooseProjectFolder(dialog, ownerWebContentsId) {
@@ -127,6 +357,7 @@ async function chooseProjectFolder(dialog, ownerWebContentsId) {
   }
   const selectedRoot = await fs.realpath(result.filePaths[0]);
   projectRoots.set(ownerWebContentsId, selectedRoot);
+  projectDiscoveryMatches.delete(ownerWebContentsId);
   return { canceled: false, projectRoot: selectedRoot };
 }
 
@@ -153,10 +384,18 @@ async function readFile(relativePath, ownerWebContentsId) {
   return result;
 }
 
-async function searchCode(query, ownerWebContentsId) {
+async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
   const normalizedQuery = typeof query === 'string' ? query.trim().toLowerCase() : '';
   if (!normalizedQuery) throw new Error('Search query is required.');
   const root = await validateProjectRoot(ownerWebContentsId);
+  let scope = String(relativeScope || '.').trim() || '.';
+  let scopeTarget = await resolveProjectPath(scope, ownerWebContentsId);
+  const scopeStat = await fs.stat(scopeTarget.target);
+  if (!scopeStat.isDirectory()) {
+    scope = path.dirname(scope);
+    scopeTarget = await resolveProjectPath(scope, ownerWebContentsId);
+    if (!(await fs.stat(scopeTarget.target)).isDirectory()) throw new Error('Search scope must be a directory.');
+  }
   const results = [];
   let filesVisited = 0;
 
@@ -204,7 +443,7 @@ async function searchCode(query, ownerWebContentsId) {
     }
   }
 
-  await walk('.');
+  await walk(scope);
   if (results.length === 0) {
     async function addPhpScope(relativeDirectory, depth = 0) {
       if (depth > 6 || results.length >= 40) return;
@@ -224,10 +463,10 @@ async function searchCode(query, ownerWebContentsId) {
         }
       }
     }
-    await addPhpScope('.');
+    await addPhpScope(scope);
   }
-  const result = { query, results, filesVisited, truncated: results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES };
-  await appendAudit(root, 'search_code', query, 'success');
+  const result = { query, scope, results, filesVisited, truncated: results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES };
+  await appendAudit(root, 'search_code', `${scope}:${query}`, 'success');
   return result;
 }
 
@@ -372,7 +611,10 @@ async function findChangedPhpFiles(root) {
 async function runVerification(script, ownerWebContentsId, options = {}) {
   const root = await validateProjectRoot(ownerWebContentsId);
   if (typeof script !== 'string' || !/^[a-z][a-z0-9:_-]{0,31}$/i.test(script)) throw new Error('Verification script name is invalid.');
-  const projectType = await detectProjectType(root);
+  const scope = await resolveProjectScope(ownerWebContentsId, options.scope || '.');
+  const scopedRoot = scope === '.' ? root : path.join(root, ...scope.split('/'));
+  const projectType = await detectProjectType(scopedRoot);
+  const rootProjectType = scope === '.' ? projectType : await detectProjectType(root);
   let phpCommand = null;
   if (projectType.type === 'php') {
     if (script === 'phpunit' && projectType.hasPhpUnitConfig
@@ -387,7 +629,7 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
         phpCommand = { executable: process.platform === 'win32' ? 'composer.bat' : 'composer', args: ['run-script', 'test'] };
       }
     } else if (script === 'php-lint') {
-      const changedFiles = await findChangedPhpFiles(root);
+      const changedFiles = (await findChangedPhpFiles(root)).filter((file) => scope === '.' || file.replace(/\\/g, '/').startsWith(`${scope}/`));
       if (!changedFiles.length) throw new Error('NOT_AVAILABLE (no changed PHP files available for syntax lint).');
       phpCommand = { executable: 'php', args: changedFiles.map((file) => ['-l', file]).flat(), lintFiles: changedFiles };
     }
@@ -421,7 +663,9 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
     await appendAudit(root, 'run_php_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
     const runtimeEvidence = ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options);
     const phpunitPath = process.platform === 'win32' ? 'vendor/bin/phpunit.bat' : 'vendor/bin/phpunit';
-    const reason = script === 'php-lint' && projectType.hasPhpUnitConfig && !await hasProjectExecutable(root, phpunitPath)
+    const reason = script === 'php-lint'
+      && (projectType.hasPhpUnitConfig || rootProjectType.hasPhpUnitConfig || projectType.composer || rootProjectType.composer)
+      && !await hasProjectExecutable(root, phpunitPath)
       ? 'PHPUnit is not installed for this project (vendor/bin/phpunit not found); php-lint fallback used.'
       : null;
     return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, reason, networkPolicy: NETWORK_POLICY, lintFiles: phpCommand.lintFiles };
@@ -558,12 +802,17 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
 
 async function getVerificationScripts(ownerWebContentsId, requested = []) {
   const root = await validateProjectRoot(ownerWebContentsId);
-  const projectType = await detectProjectType(root);
+  const scope = arguments.length > 2 ? await resolveProjectScope(ownerWebContentsId, arguments[2]) : '.';
+  const scopedRoot = scope === '.' ? root : path.join(root, ...scope.split('/'));
+  const projectType = await detectProjectType(scopedRoot);
   if (projectType.type === 'php') {
-    const composer = await readComposer(root, projectType.composer);
+    const rootProjectType = scope === '.' ? projectType : await detectProjectType(root);
+    const composer = await readComposer(scopedRoot, projectType.composer)
+      || await readComposer(root, rootProjectType.composer);
     const available = [];
     const phpunitPath = process.platform === 'win32' ? 'vendor/bin/phpunit.bat' : 'vendor/bin/phpunit';
-    const phpunitInstalled = projectType.hasPhpUnitConfig && await hasProjectExecutable(root, phpunitPath);
+    const phpunitInstalled = (projectType.hasPhpUnitConfig || rootProjectType.hasPhpUnitConfig)
+      && (await hasProjectExecutable(scopedRoot, phpunitPath) || await hasProjectExecutable(root, phpunitPath));
     if (phpunitInstalled) available.push('phpunit');
     if (typeof composer?.scripts?.test === 'string' && composer.scripts.test.trim()
       && !UNSAFE_SCRIPT_PATTERN.test(composer.scripts.test)) available.push('composer-test');
@@ -584,7 +833,9 @@ async function getVerificationScripts(ownerWebContentsId, requested = []) {
       missing,
       reason: unavailablePhpUnit
         ? 'PHPUnit is not installed for this project (vendor/bin/phpunit not found); using php-lint fallback.'
-        : scripts.length ? (missing.length ? `Verification checks are unavailable: ${missing.join(', ')}.` : null) : 'NOT_AVAILABLE (PHP verification tools/configuration unavailable).',
+        : scripts.length
+          ? (missing.length ? `Verification checks are unavailable: ${missing.join(', ')}.` : (scripts.includes('php-lint') && (projectType.composer || rootProjectType.composer) ? 'PHPUnit is not installed for this project (vendor/bin/phpunit not found); using php-lint fallback.' : null))
+          : 'NOT_AVAILABLE (PHP verification tools/configuration unavailable).',
     };
   }
   if (projectType.type !== 'node') {
@@ -618,12 +869,26 @@ async function getVerificationScripts(ownerWebContentsId, requested = []) {
 function clearProject(ownerWebContentsId) {
   if (ownerWebContentsId !== undefined) {
     projectRoots.delete(ownerWebContentsId);
+    projectDiscoveryMatches.delete(ownerWebContentsId);
   }
+}
+
+function configureAuditDirectory(directory) {
+  if (directory === null || directory === undefined) {
+    auditDirectory = null;
+    return;
+  }
+  if (typeof directory !== 'string' || !path.isAbsolute(directory)
+    || path.resolve(directory).toLowerCase() === path.parse(path.resolve(directory)).root.toLowerCase()) {
+    throw new TypeError('Developer audit storage must be an absolute non-sensitive application-data path.');
+  }
+  auditDirectory = path.resolve(directory);
 }
 
 function releaseProject(ownerWebContentsId) {
   if (ownerWebContentsId !== undefined) {
     projectRoots.delete(ownerWebContentsId);
+    projectDiscoveryMatches.delete(ownerWebContentsId);
   }
 }
 
@@ -637,8 +902,9 @@ function getProjectRoot(ownerWebContentsId = null) {
 
 module.exports = {
   chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit,
-  getVerificationScripts, resolveWithinRoot, clearProject, releaseProject,
+  getVerificationScripts, resolveWithinRoot, resolveProjectScope, clearProject, releaseProject,
   assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY, isSensitivePath,
+  discoverProjectByName, getProjectDiscoveryRoots, configureAuditDirectory,
   redactRuntimeValue, parseRuntimeFailure, mapRuntimeSource, classifyProjectSignals,
   PROJECT_MANIFESTS, VERIFICATION_PROFILES,
   detectProjectType,

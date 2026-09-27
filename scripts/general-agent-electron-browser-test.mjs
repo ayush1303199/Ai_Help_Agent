@@ -19,12 +19,36 @@ class FakeWindow {
       pageState: 'complete',
     };
     this.observationSources = [];
+    this.clickedElements = [];
+    this.interactiveElements = [{
+      id: 'continue',
+      name: '',
+      label: 'Continue',
+      ariaLabel: '',
+      placeholder: '',
+      innerText: 'Continue',
+      textContent: 'Continue',
+      disabled: false,
+      click: () => this.clickedElements.push('continue'),
+      getAttribute(name) {
+        if (name === 'aria-label') return this.ariaLabel;
+        if (name === 'placeholder') return this.placeholder;
+        if (name === 'aria-disabled') return 'false';
+        return null;
+      },
+      getClientRects: () => [{ width: 40, height: 20 }],
+    }];
     this.popupHandler = null;
     this.webContents = {
       setWindowOpenHandler: (handler) => { this.popupHandler = handler; },
       executeJavaScript: async (source) => {
+        if (source.includes('const normalizedRequest')) {
+          const document = {
+            querySelectorAll: () => this.interactiveElements,
+          };
+          return new Function('document', `return ${source}`)(document);
+        }
         new Function(source);
-        if (source.includes('const requested')) return true;
         this.observationSources.push(source);
         return this.nextObservation;
       },
@@ -71,7 +95,22 @@ assert.equal(FakeWindow.instances[0].observationSources.some((source) => /\.valu
 await adapter.observe(second);
 assert.notEqual(FakeWindow.instances[0].options.webPreferences.partition, FakeWindow.instances[1].options.webPreferences.partition);
 assert.deepEqual(FakeWindow.instances[0].popupHandler({ url: 'https://popup.example' }), { action: 'deny' });
-await adapter.click(first, { target: 'continue' });
+await adapter.click(first, { target: 'Click the continue button', label: 'CONTINUE' });
+assert.deepEqual(FakeWindow.instances[0].clickedElements, ['continue']);
+
+const duplicateLabel = {
+  ...FakeWindow.instances[0].interactiveElements[0],
+  id: 'continue-secondary',
+  click: () => FakeWindow.instances[0].clickedElements.push('continue-secondary'),
+};
+FakeWindow.instances[0].interactiveElements.push(duplicateLabel);
+await assert.rejects(
+  () => adapter.click(first, { target: ' continue ', label: 'Continue' }),
+  (error) => error.code === 'ELEMENT_NOT_FOUND',
+);
+assert.deepEqual(FakeWindow.instances[0].clickedElements, ['continue']);
+FakeWindow.instances[0].interactiveElements.pop();
+
 await adapter.screenshot(first);
 
 await assert.rejects(

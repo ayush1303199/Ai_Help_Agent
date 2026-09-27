@@ -8,6 +8,12 @@ interface AnsweredSegment {
   answer: string;
 }
 
+interface SavedTranscript {
+  id: string;
+  source: string;
+  text: string;
+}
+
 interface MeetingAssistantWorkspaceProps {
   sessionActive: boolean;
   meetingAudioMode: MeetingAudioMode;
@@ -24,6 +30,9 @@ interface MeetingAssistantWorkspaceProps {
   lastQuestion: string;
   lastAnswer: string;
   answeredSegments: AnsweredSegment[];
+  transcripts: SavedTranscript[];
+  transcriptSearch: string;
+  filteredTranscripts: SavedTranscript[];
   transcriptOpen: boolean;
   error: string;
   input: string;
@@ -40,6 +49,9 @@ interface MeetingAssistantWorkspaceProps {
   onReadScreen: () => void;
   screenReading: boolean;
   screenReadingEnabled: boolean;
+  onTranscriptSearchChange: (value: string) => void;
+  onUseTranscript: (transcript: SavedTranscript) => void;
+  onSaveTranscript: () => void;
 }
 
 const audioModeLabels: Record<MeetingAudioMode, string> = {
@@ -64,6 +76,9 @@ export function MeetingAssistantWorkspace({
   lastQuestion,
   lastAnswer,
   answeredSegments,
+  transcripts,
+  transcriptSearch,
+  filteredTranscripts,
   transcriptOpen,
   error,
   input,
@@ -80,6 +95,9 @@ export function MeetingAssistantWorkspace({
   onReadScreen,
   screenReading,
   screenReadingEnabled,
+  onTranscriptSearchChange,
+  onUseTranscript,
+  onSaveTranscript,
 }: MeetingAssistantWorkspaceProps) {
   if (!sessionActive) {
     return (
@@ -100,13 +118,29 @@ export function MeetingAssistantWorkspace({
     <section className="flex flex-1 flex-col">
       {meetingMenuOpen && <div className="mb-4 rounded-xl border border-slate-700 bg-slate-900 p-4 text-xs"><div className="flex justify-between"><span className="text-slate-400">Audio source</span><span>{audioModeLabels[meetingAudioMode]}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Device</span><span className="max-w-[14rem] truncate">{displayedAudioSourceLabel}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Audio status</span><span>{displayedAudioStatus}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">Microphone</span><span className={microphoneStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}>{microphoneStatus === 'connected' ? 'ON' : 'OFF'}</span></div><div className="mt-2 flex justify-between"><span className="text-slate-400">System audio</span><span className={systemAudioStatus === 'connected' ? 'text-emerald-300' : 'text-slate-500'}>{systemAudioStatus === 'connected' ? 'ON' : 'OFF'}</span></div>{isRecording || isTranscribing ? <button type="button" onClick={onStopCapture} className="mt-3 rounded-lg border border-slate-600 px-3 py-2 text-slate-300 hover:border-rose-400">Stop Listening</button> : <button type="button" onClick={onStartCapture} className="mt-3 rounded-lg border border-emerald-500/40 px-3 py-2 text-emerald-300 hover:border-emerald-400">Start Listening</button>}</div>}
       <div className="mb-5 text-center"><p className={`text-sm font-medium ${statusTone}`}>● {statusLabel}</p><p className="mt-2 text-xs text-slate-500">{pipelineStatus === 'listening' ? 'Listening for a question' : pipelineStatus === 'thinking' ? 'Generating answer...' : 'Your answer will appear below'}</p></div>
-      <div className="mb-4"><p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-slate-500">Last heard</p><p className="truncate text-sm text-slate-300">{liveTranscript || 'Waiting for speech...'}</p></div>
+      <div className="mb-4 flex items-end justify-between gap-3"><div className="min-w-0"><p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-slate-500">Last heard</p><p className="truncate text-sm text-slate-300">{liveTranscript || 'Waiting for speech...'}</p></div>{liveTranscript && <button type="button" onClick={onSaveTranscript} className="shrink-0 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:bg-emerald-500/10">Save transcript</button>}</div>
       <AnswerSessionView lastQuestion={lastQuestion} lastAnswer={lastAnswer} isThinking={pipelineStatus === 'thinking'} answeredSegments={answeredSegments} />
       <div className="mt-4 flex items-center justify-between"><button type="button" onClick={onTranscriptToggle} className="text-xs text-emerald-300 hover:text-emerald-200">{transcriptOpen ? 'Hide full transcript' : 'View full transcript'}</button>{isRecording || isTranscribing ? <button type="button" onClick={onStopCapture} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-rose-400">Stop Listening</button> : <button type="button" onClick={onStartCapture} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:border-emerald-400">Start Listening</button>}</div>
-      {transcriptOpen && <div className="mt-3 max-h-48 overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">{liveTranscript || 'No transcript captured yet.'}</div>}
+      {transcriptOpen && (
+        <div className="mt-3 space-y-3 rounded-xl border border-slate-700 bg-slate-900 p-4">
+          <p className="text-sm leading-relaxed text-slate-300">{liveTranscript || 'No transcript captured yet.'}</p>
+          {transcripts.length > 0 && (
+            <div className="border-t border-slate-800 pt-3">
+              <input value={transcriptSearch} onChange={(event) => onTranscriptSearchChange(event.target.value)} placeholder="Search saved transcripts" aria-label="Search saved transcripts" className="mb-2 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-200 outline-none" />
+              <div className="max-h-40 space-y-1 overflow-y-auto">
+                {filteredTranscripts.map((transcript) => (
+                  <button type="button" key={transcript.id} onClick={() => onUseTranscript(transcript)} className="block w-full rounded-md px-2 py-1.5 text-left text-xs text-slate-300 hover:bg-slate-800">
+                    <span className="text-emerald-300">{transcript.source}</span> {transcript.text}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       <ScreenReadingButton chatStreaming={chatStreaming} onReadScreen={onReadScreen} screenReading={screenReading} enabled={screenReadingEnabled} />
       {error && <div className="mt-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-300"><AlertCircle className="mr-2 inline h-4 w-4" />{error}</div>}
-      <div className="mt-5 flex gap-2"><input value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSendMessage(); } }} placeholder="Ask a text question..." className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-emerald-400" /><button onClick={onSendMessage} disabled={!input.trim() || chatStreaming} className="rounded-lg bg-emerald-500 px-4 text-sm font-medium text-slate-950 disabled:opacity-40">Send</button></div>
+      <div className="mt-5 flex gap-2"><input value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSendMessage(); } }} placeholder="Ask the assistant..." className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-emerald-400" /><button type="button" onClick={onSendMessage} disabled={!input.trim() || chatStreaming} className="rounded-lg bg-emerald-500 px-4 text-sm font-medium text-slate-950 disabled:opacity-40">Send</button></div>
     </section>
   );
 }

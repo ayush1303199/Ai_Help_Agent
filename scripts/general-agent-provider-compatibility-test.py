@@ -6,6 +6,58 @@ import index  # noqa: E402
 
 
 def main():
+    content_message = index._message_dict(
+        SimpleNamespace(role="assistant", content="Standard answer.", reasoning_content="hidden alternate")
+    )
+    normalized_content = index._normalize_message_text(content_message)
+    assert normalized_content["content"] == "Standard answer."
+    assert "_content_source" not in normalized_content
+
+    reasoning_message = index._message_dict(
+        SimpleNamespace(role="assistant", content=None, reasoning_content="Fallback answer.")
+    )
+    normalized_reasoning = index._normalize_message_text(reasoning_message)
+    assert not normalized_reasoning.get("content")
+    assert "_content_source" not in normalized_reasoning
+
+    model_reasoning_message = index._normalize_message_text(
+        {"role": "assistant", "reasoning": "Alternate field captured in the live trace."}
+    )
+    assert not model_reasoning_message.get("content")
+    assert "_content_source" not in model_reasoning_message
+
+    alternate_final_message = index._normalize_message_text(
+        {"role": "assistant", "content": None, "output_text": "Final answer."}
+    )
+    assert alternate_final_message["content"] == "Final answer."
+    assert alternate_final_message["_content_source"] == "output_text"
+    text_final_message = index._normalize_message_text(
+        {"role": "assistant", "content": "", "text": "Text-field final answer."}
+    )
+    assert text_final_message["content"] == "Text-field final answer."
+    assert text_final_message["_content_source"] == "text"
+
+    tool_message = index._normalize_message_text({
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "call-1"}],
+        "reasoning_content": "not a user-facing answer",
+    })
+    assert tool_message["content"] is None
+    assert tool_message["tool_calls"] == [{"id": "call-1"}]
+
+    empty_message = index._normalize_message_text({"role": "assistant", "content": None})
+    assert not empty_message.get("content")
+    assert index._message_shape({
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": "secret answer text",
+    }) == {
+        "fields": ["content", "reasoning_content", "role"],
+        "roleLength": 9,
+        "reasoning_contentLength": 18,
+    }
+
     primary = SimpleNamespace(
         id="primary",
         type="cohere",
@@ -142,7 +194,76 @@ def main():
         assert message["content"] == "Recovered after retry."
         assert len(retry_calls) == 2, "transient provider failures must receive one bounded retry"
 
-        print('{"runtime":"general-agent-provider-compatibility","classification":true,"boundedFallback":true,"configurationPreserved":true}')
+        class AlternateCompletions:
+            def create(self, **_request):
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(
+                        role="assistant",
+                        content=None,
+                        output_text="Recovered from final-text response field.",
+                    ))]
+                )
+
+        class AlternateClient:
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=AlternateCompletions())
+
+        index.OpenAI = AlternateClient
+        message, selected = index.complete_model(
+            [{"role": "user", "content": "Test final-text response normalization."}],
+            request_id="provider-final-text-content-test",
+        )
+        assert selected.id == "retry-provider"
+        assert message["content"] == "Recovered from final-text response field."
+        assert "_content_source" not in message
+
+        class ReasoningOnlyCompletions:
+            def create(self, **_request):
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(
+                        role="assistant",
+                        content=None,
+                        reasoning_content="This must not be exposed as an answer.",
+                    ))]
+                )
+
+        class ReasoningOnlyClient:
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=ReasoningOnlyCompletions())
+
+        index.OpenAI = ReasoningOnlyClient
+        try:
+            index.complete_model(
+                [{"role": "user", "content": "Test reasoning-only provider response."}],
+                request_id="provider-reasoning-only-test",
+            )
+        except index.HTTPException as error:
+            assert "neither text nor tool calls" in str(error)
+        else:
+            raise AssertionError("reasoning-only provider response must not be exposed as answer text")
+
+        class EmptyCompletions:
+            def create(self, **_request):
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(role="assistant", content=None))]
+                )
+
+        class EmptyClient:
+            def __init__(self, **_kwargs):
+                self.chat = SimpleNamespace(completions=EmptyCompletions())
+
+        index.OpenAI = EmptyClient
+        try:
+            index.complete_model(
+                [{"role": "user", "content": "Test empty provider response."}],
+                request_id="provider-empty-content-test",
+            )
+        except index.HTTPException as error:
+            assert "neither text nor tool calls" in str(error)
+        else:
+            raise AssertionError("an entirely empty provider response must raise a clear error")
+
+        print('{"runtime":"general-agent-provider-compatibility","contentPreserved":true,"finalTextFallback":true,"reasoningFieldsHidden":true,"toolCalls":true,"emptyResponseError":true,"multiProviderFallback":true,"boundedRetry":true}')
     finally:
         index.provider_candidates = original["provider_candidates"]
         index.get_api_key = original["get_api_key"]

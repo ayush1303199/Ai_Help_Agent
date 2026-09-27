@@ -13,6 +13,14 @@ from datetime import datetime
 from enum import Enum
 import hashlib
 import uuid
+import re
+import os
+from provider_service import classify_provider_error, redact_provider_error
+from provider_model_contract import (
+    ProviderModelConfigurationError,
+    provider_model_error,
+    provider_model_is_valid,
+)
 
 
 class ProviderStatus(str, Enum):
@@ -29,6 +37,7 @@ class ProviderStatus(str, Enum):
     CAPACITY_ERROR = "CAPACITY_ERROR"       # Provider capacity exceeded
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE" # Requested model not available
     SELF_TEST_FAILED = "SELF_TEST_FAILED"   # Self-test failure
+    CONFIGURATION_INVALID = "CONFIGURATION_INVALID" # Provider/model pair needs repair
 
 
 class RegistryState(str, Enum):
@@ -54,6 +63,7 @@ class ProviderInstance:
         label: str = "",
         last_checked_at: Optional[str] = None,
         failure_category: Optional[str] = None,
+        failure_diagnostic: Optional[Dict[str, Any]] = None,
     ):
         self.id = provider_id
         self.type = provider_type
@@ -66,6 +76,8 @@ class ProviderInstance:
         self.label = label or provider_type.capitalize()
         self.last_checked_at = last_checked_at
         self.failure_category = failure_category
+        self.failure_diagnostic = dict(failure_diagnostic) if failure_diagnostic else None
+        self.configuration_error: Optional[Dict[str, str]] = None
 
     def to_dict(self, include_api_key: bool = False) -> Dict[str, Any]:
         """Serialize to dict. Never includes actual API key."""
@@ -84,6 +96,20 @@ class ProviderInstance:
         }
         if self.failure_category:
             result["failureCategory"] = self.failure_category
+        if self.failure_diagnostic:
+            result["failureCategory"] = self.failure_diagnostic["category"]
+            result["failureDetails"] = dict(self.failure_diagnostic)
+        elif self.status == ProviderStatus.UNCONFIGURED and not self.has_api_key:
+            result["failureCategory"] = "INVALID_OR_MISSING_KEY"
+            result["failureDetails"] = {
+                "category": "INVALID_OR_MISSING_KEY",
+                "statusCode": None,
+                "reason": "No API key is available to this backend process. Re-enter and save the provider key.",
+                "rawMessage": "",
+            }
+        result["configurationValid"] = self.configuration_error is None
+        if self.configuration_error:
+            result["configurationError"] = dict(self.configuration_error)
         return result
 
     @staticmethod
@@ -101,6 +127,7 @@ class ProviderInstance:
             label=data.get("label", data["type"].capitalize()),
             last_checked_at=data.get("lastCheckedAt"),
             failure_category=data.get("failureCategory"),
+            failure_diagnostic=data.get("failureDetails"),
         )
 
 
@@ -155,6 +182,14 @@ class ProviderRegistry:
                     first_enabled.enabled = True
                     if not self.active_provider_id:
                         self.active_provider_id = first_enabled.id
+
+            active = self.providers.get(self.active_provider_id or "")
+            if (
+                not active
+                or not active.enabled
+                or not provider_model_is_valid(active.type, active.model, active.base_url)
+            ):
+                self.active_provider_id = self._next_active_provider_id()
             
             self.state = RegistryState.READY
         except Exception as e:
@@ -197,12 +232,30 @@ class ProviderRegistry:
                 provider_data["hasApiKey"] = bool(provider_data.get("hasApiKey", False))
 
                 provider = ProviderInstance.from_dict(provider_data)
+                configuration_error = provider_model_error(
+                    provider.type,
+                    provider.model,
+                    provider.base_url,
+                )
+                if configuration_error:
+                    provider.configuration_error = configuration_error
+                    provider.status = ProviderStatus.CONFIGURATION_INVALID
+                    provider.failure_category = configuration_error["code"]
+                    print(json.dumps({
+                        "event": "provider_configuration_invalid",
+                        "providerId": provider.type,
+                        "modelId": provider.model,
+                        "errorCode": configuration_error["code"],
+                        "instanceId": provider.id,
+                    }))
                 if provider.id not in self.providers:
                     self.providers[provider.id] = provider
 
             self.active_provider_id = data.get("activeProvider")
             if self.active_provider_id and self.active_provider_id not in self.providers:
-                self.active_provider_id = next(iter(self.providers.keys())) if self.providers else None
+                active = self.providers.get(self.active_provider_id or "")
+                if not active or not active.enabled or not provider_model_is_valid(active.type, active.model, active.base_url):
+                    self.active_provider_id = self._next_active_provider_id()
             self.fallback_enabled = data.get("fallbackEnabled", True)
             self.stt_provider_id = data.get("sttProvider")
         except Exception as e:
@@ -272,41 +325,20 @@ class ProviderRegistry:
         return f"{provider_type.lower()}-{url_hash}"
 
     def _deduplicate(self) -> None:
-        """
-        Remove duplicate providers.
-        
-        Duplicates detected by:
-        - Same type + base URL + model
-        
-        Keep the one with the highest priority, or the first one if priorities match.
-        """
-        seen: Dict[str, str] = {}  # (type, base_url, model) -> provider_id
-        duplicates: List[str] = []
-        
-        for provider_id, provider in sorted(
-            self.providers.items(),
-            key=lambda x: -x[1].priority  # Sort by priority desc (higher priority first)
-        ):
-            key = (provider.type.lower(), provider.base_url.lower(), provider.model.lower())
-            key_str = f"{key[0]}:{key[1]}:{key[2]}"
-            
-            if key_str in seen:
-                # This is a duplicate
-                duplicates.append(provider_id)
-            else:
-                seen[key_str] = provider_id
-        
-        # Remove duplicates
-        for dup_id in duplicates:
-            print(f"Removing duplicate provider: {dup_id}")
-            del self.providers[dup_id]
-        
-        # Update active provider if it was removed
+        """Normalize ordering without collapsing distinct provider instances."""
+        self.normalize_priorities()
         if self.active_provider_id and self.active_provider_id not in self.providers:
-            self.active_provider_id = next(iter(self.providers.keys())) if self.providers else None
+            self.active_provider_id = self._next_active_provider_id()
+
+    def normalize_priorities(self) -> None:
+        """Keep provider order deterministic and priorities contiguous."""
+        ordered = sorted(self.providers.values(), key=lambda p: (p.priority, p.id))
+        for index, provider in enumerate(ordered, start=1):
+            provider.priority = index
 
     def save_to_file(self) -> None:
         """Persist provider configuration to file."""
+        temporary_path = self.config_path.with_suffix(f"{self.config_path.suffix}.{uuid.uuid4().hex}.tmp")
         try:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
             
@@ -324,10 +356,17 @@ class ProviderRegistry:
                 "lastModifiedAt": datetime.now().isoformat(),
             }
             
-            with open(self.config_path, 'w') as f:
+            with open(temporary_path, 'w', encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, self.config_path)
         except Exception as e:
-            print(f"Error saving provider config to {self.config_path}: {e}")
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RuntimeError(f"Error saving provider config to {self.config_path}.") from e
 
     def add_provider(
         self,
@@ -337,56 +376,74 @@ class ProviderRegistry:
         api_key: str,
         label: Optional[str] = None,
         priority: Optional[int] = None,
+        provider_id: Optional[str] = None,
+        create_new: bool = False,
+        enabled: Optional[bool] = None,
     ) -> ProviderInstance:
-        """Add or update a provider."""
-        # Check for existing provider with same type
-        existing = self._find_provider_by_type(provider_type)
+        """Add a provider instance, or update the instance identified by provider_id."""
+        configuration_error = provider_model_error(provider_type, model, base_url)
+        if configuration_error:
+            raise ProviderModelConfigurationError(configuration_error)
+        if priority is not None and priority < 1:
+            raise ValueError("Provider priority must be positive.")
+
+        existing = self.providers.get(provider_id or "")
+        if provider_id and not existing and not create_new:
+            raise ValueError("Provider instance not found.")
+        if not provider_id and not create_new:
+            existing = self._find_provider_by_type(provider_type)
 
         if existing:
-            # Update existing
+            if existing.type.lower() != provider_type.lower():
+                raise ValueError("A provider instance cannot change its adapter type.")
             existing.model = model
             existing.base_url = base_url
-            existing.has_api_key = bool(api_key)
+            existing.has_api_key = bool(api_key) or bool(self._runtime_api_keys.get(existing.id))
             if api_key:
                 self._runtime_api_keys[existing.id] = api_key
             existing.label = label or existing.label
-            existing.enabled = True
-            existing.status = ProviderStatus.CONFIGURED if api_key else ProviderStatus.UNCONFIGURED
-            if self.active_provider_id is None:
+            if enabled is not None:
+                existing.enabled = enabled
+            existing.status = ProviderStatus.CONFIGURED if existing.has_api_key else ProviderStatus.UNCONFIGURED
+            existing.configuration_error = None
+            existing.failure_category = None
+            existing.failure_diagnostic = None
+            if existing.enabled and self.active_provider_id is None:
                 self.active_provider_id = existing.id
             return existing
-        else:
-            # Create new
-            stable_id = self._generate_stable_id(provider_type, base_url)
-            new_priority = priority or (max((p.priority for p in self.providers.values()), default=0) + 1)
 
-            provider = ProviderInstance(
-                provider_id=stable_id,
-                provider_type=provider_type,
-                model=model,
-                base_url=base_url,
-                has_api_key=bool(api_key),
-                enabled=True,
-                priority=new_priority,
-                label=label or provider_type.capitalize(),
-                status=ProviderStatus.CONFIGURED if api_key else ProviderStatus.UNCONFIGURED,
-            )
+        # New UI-created instances need unique IDs even when adapter, endpoint,
+        # model, and label match another configured instance.
+        stable_id = provider_id or f"{provider_type.lower()}-{uuid.uuid4().hex}"
+        if stable_id in self.providers:
+            raise ValueError("Provider instance ID is already in use.")
+        new_priority = priority or (max((p.priority for p in self.providers.values()), default=0) + 1)
 
-            self.providers[provider.id] = provider
-            if api_key:
-                self._runtime_api_keys[provider.id] = api_key
-
-            # Set as active if first provider
-            if not self.active_provider_id:
-                self.active_provider_id = provider.id
-
-            return provider
+        provider = ProviderInstance(
+            provider_id=stable_id,
+            provider_type=provider_type,
+            model=model,
+            base_url=base_url,
+            has_api_key=bool(api_key),
+            enabled=True if enabled is None else enabled,
+            priority=new_priority,
+            label=label or provider_type.capitalize(),
+            status=ProviderStatus.CONFIGURED if api_key else ProviderStatus.UNCONFIGURED,
+        )
+        self.providers[provider.id] = provider
+        if api_key:
+            self._runtime_api_keys[provider.id] = api_key
+        if not self.active_provider_id and provider.enabled:
+            self.active_provider_id = provider.id
+        self.normalize_priorities()
+        return provider
 
     def update_provider_status(
         self,
         provider_id: str,
         status: ProviderStatus,
         failure_category: Optional[str] = None,
+        failure_diagnostic: Optional[Dict[str, Any]] = None,
     ) -> Optional[ProviderInstance]:
         """Update provider status (e.g., after self-test or error)."""
         if provider_id not in self.providers:
@@ -394,7 +451,48 @@ class ProviderRegistry:
         
         provider = self.providers[provider_id]
         provider.status = status
-        provider.failure_category = failure_category
+        if failure_diagnostic and status not in {
+            ProviderStatus.READY,
+            ProviderStatus.CONFIGURED,
+            ProviderStatus.ENABLED,
+            ProviderStatus.CHECKING,
+            ProviderStatus.UNCONFIGURED,
+        }:
+            diagnostic = dict(failure_diagnostic)
+            diagnostic["rawMessage"] = redact_provider_error(
+                diagnostic.get("rawMessage", ""),
+                tuple(filter(None, (
+                    self._runtime_api_keys.get(provider_id, ""),
+                    os.getenv(f"{provider.type.upper()}_API_KEY", "").strip(),
+                ))),
+            )
+            provider.failure_diagnostic = diagnostic
+            provider.failure_category = str(diagnostic.get("category") or failure_category or "UNKNOWN")
+        elif failure_category and status not in {
+            ProviderStatus.READY,
+            ProviderStatus.CONFIGURED,
+            ProviderStatus.ENABLED,
+            ProviderStatus.CHECKING,
+            ProviderStatus.UNCONFIGURED,
+        }:
+            status_match = re.search(r"\bHTTP\s+(\d{3})\b", failure_category, re.IGNORECASE)
+            status_code = int(status_match.group(1)) if status_match else None
+            secret_values = tuple(filter(None, (
+                self._runtime_api_keys.get(provider_id, ""),
+                os.getenv(f"{provider.type.upper()}_API_KEY", "").strip(),
+            )))
+            diagnostic = classify_provider_error(status_code, failure_category, secret_values)
+            provider.failure_diagnostic = diagnostic
+            provider.failure_category = diagnostic["category"]
+        else:
+            provider.failure_category = failure_category
+            if status in {
+                ProviderStatus.READY,
+                ProviderStatus.CONFIGURED,
+                ProviderStatus.ENABLED,
+                ProviderStatus.UNCONFIGURED,
+            }:
+                provider.failure_diagnostic = None
         provider.last_checked_at = datetime.now().isoformat()
         
         return provider
@@ -406,6 +504,14 @@ class ProviderRegistry:
         
         provider = self.providers[provider_id]
         provider.enabled = enabled
+        if not enabled and self.active_provider_id == provider_id:
+            self.active_provider_id = self._next_active_provider_id()
+        elif (
+            enabled
+            and self.active_provider_id not in self.providers
+            and provider_model_is_valid(provider.type, provider.model, provider.base_url)
+        ):
+            self.active_provider_id = provider_id
         
         return provider
 
@@ -416,16 +522,37 @@ class ProviderRegistry:
         
         del self.providers[provider_id]
         self._runtime_api_keys.pop(provider_id, None)
+        self.normalize_priorities()
+        if self.stt_provider_id == provider_id:
+            self.stt_provider_id = None
         
-        # Update active provider if deleted
-        if self.active_provider_id == provider_id:
-            self.active_provider_id = next(iter(self.providers.keys())) if self.providers else None
+        if self.active_provider_id == provider_id or self.active_provider_id not in self.providers:
+            self.active_provider_id = self._next_active_provider_id()
         
         return True
 
     def get_api_key(self, provider_id: str) -> str:
         """Return a provider secret held only in the current process."""
         return self._runtime_api_keys.get(provider_id, "")
+
+    def set_api_key(self, provider_id: str, api_key: str) -> bool:
+        """Update an instance's in-memory credential without persisting it."""
+        provider = self.providers.get(provider_id)
+        if not provider:
+            return False
+        key = api_key.strip()
+        if not key:
+            return False
+        self._runtime_api_keys[provider_id] = key
+        provider.has_api_key = True
+        if provider.configuration_error:
+            provider.status = ProviderStatus.CONFIGURATION_INVALID
+            provider.failure_category = provider.configuration_error["code"]
+        else:
+            provider.status = ProviderStatus.CONFIGURED
+            provider.failure_category = None
+        provider.failure_diagnostic = None
+        return True
 
     def get_provider(self, provider_id: str) -> Optional[ProviderInstance]:
         """Get a provider by ID."""
@@ -436,23 +563,25 @@ class ProviderRegistry:
         return sorted(self.providers.values(), key=lambda p: p.priority)
 
     def get_active_provider(self) -> Optional[ProviderInstance]:
-        """Get the currently active provider."""
-        if self.active_provider_id and self.active_provider_id in self.providers:
-            return self.providers[self.active_provider_id]
-        
-        # Fallback: get first enabled provider
-        for provider in sorted(self.providers.values(), key=lambda p: p.priority):
-            if provider.enabled:
-                self.active_provider_id = provider.id
-                return provider
-        
-        # Last resort: get first provider
-        if self.providers:
-            first = next(iter(self.providers.values()))
-            self.active_provider_id = first.id
-            return first
-        
-        return None
+        """Return the selected provider, switching away from disabled or invalid entries."""
+        selected = self.providers.get(self.active_provider_id or "")
+        if selected and selected.enabled and provider_model_is_valid(selected.type, selected.model, selected.base_url):
+            return selected
+
+        self.active_provider_id = self._next_active_provider_id()
+        return self.providers.get(self.active_provider_id or "")
+
+    def _next_active_provider_id(self) -> Optional[str]:
+        """Choose the highest-priority eligible provider, independent of insertion order."""
+        eligible = self.get_eligible_providers()
+        if eligible:
+            return eligible[0].id
+
+        configured = [
+            provider for provider in self.get_all_providers()
+            if provider.enabled and provider_model_is_valid(provider.type, provider.model, provider.base_url)
+        ]
+        return configured[0].id if configured else None
 
     def get_eligible_providers(self) -> List[ProviderInstance]:
         """
@@ -462,12 +591,17 @@ class ProviderRegistry:
         """
         return [
             p for p in self.get_all_providers()
-            if p.has_api_key and p.enabled
+            if p.has_api_key and p.enabled and provider_model_is_valid(p.type, p.model, p.base_url)
         ]
 
     def set_active_provider(self, provider_id: str) -> bool:
-        """Set the active provider."""
-        if provider_id not in self.providers:
+        """Select only enabled, valid provider instances."""
+        provider = self.providers.get(provider_id)
+        if (
+            not provider
+            or not provider.enabled
+            or not provider_model_is_valid(provider.type, provider.model, provider.base_url)
+        ):
             return False
         
         self.active_provider_id = provider_id
@@ -475,12 +609,17 @@ class ProviderRegistry:
 
     def reorder_providers(self, provider_ids: List[str]) -> bool:
         """Reorder providers by priority."""
-        # Verify all IDs exist
-        if not all(pid in self.providers for pid in provider_ids):
+        if (
+            len(provider_ids) != len(self.providers)
+            or len(set(provider_ids)) != len(provider_ids)
+            or set(provider_ids) != set(self.providers)
+        ):
             return False
         
         for index, provider_id in enumerate(provider_ids):
             self.providers[provider_id].priority = index + 1
+
+        self.active_provider_id = self._next_active_provider_id()
         
         return True
 

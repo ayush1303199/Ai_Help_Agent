@@ -20,6 +20,7 @@ ignoreBrokenOutputPipe(process.stdout);
 ignoreBrokenOutputPipe(process.stderr);
 
 const isDev = !app.isPackaged;
+developerFiles.configureAuditDirectory(path.join(app.getPath('userData'), 'developer-audit'));
 let backendProcess = null;
 let isQuitting = false;
 let mainWindow = null;
@@ -107,8 +108,8 @@ function isPortOpen(port) {
 
 async function startPackagedBackend() {
   if (isDev || backendProcess) return;
-  const [httpReady, websocketReady] = await Promise.all([isPortOpen(3001), isPortOpen(3002)]);
-  if (httpReady && websocketReady) return;
+  const [httpReady, websocketReady, codingWebsocketReady] = await Promise.all([isPortOpen(3001), isPortOpen(3002), isPortOpen(3003)]);
+  if (httpReady && websocketReady && codingWebsocketReady) return;
   const backendExecutable = process.platform === 'win32'
     ? path.join(process.resourcesPath, 'backend', 'ai-help-agent-backend.exe')
     : path.join(process.resourcesPath, 'backend', 'ai-help-agent-backend');
@@ -126,6 +127,7 @@ async function startPackagedBackend() {
   });
   await waitForPort(3001);
   await waitForPort(3002);
+  await waitForPort(3003);
 }
 
 function isPlainObject(value) {
@@ -525,6 +527,13 @@ function assertTrustedOverlaySender(event) {
   if (!isMainRenderer && !isOverlayRenderer) {
     throw new Error('Unauthorized overlay IPC sender.');
   }
+
+  function assertTrustedMainRendererSender(event) {
+    const sender = event?.sender;
+    if (!mainWindow || mainWindow.isDestroyed() || sender !== mainWindow.webContents) {
+      throw new Error('This action is only available from the main AI Help Agent window.');
+    }
+  }
 }
 
 function createWindow() {
@@ -748,6 +757,22 @@ app.whenReady().then(async () => {
     }
     return developerFiles.chooseProjectFolder(dialog, event.sender.id);
   });
+  ipcMain.handle('developer:discover-project', async (event, payload) => {
+    developerAgent.getSession(event.sender.id);
+    const projectName = typeof payload?.projectName === 'string' ? payload.projectName.trim() : '';
+    const result = await developerFiles.discoverProjectByName(projectName, event.sender.id);
+    if (result.timedOut || result.directoryLimitReached) {
+      throw new Error(
+        `Project discovery for '${projectName}' stopped at its safety limit while searching [${result.roots.join(', ')}]. Use Advanced > Select folder to choose it directly.`,
+      );
+    }
+    if (!result.matches.length) {
+      throw new Error(
+        `Project '${projectName}' was not found in [${result.roots.join(', ')}]. Use Advanced > Select folder to choose it directly.`,
+      );
+    }
+    return { matches: result.matches, projectRoot: result.projectRoot };
+  });
   ipcMain.handle('developer:clear-project', (event) => {
     developerAgent.getSession(event.sender.id);
     const currentRoot = developerFiles.getProjectRoot(event.sender.id);
@@ -765,14 +790,39 @@ app.whenReady().then(async () => {
     developerAgent.getSession(event.sender.id);
     return developerFiles.readFile(relativePath, event.sender.id);
   });
-  ipcMain.handle('developer:search-code', (event, query) => {
+  ipcMain.handle('developer:search-code', (event, payload) => {
     developerAgent.getSession(event.sender.id);
-    return developerFiles.searchCode(query, event.sender.id);
+    const query = typeof payload === 'string' ? payload : payload?.query;
+    const scope = typeof payload === 'string' ? '.' : payload?.scope;
+    return developerFiles.searchCode(query, event.sender.id, scope);
   });
   const ownedDeveloperSession = (event) => {
     const sessionId = developerAgent.getSession(event.sender.id);
     return { sessionId, ownerWebContentsId: event.sender.id };
   };
+  ipcMain.handle('developer:conversation-start', async (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
+    const scope = await developerFiles.resolveProjectScope(event.sender.id, payload?.scope || '.');
+    const turn = developerAgent.beginConversationTurn({
+      root,
+      scope,
+      request: payload?.request,
+      ...owner,
+    });
+    return { ...turn, projectRoot: root, scope };
+  });
+  ipcMain.handle('developer:conversation-update', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const allowedRendererStates = new Set(['understanding', 'completed', 'failed', 'cancelled']);
+    if (!allowedRendererStates.has(payload?.state)) throw new Error('Unsupported Coding conversation lifecycle update.');
+    return developerAgent.advanceConversationTurn(payload?.turnId, payload.state, owner, {
+      phase: payload.phase,
+      fileCount: Number.isInteger(payload.fileCount) ? payload.fileCount : undefined,
+    });
+  });
   ipcMain.handle('developer:index', async (event) => {
     ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
@@ -814,14 +864,103 @@ app.whenReady().then(async () => {
     developerFiles.assertProjectOwner(event.sender.id);
     const query = payload?.query;
     const currentRoot = developerFiles.getProjectRoot(event.sender.id);
-    const search = await developerFiles.searchCode(query, event.sender.id);
+    const search = await developerFiles.searchCode(query, event.sender.id, payload?.scope);
+    const normalizedScope = String(payload?.scope || '.').replace(/\\/g, '/').replace(/^\.\/+|\/+$/g, '');
     const cached = currentRoot ? developerIndexCaches.get(currentRoot) || null : null;
     const nextIndex = currentRoot ? await developerIndex.buildIndex(currentRoot, cached && cached.root === currentRoot ? cached : null) : null;
     if (currentRoot) developerIndexCaches.set(currentRoot, nextIndex);
     const symbols = nextIndex
-      ? developerIndex.searchSymbols(nextIndex, query).slice(0, 50)
+      ? developerIndex.searchSymbols(nextIndex, query)
+        .filter((item) => !normalizedScope || String(item.path || '').replace(/\\/g, '/').startsWith(`${normalizedScope}/`))
+        .slice(0, 50)
       : [];
     return developerContext.assembleContext({ root: currentRoot, query, results: [...search.results, ...symbols], maxTokens: payload?.maxTokens });
+  });
+  ipcMain.handle('developer:tool', async (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const name = String(payload?.name || '');
+    const args = payload?.args;
+    if (!isPlainObject(args)) throw new TypeError('Coding Agent tool arguments must be an object.');
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    const scope = await developerFiles.resolveProjectScope(event.sender.id, payload?.scope || '.');
+    const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
+    const normalizeScopedPath = (requestedPath, expectedType) => {
+      if (typeof requestedPath !== 'string' || requestedPath.length > 512 || path.isAbsolute(requestedPath)) {
+        throw new TypeError('Coding Agent tool path must be a bounded relative path.');
+      }
+      const clean = requestedPath.replace(/\\/g, '/').trim() || '.';
+      if (clean.split('/').includes('..')) throw new Error('Coding Agent tool path traversal is denied.');
+      const scopePath = path.resolve(root, scope);
+      const requested = path.resolve(root, clean === '.' ? scope : clean.startsWith(`${scope}/`) || scope === '.' ? clean : path.join(scope, clean));
+      const relativeToScope = path.relative(scopePath, requested);
+      if (relativeToScope === '..' || relativeToScope.startsWith(`..${path.sep}`) || path.isAbsolute(relativeToScope)) {
+        throw new Error('Coding Agent tool path is outside the selected scope.');
+      }
+      const relativeToRoot = path.relative(root, requested);
+      if (relativeToRoot === '..' || relativeToRoot.startsWith(`..${path.sep}`) || path.isAbsolute(relativeToRoot)) {
+        throw new Error('Coding Agent tool path is outside the selected project.');
+      }
+      return relativeToRoot.replace(/\\/g, '/') || '.';
+    };
+    if (name === 'list_directory') {
+      const relativePath = normalizeScopedPath(args.relativePath || '.', 'directory');
+      return { ok: true, tool: name, data: await developerFiles.listDirectory(relativePath, event.sender.id) };
+    }
+    if (name === 'read_file') {
+      const relativePath = normalizeScopedPath(args.relativePath, 'file');
+      return { ok: true, tool: name, data: await developerFiles.readFile(relativePath, event.sender.id) };
+    }
+    if (name === 'search_code') {
+      if (!query || query.length > 200) throw new TypeError('Coding Agent search query is invalid.');
+      return { ok: true, tool: name, data: await developerFiles.searchCode(query, event.sender.id, scope) };
+    }
+    if (name === 'get_context') {
+      if (!query || query.length > 200) throw new TypeError('Coding Agent context query is invalid.');
+      const search = await developerFiles.searchCode(query, event.sender.id, scope);
+      return {
+        ok: true,
+        tool: name,
+        data: developerContext.assembleContext({ root, query, results: search.results, maxTokens: args.maxTokens }),
+      };
+    }
+    if (name === 'search_symbols' || name === 'find_references' || name === 'get_repository_map') {
+      const cached = developerIndexCaches.get(root) || null;
+      const nextIndex = await developerIndex.buildIndex(root, cached && cached.root === root ? cached : null);
+      developerIndexCaches.set(root, nextIndex);
+      const scopePrefix = scope === '.' ? '' : `${scope.replace(/\\/g, '/')}/`;
+      if (name === 'search_symbols') {
+        if (!query || query.length > 200) throw new TypeError('Coding Agent symbol query is invalid.');
+        const data = developerIndex.searchSymbols(nextIndex, query)
+          .filter((item) => !scopePrefix || String(item.path || '').replace(/\\/g, '/').startsWith(scopePrefix))
+          .slice(0, 50);
+        return { ok: true, tool: name, data };
+      }
+      if (name === 'find_references') {
+        if (!query || query.length > 200) throw new TypeError('Coding Agent reference query is invalid.');
+        const data = developerIndex.findReferences(nextIndex, query)
+          .filter((item) => !scopePrefix || String(item.file || '').replace(/\\/g, '/').startsWith(scopePrefix))
+          .slice(0, 50);
+        return { ok: true, tool: name, data };
+      }
+      const map = developerIndex.buildRepositoryMap(root, nextIndex?.repositoryMap || null);
+      if (scope === '.') return { ok: true, tool: name, data: map };
+      const withinScope = (value) => String(value || '').replace(/\\/g, '/').startsWith(scopePrefix);
+      return {
+        ok: true,
+        tool: name,
+        data: {
+          ...map,
+          sourceDirectories: map.sourceDirectories.filter(withinScope),
+          testDirectories: map.testDirectories.filter(withinScope),
+          entryPoints: map.entryPoints.filter(withinScope),
+          configFiles: map.configFiles.filter(withinScope),
+          importantFiles: map.importantFiles.filter(withinScope),
+          structure: map.structure.filter((item) => withinScope(item.path)),
+        },
+      };
+    }
+    throw new Error(`Unsupported Coding Agent tool: ${name}.`);
   });
   ipcMain.handle('developer:provider-discovery', (_event, providers) => developerBenchmark.discoverProviders(providers));
   ipcMain.handle('developer:run-verification', (event, script) => {
@@ -845,7 +984,7 @@ app.whenReady().then(async () => {
     ownedDeveloperSession(event);
     return developerFiles.runGit(kind === 'diff' ? ['diff', '--no-ext-diff'] : ['status', '--short'], event.sender.id);
   });
-  ipcMain.handle('developer:proposal-create', (event, payload) => {
+  ipcMain.handle('developer:proposal-create', async (event, payload) => {
     const owner = ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
     return developerAgent.createProposal({
@@ -853,9 +992,12 @@ app.whenReady().then(async () => {
       sessionId: owner.sessionId, ownerWebContentsId: owner.ownerWebContentsId,
       workspace: payload?.workspace,
       verificationScript: payload?.verificationScript || null,
+      scope: await developerFiles.resolveProjectScope(event.sender.id, payload?.scope || '.'),
+      conversationTurnId: payload?.conversationTurnId || null,
     });
   });
   ipcMain.handle('developer:proposal-approve', (event, id) => developerAgent.approve(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
+  ipcMain.handle('developer:proposal-reject', (event, id) => developerAgent.reject(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
   ipcMain.handle('developer:proposal-apply', async (event, id) => {
     const owner = { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id };
     const task = developerAgent.getTaskForTest(id);
@@ -866,7 +1008,7 @@ app.whenReady().then(async () => {
     const requestedScripts = task.verificationScripts?.length
       ? task.verificationScripts
       : task.verificationScript ? [task.verificationScript] : [];
-    const verificationPlan = await developerFiles.getVerificationScripts(event.sender.id, requestedScripts);
+    const verificationPlan = await developerFiles.getVerificationScripts(event.sender.id, requestedScripts, task.scope);
     const verify = () => {
       if (verificationPlan.missing?.length) {
         return Promise.resolve({
@@ -886,6 +1028,7 @@ app.whenReady().then(async () => {
           if (progress.check) console.log(`[DEV][VERIFY] task=${id} check=${progress.check}`);
         },
         runCheck: (script) => developerFiles.runVerification(script, event.sender.id, {
+          scope: task.scope,
           isCancelled: () => developerAgent.isCancellationRequested(id, owner),
         }).catch((error) => ({
           ok: false,

@@ -5,6 +5,7 @@ const main = await fs.readFile(new URL('../electron/main.cjs', import.meta.url),
 const preload = await fs.readFile(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
 const overlay = await fs.readFile(new URL('../src/Overlay.tsx', import.meta.url), 'utf8');
 const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const assistantController = await fs.readFile(new URL('../src/features/assistant/useAssistantAgentController.ts', import.meta.url), 'utf8');
 const rendererEntry = await fs.readFile(new URL('../src/main.tsx', import.meta.url), 'utf8');
 
 assert.doesNotMatch(main, /app\.setPath\(['"]userData['"],\s*path\.join\(app\.getPath\(['"]temp['"]\)/);
@@ -48,14 +49,14 @@ assert.match(overlay, /style=\{\{ opacity: visualOpacity \}\}/);
 assert.match(overlay, /Search with AI/);
 assert.match(overlay, /type: 'overlay-question'/);
 assert.match(appSource, /overlay-question/);
-assert.match(appSource, /overlaySendMessageRef/);
+assert.match(assistantController, /onAnswer\?\.\(question, content\)/);
 assert.match(appSource, /buildOverlayAnalysis/);
 assert.match(appSource, /buildOverlaySummary/);
 assert.match(appSource, /buildOverlayActionItems/);
 assert.match(appSource, /analysis: buildOverlayAnalysis/);
 assert.match(appSource, /summary: buildOverlaySummary/);
-assert.match(appSource, /actionItems: answer \? buildOverlayActionItems/);
-assert.match(appSource, /overlayChannelRef\.current\?\.postMessage\(\{[\s\S]*answer: answerText/);
+assert.match(appSource, /actionItems: assistantAnswer \? buildOverlayActionItems/);
+assert.match(appSource, /overlayChannelRef\.current\?\.postMessage\(\{ type: 'state', \.\.\.overlayStateRef\.current \}\)/);
 assert.match(overlay, /setState\(\(previous\) => \(\{ \.\.\.previous, activeTab: 'answer', status: 'thinking' \}\)\)/);
 assert.match(overlay, /overlay-question/);
 assert.match(overlay, /className=\{`overlay-shell \$\{effectiveLowVisibility \? 'overlay-shell-low-visibility' : ''\}`\}/);

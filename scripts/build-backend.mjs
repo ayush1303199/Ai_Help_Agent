@@ -18,6 +18,8 @@ const args = [
   '--workpath', workRoot,
   '--specpath', specRoot,
   '--paths', path.join(root, 'server', 'src'),
+  '--add-data', `${path.join(root, 'src', 'config', 'providerRegistry.json')}${path.delimiter}.`,
+  '--add-data', `${path.join(root, 'src', 'config', 'providerErrorPatterns.json')}${path.delimiter}.`,
   '--collect-all', 'websockets',
   path.join(root, 'server', 'src', 'index.py'),
 ];

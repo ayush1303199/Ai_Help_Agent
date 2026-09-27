@@ -18,19 +18,18 @@ function isProjectProcess(processInfo) {
   const cwd = normalize(processInfo.cwd || '');
   const projectPatterns = [
     normalizedRoot,
-    normalize(path.join(projectRoot, 'server', 'src', 'index.js')),
+    normalize(path.join(projectRoot, 'server', 'src', 'index.py')),
     normalize(path.join(projectRoot, 'src', 'main.tsx')),
     normalize(path.join(projectRoot, 'electron', 'main.cjs')),
-    'src/index.js',
-    'server/src/index.js',
+    'server/src/index.py',
     'electron/main.cjs',
     'vite',
     'node_modules/.bin/vite',
   ];
 
-  const looksLikeProjectRuntime = /(?:node|electron|vite|npm|npx)/i.test(processInfo.commandLine || '');
+  const looksLikeProjectRuntime = /(?:node|electron|python|uvicorn|vite|npm|npx)/i.test(processInfo.commandLine || '');
   const matchesProjectPath = projectPatterns.some((pattern) => command.includes(pattern) || cwd.includes(pattern));
-  const matchesProjectEntrypoint = /(?:src\/index\.js|server\/src\/index\.js|electron\/main\.cjs|vite(?:\.cmd)?|npm(?:\.cmd)?)/i.test(command);
+  const matchesProjectEntrypoint = /(?:server\/src\/index\.py|electron\/main\.cjs|vite(?:\.cmd)?|npm(?:\.cmd)?)/i.test(command);
 
   return looksLikeProjectRuntime && (matchesProjectPath || matchesProjectEntrypoint);
 }

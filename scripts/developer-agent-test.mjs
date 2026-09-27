@@ -20,6 +20,14 @@ try {
   const owner = { ownerWebContentsId, sessionId };
   await assert.rejects(() => agent.apply(proposal.taskId, owner), /approved/);
   assert.throws(() => agent.approve(proposal.taskId, { ownerWebContentsId: 12, sessionId: agent.getSession(12) }), /not owned/);
+  const rejectedProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n',
+  });
+  assert.equal(agent.reject(rejectedProposal.taskId, owner).state, 'cancelled');
+  assert.throws(() => agent.approve(rejectedProposal.taskId, owner), /awaiting approval/);
+  assert.equal(agent.getTaskForTest(rejectedProposal.taskId).approval, undefined);
+  await assert.rejects(() => agent.apply(rejectedProposal.taskId, owner), /approved/);
   agent.approve(proposal.taskId, owner);
   await agent.apply(proposal.taskId, owner);
   assert.equal(await fs.readFile(file, 'utf8'), 'one\nthree\n');

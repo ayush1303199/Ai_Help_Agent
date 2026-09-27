@@ -1,5 +1,11 @@
 import { Loader2 } from 'lucide-react';
 import { renderAnswerMarkdown } from '../../ui/answerMarkdown';
+import {
+  generalSafeObservationSummary,
+  generalUserFailureMessage,
+  generalUserProgressMessage,
+  generalUserStatus,
+} from './generalAgentPresentation';
 
 interface GeneralAgentWorkspaceProps {
   generalTask: GeneralTaskState | null;
@@ -8,6 +14,8 @@ interface GeneralAgentWorkspaceProps {
   generalFollowUp: string;
   generalBusy: boolean;
   generalTaskActive: boolean;
+  generalError: string;
+  generalStatusMessage: string;
   onGoalChange: (value: string) => void;
   onClarificationChange: (value: string) => void;
   onFollowUpChange: (value: string) => void;
@@ -17,10 +25,6 @@ interface GeneralAgentWorkspaceProps {
   onTogglePause: () => void;
   onStop: () => void;
   onNewTask: () => void;
-  generalUserStatus: (task: GeneralTaskState) => string;
-  generalUserProgressMessage: (message?: string | null) => string;
-  generalUserFailureMessage: (category?: string | null) => string;
-  generalSafeObservationSummary: (observation: Record<string, unknown> | null | undefined) => string;
 }
 
 export function GeneralAgentWorkspace({
@@ -30,6 +34,8 @@ export function GeneralAgentWorkspace({
   generalFollowUp,
   generalBusy,
   generalTaskActive,
+  generalError,
+  generalStatusMessage,
   onGoalChange,
   onClarificationChange,
   onFollowUpChange,
@@ -39,13 +45,11 @@ export function GeneralAgentWorkspace({
   onTogglePause,
   onStop,
   onNewTask,
-  generalUserStatus,
-  generalUserProgressMessage,
-  generalUserFailureMessage,
-  generalSafeObservationSummary,
 }: GeneralAgentWorkspaceProps) {
   return (
     <>
+      {generalError && <div role="alert" className="mb-3 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-200">{generalError}</div>}
+      {generalStatusMessage && <div role="status" className="mb-3 rounded-lg border border-violet-500/30 bg-violet-500/10 p-3 text-xs text-violet-200">{generalStatusMessage}</div>}
       {!generalTask && (
         <div className="rounded-xl border border-slate-700 bg-slate-800/50 p-3">
           <textarea

@@ -426,9 +426,12 @@ class MockBrowserAdapter {
 
   click(session, target = {}) {
     const current = this._session(session);
-    const requested = typeof target === 'string' ? target : target.target || target.id || target.label;
-    const element = current.state.interactiveElements.find((item) => item.id === requested || item.label === requested);
-    if (!element || element.enabled === false) throw new ExecutionError('Mock browser target is not an enabled interactive element.', 'INVALID_TARGET');
+    const requested = typeof target === 'string' ? [target] : [target.target, target.id, target.label];
+    const normalizedTargets = requested.map((value) => boundedString(value, 200).replace(/\s+/g, ' ').trim().toLocaleLowerCase()).filter(Boolean);
+    const matches = current.state.interactiveElements.filter((item) => item.enabled !== false
+      && [item.id, item.label].some((value) => normalizedTargets.includes(boundedString(value, 200).replace(/\s+/g, ' ').trim().toLocaleLowerCase())));
+    if (matches.length !== 1) throw new ExecutionError('Mock browser target is not a unique enabled interactive element.', 'INVALID_TARGET');
+    const element = matches[0];
     const label = boundedString(element.label || element.id, 200);
     return bumpObservation(current, {
       visibleText: `${current.state.visibleText} Selected ${label}.`.slice(0, 4000),

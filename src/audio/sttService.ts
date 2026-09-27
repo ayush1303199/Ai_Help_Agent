@@ -6,6 +6,7 @@ export interface SttSegmentRequest {
   sessionId: string;
   segmentId: string;
   payloadName: string;
+  source?: 'microphone' | 'video' | 'system_audio' | 'mixed';
 }
 
 export interface SttSegmentResponse {
@@ -19,6 +20,7 @@ export async function transcribeAudioSegment({
   sessionId,
   segmentId,
   payloadName,
+  source = 'microphone',
 }: SttSegmentRequest): Promise<SttSegmentResponse> {
   if (audio.size === 0) {
     throw Object.assign(new Error('No audio signal was captured.'), {
@@ -34,6 +36,7 @@ export async function transcribeAudioSegment({
     headers: {
       'X-STT-Session-ID': sessionId,
       'X-STT-Segment-ID': segmentId,
+      'X-STT-Source': source,
     },
   });
 

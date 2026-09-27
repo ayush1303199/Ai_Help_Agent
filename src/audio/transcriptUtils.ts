@@ -339,13 +339,6 @@ export function prepareTextRequest(rawText: string, context?: TranscriptNormaliz
   if (!normalized) {
     return { rawText: raw, normalizedText: normalized, acceptedQuestion: null, qualityClassification: 'EMPTY' };
   }
-  if (isRepeatedNoise(normalized) || isFiller(normalized)) {
-    return { rawText: raw, normalizedText: normalized, acceptedQuestion: null, qualityClassification: 'REPEATED_NOISE' };
-  }
-  const textRequestSignals = /^(?:introduce|tell me about|explain|describe|summarize|compare|review|analyze|show me|help me|what are|what is|why should|how should|why|how|what|when|where|who|which|can you|could you|please\s+tell me|please\s+explain|please\s+describe)/i;
-  if (!textRequestSignals.test(normalized) && normalized.split(/\s+/).length < 4) {
-    return { rawText: raw, normalizedText: normalized, acceptedQuestion: null, qualityClassification: 'NOT_A_QUESTION' };
-  }
   return {
     rawText: raw,
     normalizedText: normalized,

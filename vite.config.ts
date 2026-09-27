@@ -10,7 +10,7 @@ const developmentCsp = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
-  "connect-src 'self' http://localhost:3001 ws://localhost:3002 ws://localhost:5174",
+  "connect-src 'self' http://localhost:3001 ws://localhost:3002 ws://localhost:5174 ws://127.0.0.1:3003",
   "media-src 'self' blob:",
 ].join('; ');
 
@@ -22,7 +22,7 @@ const productionCsp = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
-  "connect-src 'self' http://localhost:3001 ws://localhost:3002",
+  "connect-src 'self' http://localhost:3001 ws://localhost:3002 ws://127.0.0.1:3003",
   "media-src 'self' blob:",
 ].join('; ');
 

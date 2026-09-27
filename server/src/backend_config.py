@@ -4,6 +4,7 @@ from pathlib import Path
 APP_ROOT = Path(__file__).resolve().parent.parent
 PORT = int(os.getenv("PORT", "3001"))
 WS_PORT = int(os.getenv("WS_PORT", "3002"))
+CODING_WS_PORT = int(os.getenv("CODING_WS_PORT", "3003"))
 MAX_PDF_MB = int(os.getenv("MAX_PDF_MB", "10"))
 MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "384"))
 PROVIDER_RETRY_ATTEMPTS = 1

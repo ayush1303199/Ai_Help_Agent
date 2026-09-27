@@ -12,6 +12,8 @@ const {
 } = await import('../src/ai/interviewContext.ts');
 const { buildInterviewSystemPrompt, buildCanonicalInterviewSystemPrompt } = await import('../src/ai/interviewSystemPrompt.ts');
 const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const meetingControllerSource = await fs.readFile(new URL('../src/features/meeting/useMeetingAssistantController.ts', import.meta.url), 'utf8');
+const assistantControllerSource = await fs.readFile(new URL('../src/features/assistant/useAssistantAgentController.ts', import.meta.url), 'utf8');
 
 const cases = [
   {
@@ -130,13 +132,13 @@ assert.equal(microphoneDisplayLabel(null), 'Microphone unavailable');
 assert.match(microphoneDisplayLabel({ deviceId: 'usb', label: 'AB13X USB Audio' }), /AB13X USB Audio/);
 assert.match(appSource, /readPersistedInterviewContext\(\)/);
 assert.match(appSource, /writePersistedInterviewContext\(interviewConfig\)/);
-assert.match(appSource, /normalizeMicrophoneDevices\(/);
+assert.match(meetingControllerSource, /normalizeMicrophoneDevices\(/);
 assert.match(appSource, />Background<\/label>/);
-assert.match(appSource, /enumerateDevices\(\)/);
-assert.match(appSource, /deviceId: \{ exact: microphoneDeviceId \}/);
-assert.match(appSource, /deviceId: \{ exact: fallbackDeviceId \}/);
-assert.match(appSource, /microphoneConfigured: Boolean\(microphoneDeviceId\)/);
-assert.match(appSource, /microphoneDevicePresent/);
+assert.match(meetingControllerSource, /enumerateDevices\(\)/);
+assert.match(meetingControllerSource, /deviceId: \{ exact: microphoneDeviceId \}/);
+assert.match(meetingControllerSource, /deviceId: \{ exact: fallbackDeviceId \}/);
+assert.match(appSource, /microphoneConfigured: Boolean\(interviewConfig\.microphoneDeviceId\)/);
+assert.match(appSource, /microphoneDevicePresent: Boolean\(microphoneDevicePresent\)/);
 
 console.log(JSON.stringify({
   interviewContext: true,

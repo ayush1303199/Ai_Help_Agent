@@ -1,42 +1,204 @@
+import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const featureRoot = path.resolve('src', 'features');
-const features = ['meeting', 'coding', 'general'];
-const forbiddenImports = features
-  .flatMap((feature) => features
-    .filter((other) => other !== feature)
-    .map((other) => ({
-      feature,
-      other,
-      pattern: new RegExp(`(?:features/|\\.\\./)+${other}[/"']`),
-    })));
+const projectRoot = process.cwd();
+const sourceExtensions = /\.(?:cjs|js|jsx|mjs|py|ts|tsx)$/;
+const appSource = fs.readFileSync(path.join(projectRoot, 'src', 'App.tsx'), 'utf8');
+const generalControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'general', 'useGeneralAgentController.ts'), 'utf8');
+const codingControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'coding', 'useCodingAgentController.ts'), 'utf8');
+const meetingControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'useMeetingAssistantController.ts'), 'utf8');
+const meetingPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'MeetingAssistantPage.tsx'), 'utf8');
+const meetingTransportSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'meetingTransport.ts'), 'utf8');
+const assistantControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'assistant', 'useAssistantAgentController.ts'), 'utf8');
+const assistantTransportSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'assistant', 'assistantTransport.ts'), 'utf8');
+const assistantPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'assistant', 'AssistantAgentPage.tsx'), 'utf8');
+const assistantWorkspaceSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'assistant', 'AssistantAgentWorkspace.tsx'), 'utf8');
+const agentRoots = Object.freeze({
+  assistant: [
+    'src/features/assistant',
+  ],
+  coding: [
+    'src/features/coding',
+    'electron/coding-pipeline',
+    'electron/developerAgent.cjs',
+    'electron/developerBenchmark.cjs',
+    'electron/developerContext.cjs',
+    'electron/developerFiles.cjs',
+    'electron/developerIndex.cjs',
+    'server/src/coding_provider.py',
+    'server/src/coding_websocket.py',
+  ],
+  general: [
+    'src/features/general',
+    'electron/generalAgent.cjs',
+    'electron/generalAgentCapabilities.cjs',
+    'electron/generalAgentElectronBrowser.cjs',
+    'electron/generalAgentExecution.cjs',
+    'electron/generalAgentPlanner.cjs',
+  ],
+  meeting: [
+    'src/features/meeting',
+    'src/audio/sttService.ts',
+    'src/audio/sttTypes.ts',
+    'server/src/stt_service.py',
+  ],
+});
 
-function collectSourceFiles(directory) {
+const pythonModuleOwners = new Map([
+  ['coding_provider', 'coding'],
+  ['coding_websocket', 'coding'],
+  ['stt_service', 'meeting'],
+]);
+
+function normalizePath(value) {
+  return value.split(path.sep).join('/');
+}
+
+function ownerForPath(relativePath) {
+  const normalized = normalizePath(relativePath).replace(/^\.\//, '');
+  for (const [owner, roots] of Object.entries(agentRoots)) {
+    if (roots.some((root) => {
+      const normalizedRoot = normalizePath(root);
+      return normalized === normalizedRoot || normalized.startsWith(`${normalizedRoot}/`);
+    })) return owner;
+  }
+  return null;
+}
+
+function collectSourceFiles(directory, root = directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     const entryPath = path.join(directory, entry.name);
-    if (entry.isDirectory()) return collectSourceFiles(entryPath);
-    return /\.(?:ts|tsx|js|jsx)$/.test(entry.name) ? [entryPath] : [];
+    if (entry.isDirectory()) return collectSourceFiles(entryPath, root);
+    if (!sourceExtensions.test(entry.name)) return [];
+    return [{
+      relativePath: normalizePath(path.relative(projectRoot, entryPath)),
+      source: fs.readFileSync(entryPath, 'utf8'),
+      root,
+    }];
   });
 }
 
-const violations = [];
-for (const feature of features) {
-  const files = collectSourceFiles(path.join(featureRoot, feature));
+function extractModuleSpecifiers(source) {
+  const specifiers = new Set();
+  const jsImports = /\b(?:from|import|require)\s*\(?\s*['"]([^'"]+)['"]/g;
+  const pythonImports = /^\s*(?:from|import)\s+([.\w]+)/gm;
+  for (const match of source.matchAll(jsImports)) specifiers.add(match[1]);
+  for (const match of source.matchAll(pythonImports)) specifiers.add(match[1]);
+  return specifiers;
+}
+
+function ownerForImport(importerPath, specifier) {
+  const importer = normalizePath(importerPath);
+  const aliased = specifier.startsWith('@/') || specifier.startsWith('~/')
+    ? `src/${specifier.slice(2)}`
+    : specifier;
+  if (aliased.startsWith('.')) {
+    const resolved = normalizePath(path.relative(projectRoot, path.resolve(projectRoot, path.dirname(importer), aliased)));
+    return ownerForPath(resolved);
+  }
+  return pythonModuleOwners.get(path.basename(aliased)) || null;
+}
+
+function findCrossAgentImports(files) {
+  const violations = [];
   for (const file of files) {
-    const source = fs.readFileSync(file, 'utf8');
-    for (const rule of forbiddenImports.filter((item) => item.feature === feature)) {
-      if (rule.pattern.test(source)) {
-        violations.push(`${path.relative(process.cwd(), file)} imports sibling feature "${rule.other}"`);
+    const importerOwner = ownerForPath(file.relativePath);
+    if (!importerOwner) continue;
+    for (const specifier of extractModuleSpecifiers(file.source)) {
+      const importedOwner = ownerForImport(file.relativePath, specifier);
+      if (importedOwner && importedOwner !== importerOwner) {
+        violations.push(
+          `${file.relativePath} (${importerOwner}) imports "${specifier}" owned by ${importedOwner}`,
+        );
       }
     }
   }
+  return violations;
 }
 
+const fixtureViolations = findCrossAgentImports([{
+  relativePath: 'src/features/coding/test-fixture.ts',
+  source: "import { GeneralAgentWorkspace } from '../general/GeneralAgentWorkspace';",
+}]);
+assert.equal(fixtureViolations.length, 1, 'The boundary checker must detect a cross-agent import.');
+const codingMeetingFixtureViolations = findCrossAgentImports([
+  {
+    relativePath: 'src/features/coding/test-fixture.ts',
+    source: "import { useMeetingAssistantController } from '../meeting/useMeetingAssistantController';",
+  },
+  {
+    relativePath: 'src/features/meeting/test-fixture.ts',
+    source: "import { CodingAgentPage } from '../coding/CodingAgentPage';",
+  },
+]);
+assert.equal(codingMeetingFixtureViolations.length, 2, 'The boundary checker must reject imports between Coding and Meeting.');
+assert.match(appSource, /useGeneralAgentController\(\)/, 'App composition must mount the General Agent controller.');
+assert.doesNotMatch(
+  appSource,
+  /createGeneralTask|generalBrowserOperation|recordGeneralModelResponse|runGeneralAgentRequest|pendingGeneralRequestIdsRef/,
+  'General lifecycle, model transport, and browser dispatch must stay in the General feature.',
+);
+assert.match(generalControllerSource, /new WebSocket\(GENERAL_WS_URL\)/, 'General Agent must own its WebSocket connection.');
+assert.match(generalControllerSource, /mode: 'general'[\s\S]*general: true/, 'General requests must use the General-only protocol contract.');
+assert.match(appSource, /useMeetingAssistantController\(/, 'App composition must mount the Meeting Assistant controller.');
+assert.match(
+  meetingControllerSource,
+  /const sendQuestion = async[\s\S]*transport\.send\(buildChatRequest\(/,
+  'Meeting questions must use the Meeting-owned transport and request builder.',
+);
+assert.match(meetingTransportSource, /agent: 'meeting'/, 'Meeting transport must identify its own agent endpoint.');
+assert.match(meetingPageSource, /<MeetingAssistantWorkspace \{\.\.\.workspace\} \/>/, 'Meeting must have a feature-owned page boundary.');
+assert.match(appSource, /appMode === 'meeting'/, 'Meeting must have an independent application page route.');
+assert.doesNotMatch(appSource, /generalAnswer \|\| assistantAnswer|generalBusy \? 'thinking' : generalAnswer/, 'Assistant overlay status must not consume General Agent state.');
+assert.match(appSource, /useAssistantAgentController\(/, 'App composition must mount the Assistant controller.');
+assert.match(assistantPageSource, /<AssistantAgentWorkspace \{\.\.\.workspace\} \/>/, 'Assistant must have a feature-owned page boundary.');
+assert.match(assistantWorkspaceSource, /export function AssistantAgentWorkspace/, 'Assistant chat presentation must stay in its feature folder.');
+assert.match(appSource, /<AssistantAgentPage/, 'App must route Assistant rendering through its feature-owned page.');
+assert.match(assistantControllerSource, /new AssistantAgentTransport\(/, 'Assistant Agent must own its transport lifecycle.');
+assert.match(assistantTransportSource, /ASSISTANT_WS_URL = .*\/assistant/, 'Assistant transport must use its isolated endpoint.');
+assert.match(assistantTransportSource, /agent: 'assistant'/, 'Assistant transport must identify its own endpoint.');
+assert.doesNotMatch(appSource, /new WebSocket|wsRef|wsConnectPromiseRef|handleWsMessage|pendingChatRequestIdsRef|draftImproveRequestIdRef/, 'Assistant WebSocket lifecycle and request routing must stay in the Assistant feature.');
+assert.match(appSource, /buildChatRequest:/, 'App must provide Meeting context through an injected request-builder contract.');
+assert.doesNotMatch(
+  appSource,
+  /transcribeAudioSegment|MediaRecorder|getUserMedia|segmentProcessorRef|captureSessionIdRef|pendingPartialQuestionRef|const (?:start|stop)MeetingCapture|const requestMeetingAudioStream/,
+  'Meeting capture, segmentation, and STT lifecycle must stay in the Meeting controller.',
+);
+assert.doesNotMatch(
+  appSource,
+  /const \[(?:meetingAudioMode|meetingMenuOpen|microphoneDevices|microphoneUnavailable|transcriptOpen|isRecording|isTranscribing|audioSourceLabel|audioLevel|audioStatus|systemAudioStatus|microphoneStatus|pipelineStatus|liveTranscript|transcripts|transcriptSearch),/,
+  'Meeting-owned capture, transcript, and pipeline state must not drift back into App.',
+);
+assert.doesNotMatch(
+  appSource,
+  /CodingAgentTransport|developerSocket|codingWebSocket|proposal_ready|awaiting_approval|developer\.readFiles|developer\.applyPatch|developer\.verify|const \[(?:developerMessages|developerInput|developerStreaming|developerProposal|developerActivity|codingMessages|codingInput|codingProposal),/,
+  'Coding Agent transport, state, and proposal lifecycle must stay in the Coding feature.',
+);
+assert.match(codingControllerSource, /new CodingAgentTransport\(\)/, 'Coding Agent must own its transport lifecycle.');
+assert.match(meetingControllerSource, /transcribeAudioSegment\(/, 'Meeting Assistant must own its STT processing lifecycle.');
+assert.match(meetingControllerSource, /const \[meetingAudioMode, setMeetingAudioMode\]/, 'Meeting Assistant must own audio source state.');
+assert.match(meetingControllerSource, /MediaRecorder|getUserMedia|captureSessionIdRef/, 'Meeting Assistant must own capture and segmentation state.');
+
+const sourceFiles = Object.values(agentRoots).flat().flatMap((root) => {
+  const absolute = path.resolve(projectRoot, root);
+  if (fs.existsSync(absolute) && fs.statSync(absolute).isDirectory()) {
+    return collectSourceFiles(absolute);
+  }
+  if (fs.existsSync(absolute) && fs.statSync(absolute).isFile()) {
+    return [{
+      relativePath: normalizePath(path.relative(projectRoot, absolute)),
+      source: fs.readFileSync(absolute, 'utf8'),
+    }];
+  }
+  return [];
+});
+
+const violations = findCrossAgentImports(sourceFiles);
 if (violations.length > 0) {
   console.error('Architecture boundary violations found:');
   for (const violation of violations) console.error(`- ${violation}`);
   process.exit(1);
 }
 
-console.log('Architecture boundary test passed.');
+console.log('Architecture boundary test passed (cross-agent module imports are isolated).');

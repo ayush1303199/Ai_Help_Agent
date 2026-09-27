@@ -127,12 +127,13 @@ process.once('SIGTERM', () => void shutdown(0));
 try {
   const backendAlreadyRunning = await portOpen(3001);
   const websocketAlreadyRunning = await portOpen(3002);
+  const codingWebsocketAlreadyRunning = await portOpen(3003);
   const frontendAlreadyRunning = await portOpen(5174);
 
-  if (!backendAlreadyRunning || !websocketAlreadyRunning) {
+  if (!backendAlreadyRunning || !websocketAlreadyRunning || !codingWebsocketAlreadyRunning) {
     start(npmCommand, ['run', 'server:dev']);
   } else {
-    console.log('[DEV] Reusing the existing backend on ports 3001 and 3002.');
+    console.log('[DEV] Reusing the existing backend on ports 3001, 3002, and 3003.');
   }
 
   if (!frontendAlreadyRunning) {
@@ -145,6 +146,7 @@ try {
     waitForTcp(5174),
     waitForHttp('http://localhost:3001/api/health'),
     waitForTcp(3002),
+    waitForTcp(3003),
   ]);
   const electron = start(electronCommand, ['electron/main.cjs']);
   await new Promise((resolve) => electron.once('exit', (code) => resolve(code || 0)));

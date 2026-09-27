@@ -68,6 +68,7 @@ const page = engine.browserOperation(browserA.sessionId, ownerA, 'navigate', {
 });
 assert.equal(page.url, 'https://mock.test/products');
 assert.equal(engine.browserOperation(browserA.sessionId, ownerA, 'click', 'details').pageState.name, 'INTERACTION_COMPLETE');
+assert.equal(engine.browserOperation(browserA.sessionId, ownerA, 'click', { target: 'Click the details button', label: 'DETAILS' }).pageState.name, 'INTERACTION_COMPLETE');
 assert.equal(engine.browserOperation(browserA.sessionId, ownerA, 'type', { target: 'query', text: 'laptop' }).pageState.name, 'INPUT_UPDATED');
 assert.equal(engine.browserOperation(browserA.sessionId, ownerA, 'scroll', { delta: 300 }).pageState.name, 'SCROLLED');
 assert.equal(engine.browserOperation(browserA.sessionId, ownerA, 'wait', { milliseconds: 10 }).pageState.name, 'WAITED_10MS');

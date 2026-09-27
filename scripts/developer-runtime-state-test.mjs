@@ -1,42 +1,4 @@
 import assert from 'node:assert/strict';
-import { buildReadPlan, createTaskRuntimeState, detectBadToolBehavior, evaluateCompletionState } from '../server/src/llm/developerDecisionEngine.js';
-
-const plan = buildReadPlan('Fix the login timeout bug.');
-const developerPrompt = (await import('../server/src/llm/developerDecisionEngine.js')).developerDecisionPrompt('Fix the login timeout bug.');
-assert.equal(plan.mode, 'AGENT');
-assert.equal(plan.runtimeState.phase, 'UNDERSTANDING');
-assert.ok(Array.isArray(plan.taskPlan.tasks));
-assert.match(developerPrompt, /selected project root/i);
-assert.match(developerPrompt, /Are you sure you want to close \[process\/task name\]\?/i);
-assert.match(developerPrompt, /Never modify, delete, or overwrite files/i);
-
-const runtime = createTaskRuntimeState({
-  phase: 'CONTEXT_BUILDING',
-  plan: plan.taskPlan,
-  taskGraph: plan.taskGraph,
-  taskMemory: { goal: 'Fix login timeout', constraints: ['read-only'], filesInspected: ['src/login.ts'], importantFindings: ['timeout is read from config'], plannedChanges: ['edit config'], proposalIds: [], verificationResults: [], failures: [], repairRounds: 0 },
-});
-runtime.recordToolDecision({ selectedTool: 'search_code', reasonCategory: 'locate_target', useful: true });
-runtime.recordObservation('SEARCH_TARGET_FOUND', { path: 'src/login.ts' });
-runtime.setPhase('PROPOSING', { message: 'proposal preparation' });
-runtime.recordAssumption('FACT', { description: 'Target file was identified.' });
-runtime.recordAssumption('UNKNOWN', { description: 'Exact root cause still unconfirmed.' });
-assert.equal(runtime.taskState, 'PROPOSING');
-assert.equal(runtime.metrics.toolCalls, 1);
-assert.equal(runtime.observations.at(-1).kind, 'PROPOSING');
-assert.equal(runtime.assumptions.length, 2);
-
-const decisionLog = [
-  { tool: 'search_code', phase: 'EXPLORING', targetScope: 'narrow', reasonCategory: 'locate_target' },
-  { tool: 'search_code', phase: 'EXPLORING', targetScope: 'narrow', reasonCategory: 'locate_target' },
-  { tool: 'read_file', phase: 'UNDERSTANDING', targetScope: 'narrow', reasonCategory: 'read_context' },
-  { tool: 'run_command', phase: 'PROPOSING', targetScope: 'narrow', reasonCategory: 'verification' },
-];
-const badBehavior = detectBadToolBehavior(decisionLog);
-assert.equal(badBehavior.duplicateToolCalls.length, 1);
-assert.equal(badBehavior.repeatedSearches.length, 1);
-assert.equal(badBehavior.invalidPhaseUsage.length, 2);
-assert.equal(evaluateCompletionState({ implemented: true, verificationStatus: 'PASS', repairAttempts: 0, changedFiles: ['src/login.ts'] }).status, 'COMPLETED');
 
 const os = await import('node:os');
 const fs = await import('node:fs/promises');
@@ -61,6 +23,14 @@ assert.equal((await developerFiles.readFile('alpha.txt', 'owner-a')).content, 'A
 assert.equal((await developerFiles.readFile('beta.txt', 'owner-b')).content, 'B');
 assert.throws(() => developerFiles.assertProjectOwner('owner-c'), /not owned/i);
 
+developerFiles.releaseProject('owner-a');
+assert.equal(developerFiles.getProjectRoot('owner-a'), null);
+assert.throws(() => developerFiles.assertProjectOwner('owner-a'), /not owned/i);
+await developerFiles.chooseProjectFolder({ showOpenDialog: async () => ({ canceled: false, filePaths: [projectA] }) }, 'owner-a-reloaded');
+assert.equal(developerFiles.getProjectRoot('owner-a-reloaded'), projectA);
+assert.equal((await developerFiles.readFile('alpha.txt', 'owner-a-reloaded')).content, 'A');
+assert.equal((await developerFiles.readFile('beta.txt', 'owner-b')).content, 'B');
+
 const sharedResult = [{ path: 'src/login.ts', text: 'login timeout is read from config', matchType: 'content' }];
 const contextA = developerContext.assembleContext({ query: 'timeout', results: sharedResult, root: projectA, maxTokens: 1200 });
 const contextB = developerContext.assembleContext({ query: 'timeout', results: sharedResult, root: projectB, maxTokens: 1200 });
@@ -81,14 +51,8 @@ assert.equal(projectBContextAfterClear.cached, false);
 
 developerFiles.clearProject('owner-a');
 developerFiles.clearProject('owner-b');
+developerFiles.clearProject('owner-a-reloaded');
 
 console.log(JSON.stringify({
-  simulated: true,
-  planMode: plan.mode,
-  runtimePhase: runtime.phase,
-  runtimeMetrics: runtime.metrics,
-  historyLength: runtime.history.length,
-  assumptionCount: runtime.assumptions.length,
-  badToolBehavior: badBehavior,
   projectIsolation: true,
 }));

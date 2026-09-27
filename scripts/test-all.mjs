@@ -5,8 +5,10 @@ const scripts = [
   'architecture-boundary-test.mjs',
   'developer-pipeline-contract-test.mjs',
   'developer-agent-test.mjs',
+  'developer-project-discovery-test.mjs',
   'developer-gates-test.mjs',
   'developer-lifecycle-test.mjs',
+  'coding-diff-test.mjs',
   'developer-runtime-state-test.mjs',
   'assistant-smoke-test.mjs',
   'document-service-test.mjs',
@@ -14,6 +16,7 @@ const scripts = [
   'interview-context-test.mjs',
   'context-dialog-test.mjs',
   'configuration-ui-test.mjs',
+  'provider-config-test.mjs',
   'overlay-static-test.mjs',
   'general-agent-runtime-test.mjs',
   'general-agent-capability-test.mjs',
@@ -22,8 +25,6 @@ const scripts = [
   'general-agent-execution-test.mjs',
   'general-agent-execution-integration-test.mjs',
   'general-agent-electron-browser-test.mjs',
-  'gemini-protocol-test.mjs',
-  'phase8-protocol-test.mjs',
 ];
 
 const backendResult = await new Promise((resolve) => {
@@ -40,7 +41,10 @@ if (backendResult.code !== 0) {
 } else {
 for (const script of scripts) {
   const result = await new Promise((resolve) => {
-    const child = spawn(process.execPath, [path.join('scripts', script)], {
+    const args = ['coding-diff-test.mjs', 'provider-config-test.mjs'].includes(script)
+      ? ['--experimental-strip-types', path.join('scripts', script)]
+      : [path.join('scripts', script)];
+    const child = spawn(process.execPath, args, {
       stdio: 'inherit',
       windowsHide: true,
     });
