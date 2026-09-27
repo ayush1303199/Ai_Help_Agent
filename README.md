@@ -265,8 +265,12 @@ and packaged launches do not need API URLs or client limits hardcoded in
 | `VITE_MAX_PDF_SIZE_BYTES` | `20971520` | Maximum client-side PDF size. |
 | `VITE_PDF_CONTEXT_BUDGET_RATIO` | `0.65` | Fraction of context budget available to extracted PDF text. |
 | `VITE_PDF_UPLOAD_TIMEOUT_MS` | `20000` | PDF upload timeout. |
-| `VITE_SYSTEM_AUDIO_SILENCE_MS` | `2000` | Silence after speech before an utterance is submitted to STT and the AI assistant. |
+| `VITE_SYSTEM_AUDIO_SILENCE_MS` | `1800` | Silence after speech before an utterance is submitted to STT and the AI assistant. |
 | `VITE_SYSTEM_AUDIO_LEVEL_THRESHOLD` | `2` | System-audio level threshold. |
+| `VITE_AUDIO_CONTINUATION_TIMEOUT_MS` | `3000` | Maximum wait for speech that continues an incomplete or short transcript. |
+| `VITE_AUDIO_CONTINUATION_MAX_CHARS` | `240` | Maximum incomplete transcript length eligible for continuation. |
+| `VITE_AUDIO_SHORT_FRAGMENT_MAX_WORDS` | `2` | Maximum word count treated as a possible speech fragment. |
+| `VITE_AUDIO_SHORT_FRAGMENT_MAX_DURATION_MS` | `5000` | Maximum segment duration eligible for short-fragment continuation. |
 
 ## Running the Application
 

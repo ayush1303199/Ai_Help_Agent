@@ -3,6 +3,8 @@ import { runtimeConfig } from '../../config/runtimeConfig';
 import { ConfirmationDialog } from '../../ui/ConfirmationDialog';
 import { CodingAgentWorkspace } from './CodingAgentWorkspace';
 import { useCodingAgentController } from './useCodingAgentController';
+import { AgentProviderSelect } from '../provider-selection/AgentProviderSelect';
+import { useAgentProviderSelection, type AgentProviderOption } from '../provider-selection/useAgentProviderSelection';
 
 export interface CodingHistoryRestoreRequest {
   key: number;
@@ -11,14 +13,19 @@ export interface CodingHistoryRestoreRequest {
 
 interface CodingAgentPageProps {
   active: boolean;
-  provider: { id?: string; label?: string; model?: string } | null;
+  defaultProvider: { id?: string; label?: string; model?: string } | null;
+  providers: AgentProviderOption[];
+  onProviderStorageError: (message: string) => void;
   restoreRequest: CodingHistoryRestoreRequest | null;
   onBusyChange: (busy: boolean) => void;
 }
 
-export function CodingAgentPage({ active, provider, restoreRequest, onBusyChange }: CodingAgentPageProps) {
+export function CodingAgentPage({ active, defaultProvider, providers, onProviderStorageError, restoreRequest, onBusyChange }: CodingAgentPageProps) {
+  const { providerId, setProviderId } = useAgentProviderSelection('coding', providers, onProviderStorageError);
+  const provider = providers.find((item) => item.id === providerId) || defaultProvider;
   const controller = useCodingAgentController({
     provider,
+    providerId,
     maxContextChars: runtimeConfig.limits.maxContextChars,
     maxHistoryMessages: runtimeConfig.limits.maxChatHistoryMessages,
     maxMessageChars: runtimeConfig.limits.maxChatMessageChars,
@@ -47,6 +54,7 @@ export function CodingAgentPage({ active, provider, restoreRequest, onBusyChange
           <h2 className="mt-1 text-xl font-semibold">Coding assistant</h2>
           <p className="mt-2 text-xs text-slate-500">Read and search are automatic. Source writes happen only through a validated proposal after you explicitly approve it; verification uses allow-listed project scripts.</p>
         </div>
+        <AgentProviderSelect agentId="coding" providers={providers} value={providerId} onChange={setProviderId} />
         <CodingAgentWorkspace
           {...workspace}
           onResetCodingPreferences={() => setConfirmationOpen(true)}

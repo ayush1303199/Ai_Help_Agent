@@ -1,3 +1,5 @@
+import { runtimeConfig } from '../../config/runtimeConfig';
+
 export interface CodingReadFile {
   path: string;
   content: string;
@@ -38,7 +40,7 @@ interface CodingRequestState {
   toolCalls: CodingTransportResult['toolCalls'];
 }
 
-const CODING_WS_URL = import.meta.env.VITE_CODING_WS_URL || 'ws://127.0.0.1:3003';
+const CODING_WS_URL = runtimeConfig.codingWsUrl;
 
 export class CodingAgentTransport {
   private socket: WebSocket | null = null;
@@ -49,6 +51,7 @@ export class CodingAgentTransport {
     requestId: string,
     messages: Array<{ role: 'user' | 'assistant'; content: string }>,
     scope: string,
+    providerId: string | null,
     handlers: CodingHandlers,
   ): Promise<string> {
     if (!window.electronAPI) throw new Error('Coding Agent desktop IPC is unavailable.');
@@ -72,6 +75,7 @@ export class CodingAgentTransport {
       type: 'chat',
       requestId,
       scope: turn.scope,
+      ...(providerId ? { providerId } : {}),
       messages,
     }));
     return turn.turnId;
@@ -97,7 +101,7 @@ export class CodingAgentTransport {
       const timeout = window.setTimeout(() => {
         socket.close();
         reject(new Error('Timed out connecting to the Coding Agent service.'));
-      }, 10000);
+      }, runtimeConfig.limits.transportConnectTimeoutMs);
       socket.onopen = () => {
         window.clearTimeout(timeout);
         this.socket = socket;

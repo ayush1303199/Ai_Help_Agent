@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { runtimeConfig } from '../../config/runtimeConfig';
 import { createUnvalidatedSuggestion, parseUnifiedDiff, validateUnifiedFile, type DeveloperDiffFile } from './codingDiff';
 import { CodingAgentTransport, type CodingActivity, type CodingTransportResult } from './codingTransport';
 import {
@@ -56,6 +57,7 @@ interface CodingProposal {
 
 interface CodingControllerOptions {
   provider: { id?: string; label?: string; model?: string } | null;
+  providerId: string | null;
   maxContextChars: number;
   maxHistoryMessages: number;
   maxMessageChars: number;
@@ -80,6 +82,7 @@ async function hashDeveloperContent(content: string) {
 
 export function useCodingAgentController({
   provider,
+  providerId,
   maxContextChars,
   maxHistoryMessages,
   maxMessageChars,
@@ -260,7 +263,7 @@ export function useCodingAgentController({
     try {
       const transport = transportRef.current;
       if (!transport) throw new Error('Coding Agent transport is unavailable.');
-      await transport.send(requestId, conversationHistory, currentScope, {
+      await transport.send(requestId, conversationHistory, currentScope, providerId, {
         onStart: (turnId, root, scope) => {
           turnIdsRef.current.set(requestId, turnId);
           setProjectRoot(root);
@@ -568,7 +571,7 @@ export function useCodingAgentController({
       projectRoot,
       pendingPlan: proposal?.runtime ? { ...proposal.runtime } : null,
       appliedPatchLog,
-    }, ...previous.filter((session) => session.id !== conversationId)].slice(0, 30));
+    }, ...previous.filter((session) => session.id !== conversationId)].slice(0, runtimeConfig.codingSession.maxSessions));
     setConversationId(crypto.randomUUID());
     setProposal(null);
     setPath('.');

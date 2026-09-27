@@ -15,10 +15,9 @@ import {
   X,
   Zap
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { questionFingerprintForComparison, type PreparedQuestion } from './audio/transcriptUtils';
 import {
-  createCanonicalInterviewContext,
   INTERVIEW_BACKGROUND_OPTIONS,
   INTERVIEW_DOMAIN_OPTIONS,
   microphoneDisplayLabel,
@@ -26,8 +25,7 @@ import {
   writePersistedInterviewContext,
   type InterviewContextConfig,
 } from './ai/interviewContext';
-import { buildCanonicalInterviewSystemPrompt } from './ai/interviewSystemPrompt';
-import { resolveContext, truncateContextText } from './context/contextResolver';
+import { truncateContextText } from './context/contextResolver';
 import {
   allowsCustomModel,
   getDefaultModel,
@@ -59,15 +57,14 @@ import { AssistantAgentPage } from './features/assistant/AssistantAgentPage';
 import type { AssistantControllerSnapshot } from './features/assistant/AssistantAgentPage';
 import { MeetingAssistantPage } from './features/meeting/MeetingAssistantPage';
 import type { MeetingControllerSnapshot } from './features/meeting/MeetingAssistantPage';
-import type { MeetingChatMessage, MeetingChatRequest } from './features/meeting/meetingTransport';
-import type { AssistantChatMessage, AssistantChatRequest } from './features/assistant/assistantTransport';
+import type { MeetingRequestContext } from './features/meeting/meetingRequestBuilder';
+import type { AssistantRequestContext } from './features/assistant/assistantRequestBuilder';
 import { ChatHistoryModal } from './features/history/ChatHistoryModal';
-import { useScreenReader } from './features/screen-reading/useScreenReader';
 import { AppHeader } from './ui/header/AppHeader';
 import { ContextButton, ContextPanel, FontSizeControls, HistoryButton, OverlayButton, ScreenReadingToggle, SettingsButton } from './ui/header/HeaderActions';
 import { ModeControls } from './ui/header/ModeControls';
 import type { AppMode, AssistantMode, MeetingAudioMode } from './app/appTypes';
-import { historyTitle, readHistory, removeHistorySession, searchHistory, upsertHistory, writeHistory, type HistoryMode, type HistorySession } from './history/historyService';
+import { readHistory, removeHistorySession, searchHistory, upsertHistory, writeHistory, type HistoryMode, type HistorySession } from './history/historyService';
 
 type Message = AssistantControllerSnapshot['messages'][number];
 
@@ -142,18 +139,6 @@ interface ChatSession {
   lastUsedProvider?: { id?: string; label?: string; model?: string; changedAt?: string } | null;
 }
 
-function completedTurnEntries(messages: Message[]): Array<{ index: number; messages: Message[] }> {
-  const entries: Array<{ index: number; messages: Message[] }> = [];
-  for (let index = 0; index < messages.length - 1; index += 1) {
-    const user = messages[index];
-    const assistant = messages[index + 1];
-    if (user.role !== 'user' || assistant.role !== 'assistant' || assistant.streaming || !assistant.content.trim()) continue;
-    entries.push({ index, messages: [{ role: 'user', content: user.content }, { role: 'assistant', content: assistant.content }] });
-    index += 1;
-  }
-  return entries;
-}
-
 type SessionDocument = NormalizedDocument;
 
 interface TrainedProfile {
@@ -200,14 +185,18 @@ interface ConfirmationRequest {
   onConfirm: () => void | Promise<void>;
 }
 
+interface ScreenReadingPreference {
+  enabled: boolean;
+  setEnabled: (enabled: boolean) => void;
+}
+
 const HTTP_URL = runtimeConfig.httpUrl;
 const CUSTOM_PROVIDER_MODEL = '__custom_provider_model__';
 const {
   maxChatHistoryMessages: MAX_CHAT_HISTORY_MESSAGES,
   maxContextChars: MAX_CONTEXT_CHARS,
-  pdfContextBudgetRatio: PDF_CONTEXT_BUDGET_RATIO,
 } = runtimeConfig.limits;
-const PDF_CONTEXT_CHAR_BUDGET = Math.floor(MAX_CONTEXT_CHARS * PDF_CONTEXT_BUDGET_RATIO);
+const PDF_CONTEXT_CHAR_BUDGET = Math.floor(MAX_CONTEXT_CHARS * runtimeConfig.limits.pdfContextBudgetRatio);
 function providerResponseError(data: Record<string, unknown>, fallback: string): string {
   if (typeof data.error === 'string') return data.error;
   if (typeof data.detail === 'string') return data.detail;
@@ -239,6 +228,8 @@ function App() {
   const [health, setHealth] = useState<{ provider: string; model: string; sttReady?: boolean; sttProvider?: string } | null>(null);
   const [assistantController, setAssistantController] = useState<AssistantControllerSnapshot | null>(null);
   const [meetingController, setMeetingController] = useState<MeetingControllerSnapshot | null>(null);
+  const [assistantScreenReading, setAssistantScreenReading] = useState<ScreenReadingPreference | null>(null);
+  const [meetingScreenReading, setMeetingScreenReading] = useState<ScreenReadingPreference | null>(null);
   const [codingBusy, setCodingBusy] = useState(false);
   const [codingRestoreRequest, setCodingRestoreRequest] = useState<CodingHistoryRestoreRequest | null>(null);
   const codingRestoreKeyRef = useRef(0);
@@ -302,6 +293,27 @@ function App() {
   const jobDescriptionFileInputRef = useRef<HTMLInputElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const activeProfile = trainedProfiles.find((profile) => profile.id === activeProfileId) ?? null;
+  const microphoneDevicePresent = meetingController?.microphoneDevicePresent ?? false;
+  const assistantRequestContext = useMemo<AssistantRequestContext>(() => ({
+    mode,
+    sessionDocuments,
+    activeProfile,
+    interviewConfig,
+    microphoneDevicePresent,
+    contextCharBudget: PDF_CONTEXT_CHAR_BUDGET,
+    maxHistoryMessages: MAX_CHAT_HISTORY_MESSAGES,
+    maxContextChars: MAX_CONTEXT_CHARS,
+  }), [activeProfile, interviewConfig, microphoneDevicePresent, mode, sessionDocuments]);
+  const meetingRequestContext = useMemo<MeetingRequestContext>(() => ({
+    mode,
+    sessionDocuments,
+    activeProfile,
+    interviewConfig,
+    microphoneDevicePresent,
+    contextCharBudget: PDF_CONTEXT_CHAR_BUDGET,
+    maxHistoryMessages: MAX_CHAT_HISTORY_MESSAGES,
+    maxContextChars: MAX_CONTEXT_CHARS,
+  }), [activeProfile, interviewConfig, microphoneDevicePresent, mode, sessionDocuments]);
   const acceptedQuestionHistoryRef = useRef<string[]>([]);
   const rememberAcceptedQuestion = useCallback((question: string) => {
     const fingerprint = questionFingerprintForComparison(question);
@@ -313,123 +325,17 @@ function App() {
   const meeting = meetingController ?? EMPTY_MEETING_CONTROLLER;
   const {
     meetingAudioMode, setMeetingAudioMode, meetingMenuOpen, setMeetingMenuOpen,
-    microphoneDevices, microphoneUnavailable, selectedMicrophoneLabel, microphoneDevicePresent,
+    microphoneDevices, microphoneUnavailable, selectedMicrophoneLabel,
     isRecording, isTranscribing, audioLevel, audioStatus, systemAudioStatus, microphoneStatus,
-    pipelineStatus, chatBusy: meetingChatBusy, reportError: reportMeetingError,
+    pipelineStatus, chatBusy: meetingChatBusy,
     answeredSegments: meetingAnsweredSegments, liveTranscript, transcripts, transcriptSearch,
     setTranscriptSearch, filteredTranscripts, displayedAudioSourceLabel, startMeetingCapture,
-    stopMeetingCapture, testSystemAudio, saveMeetingTranscript, sendQuestion: sendMeetingQuestion,
+    stopMeetingCapture, testSystemAudio, saveMeetingTranscript,
   } = meeting;
-  const buildMeetingChatRequest = useCallback((
-    question: string,
-    history: MeetingChatMessage[],
-    screenImage?: string,
-  ): MeetingChatRequest => {
-      const resolvedContext = resolveContext({
-        mode,
-        sessionDocuments,
-        activeProfile,
-        contextCharBudget: PDF_CONTEXT_CHAR_BUDGET,
-        profileCharBudget: PDF_CONTEXT_CHAR_BUDGET,
-      });
-      const { domain, background } = interviewConfig;
-      const interviewContextActive = Boolean(resolvedContext.trim() || domain || background.length);
-      const directModeContextInstruction = mode === 'direct' && interviewContextActive
-        ? '\n\nDIRECT MODE ACTIVE CONTEXT:\nThe request includes the selected Resume, Job Description, profile, interview domain, and technical background when available. Use Resume/profile evidence for personal claims, Job Description for role requirements, and domain/background as interview focus only. Answer in first person as the user when the question is about their qualifications or introduction. Never switch to a generic ChatGPT identity.'
-        : '';
-      return {
-        mode,
-        messages: [
-          {
-            role: 'system' as const,
-            content: `${buildCanonicalInterviewSystemPrompt(createCanonicalInterviewContext({
-              currentQuestion: question,
-              hasCandidateContext: Boolean(resolvedContext.trim()),
-              domain,
-              background,
-            }))}${directModeContextInstruction}`,
-          },
-          ...history.slice(-MAX_CHAT_HISTORY_MESSAGES),
-          {
-            role: 'user' as const,
-            content: screenImage
-              ? [
-                { type: 'text', text: `${question}\n\nRead the attached shared-screen image. Identify any visible interview or meeting question and answer it directly. If no question is visible, say so.` },
-                { type: 'image_url', image_url: { url: screenImage } },
-              ]
-              : `CURRENT QUESTION:\n${question}\n\nTASK:\nAnswer this question directly. Stay on topic, preserve its terminology, and ask one concise clarification only if it is genuinely ambiguous.`,
-          },
-        ],
-        interviewContext: {
-          domain,
-          background,
-          microphoneConfigured: Boolean(interviewConfig.microphoneDeviceId),
-          microphoneDevicePresent: Boolean(interviewConfig.microphoneDeviceId),
-        },
-        pdfContext: resolvedContext.slice(-MAX_CONTEXT_CHARS),
-      };
-    },
-    [activeProfile, interviewConfig, mode, sessionDocuments],
-  );
-  const buildAssistantChatRequest = useCallback((
-    question: string,
-    history: AssistantChatMessage[],
-    screenImage?: string,
-    contextOverride?: string,
-  ): AssistantChatRequest => {
-      const resolvedContext = contextOverride !== undefined
-        ? contextOverride
-        : resolveContext({
-          mode,
-          sessionDocuments,
-          activeProfile,
-          contextCharBudget: PDF_CONTEXT_CHAR_BUDGET,
-          profileCharBudget: PDF_CONTEXT_CHAR_BUDGET,
-        });
-      const { domain, background } = interviewConfig;
-      const interviewContextActive = Boolean(resolvedContext.trim() || domain || background.length);
-      const directModeContextInstruction = mode === 'direct' && interviewContextActive
-        ? '\n\nDIRECT MODE ACTIVE CONTEXT:\nThe request includes the selected Resume, Job Description, profile, interview domain, and technical background when available. Use Resume/profile evidence for personal claims, Job Description for role requirements, and domain/background as interview focus only. Answer in first person as the user when the question is about their qualifications or introduction. Never switch to a generic ChatGPT identity.'
-        : '';
-      return {
-        mode,
-        messages: [
-          {
-            role: 'system',
-            content: `${buildCanonicalInterviewSystemPrompt(createCanonicalInterviewContext({
-              currentQuestion: question,
-              hasCandidateContext: Boolean(resolvedContext.trim()),
-              domain,
-              background,
-            }))}${directModeContextInstruction}`,
-          },
-          ...history.slice(-MAX_CHAT_HISTORY_MESSAGES),
-          {
-            role: 'user',
-            content: screenImage
-              ? [
-                { type: 'text', text: `${question}\n\nRead the attached shared-screen image. Identify any visible interview or meeting question and answer it directly. If no question is visible, say so.` },
-                { type: 'image_url', image_url: { url: screenImage } },
-              ]
-              : `CURRENT QUESTION:\n${question}\n\nTASK:\nAnswer this question directly. Stay on topic, preserve its terminology, and ask one concise clarification only if it is genuinely ambiguous.`,
-          },
-        ],
-        interviewContext: {
-          domain,
-          background,
-          microphoneConfigured: Boolean(interviewConfig.microphoneDeviceId),
-          microphoneDevicePresent: Boolean(microphoneDevicePresent),
-        },
-        pdfContext: resolvedContext.slice(-MAX_CONTEXT_CHARS),
-      };
-    },
-    [activeProfile, interviewConfig, mode, microphoneDevicePresent, sessionDocuments],
-  );
   const messages = assistantController?.messages ?? EMPTY_ASSISTANT_MESSAGES;
   const setMessages: AssistantControllerSnapshot['setMessages'] = assistantController?.setMessages ?? IGNORE_ASSISTANT_MESSAGES;
   const input = assistantController?.input ?? '';
   const setInput: AssistantControllerSnapshot['setInput'] = assistantController?.setInput ?? IGNORE_ASSISTANT_INPUT;
-  const chatStreaming = assistantController?.chatStreaming ?? false;
   const assistantPipelineStatus = assistantController?.pipelineStatus ?? 'ready';
   const connected = assistantController?.connected ?? false;
   const sendAssistantMessage: AssistantControllerSnapshot['sendMessage'] = assistantController?.sendMessage ?? IGNORE_ASSISTANT_SEND;
@@ -439,6 +345,14 @@ function App() {
 
   const addGeneralHistoryEntry = useCallback((entry: HistorySession) => {
     setChatHistory((previous) => upsertHistory(previous, entry));
+  }, []);
+
+  const addAssistantHistoryEntries = useCallback((conversationId: string, entries: HistorySession[]) => {
+    setChatHistory((previous) => {
+      const withoutCurrentConversation = previous.filter((session) => session.id !== conversationId
+        && !session.id.startsWith(`${conversationId}-turn-`));
+      return entries.reduce((sessions, entry) => upsertHistory(sessions, entry), withoutCurrentConversation);
+    });
   }, []);
 
   const closeConfirmation = useCallback(() => {
@@ -506,26 +420,6 @@ function App() {
     writePersistedInterviewContext(interviewConfig);
   }, [interviewConfig]);
 
-  // Save only completed turns, so streaming tokens never cause storage writes.
-  useEffect(() => {
-    const turns = completedTurnEntries(messages);
-    if (!turns.length || messages.some((message) => message.streaming)) return;
-    setChatHistory((previous) => {
-      const withoutCurrentConversation = previous.filter((session) => session.id !== activeChatId
-        && !session.id.startsWith(`${activeChatId}-turn-`));
-      return turns.reduce((sessions, turn) => {
-        const savedMessages = turn.messages.map(({ role, content }) => ({ role, content }));
-        return upsertHistory(sessions, {
-          id: `${activeChatId}-turn-${turn.index}`,
-          mode: 'assistant',
-          title: historyTitle(savedMessages),
-          messages: savedMessages,
-          updatedAt: new Date().toISOString(),
-        });
-      }, withoutCurrentConversation);
-    });
-  }, [activeChatId, messages]);
-
   const savedJobDescription = sessionDocuments.find((document) => document.name === 'Job Description: Pasted text')?.text || '';
   const closeContextMenu = useCallback(() => {
     setContextMenuOpen(false);
@@ -579,7 +473,7 @@ function App() {
     fetch(`${HTTP_URL}/api/health`)
       .then((r) => r.json())
       .then((data) => setHealth({ provider: data.provider, model: data.model }))
-      .catch(() => setError('Cannot reach the AI server. Is it running on port 3001?'));
+      .catch(() => setError(`Cannot reach the AI server at ${HTTP_URL}.`));
   }, []);
 
   const { domain, background, microphoneDeviceId } = interviewConfig;
@@ -858,35 +752,6 @@ function App() {
     return sendAssistantMessage(question, contextOverride, modelInstruction, questionFinalizedAt, options);
   };
 
-  const handleScreenReadError = useCallback((message: string) => {
-    if (appMode === 'meeting') {
-      reportMeetingError(message);
-      return;
-    }
-    setError(message);
-  }, [appMode, reportMeetingError]);
-  const { readScreen: readSharedScreen, screenReading, enabled: screenReadingEnabled, setEnabled: setScreenReadingEnabled } = useScreenReader({
-    disabled: appMode === 'assistant' ? chatStreaming : appMode === 'meeting' ? meetingChatBusy : true,
-    onError: handleScreenReadError,
-    onScreenCaptured: async (image) => {
-      if (appMode === 'meeting') {
-        await sendMeetingQuestion(
-          'Read the visible question on my shared meeting screen and answer it.',
-          { duplicateChecked: true, screenImage: image },
-        );
-        return;
-      }
-      if (appMode !== 'assistant') return;
-      await sendAssistantMessage(
-        'Read the visible question on my shared screen and answer it.',
-        undefined,
-        undefined,
-        undefined,
-        { duplicateChecked: true, screenImage: image },
-      );
-    },
-  });
-
   const chooseProvider = (value: ProviderId) => {
     if (editingProviderId) return;
     setProviderId(value);
@@ -1107,7 +972,7 @@ function App() {
     setError('');
     const hydration = retryProviderHydration(
       (signal) => loadConfiguredProviders(signal),
-      { signal: controller.signal },
+      { signal: controller.signal, delaysMs: runtimeConfig.providerHydration.retryDelaysMs },
     ).catch((err: unknown) => {
       setError(`Could not load providers: ${(err as Error).message}`);
       throw err;
@@ -1551,6 +1416,7 @@ function App() {
   }, [chatHistory.length, requestConfirmation, setInput, setMessages]);
 
   const filteredChatHistory = searchHistory(chatHistory, historySearch);
+  const activeScreenReading = appMode === 'assistant' ? assistantScreenReading : appMode === 'meeting' ? meetingScreenReading : null;
 
   const requestClearChat = useCallback(() => {
     if (!messages.length) {
@@ -1601,14 +1467,19 @@ function App() {
               onAppModeChange={setAppMode}
               onAssistantModeChange={setMode}
             />
-            <OverlayButton visible={appMode === 'assistant'} onClick={() => {
+            <OverlayButton visible={appMode === 'assistant' || appMode === 'meeting'} onClick={() => {
               if (window.electronAPI) {
                 void window.electronAPI.toggleOverlay();
               } else {
                 setError('Overlay mode is available in the Electron desktop app.');
               }
             }} />
-            {appMode === 'assistant' && <ScreenReadingToggle enabled={screenReadingEnabled} onClick={() => setScreenReadingEnabled(!screenReadingEnabled)} />}
+            {(appMode === 'assistant' || appMode === 'meeting') && activeScreenReading && (
+              <ScreenReadingToggle
+                enabled={activeScreenReading.enabled}
+                onClick={() => activeScreenReading.setEnabled(!activeScreenReading.enabled)}
+              />
+            )}
             {appMode === 'meeting' && sessionActive && <button type="button" onClick={() => setMeetingMenuOpen((open) => !open)} aria-expanded={meetingMenuOpen} className="ui-button border border-slate-700 text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
             <div className={`${appMode === 'assistant' ? '' : 'hidden'} relative`}>
               <ContextButton open={contextMenuOpen} onClick={() => (contextMenuOpen ? closeContextMenu() : openContextMenu())} />
@@ -2108,26 +1979,30 @@ function App() {
       <main className={`${appMode === 'assistant' ? 'hidden' : 'mx-auto flex min-h-[calc(100dvh-57px)] w-full max-w-3xl flex-col px-4 py-6'}`}>
         <GeneralAgentPage
           active={appMode === 'general'}
+          providers={configuredProviders}
+          onProviderStorageError={setError}
           onBusyChange={setGeneralBusy}
           onHistoryEntry={addGeneralHistoryEntry}
         />
         <CodingAgentPage
           active={appMode === 'developer'}
-          provider={health ? { id: health.provider, label: health.provider, model: health.model } : null}
+          defaultProvider={health ? { id: health.provider, label: health.provider, model: health.model } : null}
+          providers={configuredProviders}
+          onProviderStorageError={setError}
           restoreRequest={codingRestoreRequest}
           onBusyChange={setCodingBusy}
         />
         <MeetingAssistantPage
           active={appMode === 'meeting'}
+          providers={configuredProviders}
+          onProviderStorageError={setError}
           interviewConfig={interviewConfig}
           setInterviewConfig={setInterviewConfig}
           refreshConfiguredProviders={refreshConfiguredProviders}
           shouldAcceptQuestion={rememberAcceptedQuestion}
-          buildChatRequest={buildMeetingChatRequest}
-          screenReading={screenReading}
-          screenReadingEnabled={screenReadingEnabled}
-          onReadScreen={() => void readSharedScreen()}
+          requestContext={meetingRequestContext}
           onControllerChange={setMeetingController}
+          onScreenReadingChange={setMeetingScreenReading}
         />
       </main>
 
@@ -2265,12 +2140,16 @@ function App() {
       </div>}
       <AssistantAgentPage
         active={appMode === 'assistant'}
+        providers={configuredProviders}
         mode={mode}
         voiceReplies={voiceReplies}
         setError={setError}
         setStatus={setStatusMessage}
-        buildChatRequest={buildAssistantChatRequest}
+        requestContext={assistantRequestContext}
         onControllerChange={setAssistantController}
+        onScreenReadingChange={setAssistantScreenReading}
+        activeChatId={activeChatId}
+        onHistoryEntries={addAssistantHistoryEntries}
         workspace={{
           error,
           copiedItem,

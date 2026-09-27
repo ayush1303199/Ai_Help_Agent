@@ -10,7 +10,7 @@ export class ProviderHydrationRequestError extends Error {
 
 interface RetryOptions {
   signal: AbortSignal;
-  delaysMs?: number[];
+  delaysMs: number[];
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -42,7 +42,7 @@ function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
 
 export async function retryProviderHydration<T>(
   operation: (signal: AbortSignal) => Promise<T>,
-  { signal, delaysMs = [250, 500, 1000] }: RetryOptions,
+  { signal, delaysMs }: RetryOptions,
 ): Promise<T> {
   for (let attempt = 0; ; attempt += 1) {
     if (signal.aborted) throw abortError(signal);

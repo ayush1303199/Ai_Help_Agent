@@ -5,9 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from provider_model_contract import provider_capability_states
-
-
-PROVIDER_ERROR_MAX_CHARS = 10_000
+from backend_config import PROVIDER_ERROR_MAX_CHARS
 
 
 def _load_provider_error_patterns() -> tuple[Dict[str, Any], ...]:

@@ -25,6 +25,20 @@ try {
 
   globalThis.fetch = async (url, options) => {
     request = { url, options };
+    return new Response(JSON.stringify({ text: 'What is JavaScript?' }), { status: 200 });
+  };
+  await transcribeAudioSegment({
+    audio: new Blob(['audio'], { type: 'audio/webm' }),
+    endpoint: 'http://localhost:3001/api/transcribe-audio',
+    sessionId: 'session-1',
+    segmentId: 'segment-meeting',
+    payloadName: 'meeting.webm',
+    source: 'meeting_microphone',
+  });
+  assert.equal(request.options.headers['X-STT-Source'], 'meeting_microphone');
+
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
     return new Response(
       JSON.stringify({ error: 'Provider rejected audio', classification: 'STT_BAD_REQUEST' }),
       { status: 400 },

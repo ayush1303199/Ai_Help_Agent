@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { prepareTextRequest } from '../../audio/transcriptUtils';
+import { runtimeConfig } from '../../config/runtimeConfig';
 import type { AssistantMessage, AssistantSendOptions } from './useAssistantAgentController';
 
 type AssistantStatus = 'ready' | 'thinking' | 'answer' | 'error';
@@ -93,8 +94,8 @@ export function AssistantOverlayBridge({
       actionItems: answer ? buildOverlayActionItems(answer) : [],
       status,
     };
-    channelRef.current?.postMessage({ type: 'state', ...stateRef.current });
-  }, [messages, status]);
+    if (active) channelRef.current?.postMessage({ type: 'state', ...stateRef.current });
+  }, [active, messages, status]);
 
   useEffect(() => {
     if (typeof BroadcastChannel === 'undefined') return;
@@ -107,20 +108,15 @@ export function AssistantOverlayBridge({
     channelRef.current = channel;
     channel.onmessage = (event) => {
       if (event.data?.type === 'overlay-ready') {
-        channel.postMessage({ type: 'state', ...stateRef.current });
-      }
-      if (event.data?.type !== 'overlay-question') return;
-      const question = typeof event.data.question === 'string'
-        ? event.data.question.trim().slice(0, 2000)
-        : '';
-      if (!question) return;
-      if (!active) {
-        channel.postMessage({
-          type: 'overlay-search-error',
-          message: 'Switch to the AI Assistant page to use the Assistant overlay.',
-        });
+        if (active) channel.postMessage({ type: 'state', ...stateRef.current });
         return;
       }
+      if (event.data?.type !== 'overlay-question') return;
+      if (!active) return;
+      const question = typeof event.data.question === 'string'
+        ? event.data.question.trim().slice(0, runtimeConfig.overlay.questionMaxChars)
+        : '';
+      if (!question) return;
       if (chatStreaming) {
         channel.postMessage({
           type: 'overlay-search-error',

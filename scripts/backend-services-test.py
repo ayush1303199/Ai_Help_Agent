@@ -247,6 +247,45 @@ class SttServiceTests(unittest.TestCase):
             "inlineData": {"mimeType": "audio/webm", "data": "YXVkaW8="},
         })
 
+    def test_meeting_audio_uses_meeting_specific_transcription_prompt(self):
+        provider = SimpleNamespace(
+            id="gemini-instance",
+            type="gemini",
+            model="gemini-3.6-flash",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+        service = SttService(
+            get_provider=lambda: provider,
+            get_speech_capable_provider=lambda: provider,
+            get_api_key=lambda _provider_id: "test-key",
+            transcription_prompt="generic prompt",
+            meeting_transcription_prompt="meeting-only exact speech prompt",
+            max_upload_mb=1,
+            retry_attempts=0,
+            retry_delay=lambda _error, _attempt: 0,
+            retryable=lambda _error: False,
+        )
+        response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"candidates": [{"content": {"parts": [{"text": "What is JavaScript?"}]}}]},
+        )
+        audio = UploadFile(
+            filename="meeting.webm",
+            file=io.BytesIO(b"audio"),
+            headers={"content-type": "audio/webm"},
+        )
+
+        with patch("stt_service.httpx.post", return_value=response) as post:
+            result = asyncio.run(service.transcribe(
+                SimpleNamespace(headers={"x-stt-source": "meeting_microphone"}),
+                audio,
+            ))
+
+        self.assertEqual(result["text"], "What is JavaScript?")
+        prompt = post.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"]
+        self.assertTrue(prompt.startswith("meeting-only exact speech prompt"))
+        self.assertNotIn("generic prompt", prompt)
+
     def test_development_diagnostics_capture_upstream_status_and_bounded_retry_safely(self):
         import index
 

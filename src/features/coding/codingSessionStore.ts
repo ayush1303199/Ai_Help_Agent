@@ -1,3 +1,5 @@
+import { runtimeConfig } from '../../config/runtimeConfig';
+
 export interface CodingHistoryMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -36,8 +38,8 @@ export interface CodingPreference {
 
 const SESSION_KEY = 'coding-session-state';
 const PREFERENCES_KEY = 'coding-preferences-v1';
-const MAX_SESSIONS = 30;
-const MAX_PREFERENCES = 20;
+const MAX_SESSIONS = runtimeConfig.codingSession.maxSessions;
+const MAX_PREFERENCES = runtimeConfig.codingSession.maxPreferences;
 
 function isMessage(value: unknown): value is CodingHistoryMessage {
   if (!value || typeof value !== 'object') return false;
@@ -56,7 +58,7 @@ function isConversation(value: unknown): value is CodingConversationState {
 
 function sanitizePreferenceText(value: unknown): string | null {
   if (typeof value !== 'string') return null;
-  const text = value.replace(/\s+/g, ' ').trim().slice(0, 240);
+  const text = value.replace(/\s+/g, ' ').trim().slice(0, runtimeConfig.codingSession.maxPreferenceChars);
   if (!text || /(?:sk-[A-Za-z0-9_-]{12,}|bearer\s+|api[_-]?key|password|secret|token|credential|\.env|\/(?:users|home)\/|[A-Za-z]:\\)/i.test(text)) return null;
   if (/[{};]|```|<script|function\s*\(|=>/i.test(text)) return null;
   return text;
@@ -152,15 +154,20 @@ export function upsertCodingPreference(
 
 export function codingPreferenceContext(preferences: CodingPreference[]): string {
   return preferences.filter((preference) => preference.enabled)
-    .map((preference) => `- [${preference.category}] ${preference.text}`).join('\n').slice(0, 2400);
+    .map((preference) => `- [${preference.category}] ${preference.text}`).join('\n').slice(0, runtimeConfig.codingSession.maxPreferenceContextChars);
 }
 
 export function compactCodingConversation(
   session: Pick<CodingConversationState, 'messages' | 'projectRoot' | 'pendingPlan' | 'appliedPatchLog' | 'providerNeutralSummary'>,
   options: { maxTokens?: number; lastMessageCount?: number } = {},
 ) {
-  const maxTokens = Math.max(512, Math.min(options.maxTokens || 6000, 12000));
-  const lastMessageCount = Math.max(2, Math.min(options.lastMessageCount || 8, 20));
+  const {
+    minContextTokens, defaultContextTokens, maxContextTokens,
+    minRecentMessages, defaultRecentMessages, maxRecentMessages,
+    maxStoredContextChars, minContextBudgetTokens,
+  } = runtimeConfig.codingSession;
+  const maxTokens = Math.max(minContextTokens, Math.min(options.maxTokens || defaultContextTokens, maxContextTokens));
+  const lastMessageCount = Math.max(minRecentMessages, Math.min(options.lastMessageCount || defaultRecentMessages, maxRecentMessages));
   const estimate = (value: string) => Math.ceil(value.length / 4);
   const rawMessages = session.messages.map((message) => ({ role: message.role, content: message.content }));
   const rawTokens = rawMessages.reduce((total, message) => total + estimate(message.content), 0);
@@ -168,14 +175,14 @@ export function compactCodingConversation(
   const summary = String(session.providerNeutralSummary || rawMessages
     .slice(0, -lastMessageCount)
     .map((message) => `${message.role}: ${message.content}`)
-    .join('\n').slice(0, 12000) || 'No earlier Coding Agent context.');
+    .join('\n').slice(0, maxStoredContextChars) || 'No earlier Coding Agent context.');
   const durableContext = [
     `Project root: ${session.projectRoot || 'not selected'}`,
     `Pending plan: ${JSON.stringify(session.pendingPlan || null)}`,
     `Applied patch log: ${JSON.stringify(session.appliedPatchLog || [])}`,
     `Session summary: ${summary}`,
   ].join('\n');
-  const contextBudget = Math.max(64, maxTokens - recent.reduce((total, message) => total + estimate(message.content), 0));
+  const contextBudget = Math.max(minContextBudgetTokens, maxTokens - recent.reduce((total, message) => total + estimate(message.content), 0));
   const contextMessage: CodingHistoryMessage = {
     role: 'assistant',
     content: `[CODING_SESSION_CONTEXT]\n${durableContext.slice(0, contextBudget * 4)}`,

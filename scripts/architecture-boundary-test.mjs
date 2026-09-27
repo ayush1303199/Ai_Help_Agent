@@ -16,6 +16,9 @@ const assistantControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 
 const assistantTransportSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'assistant', 'assistantTransport.ts'), 'utf8');
 const assistantPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'assistant', 'AssistantAgentPage.tsx'), 'utf8');
 const assistantWorkspaceSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'assistant', 'AssistantAgentWorkspace.tsx'), 'utf8');
+const providerSelectionSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'provider-selection', 'useAgentProviderSelection.ts'), 'utf8');
+const providerSelectComponentSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'provider-selection', 'AgentProviderSelect.tsx'), 'utf8');
+const screenReaderSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'screen-reading', 'useScreenReader.ts'), 'utf8');
 const agentRoots = Object.freeze({
   assistant: [
     'src/features/assistant',
@@ -135,7 +138,7 @@ const codingMeetingFixtureViolations = findCrossAgentImports([
   },
 ]);
 assert.equal(codingMeetingFixtureViolations.length, 2, 'The boundary checker must reject imports between Coding and Meeting.');
-assert.match(generalPageSource, /useGeneralAgentController\(\)/, 'The General Agent page must own its controller lifecycle.');
+assert.match(generalPageSource, /useGeneralAgentController\(\{ providerId \}\)/, 'The General Agent page must own its controller lifecycle and provider selection.');
 assert.match(generalPageSource, /<GeneralAgentWorkspace/, 'The General Agent page must render its own workspace.');
 assert.match(generalPageSource, /onHistoryEntry\(/, 'General Agent history records must leave the page through a typed callback.');
 assert.doesNotMatch(appSource, /useGeneralAgentController/, 'App composition must not construct the General Agent controller.');
@@ -166,7 +169,20 @@ assert.match(assistantControllerSource, /new AssistantAgentTransport\(/, 'Assist
 assert.match(assistantTransportSource, /ASSISTANT_WS_URL = .*\/assistant/, 'Assistant transport must use its isolated endpoint.');
 assert.match(assistantTransportSource, /agent: 'assistant'/, 'Assistant transport must identify its own endpoint.');
 assert.doesNotMatch(appSource, /new WebSocket|wsRef|wsConnectPromiseRef|handleWsMessage|pendingChatRequestIdsRef|draftImproveRequestIdRef/, 'Assistant WebSocket lifecycle and request routing must stay in the Assistant feature.');
-assert.match(appSource, /buildChatRequest=\{buildMeetingChatRequest\}/, 'App must provide Meeting context through an injected request-builder contract.');
+assert.match(appSource, /requestContext=\{meetingRequestContext\}/, 'App must provide Meeting context through its typed feature-owned request contract.');
+assert.match(appSource, /requestContext=\{assistantRequestContext\}/, 'App must provide Assistant context through its typed feature-owned request contract.');
+assert.match(assistantPageSource, /buildAssistantChatRequest\(requestContext/, 'Assistant prompt construction must stay in the Assistant feature.');
+assert.match(meetingPageSource, /buildMeetingChatRequest\(requestContext/, 'Meeting prompt construction must stay in the Meeting feature.');
+assert.match(appSource, /onHistoryEntries=\{addAssistantHistoryEntries\}/, 'Assistant history must cross the page boundary through a feature-owned completed-turn callback.');
+assert.doesNotMatch(appSource, /completedTurnEntries/, 'Assistant completed-turn history generation must stay out of App.');
+assert.match(providerSelectionSource, /ai-help-agent-provider-selection:\$\{agentId\}/, 'Agent provider preferences must be stored independently per agent.');
+assert.match(providerSelectionSource, /provider\.enabled && provider\.hasApiKey/, 'Agent provider preferences must reject disabled or unconfigured provider instances.');
+assert.match(providerSelectComponentSource, /provider\.enabled && provider\.hasApiKey/, 'Agent selectors must only expose enabled providers with shared credentials.');
+assert.match(providerSelectComponentSource, /Automatic \(enabled provider fallback\)/, 'Agent provider selection must preserve automatic provider fallback.');
+assert.doesNotMatch(meetingPageSource, /<AgentProviderSelect/, 'Meeting provider selection must remain hidden from the Meeting page.');
+assert.match(assistantPageSource, /useScreenReader\(\{[\s\S]*storageKey: 'assistant-screen-reading-enabled'/, 'Assistant must own its independent screen-reading preference.');
+assert.match(meetingPageSource, /useScreenReader\(\{[\s\S]*storageKey: 'meeting-screen-reading-enabled'/, 'Meeting must own its independent screen-reading preference.');
+assert.match(screenReaderSource, /if \(enabled && !disabled && event\.ctrlKey/, 'Inactive feature pages must not intercept screen-reading shortcuts.');
 assert.doesNotMatch(
   appSource,
   /transcribeAudioSegment|MediaRecorder|getUserMedia|segmentProcessorRef|captureSessionIdRef|pendingPartialQuestionRef|const (?:start|stop)MeetingCapture|const requestMeetingAudioStream/,

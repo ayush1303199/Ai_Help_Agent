@@ -1,16 +1,21 @@
 import { useEffect } from 'react';
 import { historyTitle, type HistorySession } from '../../history/historyService';
+import { AgentProviderSelect } from '../provider-selection/AgentProviderSelect';
+import { useAgentProviderSelection, type AgentProviderOption } from '../provider-selection/useAgentProviderSelection';
 import { GeneralAgentWorkspace } from './GeneralAgentWorkspace';
 import { useGeneralAgentController } from './useGeneralAgentController';
 
 interface GeneralAgentPageProps {
   active: boolean;
+  providers: AgentProviderOption[];
+  onProviderStorageError: (message: string) => void;
   onBusyChange: (busy: boolean) => void;
   onHistoryEntry: (entry: HistorySession) => void;
 }
 
-export function GeneralAgentPage({ active, onBusyChange, onHistoryEntry }: GeneralAgentPageProps) {
-  const controller = useGeneralAgentController();
+export function GeneralAgentPage({ active, providers, onProviderStorageError, onBusyChange, onHistoryEntry }: GeneralAgentPageProps) {
+  const { providerId, setProviderId } = useAgentProviderSelection('general', providers, onProviderStorageError);
+  const controller = useGeneralAgentController({ providerId });
 
   useEffect(() => {
     onBusyChange(controller.busy);
@@ -39,6 +44,7 @@ export function GeneralAgentPage({ active, onBusyChange, onHistoryEntry }: Gener
         <h2 className="mt-1 text-xl font-semibold">What do you want me to do?</h2>
         <p className="mt-2 text-xs text-slate-500">Describe the outcome naturally. I will choose a bounded, read-only path and ask before any external action.</p>
       </div>
+      <AgentProviderSelect agentId="general" providers={providers} value={providerId} onChange={setProviderId} />
       <GeneralAgentWorkspace
         generalTask={controller.task}
         generalGoal={controller.goal}

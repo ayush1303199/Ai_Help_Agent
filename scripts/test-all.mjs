@@ -3,6 +3,7 @@ import path from 'node:path';
 
 const scripts = [
   'architecture-boundary-test.mjs',
+  'runtime-settings-test.mjs',
   'developer-pipeline-contract-test.mjs',
   'developer-agent-test.mjs',
   'developer-project-discovery-test.mjs',

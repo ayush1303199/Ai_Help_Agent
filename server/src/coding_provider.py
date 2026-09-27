@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from openai import OpenAI
 from provider_model_contract import ProviderModelConfigurationError, provider_model_error
+from backend_config import CODING_COMPLETION_TOKENS, MODEL_REQUEST_TIMEOUT_SECONDS
 
 
 OPENAI_COMPATIBLE = {
@@ -15,7 +16,7 @@ OPENAI_COMPATIBLE = {
     "mistral", "xai", "perplexity", "fireworks", "cerebras", "custom",
     "custom-openai",
 }
-CODING_MAX_COMPLETION_TOKENS = 1024
+CODING_MAX_COMPLETION_TOKENS = CODING_COMPLETION_TOKENS
 
 
 def _api_key(registry: Any, provider: Any, config_path: Path) -> str:
@@ -38,8 +39,18 @@ def _api_key(registry: Any, provider: Any, config_path: Path) -> str:
     return ""
 
 
-def _candidates(registry: Any) -> List[Any]:
+def _candidates(registry: Any, provider_id: Optional[str] = None) -> List[Any]:
     result = []
+    if provider_id:
+        requested = registry.get_provider(provider_id)
+        if not requested:
+            raise RuntimeError("The selected Coding Agent provider is no longer configured.")
+        if not requested.enabled:
+            raise RuntimeError("The selected Coding Agent provider is disabled.")
+        configuration_error = provider_model_error(requested.type, requested.model, requested.base_url)
+        if configuration_error:
+            raise ProviderModelConfigurationError(configuration_error)
+        return [requested]
     active = registry.get_active_provider()
     if active:
         configuration_error = provider_model_error(active.type, active.model, active.base_url)
@@ -135,7 +146,7 @@ def _anthropic_request(
         f"{provider.base_url.rstrip('/')}/messages",
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
         json=body,
-        timeout=60,
+        timeout=MODEL_REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     payload = response.json()
@@ -229,7 +240,7 @@ def _gemini_request(
         f"{provider.base_url.rstrip('/')}/models/{provider.model}:generateContent",
         headers={"x-goog-api-key": api_key, "content-type": "application/json"},
         json=body,
-        timeout=60,
+        timeout=MODEL_REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     payload = response.json()
@@ -258,9 +269,10 @@ def complete_coding_model(
     config_path: Path,
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
+    provider_id: Optional[str] = None,
 ) -> tuple[Dict[str, Any], Any]:
     """Run Coding-only provider selection and response adaptation."""
-    candidates = _candidates(registry)
+    candidates = _candidates(registry, provider_id)
     if not candidates:
         raise RuntimeError("No provider is configured for the Coding Agent.")
     errors = []

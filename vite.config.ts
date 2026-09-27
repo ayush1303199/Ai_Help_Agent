@@ -1,16 +1,23 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { fileURLToPath, URL } from 'node:url';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { services } = require('./src/config/runtimeSettings.json');
+const { http, websocket, codingWebsocket, devServer } = services;
+const devServerUrl = `http://${devServer.host}:${devServer.port}`;
+const toWebSocketUrl = (url: string) => url.replace(/^http:/, 'ws:');
 
 const developmentCsp = [
   "default-src 'self'",
   "base-uri 'self'",
   "object-src 'none'",
-  "script-src 'self' 'unsafe-inline' http://localhost:5174",
+  `script-src 'self' 'unsafe-inline' ${devServerUrl}`,
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
-  "connect-src 'self' http://localhost:3001 ws://localhost:3002 ws://localhost:5174 ws://127.0.0.1:3003",
+  `connect-src 'self' ${http.baseUrl} ${websocket.baseUrl} ${toWebSocketUrl(devServerUrl)} ${codingWebsocket.baseUrl}`,
   "media-src 'self' blob:",
 ].join('; ');
 
@@ -22,7 +29,7 @@ const productionCsp = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
-  "connect-src 'self' http://localhost:3001 ws://localhost:3002 ws://127.0.0.1:3003",
+  `connect-src 'self' ${http.baseUrl} ${websocket.baseUrl} ${codingWebsocket.baseUrl}`,
   "media-src 'self' blob:",
 ].join('; ');
 

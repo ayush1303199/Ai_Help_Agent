@@ -1,0 +1,158 @@
+{
+  "services": {
+    "http": {
+      "host": "localhost",
+      "port": 3001,
+      "baseUrl": "http://localhost:3001"
+    },
+    "websocket": {
+      "host": "localhost",
+      "port": 3002,
+      "baseUrl": "ws://localhost:3002"
+    },
+    "codingWebsocket": {
+      "host": "127.0.0.1",
+      "port": 3003,
+      "baseUrl": "ws://127.0.0.1:3003"
+    },
+    "devServer": {
+      "host": "localhost",
+      "port": 5174,
+      "startupTimeoutMs": 30000,
+      "probeIntervalMs": 250,
+      "httpProbeTimeoutMs": 1000,
+      "tcpProbeTimeoutMs": 500
+    }
+  },
+  "client": {
+    "limits": {
+      "maxChatHistoryMessages": 4,
+      "maxChatMessageChars": 900,
+      "maxContextChars": 6000,
+      "maxPdfSizeBytes": 20971520,
+      "pdfContextBudgetRatio": 0.65,
+      "pdfUploadTimeoutMs": 20000
+    },
+    "transport": {
+      "connectTimeoutMs": 10000,
+      "requestTimeoutMs": 75000
+    },
+    "providerHydration": {
+      "retryDelaysMs": [250, 500, 1000]
+    },
+    "audio": {
+      "systemSilenceMs": 1800,
+      "systemLevelThreshold": 2,
+      "voiceHighPassHz": 100,
+      "voiceLowPassHz": 7500,
+      "voiceCompressorThresholdDb": -28,
+      "voiceCompressorRatio": 4,
+      "continuationTimeoutMs": 3000,
+      "continuationMaxChars": 240,
+      "shortFragmentMaxWords": 2,
+      "shortFragmentMaxDurationMs": 5000
+    },
+    "history": {
+      "maxSessions": 30,
+      "maxCodingPreferences": 20
+    },
+    "codingSession": {
+      "maxSessions": 30,
+      "maxPreferences": 20,
+      "maxPreferenceChars": 240,
+      "maxPreferenceContextChars": 2400,
+      "maxContextTokens": 12000,
+      "defaultContextTokens": 6000,
+      "minContextTokens": 512,
+      "maxRecentMessages": 20,
+      "defaultRecentMessages": 8,
+      "minRecentMessages": 2,
+      "maxStoredContextChars": 12000,
+      "minContextBudgetTokens": 64
+    }
+  },
+  "backend": {
+    "maxPdfMb": 10,
+    "maxCompletionTokens": 384,
+    "providerRetryAttempts": 1,
+    "providerRetryMaxSeconds": 4,
+    "maxModelInputChars": 14000,
+    "maxModelMessageChars": 1800,
+    "maxModelSystemChars": 13000,
+    "generalContextCharBudget": 18000,
+    "generalContextMessageChars": 2200,
+    "generalForcedContextMessageChars": 1400,
+    "generalMinimumMessageBudgetChars": 2400,
+    "generalRetryDelaySeconds": 1,
+    "modelRequestTimeoutSeconds": 60,
+    "modelCatalogTimeoutSeconds": 15,
+    "sttRequestTimeoutSeconds": 60,
+    "codingCompletionTokens": 1024,
+    "codingToolRounds": 7,
+    "codingConversationChars": 16000,
+    "codingToolResultChars": 6000,
+    "codingFinalEvidenceChars": 6000,
+    "codingToolWaitTimeoutSeconds": 30,
+    "codingMaxHistoryMessages": 12,
+    "codingMaxPathChars": 512,
+    "codingMaxRequestChars": 500,
+    "providerErrorMaxChars": 10000,
+    "agentActivityMaxEntries": 100,
+    "transcriptionPrompt": "Transcribe only the words spoken in the audio. Do not paraphrase, complete, or convert a request into a self-answer. Preserve clearly spoken technical product names exactly. Technical vocabulary: Spring Boot, Spring Security, dependency injection, Hibernate, JPA, Java, JavaScript, TypeScript, React, React.js, Node.js, Python, FastAPI, OpenAI, Copilot, Groq, API, REST API, Microservices, SQL, PostgreSQL, MySQL, Docker, Kubernetes, AWS, Azure, GitHub. If a word is uncertain, return the audible wording instead of inventing a correction.",
+    "meetingTranscriptionPrompt": "Transcribe the audible speech exactly, in its original language. Preserve technical terms and complete questions. Do not answer, summarize, infer missing words, or repeat words not clearly spoken. Return an empty transcript when no speech is intelligible."
+  },
+  "developer": {
+    "maxFileBytes": 524288,
+    "maxSearchResults": 100,
+    "maxSearchFiles": 2000,
+    "maxCommandDurationMs": 120000,
+    "maxOutputChars": 12000,
+    "maxRuntimeFrames": 12,
+    "maxRuntimeSourceLines": 9,
+    "projectDiscoveryMaxDepth": 3,
+    "projectDiscoveryTimeoutMs": 5000,
+    "projectDiscoveryMaxDirectories": 2000,
+    "projectDiscoveryMaxMatches": 20,
+    "maxRequestChars": 4000,
+    "maxProposalBytes": 2097152,
+    "maxStateHistoryEntries": 20,
+    "maxSummaryChars": 2000,
+    "contextMinTokens": 64,
+    "contextDefaultTokens": 4000,
+    "contextMaxTokens": 12000,
+    "contextDefaultEvidenceTokens": 1800,
+    "contextMaxEvidenceTokens": 4000,
+    "contextMaxFiles": 20,
+    "contextMaxQueryChars": 200,
+    "contextMaxResults": 500,
+    "contextMaxRuntimeFrames": 8,
+    "contextMaxRuntimeMessageChars": 1000,
+    "contextDefaultPreferenceTokens": 600,
+    "contextMaxPreferenceTokens": 1200,
+    "contextMaxPreferences": 20,
+    "contextMaxPreferenceCategoryChars": 32,
+    "contextMaxPreferenceChars": 240,
+    "proposalMaxBytes": 2097152
+  },
+  "electron": {
+    "backendStartupTimeoutMs": 30000,
+    "portConnectTimeoutMs": 1000,
+    "portProbeTimeoutMs": 500,
+    "portRetryDelayMs": 250,
+    "overlay": {
+      "minOpacity": 0.2,
+      "maxOpacity": 1,
+      "opacityStep": 0.1,
+      "questionMaxChars": 2000,
+      "minWidth": 320,
+      "minHeight": 180,
+      "defaultWidth": 620,
+      "defaultHeight": 420,
+      "miniWidth": 320,
+      "miniHeight": 128,
+      "autoHideDelayMs": 5000,
+      "boundsPersistDelayMs": 200,
+      "captureCommandConfirmTimeoutMs": 6000
+    }
+  }
+}

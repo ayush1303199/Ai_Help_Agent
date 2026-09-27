@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { developer: developerSettings } = require('../src/config/runtimeSettings.json');
 
 const STATES = Object.freeze([
   'idle', 'reading', 'understanding', 'proposal_ready', 'awaiting_approval',
@@ -49,7 +50,7 @@ let auditError = null;
 let eventSequence = 0;
 
 function now() { return new Date().toISOString(); }
-function bounded(value, limit = 2000) {
+function bounded(value, limit = developerSettings.maxSummaryChars) {
   const text = String(value ?? '');
   return text.length <= limit ? text : `${text.slice(0, limit)}…[truncated]`;
 }
@@ -144,7 +145,7 @@ function assertConversationOwner(turn, owner) {
 }
 function beginConversationTurn({ root, scope = '.', request, sessionId, ownerWebContentsId }) {
   if (!sessionId || ownerWebContentsId === undefined) throw new Error('Developer session ownership is required.');
-  if (typeof request !== 'string' || !request.trim() || request.length > 4000) throw new Error('Coding request is invalid or too long.');
+  if (typeof request !== 'string' || !request.trim() || request.length > developerSettings.maxRequestChars) throw new Error('Coding request is invalid or too long.');
   const turn = {
     turnId: crypto.randomUUID(), sessionId, ownerWebContentsId, root, scope,
     state: 'reading', createdAt: now(), updatedAt: now(),
@@ -289,10 +290,10 @@ function runtimeState(task) {
     plan: state.plan || null,
     taskGraph: state.taskGraph || null,
     assumptions: Array.isArray(state.assumptions) ? [...state.assumptions] : [],
-    observations: Array.isArray(state.observations) ? [...state.observations].slice(-20) : [],
+    observations: Array.isArray(state.observations) ? [...state.observations].slice(-developerSettings.maxStateHistoryEntries) : [],
     metrics: { ...state.metrics },
     taskMemory: { ...state.taskMemory },
-    history: Array.isArray(state.history) ? [...state.history].slice(-20) : [],
+    history: Array.isArray(state.history) ? [...state.history].slice(-developerSettings.maxStateHistoryEntries) : [],
     lastUpdated: state.lastUpdated,
   };
 }
@@ -339,7 +340,7 @@ async function snapshot(root, relative) {
   return { path: safe.relative, hash: hash(content), content };
 }
 function parsePatch(raw) {
-  if (typeof raw !== 'string' || raw.length > 2 * 1024 * 1024) throw new Error('Proposal is invalid or too large.');
+  if (typeof raw !== 'string' || raw.length > developerSettings.proposalMaxBytes) throw new Error('Proposal is invalid or too large.');
   if (/^\s*NO_CHANGES\s*$/i.test(raw)) return [];
   const lines = raw.replace(/^```(?:diff|patch)?\s*/i, '').replace(/\s*```\s*$/, '').split(/\r?\n/);
   const files = []; let current;
@@ -445,7 +446,7 @@ function approve(taskId, owner) {
   task.runtime = task.runtime || {};
   task.runtime.phase = 'AWAITING_APPROVAL';
   task.runtime.taskState = 'AWAITING_APPROVAL';
-  task.runtime.history = [...(task.runtime.history || []), { phase: 'AWAITING_APPROVAL', at: now(), message: 'User approved the proposal.' }].slice(-20);
+  task.runtime.history = [...(task.runtime.history || []), { phase: 'AWAITING_APPROVAL', at: now(), message: 'User approved the proposal.' }].slice(-developerSettings.maxStateHistoryEntries);
   task.runtime.lastUpdated = now();
   transition(task, 'approved');
   recordMutation(task, 'proposal_approved', { proposalId: task.proposalId || taskId, actor: task.approval.actor });
@@ -457,7 +458,7 @@ function reject(taskId, owner) {
   task.runtime = task.runtime || {};
   task.runtime.phase = 'CANCELLED';
   task.runtime.taskState = 'CANCELLED';
-  task.runtime.history = [...(task.runtime.history || []), { phase: 'CANCELLED', at: now(), message: 'User rejected the proposal.' }].slice(-20);
+  task.runtime.history = [...(task.runtime.history || []), { phase: 'CANCELLED', at: now(), message: 'User rejected the proposal.' }].slice(-developerSettings.maxStateHistoryEntries);
   task.runtime.lastUpdated = now();
   transition(task, 'cancelled');
   recordMutation(task, 'proposal_rejected', { proposalId: task.proposalId || taskId });
@@ -528,7 +529,7 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     task.runtime = task.runtime || {};
     task.runtime.phase = 'APPLYING';
     task.runtime.taskState = 'APPLYING';
-    task.runtime.history = [...(task.runtime.history || []), { phase: 'APPLYING', at: now(), message: 'Applying validated patch.' }].slice(-20);
+    task.runtime.history = [...(task.runtime.history || []), { phase: 'APPLYING', at: now(), message: 'Applying validated patch.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'apply', 'Applying validated patch.');
     const current = await Promise.all(task.before.map((item) => snapshot(task.root, item.path)));
@@ -542,7 +543,7 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     task.runtime = task.runtime || {};
     task.runtime.phase = 'VERIFYING';
     task.runtime.taskState = 'VERIFYING';
-    task.runtime.history = [...(task.runtime.history || []), { phase: 'VERIFYING', at: now(), message: 'Running approved verification.' }].slice(-20);
+    task.runtime.history = [...(task.runtime.history || []), { phase: 'VERIFYING', at: now(), message: 'Running approved verification.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'verify', 'Running approved verification.');
     if (verifyRunner) {
@@ -562,7 +563,7 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     task.runtime.phase = 'COMPLETED';
     task.runtime.taskState = 'COMPLETED';
     task.runtime.metrics = { ...(task.runtime.metrics || {}), verificationRuns: Number(task.runtime.metrics?.verificationRuns || 0) + 1, confidence: 'HIGH' };
-    task.runtime.history = [...(task.runtime.history || []), { phase: 'COMPLETED', at: now(), message: 'Apply and verification completed.' }].slice(-20);
+    task.runtime.history = [...(task.runtime.history || []), { phase: 'COMPLETED', at: now(), message: 'Apply and verification completed.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'complete', 'Apply and verification completed.');
     return publicTask(task);

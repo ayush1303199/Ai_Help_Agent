@@ -3,24 +3,25 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+const { developer: developerSettings } = require('../src/config/runtimeSettings.json');
 const { detectProject, PROJECT_MANIFESTS, VERIFICATION_PROFILES } = require('./coding-pipeline/detect/projectDetector.cjs');
 
-const MAX_FILE_BYTES = 512 * 1024;
-const MAX_SEARCH_RESULTS = 100;
-const MAX_SEARCH_FILES = 2000;
+const MAX_FILE_BYTES = developerSettings.maxFileBytes;
+const MAX_SEARCH_RESULTS = developerSettings.maxSearchResults;
+const MAX_SEARCH_FILES = developerSettings.maxSearchFiles;
 const IGNORED_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', 'logs', 'tmp', 'temp', '.dev-mode-audit.log']);
 function isIgnoredName(name) {
   const normalized = String(name || '').toLowerCase();
   return IGNORED_NAMES.has(normalized) || normalized.startsWith('.developer-journal-') || normalized.endsWith('.log');
 }
-const MAX_COMMAND_DURATION_MS = 120000;
-const MAX_OUTPUT_CHARS = 12000;
-const MAX_RUNTIME_FRAMES = 12;
-const MAX_RUNTIME_SOURCE_LINES = 9;
-const PROJECT_DISCOVERY_MAX_DEPTH = 3;
-const PROJECT_DISCOVERY_TIMEOUT_MS = 5000;
-const PROJECT_DISCOVERY_MAX_DIRECTORIES = 2000;
-const PROJECT_DISCOVERY_MAX_MATCHES = 20;
+const MAX_COMMAND_DURATION_MS = developerSettings.maxCommandDurationMs;
+const MAX_OUTPUT_CHARS = developerSettings.maxOutputChars;
+const MAX_RUNTIME_FRAMES = developerSettings.maxRuntimeFrames;
+const MAX_RUNTIME_SOURCE_LINES = developerSettings.maxRuntimeSourceLines;
+const PROJECT_DISCOVERY_MAX_DEPTH = developerSettings.projectDiscoveryMaxDepth;
+const PROJECT_DISCOVERY_TIMEOUT_MS = developerSettings.projectDiscoveryTimeoutMs;
+const PROJECT_DISCOVERY_MAX_DIRECTORIES = developerSettings.projectDiscoveryMaxDirectories;
+const PROJECT_DISCOVERY_MAX_MATCHES = developerSettings.projectDiscoveryMaxMatches;
 const PROJECT_DISCOVERY_EXCLUDED_NAMES = new Set([
   ...IGNORED_NAMES,
   '.ssh',
@@ -378,7 +379,7 @@ async function readFile(relativePath, ownerWebContentsId) {
   const { root, target } = await resolveProjectPath(relativePath, ownerWebContentsId);
   const stat = await fs.stat(target);
   if (!stat.isFile()) throw new Error('The requested path is not a file.');
-  if (stat.size > MAX_FILE_BYTES) throw new Error('File is too large to read (512KB limit).');
+  if (stat.size > MAX_FILE_BYTES) throw new Error(`File is too large to read (${Math.floor(MAX_FILE_BYTES / 1024)}KB limit).`);
   const result = { path: relativePath, content: await fs.readFile(target, 'utf8') };
   await appendAudit(root, 'read_file', relativePath, 'success');
   return result;

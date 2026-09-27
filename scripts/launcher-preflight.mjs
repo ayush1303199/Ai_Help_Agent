@@ -3,9 +3,17 @@ import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { createRequire } from 'node:module';
 
 const execFileAsync = promisify(execFile);
-const ports = [5174, 3001, 3002];
+const require = createRequire(import.meta.url);
+const { services } = require('../src/config/runtimeSettings.json');
+const ports = [
+  services.devServer.port,
+  services.http.port,
+  services.websocket.port,
+  services.codingWebsocket.port,
+];
 const projectRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const normalizedRoot = normalize(projectRoot);
 

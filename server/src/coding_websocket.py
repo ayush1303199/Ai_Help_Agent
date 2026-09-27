@@ -6,6 +6,16 @@ import re
 from typing import Any, Dict, List
 
 from coding_provider import complete_coding_model
+from backend_config import (
+    CODING_CONVERSATION_CHARS,
+    CODING_FINAL_EVIDENCE_CHARS,
+    CODING_MAX_HISTORY_MESSAGES,
+    CODING_MAX_PATH_CHARS,
+    CODING_MAX_REQUEST_CHARS,
+    CODING_TOOL_RESULT_CHARS,
+    CODING_TOOL_ROUNDS,
+    CODING_TOOL_WAIT_TIMEOUT_SECONDS,
+)
 
 
 def _proposal_prompt_instruction(retry: bool = False) -> str:
@@ -112,10 +122,10 @@ TOOL_ALIASES = {
     "repo_browser.read_file": "read_file",
     "repo_browser.open_file": "read_file",
 }
-MAX_CODING_TOOL_ROUNDS = 7
-MAX_CODING_CONVERSATION_CHARS = 16000
-MAX_CODING_TOOL_RESULT_CHARS = 6000
-MAX_CODING_FINAL_EVIDENCE_CHARS = 6000
+MAX_CODING_TOOL_ROUNDS = CODING_TOOL_ROUNDS
+MAX_CODING_CONVERSATION_CHARS = CODING_CONVERSATION_CHARS
+MAX_CODING_TOOL_RESULT_CHARS = CODING_TOOL_RESULT_CHARS
+MAX_CODING_FINAL_EVIDENCE_CHARS = CODING_FINAL_EVIDENCE_CHARS
 UNIFIED_DIFF_EXAMPLE = (
     "--- a/path/to/file\n"
     "+++ b/path/to/file\n"
@@ -321,11 +331,11 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         raise ValueError("Coding Agent tool arguments must be an object.")
     if name in TOOL_ALIASES:
         path = arguments.get("path")
-        if not isinstance(path, str) or len(path) > 512:
+        if not isinstance(path, str) or len(path) > CODING_MAX_PATH_CHARS:
             raise ValueError("Coding Agent file path is invalid or too long.")
         return TOOL_ALIASES[name], {"relativePath": path}
     for key in ("query", "relativePath"):
-        if key in arguments and (not isinstance(arguments[key], str) or len(arguments[key]) > 512):
+        if key in arguments and (not isinstance(arguments[key], str) or len(arguments[key]) > CODING_MAX_PATH_CHARS):
             raise ValueError(f"Coding Agent {key} is invalid or too long.")
     return name, arguments
 
@@ -342,7 +352,7 @@ async def _wait_for_tool(state: Dict[str, Any], request_id: str, tool_call_id: s
     future = loop.create_future()
     state["pending"][key] = future
     try:
-        return await asyncio.wait_for(future, timeout=30)
+        return await asyncio.wait_for(future, timeout=CODING_TOOL_WAIT_TIMEOUT_SECONDS)
     finally:
         state["pending"].pop(key, None)
 
@@ -379,19 +389,20 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
 
 async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, Any], registry: Any, config_path: Any) -> None:
     request_id = str(payload.get("requestId") or "")
+    selected_provider_id = str(payload.get("providerId") or "").strip() or None
     supplied = [
         {"role": item.get("role"), "content": item.get("content")}
         for item in payload.get("messages", [])
         if isinstance(item, dict) and item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str)
-    ][-12:]
+    ][-CODING_MAX_HISTORY_MESSAGES:]
     request = _last_user_message(supplied)
     if not request:
         await _send(send_json, {"type": "error", "requestId": request_id, "message": "The Coding Agent request is empty."})
         return
     proposal_required = _requires_proposal(request)
-    scope = str(payload.get("scope") or ".")[:512]
+    scope = str(payload.get("scope") or ".")[:CODING_MAX_PATH_CHARS]
     plan = {
-        "goal": request[:500],
+        "goal": request[:CODING_MAX_REQUEST_CHARS],
         "scope": scope,
         "steps": ["Understand the request", "Find the most relevant project files", "Read evidence", "Prepare a safe response"],
     }
@@ -436,7 +447,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             })
             message, selected_provider = await asyncio.to_thread(
                 complete_coding_model, registry, config_path,
-                _compact_coding_conversation(conversation), CODING_TOOLS,
+                _compact_coding_conversation(conversation), CODING_TOOLS, selected_provider_id,
             )
             conversation.append(message)
             calls = message.get("tool_calls") or []
@@ -480,7 +491,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             })
             final_message, selected_provider = await asyncio.to_thread(
                 complete_coding_model, registry, config_path,
-                _coding_finalization_messages(conversation, proposal_required), None,
+                _coding_finalization_messages(conversation, proposal_required), None, selected_provider_id,
             )
         content = str(final_message.get("content") or "").strip()
         if not content:
@@ -494,6 +505,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     config_path,
                     _coding_finalization_messages(conversation, proposal_required=True, retry=True),
                     None,
+                    selected_provider_id,
                 )
                 content = str(final_message.get("content") or "").strip()
                 diagnostics.append(_proposal_response_shape(content))

@@ -1,14 +1,16 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { EyeOff, Minus, PanelTop, Plus, Search, Sparkles, X } from 'lucide-react';
+import { runtimeConfig } from './config/runtimeConfig';
+import { meetingOverlayStage, shouldAcceptOverlayAgentState } from './features/meeting/meetingOverlayProtocol';
 import { renderAnswerMarkdown } from './ui/answerMarkdown';
 
 type OverlayVisibility = 'VISIBLE' | 'MINIMIZED' | 'HIDDEN';
 type OverlayTab = 'answer' | 'analysis' | 'summary' | 'action-items';
 
 type OverlayBounds = { x: number; y: number; width: number; height: number };
-const OVERLAY_MIN_OPACITY = 0.2;
-const OVERLAY_MAX_OPACITY = 1;
-const OVERLAY_OPACITY_STEP = 0.1;
+const OVERLAY_MIN_OPACITY = runtimeConfig.overlay.minOpacity;
+const OVERLAY_MAX_OPACITY = runtimeConfig.overlay.maxOpacity;
+const OVERLAY_OPACITY_STEP = runtimeConfig.overlay.opacityStep;
 
 type OverlayState = {
   answer?: string;
@@ -17,6 +19,8 @@ type OverlayState = {
   summary?: string | string[] | null;
   actionItems?: unknown;
   status?: string;
+  statusMessage?: string;
+  error?: string;
   visibility?: OverlayVisibility;
   lowVisibility?: boolean;
   opacity?: number;
@@ -26,6 +30,12 @@ type OverlayState = {
   activeTab?: OverlayTab;
   bounds?: OverlayBounds;
   expandedBounds?: OverlayBounds;
+  agent?: 'assistant' | 'meeting';
+  captureActive?: boolean;
+  transcribing?: boolean;
+  meetingActive?: boolean;
+  version?: number;
+  updatedAt?: number;
 };
 
 const defaultOverlayState: OverlayState = {
@@ -37,13 +47,13 @@ const defaultOverlayState: OverlayState = {
   status: 'ready',
   visibility: 'VISIBLE',
   lowVisibility: false,
-  opacity: 1,
+  opacity: OVERLAY_MAX_OPACITY,
   autoHideEnabled: true,
-  autoHideDelay: 5000,
+  autoHideDelay: runtimeConfig.overlay.autoHideDelayMs,
   alwaysOnTop: true,
   activeTab: 'answer',
-  bounds: { x: 0, y: 0, width: 620, height: 420 },
-  expandedBounds: { x: 0, y: 0, width: 620, height: 420 },
+  bounds: { x: 0, y: 0, width: runtimeConfig.overlay.defaultWidth, height: runtimeConfig.overlay.defaultHeight },
+  expandedBounds: { x: 0, y: 0, width: runtimeConfig.overlay.defaultWidth, height: runtimeConfig.overlay.defaultHeight },
 };
 
 const tabConfig: Array<{ id: OverlayTab; label: string }> = [
@@ -71,11 +81,16 @@ function getStatusLabel(status?: string) {
     case 'listening':
       return 'Listening';
     case 'thinking':
-      return 'Thinking';
+    case 'question':
+      return 'Answering';
     case 'answer':
       return 'Answer ready';
     case 'transcribing':
       return 'Transcribing';
+    case 'error':
+      return 'Request failed';
+    case 'stopped':
+      return 'Stopped';
     default:
       return 'Ready';
   }
@@ -129,11 +144,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function isMissingMeetingOverlayHandler(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("No handler registered for 'meeting-overlay:");
+}
+
 function mergeOverlayState(previous: OverlayState, incoming: unknown): OverlayState {
   if (!isRecord(incoming)) return previous;
+  if (!shouldAcceptOverlayAgentState(previous, incoming)) return previous;
   const next = { ...previous };
   if (typeof incoming.answer === 'string') next.answer = incoming.answer;
+  if (typeof incoming.question === 'string') next.question = incoming.question;
   if (typeof incoming.status === 'string') next.status = incoming.status;
+  if (typeof incoming.statusMessage === 'string') next.statusMessage = incoming.statusMessage;
+  if (typeof incoming.error === 'string') next.error = incoming.error;
+  if (incoming.agent === 'assistant' || incoming.agent === 'meeting') next.agent = incoming.agent;
+  if (typeof incoming.captureActive === 'boolean') next.captureActive = incoming.captureActive;
+  if (typeof incoming.transcribing === 'boolean') next.transcribing = incoming.transcribing;
+  if (typeof incoming.meetingActive === 'boolean') next.meetingActive = incoming.meetingActive;
+  if (typeof incoming.version === 'number' && Number.isSafeInteger(incoming.version)) next.version = incoming.version;
+  if (typeof incoming.updatedAt === 'number' && Number.isFinite(incoming.updatedAt)) next.updatedAt = incoming.updatedAt;
   if (incoming.analysis === null || typeof incoming.analysis === 'string' || Array.isArray(incoming.analysis)) {
     next.analysis = incoming.analysis as OverlayState['analysis'];
   }
@@ -169,6 +198,25 @@ function mergeOverlayState(previous: OverlayState, incoming: unknown): OverlaySt
   return next;
 }
 
+function mergeOverlayPreferences(previous: OverlayState, incoming: unknown): OverlayState {
+  if (!isRecord(incoming)) return previous;
+  const preferences: Record<string, unknown> = {};
+  for (const key of [
+    'visibility',
+    'lowVisibility',
+    'opacity',
+    'autoHideEnabled',
+    'autoHideDelay',
+    'alwaysOnTop',
+    'activeTab',
+    'bounds',
+    'expandedBounds',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(incoming, key)) preferences[key] = incoming[key];
+  }
+  return mergeOverlayState(previous, preferences);
+}
+
 export default function Overlay() {
   const [state, setState] = useState<OverlayState>(defaultOverlayState);
   const [interactiveLowVisibility, setInteractiveLowVisibility] = useState(false);
@@ -176,15 +224,27 @@ export default function Overlay() {
   const [isFocused, setIsFocused] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchError, setSearchError] = useState('');
+  const [captureCommandPending, setCaptureCommandPending] = useState<{ commandId: string; targetActive: boolean } | null>(null);
+  const [searchCommandPending, setSearchCommandPending] = useState(false);
   const timerRef = useRef<number | null>(null);
   const overlayChannelRef = useRef<BroadcastChannel | null>(null);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const captureCommandRef = useRef<{ commandId: string; targetActive: boolean } | null>(null);
+  const searchCommandIdRef = useRef('');
+  const captureCommandTimerRef = useRef<number | null>(null);
+  const searchCommandTimerRef = useRef<number | null>(null);
 
   const activeTab = state.activeTab ?? 'answer';
   const statusLabel = getStatusLabel(state.status);
   const effectiveLowVisibility = state.visibility === 'VISIBLE' && (state.lowVisibility === true || interactiveLowVisibility);
   const opacity = state.opacity ?? 1;
   const opacityPercent = Math.round(opacity * 100);
-  const searchBusy = state.status === 'thinking' || state.status === 'transcribing';
+  const searchBusy = searchCommandPending
+    || state.status === 'thinking'
+    || state.status === 'question'
+    || state.status === 'transcribing';
+  const stage = meetingOverlayStage(state.status);
   const visualOpacity = effectiveLowVisibility && !isHovered && !isFocused
     ? Math.min(opacity, 0.38)
     : opacity;
@@ -220,13 +280,75 @@ export default function Overlay() {
       });
   };
 
+  const refreshMeetingState = useCallback(() => {
+    overlayChannelRef.current?.postMessage({ type: 'meeting-state-refresh' });
+    void window.electronAPI?.getMeetingOverlayState().then((meetingState) => {
+      if (meetingState) acceptMeetingState(meetingState);
+    }).catch((error: unknown) => {
+      if (!isMissingMeetingOverlayHandler(error)) console.error('Failed to refresh Meeting overlay state:', error);
+    });
+  }, []);
+
+  const clearCaptureCommand = useCallback(() => {
+    captureCommandRef.current = null;
+    setCaptureCommandPending(null);
+    if (captureCommandTimerRef.current !== null) {
+      window.clearTimeout(captureCommandTimerRef.current);
+      captureCommandTimerRef.current = null;
+    }
+  }, []);
+
+  const clearSearchCommand = useCallback(() => {
+    searchCommandIdRef.current = '';
+    setSearchCommandPending(false);
+    if (searchCommandTimerRef.current !== null) {
+      window.clearTimeout(searchCommandTimerRef.current);
+      searchCommandTimerRef.current = null;
+    }
+  }, []);
+
+  const acceptMeetingState = useCallback((meetingState: unknown) => {
+    if (!isRecord(meetingState)) return;
+    setState((previous) => mergeOverlayState(previous, meetingState));
+    const pending = captureCommandRef.current;
+    if (pending && typeof meetingState.captureActive === 'boolean'
+      && meetingState.captureActive === pending.targetActive) {
+      clearCaptureCommand();
+      setSearchError('');
+    }
+  }, [clearCaptureCommand]);
+
+  const handleMeetingCommandResult = useCallback((result: MeetingOverlayCommandResult) => {
+    if (!isRecord(result) || typeof result.commandId !== 'string' || typeof result.ok !== 'boolean') return;
+    const pendingCapture = captureCommandRef.current;
+    if (pendingCapture?.commandId === result.commandId) {
+      if (!result.ok) {
+        clearCaptureCommand();
+        setSearchError(typeof result.message === 'string' ? result.message : 'Meeting listening command failed.');
+      } else if (stateRef.current.captureActive === pendingCapture.targetActive) {
+        clearCaptureCommand();
+        setSearchError('');
+      }
+      return;
+    }
+    if (searchCommandIdRef.current === result.commandId) {
+      clearSearchCommand();
+      if (!result.ok) setSearchError(typeof result.message === 'string' ? result.message : 'Meeting request could not be sent.');
+      else setSearchError('');
+    }
+  }, [clearCaptureCommand, clearSearchCommand]);
+
   useEffect(() => {
     let channel: BroadcastChannel | null = null;
+    const requestMeetingStateRefresh = () => {
+      refreshMeetingState();
+    };
     const handleChannelMessage = (event: MessageEvent<unknown>) => {
       if (!isRecord(event.data)) return;
       if (event.data.type === 'state') {
-        setState((previous) => mergeOverlayState(previous, event.data));
+        acceptMeetingState(event.data);
       }
+      if (event.data.type === 'meeting-command-result') handleMeetingCommandResult(event.data);
       if (event.data.type === 'overlay-search-error' && typeof event.data.message === 'string') {
         setSearchError(event.data.message);
       }
@@ -241,43 +363,143 @@ export default function Overlay() {
         channel.onmessage = handleChannelMessage;
         overlayChannelRef.current = channel;
         channel.postMessage({ type: 'overlay-ready' });
+        requestMeetingStateRefresh();
       } catch {
         channel = null;
       }
     }
 
     const removeOverlayStateListener = window.electronAPI?.onOverlayState((nativeState) => {
-      setState((previous) => mergeOverlayState(previous, nativeState));
+      setState((previous) => mergeOverlayPreferences(previous, nativeState));
     });
+    const removeMeetingStateListener = window.electronAPI?.onMeetingOverlayState((meetingState) => {
+      acceptMeetingState(meetingState);
+    });
+    const removeMeetingCommandResultListener = window.electronAPI?.onMeetingOverlayCommandResult(handleMeetingCommandResult);
     void window.electronAPI?.getOverlayPreferences().then((preferences) => {
       if (preferences) {
-        setState((previous) => mergeOverlayState(previous, preferences));
+        setState((previous) => mergeOverlayPreferences(previous, preferences));
       }
     }).catch(() => undefined);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') requestMeetingStateRefresh();
+    };
+    window.addEventListener('focus', requestMeetingStateRefresh);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
+      window.removeEventListener('focus', requestMeetingStateRefresh);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       removeOverlayStateListener?.();
+      removeMeetingStateListener?.();
+      removeMeetingCommandResultListener?.();
+      if (captureCommandTimerRef.current !== null) window.clearTimeout(captureCommandTimerRef.current);
+      if (searchCommandTimerRef.current !== null) window.clearTimeout(searchCommandTimerRef.current);
       if (channel) {
         channel.onmessage = null;
         channel.close();
       }
       overlayChannelRef.current = null;
     };
-  }, []);
+  }, [acceptMeetingState, handleMeetingCommandResult, refreshMeetingState]);
 
   const submitOverlaySearch = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const question = searchText.trim();
     if (!question) return;
-    if (!overlayChannelRef.current) {
+    if (!window.electronAPI && !overlayChannelRef.current) {
       setSearchError('AI search is unavailable. Reopen the assistant window and try again.');
       return;
     }
-    setState((previous) => ({ ...previous, activeTab: 'answer', status: 'thinking' }));
+    setState((previous) => ({ ...previous, activeTab: 'answer' }));
     void applyPreferences({ activeTab: 'answer' });
-    overlayChannelRef.current.postMessage({ type: 'overlay-question', question });
+    if (state.agent === 'meeting') {
+      if (!state.meetingActive) {
+        setSearchError('Open the Meeting page before sending a Meeting question.');
+        return;
+      }
+      const commandId = crypto.randomUUID();
+      searchCommandIdRef.current = commandId;
+      setSearchCommandPending(true);
+      searchCommandTimerRef.current = window.setTimeout(() => {
+        if (searchCommandIdRef.current !== commandId) return;
+        clearSearchCommand();
+        setSearchError('Meeting did not confirm the request. Refreshing its latest state; please retry if no answer appears.');
+        refreshMeetingState();
+      }, runtimeConfig.overlay.captureCommandConfirmTimeoutMs);
+      void dispatchMeetingCommand({ type: 'question', question, commandId }).catch((error: unknown) => {
+        clearSearchCommand();
+        setSearchError(error instanceof Error ? error.message : 'Meeting search could not be sent.');
+      });
+    } else {
+      setState((previous) => ({ ...previous, status: 'thinking' }));
+      overlayChannelRef.current?.postMessage({ type: 'overlay-question', question });
+    }
     setSearchText('');
     setSearchError('');
+  };
+
+  const dispatchMeetingCommand = async (command: MeetingOverlayCommand) => {
+    try {
+      if (window.electronAPI) {
+        await window.electronAPI.sendMeetingOverlayCommand(command);
+      } else {
+        const messageType = command.type === 'question'
+          ? 'overlay-question'
+          : command.type === 'stop-listening' ? 'overlay-stop-listening' : 'overlay-start-listening';
+        overlayChannelRef.current?.postMessage({ type: messageType, ...command });
+      }
+    } catch (error) {
+      if (!isMissingMeetingOverlayHandler(error) || !overlayChannelRef.current) throw error;
+      const messageType = command.type === 'question'
+        ? 'overlay-question'
+        : command.type === 'stop-listening' ? 'overlay-stop-listening' : 'overlay-start-listening';
+      overlayChannelRef.current.postMessage({ type: messageType, ...command });
+    }
+  };
+
+  const toggleMeetingCapture = () => {
+    if (!state.meetingActive || captureCommandRef.current) return;
+    const targetActive = !state.captureActive;
+    const commandId = crypto.randomUUID();
+    const pending = { commandId, targetActive };
+    captureCommandRef.current = pending;
+    setCaptureCommandPending(pending);
+    setSearchError('');
+    captureCommandTimerRef.current = window.setTimeout(() => {
+      if (captureCommandRef.current?.commandId !== commandId) return;
+      clearCaptureCommand();
+      setSearchError(`Meeting did not confirm ${targetActive ? 'listening start' : 'listening stop'}. Refreshing its latest state.`);
+      refreshMeetingState();
+    }, runtimeConfig.overlay.captureCommandConfirmTimeoutMs);
+    void dispatchMeetingCommand({
+      type: targetActive ? 'start-listening' : 'stop-listening',
+      commandId,
+    }).catch((error: unknown) => {
+      clearCaptureCommand();
+      setSearchError(error instanceof Error ? error.message : 'Meeting listening control failed.');
+    });
+  };
+
+  const retryMeetingAnswer = () => {
+    if (!state.question?.trim() || !state.meetingActive || searchBusy) return;
+    const commandId = crypto.randomUUID();
+    searchCommandIdRef.current = commandId;
+    setSearchCommandPending(true);
+    setSearchError('');
+    searchCommandTimerRef.current = window.setTimeout(() => {
+      if (searchCommandIdRef.current !== commandId) return;
+      clearSearchCommand();
+      setSearchError('Meeting did not confirm the retry. Please try again.');
+    }, runtimeConfig.overlay.captureCommandConfirmTimeoutMs);
+    void dispatchMeetingCommand({
+      type: 'question',
+      question: state.question,
+      commandId,
+    }).catch((error: unknown) => {
+      clearSearchCommand();
+      setSearchError(error instanceof Error ? error.message : 'The answer could not be retried.');
+    });
   };
 
   useEffect(() => {
@@ -301,7 +523,7 @@ export default function Overlay() {
     timerRef.current = window.setTimeout(() => {
       setInteractiveLowVisibility(true);
       void applyPreferences({ lowVisibility: true });
-    }, Number(state.autoHideDelay ?? 5000));
+    }, Number(state.autoHideDelay ?? runtimeConfig.overlay.autoHideDelayMs));
 
     return () => {
       if (timerRef.current) {
@@ -365,6 +587,16 @@ export default function Overlay() {
           </div>
         </div>
         <div className="overlay-controls no-drag">
+          {state.agent === 'meeting' && state.meetingActive && (
+            <button
+              type="button"
+              className="overlay-action-button"
+              aria-label={state.captureActive ? 'Stop Meeting listening' : 'Start Meeting listening'}
+              onClick={toggleMeetingCapture}
+            >
+              {state.captureActive ? 'Stop Listening' : 'Start Listening'}
+            </button>
+          )}
           <div className="overlay-opacity-controls" aria-label="Overlay transparency controls">
             <button
               type="button"
@@ -456,6 +688,7 @@ export default function Overlay() {
         className="overlay-view"
         aria-live="polite"
       >
+        {state.error && <p className="overlay-search-error" role="alert">{state.error}</p>}
         {renderTabBody(activeTab, state)}
       </section>
     </main>

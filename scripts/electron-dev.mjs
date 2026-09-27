@@ -3,9 +3,13 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { portOpen } from './launcher-preflight.mjs';
 
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
+const require = createRequire(import.meta.url);
+const { services } = require('../src/config/runtimeSettings.json');
+const { http: httpService, websocket: websocketService, codingWebsocket: codingWebsocketService, devServer } = services;
 const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const viteCommand = process.platform === 'win32'
   ? path.join(root, 'node_modules', '.bin', 'vite.cmd')
@@ -51,7 +55,7 @@ async function stopChild(child) {
   if (child.exitCode === null) child.kill('SIGKILL');
 }
 
-function waitForHttp(url, timeoutMs = 30000) {
+function waitForHttp(url, timeoutMs = devServer.startupTimeoutMs) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     const attempt = () => {
@@ -61,17 +65,17 @@ function waitForHttp(url, timeoutMs = 30000) {
         retry();
       });
       request.on('error', retry);
-      request.setTimeout(1000, () => { request.destroy(); retry(); });
+      request.setTimeout(devServer.httpProbeTimeoutMs, () => { request.destroy(); retry(); });
     };
     const retry = () => {
       if (Date.now() >= deadline) reject(new Error(`Timed out waiting for ${url}`));
-      else setTimeout(attempt, 250);
+      else setTimeout(attempt, devServer.probeIntervalMs);
     };
     attempt();
   });
 }
 
-function waitForTcp(port, timeoutMs = 30000) {
+function waitForTcp(port, timeoutMs = devServer.startupTimeoutMs) {
   const deadline = Date.now() + timeoutMs;
   const hosts = ['localhost', '127.0.0.1', '::1'];
   let attemptIndex = 0;
@@ -88,15 +92,15 @@ function waitForTcp(port, timeoutMs = 30000) {
           reject(new Error(`Timed out waiting for TCP port ${port} on ${host}`));
           return;
         }
-        setTimeout(attempt, 250);
+        setTimeout(attempt, devServer.probeIntervalMs);
       });
-      socket.setTimeout(500, () => {
+      socket.setTimeout(devServer.tcpProbeTimeoutMs, () => {
         socket.destroy();
         if (Date.now() >= deadline) {
           reject(new Error(`Timed out waiting for TCP port ${port} on ${host}`));
           return;
         }
-        setTimeout(attempt, 250);
+        setTimeout(attempt, devServer.probeIntervalMs);
       });
     };
 
@@ -125,28 +129,28 @@ process.once('SIGINT', () => void shutdown(0));
 process.once('SIGTERM', () => void shutdown(0));
 
 try {
-  const backendAlreadyRunning = await portOpen(3001);
-  const websocketAlreadyRunning = await portOpen(3002);
-  const codingWebsocketAlreadyRunning = await portOpen(3003);
-  const frontendAlreadyRunning = await portOpen(5174);
+  const backendAlreadyRunning = await portOpen(httpService.port);
+  const websocketAlreadyRunning = await portOpen(websocketService.port);
+  const codingWebsocketAlreadyRunning = await portOpen(codingWebsocketService.port);
+  const frontendAlreadyRunning = await portOpen(devServer.port);
 
   if (!backendAlreadyRunning || !websocketAlreadyRunning || !codingWebsocketAlreadyRunning) {
     start(npmCommand, ['run', 'server:dev']);
   } else {
-    console.log('[DEV] Reusing the existing backend on ports 3001, 3002, and 3003.');
+    console.log(`[DEV] Reusing the existing backend on ports ${httpService.port}, ${websocketService.port}, and ${codingWebsocketService.port}.`);
   }
 
   if (!frontendAlreadyRunning) {
-    start(viteCommand, ['--port', '5174', '--strictPort']);
+    start(viteCommand, ['--host', devServer.host, '--port', String(devServer.port), '--strictPort']);
   } else {
-    console.log('[DEV] Reusing the existing Vite frontend on port 5174.');
+    console.log(`[DEV] Reusing the existing Vite frontend on port ${devServer.port}.`);
   }
 
   await Promise.all([
-    waitForTcp(5174),
-    waitForHttp('http://localhost:3001/api/health'),
-    waitForTcp(3002),
-    waitForTcp(3003),
+    waitForTcp(devServer.port),
+    waitForHttp(`${httpService.baseUrl}/api/health`),
+    waitForTcp(websocketService.port),
+    waitForTcp(codingWebsocketService.port),
   ]);
   const electron = start(electronCommand, ['electron/main.cjs']);
   await new Promise((resolve) => electron.once('exit', (code) => resolve(code || 0)));

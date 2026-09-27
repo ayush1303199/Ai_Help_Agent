@@ -1,16 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
-import { cleanTranscript, joinQuestionContinuation, prepareQuestion, type PreparedQuestion } from '../../audio/transcriptUtils';
+import { cleanTranscript, joinQuestionContinuation, prepareQuestion, prepareTextRequest, type PreparedQuestion } from '../../audio/transcriptUtils';
 import { transcribeAudioSegment } from '../../audio/sttService';
 import type { SttFailureClassification } from '../../audio/sttTypes';
 import { chooseMicrophoneDevice, microphoneDisplayLabel, normalizeMicrophoneDevices, type InterviewContextConfig, type MicrophoneDeviceOption } from '../../ai/interviewContext';
 import type { MeetingAudioMode } from '../../app/appTypes';
 import { runtimeConfig } from '../../config/runtimeConfig';
 import { MeetingAgentTransport, type MeetingChatMessage, type MeetingChatRequest } from './meetingTransport';
+import {
+  hasMeetingRequestIntent,
+  hasRepeatedSpeechLoop,
+  joinShortTranscriptContinuation,
+  shouldBufferShortTranscript,
+} from './meetingTranscriptQuality';
 
 interface PendingAudioSegment {
   blob: Blob;
   durationMs: number;
   sttSession: string;
+  continuationEligible: boolean;
 }
 
 export interface MeetingTranscript {
@@ -36,8 +43,14 @@ const HTTP_URL = runtimeConfig.httpUrl;
 const {
   systemSilenceMs: SYSTEM_AUDIO_SILENCE_MS,
   systemLevelThreshold: SYSTEM_AUDIO_LEVEL_THRESHOLD,
+  voiceHighPassHz: VOICE_HIGH_PASS_HZ,
+  voiceLowPassHz: VOICE_LOW_PASS_HZ,
+  voiceCompressorThresholdDb: VOICE_COMPRESSOR_THRESHOLD_DB,
+  voiceCompressorRatio: VOICE_COMPRESSOR_RATIO,
   continuationTimeoutMs: AUDIO_CONTINUATION_TIMEOUT_MS,
   continuationMaxChars: AUDIO_CONTINUATION_MAX_CHARS,
+  shortFragmentMaxWords: SHORT_FRAGMENT_MAX_WORDS,
+  shortFragmentMaxDurationMs: SHORT_FRAGMENT_MAX_DURATION_MS,
 } = runtimeConfig.audio;
 
 function logSttTrace(sttSession: string, event: string, fields: Record<string, unknown> = {}) {
@@ -119,11 +132,14 @@ export function useMeetingAssistantController({
   const [microphoneStatus, setMicrophoneStatus] = useState<'off' | 'connected'>('off');
   const [pipelineStatus, setPipelineStatus] = useState<'ready' | 'listening' | 'transcribing' | 'question' | 'thinking' | 'answer' | 'error' | 'stopped'>('ready');
   const [liveTranscript, setLiveTranscript] = useState('');
+  const [answerPending, setAnswerPending] = useState(false);
   const [transcripts, setTranscripts] = useState<MeetingTranscript[]>(() => {
     try { return JSON.parse(localStorage.getItem('meeting-transcripts') || '[]'); } catch { return []; }
   });
   const [transcriptSearch, setTranscriptSearch] = useState('');
   const [input, setInput] = useState('');
+  const [displayedQuestion, setDisplayedQuestion] = useState('');
+  const [displayedAnswer, setDisplayedAnswer] = useState('');
   const [chatBusy, setChatBusy] = useState(false);
   const [meetingError, setMeetingError] = useState('');
   const [meetingStatusMessage, setMeetingStatusMessage] = useState('');
@@ -135,7 +151,7 @@ export function useMeetingAssistantController({
         && typeof item === 'object'
         && typeof item.question === 'string'
         && typeof item.answer === 'string'
-      )).slice(0, 30) : [];
+      )).slice(0, runtimeConfig.history.maxSessions) : [];
     } catch {
       return [];
     }
@@ -152,7 +168,9 @@ export function useMeetingAssistantController({
   const segmentHeardAudioRef = useRef(false);
   const segmentStartedAtRef = useRef(0);
   const captureActiveRef = useRef(false);
+  const captureStartInProgressRef = useRef(false);
   const captureSessionIdRef = useRef('');
+  const finalCaptureSegmentClosedRef = useRef(false);
   const pendingSegmentQueueRef = useRef<PendingAudioSegment[]>([]);
   const segmentProcessorActiveRef = useRef(false);
   const segmentProcessorRef = useRef<(() => Promise<void>) | null>(null);
@@ -189,7 +207,7 @@ export function useMeetingAssistantController({
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('meeting-chat-state', JSON.stringify(answeredSegments.slice(0, 30)));
+    localStorage.setItem('meeting-chat-state', JSON.stringify(answeredSegments.slice(0, runtimeConfig.history.maxSessions)));
   }, [answeredSegments]);
 
   const sendQuestion = async (
@@ -208,6 +226,9 @@ export function useMeetingAssistantController({
       onStatus('This question was already submitted recently.');
       return;
     }
+    setDisplayedQuestion(acceptedQuestion);
+    setDisplayedAnswer('');
+    setAnswerPending(true);
     setInput('');
     setLiveTranscript(acceptedQuestion);
     setPipelineStatus('question');
@@ -222,6 +243,11 @@ export function useMeetingAssistantController({
         { role: 'assistant', content: segment.answer },
       ]);
       const result = await transport.send(buildChatRequest(acceptedQuestion, history, options.screenImage));
+      if (!result.content.trim()) {
+        throw new Error('The Meeting Assistant returned an empty answer. Please try the question again.');
+      }
+      setDisplayedAnswer(result.content);
+      setAnswerPending(false);
       setAnsweredSegments((previous) => [...previous, { question: acceptedQuestion, answer: result.content }].slice(-30));
       setPipelineStatus('answer');
       onStatus('');
@@ -233,7 +259,7 @@ export function useMeetingAssistantController({
     }
   };
 
-  const sendTypedQuestion = () => void sendQuestion(input, { preparedQuestion: prepareQuestion(input) });
+  const sendTypedQuestion = () => void sendQuestion(input, { preparedQuestion: prepareTextRequest(input) });
 
   const refreshMicrophoneDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) {
@@ -271,8 +297,6 @@ export function useMeetingAssistantController({
   useEffect(() => { localStorage.setItem('meeting-transcripts', JSON.stringify(transcripts)); }, [transcripts]);
 
   const stopMeetingCapture = () => {
-    captureCleanupRef.current?.();
-    captureCleanupRef.current = null;
     const sttSession = captureSessionIdRef.current;
     const recorder = recorderRef.current;
     const stream = streamRef.current;
@@ -285,31 +309,36 @@ export function useMeetingAssistantController({
       stopRequested: true,
     });
     captureActiveRef.current = false;
-    captureSessionIdRef.current = '';
+    finalCaptureSegmentClosedRef.current = true;
     pendingPartialQuestionRef.current = '';
     pendingPartialRawTextRef.current = '';
     if (pendingPartialTimeoutRef.current) clearTimeout(pendingPartialTimeoutRef.current);
     pendingPartialTimeoutRef.current = null;
-    pendingSegmentQueueRef.current = [];
     if (segmentSilenceTimerRef.current) clearInterval(segmentSilenceTimerRef.current);
     segmentSilenceTimerRef.current = null;
     void segmentAudioContextRef.current?.close();
     segmentAudioContextRef.current = null;
-    recorderRef.current = null;
-    streamRef.current = null;
     if (recorder && recorder.state === 'recording') {
       recorder.stop();
-    }
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
+    } else {
+      finalCaptureSegmentClosedRef.current = true;
+      recorderRef.current = null;
+      streamRef.current = null;
+      if (
+        captureSessionIdRef.current === sttSession
+        && !segmentProcessorActiveRef.current
+        && pendingSegmentQueueRef.current.length === 0
+      ) captureSessionIdRef.current = '';
+      captureCleanupRef.current?.();
+      captureCleanupRef.current = null;
+      stream?.getTracks().forEach((track) => track.stop());
+      setIsRecording(false);
     }
     stopAudioMonitoring();
     setAudioLevel(0);
     setAudioStatus('disabled');
     setSystemAudioStatus('off');
     onStatus('');
-    setIsRecording(false);
-    setIsTranscribing(false);
     setPipelineStatus('stopped');
     setMicrophoneStatus('off');
   };
@@ -362,6 +391,48 @@ export function useMeetingAssistantController({
     displayStream.getVideoTracks().forEach((track) => track.stop());
     const systemStream = new MediaStream(audioTracks);
     return systemStream;
+  };
+
+  const processMicrophoneVoice = async (microphoneStream: MediaStream) => {
+    let audioContext: AudioContext | null = null;
+    try {
+      audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(microphoneStream);
+      const highPass = audioContext.createBiquadFilter();
+      highPass.type = 'highpass';
+      highPass.frequency.value = VOICE_HIGH_PASS_HZ;
+      const lowPass = audioContext.createBiquadFilter();
+      lowPass.type = 'lowpass';
+      lowPass.frequency.value = VOICE_LOW_PASS_HZ;
+      const compressor = audioContext.createDynamicsCompressor();
+      compressor.threshold.value = VOICE_COMPRESSOR_THRESHOLD_DB;
+      compressor.knee.value = 18;
+      compressor.ratio.value = VOICE_COMPRESSOR_RATIO;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.25;
+      const destination = audioContext.createMediaStreamDestination();
+      source.connect(highPass).connect(lowPass).connect(compressor).connect(destination);
+      if (audioContext.state !== 'running') await audioContext.resume();
+      if (audioContext.state !== 'running') throw new Error('Microphone voice filtering could not start.');
+      logSttTrace(captureSessionIdRef.current, 'MICROPHONE_VOICE_FILTER_ENABLED', {
+        browserNoiseSuppression: microphoneStream.getAudioTracks()[0]?.getSettings?.().noiseSuppression ?? null,
+        highPassHz: VOICE_HIGH_PASS_HZ,
+        lowPassHz: VOICE_LOW_PASS_HZ,
+        compressorRatio: VOICE_COMPRESSOR_RATIO,
+      });
+      return {
+        stream: destination.stream,
+        cleanup: () => {
+          destination.stream.getTracks().forEach((track) => track.stop());
+          microphoneStream.getTracks().forEach((track) => track.stop());
+          void audioContext?.close();
+        },
+      };
+    } catch (error) {
+      microphoneStream.getTracks().forEach((track) => track.stop());
+      void audioContext?.close();
+      throw error;
+    }
   };
 
   const requestMicrophoneStream = async (): Promise<{ stream: MediaStream; deviceId: string | null; label: string }> => {
@@ -490,8 +561,15 @@ export function useMeetingAssistantController({
       }
     }
 
+    let processedMicrophone: Awaited<ReturnType<typeof processMicrophoneVoice>> | null = null;
+    try {
+      processedMicrophone = microphoneStream ? await processMicrophoneVoice(microphoneStream) : null;
+    } catch (error) {
+      systemStream?.getTracks().forEach((track) => track.stop());
+      throw error;
+    }
     const sourceStreams = [
-      ...(microphoneStream ? [microphoneStream] : []),
+      ...(processedMicrophone ? [processedMicrophone.stream] : []),
       ...(systemStream && systemAudio ? [systemStream] : []),
     ];
     if (sourceStreams.length === 0) {
@@ -505,14 +583,18 @@ export function useMeetingAssistantController({
       try {
         monitorSystemAudio(sourceStreams[0]);
       } catch (error) {
-        sourceStreams.forEach((source) => source.getTracks().forEach((track) => track.stop()));
+        processedMicrophone?.cleanup();
+        systemStream?.getTracks().forEach((track) => track.stop());
         throw error;
       }
       return {
         stream: sourceStreams[0],
         microphoneAudio: Boolean(microphoneStream),
         systemAudio,
-        cleanup: () => sourceStreams.forEach((source) => source.getTracks().forEach((track) => track.stop())),
+        cleanup: () => {
+          processedMicrophone?.cleanup();
+          systemStream?.getTracks().forEach((track) => track.stop());
+        },
       };
     }
 
@@ -526,7 +608,8 @@ export function useMeetingAssistantController({
       setAudioStatus('connected');
       monitorSystemAudio(destination.stream);
     } catch (error) {
-      sourceStreams.forEach((source) => source.getTracks().forEach((track) => track.stop()));
+      processedMicrophone?.cleanup();
+      systemStream?.getTracks().forEach((track) => track.stop());
       destination?.stream.getTracks().forEach((track) => track.stop());
       void mixContext.close();
       throw error;
@@ -536,14 +619,15 @@ export function useMeetingAssistantController({
       microphoneAudio: Boolean(microphoneStream),
       systemAudio,
       cleanup: () => {
-        sourceStreams.forEach((source) => source.getTracks().forEach((track) => track.stop()));
+        processedMicrophone?.cleanup();
+        systemStream?.getTracks().forEach((track) => track.stop());
         destination.stream.getTracks().forEach((track) => track.stop());
         void mixContext.close();
       },
     };
   };
 
-  const recordAudioStream = (stream: MediaStream, cleanup: () => void) => {
+  const recordAudioStream = async (stream: MediaStream, cleanup: () => void) => {
     let cleanedUp = false;
     const cleanupCapture = () => {
       if (cleanedUp) return;
@@ -568,7 +652,7 @@ export function useMeetingAssistantController({
     recorder.ondataavailable = (event) => {
       if (event.data.size > 0) chunks.push(event.data);
     };
-    const processSegment = async (segment: Blob, segmentDurationMs: number) => {
+    const processSegment = async (segment: Blob, segmentDurationMs: number, continuationEligible: boolean) => {
       if (captureSessionIdRef.current !== sttSession) return;
       const segmentId = crypto.randomUUID();
       setIsTranscribing(true);
@@ -595,6 +679,11 @@ export function useMeetingAssistantController({
             sessionId: sttSession,
             segmentId,
             payloadName,
+            source: meetingAudioMode === 'microphone'
+              ? 'meeting_microphone'
+              : meetingAudioMode === 'system'
+                ? 'meeting_system_audio'
+                : 'meeting_mixed',
           });
         } catch (error) {
           const classification = ((error as { classification?: SttFailureClassification }).classification || 'STT_UNKNOWN');
@@ -636,11 +725,69 @@ export function useMeetingAssistantController({
         }
         const continuedQuestion = pendingQuestion
           ? joinQuestionContinuation(pendingQuestion, normalizedTranscript, transcriptNormalizationContext)
+            || joinShortTranscriptContinuation(pendingQuestion, normalizedTranscript)
           : null;
         const candidateText = continuedQuestion || normalizedTranscript;
         const candidateRawText = continuedQuestion && pendingRawText
           ? `${pendingRawText} ${rawTranscript}`.replace(/\s+/g, ' ').trim()
           : rawTranscript;
+        const bufferShortTranscript = () => {
+          if (
+            !continuationEligible
+            || !shouldBufferShortTranscript(
+              candidateText,
+              segmentDurationMs,
+              SYSTEM_AUDIO_SILENCE_MS,
+              SHORT_FRAGMENT_MAX_WORDS,
+              SHORT_FRAGMENT_MAX_DURATION_MS,
+            )
+          ) return false;
+          pendingPartialQuestionRef.current = candidateText;
+          pendingPartialRawTextRef.current = candidateRawText;
+          pendingPartialTimeoutRef.current = setTimeout(() => {
+            if (captureSessionIdRef.current !== sttSession
+              || pendingPartialQuestionRef.current !== candidateText) return;
+            pendingPartialQuestionRef.current = '';
+            pendingPartialRawTextRef.current = '';
+            pendingPartialTimeoutRef.current = null;
+            onStatus('Short speech was saved. Ask a complete question to get an AI answer.');
+            logSttTrace(sttSession, 'SHORT_TRANSCRIPT_SAVED_WITHOUT_REQUEST', {
+              segmentId,
+              transcriptLength: candidateText.length,
+              segmentDurationMs,
+            });
+          }, AUDIO_CONTINUATION_TIMEOUT_MS);
+          onStatus('I heard a short phrase. Continue speaking to complete your question.');
+          logSttTrace(sttSession, 'SHORT_TRANSCRIPT_WAITING_FOR_CONTINUATION', {
+            segmentId,
+            transcriptLength: candidateText.length,
+            segmentDurationMs,
+            timeoutMs: AUDIO_CONTINUATION_TIMEOUT_MS,
+          });
+          return true;
+        };
+        setLiveTranscript(candidateText);
+        setDisplayedQuestion(candidateText);
+        setDisplayedAnswer('');
+        setAnswerPending(true);
+        setTranscripts((current) => [{
+          id: crypto.randomUUID(),
+          source: meetingSource,
+          rawText: candidateRawText,
+          normalizedText: candidateText,
+          text: candidateText,
+          createdAt: new Date().toISOString(),
+        }, ...current]);
+        if (hasRepeatedSpeechLoop(candidateText)) {
+          onStatus('Speech recognition detected repeated words and did not send them. Please repeat your question clearly.');
+          setPipelineStatus('ready');
+          onError('');
+          logSttTrace(sttSession, 'REPEATED_SPEECH_LOOP_REJECTED', {
+            segmentId,
+            transcriptLength: candidateText.length,
+          });
+          return;
+        }
         const preparedQuestion = {
           ...prepareQuestion(candidateText, transcriptNormalizationContext),
           rawText: candidateRawText,
@@ -687,7 +834,7 @@ export function useMeetingAssistantController({
                 maxChars: AUDIO_CONTINUATION_MAX_CHARS,
               });
             }
-          } else {
+          } else if (hasMeetingRequestIntent(candidateText) || !bufferShortTranscript()) {
             pendingPartialQuestionRef.current = '';
             pendingPartialRawTextRef.current = '';
             onStatus(inputQualityMessage(preparedQuestion.qualityClassification));
@@ -701,21 +848,29 @@ export function useMeetingAssistantController({
           onError('');
           return;
         }
+        if (!hasMeetingRequestIntent(candidateText)) {
+          if (bufferShortTranscript()) {
+            setPipelineStatus('ready');
+            onError('');
+            return;
+          }
+          pendingPartialQuestionRef.current = '';
+          pendingPartialRawTextRef.current = '';
+          onStatus('I heard speech but could not detect a complete question. Your transcript was saved; please ask the question again.');
+          setPipelineStatus('ready');
+          onError('');
+          logSttTrace(sttSession, 'SPOKEN_REQUEST_INTENT_NOT_DETECTED', {
+            segmentId,
+            transcriptLength: candidateText.length,
+          });
+          return;
+        }
         pendingPartialQuestionRef.current = '';
         pendingPartialRawTextRef.current = '';
         if (pendingPartialTimeoutRef.current) clearTimeout(pendingPartialTimeoutRef.current);
         pendingPartialTimeoutRef.current = null;
         const acceptedQuestion = preparedQuestion.acceptedQuestion;
-        if (!shouldAcceptQuestion(acceptedQuestion)) {
-          logSttTrace(sttSession, 'DUPLICATE_TRANSCRIPT_IGNORED', {
-            segmentId,
-            transcriptLength: acceptedQuestion.length,
-            duplicate: true,
-          });
-          setPipelineStatus('ready');
-          onError('');
-          return;
-        }
+        onStatus('');
         setPipelineStatus('question');
         logSttTrace(sttSession, 'REQUEST_DETECTED', {
           segmentId,
@@ -723,14 +878,6 @@ export function useMeetingAssistantController({
           continuation: Boolean(continuedQuestion),
         });
         setLiveTranscript(acceptedQuestion);
-        setTranscripts((current) => [{
-          id: crypto.randomUUID(),
-          source: meetingSource,
-          rawText: candidateRawText,
-          normalizedText: preparedQuestion.normalizedText,
-          text: acceptedQuestion,
-          createdAt: new Date().toISOString(),
-        }, ...current]);
         setPipelineStatus('thinking');
         logSttTrace(sttSession, 'AI_REQUEST_STARTED', { segmentId, questionLength: acceptedQuestion.length });
         await sendQuestion(acceptedQuestion, {
@@ -768,13 +915,23 @@ export function useMeetingAssistantController({
           if (captureSessionIdRef.current !== sttSession) break;
           const nextSegment = pendingSegmentQueueRef.current.shift();
           if (nextSegment?.sttSession === sttSession) {
-            await processSegment(nextSegment.blob, nextSegment.durationMs);
+            await processSegment(nextSegment.blob, nextSegment.durationMs, nextSegment.continuationEligible);
           }
         }
       } finally {
         requestInProgressRef.current = false;
         segmentProcessorActiveRef.current = false;
         if (isCurrentSession()) setPipelineStatus('listening');
+        if (
+          !captureActiveRef.current
+          && finalCaptureSegmentClosedRef.current
+          && pendingSegmentQueueRef.current.length === 0
+          && captureSessionIdRef.current === sttSession
+        ) {
+          captureSessionIdRef.current = '';
+          setIsRecording(false);
+          setIsTranscribing(false);
+        }
         const nextProcessor = segmentProcessorRef.current;
         if (nextProcessor && nextProcessor !== processPendingSegments && captureActiveRef.current) {
           void nextProcessor();
@@ -795,9 +952,11 @@ export function useMeetingAssistantController({
       segmentHeardAudioRef.current = false;
       const segmentDurationMs = Math.max(0, Math.round(performance.now() - (segmentStartedAtRef.current || performance.now())));
       segmentStartedAtRef.current = 0;
-      if (!isCurrentSession()) {
+      if (captureSessionIdRef.current !== sttSession || recorderRef.current !== recorder) {
         cleanupCapture();
         stream.getTracks().forEach((track) => track.stop());
+        if (recorderRef.current === recorder) recorderRef.current = null;
+        if (captureSessionIdRef.current === sttSession) captureSessionIdRef.current = '';
         logSttTrace(sttSession, 'CAPTURE_STOPPED', {
           segmentDurationMs,
           clearedQueuedSegments: pendingSegmentQueueRef.current.length,
@@ -805,14 +964,24 @@ export function useMeetingAssistantController({
         });
         return;
       }
-      recorder.start();
-      setTimeout(() => {
-        if (captureSessionIdRef.current === sttSession && recorderRef.current === recorder) {
-          segmentCloseInProgressRef.current = false;
-        }
-      }, 0);
-      segmentStartedAtRef.current = performance.now();
-      console.log('[CAPTURE] Utterance segment started');
+      const continueCapture = captureActiveRef.current;
+      if (continueCapture) {
+        recorder.start();
+        setTimeout(() => {
+          if (captureSessionIdRef.current === sttSession && recorderRef.current === recorder) {
+            segmentCloseInProgressRef.current = false;
+          }
+        }, 0);
+        segmentStartedAtRef.current = performance.now();
+        console.log('[CAPTURE] Utterance segment started');
+      } else {
+        recorderRef.current = null;
+        streamRef.current = null;
+        cleanupCapture();
+        captureCleanupRef.current = null;
+        stream.getTracks().forEach((track) => track.stop());
+        setIsRecording(false);
+      }
       const audioSegment = new Blob(segment, { type: recorder.mimeType || 'audio/webm' });
       if (audioSegment.size > 0) {
         logSttTrace(sttSession, 'SEGMENT_CLOSED', {
@@ -824,9 +993,17 @@ export function useMeetingAssistantController({
           blob: audioSegment,
           durationMs: segmentDurationMs,
           sttSession,
+          continuationEligible: continueCapture,
         });
         void processPendingSegments();
       } else {
+        if (!continueCapture) setIsRecording(false);
+        if (
+          !continueCapture
+          && captureSessionIdRef.current === sttSession
+          && !segmentProcessorActiveRef.current
+          && pendingSegmentQueueRef.current.length === 0
+        ) captureSessionIdRef.current = '';
         logSttTrace(sttSession, 'SEGMENT_DISCARDED', {
           segmentDurationMs,
           segmentBytes: 0,
@@ -834,23 +1011,28 @@ export function useMeetingAssistantController({
         });
       }
     };
+    const audioContext = new AudioContext();
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 1024;
+    audioContext.createMediaStreamSource(stream).connect(analyser);
+    if (audioContext.state !== 'running') await audioContext.resume();
+    if (audioContext.state !== 'running') {
+      await audioContext.close();
+      throw new Error('Audio level monitoring could not start. Allow microphone access and try again.');
+    }
+    segmentAudioContextRef.current = audioContext;
+    const samples = new Uint8Array(analyser.fftSize);
+    let lastAudioAt = Date.now();
     recorder.start();
     segmentCloseInProgressRef.current = false;
     captureActiveRef.current = true;
+    finalCaptureSegmentClosedRef.current = false;
     segmentStartedAtRef.current = performance.now();
     logSttTrace(sttSession, 'SEGMENT_STARTED', { encoding: recorder.mimeType || 'unknown' });
     recorderRef.current = recorder;
     setLiveTranscript('');
     setIsRecording(true);
     setPipelineStatus('listening');
-
-    const audioContext = new AudioContext();
-    const analyser = audioContext.createAnalyser();
-    analyser.fftSize = 1024;
-    audioContext.createMediaStreamSource(stream).connect(analyser);
-    segmentAudioContextRef.current = audioContext;
-    const samples = new Uint8Array(analyser.fftSize);
-    let lastAudioAt = Date.now();
     segmentSilenceTimerRef.current = setInterval(() => {
       if (!captureActiveRef.current || recorder.state !== 'recording') return;
       analyser.getByteTimeDomainData(samples);
@@ -871,7 +1053,9 @@ export function useMeetingAssistantController({
   };
 
   const startMeetingCapture = async () => {
-    if (captureActiveRef.current || captureSessionIdRef.current) return;
+    if (captureActiveRef.current) return true;
+    if (captureStartInProgressRef.current || captureSessionIdRef.current) return false;
+    captureStartInProgressRef.current = true;
     try {
       await refreshProviders();
       const healthResponse = await fetch(`${HTTP_URL}/api/health`);
@@ -879,12 +1063,14 @@ export function useMeetingAssistantController({
       if (!healthResponse.ok || healthData.sttReady === false) {
         onError('No speech-capable provider key is available to this desktop session. Open Settings → Configured Providers, save the key in this desktop app, then try again.');
         onStatus('');
-        return;
+        captureStartInProgressRef.current = false;
+        return false;
       }
     } catch (error) {
       onError(`Could not verify speech transcription readiness: ${(error as Error).message}`);
       onStatus('');
-      return;
+      captureStartInProgressRef.current = false;
+      return false;
     }
     onError('');
     pendingPartialQuestionRef.current = '';
@@ -917,9 +1103,11 @@ export function useMeetingAssistantController({
           setMicrophoneStatus('off');
           setAudioSourceLabel('Not connected');
         }
-        return;
+        captureStartInProgressRef.current = false;
+        return false;
       }
-      recordAudioStream(capture.stream, capture.cleanup);
+      await recordAudioStream(capture.stream, capture.cleanup);
+      captureStartInProgressRef.current = false;
       onStatus(capture.systemAudio
         ? capture.microphoneAudio
           ? 'Microphone and system audio connected. Listening is ready.'
@@ -929,8 +1117,12 @@ export function useMeetingAssistantController({
         systemAudio: capture.systemAudio,
         audioTracks: capture.stream.getAudioTracks().length,
       });
+      return true;
     } catch (err) {
-      if (captureSessionIdRef.current !== sttSession) return;
+      if (captureSessionIdRef.current !== sttSession) {
+        captureStartInProgressRef.current = false;
+        return false;
+      }
       const recorder = recorderRef.current;
       captureActiveRef.current = false;
       captureSessionIdRef.current = '';
@@ -956,6 +1148,8 @@ export function useMeetingAssistantController({
         ? sttUserError(classification, 'Microphone permission was denied or blocked.')
         : (err instanceof Error ? err.message : String(err)));
       onStatus('');
+      captureStartInProgressRef.current = false;
+      return false;
     }
   };
 
@@ -1026,8 +1220,8 @@ export function useMeetingAssistantController({
     systemAudioStatus, microphoneStatus, pipelineStatus, setPipelineStatus,
     input, setInput, chatBusy, answeredSegments, meetingError, meetingStatusMessage,
     reportError: setMeetingError,
-    lastQuestion: answeredSegments.length ? answeredSegments[answeredSegments.length - 1].question : '',
-    lastAnswer: answeredSegments.length ? answeredSegments[answeredSegments.length - 1].answer : '',
+    lastQuestion: displayedQuestion || (answeredSegments.length ? answeredSegments[answeredSegments.length - 1].question : ''),
+    lastAnswer: displayedAnswer || (!answerPending && answeredSegments.length ? answeredSegments[answeredSegments.length - 1].answer : ''),
     liveTranscript, transcripts, transcriptSearch, setTranscriptSearch, filteredTranscripts,
     selectedMicrophone, selectedMicrophoneLabel, microphoneDevicePresent, configuredMicrophoneLabel,
     displayedAudioSourceLabel, displayedAudioStatus,

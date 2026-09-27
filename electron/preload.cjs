@@ -16,6 +16,28 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('overlay:state', listener);
     return () => ipcRenderer.removeListener('overlay:state', listener);
   },
+  publishMeetingOverlayState: (state) => ipcRenderer.invoke('meeting-overlay:publish-state', state),
+  getMeetingOverlayState: () => ipcRenderer.invoke('meeting-overlay:get-state'),
+  onMeetingOverlayState: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on('meeting-overlay:state', listener);
+    return () => ipcRenderer.removeListener('meeting-overlay:state', listener);
+  },
+  sendMeetingOverlayCommand: (command) => ipcRenderer.invoke('meeting-overlay:command', command),
+  onMeetingOverlayCommand: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, command) => callback(command);
+    ipcRenderer.on('meeting-overlay:command', listener);
+    return () => ipcRenderer.removeListener('meeting-overlay:command', listener);
+  },
+  reportMeetingOverlayCommandResult: (result) => ipcRenderer.invoke('meeting-overlay:command-result', result),
+  onMeetingOverlayCommandResult: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, result) => callback(result);
+    ipcRenderer.on('meeting-overlay:command-result', listener);
+    return () => ipcRenderer.removeListener('meeting-overlay:command-result', listener);
+  },
   getOverlayBounds: () => ipcRenderer.invoke('overlay:get-bounds'),
   setOverlayBounds: (bounds) => ipcRenderer.invoke('overlay:set-bounds', bounds),
   setOverlayAlwaysOnTop: (alwaysOnTop) => ipcRenderer.invoke('overlay:set-always-on-top', alwaysOnTop),

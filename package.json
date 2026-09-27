@@ -33,6 +33,7 @@
     "test:provider-config": "node --experimental-strip-types scripts/provider-config-test.mjs",
     "test:overlay": "node scripts/overlay-static-test.mjs",
     "test:architecture": "node scripts/architecture-boundary-test.mjs",
+    "test:runtime-settings": "node scripts/runtime-settings-test.mjs",
     "test:general-agent-runtime": "node scripts/general-agent-runtime-test.mjs",
     "test:general-agent-context": "python scripts/general-agent-context-test.py",
     "test:general-agent-provider-compatibility": "python scripts/general-agent-provider-compatibility-test.py",
@@ -90,6 +91,7 @@
       "server/**/*",
       "src/config/providerRegistry.json",
       "src/config/providerErrorPatterns.json",
+      "src/config/runtimeSettings.json",
       "package.json"
     ],
     "extraResources": [

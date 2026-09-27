@@ -1,46 +1,72 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import type { ComponentProps } from 'react';
 import type { InterviewContextConfig } from '../../ai/interviewContext';
+import { useAgentProviderSelection, type AgentProviderOption } from '../provider-selection/useAgentProviderSelection';
 import { MeetingAssistantWorkspace } from './MeetingAssistantWorkspace';
+import { MeetingOverlayBridge } from './MeetingOverlayBridge';
 import {
   useMeetingAssistantController,
   type MeetingAssistantControllerOptions,
 } from './useMeetingAssistantController';
+import { buildMeetingChatRequest, type MeetingRequestBuilderArgs, type MeetingRequestContext } from './meetingRequestBuilder';
+import { useScreenReader } from '../screen-reading/useScreenReader';
 
 type MeetingWorkspaceProps = ComponentProps<typeof MeetingAssistantWorkspace>;
 export type MeetingControllerSnapshot = ReturnType<typeof useMeetingAssistantController>;
 
 interface MeetingAssistantPageProps {
   active: boolean;
+  providers: AgentProviderOption[];
+  onProviderStorageError: (message: string) => void;
   interviewConfig: InterviewContextConfig;
   setInterviewConfig: MeetingAssistantControllerOptions['setInterviewConfig'];
   refreshConfiguredProviders: MeetingAssistantControllerOptions['refreshConfiguredProviders'];
   shouldAcceptQuestion: MeetingAssistantControllerOptions['shouldAcceptQuestion'];
-  buildChatRequest: MeetingAssistantControllerOptions['buildChatRequest'];
-  screenReading: boolean;
-  screenReadingEnabled: boolean;
-  onReadScreen: () => void;
+  requestContext: MeetingRequestContext;
   onControllerChange: (controller: MeetingControllerSnapshot) => void;
+  onScreenReadingChange: (state: Pick<ReturnType<typeof useScreenReader>, 'enabled' | 'setEnabled'>) => void;
 }
 
 export function MeetingAssistantPage({
   active,
+  providers,
+  onProviderStorageError,
   interviewConfig,
   setInterviewConfig,
   refreshConfiguredProviders,
   shouldAcceptQuestion,
-  buildChatRequest,
-  screenReading,
-  screenReadingEnabled,
-  onReadScreen,
+  requestContext,
   onControllerChange,
+  onScreenReadingChange,
 }: MeetingAssistantPageProps) {
+  const { providerId } = useAgentProviderSelection('meeting', providers, onProviderStorageError);
+  const buildSelectedChatRequest = useCallback((
+    ...args: MeetingRequestBuilderArgs
+  ) => ({
+      ...buildMeetingChatRequest(requestContext, ...args),
+      ...(providerId ? { providerId } : {}),
+    }),
+    [providerId, requestContext],
+  );
   const controller = useMeetingAssistantController({
     interviewConfig,
     setInterviewConfig,
     refreshConfiguredProviders,
     shouldAcceptQuestion,
-    buildChatRequest,
+    buildChatRequest: buildSelectedChatRequest,
+  });
+  const reportError = controller.reportError;
+  const onScreenReadError = useCallback((message: string) => reportError(message), [reportError]);
+  const screenReader = useScreenReader({
+    storageKey: 'meeting-screen-reading-enabled',
+    disabled: !active || controller.chatBusy,
+    onError: onScreenReadError,
+    onScreenCaptured: async (image) => {
+      await controller.sendQuestion(
+        'Read the visible question on my shared meeting screen and answer it.',
+        { duplicateChecked: true, screenImage: image },
+      );
+    },
   });
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
@@ -141,6 +167,10 @@ export function MeetingAssistantPage({
     onControllerChange(snapshot);
   }, [onControllerChange, snapshot]);
 
+  useEffect(() => {
+    onScreenReadingChange({ enabled: screenReader.enabled, setEnabled: screenReader.setEnabled });
+  }, [onScreenReadingChange, screenReader.enabled, screenReader.setEnabled]);
+
   const workspace: MeetingWorkspaceProps = {
     sessionActive,
     meetingAudioMode: controller.meetingAudioMode,
@@ -176,19 +206,17 @@ export function MeetingAssistantPage({
     onSaveTranscript: controller.saveMeetingTranscript,
     onInputChange: controller.setInput,
     onSendMessage: controller.sendTypedQuestion,
-    onReadScreen,
-    screenReading,
-    screenReadingEnabled,
+    onReadScreen: () => void screenReader.readScreen(),
+    screenReading: screenReader.screenReading,
+    screenReadingEnabled: screenReader.enabled,
   };
 
   return (
-    <section hidden={!active} className={`${active ? 'flex' : 'hidden'} m-auto w-full max-w-3xl flex-1 flex-col rounded-2xl border border-teal-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7`}>
-      <div className="mb-5">
-        <p className="text-[11px] font-semibold uppercase tracking-wider text-teal-300">Meeting Assistant</p>
-        <h2 className="mt-1 text-xl font-semibold">Listen and get answers</h2>
-        <p className="mt-2 text-xs text-slate-500">Meeting audio, transcription, and answers run in their own pipeline.</p>
-      </div>
-      <MeetingAssistantWorkspace {...workspace} />
-    </section>
+    <>
+      <section hidden={!active} className={`${active ? 'flex' : 'hidden'} m-auto w-full max-w-3xl flex-1 flex-col rounded-2xl border border-teal-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7`}>
+        <MeetingAssistantWorkspace {...workspace} />
+      </section>
+      <MeetingOverlayBridge active={active} controller={controller} />
+    </>
   );
 }

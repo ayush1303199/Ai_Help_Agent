@@ -13,6 +13,7 @@ import httpx
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from python_compat import configure_runtime_warnings
+from backend_config import STT_REQUEST_TIMEOUT_SECONDS
 
 configure_runtime_warnings()
 
@@ -32,11 +33,13 @@ class SttService:
         retry_attempts: int,
         retry_delay: Callable[[Exception, int], float],
         retryable: Callable[[Exception], bool],
+        meeting_transcription_prompt: str = "",
     ) -> None:
         self._get_provider = get_provider
         self._get_speech_capable_provider = get_speech_capable_provider
         self._get_api_key = get_api_key
         self._transcription_prompt = transcription_prompt
+        self._meeting_transcription_prompt = meeting_transcription_prompt or transcription_prompt
         self._max_upload_bytes = max_upload_mb * 1024 * 1024
         self._max_upload_mb = max_upload_mb
         self._retry_attempts = retry_attempts
@@ -86,8 +89,22 @@ class SttService:
         segment_id = request.headers.get("x-stt-segment-id", "unknown")
         request_id = request.headers.get("x-stt-request-id") or segment_id
         source = request.headers.get("x-stt-source", "unknown").lower()
-        if source not in {"microphone", "video", "system_audio", "mixed", "unknown"}:
+        if source not in {
+            "microphone",
+            "video",
+            "system_audio",
+            "mixed",
+            "meeting_microphone",
+            "meeting_system_audio",
+            "meeting_mixed",
+            "unknown",
+        }:
             source = "unknown"
+        transcription_prompt = (
+            self._meeting_transcription_prompt
+            if source.startswith("meeting_")
+            else self._transcription_prompt
+        )
         try:
             audio_duration_ms = max(0, int(request.headers.get("x-stt-audio-duration-ms", "")))
         except (TypeError, ValueError):
@@ -159,7 +176,7 @@ class SttService:
                         "role": "user",
                         "parts": [
                             {"text": (
-                                f"{self._transcription_prompt} "
+                                f"{transcription_prompt} "
                                 "Return only the transcript, preserving the original language. "
                                 "Do not answer or summarize it."
                             )},
@@ -196,7 +213,7 @@ class SttService:
                             url,
                             headers={"x-goog-api-key": api_key, "content-type": "application/json"},
                             json=body,
-                            timeout=60,
+                            timeout=STT_REQUEST_TIMEOUT_SECONDS,
                         )
                         self._diagnostic(
                             "STT_DIAGNOSTIC_UPSTREAM_RESPONSE",
@@ -246,7 +263,7 @@ class SttService:
                     "file": (file.filename, BytesIO(contents), file.content_type or "audio/webm"),
                     "model": transcription_model,
                     "response_format": "text",
-                    "prompt": self._transcription_prompt,
+                    "prompt": transcription_prompt,
                     "temperature": 0,
                 }
                 language = os.getenv("TRANSCRIPTION_LANGUAGE", "").strip()

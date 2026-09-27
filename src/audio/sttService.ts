@@ -6,7 +6,7 @@ export interface SttSegmentRequest {
   sessionId: string;
   segmentId: string;
   payloadName: string;
-  source?: 'microphone' | 'video' | 'system_audio' | 'mixed';
+  source?: 'microphone' | 'video' | 'system_audio' | 'mixed' | 'meeting_microphone' | 'meeting_system_audio' | 'meeting_mixed';
 }
 
 export interface SttSegmentResponse {

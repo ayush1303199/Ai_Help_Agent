@@ -8,6 +8,7 @@ export interface MeetingChatMessage {
 export interface MeetingChatRequest {
   mode: string;
   messages: MeetingChatMessage[];
+  providerId?: string;
   interviewContext?: Record<string, unknown>;
   pdfContext?: string;
 }
@@ -21,6 +22,7 @@ export interface MeetingChatResult {
 interface PendingRequest {
   resolve: (result: MeetingChatResult) => void;
   reject: (error: Error) => void;
+  timeout: number;
 }
 
 const MEETING_WS_URL = `${runtimeConfig.wsUrl.replace(/\/+$/, '')}/meeting`;
@@ -34,14 +36,27 @@ export class MeetingAgentTransport {
     const socket = await this.connect();
     const requestId = crypto.randomUUID();
     const result = new Promise<MeetingChatResult>((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
+      const timeout = window.setTimeout(() => {
+        this.pending.delete(requestId);
+        reject(new Error('The Meeting Assistant did not return an answer in time. Please try again.'));
+      }, runtimeConfig.limits.transportRequestTimeoutMs);
+      this.pending.set(requestId, { resolve, reject, timeout });
     });
-    socket.send(JSON.stringify({
-      type: 'chat',
-      agent: 'meeting',
-      requestId,
-      ...request,
-    }));
+    try {
+      socket.send(JSON.stringify({
+        type: 'chat',
+        agent: 'meeting',
+        requestId,
+        ...request,
+      }));
+    } catch (error) {
+      const pending = this.pending.get(requestId);
+      if (pending) {
+        window.clearTimeout(pending.timeout);
+        this.pending.delete(requestId);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
     return result;
   }
 
@@ -51,6 +66,7 @@ export class MeetingAgentTransport {
     this.connecting = null;
     socket?.close();
     for (const [requestId, request] of this.pending) {
+      window.clearTimeout(request.timeout);
       this.pending.delete(requestId);
       request.reject(new Error('The Meeting Assistant connection was closed before the answer completed.'));
     }
@@ -64,7 +80,7 @@ export class MeetingAgentTransport {
       const timeout = window.setTimeout(() => {
         socket.close();
         reject(new Error('Timed out connecting to the Meeting Assistant service.'));
-      }, 10000);
+      }, runtimeConfig.limits.transportConnectTimeoutMs);
       socket.onopen = () => {
         window.clearTimeout(timeout);
         this.socket = socket;
@@ -102,6 +118,7 @@ export class MeetingAgentTransport {
     const request = this.pending.get(requestId);
     if (!request) return;
     if (message.type === 'done') {
+      window.clearTimeout(request.timeout);
       this.pending.delete(requestId);
       request.resolve({
         content: String(message.content || ''),
@@ -109,6 +126,7 @@ export class MeetingAgentTransport {
         model: typeof message.model === 'string' ? message.model : undefined,
       });
     } else if (message.type === 'error') {
+      window.clearTimeout(request.timeout);
       this.pending.delete(requestId);
       request.reject(new Error(String(message.message || 'The Meeting Assistant request failed.')));
     }

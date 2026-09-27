@@ -31,9 +31,11 @@ from provider_model_contract import (
 from provider_presets import PROVIDER_PRESETS
 from backend_config import (
     APP_ROOT, CONFIG_PATH, GENERAL_CONTEXT_CHAR_BUDGET, GENERAL_CONTEXT_MESSAGE_CHARS,
+    GENERAL_FORCED_CONTEXT_MESSAGE_CHARS, GENERAL_MINIMUM_MESSAGE_BUDGET_CHARS,
+    GENERAL_RETRY_DELAY_SECONDS, MODEL_CATALOG_TIMEOUT_SECONDS, MODEL_REQUEST_TIMEOUT_SECONDS,
     MAX_MODEL_INPUT_CHARS, MAX_MODEL_MESSAGE_CHARS, MAX_MODEL_SYSTEM_CHARS, MAX_PDF_MB,
     MAX_TOKENS, PORT, PROVIDER_RETRY_ATTEMPTS, PROVIDER_RETRY_MAX_SECONDS,
-    CODING_WS_PORT, STT_TRANSCRIPTION_PROMPT, WS_PORT,
+    CODING_WS_PORT, MEETING_TRANSCRIPTION_PROMPT, STT_TRANSCRIPTION_PROMPT, WS_PORT,
 )
 from coding_websocket import run_coding_websocket_server
 from provider_service import (
@@ -120,15 +122,16 @@ def call_model(
     provider_id: Optional[str] = None,
     request_id: Optional[str] = None,
     trace_metadata: Optional[Dict[str, Any]] = None,
-) -> str:
+) -> tuple[str, Any]:
     """Call LLM using specified or active provider."""
-    message, _provider = complete_model(
+    message, provider = complete_model(
         messages,
         provider_id,
         request_id=request_id,
         trace_metadata=trace_metadata,
     )
-    return str(message.get("content") or "").strip() or "No response returned by the model."
+    content = str(message.get("content") or "").strip() or "No response returned by the model."
+    return content, provider
 
 
 def compact_model_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -218,7 +221,7 @@ def compact_general_context(
             continue
         item = dict(message)
         content = _message_content_text(item.get("content"))
-        limit = 1400 if force else GENERAL_CONTEXT_MESSAGE_CHARS
+        limit = GENERAL_FORCED_CONTEXT_MESSAGE_CHARS if force else GENERAL_CONTEXT_MESSAGE_CHARS
         if len(content) > limit:
             content = content[:limit] + "\n[General context truncated.]"
         item["content"] = content
@@ -239,7 +242,7 @@ def compact_general_context(
                 item["name"] = name
 
     tool_chars = len(json.dumps(tools or [], ensure_ascii=False, separators=(",", ":")))
-    message_budget = max(2400, GENERAL_CONTEXT_CHAR_BUDGET - tool_chars)
+    message_budget = max(GENERAL_MINIMUM_MESSAGE_BUDGET_CHARS, GENERAL_CONTEXT_CHAR_BUDGET - tool_chars)
     system_messages = normalized[:1] if normalized and normalized[0].get("role") == "system" else []
     remaining = normalized[len(system_messages):]
     kept: List[Dict[str, Any]] = []
@@ -504,7 +507,7 @@ def _post_provider_json(
             "url": url,
             "body": redact_provider_error(serialized_body, sensitive_headers),
         }
-    with httpx.Client(timeout=60.0) as client:
+    with httpx.Client(timeout=MODEL_REQUEST_TIMEOUT_SECONDS) as client:
         if request_capture:
             response = client.post(
                 url,
@@ -898,7 +901,7 @@ def list_provider_models(provider_id: str) -> Dict[str, Any]:
             f"{provider.base_url.rstrip('/')}/models",
             headers={"x-goog-api-key": api_key},
             params={"pageSize": 100},
-            timeout=15.0,
+            timeout=MODEL_CATALOG_TIMEOUT_SECONDS,
         )
     except httpx.RequestError as error:
         raise HTTPException(status_code=502, detail="Could not reach the Gemini model catalog.") from error
@@ -1803,6 +1806,7 @@ stt_service = SttService(
     get_speech_capable_provider=get_speech_capable_provider_candidate,
     get_api_key=get_api_key,
     transcription_prompt=STT_TRANSCRIPTION_PROMPT,
+    meeting_transcription_prompt=MEETING_TRANSCRIPTION_PROMPT,
     max_upload_mb=MAX_PDF_MB,
     retry_attempts=PROVIDER_RETRY_ATTEMPTS,
     retry_delay=provider_retry_delay_seconds,
@@ -1948,7 +1952,7 @@ def complete_model(
                         error=error,
                         trace_metadata=trace_metadata,
                     )
-                    time.sleep(delay)
+                    time.sleep(GENERAL_RETRY_DELAY_SECONDS)
             if not compatibility_fallback_used:
                 registry.update_provider_status(provider.id, ProviderStatus.READY)
                 registry.save_to_file()
@@ -2514,6 +2518,7 @@ async def run_tool_loop(
     developer: bool,
 ) -> None:
     request_id = str(payload.get("requestId") or "")
+    selected_provider_id = str(payload.get("providerId") or "").strip() or None
     raw_messages = payload.get("messages") or []
     if developer:
         system = (
@@ -2620,7 +2625,7 @@ async def run_tool_loop(
             return await asyncio.to_thread(
                 complete_model,
                 current_messages,
-                None,
+                selected_provider_id,
                 request_tools,
                 tool_choice,
                 allow_tool_compatibility_fallback=False,
@@ -2638,7 +2643,7 @@ async def run_tool_loop(
                 message, selected_provider = await asyncio.to_thread(
                     complete_model,
                     prepared,
-                    None,
+                    selected_provider_id,
                     request_tools,
                     tool_choice,
                     allow_tool_compatibility_fallback=True,
@@ -2654,7 +2659,7 @@ async def run_tool_loop(
                     return await asyncio.to_thread(
                         complete_model,
                         current_messages,
-                        None,
+                        selected_provider_id,
                         request_tools,
                         "auto",
                         allow_tool_compatibility_fallback=True,
@@ -2870,6 +2875,7 @@ async def run_tool_loop(
 
 async def process_chat_payload(payload: Dict[str, Any], send_json, state: Dict[str, Any]) -> None:
     request_id = str(payload.get("requestId") or "")
+    selected_provider_id = str(payload.get("providerId") or "").strip() or None
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         await send_connection_message(send_json, state, {
@@ -2970,13 +2976,13 @@ async def process_chat_payload(payload: Dict[str, Any], send_json, state: Dict[s
             ),
             "promptChars": len(system_content),
         }
-        answer = await asyncio.to_thread(
+        answer, provider = await asyncio.to_thread(
             call_model,
             final_messages,
+            selected_provider_id,
             request_id=request_id,
             trace_metadata=trace_metadata,
         )
-        provider = registry.get_active_provider()
         await send_connection_message(send_json, state, {
             "type": "token",
             "content": answer,

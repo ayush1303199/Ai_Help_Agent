@@ -8,6 +8,7 @@ export interface AssistantChatMessage {
 export interface AssistantChatRequest {
   mode: string;
   messages: AssistantChatMessage[];
+  providerId?: string;
   interviewContext?: Record<string, unknown>;
   pdfContext?: string;
 }
@@ -98,7 +99,7 @@ export class AssistantAgentTransport {
       const timeout = window.setTimeout(() => {
         socket.close();
         reject(new Error('Timed out connecting to the Assistant service.'));
-      }, 10000);
+      }, runtimeConfig.limits.transportConnectTimeoutMs);
       socket.onopen = () => {
         window.clearTimeout(timeout);
         this.socket = socket;
@@ -109,7 +110,7 @@ export class AssistantAgentTransport {
       socket.onerror = () => {
         window.clearTimeout(timeout);
         this.options.onConnectionChange?.(false);
-        reject(new Error('WebSocket connection failed. Is the WS server running on port 3002?'));
+        reject(new Error(`WebSocket connection failed. Is the WS server running on port ${runtimeConfig.services.websocket.port}?`));
       };
       socket.onclose = () => {
         window.clearTimeout(timeout);

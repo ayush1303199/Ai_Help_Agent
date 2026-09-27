@@ -24,7 +24,7 @@ function asError(value: unknown) {
   return value instanceof Error ? value : new Error(String(value));
 }
 
-export function useGeneralAgentController() {
+export function useGeneralAgentController({ providerId }: { providerId: string | null }) {
   const [goal, setGoal] = useState('');
   const [clarification, setClarification] = useState('');
   const [followUp, setFollowUp] = useState('');
@@ -304,6 +304,7 @@ export function useGeneralAgentController() {
         general: true,
         generalTaskId: requestTask.taskId,
         generalContinuation: continuation,
+        ...(providerId ? { providerId } : {}),
         requestId,
         messages,
       }));

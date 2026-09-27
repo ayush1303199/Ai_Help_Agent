@@ -2,17 +2,25 @@ import { useCallback, useEffect, useState } from 'react';
 import { captureScreenForReading } from './screenReadingService';
 
 interface UseScreenReaderOptions {
+  storageKey?: string;
   disabled?: boolean;
   onError: (message: string) => void;
   onScreenCaptured: (image: string) => Promise<void>;
 }
 
 export function useScreenReader({
+  storageKey = 'screen-reading-enabled',
   disabled = false,
   onError,
   onScreenCaptured,
 }: UseScreenReaderOptions) {
-  const [enabled, setEnabled] = useState(() => localStorage.getItem('screen-reading-enabled') === 'true');
+  const [enabled, setEnabled] = useState(() => {
+    try {
+      return localStorage.getItem(storageKey) === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [screenReading, setScreenReading] = useState(false);
 
   const readScreen = useCallback(async () => {
@@ -32,7 +40,7 @@ export function useScreenReader({
 
   useEffect(() => {
     const onShortcut = (event: KeyboardEvent) => {
-      if (enabled && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'r') {
+      if (enabled && !disabled && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'r') {
         event.preventDefault();
         void readScreen();
       }
@@ -46,12 +54,16 @@ export function useScreenReader({
       window.removeEventListener('keydown', onShortcut);
       removeElectronShortcut?.();
     };
-  }, [enabled, readScreen]);
+  }, [disabled, enabled, readScreen]);
 
   const setEnabledState = useCallback((next: boolean) => {
-    setEnabled(next);
-    localStorage.setItem('screen-reading-enabled', String(next));
-  }, []);
+    try {
+      localStorage.setItem(storageKey, String(next));
+      setEnabled(next);
+    } catch {
+      onError('Screen-reading preference could not be saved because browser storage is unavailable.');
+    }
+  }, [onError, storageKey]);
 
   return { readScreen, screenReading, enabled, setEnabled: setEnabledState };
 }

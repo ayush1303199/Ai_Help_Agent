@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { developer: developerSettings } = require('../src/config/runtimeSettings.json');
 const cache = new Map();
 const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
 function tokens(text) { return Math.ceil(String(text || '').length / 4); }
@@ -42,11 +43,11 @@ function rankResults(results, query) {
     return { ...item, score, rank: index };
   }).sort((a, b) => b.score - a.score || String(a.path).localeCompare(String(b.path)) || (a.line || 0) - (b.line || 0));
 }
-function assembleContext({ query, results = [], files = [], maxTokens = 4000, root = '__global__' } = {}) {
-  if (typeof query !== 'string' || query.length > 200 || !Array.isArray(results) || results.length > 500) {
+function assembleContext({ query, results = [], files = [], maxTokens = developerSettings.contextDefaultTokens, root = '__global__' } = {}) {
+  if (typeof query !== 'string' || query.length > developerSettings.contextMaxQueryChars || !Array.isArray(results) || results.length > developerSettings.contextMaxResults) {
     throw new Error('Invalid bounded Developer context request.');
   }
-  maxTokens = Math.max(64, Math.min(Number(maxTokens) || 4000, 12000));
+  maxTokens = Math.max(developerSettings.contextMinTokens, Math.min(Number(maxTokens) || developerSettings.contextDefaultTokens, developerSettings.contextMaxTokens));
   const scopedRoot = normalizeRoot(root);
   const key = digest(JSON.stringify({ root: scopedRoot, query, results, files, maxTokens }));
   if (cache.has(key)) return { ...cache.get(key), cached: true, root: scopedRoot };
@@ -73,21 +74,21 @@ function assembleContext({ query, results = [], files = [], maxTokens = 4000, ro
   cache.set(key, context);
   return { ...context, cached: false };
 }
-function assembleRuntimeEvidenceContext(evidence = {}, maxTokens = 1800) {
-  const budget = Math.max(64, Math.min(Number(maxTokens) || 1800, 4000));
-  const mapped = Array.isArray(evidence.mapped) ? evidence.mapped.slice(0, 8) : [];
+function assembleRuntimeEvidenceContext(evidence = {}, maxTokens = developerSettings.contextDefaultEvidenceTokens) {
+  const budget = Math.max(developerSettings.contextMinTokens, Math.min(Number(maxTokens) || developerSettings.contextDefaultEvidenceTokens, developerSettings.contextMaxEvidenceTokens));
+  const mapped = Array.isArray(evidence.mapped) ? evidence.mapped.slice(0, developerSettings.contextMaxRuntimeFrames) : [];
   const lines = [
-    `[runtime-observed] ${String(evidence.message || 'Runtime failure captured.').slice(0, 1000)}`,
+    `[runtime-observed] ${String(evidence.message || 'Runtime failure captured.').slice(0, developerSettings.contextMaxRuntimeMessageChars)}`,
     ...mapped.map((item) => `[mapped] ${item.file}:${item.line}${item.column ? `:${item.column}` : ''}\n${(item.source || []).map((line) => `${line.line}: ${line.text}`).join('\n')}`),
   ];
   const content = lines.join('\n').slice(0, budget * 4);
   return { content, tokenCount: tokens(content), budget, observed: Boolean(evidence.observed), redacted: evidence.redacted !== false };
 }
-function assemblePreferenceContext(preferences = [], maxTokens = 600) {
-  const budget = Math.max(64, Math.min(Number(maxTokens) || 600, 1200));
+function assemblePreferenceContext(preferences = [], maxTokens = developerSettings.contextDefaultPreferenceTokens) {
+  const budget = Math.max(developerSettings.contextMinTokens, Math.min(Number(maxTokens) || developerSettings.contextDefaultPreferenceTokens, developerSettings.contextMaxPreferenceTokens));
   const content = preferences.filter((item) => item && item.enabled && typeof item.text === 'string')
-    .slice(0, 20)
-    .map((item) => `- [${String(item.category || 'other').slice(0, 32)}] ${item.text.slice(0, 240)}`)
+    .slice(0, developerSettings.contextMaxPreferences)
+    .map((item) => `- [${String(item.category || 'other').slice(0, developerSettings.contextMaxPreferenceCategoryChars)}] ${item.text.slice(0, developerSettings.contextMaxPreferenceChars)}`)
     .join('\n')
     .slice(0, budget * 4);
   return { content: content ? `[user-style-guidance]\n${content}` : '', tokenCount: tokens(content), budget };

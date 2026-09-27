@@ -214,6 +214,36 @@ interface OverlayRendererState {
   expandedBounds: OverlayBounds;
 }
 
+interface MeetingOverlayRuntimeState {
+  answer: string;
+  question: string;
+  analysis: string;
+  summary: string;
+  actionItems: string[];
+  status: string;
+  error: string;
+  statusMessage: string;
+  agent: 'meeting';
+  captureActive: boolean;
+  transcribing: boolean;
+  meetingActive: boolean;
+  version: number;
+  updatedAt: number;
+}
+
+interface MeetingOverlayCommand {
+  type: 'start-listening' | 'stop-listening' | 'question';
+  question?: string;
+  commandId?: string;
+}
+
+interface MeetingOverlayCommandResult {
+  commandId: string;
+  ok: boolean;
+  captureActive?: boolean;
+  message?: string;
+}
+
 interface Window {
   electronAPI?: {
     openOverlay: () => Promise<OverlayRendererState>;
@@ -229,6 +259,13 @@ interface Window {
     setOverlayBounds: (bounds: OverlayBounds) => Promise<OverlayRendererState>;
     setOverlayAlwaysOnTop: (alwaysOnTop: boolean) => Promise<OverlayRendererState>;
     onOverlayState: (callback: (state: OverlayRendererState) => void) => () => void;
+    publishMeetingOverlayState: (state: MeetingOverlayRuntimeState) => Promise<MeetingOverlayRuntimeState>;
+    getMeetingOverlayState: () => Promise<MeetingOverlayRuntimeState>;
+    onMeetingOverlayState: (callback: (state: MeetingOverlayRuntimeState) => void) => () => void;
+    sendMeetingOverlayCommand: (command: MeetingOverlayCommand) => Promise<void>;
+    onMeetingOverlayCommand: (callback: (command: MeetingOverlayCommand) => void) => () => void;
+    reportMeetingOverlayCommandResult: (result: MeetingOverlayCommandResult) => Promise<void>;
+    onMeetingOverlayCommandResult: (callback: (result: MeetingOverlayCommandResult) => void) => () => void;
     focusOverlayAnswer: () => Promise<OverlayRendererState>;
     captureScreen: () => Promise<string>;
     onScreenReadShortcut: (callback: () => void) => () => void;

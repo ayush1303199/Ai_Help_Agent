@@ -1,6 +1,7 @@
 import { Bot, Copy, Loader2, Send, Sparkles, Trash2, User } from 'lucide-react';
 import type { RefObject } from 'react';
 import type { AssistantMessage } from './useAssistantAgentController';
+import { ScreenReadingButton } from '../screen-reading/ScreenReadingButton';
 
 interface AssistantAgentWorkspaceProps {
   messages: AssistantMessage[];
@@ -16,6 +17,9 @@ interface AssistantAgentWorkspaceProps {
   onClearChat: () => void;
   onCopyMessage: (content: string, id: string) => void;
   onSuggestion: (value: string) => void;
+  screenReading: boolean;
+  screenReadingEnabled: boolean;
+  onReadScreen: () => void;
 }
 
 export function AssistantAgentWorkspace({
@@ -32,6 +36,9 @@ export function AssistantAgentWorkspace({
   onClearChat,
   onCopyMessage,
   onSuggestion,
+  screenReading,
+  screenReadingEnabled,
+  onReadScreen,
 }: AssistantAgentWorkspaceProps) {
   return (
     <>
@@ -85,6 +92,12 @@ export function AssistantAgentWorkspace({
             )}
           </div>
         ))}
+        <ScreenReadingButton
+          chatStreaming={chatStreaming}
+          onReadScreen={onReadScreen}
+          screenReading={screenReading}
+          enabled={screenReadingEnabled}
+        />
       </div>
       <div className="mt-4 flex items-end gap-2">
         <button type="button" onClick={onClearChat} className="flex-shrink-0 rounded-xl border border-slate-700 bg-slate-800 p-3 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-200" title="Clear chat">

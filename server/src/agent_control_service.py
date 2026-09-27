@@ -4,6 +4,7 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
+from backend_config import AGENT_ACTIVITY_MAX_ENTRIES
 
 from fastapi import HTTPException
 
@@ -11,7 +12,7 @@ from fastapi import HTTPException
 class AgentControlService:
     """Owns loopback-controlled desktop permissions and activity history."""
 
-    MAX_ACTIVITY = 100
+    MAX_ACTIVITY = AGENT_ACTIVITY_MAX_ENTRIES
 
     def __init__(self) -> None:
         self.permissions: Dict[str, bool] = {

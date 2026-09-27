@@ -9,6 +9,9 @@ const developerIndex = require('./developerIndex.cjs');
 const developerContext = require('./developerContext.cjs');
 const developerBenchmark = require('./developerBenchmark.cjs');
 const generalAgent = require('./generalAgent.cjs');
+const runtimeSettings = require('../src/config/runtimeSettings.json');
+const { services, electron: electronSettings } = runtimeSettings;
+const devServerUrl = `http://${services.devServer.host}:${services.devServer.port}`;
 
 function ignoreBrokenOutputPipe(stream) {
   stream.on('error', (error) => {
@@ -43,32 +46,48 @@ const OVERLAY_STATE_PATH = path.join(app.getPath('userData'), 'overlay-state.jso
 const OVERLAY_VISIBILITY_VALUES = new Set(['VISIBLE', 'MINIMIZED', 'HIDDEN']);
 const OVERLAY_TAB_VALUES = new Set(['answer', 'analysis', 'summary', 'action-items']);
 const OVERLAY_PREFERENCE_KEYS = new Set(['lowVisibility', 'autoHideEnabled', 'autoHideDelay', 'alwaysOnTop', 'activeTab', 'opacity']);
-const OVERLAY_MIN_OPACITY = 0.2;
-const OVERLAY_MAX_OPACITY = 1;
-const OVERLAY_MIN_WIDTH = 320;
-const OVERLAY_MIN_HEIGHT = 180;
-const OVERLAY_DEFAULT_WIDTH = 620;
-const OVERLAY_DEFAULT_HEIGHT = 420;
-const OVERLAY_MINI_WIDTH = 320;
-const OVERLAY_MINI_HEIGHT = 128;
+const OVERLAY_MIN_OPACITY = electronSettings.overlay.minOpacity;
+const OVERLAY_MAX_OPACITY = electronSettings.overlay.maxOpacity;
+const OVERLAY_MIN_WIDTH = electronSettings.overlay.minWidth;
+const OVERLAY_MIN_HEIGHT = electronSettings.overlay.minHeight;
+const OVERLAY_DEFAULT_WIDTH = electronSettings.overlay.defaultWidth;
+const OVERLAY_DEFAULT_HEIGHT = electronSettings.overlay.defaultHeight;
+const OVERLAY_MINI_WIDTH = electronSettings.overlay.miniWidth;
+const OVERLAY_MINI_HEIGHT = electronSettings.overlay.miniHeight;
 const defaultOverlayState = {
   visibility: 'VISIBLE',
   lowVisibility: false,
   opacity: OVERLAY_MAX_OPACITY,
   autoHideEnabled: true,
-  autoHideDelay: 5000,
+  autoHideDelay: electronSettings.overlay.autoHideDelayMs,
   alwaysOnTop: true,
   activeTab: 'answer',
   bounds: { x: 0, y: 0, width: OVERLAY_DEFAULT_WIDTH, height: OVERLAY_DEFAULT_HEIGHT },
   expandedBounds: { x: 0, y: 0, width: OVERLAY_DEFAULT_WIDTH, height: OVERLAY_DEFAULT_HEIGHT },
 };
 let overlayState = { ...defaultOverlayState };
+let meetingOverlayRuntimeState = {
+  answer: '',
+  question: '',
+  analysis: '',
+  summary: '',
+  actionItems: [],
+  status: 'ready',
+  error: '',
+  statusMessage: '',
+  agent: 'meeting',
+  captureActive: false,
+  transcribing: false,
+  meetingActive: false,
+  version: 0,
+  updatedAt: 0,
+};
 const overlayShortcutMap = new Map();
 let overlayBoundsPersistTimer = null;
 let overlayWriteSequence = 0;
 let overlayWriteQueue = Promise.resolve();
 
-function waitForPort(port, timeoutMs = 30000) {
+function waitForPort(port, timeoutMs = electronSettings.backendStartupTimeoutMs) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     const attempt = () => {
@@ -80,9 +99,9 @@ function waitForPort(port, timeoutMs = 30000) {
       socket.once('error', () => {
         socket.destroy();
         if (Date.now() >= deadline) reject(new Error(`Timed out waiting for backend port ${port}.`));
-        else setTimeout(attempt, 250);
+        else setTimeout(attempt, electronSettings.portRetryDelayMs);
       });
-      socket.setTimeout(1000, () => socket.destroy());
+      socket.setTimeout(electronSettings.portConnectTimeoutMs, () => socket.destroy());
     };
     attempt();
   });
@@ -99,7 +118,7 @@ function isPortOpen(port) {
       socket.destroy();
       resolve(false);
     });
-    socket.setTimeout(500, () => {
+    socket.setTimeout(electronSettings.portProbeTimeoutMs, () => {
       socket.destroy();
       resolve(false);
     });
@@ -108,7 +127,11 @@ function isPortOpen(port) {
 
 async function startPackagedBackend() {
   if (isDev || backendProcess) return;
-  const [httpReady, websocketReady, codingWebsocketReady] = await Promise.all([isPortOpen(3001), isPortOpen(3002), isPortOpen(3003)]);
+  const [httpReady, websocketReady, codingWebsocketReady] = await Promise.all([
+    isPortOpen(services.http.port),
+    isPortOpen(services.websocket.port),
+    isPortOpen(services.codingWebsocket.port),
+  ]);
   if (httpReady && websocketReady && codingWebsocketReady) return;
   const backendExecutable = process.platform === 'win32'
     ? path.join(process.resourcesPath, 'backend', 'ai-help-agent-backend.exe')
@@ -125,9 +148,9 @@ async function startPackagedBackend() {
     }
     backendProcess = null;
   });
-  await waitForPort(3001);
-  await waitForPort(3002);
-  await waitForPort(3003);
+  await waitForPort(services.http.port);
+  await waitForPort(services.websocket.port);
+  await waitForPort(services.codingWebsocket.port);
 }
 
 function isPlainObject(value) {
@@ -352,7 +375,7 @@ function updateOverlayBoundsFromWindow() {
   overlayBoundsPersistTimer = setTimeout(() => {
     overlayBoundsPersistTimer = null;
     void persistOverlayState(overlayState);
-  }, 100);
+  }, electronSettings.overlay.boundsPersistDelayMs);
 }
 
 async function showOverlayWindow() {
@@ -370,8 +393,8 @@ async function showOverlayWindow() {
     bounds: expandedBounds,
     expandedBounds,
   });
-  await persistOverlayState(nextState);
   applyOverlayWindowState(nextState, { reveal: true, focus: true });
+  void persistOverlayState(nextState);
   return nextState;
 }
 
@@ -527,12 +550,12 @@ function assertTrustedOverlaySender(event) {
   if (!isMainRenderer && !isOverlayRenderer) {
     throw new Error('Unauthorized overlay IPC sender.');
   }
+}
 
-  function assertTrustedMainRendererSender(event) {
-    const sender = event?.sender;
-    if (!mainWindow || mainWindow.isDestroyed() || sender !== mainWindow.webContents) {
-      throw new Error('This action is only available from the main AI Help Agent window.');
-    }
+function assertTrustedMainRendererSender(event) {
+  const sender = event?.sender;
+  if (!mainWindow || mainWindow.isDestroyed() || sender !== mainWindow.webContents) {
+    throw new Error('This action is only available from the main AI Help Agent window.');
   }
 }
 
@@ -565,7 +588,7 @@ function createWindow() {
   });
 
   if (isDev) {
-    window.loadURL(process.env.ELECTRON_DEV_URL || 'http://localhost:5174');
+    window.loadURL(process.env.ELECTRON_DEV_URL || devServerUrl);
   } else {
     window.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   }
@@ -654,7 +677,7 @@ async function createOverlayWindow() {
   });
 
   const overlayUrl = isDev
-    ? `${process.env.ELECTRON_DEV_URL || 'http://localhost:5174'}?overlay=1`
+    ? `${process.env.ELECTRON_DEV_URL || devServerUrl}?overlay=1`
     : `file://${path.join(__dirname, '..', 'dist', 'index.html')}?overlay=1`;
   overlayWindow.loadURL(overlayUrl);
   overlayWindow.on('closed', () => {
@@ -712,6 +735,83 @@ app.whenReady().then(async () => {
   ipcMain.handle('overlay:get-preferences', async (event) => {
     assertTrustedOverlaySender(event);
     return getOverlayStateForRenderer();
+  });
+  ipcMain.handle('meeting-overlay:publish-state', (event, state) => {
+    assertTrustedMainRendererSender(event);
+    if (!isPlainObject(state)
+      || !Number.isSafeInteger(state.version)
+      || state.version < 0
+      || !Number.isFinite(state.updatedAt)
+      || state.updatedAt < 0) {
+      throw new Error('Invalid Meeting overlay state.');
+    }
+    if (state.version < meetingOverlayRuntimeState.version
+      || (state.version === meetingOverlayRuntimeState.version
+        && state.updatedAt < meetingOverlayRuntimeState.updatedAt)) {
+      return meetingOverlayRuntimeState;
+    }
+    meetingOverlayRuntimeState = {
+      answer: typeof state.answer === 'string' ? state.answer.slice(0, 20000) : '',
+      question: typeof state.question === 'string' ? state.question.slice(0, 2000) : '',
+      analysis: typeof state.analysis === 'string' ? state.analysis.slice(0, 20000) : '',
+      summary: typeof state.summary === 'string' ? state.summary.slice(0, 20000) : '',
+      actionItems: Array.isArray(state.actionItems) ? state.actionItems.filter((item) => typeof item === 'string').slice(0, 20) : [],
+      status: typeof state.status === 'string' ? state.status.slice(0, 80) : 'ready',
+      error: typeof state.error === 'string' ? state.error.slice(0, 1000) : '',
+      statusMessage: typeof state.statusMessage === 'string' ? state.statusMessage.slice(0, 500) : '',
+      agent: 'meeting',
+      captureActive: state.captureActive === true,
+      transcribing: state.transcribing === true,
+      meetingActive: state.meetingActive === true,
+      version: state.version,
+      updatedAt: state.updatedAt,
+    };
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.webContents.send('meeting-overlay:state', meetingOverlayRuntimeState);
+    }
+    return meetingOverlayRuntimeState;
+  });
+  ipcMain.handle('meeting-overlay:get-state', (event) => {
+    assertTrustedOverlaySender(event);
+    return meetingOverlayRuntimeState;
+  });
+  ipcMain.handle('meeting-overlay:command', (event, command) => {
+    assertTrustedOverlaySender(event);
+    if (!isPlainObject(command) || !['start-listening', 'stop-listening', 'question'].includes(command.type)) {
+      throw new Error('Invalid Meeting overlay command.');
+    }
+    if (command.type === 'question' && typeof command.question !== 'string') {
+      throw new Error('Meeting overlay questions must be text.');
+    }
+    if (typeof command.commandId !== 'string' || !command.commandId.trim() || command.commandId.length > 100) {
+      throw new Error('Meeting overlay command ID is invalid.');
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) throw new Error('The Meeting window is unavailable.');
+    mainWindow.webContents.send('meeting-overlay:command', {
+      type: command.type,
+      commandId: command.commandId,
+      ...(typeof command.question === 'string' ? { question: command.question.slice(0, 2000) } : {}),
+    });
+  });
+  ipcMain.handle('meeting-overlay:command-result', (event, result) => {
+    assertTrustedMainRendererSender(event);
+    if (!isPlainObject(result)
+      || typeof result.commandId !== 'string'
+      || !result.commandId.trim()
+      || result.commandId.length > 100
+      || typeof result.ok !== 'boolean'
+      || (typeof result.captureActive !== 'undefined' && typeof result.captureActive !== 'boolean')
+      || (typeof result.message !== 'undefined' && typeof result.message !== 'string')) {
+      throw new Error('Invalid Meeting overlay command result.');
+    }
+    if (overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.webContents.send('meeting-overlay:command-result', {
+        commandId: result.commandId,
+        ok: result.ok,
+        ...(typeof result.captureActive === 'boolean' ? { captureActive: result.captureActive } : {}),
+        ...(typeof result.message === 'string' ? { message: result.message.slice(0, 500) } : {}),
+      });
+    }
   });
   ipcMain.handle('overlay:set-preferences', async (event, prefs) => {
     assertTrustedOverlaySender(event);

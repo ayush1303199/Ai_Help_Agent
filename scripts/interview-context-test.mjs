@@ -14,6 +14,8 @@ const { buildInterviewSystemPrompt, buildCanonicalInterviewSystemPrompt } = awai
 const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
 const meetingControllerSource = await fs.readFile(new URL('../src/features/meeting/useMeetingAssistantController.ts', import.meta.url), 'utf8');
 const assistantControllerSource = await fs.readFile(new URL('../src/features/assistant/useAssistantAgentController.ts', import.meta.url), 'utf8');
+const assistantRequestBuilderSource = await fs.readFile(new URL('../src/features/assistant/assistantRequestBuilder.ts', import.meta.url), 'utf8');
+const meetingRequestBuilderSource = await fs.readFile(new URL('../src/features/meeting/meetingRequestBuilder.ts', import.meta.url), 'utf8');
 
 const cases = [
   {
@@ -137,8 +139,16 @@ assert.match(appSource, />Background<\/label>/);
 assert.match(meetingControllerSource, /enumerateDevices\(\)/);
 assert.match(meetingControllerSource, /deviceId: \{ exact: microphoneDeviceId \}/);
 assert.match(meetingControllerSource, /deviceId: \{ exact: fallbackDeviceId \}/);
-assert.match(appSource, /microphoneConfigured: Boolean\(interviewConfig\.microphoneDeviceId\)/);
-assert.match(appSource, /microphoneDevicePresent: Boolean\(microphoneDevicePresent\)/);
+assert.match(assistantRequestBuilderSource, /microphoneConfigured: Boolean\(context\.interviewConfig\.microphoneDeviceId\)/);
+assert.match(assistantRequestBuilderSource, /microphoneDevicePresent: context\.microphoneDevicePresent/);
+assert.match(assistantRequestBuilderSource, /contextCharBudget: context\.contextCharBudget/);
+assert.match(assistantRequestBuilderSource, /profileCharBudget: context\.contextCharBudget/);
+assert.match(meetingRequestBuilderSource, /microphoneConfigured: Boolean\(context\.interviewConfig\.microphoneDeviceId\)/);
+assert.match(meetingRequestBuilderSource, /microphoneDevicePresent: context\.microphoneDevicePresent/);
+assert.match(meetingRequestBuilderSource, /contextCharBudget: context\.contextCharBudget/);
+assert.match(meetingRequestBuilderSource, /profileCharBudget: context\.contextCharBudget/);
+assert.match(appSource, /const microphoneDevicePresent = meetingController\?\.microphoneDevicePresent \?\? false/);
+assert.match(appSource, /Math\.floor\(MAX_CONTEXT_CHARS \* runtimeConfig\.limits\.pdfContextBudgetRatio\)/);
 
 console.log(JSON.stringify({
   interviewContext: true,
