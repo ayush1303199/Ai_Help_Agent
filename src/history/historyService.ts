@@ -1,6 +1,19 @@
 import { runtimeConfig } from '../config/runtimeConfig';
+import {
+  pruneMeetingRecords,
+  readMeetingHistoryRetention,
+} from './meetingHistoryRetention';
+import type { MeetingHistoryRetentionDays } from './meetingHistoryRetention';
+export {
+  DEFAULT_MEETING_HISTORY_RETENTION_DAYS,
+  MEETING_HISTORY_RETENTION_STORAGE_KEY,
+  pruneMeetingRecords,
+  readMeetingHistoryRetention,
+  writeMeetingHistoryRetention,
+} from './meetingHistoryRetention';
+export type { MeetingHistoryRetentionDays } from './meetingHistoryRetention';
 
-export type HistoryMode = 'assistant' | 'developer' | 'general';
+export type HistoryMode = 'assistant' | 'meeting' | 'developer' | 'general';
 
 export interface HistoryMessage {
   role: 'user' | 'assistant';
@@ -59,6 +72,20 @@ export interface HistorySession {
   lastUsedProvider?: DeveloperSessionMetadata['lastUsedProvider'];
 }
 
+export function pruneMeetingHistory(
+  sessions: HistorySession[],
+  retentionDays: MeetingHistoryRetentionDays,
+  now = Date.now(),
+) {
+  const meetings = sessions.filter((session) => session.mode === 'meeting');
+  const retainedMeetings = new Set(pruneMeetingRecords(
+    meetings.map((session) => ({ id: session.id, createdAt: session.updatedAt })),
+    retentionDays,
+    now,
+  ).map((session) => session.id));
+  return sessions.filter((session) => session.mode !== 'meeting' || retainedMeetings.has(session.id));
+}
+
 const STORAGE_KEY = 'chat-history';
 const DEVELOPER_STATE_STORAGE_KEY = 'coding-session-state';
 const CODING_PREFERENCES_STORAGE_KEY = 'coding-preferences-v1';
@@ -79,7 +106,7 @@ function isHistorySession(value: unknown): value is HistorySession {
     && typeof session.updatedAt === 'string'
     && Array.isArray(session.messages)
     && session.messages.every(isHistoryMessage)
-    && (session.mode === 'assistant' || session.mode === 'developer' || session.mode === 'general');
+    && (session.mode === 'assistant' || session.mode === 'meeting' || session.mode === 'developer' || session.mode === 'general');
 }
 
 function isDeveloperConversationState(value: unknown): value is DeveloperConversationState {
@@ -95,7 +122,10 @@ export function readHistory(): HistorySession[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isHistorySession).slice(0, MAX_SESSIONS);
+    return pruneMeetingHistory(
+      parsed.filter(isHistorySession).slice(0, MAX_SESSIONS),
+      readMeetingHistoryRetention(),
+    );
   } catch {
     return [];
   }
@@ -103,7 +133,9 @@ export function readHistory(): HistorySession[] {
 
 export function writeHistory(sessions: HistorySession[]): boolean {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions.slice(0, MAX_SESSIONS)));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(
+      pruneMeetingHistory(sessions, readMeetingHistoryRetention()).slice(0, MAX_SESSIONS),
+    ));
     return true;
   } catch {
     return false;

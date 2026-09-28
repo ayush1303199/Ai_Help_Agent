@@ -75,9 +75,11 @@ let meetingOverlayRuntimeState = {
   status: 'ready',
   error: '',
   statusMessage: '',
+  statusStartedAt: 0,
   agent: 'meeting',
   captureActive: false,
   transcribing: false,
+  audioSignalDetected: false,
   meetingActive: false,
   version: 0,
   updatedAt: 0,
@@ -759,9 +761,11 @@ app.whenReady().then(async () => {
       status: typeof state.status === 'string' ? state.status.slice(0, 80) : 'ready',
       error: typeof state.error === 'string' ? state.error.slice(0, 1000) : '',
       statusMessage: typeof state.statusMessage === 'string' ? state.statusMessage.slice(0, 500) : '',
+      statusStartedAt: Number.isFinite(state.statusStartedAt) ? state.statusStartedAt : Date.now(),
       agent: 'meeting',
       captureActive: state.captureActive === true,
       transcribing: state.transcribing === true,
+      audioSignalDetected: state.audioSignalDetected === true,
       meetingActive: state.meetingActive === true,
       version: state.version,
       updatedAt: state.updatedAt,
@@ -777,7 +781,7 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('meeting-overlay:command', (event, command) => {
     assertTrustedOverlaySender(event);
-    if (!isPlainObject(command) || !['start-listening', 'stop-listening', 'question'].includes(command.type)) {
+    if (!isPlainObject(command) || !['start-listening', 'stop-listening', 'cancel-request', 'open-audio-settings', 'question'].includes(command.type)) {
       throw new Error('Invalid Meeting overlay command.');
     }
     if (command.type === 'question' && typeof command.question !== 'string') {

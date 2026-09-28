@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { prepareQuestion } from '../../audio/transcriptUtils';
 import { runtimeConfig } from '../../config/runtimeConfig';
+import { isMissingMeetingOverlayHandler } from './meetingOverlayProtocol';
 import type { MeetingControllerSnapshot } from './MeetingAssistantPage';
 
 interface MeetingOverlayBridgeProps {
@@ -10,14 +11,19 @@ interface MeetingOverlayBridgeProps {
     | 'lastAnswer'
     | 'liveTranscript'
     | 'pipelineStatus'
+    | 'pipelineStatusSince'
     | 'meetingError'
     | 'meetingStatusMessage'
     | 'chatBusy'
     | 'isRecording'
     | 'isTranscribing'
+    | 'audioSignalDetected'
     | 'sendQuestion'
     | 'startMeetingCapture'
     | 'stopMeetingCapture'
+    | 'cancelCurrentRequest'
+    | 'setMeetingMenuOpen'
+    | 'refreshMicrophoneDevices'
   >;
 }
 
@@ -37,9 +43,11 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
     status: 'ready',
     error: '',
     statusMessage: '',
+    statusStartedAt: Date.now(),
     agent: 'meeting',
     captureActive: false,
     transcribing: false,
+    audioSignalDetected: false,
     meetingActive: false,
     version: 0,
     updatedAt: 0,
@@ -66,10 +74,12 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
       lastAnswer,
       liveTranscript,
       pipelineStatus,
+      pipelineStatusSince,
       meetingError,
       meetingStatusMessage,
       isRecording,
       isTranscribing,
+      audioSignalDetected,
     } = controller;
     const updatedAt = Date.now();
     stateRef.current = {
@@ -81,9 +91,11 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
       status: pipelineStatus,
       error: meetingError,
       statusMessage: meetingStatusMessage,
+      statusStartedAt: pipelineStatusSince,
       agent: 'meeting',
       captureActive: isRecording,
       transcribing: isTranscribing,
+      audioSignalDetected,
       meetingActive: active,
       version: Math.max(updatedAt, stateRef.current.version + 1),
       updatedAt,
@@ -104,14 +116,37 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
 
   useEffect(() => {
     const handleCommand = async (command: MeetingOverlayCommand) => {
-      if (!activeRef.current) return;
-      const current = controllerRef.current;
       if (!command.commandId) return;
+      if (!activeRef.current) {
+        await reportCommandResult({
+          commandId: command.commandId,
+          ok: false,
+          message: 'Open the Meeting page before using Meeting overlay controls.',
+        });
+        return;
+      }
+      const current = controllerRef.current;
+      if (command.type === 'cancel-request') {
+        const cancelled = current.cancelCurrentRequest();
+        await reportCommandResult({
+          commandId: command.commandId,
+          ok: cancelled,
+          ...(cancelled ? {} : { message: 'There is no active transcription or answer to cancel.' }),
+        });
+        return;
+      }
+      if (command.type === 'open-audio-settings') {
+        current.setMeetingMenuOpen(true);
+        await current.refreshMicrophoneDevices();
+        await reportCommandResult({ commandId: command.commandId, ok: true });
+        return;
+      }
       if (command.type === 'start-listening') {
         const started = current.isRecording || await current.startMeetingCapture();
         await reportCommandResult({
           commandId: command.commandId,
           ok: started,
+          captureActive: started || current.isRecording,
           ...(started ? {} : { message: current.meetingError || 'Meeting listening could not start.' }),
         });
         return;
@@ -134,6 +169,15 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
         : '';
       if (!question) {
         await reportCommandResult({ commandId: command.commandId, ok: false, message: 'Enter a question first.' });
+        return;
+      }
+      const preparedQuestion = prepareQuestion(question);
+      if (!preparedQuestion.acceptedQuestion) {
+        await reportCommandResult({
+          commandId: command.commandId,
+          ok: false,
+          message: 'Please enter a complete question or request.',
+        });
         return;
       }
       if (current.chatBusy) {
@@ -161,7 +205,7 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
         await reportCommandResult({ commandId: command.commandId, ok: false, message: error });
         return;
       }
-      void current.sendQuestion(question, { preparedQuestion: prepareQuestion(question), duplicateChecked: true });
+      void current.sendQuestion(question, { preparedQuestion, duplicateChecked: true });
       await reportCommandResult({ commandId: command.commandId, ok: true });
     };
 
@@ -200,6 +244,14 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
         void handleCommand({ type: 'stop-listening', commandId: event.data.commandId });
         return;
       }
+      if (event.data?.type === 'overlay-cancel-request') {
+        void handleCommand({ type: 'cancel-request', commandId: event.data.commandId });
+        return;
+      }
+      if (event.data?.type === 'overlay-open-audio-settings') {
+        void handleCommand({ type: 'open-audio-settings', commandId: event.data.commandId });
+        return;
+      }
       if (event.data?.type !== 'overlay-question') return;
       void handleCommand({ type: 'question', question: event.data.question, commandId: event.data.commandId });
     };
@@ -211,8 +263,4 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
   }, []);
 
   return null;
-}
-
-function isMissingMeetingOverlayHandler(error: unknown): boolean {
-  return error instanceof Error && error.message.includes("No handler registered for 'meeting-overlay:");
 }

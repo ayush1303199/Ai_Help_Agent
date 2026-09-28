@@ -433,6 +433,27 @@ body.overlay-body {
   -webkit-app-region: no-drag;
 }
 
+.overlay-meeting-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-height: 30px;
+  padding: 7px 8px;
+  color: rgba(203, 213, 225, 0.88);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  border-bottom: 1px solid rgba(100, 116, 139, 0.22);
+  -webkit-app-region: no-drag;
+}
+
+.overlay-meeting-status > span:first-child {
+  color: rgba(167, 243, 208, 0.96);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .overlay-search-label {
   display: block;
   margin: 0 0 5px 2px;
@@ -518,6 +539,15 @@ body.overlay-body {
   box-shadow: inset 0 0 22px rgba(71, 85, 105, 0.08);
   scrollbar-width: thin;
   -webkit-app-region: no-drag;
+}
+
+.overlay-view-expanded {
+  max-height: calc(100vh - 102px);
+  min-height: calc(100vh - 132px);
+}
+
+.overlay-answer-expand-toggle {
+  margin: 0 8px 8px;
 }
 
 .overlay-tab-scroll {

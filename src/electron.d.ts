@@ -223,16 +223,18 @@ interface MeetingOverlayRuntimeState {
   status: string;
   error: string;
   statusMessage: string;
+  statusStartedAt: number;
   agent: 'meeting';
   captureActive: boolean;
   transcribing: boolean;
+  audioSignalDetected: boolean;
   meetingActive: boolean;
   version: number;
   updatedAt: number;
 }
 
 interface MeetingOverlayCommand {
-  type: 'start-listening' | 'stop-listening' | 'question';
+  type: 'start-listening' | 'stop-listening' | 'cancel-request' | 'open-audio-settings' | 'question';
   question?: string;
   commandId?: string;
 }

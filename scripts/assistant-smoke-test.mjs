@@ -9,7 +9,13 @@ const modeControlsSource = await fs.readFile(new URL('../src/ui/header/ModeContr
 const meetingWorkspaceSource = await fs.readFile(new URL('../src/features/meeting/MeetingAssistantWorkspace.tsx', import.meta.url), 'utf8');
 const meetingPageSource = await fs.readFile(new URL('../src/features/meeting/MeetingAssistantPage.tsx', import.meta.url), 'utf8');
 const meetingControllerSource = await fs.readFile(new URL('../src/features/meeting/useMeetingAssistantController.ts', import.meta.url), 'utf8');
+const meetingSttErrorSource = await fs.readFile(new URL('../src/features/meeting/meetingSttError.ts', import.meta.url), 'utf8');
+const meetingAudioSourcesSource = await fs.readFile(new URL('../src/features/meeting/useMeetingAudioSources.ts', import.meta.url), 'utf8');
+const meetingCaptureLifecycleSource = await fs.readFile(new URL('../src/features/meeting/meetingCaptureLifecycle.ts', import.meta.url), 'utf8');
+const meetingSttSegmentProcessorSource = await fs.readFile(new URL('../src/features/meeting/meetingSttSegmentProcessor.ts', import.meta.url), 'utf8');
+const meetingTranscriptHistorySource = await fs.readFile(new URL('../src/features/meeting/useMeetingTranscriptHistory.ts', import.meta.url), 'utf8');
 const meetingTransportSource = await fs.readFile(new URL('../src/features/meeting/meetingTransport.ts', import.meta.url), 'utf8');
+const historyServiceSource = await fs.readFile(new URL('../src/history/historyService.ts', import.meta.url), 'utf8');
 const assistantControllerSource = await fs.readFile(new URL('../src/features/assistant/useAssistantAgentController.ts', import.meta.url), 'utf8');
 const assistantTransportSource = await fs.readFile(new URL('../src/features/assistant/assistantTransport.ts', import.meta.url), 'utf8');
 const codingPageSource = await fs.readFile(new URL('../src/features/coding/CodingAgentPage.tsx', import.meta.url), 'utf8');
@@ -149,20 +155,22 @@ assert.match(appSource, /requestContext=\{assistantRequestContext\}/);
 assert.match(appSource, /onHistoryEntries=\{addAssistantHistoryEntries\}/);
 assert.match(meetingControllerSource, /sendTypedQuestion/);
 assert.match(meetingControllerSource, /sendTypedQuestion = \(\) => void sendQuestion\(input, \{ preparedQuestion: prepareTextRequest\(input\) \}\)/);
+assert.match(meetingControllerSource, /useMeetingAudioSources/);
+assert.match(meetingControllerSource, /useMeetingTranscriptHistory/);
 assert.match(meetingControllerSource, /new MeetingAgentTransport\(\)/);
-assert.match(meetingControllerSource, /transport\.send\(buildChatRequest\(/);
-assert.match(meetingControllerSource, /REPEATED_SPEECH_LOOP_REJECTED/);
-assert.match(meetingControllerSource, /SHORT_TRANSCRIPT_WAITING_FOR_CONTINUATION/);
-assert.match(meetingControllerSource, /joinShortTranscriptContinuation\(pendingQuestion, normalizedTranscript\)/);
-assert.match(meetingControllerSource, /shouldBufferShortTranscript\(/);
+assert.match(meetingControllerSource, /transport\.send\([\s\S]*?buildChatRequest\([\s\S]*?abortController\.signal/);
+assert.match(meetingSttSegmentProcessorSource, /REPEATED_SPEECH_LOOP_REJECTED/);
+assert.match(meetingSttSegmentProcessorSource, /SHORT_TRANSCRIPT_WAITING_FOR_CONTINUATION/);
+assert.match(meetingSttSegmentProcessorSource, /joinQuestionContinuation\(pendingQuestion, normalizedTranscript/);
+assert.match(meetingSttSegmentProcessorSource, /shouldBufferShortTranscript\(/);
 assert.ok(
-  meetingControllerSource.indexOf('prepareQuestion(candidateText')
-    < meetingControllerSource.indexOf('if (!hasMeetingRequestIntent(candidateText))'),
+  meetingSttSegmentProcessorSource.indexOf('prepareQuestion(candidateText')
+    < meetingSttSegmentProcessorSource.indexOf('if (!hasMeetingRequestIntent(candidateText))'),
   'Incomplete transcript continuation must be evaluated before rejecting missing request intent.',
 );
-assert.match(meetingControllerSource, /source: meetingAudioMode === 'microphone'/);
-assert.match(meetingControllerSource, /setAnswerPending\(true\)/);
-assert.match(meetingControllerSource, /setDisplayedQuestion\(candidateText\)/);
+assert.match(meetingSttSegmentProcessorSource, /source: meetingAudioMode === 'microphone'/);
+assert.match(meetingSttSegmentProcessorSource, /setAnswerPending\(true\)/);
+assert.match(meetingSttSegmentProcessorSource, /setDisplayedQuestion\(candidateText\)/);
 assert.match(meetingControllerSource, /lastQuestion: displayedQuestion \|\|/);
 assert.match(meetingControllerSource, /setDisplayedAnswer\(result\.content\)/);
 assert.match(meetingControllerSource, /!answerPending && answeredSegments\.length/);
@@ -206,17 +214,17 @@ assert.match(appSource, /active=\{appMode === 'assistant'\}/);
 assert.match(assistantRequestBuilderSource, /CURRENT QUESTION:/);
 assert.match(assistantRequestBuilderSource, /DIRECT MODE ACTIVE CONTEXT:/);
 assert.match(interviewPromptSource, /do not say "I am ChatGPT"/i);
-const meetingVoiceProcessorStart = meetingControllerSource.indexOf('const processSegment = async');
-const meetingVoiceProcessorEnd = meetingControllerSource.indexOf('const processPendingSegments = async', meetingVoiceProcessorStart);
-const meetingVoiceProcessor = meetingControllerSource.slice(meetingVoiceProcessorStart, meetingVoiceProcessorEnd);
+const meetingVoiceProcessorStart = meetingSttSegmentProcessorSource.indexOf('return async (');
+const meetingVoiceProcessorEnd = meetingSttSegmentProcessorSource.length;
+const meetingVoiceProcessor = meetingSttSegmentProcessorSource.slice(meetingVoiceProcessorStart, meetingVoiceProcessorEnd);
 assert.ok(meetingVoiceProcessorStart >= 0 && meetingVoiceProcessorEnd > meetingVoiceProcessorStart);
 assert.doesNotMatch(meetingVoiceProcessor, /shouldAcceptQuestion/);
 assert.match(meetingVoiceProcessor, /onStatus\(''\);\s*setPipelineStatus\('question'\)/);
-assert.match(meetingControllerSource, /rawText: candidateRawText/);
+assert.match(meetingSttSegmentProcessorSource, /rawText: candidateRawText/);
 assert.match(assistantControllerSource, /releaseAcceptedQuestion/);
 assert.match(appTypesSource, /export type MeetingAudioMode = 'microphone' \| 'system' \| 'meeting';/);
-assert.match(meetingControllerSource, /const microphoneAudio = meetingAudioMode !== 'system';/);
-assert.match(meetingControllerSource, /const systemAudioRequested = meetingAudioMode !== 'microphone';/);
+assert.match(meetingAudioSourcesSource, /const microphoneAudio = meetingAudioMode !== 'system';/);
+assert.match(meetingAudioSourcesSource, /const systemAudioRequested = meetingAudioMode !== 'microphone';/);
 assert.match(meetingWorkspaceSource, /System \/ Internal Audio \(meeting sound\)/);
 assert.doesNotMatch(meetingWorkspaceSource, /Click a website button or result|Review click/);
 assert.match(meetingWorkspaceSource, /Ask the assistant\.\.\./);
@@ -229,14 +237,50 @@ assert.doesNotMatch(appSource, /browserClickTarget|requestBrowserButtonClick/);
 assert.doesNotMatch(electronMainSource, /browser:click-confirmed-target|browserClickService|Confirm browser click/);
 assert.match(meetingControllerSource, /Microphone and system audio connected/);
 assert.match(meetingControllerSource, /System audio connected/);
-assert.match(meetingControllerSource, /SYSTEM_AUDIO_UNAVAILABLE/);
-assert.doesNotMatch(meetingControllerSource, /SYSTEM_AUDIO_OPTIONAL_UNAVAILABLE/);
-assert.match(meetingControllerSource, /selectedDeviceConfigured/);
-assert.match(meetingControllerSource, /selectedDevicePresent/);
+assert.match(meetingAudioSourcesSource, /SYSTEM_AUDIO_UNAVAILABLE/);
+assert.doesNotMatch(meetingAudioSourcesSource, /SYSTEM_AUDIO_OPTIONAL_UNAVAILABLE/);
+assert.match(meetingAudioSourcesSource, /selectedDeviceConfigured/);
+assert.match(meetingAudioSourcesSource, /selectedDevicePresent/);
 assert.match(meetingControllerSource, /displayedAudioSourceLabel/);
 assert.match(meetingControllerSource, /displayedAudioStatus/);
 assert.match(meetingControllerSource, /const stopMeetingCapture = \(\) =>/);
-assert.match(meetingControllerSource, /if \(captureActiveRef\.current \|\| captureSessionIdRef\.current\) return;/);
+assert.match(meetingControllerSource, /meetingCaptureStartDecision\(/);
+assert.match(meetingCaptureLifecycleSource, /startInProgress \|\| activeSessionId !== ''/);
+assert.match(meetingControllerSource, /captureStartGenerationRef\.current \+= 1/);
+assert.match(meetingControllerSource, /adaptiveSilenceTimeoutMs\(\s*SYSTEM_AUDIO_SILENCE_MS/);
+assert.match(meetingControllerSource, /adaptiveAudioLevelThreshold\(SYSTEM_AUDIO_LEVEL_THRESHOLD, recentLevels\)/);
+assert.match(meetingTranscriptHistorySource, /limitMeetingTranscriptHistory<MeetingTranscript>/);
+assert.match(meetingTranscriptHistorySource, /meeting-transcripts/);
+assert.match(meetingTranscriptHistorySource, /meeting-chat-state/);
+assert.match(meetingTranscriptHistorySource, /appendAnsweredSegment/);
+assert.match(meetingTranscriptHistorySource, /restoreMeetingHistory/);
+assert.match(meetingControllerSource, /deleteMeetingTranscript/);
+assert.match(meetingCaptureLifecycleSource, /addEventListener\('ended', handleEnded\)/);
+assert.match(meetingAudioSourcesSource, /devicechange/);
+assert.match(meetingControllerSource, /setAudioSignalDetected\(true\)/);
+assert.match(meetingWorkspaceSource, /Edit transcript before sending/);
+assert.match(meetingWorkspaceSource, /Send edited question/);
+assert.match(meetingWorkspaceSource, /meetingAudioDiagnostic/);
+assert.match(meetingWorkspaceSource, /Transcription language/);
+assert.doesNotMatch(meetingWorkspaceSource, /Technical terms \(optional\)|Comma- or line-separated/);
+assert.match(meetingSttSegmentProcessorSource, /language: transcriptionLanguage/);
+assert.doesNotMatch(meetingControllerSource, /meeting-transcription-glossary|glossary: transcriptionGlossary/);
+assert.match(meetingPageSource, /onScreenCaptured: async \(image\) =>[\s\S]*controller\.sendQuestion\([\s\S]*screenImage: image/);
+assert.match(meetingPageSource, /mode: 'meeting'/);
+assert.match(meetingPageSource, /controller\.answeredSegments\.flatMap/);
+assert.match(historyServiceSource, /session\.mode === 'meeting'/);
+assert.match(appSource, /session\.mode === 'meeting'[\s\S]*meeting\.restoreMeetingHistory\(session\)/);
+assert.match(meetingWorkspaceSource, /if \(!sessionActive\)[\s\S]*<ScreenReadingButton/);
+assert.doesNotMatch(meetingWorkspaceSource, /Microphone device|Meeting microphone device|No microphone found/);
+assert.match(meetingPageSource, /onTestAudio: \(\) => void controller\.testMeetingAudio\(\)/);
+assert.match(meetingControllerSource, /const testMeetingAudio = async \(\) =>[\s\S]*requestMeetingAudioStream\('audio-test'\)/);
+assert.match(meetingWorkspaceSource, /Last request: transcription/);
+assert.match(meetingWorkspaceSource, /onDeleteTranscript/);
+assert.match(meetingWorkspaceSource, /navigator\.clipboard\.writeText/);
+assert.match(meetingWorkspaceSource, /Cancel \{chatStreaming \? 'answer' : 'transcription'\}/);
+assert.match(meetingPageSource, /buildTranscriptSummaryPrompt/);
+assert.match(meetingPageSource, /onOpenAudioSettings/);
+assert.match(meetingPageSource, /if \(active\) return;[\s\S]*?cancelCurrentRequest\(\)/);
 const meetingCaptureStart = meetingControllerSource.indexOf('const startMeetingCapture = async () =>');
 const meetingCaptureReadiness = meetingControllerSource.indexOf('await refreshProviders();', meetingCaptureStart);
 const meetingCaptureHealthCheck = meetingControllerSource.indexOf("fetch(`${HTTP_URL}/api/health`)", meetingCaptureStart);
@@ -245,33 +289,48 @@ assert.ok(
   'Meeting capture must rehydrate persisted provider credentials before checking STT readiness.',
 );
 assert.match(meetingControllerSource, /No speech-capable provider key is available to this desktop session/);
-assert.match(meetingControllerSource, /No enabled provider with speech-transcription support is available/);
-assert.match(meetingControllerSource, /speech-to-text provider key is missing or was rejected/);
+assert.match(meetingSttErrorSource, /No enabled provider with speech-transcription support is available/);
+assert.match(meetingSttErrorSource, /speech-to-text provider key is missing or was rejected/);
 assert.doesNotMatch(meetingControllerSource, /The active provider does not support speech transcription/);
 assert.match(meetingControllerSource, /captureSessionIdRef\.current = ''/);
-assert.match(meetingControllerSource, /createDynamicsCompressor\(\)/);
-assert.match(meetingControllerSource, /createBiquadFilter\(\)/);
-assert.match(meetingControllerSource, /noiseSuppression: true/);
-assert.match(meetingControllerSource, /echoCancellation: true/);
-assert.match(meetingControllerSource, /MICROPHONE_VOICE_FILTER_ENABLED/);
+assert.match(meetingAudioSourcesSource, /createDynamicsCompressor\(\)/);
+assert.match(meetingAudioSourcesSource, /createBiquadFilter\(\)/);
+assert.match(meetingAudioSourcesSource, /noiseSuppression: true/);
+assert.match(meetingAudioSourcesSource, /echoCancellation: true/);
+assert.match(meetingAudioSourcesSource, /MICROPHONE_VOICE_FILTER_ENABLED/);
+assert.match(meetingControllerSource, /shouldHandleMeetingTrackEnd/);
+assert.match(meetingSttSegmentProcessorSource, /shouldApplyMeetingSttResult/);
+assert.match(meetingControllerSource, /meetingCaptureStartDecision/);
+assert.match(meetingCaptureLifecycleSource, /classifySttClientError/);
 assert.match(meetingControllerSource, /recorder\.state === 'recording'/);
 assert.match(meetingControllerSource, /recorderRef\.current === recorder/);
 assert.match(meetingControllerSource, /nextSegment\?\.sttSession === sttSession/);
-assert.match(meetingControllerSource, /STALE_STT_CALLBACK_IGNORED/);
-assert.match(meetingControllerSource, /if \(audioContext\.state !== 'running'\) await audioContext\.resume\(\)/);
+assert.match(meetingSttSegmentProcessorSource, /STALE_STT_CALLBACK_IGNORED/);
+assert.match(meetingAudioSourcesSource, /if \(audioContext\.state !== 'running'\) await audioContext\.resume\(\)/);
 assert.match(meetingControllerSource, /finalCaptureSegmentClosedRef/);
 assert.match(meetingControllerSource, /if \(recorder && recorder\.state === 'recording'\) \{\s*recorder\.stop\(\);/);
 assert.match(meetingControllerSource, /The Meeting Assistant returned an empty answer/);
-assert.match(meetingControllerSource, /setTranscripts\(\(current\) => \[\{\s*id: crypto\.randomUUID\(\),\s*source: meetingSource,\s*rawText: candidateRawText/);
+assert.match(meetingSttSegmentProcessorSource, /addTranscript\(\{\s*id: crypto\.randomUUID\(\),\s*source: meetingSource,\s*rawText: candidateRawText/);
 assert.match(meetingTransportSource, /transportRequestTimeoutMs/);
-assert.match(meetingWorkspaceSource, /isRecording \|\| isTranscribing \? <button type="button" onClick=\{onStopCapture\}/);
-assert.match(meetingWorkspaceSource, /<button type="button" onClick=\{onStartCapture\}[^>]*>Start Listening<\/button>/);
-const microphoneStatusIndex = meetingWorkspaceSource.indexOf('● {statusLabel}');
-const stopListeningIndex = meetingWorkspaceSource.indexOf('>Stop Listening</button>', microphoneStatusIndex);
-const lastHeardIndex = meetingWorkspaceSource.indexOf('Last heard', microphoneStatusIndex);
+const initialMeetingPageEnd = meetingWorkspaceSource.indexOf('if (!sessionActive)');
+const activeMeetingPageStart = meetingWorkspaceSource.lastIndexOf('return (');
+const initialMeetingPage = meetingWorkspaceSource.slice(initialMeetingPageEnd, activeMeetingPageStart);
+const activeMeetingPage = meetingWorkspaceSource.slice(activeMeetingPageStart);
 assert.ok(
-  microphoneStatusIndex >= 0 && stopListeningIndex > microphoneStatusIndex && stopListeningIndex < lastHeardIndex,
-  'Meeting listening controls must sit directly beneath the listening status and above the transcript.',
+  initialMeetingPageEnd > 0
+    && activeMeetingPageStart > initialMeetingPageEnd
+    && initialMeetingPage.includes('aria-label="Audio source"')
+    && initialMeetingPage.includes('onTestAudio')
+    && !activeMeetingPage.includes('aria-label="Audio source"')
+    && !activeMeetingPage.includes('onTestAudio'),
+  'Audio source selection and audio test must appear only on the initial Meeting page.',
+);
+assert.match(meetingWorkspaceSource, /onStartCapture/);
+assert.match(meetingWorkspaceSource, /onStopCapture/);
+const activeComposerIndex = meetingWorkspaceSource.indexOf('{questionComposer}', activeMeetingPageStart);
+assert.ok(
+  activeMeetingPageStart >= 0 && activeComposerIndex > activeMeetingPageStart,
+  'The active Meeting page must continue rendering its question and answer workspace.',
 );
 assert.match(electronMainSource, /setDisplayMediaRequestHandler/);
 assert.match(electronMainSource, /audio: 'loopback'/);

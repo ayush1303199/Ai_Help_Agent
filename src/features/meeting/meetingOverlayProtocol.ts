@@ -14,6 +14,11 @@ export interface MeetingOverlayCommandResult {
 
 export type MeetingOverlayStage = 'ready' | 'listening' | 'transcribing' | 'answering' | 'complete' | 'error';
 
+export function isMissingMeetingOverlayHandler(error: unknown) {
+  return error instanceof Error
+    && error.message.includes("No handler registered for 'meeting-overlay:");
+}
+
 export function shouldAcceptOverlayAgentState(
   current: VersionedMeetingOverlayState,
   incoming: VersionedMeetingOverlayState,

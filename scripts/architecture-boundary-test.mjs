@@ -10,6 +10,8 @@ const generalPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'feature
 const codingControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'coding', 'useCodingAgentController.ts'), 'utf8');
 const codingPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'coding', 'CodingAgentPage.tsx'), 'utf8');
 const meetingControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'useMeetingAssistantController.ts'), 'utf8');
+const meetingSttSegmentProcessorSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'meetingSttSegmentProcessor.ts'), 'utf8');
+const meetingSttRetrySource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'meetingSttRetry.ts'), 'utf8');
 const meetingPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'MeetingAssistantPage.tsx'), 'utf8');
 const meetingTransportSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'meetingTransport.ts'), 'utf8');
 const assistantControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'assistant', 'useAssistantAgentController.ts'), 'utf8');
@@ -153,7 +155,7 @@ assert.match(meetingPageSource, /useMeetingAssistantController\(/, 'The Meeting 
 assert.doesNotMatch(appSource, /useMeetingAssistantController/, 'App composition must not construct the Meeting Assistant controller.');
 assert.match(
   meetingControllerSource,
-  /const sendQuestion = async[\s\S]*transport\.send\(buildChatRequest\(/,
+  /const sendQuestion = async[\s\S]*transport\.send\([\s\S]*buildChatRequest\(/,
   'Meeting questions must use the Meeting-owned transport and request builder.',
 );
 assert.match(meetingTransportSource, /agent: 'meeting'/, 'Meeting transport must identify its own agent endpoint.');
@@ -201,7 +203,11 @@ assert.doesNotMatch(
 assert.match(codingPageSource, /useCodingAgentController\(/, 'The Coding Agent page must own its controller lifecycle.');
 assert.doesNotMatch(appSource, /useCodingAgentController/, 'App composition must not construct the Coding Agent controller.');
 assert.match(codingControllerSource, /new CodingAgentTransport\(\)/, 'Coding Agent must own its transport lifecycle.');
-assert.match(meetingControllerSource, /transcribeAudioSegment\(/, 'Meeting Assistant must own its STT processing lifecycle.');
+assert.match(meetingSttSegmentProcessorSource, /transcribeMeetingSegmentWithRetry\(/, 'Meeting STT retries must stay in the Meeting-owned STT processor.');
+assert.match(meetingSttRetrySource, /return await transcribe\(request\)/, 'Meeting retries must retry the STT request only.');
+assert.doesNotMatch(meetingSttRetrySource, /sendQuestion|MeetingAgentTransport/, 'Meeting STT retry logic must not replay AI answer requests.');
+assert.match(meetingPageSource, /controllerActions\.clearMeetingHistory\(\);\s*onClearHistory\(\)/, 'Clearing Meeting history must clear feature-owned state through its page boundary.');
+assert.match(appSource, /previous\.filter\(\(session\) => session\.mode !== 'meeting'\)/, 'Clearing Meeting history must retain other agents\' shared history.');
 assert.match(meetingControllerSource, /const \[meetingAudioMode, setMeetingAudioMode\]/, 'Meeting Assistant must own audio source state.');
 assert.match(meetingControllerSource, /MediaRecorder|getUserMedia|captureSessionIdRef/, 'Meeting Assistant must own capture and segmentation state.');
 

@@ -7,6 +7,9 @@ export interface SttSegmentRequest {
   segmentId: string;
   payloadName: string;
   source?: 'microphone' | 'video' | 'system_audio' | 'mixed' | 'meeting_microphone' | 'meeting_system_audio' | 'meeting_mixed';
+  language?: 'auto' | 'en' | 'hi' | 'hinglish';
+  glossary?: string;
+  signal?: AbortSignal;
 }
 
 export interface SttSegmentResponse {
@@ -21,6 +24,9 @@ export async function transcribeAudioSegment({
   segmentId,
   payloadName,
   source = 'microphone',
+  language,
+  glossary,
+  signal,
 }: SttSegmentRequest): Promise<SttSegmentResponse> {
   if (audio.size === 0) {
     throw Object.assign(new Error('No audio signal was captured.'), {
@@ -30,14 +36,22 @@ export async function transcribeAudioSegment({
 
   const formData = new FormData();
   formData.append('file', audio, payloadName);
+  const headers: Record<string, string> = {
+    'X-STT-Session-ID': sessionId,
+    'X-STT-Segment-ID': segmentId,
+    'X-STT-Source': source,
+  };
+  if (source.startsWith('meeting_')) {
+    if (language) headers['X-STT-Language'] = language;
+    const boundedGlossary = glossary?.replace(/[\r\n]+/g, ', ').slice(0, 1000).trim();
+    if (boundedGlossary) headers['X-STT-Glossary'] = encodeURIComponent(boundedGlossary);
+  }
+
   const response = await fetch(endpoint, {
     method: 'POST',
     body: formData,
-    headers: {
-      'X-STT-Session-ID': sessionId,
-      'X-STT-Segment-ID': segmentId,
-      'X-STT-Source': source,
-    },
+    headers,
+    signal,
   });
 
   let data: { text?: unknown; error?: string; detail?: string; classification?: SttFailureClassification } = {};

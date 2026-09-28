@@ -20,6 +20,7 @@ assert.ok(settings.client.transport.requestTimeoutMs > settings.backend.modelReq
 assert.equal(settings.client.audio.systemSilenceMs, 1800, 'Meeting voice should finalize speech promptly after a short pause');
 assert.equal(settings.client.audio.shortFragmentMaxWords, 2);
 assert.equal(settings.client.audio.shortFragmentMaxDurationMs, 5000);
+assert.equal(settings.client.history.maxMeetingTranscripts, 100);
 assert.ok(settings.client.audio.voiceHighPassHz > 0);
 assert.ok(settings.client.audio.voiceLowPassHz > settings.client.audio.voiceHighPassHz);
 assert.ok(settings.client.audio.voiceCompressorRatio > 1);

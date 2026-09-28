@@ -19,6 +19,11 @@ const scripts = [
   'configuration-ui-test.mjs',
   'provider-config-test.mjs',
   'overlay-static-test.mjs',
+  'meeting-overlay-protocol-test.mjs',
+  'meeting-audio-quality-test.mjs',
+  'meeting-capture-lifecycle-test.mjs',
+  'meeting-ui-integration-test.mjs',
+  'meeting-transport-test.mjs',
   'general-agent-runtime-test.mjs',
   'general-agent-capability-test.mjs',
   'general-agent-food-research-test.mjs',
@@ -42,7 +47,7 @@ if (backendResult.code !== 0) {
 } else {
 for (const script of scripts) {
   const result = await new Promise((resolve) => {
-    const args = ['coding-diff-test.mjs', 'provider-config-test.mjs'].includes(script)
+    const args = ['coding-diff-test.mjs', 'provider-config-test.mjs', 'meeting-overlay-protocol-test.mjs', 'meeting-audio-quality-test.mjs', 'meeting-capture-lifecycle-test.mjs', 'meeting-transport-test.mjs'].includes(script)
       ? ['--experimental-strip-types', path.join('scripts', script)]
       : [path.join('scripts', script)];
     const child = spawn(process.execPath, args, {

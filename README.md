@@ -358,6 +358,13 @@ Open **Meetings** and choose an audio source:
 3. **Microphone + System / Internal Audio** — mixes both sources into one
    recording stream.
 
+Saved Meeting transcripts, answers, and Meeting conversations use a configurable
+local retention period: 30 days by default, with 7-day, 60-day, 90-day, and manual-only
+options in saved Meeting data. Expired Meeting data is pruned on load and while
+the app is running; other agents' conversation history is not subject to this
+setting. Records without a valid timestamp are preserved rather than deleted
+based on uncertain dates.
+
 For system audio:
 
 - Run the Electron desktop app, not only the browser renderer.

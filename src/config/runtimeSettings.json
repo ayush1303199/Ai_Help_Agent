@@ -54,6 +54,7 @@
     },
     "history": {
       "maxSessions": 30,
+      "maxMeetingTranscripts": 100,
       "maxCodingPreferences": 20
     },
     "codingSession": {

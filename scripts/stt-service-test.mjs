@@ -34,8 +34,12 @@ try {
     segmentId: 'segment-meeting',
     payloadName: 'meeting.webm',
     source: 'meeting_microphone',
+    language: 'hinglish',
+    glossary: 'Spring Boot\nKubernetes',
   });
   assert.equal(request.options.headers['X-STT-Source'], 'meeting_microphone');
+  assert.equal(request.options.headers['X-STT-Language'], 'hinglish');
+  assert.equal(request.options.headers['X-STT-Glossary'], 'Spring%20Boot%2C%20Kubernetes');
 
   globalThis.fetch = async (url, options) => {
     request = { url, options };
@@ -52,12 +56,16 @@ try {
       segmentId: 'segment-2',
       payloadName: 'meeting.webm',
       source: 'video',
+      language: 'hi',
+      glossary: 'this must not affect non-meeting STT',
     }),
     (error) => error.message === 'Provider rejected audio'
       && error.classification === 'STT_BAD_REQUEST'
       && error.status === 400,
   );
   assert.equal(request.options.headers['X-STT-Source'], 'video');
+  assert.equal(request.options.headers['X-STT-Language'], undefined);
+  assert.equal(request.options.headers['X-STT-Glossary'], undefined);
 
   await assert.rejects(
     () => transcribeAudioSegment({

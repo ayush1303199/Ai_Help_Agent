@@ -7,7 +7,7 @@ import base64
 from datetime import datetime
 from io import BytesIO
 from typing import Any, Callable, Dict, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 from fastapi import HTTPException, Request, UploadFile
@@ -105,6 +105,31 @@ class SttService:
             if source.startswith("meeting_")
             else self._transcription_prompt
         )
+        stt_language = "auto"
+        if source.startswith("meeting_"):
+            stt_language = request.headers.get("x-stt-language", "auto").strip().lower()
+            if stt_language not in {"auto", "en", "hi", "hinglish"}:
+                stt_language = "auto"
+            glossary = unquote(request.headers.get("x-stt-glossary", ""))[:1000]
+            glossary_terms = [
+                term.strip()[:80]
+                for term in glossary.replace("\r", "\n").replace(",", "\n").splitlines()
+                if term.strip()
+            ][:30]
+            language_instructions = {
+                "en": "Transcribe in English.",
+                "hi": "Transcribe in Hindi.",
+                "hinglish": "Preserve naturally mixed Hindi and English words and the script actually spoken.",
+            }
+            language_instruction = language_instructions.get(stt_language)
+            if language_instruction:
+                transcription_prompt += f" {language_instruction}"
+            if glossary_terms:
+                transcription_prompt += (
+                    " Use these terms as spelling hints only when they are clearly spoken: "
+                    + ", ".join(glossary_terms)
+                    + ". Never insert a term that is not audible."
+                )
         try:
             audio_duration_ms = max(0, int(request.headers.get("x-stt-audio-duration-ms", "")))
         except (TypeError, ValueError):
@@ -267,6 +292,8 @@ class SttService:
                     "temperature": 0,
                 }
                 language = os.getenv("TRANSCRIPTION_LANGUAGE", "").strip()
+                if source.startswith("meeting_"):
+                    language = stt_language if stt_language in {"en", "hi"} else ""
                 if language:
                     options["language"] = language
 

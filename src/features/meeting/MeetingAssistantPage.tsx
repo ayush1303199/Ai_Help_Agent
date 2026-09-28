@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentProps } from 'react';
 import type { InterviewContextConfig } from '../../ai/interviewContext';
+import { runtimeConfig } from '../../config/runtimeConfig';
+import { buildTranscriptSummaryPrompt } from './meetingTranscriptQuality';
 import { useAgentProviderSelection, type AgentProviderOption } from '../provider-selection/useAgentProviderSelection';
 import { MeetingAssistantWorkspace } from './MeetingAssistantWorkspace';
 import { MeetingOverlayBridge } from './MeetingOverlayBridge';
@@ -10,6 +12,7 @@ import {
 } from './useMeetingAssistantController';
 import { buildMeetingChatRequest, type MeetingRequestBuilderArgs, type MeetingRequestContext } from './meetingRequestBuilder';
 import { useScreenReader } from '../screen-reading/useScreenReader';
+import { historyTitle, type HistorySession, type MeetingHistoryRetentionDays } from '../../history/historyService';
 
 type MeetingWorkspaceProps = ComponentProps<typeof MeetingAssistantWorkspace>;
 export type MeetingControllerSnapshot = ReturnType<typeof useMeetingAssistantController>;
@@ -25,6 +28,9 @@ interface MeetingAssistantPageProps {
   requestContext: MeetingRequestContext;
   onControllerChange: (controller: MeetingControllerSnapshot) => void;
   onScreenReadingChange: (state: Pick<ReturnType<typeof useScreenReader>, 'enabled' | 'setEnabled'>) => void;
+  onHistoryEntry: (entry: HistorySession) => void;
+  onClearHistory: () => void;
+  onHistoryRetentionChange: (days: MeetingHistoryRetentionDays) => void;
 }
 
 export function MeetingAssistantPage({
@@ -38,6 +44,9 @@ export function MeetingAssistantPage({
   requestContext,
   onControllerChange,
   onScreenReadingChange,
+  onHistoryEntry,
+  onClearHistory,
+  onHistoryRetentionChange,
 }: MeetingAssistantPageProps) {
   const { providerId } = useAgentProviderSelection('meeting', providers, onProviderStorageError);
   const buildSelectedChatRequest = useCallback((
@@ -55,6 +64,12 @@ export function MeetingAssistantPage({
     shouldAcceptQuestion,
     buildChatRequest: buildSelectedChatRequest,
   });
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return undefined;
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active, controller.pipelineStatus]);
   const reportError = controller.reportError;
   const onScreenReadError = useCallback((message: string) => reportError(message), [reportError]);
   const screenReader = useScreenReader({
@@ -70,8 +85,31 @@ export function MeetingAssistantPage({
   });
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
+  useEffect(() => {
+    if (!controller.answeredSegments.length) return;
+    const messages = controller.answeredSegments.flatMap((turn): HistorySession['messages'] => [
+      { role: 'user', content: turn.question },
+      { role: 'assistant', content: turn.answer },
+    ]);
+    onHistoryEntry({
+      id: `meeting-${controller.meetingConversationId}`,
+      mode: 'meeting',
+      title: historyTitle(messages),
+      messages,
+      updatedAt: new Date().toISOString(),
+    });
+  }, [controller.answeredSegments, controller.meetingConversationId, onHistoryEntry]);
+  useEffect(() => {
+    if (active) return;
+    const current = controllerRef.current;
+    current.cancelCurrentRequest();
+    if (current.isRecording || current.isTranscribing) current.stopMeetingCapture();
+  }, [active]);
   const controllerActions = useMemo(() => ({
     setMeetingAudioMode: (...args: Parameters<MeetingControllerSnapshot['setMeetingAudioMode']>) => controllerRef.current.setMeetingAudioMode(...args),
+    selectMicrophoneDevice: (...args: Parameters<MeetingControllerSnapshot['selectMicrophoneDevice']>) => controllerRef.current.selectMicrophoneDevice(...args),
+    restoreMeetingHistory: (...args: Parameters<MeetingControllerSnapshot['restoreMeetingHistory']>) => controllerRef.current.restoreMeetingHistory(...args),
+    setTranscriptionLanguage: (...args: Parameters<MeetingControllerSnapshot['setTranscriptionLanguage']>) => controllerRef.current.setTranscriptionLanguage(...args),
     setMeetingMenuOpen: (...args: Parameters<MeetingControllerSnapshot['setMeetingMenuOpen']>) => controllerRef.current.setMeetingMenuOpen(...args),
     setTranscriptOpen: (...args: Parameters<MeetingControllerSnapshot['setTranscriptOpen']>) => controllerRef.current.setTranscriptOpen(...args),
     setPipelineStatus: (...args: Parameters<MeetingControllerSnapshot['setPipelineStatus']>) => controllerRef.current.setPipelineStatus(...args),
@@ -81,19 +119,21 @@ export function MeetingAssistantPage({
     refreshMicrophoneDevices: (...args: Parameters<MeetingControllerSnapshot['refreshMicrophoneDevices']>) => controllerRef.current.refreshMicrophoneDevices(...args),
     stopMeetingCapture: (...args: Parameters<MeetingControllerSnapshot['stopMeetingCapture']>) => controllerRef.current.stopMeetingCapture(...args),
     startMeetingCapture: (...args: Parameters<MeetingControllerSnapshot['startMeetingCapture']>) => controllerRef.current.startMeetingCapture(...args),
-    testSystemAudio: (...args: Parameters<MeetingControllerSnapshot['testSystemAudio']>) => controllerRef.current.testSystemAudio(...args),
+    testMeetingAudio: (...args: Parameters<MeetingControllerSnapshot['testMeetingAudio']>) => controllerRef.current.testMeetingAudio(...args),
     saveMeetingTranscript: (...args: Parameters<MeetingControllerSnapshot['saveMeetingTranscript']>) => controllerRef.current.saveMeetingTranscript(...args),
+    deleteMeetingTranscript: (...args: Parameters<MeetingControllerSnapshot['deleteMeetingTranscript']>) => controllerRef.current.deleteMeetingTranscript(...args),
+    clearMeetingHistory: (...args: Parameters<MeetingControllerSnapshot['clearMeetingHistory']>) => controllerRef.current.clearMeetingHistory(...args),
+    setHistoryRetentionDays: (...args: Parameters<MeetingControllerSnapshot['setHistoryRetentionDays']>) => controllerRef.current.setHistoryRetentionDays(...args),
     sendQuestion: (...args: Parameters<MeetingControllerSnapshot['sendQuestion']>) => controllerRef.current.sendQuestion(...args),
     sendTypedQuestion: (...args: Parameters<MeetingControllerSnapshot['sendTypedQuestion']>) => controllerRef.current.sendTypedQuestion(...args),
+    sendEditedTranscript: (...args: Parameters<MeetingControllerSnapshot['sendEditedTranscript']>) => controllerRef.current.sendEditedTranscript(...args),
+    cancelCurrentRequest: (...args: Parameters<MeetingControllerSnapshot['cancelCurrentRequest']>) => controllerRef.current.cancelCurrentRequest(...args),
   }), []);
   const sessionActive = controller.isRecording
     || controller.isTranscribing
     || controller.chatBusy
     || controller.answeredSegments.length > 0
     || ['question', 'thinking', 'answer'].includes(controller.pipelineStatus);
-  const statusTone = controller.pipelineStatus === 'error'
-    ? 'text-rose-300'
-    : controller.pipelineStatus === 'answer' ? 'text-emerald-300' : 'text-sky-300';
   const statusLabel = controller.meetingStatusMessage || (
     controller.pipelineStatus === 'listening' ? 'Listening...'
       : controller.pipelineStatus === 'transcribing' ? 'Transcribing...'
@@ -107,6 +147,11 @@ export function MeetingAssistantPage({
   const snapshot: MeetingControllerSnapshot = useMemo(() => ({
     meetingAudioMode: controller.meetingAudioMode,
     setMeetingAudioMode: controllerActions.setMeetingAudioMode,
+    selectMicrophoneDevice: controllerActions.selectMicrophoneDevice,
+    restoreMeetingHistory: controllerActions.restoreMeetingHistory,
+    meetingConversationId: controller.meetingConversationId,
+    transcriptionLanguage: controller.transcriptionLanguage,
+    setTranscriptionLanguage: controllerActions.setTranscriptionLanguage,
     meetingMenuOpen: controller.meetingMenuOpen,
     setMeetingMenuOpen: controllerActions.setMeetingMenuOpen,
     microphoneDevices: controller.microphoneDevices,
@@ -121,6 +166,9 @@ export function MeetingAssistantPage({
     systemAudioStatus: controller.systemAudioStatus,
     microphoneStatus: controller.microphoneStatus,
     pipelineStatus: controller.pipelineStatus,
+    pipelineStatusSince: controller.pipelineStatusSince,
+    audioSignalDetected: controller.audioSignalDetected,
+    lastStageTimings: controller.lastStageTimings,
     setPipelineStatus: controllerActions.setPipelineStatus,
     input: controller.input,
     setInput: controllerActions.setInput,
@@ -145,16 +193,27 @@ export function MeetingAssistantPage({
     refreshMicrophoneDevices: controllerActions.refreshMicrophoneDevices,
     stopMeetingCapture: controllerActions.stopMeetingCapture,
     startMeetingCapture: controllerActions.startMeetingCapture,
-    testSystemAudio: controllerActions.testSystemAudio,
+    testMeetingAudio: controllerActions.testMeetingAudio,
     saveMeetingTranscript: controllerActions.saveMeetingTranscript,
+    deleteMeetingTranscript: controllerActions.deleteMeetingTranscript,
+    clearMeetingHistory: controllerActions.clearMeetingHistory,
+    historyRetentionDays: controller.historyRetentionDays,
+    setHistoryRetentionDays: controllerActions.setHistoryRetentionDays,
     sendQuestion: controllerActions.sendQuestion,
     sendTypedQuestion: controllerActions.sendTypedQuestion,
+    sendEditedTranscript: controllerActions.sendEditedTranscript,
+    cancelCurrentRequest: controllerActions.cancelCurrentRequest,
   }), [
-    controller.meetingAudioMode, controller.meetingMenuOpen, controller.microphoneDevices,
+    controller.meetingAudioMode, controller.transcriptionLanguage,
+    controller.meetingConversationId,
+    controller.historyRetentionDays,
+    controller.meetingMenuOpen, controller.microphoneDevices,
     controller.microphoneUnavailable, controller.transcriptOpen, controller.isRecording,
     controller.isTranscribing, controller.audioSourceLabel, controller.audioLevel,
     controller.audioStatus, controller.systemAudioStatus, controller.microphoneStatus,
-    controller.pipelineStatus, controller.input, controller.chatBusy, controller.answeredSegments,
+    controller.pipelineStatus, controller.pipelineStatusSince, controller.audioSignalDetected,
+    controller.lastStageTimings,
+    controller.input, controller.chatBusy, controller.answeredSegments,
     controller.meetingError, controller.meetingStatusMessage, controller.lastQuestion,
     controller.lastAnswer, controller.liveTranscript, controller.transcripts,
     controller.transcriptSearch, controller.filteredTranscripts, controller.selectedMicrophone,
@@ -174,15 +233,19 @@ export function MeetingAssistantPage({
   const workspace: MeetingWorkspaceProps = {
     sessionActive,
     meetingAudioMode: controller.meetingAudioMode,
+    transcriptionLanguage: controller.transcriptionLanguage,
     displayedAudioSourceLabel: controller.displayedAudioSourceLabel,
     displayedAudioStatus: controller.displayedAudioStatus,
     microphoneStatus: controller.microphoneStatus,
+    microphoneUnavailable: controller.microphoneUnavailable,
     systemAudioStatus: controller.systemAudioStatus,
     audioLevel: controller.audioLevel,
+    audioSignalDetected: controller.audioSignalDetected,
     meetingMenuOpen: controller.meetingMenuOpen,
-    statusTone,
     statusLabel,
     pipelineStatus: controller.pipelineStatus,
+    pipelineElapsedMs: Math.max(0, clockNow - controller.pipelineStatusSince),
+    lastStageTimings: controller.lastStageTimings,
     liveTranscript: controller.liveTranscript,
     lastQuestion: controller.lastQuestion,
     lastAnswer: controller.lastAnswer,
@@ -197,13 +260,38 @@ export function MeetingAssistantPage({
     isTranscribing: controller.isTranscribing,
     chatStreaming: controller.chatBusy,
     onAudioModeChange: controller.setMeetingAudioMode,
-    onTestAudio: () => void controller.testSystemAudio(),
+    onTranscriptionLanguageChange: controllerActions.setTranscriptionLanguage,
+    onTestAudio: () => void controller.testMeetingAudio(),
     onStartCapture: () => void controller.startMeetingCapture(),
     onStopCapture: controller.stopMeetingCapture,
+    onCancelRequest: controller.cancelCurrentRequest,
+    onOpenAudioSettings: () => {
+      controller.setMeetingMenuOpen(true);
+      void controller.refreshMicrophoneDevices();
+    },
     onTranscriptToggle: () => controller.setTranscriptOpen((open) => !open),
     onTranscriptSearchChange: controller.setTranscriptSearch,
-    onUseTranscript: (transcript) => controller.setInput(`Summarize the ${transcript.source} meeting and list the action items.`),
+    onUseTranscript: (transcript) => {
+      controller.setInput(buildTranscriptSummaryPrompt(
+        transcript.source,
+        transcript.text,
+        runtimeConfig.limits.maxContextChars,
+      ));
+    },
     onSaveTranscript: controller.saveMeetingTranscript,
+    onSendTranscript: controllerActions.sendEditedTranscript,
+    onDeleteTranscript: controllerActions.deleteMeetingTranscript,
+    onClearHistory: () => {
+      controllerActions.clearMeetingHistory();
+      onClearHistory();
+    },
+    historyRetentionDays: controller.historyRetentionDays,
+    onRetentionDaysChange: (days) => {
+      if (!controllerActions.setHistoryRetentionDays(days)) {
+        throw new Error('Could not save the Meeting data retention setting.');
+      }
+      onHistoryRetentionChange(days);
+    },
     onInputChange: controller.setInput,
     onSendMessage: controller.sendTypedQuestion,
     onReadScreen: () => void screenReader.readScreen(),

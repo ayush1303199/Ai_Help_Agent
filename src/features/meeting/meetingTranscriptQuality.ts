@@ -7,6 +7,69 @@ export function hasMeetingRequestIntent(transcript: string) {
   return detectQuestion(text).isQuestion || spokenRequestOpening.test(text);
 }
 
+export function adaptiveSilenceTimeoutMs(baseSilenceMs: number, speechDurationMs: number) {
+  const extensionMs = Math.min(800, Math.floor(Math.max(0, speechDurationMs) / 8000) * 200);
+  return Math.max(0, baseSilenceMs) + extensionMs;
+}
+
+export function adaptiveAudioLevelThreshold(baseThreshold: number, recentLevels: number[]) {
+  const validLevels = recentLevels.filter((level) => Number.isFinite(level) && level >= 0).sort((a, b) => a - b);
+  if (validLevels.length < 4) return Math.max(0, baseThreshold);
+  const noiseFloor = validLevels[Math.floor((validLevels.length - 1) * 0.25)];
+  return Math.min(
+    Math.max(0, baseThreshold) + 10,
+    Math.max(Math.max(0, baseThreshold), noiseFloor + 1.5),
+  );
+}
+
+export function limitMeetingTranscriptHistory<T extends { id: string; source: string; text: string; createdAt: string }>(
+  entries: unknown,
+  maxEntries: number,
+): T[] {
+  if (!Array.isArray(entries)) return [];
+  return entries.filter((entry): entry is T => (
+    Boolean(entry)
+    && typeof entry === 'object'
+    && typeof entry.id === 'string'
+    && typeof entry.source === 'string'
+    && typeof entry.text === 'string'
+    && typeof entry.createdAt === 'string'
+  )).slice(0, Math.max(0, Math.floor(maxEntries)));
+}
+
+export function buildTranscriptSummaryPrompt(source: string, transcript: string, maxChars: number) {
+  const instruction = `Summarize this ${source} meeting transcript and list the action items.`;
+  const truncationNotice = '\n\n[Transcript truncated to fit the configured context limit.]';
+  const limit = Math.max(0, Math.floor(maxChars));
+  const transcriptBudget = Math.max(0, limit - instruction.length - 2 - truncationNotice.length);
+  const content = transcript.slice(0, transcriptBudget);
+  return `${instruction}\n\n${content}${content.length < transcript.length ? truncationNotice : ''}`;
+}
+
+export function meetingAudioDiagnostic({
+  microphoneUnavailable,
+  systemAudioMode,
+  isRecording,
+  signalDetected,
+  elapsedMs,
+}: {
+  microphoneUnavailable: boolean;
+  systemAudioMode: boolean;
+  isRecording: boolean;
+  signalDetected: boolean;
+  elapsedMs: number;
+}) {
+  if (microphoneUnavailable && !systemAudioMode) {
+    return 'No microphone device is available. Connect a microphone or choose another audio source.';
+  }
+  if (isRecording && !signalDetected && elapsedMs >= 4000) {
+    return systemAudioMode
+      ? 'No audio signal yet. Check the selected microphone and shared system source, and enable Share audio if needed.'
+      : 'No audio signal yet. Check microphone permission/device and speak near the selected mic.';
+  }
+  return isRecording && signalDetected ? 'Audio signal detected.' : '';
+}
+
 export function shouldBufferShortTranscript(
   transcript: string,
   segmentDurationMs: number,

@@ -1,4 +1,4 @@
-import runtimeSettings from './runtimeSettings.json';
+import runtimeSettings from './runtimeSettings.json' with { type: 'json' };
 
 const defaults = runtimeSettings;
 

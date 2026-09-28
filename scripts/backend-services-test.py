@@ -8,7 +8,7 @@ import unittest
 import httpx
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from starlette.datastructures import UploadFile
 
@@ -285,6 +285,93 @@ class SttServiceTests(unittest.TestCase):
         prompt = post.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"]
         self.assertTrue(prompt.startswith("meeting-only exact speech prompt"))
         self.assertNotIn("generic prompt", prompt)
+
+    def test_meeting_audio_applies_language_and_bounded_glossary_hints(self):
+        from urllib.parse import quote
+
+        provider = SimpleNamespace(
+            id="gemini-instance",
+            type="gemini",
+            model="gemini-3.6-flash",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+        service = SttService(
+            get_provider=lambda: provider,
+            get_speech_capable_provider=lambda: provider,
+            get_api_key=lambda _provider_id: "test-key",
+            transcription_prompt="generic prompt",
+            meeting_transcription_prompt="meeting prompt",
+            max_upload_mb=1,
+            retry_attempts=0,
+            retry_delay=lambda _error, _attempt: 0,
+            retryable=lambda _error: False,
+        )
+        response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"candidates": [{"content": {"parts": [{"text": "What is Spring Boot?"}]}}]},
+        )
+        audio = UploadFile(
+            filename="meeting.webm",
+            file=io.BytesIO(b"audio"),
+            headers={"content-type": "audio/webm"},
+        )
+        with patch("stt_service.httpx.post", return_value=response) as post:
+            result = asyncio.run(service.transcribe(
+                SimpleNamespace(headers={
+                    "x-stt-source": "meeting_microphone",
+                    "x-stt-language": "hinglish",
+                    "x-stt-glossary": quote("Spring Boot, Kubernetes"),
+                }),
+                audio,
+            ))
+
+        self.assertEqual(result["text"], "What is Spring Boot?")
+        prompt = post.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("Preserve naturally mixed Hindi and English", prompt)
+        self.assertIn("Spring Boot, Kubernetes", prompt)
+        self.assertIn("Never insert a term that is not audible.", prompt)
+
+    def test_openai_meeting_transcription_passes_hindi_language_to_whisper(self):
+        provider = SimpleNamespace(
+            id="openai-instance",
+            type="openai",
+            model="gpt-4o-mini",
+            base_url="https://api.openai.com/v1",
+        )
+        service = SttService(
+            get_provider=lambda: provider,
+            get_speech_capable_provider=lambda: provider,
+            get_api_key=lambda _provider_id: "test-key",
+            transcription_prompt="generic prompt",
+            meeting_transcription_prompt="meeting prompt",
+            max_upload_mb=1,
+            retry_attempts=0,
+            retry_delay=lambda _error, _attempt: 0,
+            retryable=lambda _error: False,
+        )
+        create_transcription = Mock(return_value="यह क्या है?")
+        client = SimpleNamespace(audio=SimpleNamespace(
+            transcriptions=SimpleNamespace(create=create_transcription),
+        ))
+        audio = UploadFile(
+            filename="meeting.webm",
+            file=io.BytesIO(b"audio"),
+            headers={"content-type": "audio/webm"},
+        )
+        with patch("stt_service.OpenAI", return_value=client):
+            result = asyncio.run(service.transcribe(
+                SimpleNamespace(headers={
+                    "x-stt-source": "meeting_microphone",
+                    "x-stt-language": "hi",
+                    "x-stt-glossary": "Spring%20Boot",
+                }),
+                audio,
+            ))
+
+        self.assertEqual(result["text"], "यह क्या है?")
+        options = create_transcription.call_args.kwargs
+        self.assertEqual(options["language"], "hi")
+        self.assertIn("Spring Boot", options["prompt"])
 
     def test_development_diagnostics_capture_upstream_status_and_bounded_retry_safely(self):
         import index

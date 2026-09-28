@@ -64,7 +64,7 @@ import { AppHeader } from './ui/header/AppHeader';
 import { ContextButton, ContextPanel, FontSizeControls, HistoryButton, OverlayButton, ScreenReadingToggle, SettingsButton } from './ui/header/HeaderActions';
 import { ModeControls } from './ui/header/ModeControls';
 import type { AppMode, AssistantMode, MeetingAudioMode } from './app/appTypes';
-import { readHistory, removeHistorySession, searchHistory, upsertHistory, writeHistory, type HistoryMode, type HistorySession } from './history/historyService';
+import { DEFAULT_MEETING_HISTORY_RETENTION_DAYS, pruneMeetingHistory, readHistory, readMeetingHistoryRetention, removeHistorySession, searchHistory, upsertHistory, writeHistory, type HistoryMode, type HistorySession, type MeetingHistoryRetentionDays } from './history/historyService';
 
 type Message = AssistantControllerSnapshot['messages'][number];
 
@@ -75,6 +75,11 @@ const IGNORE_ASSISTANT_SEND: AssistantControllerSnapshot['sendMessage'] = async 
 const EMPTY_MEETING_CONTROLLER: MeetingControllerSnapshot = {
   meetingAudioMode: 'microphone',
   setMeetingAudioMode: () => {},
+  selectMicrophoneDevice: () => {},
+  restoreMeetingHistory: () => {},
+  meetingConversationId: '',
+  transcriptionLanguage: 'auto',
+  setTranscriptionLanguage: () => {},
   meetingMenuOpen: false,
   setMeetingMenuOpen: () => {},
   microphoneDevices: [],
@@ -89,6 +94,9 @@ const EMPTY_MEETING_CONTROLLER: MeetingControllerSnapshot = {
   systemAudioStatus: 'off',
   microphoneStatus: 'off',
   pipelineStatus: 'ready',
+  pipelineStatusSince: 0,
+  audioSignalDetected: false,
+  lastStageTimings: {},
   setPipelineStatus: () => {},
   input: '',
   setInput: () => {},
@@ -112,11 +120,17 @@ const EMPTY_MEETING_CONTROLLER: MeetingControllerSnapshot = {
   displayedAudioStatus: '',
   refreshMicrophoneDevices: async () => {},
   stopMeetingCapture: () => {},
-  startMeetingCapture: async () => {},
-  testSystemAudio: async () => {},
+  startMeetingCapture: async () => false,
+  testMeetingAudio: async () => {},
   saveMeetingTranscript: () => undefined,
+  deleteMeetingTranscript: () => undefined,
+  clearMeetingHistory: () => undefined,
+  historyRetentionDays: DEFAULT_MEETING_HISTORY_RETENTION_DAYS,
+  setHistoryRetentionDays: () => true,
   sendQuestion: async () => {},
   sendTypedQuestion: () => undefined,
+  sendEditedTranscript: () => undefined,
+  cancelCurrentRequest: () => false,
 };
 
 interface AgentActivity {
@@ -330,7 +344,7 @@ function App() {
     pipelineStatus, chatBusy: meetingChatBusy,
     answeredSegments: meetingAnsweredSegments, liveTranscript, transcripts, transcriptSearch,
     setTranscriptSearch, filteredTranscripts, displayedAudioSourceLabel, startMeetingCapture,
-    stopMeetingCapture, testSystemAudio, saveMeetingTranscript,
+    stopMeetingCapture, testMeetingAudio, saveMeetingTranscript,
   } = meeting;
   const messages = assistantController?.messages ?? EMPTY_ASSISTANT_MESSAGES;
   const setMessages: AssistantControllerSnapshot['setMessages'] = assistantController?.setMessages ?? IGNORE_ASSISTANT_MESSAGES;
@@ -347,6 +361,17 @@ function App() {
     setChatHistory((previous) => upsertHistory(previous, entry));
   }, []);
 
+  const addMeetingHistoryEntry = useCallback((entry: HistorySession) => {
+    setChatHistory((previous) => upsertHistory(previous, entry));
+  }, []);
+
+  const clearMeetingHistory = useCallback(() => {
+    setChatHistory((previous) => previous.filter((session) => session.mode !== 'meeting'));
+  }, []);
+
+  const changeMeetingHistoryRetention = useCallback((days: MeetingHistoryRetentionDays) => {
+    setChatHistory((previous) => pruneMeetingHistory(previous, days));
+  }, []);
   const addAssistantHistoryEntries = useCallback((conversationId: string, entries: HistorySession[]) => {
     setChatHistory((previous) => {
       const withoutCurrentConversation = previous.filter((session) => session.id !== conversationId
@@ -371,6 +396,16 @@ function App() {
       setError('Chat history could not be saved because browser storage is full or unavailable.');
     }
   }, [chatHistory]);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const retentionDays = readMeetingHistoryRetention();
+      setChatHistory((current) => {
+        const retained = pruneMeetingHistory(current, retentionDays);
+        return retained.length === current.length ? current : retained;
+      });
+    }, 60 * 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const resetProviderForm = useCallback(() => {
     setEditingProviderId(null);
@@ -1365,7 +1400,10 @@ function App() {
 
   const openHistorySession = (session: ChatSession) => {
     const restoredMessages = session.messages.map((message) => ({ ...message, streaming: false }));
-    if (session.mode === 'developer') {
+    if (session.mode === 'meeting') {
+      setAppMode('meeting');
+      meeting.restoreMeetingHistory(session);
+    } else if (session.mode === 'developer') {
       setAppMode('developer');
       setActiveChatId(session.id.replace(/^coding-/, '').split('-turn-')[0] || crypto.randomUUID());
       setCodingRestoreRequest({ key: ++codingRestoreKeyRef.current, session });
@@ -1696,7 +1734,7 @@ function App() {
                   <div className="mb-3 flex gap-2">
                     {!isRecording && !isTranscribing ? (
                       <>
-                        <button type="button" onClick={() => void testSystemAudio()} className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/10"><MonitorUp className="h-3.5 w-3.5" /> Test Audio</button>
+                        <button type="button" onClick={() => void testMeetingAudio()} className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/10"><MonitorUp className="h-3.5 w-3.5" /> {meetingAudioMode === 'microphone' ? 'Test Microphone' : meetingAudioMode === 'system' ? 'Test System Audio' : 'Test Both Sources'}</button>
                         <button type="button" onClick={() => void startMeetingCapture()} className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-xs font-medium text-white hover:bg-blue-400"><MonitorUp className="h-3.5 w-3.5" /> Start Listening</button>
                       </>
                     ) : (
@@ -2003,6 +2041,9 @@ function App() {
           requestContext={meetingRequestContext}
           onControllerChange={setMeetingController}
           onScreenReadingChange={setMeetingScreenReading}
+          onHistoryEntry={addMeetingHistoryEntry}
+          onClearHistory={clearMeetingHistory}
+          onHistoryRetentionChange={changeMeetingHistoryRetention}
         />
       </main>
 
