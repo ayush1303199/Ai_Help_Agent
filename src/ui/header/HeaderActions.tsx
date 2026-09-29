@@ -90,9 +90,9 @@ function IconButton({ label, onClick, children }: IconButtonProps & { children: 
 
 export const ContextPanel = forwardRef<HTMLDivElement, { children: ReactNode; onClose: () => void }>(function ContextPanel({ children, onClose }, ref) {
   return (
-    <div ref={ref} className="absolute right-0 top-11 z-20 max-h-[calc(100vh-5rem)] w-[min(23rem,calc(100vw-2rem))] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl" role="dialog" aria-modal="false" aria-label="Session context">
+    <div ref={ref} className="absolute right-0 top-11 z-20 max-h-[calc(100vh-5rem)] w-[min(23rem,calc(100vw-2rem))] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl" role="dialog" aria-modal="false" aria-label="Interview and meeting context">
       <div className="mb-3 flex items-start justify-between gap-3">
-        <div><p className="text-sm font-semibold">Session context</p><p className="text-xs text-slate-500">Resume and job description context</p></div>
+        <div><p className="text-sm font-semibold">Interview &amp; meeting context</p><p className="text-xs text-slate-500">Domain, background, resume, and job description</p></div>
         <button type="button" onClick={onClose} className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200" aria-label="Close session context"><X className="h-4 w-4" /></button>
       </div>
       {children}

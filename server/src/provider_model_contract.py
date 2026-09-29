@@ -169,6 +169,19 @@ def provider_capability_states(provider_id: str, model_id: str = "") -> Dict[str
     }
 
 
+def provider_model_for_capability(provider_id: str, capability: str) -> Optional[str]:
+    """Return a registered model that explicitly supports a requested capability."""
+    provider = PROVIDER_REGISTRY.get(provider_id)
+    if not provider or capability not in {"chat", "toolCalling", "streaming", "vision", "structuredOutput", "stt"}:
+        return None
+    for model in provider.get("models", []):
+        if model.get("capabilities", {}).get(capability) == "SUPPORTED":
+            return str(model.get("id") or "")
+    if provider.get("capabilities", {}).get(capability) == "SUPPORTED":
+        return str(provider.get("defaultModel") or "") or None
+    return None
+
+
 def provider_model_is_valid(provider_id: str, model_id: str, endpoint: str = "") -> bool:
     return provider_model_error(provider_id, model_id, endpoint) is None
 

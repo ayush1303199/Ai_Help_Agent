@@ -361,33 +361,57 @@ export function MeetingAssistantWorkspace({
         </button>
       </div>
       {meetingMenuOpen && <div className="mb-4">{transcriptionSettings}</div>}
-      <div className="mb-5 text-center">
-        <p role="status" aria-live="polite" aria-atomic="true" className={`text-sm font-medium ${pipelineStatus === 'error' ? 'text-rose-300' : pipelineStatus === 'answer' ? 'text-emerald-300' : 'text-sky-300'}`}>● {statusLabel}</p>
-        {['listening', 'transcribing', 'thinking'].includes(pipelineStatus) && (
-          <p className="mt-1 text-[11px] text-slate-500" aria-live="off">{Math.floor(pipelineElapsedMs / 1000)}s in this stage</p>
-        )}
-        <p className="mt-2 text-xs text-slate-500">{pipelineStatus === 'listening' ? 'Listening for a question' : pipelineStatus === 'thinking' ? 'Generating answer...' : 'Your answer will appear below'}</p>
-        {isRecording || isTranscribing
-          ? <button type="button" onClick={onStopCapture} className="mt-3 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-rose-400">Stop Listening</button>
-          : <button type="button" onClick={onStartCapture} className="mt-3 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:border-emerald-400">Start Listening</button>}
-        {(isTranscribing || chatStreaming) && (
-          <button type="button" onClick={onCancelRequest} className="ml-2 mt-3 rounded-lg border border-amber-500/40 px-3 py-2 text-xs text-amber-300 hover:border-amber-400">
-            Cancel {chatStreaming ? 'answer' : 'transcription'}
-          </button>
-        )}
+      <div className="mb-3 rounded-xl border border-slate-700/80 bg-slate-900/60 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p role="status" aria-live="polite" aria-atomic="true" className={`text-sm font-semibold ${pipelineStatus === 'error' ? 'text-rose-300' : pipelineStatus === 'answer' ? 'text-emerald-300' : 'text-sky-300'}`}>● {statusLabel}</p>
+            <p className="mt-1 text-xs text-slate-400">
+              {pipelineStatus === 'listening'
+                ? 'Listening for a question'
+                : pipelineStatus === 'transcribing'
+                  ? 'Converting speech to text'
+                  : pipelineStatus === 'thinking'
+                    ? 'Preparing your answer'
+                    : pipelineStatus === 'answer'
+                      ? 'Your latest answer is ready'
+                      : pipelineStatus === 'error'
+                        ? 'Check the message below and try again'
+                        : 'Type a question or start listening'}
+              {['listening', 'transcribing', 'thinking'].includes(pipelineStatus) && (
+                <span className="ml-2 text-slate-500" aria-live="off">{Math.floor(pipelineElapsedMs / 1000)}s</span>
+              )}
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {isRecording || isTranscribing
+              ? <button type="button" onClick={onStopCapture} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:border-rose-400">Stop Listening</button>
+              : <button type="button" onClick={onStartCapture} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:border-emerald-400">Start Listening</button>}
+            {(isTranscribing || chatStreaming) && (
+              <button type="button" onClick={onCancelRequest} className="rounded-lg border border-amber-500/40 px-3 py-2 text-xs text-amber-300 hover:border-amber-400">
+                Cancel {chatStreaming ? 'answer' : 'transcription'}
+              </button>
+            )}
+          </div>
+        </div>
         {lastStageTimings.transcriptionMs !== undefined && lastStageTimings.answerMs !== undefined && (
-          <p className="mt-2 text-[11px] text-slate-500">
+          <p className="mt-2 border-t border-slate-800 pt-2 text-[11px] text-slate-500">
             Last request: transcription {(lastStageTimings.transcriptionMs / 1000).toFixed(1)}s · AI {(lastStageTimings.answerMs / 1000).toFixed(1)}s
           </p>
         )}
+        {audioDiagnostic && (
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-amber-500/5 px-3 py-2">
+            <p role="status" className={`text-xs ${audioSignalDetected ? 'text-emerald-300' : 'text-amber-300'}`}>{audioDiagnostic}</p>
+            {!audioSignalDetected && <button type="button" onClick={onOpenAudioSettings} className="shrink-0 text-xs text-emerald-300 underline">Check audio device settings</button>}
+          </div>
+        )}
       </div>
-      {audioDiagnostic && (
-        <div className="mb-3 space-y-1 text-center">
-          <p role="status" className={`text-xs ${audioSignalDetected ? 'text-emerald-300' : 'text-amber-300'}`}>{audioDiagnostic}</p>
-          {!audioSignalDetected && <button type="button" onClick={onOpenAudioSettings} className="text-xs text-emerald-300 underline">Check audio device settings</button>}
+      <div className="mb-3 flex items-start justify-between gap-3 rounded-xl border border-slate-700/70 bg-slate-900/40 px-3 py-2.5">
+        <div className="min-w-0 flex-1">
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">Last heard</p>
+          <p className="break-words text-sm leading-relaxed text-slate-300" style={{ display: '-webkit-box', WebkitBoxOrient: 'vertical', WebkitLineClamp: 2, overflow: 'hidden' }}>{liveTranscript || 'Waiting for speech...'}</p>
         </div>
-      )}
-      <div className="mb-4 flex items-end justify-between gap-3"><div className="min-w-0"><p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-slate-500">Last heard</p><p className="truncate text-sm text-slate-300">{liveTranscript || 'Waiting for speech...'}</p></div>{liveTranscript && <button type="button" onClick={onSaveTranscript} className="shrink-0 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:bg-emerald-500/10">Save transcript</button>}</div>
+        {liveTranscript && <button type="button" onClick={onSaveTranscript} className="shrink-0 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:bg-emerald-500/10">Save transcript</button>}
+      </div>
       {activeReview && (
         <div className="mb-4 space-y-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
           <p className="text-xs font-medium text-amber-200">

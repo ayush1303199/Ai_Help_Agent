@@ -1,7 +1,16 @@
 import { useEffect, useRef } from 'react';
 import { prepareQuestion } from '../../audio/transcriptUtils';
 import { runtimeConfig } from '../../config/runtimeConfig';
-import { isMissingMeetingOverlayHandler } from './meetingOverlayProtocol';
+import {
+  buildOverlayActionItems,
+  buildOverlayAnalysis,
+  buildOverlaySummary,
+} from '../overlay/overlayAnswerInsights';
+import {
+  isMissingMeetingOverlayHandler,
+  meetingOverlayAnswer,
+  meetingOverlayQuestion,
+} from './meetingOverlayProtocol';
 import type { MeetingControllerSnapshot } from './MeetingAssistantPage';
 
 interface MeetingOverlayBridgeProps {
@@ -18,6 +27,8 @@ interface MeetingOverlayBridgeProps {
     | 'isRecording'
     | 'isTranscribing'
     | 'audioSignalDetected'
+    | 'transcripts'
+    | 'answeredSegments'
     | 'sendQuestion'
     | 'startMeetingCapture'
     | 'stopMeetingCapture'
@@ -40,6 +51,8 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
     analysis: '',
     summary: '',
     actionItems: [] as string[],
+    transcripts: [] as MeetingControllerSnapshot['transcripts'],
+    answeredSegments: [] as MeetingControllerSnapshot['answeredSegments'],
     status: 'ready',
     error: '',
     statusMessage: '',
@@ -69,6 +82,8 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
 
   useEffect(() => {
     const wasActive = stateRef.current.meetingActive;
+    const historyChanged = stateRef.current.transcripts !== controller.transcripts
+      || stateRef.current.answeredSegments !== controller.answeredSegments;
     const {
       lastQuestion,
       lastAnswer,
@@ -80,14 +95,20 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
       isRecording,
       isTranscribing,
       audioSignalDetected,
+      transcripts,
+      answeredSegments,
     } = controller;
     const updatedAt = Date.now();
+    const answer = meetingOverlayAnswer(pipelineStatus, lastAnswer);
+    const question = meetingOverlayQuestion(pipelineStatus, lastQuestion, liveTranscript);
     stateRef.current = {
-      answer: lastAnswer,
-      question: lastQuestion || liveTranscript,
-      analysis: lastAnswer,
-      summary: lastAnswer,
-      actionItems: [],
+      answer,
+      question,
+      analysis: buildOverlayAnalysis(question, answer),
+      summary: buildOverlaySummary(answer),
+      actionItems: answer ? buildOverlayActionItems(answer) : [],
+      transcripts,
+      answeredSegments,
       status: pipelineStatus,
       error: meetingError,
       statusMessage: meetingStatusMessage,
@@ -100,8 +121,11 @@ export function MeetingOverlayBridge({ active, controller }: MeetingOverlayBridg
       version: Math.max(updatedAt, stateRef.current.version + 1),
       updatedAt,
     };
+    const stateToPublish = historyChanged
+      ? stateRef.current
+      : { ...stateRef.current, transcripts: undefined, answeredSegments: undefined };
     if (window.electronAPI && !ipcRelayUnavailableRef.current && (active || wasActive)) {
-      void window.electronAPI.publishMeetingOverlayState(stateRef.current).catch((error: unknown) => {
+      void window.electronAPI.publishMeetingOverlayState(stateToPublish).catch((error: unknown) => {
         if (isMissingMeetingOverlayHandler(error)) {
           ipcRelayUnavailableRef.current = true;
           channelRef.current?.postMessage({ type: 'state', ...stateRef.current });

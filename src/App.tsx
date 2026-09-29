@@ -1545,10 +1545,15 @@ function App() {
               />
             )}
             {appMode === 'meeting' && sessionActive && <button type="button" onClick={() => setMeetingMenuOpen((open) => !open)} aria-expanded={meetingMenuOpen} className="ui-button border border-slate-700 text-slate-300 hover:border-emerald-400">⚙ Audio</button>}
-            <div className={`${appMode === 'assistant' ? '' : 'hidden'} relative`}>
+            <div className={`${appMode === 'assistant' || appMode === 'meeting' ? '' : 'hidden'} relative`}>
               <ContextButton open={contextMenuOpen} onClick={() => (contextMenuOpen ? closeContextMenu() : openContextMenu())} />
               {contextMenuOpen && (
                 <ContextPanel ref={contextMenuRef} onClose={closeContextMenu}>
+                  {appMode === 'meeting' && (
+                    <p className="mb-3 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-[11px] leading-relaxed text-sky-200">
+                      Meeting questions use the selected domain, technical background, and uploaded documents. Screen-reading requests stay focused on the visible question.
+                    </p>
+                  )}
                   {mode === 'direct' && (sessionDocuments.length > 0 || activeProfile || domain || background.length > 0) && (
                     <p className="mb-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-[11px] text-emerald-200">
                       Interview context is attached to the next Direct mode request.

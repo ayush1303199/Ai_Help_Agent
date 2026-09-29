@@ -51,6 +51,7 @@ interface MeetingSttSegmentProcessorOptions {
   setDisplayedQuestion: Dispatch<SetStateAction<string>>;
   setDisplayedAnswer: Dispatch<SetStateAction<string>>;
   setAnswerPending: Dispatch<SetStateAction<boolean>>;
+  onAudioSignalDetected?: () => void;
   addTranscript: (transcript: MeetingTranscript) => void;
   onStatus: (message: string) => void;
   onError: (message: string) => void;
@@ -79,6 +80,7 @@ export function createMeetingSttSegmentProcessor(options: MeetingSttSegmentProce
     setDisplayedQuestion,
     setDisplayedAnswer,
     setAnswerPending,
+    onAudioSignalDetected,
     addTranscript,
     onStatus,
     onError,
@@ -186,6 +188,7 @@ export function createMeetingSttSegmentProcessor(options: MeetingSttSegmentProce
       if (!normalizedTranscript) {
         throw Object.assign(new Error('No speech detected.'), { classification: 'AUDIO_CAPTURE_NO_SIGNAL' });
       }
+      onAudioSignalDetected?.();
       const pendingQuestion = pendingPartialQuestionRef.current;
       const pendingRawText = pendingPartialRawTextRef.current;
       if (pendingQuestion && pendingPartialTimeoutRef.current) {

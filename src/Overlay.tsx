@@ -5,14 +5,18 @@ import {
   isCaptureCommandConfirmed,
   isMissingMeetingOverlayHandler,
   meetingOverlayStage,
+  resolveOverlayTabPreference,
+  shouldFocusMeetingAnswer,
   shouldAcceptOverlayAgentState,
 } from './features/meeting/meetingOverlayProtocol';
 import { renderAnswerMarkdown } from './ui/answerMarkdown';
 
 type OverlayVisibility = 'VISIBLE' | 'MINIMIZED' | 'HIDDEN';
-type OverlayTab = 'answer' | 'analysis' | 'summary' | 'action-items';
+type OverlayTab = 'answer' | 'analysis' | 'summary' | 'action-items' | 'search' | 'history';
 
 type OverlayBounds = { x: number; y: number; width: number; height: number };
+type OverlayMeetingTranscript = { id: string; source: string; text: string; createdAt: string };
+type OverlayMeetingAnswer = { question: string; answer: string; createdAt?: string };
 const OVERLAY_MIN_OPACITY = runtimeConfig.overlay.minOpacity;
 const OVERLAY_MAX_OPACITY = runtimeConfig.overlay.maxOpacity;
 const OVERLAY_OPACITY_STEP = runtimeConfig.overlay.opacityStep;
@@ -23,6 +27,8 @@ type OverlayState = {
   analysis?: string | string[] | null;
   summary?: string | string[] | null;
   actionItems?: unknown;
+  transcripts?: OverlayMeetingTranscript[];
+  answeredSegments?: OverlayMeetingAnswer[];
   status?: string;
   statusMessage?: string;
   statusStartedAt?: number;
@@ -68,6 +74,8 @@ const tabConfig: Array<{ id: OverlayTab; label: string }> = [
   { id: 'analysis', label: 'Analysis' },
   { id: 'summary', label: 'Summary' },
   { id: 'action-items', label: 'Action items' },
+  { id: 'search', label: 'Search' },
+  { id: 'history', label: 'History' },
 ];
 
 function normalizeTabContent(value: unknown): string {
@@ -81,6 +89,50 @@ function normalizeTabContent(value: unknown): string {
     }
   }
   return '';
+}
+
+function formatHistoryTimestamp(value?: string) {
+  if (!value) return '';
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? '' : timestamp.toLocaleString();
+}
+
+function renderMeetingHistory(state: OverlayState) {
+  const transcripts = [...(state.transcripts || [])].reverse();
+  const answeredSegments = [...(state.answeredSegments || [])].reverse();
+  if (!transcripts.length && !answeredSegments.length) {
+    return <p className="overlay-empty-state">No saved Meeting history yet.</p>;
+  }
+  return (
+    <div className="overlay-tab-scroll overlay-history">
+      {answeredSegments.length > 0 && (
+        <section aria-label="Answered Meeting questions">
+          <h3>Questions &amp; answers</h3>
+          {answeredSegments.map((item, index) => (
+            <article key={`answer-${index}`} className="overlay-history-entry">
+              <p className="overlay-history-label">Question{formatHistoryTimestamp(item.createdAt) ? ` · ${formatHistoryTimestamp(item.createdAt)}` : ''}</p>
+              <p>{item.question}</p>
+              <p className="overlay-history-label">Answer</p>
+              {renderAnswerMarkdown(item.answer)}
+            </article>
+          ))}
+        </section>
+      )}
+      {transcripts.length > 0 && (
+        <section aria-label="Saved Meeting transcripts">
+          <h3>Saved transcripts</h3>
+          {transcripts.map((item) => (
+            <article key={item.id} className="overlay-history-entry">
+              <p className="overlay-history-label">
+                {item.source}{formatHistoryTimestamp(item.createdAt) ? ` · ${formatHistoryTimestamp(item.createdAt)}` : ''}
+              </p>
+              <p>{item.text}</p>
+            </article>
+          ))}
+        </section>
+      )}
+    </div>
+  );
 }
 
 function getStatusLabel(status?: string) {
@@ -109,7 +161,11 @@ function renderTabBody(tab: OverlayTab, state: OverlayState) {
     analysis: 'No analysis available yet.',
     summary: 'No summary available yet.',
     'action-items': 'No action items were provided.',
+    search: 'Enter a question in the search field above.',
+    history: 'No saved Meeting history yet.',
   };
+
+  if (tab === 'history') return renderMeetingHistory(state);
 
   let content = '';
   if (tab === 'answer') {
@@ -118,9 +174,20 @@ function renderTabBody(tab: OverlayTab, state: OverlayState) {
     content = normalizeTabContent(state.analysis ?? '');
   } else if (tab === 'summary') {
     content = normalizeTabContent(state.summary ?? '');
-  } else {
-    const actionItems = state.actionItems;
-    content = normalizeTabContent(actionItems);
+  } else if (tab === 'action-items') {
+    const actionItems = Array.isArray(state.actionItems)
+      ? state.actionItems.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+      : [];
+    if (actionItems.length) {
+      return (
+        <div className="overlay-tab-scroll">
+          <ul className="overlay-action-items">
+            {actionItems.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}
+          </ul>
+        </div>
+      );
+    }
+    content = normalizeTabContent(state.actionItems);
   }
 
   if (!content.trim()) {
@@ -195,9 +262,27 @@ function mergeOverlayState(previous: OverlayState, incoming: unknown): OverlaySt
     next.autoHideDelay = incoming.autoHideDelay;
   }
   if (typeof incoming.alwaysOnTop === 'boolean') next.alwaysOnTop = incoming.alwaysOnTop;
-  if (incoming.activeTab === 'answer' || incoming.activeTab === 'analysis' || incoming.activeTab === 'summary' || incoming.activeTab === 'action-items') {
+  if (incoming.activeTab === 'answer' || incoming.activeTab === 'analysis' || incoming.activeTab === 'summary' || incoming.activeTab === 'action-items' || incoming.activeTab === 'search' || incoming.activeTab === 'history') {
     next.activeTab = incoming.activeTab;
   }
+  if (Array.isArray(incoming.transcripts)) {
+    next.transcripts = incoming.transcripts.filter((item): item is OverlayMeetingTranscript => (
+      isRecord(item)
+      && typeof item.id === 'string'
+      && typeof item.source === 'string'
+      && typeof item.text === 'string'
+      && typeof item.createdAt === 'string'
+    ));
+  }
+  if (Array.isArray(incoming.answeredSegments)) {
+    next.answeredSegments = incoming.answeredSegments.filter((item): item is OverlayMeetingAnswer => (
+      isRecord(item)
+      && typeof item.question === 'string'
+      && typeof item.answer === 'string'
+      && (item.createdAt === undefined || typeof item.createdAt === 'string')
+    ));
+  }
+  if (shouldFocusMeetingAnswer(previous, incoming)) next.activeTab = 'answer';
   const incomingBounds = incoming.bounds;
   if (isRecord(incomingBounds)
     && ['x', 'y', 'width', 'height'].every((key) => typeof incomingBounds[key] === 'number' && Number.isFinite(incomingBounds[key]))) {
@@ -211,7 +296,11 @@ function mergeOverlayState(previous: OverlayState, incoming: unknown): OverlaySt
   return next;
 }
 
-function mergeOverlayPreferences(previous: OverlayState, incoming: unknown): OverlayState {
+function mergeOverlayPreferences(
+  previous: OverlayState,
+  incoming: unknown,
+  preserveCurrentTab = false,
+): OverlayState {
   if (!isRecord(incoming)) return previous;
   const preferences: Record<string, unknown> = {};
   for (const key of [
@@ -227,7 +316,13 @@ function mergeOverlayPreferences(previous: OverlayState, incoming: unknown): Ove
   ]) {
     if (Object.prototype.hasOwnProperty.call(incoming, key)) preferences[key] = incoming[key];
   }
-  return mergeOverlayState(previous, preferences);
+  const next = mergeOverlayState(previous, preferences);
+  next.activeTab = resolveOverlayTabPreference(
+    previous.activeTab ?? 'answer',
+    incoming.activeTab,
+    preserveCurrentTab,
+  );
+  return next;
 }
 
 export default function Overlay() {
@@ -246,6 +341,7 @@ export default function Overlay() {
   const overlayChannelRef = useRef<BroadcastChannel | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
+  const userSelectedTabRef = useRef(false);
   const captureCommandRef = useRef<{ commandId: string; targetActive: boolean } | null>(null);
   const searchCommandIdRef = useRef('');
   const searchCommandVersionRef = useRef(0);
@@ -293,25 +389,29 @@ export default function Overlay() {
     if (nextOpacity !== opacity) void applyPreferences({ opacity: nextOpacity });
   };
 
+  const mergeCurrentPreferences = useCallback((previous: OverlayState, incoming: unknown) => (
+    mergeOverlayPreferences(previous, incoming, userSelectedTabRef.current)
+  ), []);
+
   const applyPreferences = useCallback(async (patch: Partial<OverlayState>) => {
     setState((previous) => mergeOverlayState(previous, patch));
     if (!window.electronAPI) return;
     try {
       const persisted = await window.electronAPI.setOverlayPreferences(patch);
-      setState((previous) => mergeOverlayState(previous, persisted));
+      setState((previous) => mergeCurrentPreferences(previous, persisted));
     } catch {
       const persisted = await window.electronAPI.getOverlayPreferences().catch(() => null);
-      if (persisted) setState((previous) => mergeOverlayState(previous, persisted));
+      if (persisted) setState((previous) => mergeCurrentPreferences(previous, persisted));
     }
-  }, []);
+  }, [mergeCurrentPreferences]);
 
   const runOverlayAction = (action: (() => Promise<OverlayRendererState>) | undefined) => {
     if (!action) return;
     void action()
-      .then((nextState) => setState((previous) => mergeOverlayState(previous, nextState)))
+      .then((nextState) => setState((previous) => mergeCurrentPreferences(previous, nextState)))
       .catch(() => {
         void window.electronAPI?.getOverlayPreferences()
-          .then((nextState) => setState((previous) => mergeOverlayState(previous, nextState)))
+          .then((nextState) => setState((previous) => mergeCurrentPreferences(previous, nextState)))
           .catch(() => undefined);
       });
   };
@@ -425,7 +525,7 @@ export default function Overlay() {
     }
 
     const removeOverlayStateListener = window.electronAPI?.onOverlayState((nativeState) => {
-      setState((previous) => mergeOverlayPreferences(previous, nativeState));
+      setState((previous) => mergeCurrentPreferences(previous, nativeState));
     });
     const removeMeetingStateListener = window.electronAPI?.onMeetingOverlayState((meetingState) => {
       acceptMeetingState(meetingState);
@@ -433,7 +533,7 @@ export default function Overlay() {
     const removeMeetingCommandResultListener = window.electronAPI?.onMeetingOverlayCommandResult(handleMeetingCommandResult);
     void window.electronAPI?.getOverlayPreferences().then((preferences) => {
       if (preferences) {
-        setState((previous) => mergeOverlayPreferences(previous, preferences));
+        setState((previous) => mergeCurrentPreferences(previous, preferences));
       }
     }).catch(() => undefined);
     const handleVisibilityChange = () => {
@@ -456,7 +556,7 @@ export default function Overlay() {
       }
       overlayChannelRef.current = null;
     };
-  }, [acceptMeetingState, handleMeetingCommandResult, refreshMeetingState]);
+  }, [acceptMeetingState, handleMeetingCommandResult, mergeCurrentPreferences, refreshMeetingState]);
 
   const submitOverlaySearch = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -725,21 +825,47 @@ export default function Overlay() {
         </div>
       </header>
 
-      <div className="overlay-tabs no-drag" role="tablist" aria-label="Assistant overlay tabs">
-        {tabConfig.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            role="tab"
-            id={`overlay-tab-${tab.id}`}
-            aria-controls={`overlay-panel-${tab.id}`}
-            aria-selected={activeTab === tab.id}
-            className={`overlay-tab ${activeTab === tab.id ? 'active' : ''}`}
-            onClick={() => void applyPreferences({ activeTab: tab.id })}
-          >
-            {tab.label}
-          </button>
-        ))}
+      <div className="overlay-tabs-row">
+        <div className="overlay-tabs no-drag" role="tablist" aria-label="Assistant overlay tabs">
+          {tabConfig.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              id={`overlay-tab-${tab.id}`}
+              aria-controls={`overlay-panel-${tab.id}`}
+              aria-selected={activeTab === tab.id}
+              className={`overlay-tab ${activeTab === tab.id ? 'active' : ''}`}
+              onClick={() => {
+                userSelectedTabRef.current = true;
+                void applyPreferences({ activeTab: tab.id });
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+        {activeTab === 'search' && (
+          <form className="overlay-search overlay-search-inline no-drag" onSubmit={submitOverlaySearch} aria-label="Search with AI">
+            <div className="overlay-search-row">
+              <input
+                id="overlay-ai-search"
+                value={searchText}
+                onChange={(event) => {
+                  setSearchText(event.target.value);
+                  if (searchError) setSearchError('');
+                }}
+                placeholder="Search with AI..."
+                aria-label="Search with AI"
+                maxLength={2000}
+              />
+              <button type="submit" className="overlay-search-button" disabled={!searchText.trim() || searchBusy} aria-label="Send search to AI">
+                <Search size={15} />
+                <span>{searchBusy ? 'Waiting…' : 'Ask'}</span>
+              </button>
+            </div>
+          </form>
+        )}
       </div>
 
       {state.agent === 'meeting' && state.meetingActive && (
@@ -766,28 +892,6 @@ export default function Overlay() {
         </div>
       )}
 
-      <form className="overlay-search no-drag" onSubmit={submitOverlaySearch}>
-        <label className="overlay-search-label" htmlFor="overlay-ai-search">Ask AI</label>
-        <div className="overlay-search-row">
-          <input
-            id="overlay-ai-search"
-            value={searchText}
-            onChange={(event) => {
-              setSearchText(event.target.value);
-              if (searchError) setSearchError('');
-            }}
-            placeholder="Search with AI..."
-            aria-label="Search with AI"
-            maxLength={2000}
-          />
-          <button type="submit" className="overlay-search-button" disabled={!searchText.trim() || searchBusy} aria-label="Send search to AI">
-            <Search size={15} />
-            <span>{searchBusy ? 'Waiting…' : 'Ask'}</span>
-          </button>
-        </div>
-        {searchError && <p className="overlay-search-error" role="alert">{searchError}</p>}
-      </form>
-
       <section
         id={`overlay-panel-${activeTab}`}
         role="tabpanel"
@@ -808,6 +912,7 @@ export default function Overlay() {
           </button>
         )}
         {state.error && <p className="overlay-search-error" role="alert">{state.error}</p>}
+        {searchError && <p className="overlay-search-error" role="alert">{searchError}</p>}
         {state.agent === 'meeting' && state.meetingActive && state.status === 'error' && state.question?.trim() && (
           <button
             type="button"

@@ -5,6 +5,36 @@ export interface VersionedMeetingOverlayState {
   updatedAt?: number;
 }
 
+export type OverlayTabPreference = 'answer' | 'analysis' | 'summary' | 'action-items' | 'search' | 'history';
+
+export function resolveOverlayTabPreference(
+  currentTab: OverlayTabPreference,
+  incomingTab: unknown,
+  userSelectedTab: boolean,
+): OverlayTabPreference {
+  if (userSelectedTab) return currentTab;
+  return incomingTab === 'answer'
+    || incomingTab === 'analysis'
+    || incomingTab === 'summary'
+    || incomingTab === 'action-items'
+    || incomingTab === 'search'
+    || incomingTab === 'history'
+    ? incomingTab
+    : currentTab;
+}
+
+export function shouldFocusMeetingAnswer(
+  current: VersionedMeetingOverlayState & { answer?: unknown; status?: unknown },
+  incoming: VersionedMeetingOverlayState & { answer?: unknown; status?: unknown },
+) {
+  const isNewMeetingAnswer = incoming.agent === 'meeting'
+    && (incoming.status === 'answer' || incoming.status === 'listening')
+    && typeof incoming.answer === 'string'
+    && Boolean(incoming.answer.trim())
+    && (current.agent !== 'meeting' || current.answer !== incoming.answer);
+  return isNewMeetingAnswer;
+}
+
 export interface MeetingOverlayCommandResult {
   commandId: string;
   ok: boolean;
@@ -13,6 +43,16 @@ export interface MeetingOverlayCommandResult {
 }
 
 export type MeetingOverlayStage = 'ready' | 'listening' | 'transcribing' | 'answering' | 'complete' | 'error';
+
+export function meetingOverlayQuestion(status: string, lastQuestion: string, liveTranscript: string) {
+  const transcript = liveTranscript.trim();
+  if ((status === 'listening' || status === 'transcribing') && transcript) return transcript;
+  return lastQuestion.trim() || transcript;
+}
+
+export function meetingOverlayAnswer(status: string, lastAnswer: string) {
+  return status === 'question' || status === 'thinking' ? '' : lastAnswer;
+}
 
 export function isMissingMeetingOverlayHandler(error: unknown) {
   return error instanceof Error

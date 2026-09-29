@@ -9,6 +9,7 @@
     "capabilities": { "stt": "SUPPORTED" },
     "models": [
       { "id": "openai/gpt-oss-20b", "displayName": "GPT-OSS 20B", "supportsToolCalling": true },
+      { "id": "qwen/qwen3.8-27b", "displayName": "Qwen 3.8 27B (Vision)", "supportsToolCalling": true, "capabilities": { "vision": "SUPPORTED" } },
       { "id": "llama-3.3-70b-versatile", "displayName": "Llama 3.3 70B Versatile", "supportsToolCalling": true },
       { "id": "llama-3.1-8b-instant", "displayName": "Llama 3.1 8B Instant", "supportsToolCalling": true },
       { "id": "mixtral-8x7b-32768", "displayName": "Mixtral 8x7B", "supportsToolCalling": true }

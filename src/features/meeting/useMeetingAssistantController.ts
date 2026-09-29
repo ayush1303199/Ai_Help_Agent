@@ -457,6 +457,7 @@ export function useMeetingAssistantController({
       setDisplayedQuestion,
       setDisplayedAnswer,
       setAnswerPending,
+      onAudioSignalDetected: () => setAudioSignalDetected(true),
       addTranscript,
       onStatus,
       onError,

@@ -44,7 +44,7 @@ function registerGeneralRenderer(event) {
 
 const OVERLAY_STATE_PATH = path.join(app.getPath('userData'), 'overlay-state.json');
 const OVERLAY_VISIBILITY_VALUES = new Set(['VISIBLE', 'MINIMIZED', 'HIDDEN']);
-const OVERLAY_TAB_VALUES = new Set(['answer', 'analysis', 'summary', 'action-items']);
+const OVERLAY_TAB_VALUES = new Set(['answer', 'analysis', 'summary', 'action-items', 'search', 'history']);
 const OVERLAY_PREFERENCE_KEYS = new Set(['lowVisibility', 'autoHideEnabled', 'autoHideDelay', 'alwaysOnTop', 'activeTab', 'opacity']);
 const OVERLAY_MIN_OPACITY = electronSettings.overlay.minOpacity;
 const OVERLAY_MAX_OPACITY = electronSettings.overlay.maxOpacity;
@@ -72,6 +72,8 @@ let meetingOverlayRuntimeState = {
   analysis: '',
   summary: '',
   actionItems: [],
+  transcripts: [],
+  answeredSegments: [],
   status: 'ready',
   error: '',
   statusMessage: '',
@@ -402,8 +404,8 @@ async function showOverlayWindow() {
 
 async function hideOverlayWindow() {
   const nextState = normalizeOverlayState({ ...overlayState, visibility: 'HIDDEN', lowVisibility: true });
-  await persistOverlayState(nextState);
   applyOverlayWindowState(nextState, { reveal: true });
+  void persistOverlayState(nextState);
   return nextState;
 }
 
@@ -423,8 +425,8 @@ async function toggleOverlayWindow() {
       bounds: expandedBounds,
       expandedBounds,
     });
-    await persistOverlayState(expandedState);
     applyOverlayWindowState(expandedState, { reveal: true, focus: true });
+    void persistOverlayState(expandedState);
     return expandedState;
   }
   return hideOverlayWindow();
@@ -441,8 +443,8 @@ async function minimizeOverlayWindow() {
     bounds: compactBounds,
     expandedBounds,
   });
-  await persistOverlayState(nextState);
   applyOverlayWindowState(nextState, { reveal: true, focus: true });
+  void persistOverlayState(nextState);
   return nextState;
 }
 
@@ -456,7 +458,8 @@ async function expandOverlayWindow() {
       bounds: expandedBounds,
       expandedBounds,
     });
-    await persistOverlayState(nextState);
+    overlayState = nextState;
+    void persistOverlayState(nextState);
     return showOverlayWindow();
   }
   const expandedBounds = getNormalizedOverlayBounds(overlayState.expandedBounds || overlayState.bounds);
@@ -467,8 +470,8 @@ async function expandOverlayWindow() {
     bounds: expandedBounds,
     expandedBounds,
   });
-  await persistOverlayState(nextState);
   applyOverlayWindowState(nextState, { reveal: true, focus: true });
+  void persistOverlayState(nextState);
   return nextState;
 }
 
@@ -594,6 +597,15 @@ function createWindow() {
   } else {
     window.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   }
+  window.webContents.once('did-finish-load', () => {
+    const warmOverlayTimer = setTimeout(() => {
+      if (window !== mainWindow) return;
+      void createOverlayWindow().catch((error) => {
+        console.error('[OVERLAY] background warm-up failed:', error);
+      });
+    }, 500);
+    warmOverlayTimer.unref();
+  });
 
   window.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) return { action: 'allow' };
@@ -732,7 +744,7 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('overlay:close', (event) => {
     assertTrustedOverlaySender(event);
-    if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close();
+    return hideOverlayWindow();
   });
   ipcMain.handle('overlay:get-preferences', async (event) => {
     assertTrustedOverlaySender(event);
@@ -758,6 +770,28 @@ app.whenReady().then(async () => {
       analysis: typeof state.analysis === 'string' ? state.analysis.slice(0, 20000) : '',
       summary: typeof state.summary === 'string' ? state.summary.slice(0, 20000) : '',
       actionItems: Array.isArray(state.actionItems) ? state.actionItems.filter((item) => typeof item === 'string').slice(0, 20) : [],
+      transcripts: Array.isArray(state.transcripts) ? state.transcripts
+        .filter((item) => isPlainObject(item)
+          && typeof item.id === 'string'
+          && typeof item.source === 'string'
+          && typeof item.text === 'string')
+        .slice(0, 100)
+        .map((item) => ({
+          id: item.id.slice(0, 160),
+          source: item.source.slice(0, 80),
+          text: item.text.slice(0, 4000),
+          createdAt: typeof item.createdAt === 'string' ? item.createdAt.slice(0, 80) : '',
+        })) : meetingOverlayRuntimeState.transcripts,
+      answeredSegments: Array.isArray(state.answeredSegments) ? state.answeredSegments
+        .filter((item) => isPlainObject(item)
+          && typeof item.question === 'string'
+          && typeof item.answer === 'string')
+        .slice(-30)
+        .map((item) => ({
+          question: item.question.slice(0, 4000),
+          answer: item.answer.slice(0, 12000),
+          ...(typeof item.createdAt === 'string' ? { createdAt: item.createdAt.slice(0, 80) } : {}),
+        })) : meetingOverlayRuntimeState.answeredSegments,
       status: typeof state.status === 'string' ? state.status.slice(0, 80) : 'ready',
       error: typeof state.error === 'string' ? state.error.slice(0, 1000) : '',
       statusMessage: typeof state.statusMessage === 'string' ? state.statusMessage.slice(0, 500) : '',
@@ -849,12 +883,20 @@ app.whenReady().then(async () => {
     visibleWindows.forEach((window) => window.hide());
     try {
       await new Promise((resolve) => setTimeout(resolve, 200));
+      const display = screen.getPrimaryDisplay();
+      const nativeWidth = Math.round(display.bounds.width * display.scaleFactor);
+      const nativeHeight = Math.round(display.bounds.height * display.scaleFactor);
+      const imageScale = Math.min(1, 3840 / Math.max(nativeWidth, nativeHeight));
       const sources = await desktopCapturer.getSources({
         types: ['screen'],
-        thumbnailSize: { width: 1600, height: 900 },
+        thumbnailSize: {
+          width: Math.round(nativeWidth * imageScale),
+          height: Math.round(nativeHeight * imageScale),
+        },
         fetchWindowIcons: false,
       });
-      const source = sources[0];
+      const source = sources.find((candidate) => candidate.display_id === String(display.id))
+        || (sources.length === 1 ? sources[0] : null);
       if (!source?.thumbnail || source.thumbnail.isEmpty()) throw new Error('No screen could be captured.');
       return source.thumbnail.toDataURL();
     } finally {

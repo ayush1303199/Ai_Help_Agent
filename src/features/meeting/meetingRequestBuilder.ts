@@ -29,6 +29,25 @@ export function buildMeetingChatRequest(
   history: MeetingChatMessage[],
   screenImage?: string,
 ): MeetingChatRequest {
+  if (screenImage) {
+    return {
+      mode: context.mode,
+      messages: [
+        {
+          role: 'system',
+          content: 'Scan the full screenshot top-to-bottom and left-to-right; identify visible questions, not unrelated interface text. Start with "Transcribed question:" and copy every clearly visible question exactly. Check every digit, operator, identifier, list item, duplicate, and item order against the screenshot before answering; never guess or silently correct unclear text. Do not omit a clearly visible question: when there are multiple distinct questions, list and answer each separately in the same order. For code, use a programming language explicitly requested in the question; if none is specified, consistently use Python. For each coding question, give one complete, runnable solution in its own fenced code block. Put the opening and closing triple-backtick fences on separate lines; do not escape or inline the fences, and keep all code inside them. Before responding, check spelling, syntax, indentation, and entry-point names. For a simple request, prefer the shortest clear complete program; do not add functions, exception handling, or a main guard unless requested or needed. Keep explanations brief.',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: question },
+            { type: 'image_url', image_url: { url: screenImage } },
+          ],
+        },
+      ],
+    };
+  }
+
   const resolvedContext = resolveContext({
     mode: context.mode as 'direct' | 'langchain',
     sessionDocuments: context.sessionDocuments,
@@ -57,12 +76,7 @@ export function buildMeetingChatRequest(
       ...history.slice(-context.maxHistoryMessages),
       {
         role: 'user',
-        content: screenImage
-          ? [
-            { type: 'text', text: `${question}\n\nRead the attached shared-screen image. Identify any visible interview or meeting question and answer it directly. If no question is visible, say so.` },
-            { type: 'image_url', image_url: { url: screenImage } },
-          ]
-          : `CURRENT QUESTION:\n${question}\n\nTASK:\nAnswer this question directly. Stay on topic, preserve its terminology, and ask one concise clarification only if it is genuinely ambiguous.`,
+        content: `CURRENT QUESTION:\n${question}\n\nTASK:\nAnswer this question directly. Stay on topic, preserve its terminology, and ask one concise clarification only if it is genuinely ambiguous.`,
       },
     ],
     interviewContext: {

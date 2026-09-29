@@ -404,21 +404,31 @@ body.overlay-body {
   background: rgba(69, 10, 10, 0.32);
 }
 
+.overlay-tabs-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 2px 8px;
+  -webkit-app-region: no-drag;
+}
+
 .overlay-tabs {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 10px 2px 12px;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  gap: 4px;
+  padding: 8px 0 4px;
   -webkit-app-region: no-drag;
 }
 
 .overlay-tab {
-  font-size: 0.78rem;
+  font-size: 0.68rem;
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  padding: 7px 10px;
+  padding: 6px 7px;
   color: rgba(148, 163, 184, 0.92);
+  white-space: nowrap;
 }
 
 .overlay-tab.active {
@@ -431,6 +441,12 @@ body.overlay-body {
 .overlay-search {
   padding: 0 2px 10px;
   -webkit-app-region: no-drag;
+}
+
+.overlay-search-inline {
+  flex: 1 1 150px;
+  min-width: 150px;
+  padding: 8px 0 4px;
 }
 
 .overlay-meeting-status {
@@ -476,7 +492,7 @@ body.overlay-body {
   box-sizing: border-box;
   border: 1px solid rgba(100, 116, 139, 0.48);
   border-radius: 10px;
-  padding: 8px 10px;
+  padding: 7px 9px;
   background: rgba(3, 25, 66, 0.42);
   color: rgba(245, 250, 255, 0.96);
   font: inherit;
@@ -499,10 +515,10 @@ body.overlay-body {
   align-items: center;
   justify-content: center;
   gap: 5px;
-  min-width: 64px;
+  min-width: 48px;
   border: 1px solid rgba(100, 116, 139, 0.64);
   border-radius: 10px;
-  padding: 7px 10px;
+  padding: 6px 8px;
   background: linear-gradient(135deg, rgba(100, 116, 139, 0.88), rgba(51, 65, 85, 0.78));
   color: rgba(239, 246, 255, 1);
   font-size: 0.78rem;
@@ -572,6 +588,29 @@ body.overlay-body {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.96);
 }
 
+.overlay-history section + section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(100, 116, 139, 0.38);
+}
+
+.overlay-history-entry {
+  margin-bottom: 12px;
+  padding: 10px;
+  border: 1px solid rgba(100, 116, 139, 0.3);
+  border-radius: 9px;
+  background: rgba(15, 23, 42, 0.55);
+}
+
+.overlay-tab-scroll .overlay-history-label {
+  margin-bottom: 4px;
+  color: rgba(110, 231, 183, 0.9);
+  font-size: 0.68rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .overlay-question {
   margin: 2px 0 16px;
   padding: 9px 11px 10px;
@@ -622,6 +661,17 @@ body.overlay-body {
 .overlay-tab-scroll ul,
 .overlay-tab-scroll ol {
   padding-left: 1.2rem;
+}
+
+.overlay-tab-scroll .overlay-action-items {
+  display: grid;
+  gap: 10px;
+  margin: 4px 0 0;
+  padding-left: 1.45rem;
+}
+
+.overlay-action-items li {
+  padding-left: 3px;
 }
 
 .overlay-tab-scroll pre {

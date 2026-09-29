@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import { createServer } from 'vite';
 
 const {
   INTERVIEW_BACKGROUND_OPTIONS,
@@ -73,6 +74,38 @@ assert.match(canonicalPrompt, /Current user request: What is dependency injectio
 assert.match(canonicalPrompt, /Custom interview instruction: Prefer concise examples\./);
 assert.match(canonicalPrompt, /TECHNICAL BACKGROUND: Java, Spring Boot/);
 
+const vite = await createServer({
+  appType: 'custom',
+  logLevel: 'error',
+  server: { middlewareMode: true },
+});
+let meetingRequest;
+try {
+  const { buildMeetingChatRequest } = await vite.ssrLoadModule('/src/features/meeting/meetingRequestBuilder.ts');
+  meetingRequest = buildMeetingChatRequest({
+    mode: 'direct',
+    sessionDocuments: [{ name: 'Job Description: Pasted text', text: 'Build backend APIs with Node.js and PostgreSQL.' }],
+    activeProfile: { name: 'Candidate', context: 'Backend engineer with API experience.' },
+    interviewConfig: {
+      domain: 'Backend Engineer',
+      background: ['Node.js', 'PostgreSQL'],
+      microphoneDeviceId: null,
+    },
+    microphoneDevicePresent: false,
+    contextCharBudget: 4000,
+    maxHistoryMessages: 6,
+    maxContextChars: 3000,
+  }, 'How would you design this API?', []);
+} finally {
+  await vite.close();
+}
+assert.equal(meetingRequest.interviewContext.domain, 'Backend Engineer');
+assert.deepEqual(meetingRequest.interviewContext.background, ['Node.js', 'PostgreSQL']);
+assert.match(meetingRequest.messages[0].content, /INTERVIEW DOMAIN: Backend Engineer/);
+assert.match(meetingRequest.messages[0].content, /TECHNICAL BACKGROUND: Node\.js, PostgreSQL/);
+assert.match(meetingRequest.pdfContext, /Job Description: Pasted text/);
+assert.match(meetingRequest.pdfContext, /Backend engineer with API experience/);
+
 const normalized = normalizeInterviewContext({
   domain: 'Data Engineering',
   background: ['Python', 'Python', 'SQL', 'Not an option'],
@@ -135,6 +168,8 @@ assert.equal(microphoneDisplayLabel(null), 'Microphone unavailable');
 assert.match(microphoneDisplayLabel({ deviceId: 'usb', label: 'AB13X USB Audio' }), /AB13X USB Audio/);
 assert.match(appSource, /readPersistedInterviewContext\(\)/);
 assert.match(appSource, /writePersistedInterviewContext\(interviewConfig\)/);
+assert.match(appSource, /appMode === 'assistant' \|\| appMode === 'meeting' \? '' : 'hidden'/, 'The shared Context control must be visible in Meeting mode.');
+assert.match(appSource, /Meeting questions use the selected domain, technical background, and uploaded documents/);
 assert.match(meetingAudioSourcesSource, /normalizeMicrophoneDevices\(/);
 assert.match(appSource, />Background<\/label>/);
 assert.match(meetingAudioSourcesSource, /enumerateDevices\(\)/);
@@ -148,6 +183,27 @@ assert.match(meetingRequestBuilderSource, /microphoneConfigured: Boolean\(contex
 assert.match(meetingRequestBuilderSource, /microphoneDevicePresent: context\.microphoneDevicePresent/);
 assert.match(meetingRequestBuilderSource, /contextCharBudget: context\.contextCharBudget/);
 assert.match(meetingRequestBuilderSource, /profileCharBudget: context\.contextCharBudget/);
+const screenRequestStart = meetingRequestBuilderSource.indexOf('if (screenImage) {');
+const screenRequestEnd = meetingRequestBuilderSource.indexOf('const resolvedContext', screenRequestStart);
+const screenRequestSource = meetingRequestBuilderSource.slice(screenRequestStart, screenRequestEnd);
+assert.ok(screenRequestStart >= 0 && screenRequestEnd > screenRequestStart);
+assert.match(screenRequestSource, /answer each separately in the same order/);
+assert.match(screenRequestSource, /never guess or silently correct unclear text/);
+assert.match(screenRequestSource, /Scan the full screenshot top-to-bottom and left-to-right/);
+assert.match(screenRequestSource, /Check every digit, operator, identifier, list item, duplicate, and item order against the screenshot before answering/);
+assert.match(screenRequestSource, /Do not omit a clearly visible question/);
+assert.match(screenRequestSource, /multiple distinct questions, list and answer each separately in the same order/);
+assert.match(screenRequestSource, /one complete, runnable solution in its own fenced code block/);
+assert.match(screenRequestSource, /if none is specified, consistently use Python/);
+assert.match(screenRequestSource, /opening and closing triple-backtick fences on separate lines/);
+assert.match(screenRequestSource, /keep all code inside them/);
+assert.match(screenRequestSource, /check spelling, syntax, indentation, and entry-point names/);
+assert.match(screenRequestSource, /prefer the shortest clear complete program/);
+assert.match(screenRequestSource, /do not add functions, exception handling, or a main guard unless requested or needed/);
+assert.match(screenRequestSource, /role: 'system'/);
+assert.match(screenRequestSource, /role: 'user'/);
+assert.match(screenRequestSource, /type: 'image_url', image_url: \{ url: screenImage \}/);
+assert.doesNotMatch(screenRequestSource, /\.\.\.history|pdfContext|interviewContext/);
 assert.match(appSource, /const microphoneDevicePresent = meetingController\?\.microphoneDevicePresent \?\? false/);
 assert.match(appSource, /Math\.floor\(MAX_CONTEXT_CHARS \* runtimeConfig\.limits\.pdfContextBudgetRatio\)/);
 

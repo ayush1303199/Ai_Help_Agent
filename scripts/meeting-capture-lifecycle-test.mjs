@@ -148,6 +148,7 @@ function createProcessorHarness(transcribeAudio, reviewBeforeSend = false) {
     reviewedQuestions: [],
     errors: [],
     statuses: [],
+    audioSignalDetected: false,
   };
   const setState = (key) => (value) => {
     state[key] = typeof value === 'function' ? value(state[key]) : value;
@@ -171,6 +172,7 @@ function createProcessorHarness(transcribeAudio, reviewBeforeSend = false) {
     setDisplayedQuestion: setState('displayedQuestion'),
     setDisplayedAnswer: setState('displayedAnswer'),
     setAnswerPending: setState('answerPending'),
+    onAudioSignalDetected: () => { state.audioSignalDetected = true; },
     addTranscript: (transcript) => state.transcripts.push(transcript),
     onStatus: (status) => state.statuses.push(status),
     onError: (error) => state.errors.push(error),
@@ -185,6 +187,19 @@ const successfulProcessor = createProcessorHarness(async () => ({ text: 'What is
 await successfulProcessor.processor(new Blob(['audio']), 1200, true, 'capture-1', 'audio/webm');
 assert.equal(successfulProcessor.state.transcripts.length, 1, 'Successful transcription should be saved.');
 assert.equal(successfulProcessor.state.sentQuestions[0], 'What is JavaScript?', 'A complete spoken question should reach the answer pipeline.');
+assert.equal(successfulProcessor.state.audioSignalDetected, true, 'A successful transcript confirms audio was captured.');
+
+const prefacedQuestionProcessor = createProcessorHarness(async () => ({
+  text: 'I will now translate the text. What is JavaScript?',
+  status: 200,
+}));
+await prefacedQuestionProcessor.processor(new Blob(['audio']), 1200, true, 'capture-1', 'audio/webm');
+assert.equal(
+  prefacedQuestionProcessor.state.sentQuestions[0],
+  'What is JavaScript?',
+  'A question following known STT narration must reach the answer pipeline without the narration.',
+);
+assert.equal(prefacedQuestionProcessor.state.errors.length, 0, 'A valid question must not be rejected as an incomplete request.');
 
 const reviewProcessor = createProcessorHarness(async () => ({ text: 'What is JavaScript?', status: 200 }), true);
 await reviewProcessor.processor(new Blob(['audio']), 1200, true, 'capture-1', 'audio/webm');

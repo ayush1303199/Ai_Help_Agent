@@ -1,6 +1,11 @@
 import { useEffect, useRef } from 'react';
 import { prepareTextRequest } from '../../audio/transcriptUtils';
 import { runtimeConfig } from '../../config/runtimeConfig';
+import {
+  buildOverlayActionItems,
+  buildOverlayAnalysis,
+  buildOverlaySummary,
+} from '../overlay/overlayAnswerInsights';
 import type { AssistantMessage, AssistantSendOptions } from './useAssistantAgentController';
 
 type AssistantStatus = 'ready' | 'thinking' | 'answer' | 'error';
@@ -27,43 +32,6 @@ interface AssistantOverlayBridgeProps {
   status: AssistantStatus;
   chatStreaming: boolean;
   sendMessage: SendAssistantMessage;
-}
-
-function overlayPlainText(content: string) {
-  return content
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/[`*_>#]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function buildOverlaySummary(answer: string) {
-  const plainText = overlayPlainText(answer);
-  if (!plainText) return '';
-  const sentences = plainText.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [plainText];
-  return sentences.slice(0, 2).join(' ').trim();
-}
-
-function buildOverlayActionItems(answer: string) {
-  const items = answer
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => /^(?:[-*•]|\d+[.)])\s+/.test(line))
-    .map((line) => line.replace(/^(?:[-*•]|\d+[.)])\s+/, '').trim())
-    .filter(Boolean)
-    .slice(0, 8);
-  return items.length ? items : ['No specific action items identified in this answer.'];
-}
-
-function buildOverlayAnalysis(question: string, answer: string) {
-  const summary = buildOverlaySummary(answer);
-  if (!summary) return '';
-  const wordCount = overlayPlainText(answer).split(/\s+/).filter(Boolean).length;
-  return [
-    question ? `Question focus: ${question}` : '',
-    `Response analysis: ${wordCount} words covering the requested topic.`,
-    `Key point: ${summary}`,
-  ].filter(Boolean).join('\n\n');
 }
 
 export function AssistantOverlayBridge({

@@ -71,6 +71,14 @@ function normalizePunctuation(text: string) {
     .replace(/\.{4,}/g, '.');
 }
 
+function stripSpeechTranscriptionPreface(text: string) {
+  const prefacePattern = /^(?:i will now|i'll now|i am going to now|i'm going to now)\s+(?:translate|transcribe)\s+(?:the\s+)?(?:text|question|speech|audio)[.!,:;—-]+\s*/i;
+  const match = text.match(prefacePattern);
+  if (!match) return text;
+  const remainder = text.slice(match[0].length).trim();
+  return detectQuestion(remainder).isQuestion ? remainder : text;
+}
+
 function isFiller(text: string) {
   return /^(?:uh+|um+|hmm+|hm+|okay|ok|yes|no|right|sure|the|a|an)[.!?]*$/i.test(text);
 }
@@ -289,6 +297,7 @@ function normalizeTechnicalVocabulary(text: string, context?: TranscriptNormaliz
 
 export function cleanTranscript(rawText: string, context?: TranscriptNormalizationContext) {
   let text = normalizePunctuation(rawText.replace(/\s+/g, ' ').trim());
+  text = stripSpeechTranscriptionPreface(text);
   text = text.replace(/^(um+|uh+|you know|like)\s+/i, '');
   text = normalizeTechnicalVocabulary(text, context);
   if (/^(what|why|how|when|where|who|can|could|would|is|are|do|does|explain|tell me|compare|describe)\b/i.test(text)) {

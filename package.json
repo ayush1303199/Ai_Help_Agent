@@ -32,6 +32,7 @@
     "test:configuration-ui": "node scripts/configuration-ui-test.mjs",
     "test:provider-config": "node --experimental-strip-types scripts/provider-config-test.mjs",
     "test:overlay": "node scripts/overlay-static-test.mjs",
+    "test:overlay-insights": "node --experimental-strip-types scripts/overlay-answer-insights-test.mjs",
     "test:meeting-overlay": "node --experimental-strip-types scripts/meeting-overlay-protocol-test.mjs",
     "test:meeting-audio": "node --experimental-strip-types scripts/meeting-audio-quality-test.mjs",
     "test:meeting-capture-lifecycle": "node --experimental-strip-types scripts/meeting-capture-lifecycle-test.mjs",

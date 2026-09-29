@@ -2,9 +2,57 @@ import assert from 'node:assert/strict';
 import {
   isCaptureCommandConfirmed,
   isMissingMeetingOverlayHandler,
+  meetingOverlayAnswer,
+  meetingOverlayQuestion,
   meetingOverlayStage,
+  resolveOverlayTabPreference,
+  shouldFocusMeetingAnswer,
   shouldAcceptOverlayAgentState,
 } from '../src/features/meeting/meetingOverlayProtocol.ts';
+
+assert.equal(
+  meetingOverlayQuestion('transcribing', 'Previous question?', 'Current spoken words'),
+  'Current spoken words',
+  'The overlay should show the current transcript instead of an older answered question while listening.',
+);
+assert.equal(
+  meetingOverlayQuestion('thinking', 'Current question?', 'Current question?'),
+  'Current question?',
+  'The active question should remain visible while its answer is generated.',
+);
+assert.equal(meetingOverlayAnswer('thinking', 'Previous answer'), '', 'The previous answer must not appear as the answer to a new question.');
+assert.equal(meetingOverlayAnswer('answer', 'Current answer'), 'Current answer');
+assert.equal(meetingOverlayQuestion('ready', '  ', 'Recognized question'), 'Recognized question');
+assert.equal(shouldFocusMeetingAnswer(
+  { agent: 'meeting', status: 'thinking', answer: '' },
+  { agent: 'meeting', status: 'answer', answer: 'Current answer' },
+), true);
+assert.equal(shouldFocusMeetingAnswer(
+  { agent: 'meeting', status: 'thinking', answer: '' },
+  { agent: 'meeting', status: 'listening', answer: 'Current answer' },
+), true, 'A newly completed answer must focus the Answer tab even when capture immediately returns to listening.');
+assert.equal(shouldFocusMeetingAnswer(
+  { agent: 'meeting', status: 'answer', answer: 'Current answer' },
+  { agent: 'meeting', status: 'listening', answer: 'Current answer' },
+), false, 'Repeated Meeting state updates must not take the user away from Search.');
+assert.equal(shouldFocusMeetingAnswer(
+  { agent: 'meeting', status: 'thinking', answer: '' },
+  { agent: 'meeting', status: 'thinking', answer: 'Previous answer' },
+), false);
+assert.equal(resolveOverlayTabPreference('history', 'answer', true), 'history',
+  'A late native preference response must not replace the tab the user just selected.');
+assert.equal(resolveOverlayTabPreference('history', 'answer', false), 'answer',
+  'Persisted tab preferences should still initialize the overlay before user interaction.');
+assert.equal(resolveOverlayTabPreference('history', 'unknown', false), 'history',
+  'Invalid native tab values must not replace the current tab.');
+assert.equal(shouldFocusMeetingAnswer(
+  { agent: 'meeting', status: 'ready', answer: '' },
+  { agent: 'meeting', status: 'answer', answer: '  ' },
+), false);
+assert.equal(shouldFocusMeetingAnswer(
+  { agent: 'assistant', status: 'answer', answer: '' },
+  { agent: 'assistant', status: 'answer', answer: 'Assistant answer' },
+), false);
 
 assert.equal(meetingOverlayStage('listening'), 'listening');
 assert.equal(meetingOverlayStage('transcribing'), 'transcribing');

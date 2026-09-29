@@ -34,7 +34,11 @@ from coding_websocket import (  # noqa: E402
 )
 from stt_service import SttService  # noqa: E402
 from provider_registry import ProviderInstance, ProviderRegistry, ProviderStatus  # noqa: E402
-from provider_model_contract import provider_capability_states, provider_model_error  # noqa: E402
+from provider_model_contract import (  # noqa: E402
+    provider_capability_states,
+    provider_model_error,
+    provider_model_for_capability,
+)
 
 
 class AgentWebSocketIsolationTests(unittest.IsolatedAsyncioTestCase):
@@ -968,6 +972,93 @@ class ProviderModelValidationTests(unittest.TestCase):
 
         self.assertEqual([groq.type, gemini.type, custom.model], ["groq", "gemini", "my-private-model"])
         self.assertIsNone(provider_model_error("custom", "my-private-model", "https://llm.example/v1"))
+        self.assertEqual(provider_model_for_capability("groq", "vision"), "qwen/qwen3.8-27b")
+        self.assertIsNone(provider_model_for_capability("deepseek", "vision"))
+
+
+    def test_image_requests_are_identified_without_treating_text_requests_as_vision(self):
+        import index
+
+        self.assertTrue(index.messages_contain_image([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Read this screen."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ],
+        }]))
+        self.assertFalse(index.messages_contain_image([{
+            "role": "user",
+            "content": "Answer this text question.",
+        }]))
+
+    def test_vision_request_uses_registered_vision_model_without_changing_saved_model(self):
+        import index
+
+        provider = SimpleNamespace(
+            id="groq-provider",
+            type="groq",
+            model="openai/gpt-oss-20b",
+            base_url="https://api.groq.com/openai/v1",
+            enabled=True,
+        )
+        response = SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(content="The visible answer.", tool_calls=None)),
+        ])
+        create_completion = Mock(return_value=response)
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create_completion),
+        ))
+        with patch.object(index, "provider_candidates", return_value=[provider]), patch.object(
+            index, "get_api_key", return_value="test-key"
+        ), patch.object(index, "OpenAI", return_value=client), patch.object(
+            index, "registry"
+        ) as registry:
+            message, used_provider = index.complete_model(
+                [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read this screen."},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    ],
+                }],
+                provider_id=provider.id,
+                required_capability="vision",
+            )
+            vision_call = create_completion.call_args
+            index.complete_model(
+                [{"role": "user", "content": "Answer this text question."}],
+                provider_id=provider.id,
+            )
+
+        self.assertEqual(vision_call.kwargs["model"], "qwen/qwen3.8-27b")
+        self.assertEqual(vision_call.kwargs["temperature"], 0.1)
+        self.assertEqual(used_provider.model, "qwen/qwen3.8-27b")
+        self.assertEqual(provider.model, "openai/gpt-oss-20b", "Vision routing must not mutate the saved provider model.")
+        self.assertEqual(message["content"], "The visible answer.")
+        self.assertEqual(registry.update_provider_status.call_count, 2)
+        self.assertEqual(create_completion.call_args.kwargs["model"], "openai/gpt-oss-20b")
+        self.assertEqual(create_completion.call_args.kwargs["temperature"], 0.3)
+
+    def test_vision_request_fails_clearly_when_provider_has_no_registered_vision_model(self):
+        import index
+
+        provider = SimpleNamespace(
+            id="text-only-provider",
+            type="deepseek",
+            model="deepseek-chat",
+            base_url="https://api.deepseek.com/v1",
+            enabled=True,
+        )
+        with patch.object(index, "provider_candidates", return_value=[provider]):
+            with self.assertRaisesRegex(index.HTTPException, "no registered vision-capable model"):
+                index.complete_model(
+                    [{
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}],
+                    }],
+                    provider_id=provider.id,
+                    required_capability="vision",
+                )
 
     def test_dummy_registry_entry_drives_backend_validation_capabilities_and_persistence(self):
         import provider_model_contract
@@ -1196,6 +1287,53 @@ class ProviderModelValidationTests(unittest.TestCase):
 
         self.assertEqual(error.exception.status_code, 400)
         self.assertEqual(error.exception.detail["code"], "MODEL_NOT_SUPPORTED_BY_PROVIDER")
+
+
+class VisionModelPayloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_multimodal_chat_payload_requests_vision_model(self):
+        import index
+
+        provider = SimpleNamespace(type="groq", model="openai/gpt-oss-20b")
+        send_messages = []
+
+        async def send_json(message):
+            send_messages.append(message)
+
+        with patch.object(index, "call_model", return_value=("Read answer.", provider)) as call_model:
+            await index.process_chat_payload({
+                "requestId": "screen-read",
+                "providerId": "groq-provider",
+                "mode": "direct",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read this screen."},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    ],
+                }],
+            }, send_json, index.new_connection_state())
+
+        self.assertEqual(call_model.call_args.kwargs["required_capability"], "vision")
+        self.assertEqual(send_messages[-1]["type"], "done")
+        self.assertEqual(send_messages[-1]["content"], "Read answer.")
+
+    async def test_text_only_chat_keeps_the_current_model(self):
+        import index
+
+        provider = SimpleNamespace(type="groq", model="openai/gpt-oss-20b")
+
+        async def send_json(_message):
+            return None
+
+        with patch.object(index, "call_model", return_value=("Text answer.", provider)) as call_model:
+            await index.process_chat_payload({
+                "requestId": "text-chat",
+                "providerId": "groq-provider",
+                "mode": "direct",
+                "messages": [{"role": "user", "content": "Answer this text question."}],
+            }, send_json, index.new_connection_state())
+
+        self.assertIsNone(call_model.call_args.kwargs["required_capability"])
 
 
 class ProviderSecretLifecycleTests(unittest.TestCase):

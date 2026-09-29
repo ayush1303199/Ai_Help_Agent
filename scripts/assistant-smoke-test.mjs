@@ -31,6 +31,16 @@ const interviewPromptSource = await fs.readFile(new URL('../src/ai/interviewSyst
 
 assert.equal(transcriptUtils.cleanTranscript(' um how are you'), 'how are you?');
 assert.equal(transcriptUtils.cleanTranscript('what is spring boot'), 'what is Spring Boot?');
+assert.equal(
+  transcriptUtils.cleanTranscript('I will now translate the text. What is JavaScript?'),
+  'What is JavaScript?',
+  'A known STT narration preface must not hide the actual spoken question.',
+);
+assert.equal(
+  transcriptUtils.cleanTranscript('I will now translate the text.'),
+  'I will now translate the text.',
+  'A narration-like utterance without a following question must be preserved.',
+);
 assert.equal(transcriptUtils.cleanTranscript('explain node.js and fastapi'), 'explain Node.js and FastAPI?');
 assert.equal(transcriptUtils.cleanTranscript('Explain dependency injection in Spring.'), 'Explain dependency injection in Spring?');
 assert.equal(transcriptUtils.cleanTranscript('What is Spring Boot???'), 'What is Spring Boot?');
@@ -85,6 +95,11 @@ assert.deepEqual(transcriptUtils.detectQuestion('What is Java?'), {
 assert.equal(transcriptUtils.prepareQuestion('uh...').qualityClassification, 'FILLER');
 assert.equal(transcriptUtils.prepareQuestion('What is the difference between...').qualityClassification, 'INCOMPLETE');
 assert.equal(transcriptUtils.prepareQuestion('What is Spring Boot?').acceptedQuestion, 'What is Spring Boot?');
+assert.equal(
+  transcriptUtils.prepareQuestion('I will now translate the text. What is JavaScript?').acceptedQuestion,
+  'What is JavaScript?',
+  'The recognized question following the STT narration preface must be accepted.',
+);
 assert.equal(transcriptUtils.prepareQuestion('Introduce yourself.').acceptedQuestion, 'Introduce yourself.');
 assert.equal(transcriptUtils.prepareQuestion('Technical vocabulary. Technical vocabulary. Technical vocabulary.').qualityClassification, 'REPEATED_NOISE');
 assert.equal(transcriptUtils.prepareTextRequest('Introduce yourself').acceptedQuestion, 'Introduce yourself');
@@ -133,6 +148,11 @@ assert.equal(
 assert.equal(meetingTranscriptQuality.hasMeetingRequestIntent('The first time we saw the word is uncertain.'), false);
 assert.equal(meetingTranscriptQuality.hasMeetingRequestIntent('haan'), false);
 assert.equal(meetingTranscriptQuality.hasMeetingRequestIntent('Thank you. What is JavaScript?'), true);
+assert.equal(
+  meetingTranscriptQuality.hasMeetingRequestIntent(transcriptUtils.cleanTranscript('I will now translate the text. What is JavaScript?')),
+  true,
+  'The cleaned question must pass Meeting request-intent detection.',
+);
 assert.equal(meetingTranscriptQuality.hasMeetingRequestIntent('I need help debugging this code.'), true);
 assert.equal(meetingTranscriptQuality.hasMeetingRequestIntent('Do it to yourself?'), true);
 assert.equal(transcriptUtils.prepareQuestion('Do it to yourself?').acceptedQuestion, 'Do it to yourself?');
@@ -342,6 +362,10 @@ assert.match(electronMainSource, /audio: 'loopback'/);
 assert.match(electronMainSource, /types: \['screen'\]/);
 const screenCaptureHandler = electronMainSource.slice(electronMainSource.indexOf("ipcMain.handle('screen:capture'"));
 assert.match(screenCaptureHandler, /visibleWindows\.forEach\(\(window\) => window\.hide\(\)\)/);
+assert.match(screenCaptureHandler, /const display = screen\.getPrimaryDisplay\(\)/);
+assert.match(screenCaptureHandler, /display\.bounds\.width \* display\.scaleFactor/);
+assert.match(screenCaptureHandler, /3840 \/ Math\.max\(nativeWidth, nativeHeight\)/);
+assert.match(screenCaptureHandler, /sources\.find\(\(candidate\) => candidate\.display_id === String\(display\.id\)\)/);
 assert.match(screenCaptureHandler, /finally\s*\{[\s\S]*window\.showInactive\(\)/);
 assert.match(screenReaderSource, /if \(!window\.electronAPI\?\.captureScreen\)\s*\{\s*onError\('Screen reading is available in the Electron desktop app\.'\)/);
 

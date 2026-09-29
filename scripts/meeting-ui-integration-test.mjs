@@ -14,6 +14,8 @@ try {
   const { MeetingAssistantWorkspace } = await vite.ssrLoadModule(
     '/src/features/meeting/MeetingAssistantWorkspace.tsx',
   );
+  const { AnswerSessionView } = await vite.ssrLoadModule('/src/ui/AnswerSessionView.tsx');
+  const { renderAnswerMarkdown } = await vite.ssrLoadModule('/src/ui/answerMarkdown.tsx');
   const { ChatHistoryModal } = await vite.ssrLoadModule('/src/features/history/ChatHistoryModal.tsx');
   const { pruneHistorySessions, readHistory } = await vite.ssrLoadModule('/src/history/historyService.ts');
   const previousLocalStorage = globalThis.localStorage;
@@ -235,6 +237,35 @@ try {
   assert.match(activeMarkup, /Delete transcript from Microphone/, 'Saved transcripts must retain per-entry deletion.');
   assert.match(activeMarkup, /Clear saved Meeting data/, 'The history view must expose the Meeting-only clear control.');
   assert.match(activeMarkup, /role="status" aria-live="polite" aria-atomic="true"/, 'Active capture and retry states must be announced to assistive technology.');
+  assert.match(activeMarkup, /Questions &amp; answers/, 'Questions and their answers should share one conversation area.');
+  assert.doesNotMatch(activeMarkup, /Earlier answers/, 'Q&A history should not be split into a separate earlier-answers panel.');
+  const conversationMarkup = renderToStaticMarkup(createElement(AnswerSessionView, {
+    lastQuestion: 'Latest question?',
+    lastAnswer: 'Latest answer.',
+    isThinking: false,
+    answeredSegments: [
+      { question: 'First question?', answer: 'First answer.' },
+      { question: 'Latest question?', answer: 'Latest answer.' },
+    ],
+  }));
+  assert.ok(
+    conversationMarkup.indexOf('Latest question?') < conversationMarkup.indexOf('First question?'),
+    'The newest question and answer should be immediately visible before older conversation entries.',
+  );
+  assert.match(conversationMarkup, /First question\?.*First answer\./s, 'Each previous question should remain paired with its answer.');
+  const malformedFencedAnswer = renderToStaticMarkup(createElement(
+    'div',
+    null,
+    renderAnswerMarkdown([
+      'Here are the two requested programs.',
+      '**1. Check even or odd number** \\`\\`\\`python n = int(input("Enter a number: ")) if n % 2 == 0: print(n, "is even") else: print(n, "is odd")\\`\\`\\`',
+      '**2. Recursion example** \\`\\`\\`python def factorial(n): if n == 0 or n == 1: return 1 return n * factorial(n - 1)\\`\\`\\`',
+    ].join('\n\n')),
+  ));
+  assert.equal((malformedFencedAnswer.match(/<pre/g) || []).length, 2, 'Escaped inline fences should render as separate code blocks.');
+  assert.match(malformedFencedAnswer, /n = int\(input\(&quot;Enter a number: ?&quot;\)\)/, 'The first inline code block should retain its code as preformatted text.');
+  assert.match(malformedFencedAnswer, /def factorial\(n\):/, 'The second inline code block should retain its code as preformatted text.');
+  assert.doesNotMatch(malformedFencedAnswer, /```/, 'Fence markers should not leak into the rendered answer.');
   const providerErrorMarkup = renderToStaticMarkup(createElement(MeetingAssistantWorkspace, {
     ...baseProps,
     sessionActive: true,

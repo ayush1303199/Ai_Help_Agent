@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import json
 import math
@@ -25,6 +26,7 @@ import httpx
 from provider_registry import ProviderRegistry, ProviderStatus, RegistryState
 from provider_model_contract import (
     provider_capability_states,
+    provider_model_for_capability,
     provider_model_error,
     provider_model_is_valid,
 )
@@ -122,6 +124,7 @@ def call_model(
     provider_id: Optional[str] = None,
     request_id: Optional[str] = None,
     trace_metadata: Optional[Dict[str, Any]] = None,
+    required_capability: Optional[str] = None,
 ) -> tuple[str, Any]:
     """Call LLM using specified or active provider."""
     message, provider = complete_model(
@@ -129,6 +132,7 @@ def call_model(
         provider_id,
         request_id=request_id,
         trace_metadata=trace_metadata,
+        required_capability=required_capability,
     )
     content = str(message.get("content") or "").strip() or "No response returned by the model."
     return content, provider
@@ -168,6 +172,19 @@ def compact_model_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any
         kept.append(item)
         used += item_size
     return system_messages + list(reversed(kept))
+
+
+def messages_contain_image(messages: List[Dict[str, Any]]) -> bool:
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        if any(
+            isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}
+            for part in content
+        ):
+            return True
+    return False
 
 
 class GeneralContextLimitError(RuntimeError):
@@ -1836,15 +1853,32 @@ def complete_model(
     request_id: Optional[str] = None,
     trace_metadata: Optional[Dict[str, Any]] = None,
     capture_provider_request: bool = False,
+    required_capability: Optional[str] = None,
 ) -> tuple[Dict[str, Any], Any]:
     """Complete one provider request and return the normalized message."""
     candidates = provider_candidates(provider_id)
+    if required_capability:
+        capability_candidates = []
+        for candidate in candidates:
+            vision_model = provider_model_for_capability(candidate.type.lower(), required_capability)
+            if not vision_model:
+                continue
+            candidate_with_capability = copy.copy(candidate)
+            candidate_with_capability.model = vision_model
+            capability_candidates.append(candidate_with_capability)
+        candidates = capability_candidates
+        if not candidates:
+            capability_name = "vision" if required_capability == "vision" else required_capability
+            raise HTTPException(
+                status_code=400,
+                detail=f"The selected AI provider has no registered {capability_name}-capable model.",
+            )
     if not candidates:
         raise HTTPException(status_code=502, detail="No provider configured.")
 
     request: Dict[str, Any] = {
         "messages": compact_model_messages(messages),
-        "temperature": 0.3,
+        "temperature": 0.1 if required_capability == "vision" else 0.3,
         "max_tokens": MAX_TOKENS,
     }
     if tools:
@@ -2975,13 +3009,16 @@ async def process_chat_payload(payload: Dict[str, Any], send_json, state: Dict[s
                 or "first person as the user" in system_content_lower
             ),
             "promptChars": len(system_content),
+            "imageInput": messages_contain_image(final_messages),
         }
+        required_capability = "vision" if messages_contain_image(final_messages) else None
         answer, provider = await asyncio.to_thread(
             call_model,
             final_messages,
             selected_provider_id,
             request_id=request_id,
             trace_metadata=trace_metadata,
+            required_capability=required_capability,
         )
         await send_connection_message(send_json, state, {
             "type": "token",
