@@ -34,6 +34,7 @@ interface SegmentRequestOptions {
 
 interface MeetingSttSegmentProcessorOptions {
   transcriptionLanguage: 'auto' | 'en' | 'hi' | 'hinglish';
+  reviewBeforeSend: boolean;
   meetingAudioMode: MeetingAudioMode;
   meetingSource: string;
   background: string[];
@@ -53,6 +54,7 @@ interface MeetingSttSegmentProcessorOptions {
   addTranscript: (transcript: MeetingTranscript) => void;
   onStatus: (message: string) => void;
   onError: (message: string) => void;
+  onReviewQuestion: (question: string) => void;
   sendQuestion: (question: string, options: SegmentRequestOptions) => Promise<void>;
   transcribeAudio?: typeof transcribeAudioSegment;
 }
@@ -60,6 +62,7 @@ interface MeetingSttSegmentProcessorOptions {
 export function createMeetingSttSegmentProcessor(options: MeetingSttSegmentProcessorOptions) {
   const {
     transcriptionLanguage,
+    reviewBeforeSend,
     meetingAudioMode,
     meetingSource,
     background,
@@ -79,6 +82,7 @@ export function createMeetingSttSegmentProcessor(options: MeetingSttSegmentProce
     addTranscript,
     onStatus,
     onError,
+    onReviewQuestion,
     sendQuestion,
     transcribeAudio = transcribeAudioSegment,
   } = options;
@@ -337,6 +341,18 @@ export function createMeetingSttSegmentProcessor(options: MeetingSttSegmentProce
         continuation: Boolean(continuedQuestion),
       });
       setLiveTranscript(acceptedQuestion);
+      if (reviewBeforeSend) {
+        setAnswerPending(false);
+        onReviewQuestion(acceptedQuestion);
+        onStatus('Transcript ready to review. Edit or send it to the AI when ready.');
+        setPipelineStatus('ready');
+        onError('');
+        logSttTrace(sttSession, 'TRANSCRIPT_QUEUED_FOR_REVIEW', {
+          segmentId,
+          transcriptLength: acceptedQuestion.length,
+        });
+        return;
+      }
       setPipelineStatus('thinking');
       logSttTrace(sttSession, 'AI_REQUEST_STARTED', { segmentId, questionLength: acceptedQuestion.length });
       await sendQuestion(acceptedQuestion, {

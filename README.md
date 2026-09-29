@@ -358,12 +358,22 @@ Open **Meetings** and choose an audio source:
 3. **Microphone + System / Internal Audio** — mixes both sources into one
    recording stream.
 
-Saved Meeting transcripts, answers, and Meeting conversations use a configurable
-local retention period: 30 days by default, with 7-day, 60-day, 90-day, and manual-only
-options in saved Meeting data. Expired Meeting data is pruned on load and while
-the app is running; other agents' conversation history is not subject to this
-setting. Records without a valid timestamp are preserved rather than deleted
-based on uncertain dates.
+In **Speech recognition settings**, enable **Review transcript before sending**
+to pause each recognized question for review. Edit it, send it to the AI, or
+skip it; up to 30 pending questions are stored as text on this device and
+restored after an app restart. The selected history retention policy also
+expires pending reviews; custom-date deletion clears the queue on that date.
+Audio is not saved for this queue. This option is saved on the device and is
+off by default, preserving automatic hands-free answers.
+
+All saved conversations use one configurable local retention period: 30 days
+by default, with 7-day, 60-day, 90-day, and manual-only options in the Chat
+history modal or Meeting setup. Expired conversations are pruned on load and
+while the app is running. A custom future calendar date can instead be selected
+to delete all saved conversations, transcripts, and Meeting answers on that
+local date; after deletion, the policy returns to the 30-day default. Records
+without a valid timestamp are preserved rather than deleted based on uncertain
+dates.
 
 For system audio:
 

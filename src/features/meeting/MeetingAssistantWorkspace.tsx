@@ -5,6 +5,7 @@ import type { MeetingAudioMode } from '../../app/appTypes';
 import type { MeetingHistoryRetentionDays } from '../../history/historyService';
 import type { MeetingTranscriptionLanguage } from './useMeetingAssistantController';
 import { ScreenReadingButton } from '../screen-reading/ScreenReadingButton';
+import { HistoryRetentionControl } from '../history/HistoryRetentionControl';
 import { meetingAudioDiagnostic } from './meetingTranscriptQuality';
 
 interface AnsweredSegment {
@@ -24,49 +25,12 @@ interface StageTimings {
   answerMs?: number;
 }
 
-function MeetingRetentionControl({
-  historyRetentionDays,
-  onRetentionDaysChange,
-}: {
-  historyRetentionDays: MeetingHistoryRetentionDays;
-  onRetentionDaysChange: (days: MeetingHistoryRetentionDays) => void;
-}) {
-  const [retentionError, setRetentionError] = useState('');
-
-  return (
-    <label className="block text-xs text-slate-300">
-      Auto-delete Meeting data
-      <select
-        aria-label="Meeting history retention"
-        value={historyRetentionDays}
-        onChange={(event) => {
-          const value = event.target.value;
-          if (value === '7' || value === '30' || value === '60' || value === '90' || value === 'off') {
-            try {
-              onRetentionDaysChange(value === 'off' ? 'off' : Number(value) as 7 | 30 | 60 | 90);
-              setRetentionError('');
-            } catch (error) {
-              setRetentionError(error instanceof Error ? error.message : 'Could not save retention preference.');
-            }
-          }
-        }}
-        className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-200"
-      >
-        <option value="7">Delete after 7 days</option>
-        <option value="30">Delete after 30 days (recommended)</option>
-        <option value="60">Delete after 60 days</option>
-        <option value="90">Delete after 90 days</option>
-        <option value="off">Off (manual deletion only)</option>
-      </select>
-      {retentionError && <span role="alert" className="mt-2 block text-xs text-rose-300">{retentionError}</span>}
-    </label>
-  );
-}
-
 interface MeetingAssistantWorkspaceProps {
   sessionActive: boolean;
   meetingAudioMode: MeetingAudioMode;
   transcriptionLanguage: MeetingTranscriptionLanguage;
+  reviewBeforeSend: boolean;
+  pendingTranscriptReviews: { id: string; text: string }[];
   displayedAudioSourceLabel: string;
   displayedAudioStatus: string;
   microphoneStatus: string;
@@ -94,6 +58,9 @@ interface MeetingAssistantWorkspaceProps {
   chatStreaming: boolean;
   onAudioModeChange: (mode: MeetingAudioMode) => void;
   onTranscriptionLanguageChange: (language: MeetingTranscriptionLanguage) => void;
+  onReviewBeforeSendChange: (enabled: boolean) => void;
+  onSendReviewedTranscript: (id: string, text: string) => void;
+  onSkipReviewedTranscript: (id: string) => void;
   onTestAudio: () => void;
   onStartCapture: () => void;
   onStopCapture: () => void;
@@ -196,6 +163,8 @@ export function MeetingAssistantWorkspace({
   sessionActive,
   meetingAudioMode,
   transcriptionLanguage,
+  reviewBeforeSend,
+  pendingTranscriptReviews,
   displayedAudioSourceLabel,
   displayedAudioStatus,
   microphoneStatus,
@@ -223,6 +192,9 @@ export function MeetingAssistantWorkspace({
   chatStreaming,
   onAudioModeChange,
   onTranscriptionLanguageChange,
+  onReviewBeforeSendChange,
+  onSendReviewedTranscript,
+  onSkipReviewedTranscript,
   onTestAudio,
   onStartCapture,
   onStopCapture,
@@ -245,10 +217,15 @@ export function MeetingAssistantWorkspace({
 }: MeetingAssistantWorkspaceProps) {
   const [editingTranscript, setEditingTranscript] = useState(false);
   const [editedTranscript, setEditedTranscript] = useState(liveTranscript);
+  const [reviewedTranscript, setReviewedTranscript] = useState('');
+  const activeReview = pendingTranscriptReviews[0] || null;
   useEffect(() => {
     setEditedTranscript(liveTranscript);
     setEditingTranscript(false);
   }, [liveTranscript]);
+  useEffect(() => {
+    setReviewedTranscript(activeReview?.text || '');
+  }, [activeReview?.id, activeReview?.text]);
 
   const audioDiagnostic = meetingAudioDiagnostic({
     microphoneUnavailable,
@@ -298,6 +275,20 @@ export function MeetingAssistantWorkspace({
           <option value="hinglish">Hindi + English (mixed)</option>
         </select>
       </label>
+      <label className="flex items-start gap-2 text-xs text-slate-300">
+          <input
+            type="checkbox"
+            checked={reviewBeforeSend}
+            disabled={isRecording || isTranscribing}
+            onChange={(event) => onReviewBeforeSendChange(event.target.checked)}
+            aria-label="Review transcript before sending"
+            className="mt-0.5 accent-emerald-400"
+          />
+          <span>
+            Review transcript before sending
+            <span className="mt-1 block text-[11px] text-slate-500">Check or edit each spoken question before it goes to the AI.</span>
+          </span>
+      </label>
     </div>
   );
   if (!sessionActive) {
@@ -316,9 +307,11 @@ export function MeetingAssistantWorkspace({
           {statusLabel !== 'Ready' && <p role="status" aria-live="polite" aria-atomic="true" className="text-center text-xs text-emerald-300">{statusLabel}</p>}
           <ScreenReadingButton chatStreaming={chatStreaming} onReadScreen={onReadScreen} screenReading={screenReading} enabled={screenReadingEnabled} />
           <div className="rounded-lg border border-slate-700 bg-slate-900/60 p-3">
-            <MeetingRetentionControl
-              historyRetentionDays={historyRetentionDays}
-              onRetentionDaysChange={onRetentionDaysChange}
+            <HistoryRetentionControl
+              value={historyRetentionDays}
+              onChange={onRetentionDaysChange}
+              label="Auto-delete saved history"
+              ariaLabel="Meeting history retention"
             />
           </div>
           {(transcripts.length > 0 || answeredSegments.length > 0) && (
@@ -395,6 +388,38 @@ export function MeetingAssistantWorkspace({
         </div>
       )}
       <div className="mb-4 flex items-end justify-between gap-3"><div className="min-w-0"><p className="mb-1 text-[11px] font-medium uppercase tracking-wider text-slate-500">Last heard</p><p className="truncate text-sm text-slate-300">{liveTranscript || 'Waiting for speech...'}</p></div>{liveTranscript && <button type="button" onClick={onSaveTranscript} className="shrink-0 rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 hover:bg-emerald-500/10">Save transcript</button>}</div>
+      {activeReview && (
+        <div className="mb-4 space-y-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
+          <p className="text-xs font-medium text-amber-200">
+            Review spoken question{pendingTranscriptReviews.length > 1 ? ` (${pendingTranscriptReviews.length} waiting)` : ''}
+          </p>
+          <textarea
+            value={reviewedTranscript}
+            onChange={(event) => setReviewedTranscript(event.target.value)}
+            aria-label="Review recognized transcript before sending"
+            rows={2}
+            className="w-full resize-y rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400"
+          />
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => onSendReviewedTranscript(activeReview.id, reviewedTranscript)}
+              disabled={!reviewedTranscript.trim() || chatStreaming}
+              className="rounded-lg bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 disabled:opacity-40"
+            >
+              Send to AI
+            </button>
+            <button
+              type="button"
+              onClick={() => onSkipReviewedTranscript(activeReview.id)}
+              disabled={chatStreaming}
+              className="rounded-lg border border-slate-600 px-3 py-2 text-xs text-slate-300 disabled:opacity-40"
+            >
+              Skip
+            </button>
+          </div>
+        </div>
+      )}
       {liveTranscript && (
         <div className="mb-4">
           <button
@@ -430,9 +455,11 @@ export function MeetingAssistantWorkspace({
       {transcriptOpen && (
         <div className="mt-3 space-y-3 rounded-xl border border-slate-700 bg-slate-900 p-4">
           <p className="text-sm leading-relaxed text-slate-300">{liveTranscript || 'No transcript captured yet.'}</p>
-          <MeetingRetentionControl
-            historyRetentionDays={historyRetentionDays}
-            onRetentionDaysChange={onRetentionDaysChange}
+          <HistoryRetentionControl
+            value={historyRetentionDays}
+            onChange={onRetentionDaysChange}
+            label="Auto-delete saved history"
+            ariaLabel="Meeting history retention"
           />
           {(transcripts.length > 0 || answeredSegments.length > 0) && (
             <SavedMeetingHistory

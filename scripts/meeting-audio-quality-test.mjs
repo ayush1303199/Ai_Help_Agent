@@ -10,6 +10,7 @@ import { resolveMeetingMicrophoneInventory } from '../src/features/meeting/meeti
 import { meetingSttUserError } from '../src/features/meeting/meetingSttError.ts';
 import {
   DEFAULT_MEETING_HISTORY_RETENTION_DAYS,
+  isMeetingHistoryRetentionDue,
   pruneMeetingRecords,
   readMeetingHistoryRetention,
   writeMeetingHistoryRetention,
@@ -74,6 +75,20 @@ assert.deepEqual(
   'The 60-day policy deletes data older than its date cutoff while keeping the cutoff itself.',
 );
 assert.equal(pruneMeetingRecords(meetingRecords, 'off', fixedNow), meetingRecords, 'Off must retain all Meeting records.');
+const beforeCustomPurge = new Date(2026, 8, 28, 23, 59).getTime();
+const onCustomPurge = new Date(2026, 8, 29, 0, 0).getTime();
+assert.deepEqual(
+  pruneMeetingRecords(meetingRecords, 'date:2026-09-29', beforeCustomPurge),
+  meetingRecords,
+  'A custom purge date retains all Meeting data until that local calendar date.',
+);
+assert.deepEqual(
+  pruneMeetingRecords(meetingRecords, 'date:2026-09-29', onCustomPurge),
+  [],
+  'A custom purge date deletes the complete Meeting history at local midnight on the chosen date.',
+);
+assert.equal(isMeetingHistoryRetentionDue('date:2026-09-29', beforeCustomPurge), false);
+assert.equal(isMeetingHistoryRetentionDue('date:2026-09-29', onCustomPurge), true);
 const chatSessions = [
   { id: 'old-meeting', title: 'Old', messages: [], updatedAt: '2026-08-01T00:00:00.000Z', mode: 'meeting' },
   { id: 'new-meeting', title: 'New', messages: [], updatedAt: '2026-09-27T00:00:00.000Z', mode: 'meeting' },
@@ -105,6 +120,9 @@ assert.equal(writeMeetingHistoryRetention(90), true);
 assert.equal(readMeetingHistoryRetention(), 90, 'The selected retention duration should persist.');
 assert.equal(writeMeetingHistoryRetention(60), true);
 assert.equal(readMeetingHistoryRetention(), 60, 'The 60-day retention duration should persist.');
+assert.equal(writeMeetingHistoryRetention('date:2026-09-29', beforeCustomPurge), true);
+assert.equal(readMeetingHistoryRetention(), 'date:2026-09-29', 'The custom local deletion date should persist.');
+assert.equal(writeMeetingHistoryRetention('date:2026-09-28', beforeCustomPurge), false, 'Past and same-day deletion dates must be rejected.');
 globalThis.localStorage = { setItem: () => { throw new Error('storage full'); }, getItem: () => null };
 assert.equal(writeMeetingHistoryRetention(7), false, 'Storage failures must be reported to the caller.');
 globalThis.localStorage = savedLocalStorage;

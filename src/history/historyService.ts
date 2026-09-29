@@ -6,6 +6,7 @@ import {
 import type { MeetingHistoryRetentionDays } from './meetingHistoryRetention';
 export {
   DEFAULT_MEETING_HISTORY_RETENTION_DAYS,
+  isMeetingHistoryRetentionDue,
   MEETING_HISTORY_RETENTION_STORAGE_KEY,
   pruneMeetingRecords,
   readMeetingHistoryRetention,
@@ -72,18 +73,17 @@ export interface HistorySession {
   lastUsedProvider?: DeveloperSessionMetadata['lastUsedProvider'];
 }
 
-export function pruneMeetingHistory(
+export function pruneHistorySessions(
   sessions: HistorySession[],
   retentionDays: MeetingHistoryRetentionDays,
   now = Date.now(),
 ) {
-  const meetings = sessions.filter((session) => session.mode === 'meeting');
-  const retainedMeetings = new Set(pruneMeetingRecords(
-    meetings.map((session) => ({ id: session.id, createdAt: session.updatedAt })),
+  const retainedIds = new Set(pruneMeetingRecords(
+    sessions.map((session) => ({ id: session.id, createdAt: session.updatedAt })),
     retentionDays,
     now,
   ).map((session) => session.id));
-  return sessions.filter((session) => session.mode !== 'meeting' || retainedMeetings.has(session.id));
+  return sessions.filter((session) => retainedIds.has(session.id));
 }
 
 const STORAGE_KEY = 'chat-history';
@@ -118,14 +118,50 @@ function isDeveloperConversationState(value: unknown): value is DeveloperConvers
     && state.messages.every(isHistoryMessage);
 }
 
+function readPersistedMeetingHistory(): HistorySession | null {
+  try {
+    const conversationId = localStorage.getItem('meeting-history-conversation-id');
+    if (!conversationId) return null;
+    const parsed: unknown = JSON.parse(localStorage.getItem('meeting-chat-state') || '[]');
+    if (!Array.isArray(parsed)) return null;
+    const turns = parsed.filter((item): item is { question: string; answer: string; createdAt?: unknown } => (
+      Boolean(item)
+      && typeof item === 'object'
+      && typeof item.question === 'string'
+      && Boolean(item.question.trim())
+      && typeof item.answer === 'string'
+      && Boolean(item.answer.trim())
+    ));
+    if (turns.length === 0) return null;
+    const messages = turns.flatMap((turn): HistoryMessage[] => [
+      { role: 'user', content: turn.question },
+      { role: 'assistant', content: turn.answer },
+    ]);
+    const timestamps = turns.map((turn) => turn.createdAt)
+      .filter((createdAt): createdAt is string => typeof createdAt === 'string' && Number.isFinite(Date.parse(createdAt)));
+    const latestTimestamp = timestamps[timestamps.length - 1];
+    return {
+      id: `meeting-${conversationId}`,
+      title: historyTitle(messages),
+      messages,
+      updatedAt: latestTimestamp || new Date().toISOString(),
+      mode: 'meeting',
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function readHistory(): HistorySession[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
     if (!Array.isArray(parsed)) return [];
-    return pruneMeetingHistory(
-      parsed.filter(isHistorySession).slice(0, MAX_SESSIONS),
-      readMeetingHistoryRetention(),
-    );
+    const sessions = parsed.filter(isHistorySession).slice(0, MAX_SESSIONS);
+    const persistedMeeting = readPersistedMeetingHistory();
+    if (persistedMeeting && !sessions.some((session) => session.id === persistedMeeting.id)) {
+      sessions.unshift(persistedMeeting);
+    }
+    return pruneHistorySessions(sessions.slice(0, MAX_SESSIONS), readMeetingHistoryRetention());
   } catch {
     return [];
   }
@@ -134,7 +170,7 @@ export function readHistory(): HistorySession[] {
 export function writeHistory(sessions: HistorySession[]): boolean {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(
-      pruneMeetingHistory(sessions, readMeetingHistoryRetention()).slice(0, MAX_SESSIONS),
+      pruneHistorySessions(sessions, readMeetingHistoryRetention()).slice(0, MAX_SESSIONS),
     ));
     return true;
   } catch {

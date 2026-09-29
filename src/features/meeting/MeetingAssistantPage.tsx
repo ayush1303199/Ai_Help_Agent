@@ -110,6 +110,9 @@ export function MeetingAssistantPage({
     selectMicrophoneDevice: (...args: Parameters<MeetingControllerSnapshot['selectMicrophoneDevice']>) => controllerRef.current.selectMicrophoneDevice(...args),
     restoreMeetingHistory: (...args: Parameters<MeetingControllerSnapshot['restoreMeetingHistory']>) => controllerRef.current.restoreMeetingHistory(...args),
     setTranscriptionLanguage: (...args: Parameters<MeetingControllerSnapshot['setTranscriptionLanguage']>) => controllerRef.current.setTranscriptionLanguage(...args),
+    setReviewBeforeSend: (...args: Parameters<MeetingControllerSnapshot['setReviewBeforeSend']>) => controllerRef.current.setReviewBeforeSend(...args),
+    sendReviewedTranscript: (...args: Parameters<MeetingControllerSnapshot['sendReviewedTranscript']>) => controllerRef.current.sendReviewedTranscript(...args),
+    skipReviewedTranscript: (...args: Parameters<MeetingControllerSnapshot['skipReviewedTranscript']>) => controllerRef.current.skipReviewedTranscript(...args),
     setMeetingMenuOpen: (...args: Parameters<MeetingControllerSnapshot['setMeetingMenuOpen']>) => controllerRef.current.setMeetingMenuOpen(...args),
     setTranscriptOpen: (...args: Parameters<MeetingControllerSnapshot['setTranscriptOpen']>) => controllerRef.current.setTranscriptOpen(...args),
     setPipelineStatus: (...args: Parameters<MeetingControllerSnapshot['setPipelineStatus']>) => controllerRef.current.setPipelineStatus(...args),
@@ -132,6 +135,7 @@ export function MeetingAssistantPage({
   const sessionActive = controller.isRecording
     || controller.isTranscribing
     || controller.chatBusy
+    || controller.pendingTranscriptReviews.length > 0
     || controller.answeredSegments.length > 0
     || ['question', 'thinking', 'answer'].includes(controller.pipelineStatus);
   const statusLabel = controller.meetingStatusMessage || (
@@ -152,6 +156,11 @@ export function MeetingAssistantPage({
     meetingConversationId: controller.meetingConversationId,
     transcriptionLanguage: controller.transcriptionLanguage,
     setTranscriptionLanguage: controllerActions.setTranscriptionLanguage,
+    reviewBeforeSend: controller.reviewBeforeSend,
+    setReviewBeforeSend: controllerActions.setReviewBeforeSend,
+    pendingTranscriptReviews: controller.pendingTranscriptReviews,
+    sendReviewedTranscript: controllerActions.sendReviewedTranscript,
+    skipReviewedTranscript: controllerActions.skipReviewedTranscript,
     meetingMenuOpen: controller.meetingMenuOpen,
     setMeetingMenuOpen: controllerActions.setMeetingMenuOpen,
     microphoneDevices: controller.microphoneDevices,
@@ -205,6 +214,7 @@ export function MeetingAssistantPage({
     cancelCurrentRequest: controllerActions.cancelCurrentRequest,
   }), [
     controller.meetingAudioMode, controller.transcriptionLanguage,
+    controller.reviewBeforeSend, controller.pendingTranscriptReviews,
     controller.meetingConversationId,
     controller.historyRetentionDays,
     controller.meetingMenuOpen, controller.microphoneDevices,
@@ -234,6 +244,8 @@ export function MeetingAssistantPage({
     sessionActive,
     meetingAudioMode: controller.meetingAudioMode,
     transcriptionLanguage: controller.transcriptionLanguage,
+    reviewBeforeSend: controller.reviewBeforeSend,
+    pendingTranscriptReviews: controller.pendingTranscriptReviews,
     displayedAudioSourceLabel: controller.displayedAudioSourceLabel,
     displayedAudioStatus: controller.displayedAudioStatus,
     microphoneStatus: controller.microphoneStatus,
@@ -261,6 +273,9 @@ export function MeetingAssistantPage({
     chatStreaming: controller.chatBusy,
     onAudioModeChange: controller.setMeetingAudioMode,
     onTranscriptionLanguageChange: controllerActions.setTranscriptionLanguage,
+    onReviewBeforeSendChange: controllerActions.setReviewBeforeSend,
+    onSendReviewedTranscript: controllerActions.sendReviewedTranscript,
+    onSkipReviewedTranscript: controllerActions.skipReviewedTranscript,
     onTestAudio: () => void controller.testMeetingAudio(),
     onStartCapture: () => void controller.startMeetingCapture(),
     onStopCapture: controller.stopMeetingCapture,
@@ -286,12 +301,7 @@ export function MeetingAssistantPage({
       onClearHistory();
     },
     historyRetentionDays: controller.historyRetentionDays,
-    onRetentionDaysChange: (days) => {
-      if (!controllerActions.setHistoryRetentionDays(days)) {
-        throw new Error('Could not save the Meeting data retention setting.');
-      }
-      onHistoryRetentionChange(days);
-    },
+    onRetentionDaysChange: onHistoryRetentionChange,
     onInputChange: controller.setInput,
     onSendMessage: controller.sendTypedQuestion,
     onReadScreen: () => void screenReader.readScreen(),

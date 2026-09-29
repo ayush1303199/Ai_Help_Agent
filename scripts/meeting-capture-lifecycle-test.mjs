@@ -8,6 +8,89 @@ import {
 } from '../src/features/meeting/meetingCaptureLifecycle.ts';
 import { createMeetingSttSegmentProcessor } from '../src/features/meeting/meetingSttSegmentProcessor.ts';
 import { transcribeMeetingSegmentWithRetry } from '../src/features/meeting/meetingSttRetry.ts';
+import {
+  MAX_PENDING_TRANSCRIPT_REVIEWS,
+  MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY,
+  prunePendingTranscriptReviews,
+  readPendingTranscriptReviews,
+  writePendingTranscriptReviews,
+} from '../src/features/meeting/meetingTranscriptReviewStore.ts';
+
+const reviewNow = Date.parse('2026-09-28T00:00:00.000Z');
+const previousLocalStorage = globalThis.localStorage;
+const reviewStorage = new Map();
+globalThis.localStorage = {
+  getItem: (key) => reviewStorage.get(key) ?? null,
+  setItem: (key, value) => reviewStorage.set(key, String(value)),
+};
+assert.deepEqual(readPendingTranscriptReviews(30, reviewNow), { reviews: [], error: null }, 'An empty persistent review queue should restore cleanly.');
+const queuedReviews = [
+  { id: 'review-1', text: 'What is JavaScript?', createdAt: '2026-09-27T00:00:00.000Z' },
+  { id: 'review-2', text: 'Explain TypeScript.', createdAt: '2026-09-27T00:00:00.000Z' },
+];
+assert.equal(writePendingTranscriptReviews(queuedReviews, 30), true);
+assert.deepEqual(readPendingTranscriptReviews(30, reviewNow), { reviews: queuedReviews, error: null }, 'Pending text reviews should survive a controller reload.');
+reviewStorage.set(MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY, JSON.stringify([
+  ...queuedReviews,
+  { id: '', text: 'invalid identifier' },
+  { id: 'empty', text: '  ' },
+]));
+assert.deepEqual(readPendingTranscriptReviews(30, reviewNow), { reviews: queuedReviews, error: null }, 'Invalid review entries should not be restored.');
+const retentionReviews = [
+  { id: 'expired', text: 'Expired question', createdAt: '2026-09-20T00:00:00.000Z' },
+  { id: 'cutoff', text: 'Question at cutoff', createdAt: '2026-09-21T00:00:00.000Z' },
+  { id: 'fresh', text: 'Fresh question', createdAt: '2026-09-27T00:00:00.000Z' },
+];
+assert.deepEqual(
+  prunePendingTranscriptReviews(retentionReviews, 7, reviewNow).map(({ id }) => id),
+  ['cutoff', 'fresh'],
+  'Pending reviews should honor duration retention and preserve entries exactly on the cutoff.',
+);
+assert.deepEqual(
+  prunePendingTranscriptReviews(retentionReviews, 'off', reviewNow),
+  retentionReviews,
+  'Manual-only retention should keep pending reviews.',
+);
+const beforeCustomPurge = new Date(2026, 8, 28, 23, 59).getTime();
+const onCustomPurge = new Date(2026, 8, 29, 0, 0).getTime();
+assert.equal(
+  prunePendingTranscriptReviews(retentionReviews, 'date:2026-09-29', beforeCustomPurge).length,
+  retentionReviews.length,
+  'Pending reviews should remain until the selected local deletion date.',
+);
+assert.deepEqual(
+  prunePendingTranscriptReviews(retentionReviews, 'date:2026-09-29', onCustomPurge),
+  [],
+  'A due custom deletion date should purge the entire pending review queue.',
+);
+reviewStorage.set(MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY, JSON.stringify(retentionReviews));
+assert.deepEqual(
+  readPendingTranscriptReviews(7, reviewNow).reviews.map(({ id }) => id),
+  ['cutoff', 'fresh'],
+  'Expired pending reviews should be pruned when the app restores the queue.',
+);
+assert.equal(writePendingTranscriptReviews(retentionReviews, 7, reviewNow), true, 'Applying retention to a persisted queue should succeed.');
+assert.deepEqual(
+  JSON.parse(reviewStorage.get(MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY)).map(({ id }) => id),
+  ['cutoff', 'fresh'],
+  'Writing the queue should not persist expired reviews.',
+);
+reviewStorage.set(MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY, JSON.stringify(
+  Array.from({ length: MAX_PENDING_TRANSCRIPT_REVIEWS + 2 }, (_, index) => ({
+    id: `review-${index}`,
+    text: `Question ${index}`,
+    createdAt: '2026-09-28T00:00:00.000Z',
+  })),
+));
+assert.equal(readPendingTranscriptReviews(30, reviewNow).reviews.length, MAX_PENDING_TRANSCRIPT_REVIEWS, 'Restored queues should stay within the bounded limit.');
+reviewStorage.set(MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY, '{invalid json');
+assert.match(readPendingTranscriptReviews(30, reviewNow).error || '', /could not be read/, 'Corrupt saved review data should report a restore error.');
+globalThis.localStorage = {
+  getItem: () => null,
+  setItem: () => { throw new Error('storage full'); },
+};
+assert.equal(writePendingTranscriptReviews(queuedReviews), false, 'Local storage failures must be reported to the controller.');
+globalThis.localStorage = previousLocalStorage;
 
 assert.equal(classifySttClientError(new DOMException('Permission denied', 'NotAllowedError')), 'AUDIO_PERMISSION');
 assert.equal(classifySttClientError(new Error('codec is unsupported')), 'STT_UNSUPPORTED_AUDIO');
@@ -52,7 +135,7 @@ captureActive = true;
 tracks[0].dispatchEvent(new Event('ended'));
 assert.equal(stopCount, 1, 'Detached audio tracks must not stop a later capture.');
 
-function createProcessorHarness(transcribeAudio) {
+function createProcessorHarness(transcribeAudio, reviewBeforeSend = false) {
   const activeSttAbortRef = { current: null };
   const captureSessionIdRef = { current: 'capture-1' };
   const pendingPartialQuestionRef = { current: '' };
@@ -62,6 +145,7 @@ function createProcessorHarness(transcribeAudio) {
     transcribing: false,
     transcripts: [],
     sentQuestions: [],
+    reviewedQuestions: [],
     errors: [],
     statuses: [],
   };
@@ -70,6 +154,7 @@ function createProcessorHarness(transcribeAudio) {
   };
   const processor = createMeetingSttSegmentProcessor({
     transcriptionLanguage: 'auto',
+    reviewBeforeSend,
     meetingAudioMode: 'microphone',
     meetingSource: 'Microphone',
     background: [],
@@ -89,6 +174,7 @@ function createProcessorHarness(transcribeAudio) {
     addTranscript: (transcript) => state.transcripts.push(transcript),
     onStatus: (status) => state.statuses.push(status),
     onError: (error) => state.errors.push(error),
+    onReviewQuestion: (question) => state.reviewedQuestions.push(question),
     sendQuestion: async (question) => state.sentQuestions.push(question),
     transcribeAudio,
   });
@@ -99,6 +185,12 @@ const successfulProcessor = createProcessorHarness(async () => ({ text: 'What is
 await successfulProcessor.processor(new Blob(['audio']), 1200, true, 'capture-1', 'audio/webm');
 assert.equal(successfulProcessor.state.transcripts.length, 1, 'Successful transcription should be saved.');
 assert.equal(successfulProcessor.state.sentQuestions[0], 'What is JavaScript?', 'A complete spoken question should reach the answer pipeline.');
+
+const reviewProcessor = createProcessorHarness(async () => ({ text: 'What is JavaScript?', status: 200 }), true);
+await reviewProcessor.processor(new Blob(['audio']), 1200, true, 'capture-1', 'audio/webm');
+assert.equal(reviewProcessor.state.transcripts.length, 1, 'Review mode should preserve the recognized transcript.');
+assert.deepEqual(reviewProcessor.state.reviewedQuestions, ['What is JavaScript?'], 'Review mode should queue the complete recognized question.');
+assert.equal(reviewProcessor.state.sentQuestions.length, 0, 'Review mode must not contact the answer pipeline automatically.');
 
 let resolveTranscription;
 const staleProcessor = createProcessorHarness(() => new Promise((resolve) => { resolveTranscription = resolve; }));

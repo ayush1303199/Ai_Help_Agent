@@ -26,6 +26,7 @@ const assistantRequestBuilderSource = await fs.readFile(new URL('../src/features
 const meetingRequestBuilderSource = await fs.readFile(new URL('../src/features/meeting/meetingRequestBuilder.ts', import.meta.url), 'utf8');
 const assistantOverlaySource = await fs.readFile(new URL('../src/features/assistant/AssistantOverlayBridge.tsx', import.meta.url), 'utf8');
 const electronMainSource = await fs.readFile(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+const screenReaderSource = await fs.readFile(new URL('../src/features/screen-reading/useScreenReader.ts', import.meta.url), 'utf8');
 const interviewPromptSource = await fs.readFile(new URL('../src/ai/interviewSystemPrompt.ts', import.meta.url), 'utf8');
 
 assert.equal(transcriptUtils.cleanTranscript(' um how are you'), 'how are you?');
@@ -158,6 +159,7 @@ assert.match(meetingControllerSource, /sendTypedQuestion = \(\) => void sendQues
 assert.match(meetingControllerSource, /useMeetingAudioSources/);
 assert.match(meetingControllerSource, /useMeetingTranscriptHistory/);
 assert.match(meetingControllerSource, /new MeetingAgentTransport\(\)/);
+assert.match(meetingPageSource, /controller\.pendingTranscriptReviews\.length > 0/, 'Queued transcript reviews must stay visible after capture stops.');
 assert.match(meetingControllerSource, /transport\.send\([\s\S]*?buildChatRequest\([\s\S]*?abortController\.signal/);
 assert.match(meetingSttSegmentProcessorSource, /REPEATED_SPEECH_LOOP_REJECTED/);
 assert.match(meetingSttSegmentProcessorSource, /SHORT_TRANSCRIPT_WAITING_FOR_CONTINUATION/);
@@ -269,6 +271,9 @@ assert.match(meetingPageSource, /onScreenCaptured: async \(image\) =>[\s\S]*cont
 assert.match(meetingPageSource, /mode: 'meeting'/);
 assert.match(meetingPageSource, /controller\.answeredSegments\.flatMap/);
 assert.match(historyServiceSource, /session\.mode === 'meeting'/);
+assert.match(historyServiceSource, /readPersistedMeetingHistory/);
+assert.match(historyServiceSource, /meeting-history-conversation-id/);
+assert.match(appSource, /meetingController\?\.clearMeetingHistory\(\);[\s\S]*setChatHistory\(\[\]\)/, 'Deleting all shared history must clear the Meeting-only persisted copy as well.');
 assert.match(appSource, /session\.mode === 'meeting'[\s\S]*meeting\.restoreMeetingHistory\(session\)/);
 assert.match(meetingWorkspaceSource, /if \(!sessionActive\)[\s\S]*<ScreenReadingButton/);
 assert.doesNotMatch(meetingWorkspaceSource, /Microphone device|Meeting microphone device|No microphone found/);
@@ -335,6 +340,10 @@ assert.ok(
 assert.match(electronMainSource, /setDisplayMediaRequestHandler/);
 assert.match(electronMainSource, /audio: 'loopback'/);
 assert.match(electronMainSource, /types: \['screen'\]/);
+const screenCaptureHandler = electronMainSource.slice(electronMainSource.indexOf("ipcMain.handle('screen:capture'"));
+assert.match(screenCaptureHandler, /visibleWindows\.forEach\(\(window\) => window\.hide\(\)\)/);
+assert.match(screenCaptureHandler, /finally\s*\{[\s\S]*window\.showInactive\(\)/);
+assert.match(screenReaderSource, /if \(!window\.electronAPI\?\.captureScreen\)\s*\{\s*onError\('Screen reading is available in the Electron desktop app\.'\)/);
 
 console.log(JSON.stringify({
   smoke: 'assistant-mode',

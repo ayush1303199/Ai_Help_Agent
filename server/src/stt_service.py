@@ -119,7 +119,10 @@ class SttService:
             language_instructions = {
                 "en": "Transcribe in English.",
                 "hi": "Transcribe in Hindi.",
-                "hinglish": "Preserve naturally mixed Hindi and English words and the script actually spoken.",
+                "hinglish": (
+                    "Preserve naturally mixed Hindi and English exactly as spoken. "
+                    "Do not translate or paraphrase the utterance."
+                ),
             }
             language_instruction = language_instructions.get(stt_language)
             if language_instruction:
@@ -281,9 +284,16 @@ class SttService:
                         time.sleep(retry_delay)
             else:
                 client = OpenAI(api_key=api_key, base_url=provider.base_url or None)
-                transcription_model = os.getenv("TRANSCRIPTION_MODEL") or (
-                    "whisper-1" if provider.type.lower() == "openai" else "whisper-large-v3-turbo"
+                default_transcription_model = (
+                    "whisper-1"
+                    if provider.type.lower() == "openai"
+                    else (
+                        "whisper-large-v3"
+                        if source.startswith("meeting_") and stt_language != "en"
+                        else "whisper-large-v3-turbo"
+                    )
                 )
+                transcription_model = os.getenv("TRANSCRIPTION_MODEL") or default_transcription_model
                 options: Dict[str, Any] = {
                     "file": (file.filename, BytesIO(contents), file.content_type or "audio/webm"),
                     "model": transcription_model,

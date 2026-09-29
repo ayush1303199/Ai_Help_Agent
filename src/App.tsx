@@ -64,7 +64,7 @@ import { AppHeader } from './ui/header/AppHeader';
 import { ContextButton, ContextPanel, FontSizeControls, HistoryButton, OverlayButton, ScreenReadingToggle, SettingsButton } from './ui/header/HeaderActions';
 import { ModeControls } from './ui/header/ModeControls';
 import type { AppMode, AssistantMode, MeetingAudioMode } from './app/appTypes';
-import { DEFAULT_MEETING_HISTORY_RETENTION_DAYS, pruneMeetingHistory, readHistory, readMeetingHistoryRetention, removeHistorySession, searchHistory, upsertHistory, writeHistory, type HistoryMode, type HistorySession, type MeetingHistoryRetentionDays } from './history/historyService';
+import { DEFAULT_MEETING_HISTORY_RETENTION_DAYS, isMeetingHistoryRetentionDue, pruneHistorySessions, readHistory, readMeetingHistoryRetention, removeHistorySession, searchHistory, upsertHistory, writeHistory, writeMeetingHistoryRetention, type HistoryMode, type HistorySession, type MeetingHistoryRetentionDays } from './history/historyService';
 
 type Message = AssistantControllerSnapshot['messages'][number];
 
@@ -80,6 +80,11 @@ const EMPTY_MEETING_CONTROLLER: MeetingControllerSnapshot = {
   meetingConversationId: '',
   transcriptionLanguage: 'auto',
   setTranscriptionLanguage: () => {},
+  reviewBeforeSend: false,
+  setReviewBeforeSend: () => {},
+  pendingTranscriptReviews: [],
+  sendReviewedTranscript: async () => {},
+  skipReviewedTranscript: () => {},
   meetingMenuOpen: false,
   setMeetingMenuOpen: () => {},
   microphoneDevices: [],
@@ -127,7 +132,7 @@ const EMPTY_MEETING_CONTROLLER: MeetingControllerSnapshot = {
   clearMeetingHistory: () => undefined,
   historyRetentionDays: DEFAULT_MEETING_HISTORY_RETENTION_DAYS,
   setHistoryRetentionDays: () => true,
-  sendQuestion: async () => {},
+  sendQuestion: async () => false,
   sendTypedQuestion: () => undefined,
   sendEditedTranscript: () => undefined,
   cancelCurrentRequest: () => false,
@@ -227,6 +232,7 @@ const agentPermissionOptions = [
 
 function App() {
   const [chatHistory, setChatHistory] = useState<ChatSession[]>(readHistory);
+  const [historyRetention, setHistoryRetention] = useState<MeetingHistoryRetentionDays>(readMeetingHistoryRetention);
   const [activeChatId, setActiveChatId] = useState<string>(() => crypto.randomUUID());
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historySearch, setHistorySearch] = useState('');
@@ -369,9 +375,14 @@ function App() {
     setChatHistory((previous) => previous.filter((session) => session.mode !== 'meeting'));
   }, []);
 
-  const changeMeetingHistoryRetention = useCallback((days: MeetingHistoryRetentionDays) => {
-    setChatHistory((previous) => pruneMeetingHistory(previous, days));
-  }, []);
+  const changeHistoryRetention = useCallback((retention: MeetingHistoryRetentionDays) => {
+    const saved = meetingController?.setHistoryRetentionDays(retention);
+    if (saved === false || (saved === undefined && !writeMeetingHistoryRetention(retention))) {
+      throw new Error('Could not save the history retention setting.');
+    }
+    setHistoryRetention(retention);
+    setChatHistory((previous) => pruneHistorySessions(previous, retention));
+  }, [meetingController]);
   const addAssistantHistoryEntries = useCallback((conversationId: string, entries: HistorySession[]) => {
     setChatHistory((previous) => {
       const withoutCurrentConversation = previous.filter((session) => session.id !== conversationId
@@ -397,15 +408,26 @@ function App() {
     }
   }, [chatHistory]);
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      const retentionDays = readMeetingHistoryRetention();
+    const pruneExpiredHistory = () => {
+      const retention = readMeetingHistoryRetention();
       setChatHistory((current) => {
-        const retained = pruneMeetingHistory(current, retentionDays);
+        const retained = pruneHistorySessions(current, retention);
         return retained.length === current.length ? current : retained;
       });
-    }, 60 * 60 * 1000);
+      if (isMeetingHistoryRetentionDue(retention)) {
+        if (writeMeetingHistoryRetention(DEFAULT_MEETING_HISTORY_RETENTION_DAYS)) {
+          setHistoryRetention(DEFAULT_MEETING_HISTORY_RETENTION_DAYS);
+        } else {
+          setError('Scheduled history was deleted, but the retention setting could not be reset. Update it in Chat history.');
+        }
+        setMessages([]);
+        setInput('');
+      }
+    };
+    pruneExpiredHistory();
+    const timer = window.setInterval(pruneExpiredHistory, 60 * 60 * 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [setInput, setMessages]);
 
   const resetProviderForm = useCallback(() => {
     setEditingProviderId(null);
@@ -1419,6 +1441,9 @@ function App() {
 
   const deleteHistorySession = (sessionId: string) => {
     setChatHistory((previous) => removeHistorySession(previous, sessionId));
+    if (sessionId === `meeting-${meetingController?.meetingConversationId}`) {
+      meetingController?.clearMeetingHistory();
+    }
     if (activeChatId === sessionId) {
       setMessages([]);
       setInput('');
@@ -1443,6 +1468,7 @@ function App() {
       description: 'This permanently removes every saved conversation from local history and clears the current chat.',
       confirmLabel: 'Delete all',
       onConfirm: () => {
+        meetingController?.clearMeetingHistory();
         setChatHistory([]);
         setMessages([]);
         setInput('');
@@ -1451,7 +1477,7 @@ function App() {
         setHistoryOpen(false);
       },
     });
-  }, [chatHistory.length, requestConfirmation, setInput, setMessages]);
+  }, [chatHistory.length, meetingController, requestConfirmation, setInput, setMessages]);
 
   const filteredChatHistory = searchHistory(chatHistory, historySearch);
   const activeScreenReading = appMode === 'assistant' ? assistantScreenReading : appMode === 'meeting' ? meetingScreenReading : null;
@@ -1887,7 +1913,7 @@ function App() {
         }}
       />
 
-      {historyOpen && <ChatHistoryModal sessions={chatHistory} filteredSessions={filteredChatHistory} search={historySearch} copiedItem={copiedItem} hasCurrentMessages={messages.length > 0} onSearchChange={setHistorySearch} onClose={() => setHistoryOpen(false)} onNewChat={requestClearChat} onCopyChat={copyConversation} onDeleteAll={requestDeleteAllHistory} onOpenSession={openHistorySession} onDeleteSession={requestDeleteHistorySession} />}
+      {historyOpen && <ChatHistoryModal sessions={chatHistory} filteredSessions={filteredChatHistory} search={historySearch} copiedItem={copiedItem} hasCurrentMessages={messages.length > 0} historyRetention={historyRetention} onRetentionChange={changeHistoryRetention} onSearchChange={setHistorySearch} onClose={() => setHistoryOpen(false)} onNewChat={requestClearChat} onCopyChat={copyConversation} onDeleteAll={requestDeleteAllHistory} onOpenSession={openHistorySession} onDeleteSession={requestDeleteHistorySession} />}
 
       {settingsOpen && (
         <div
@@ -2043,7 +2069,7 @@ function App() {
           onScreenReadingChange={setMeetingScreenReading}
           onHistoryEntry={addMeetingHistoryEntry}
           onClearHistory={clearMeetingHistory}
-          onHistoryRetentionChange={changeMeetingHistoryRetention}
+          onHistoryRetentionChange={changeHistoryRetention}
         />
       </main>
 

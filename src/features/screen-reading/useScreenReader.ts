@@ -24,7 +24,11 @@ export function useScreenReader({
   const [screenReading, setScreenReading] = useState(false);
 
   const readScreen = useCallback(async () => {
-    if (!enabled || disabled || screenReading || !window.electronAPI?.captureScreen) return;
+    if (!enabled || disabled || screenReading) return;
+    if (!window.electronAPI?.captureScreen) {
+      onError('Screen reading is available in the Electron desktop app.');
+      return;
+    }
 
     setScreenReading(true);
     onError('');

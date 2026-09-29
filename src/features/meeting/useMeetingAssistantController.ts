@@ -3,7 +3,10 @@ import { prepareQuestion, prepareTextRequest, type PreparedQuestion } from '../.
 import type { InterviewContextConfig } from '../../ai/interviewContext';
 import type { MeetingAudioMode } from '../../app/appTypes';
 import { runtimeConfig } from '../../config/runtimeConfig';
-import type { HistorySession } from '../../history/historyService';
+import {
+  readMeetingHistoryRetention,
+  type HistorySession,
+} from '../../history/historyService';
 import { MeetingAgentTransport, type MeetingChatMessage, type MeetingChatRequest } from './meetingTransport';
 import {
   systemAudioErrorMessage,
@@ -20,6 +23,12 @@ import { useMeetingTranscriptHistory } from './useMeetingTranscriptHistory';
 export type { MeetingTranscript } from './useMeetingTranscriptHistory';
 import { createMeetingSttSegmentProcessor } from './meetingSttSegmentProcessor';
 import { meetingSttUserError } from './meetingSttError';
+import {
+  MAX_PENDING_TRANSCRIPT_REVIEWS,
+  prunePendingTranscriptReviews,
+  readPendingTranscriptReviews,
+  writePendingTranscriptReviews,
+} from './meetingTranscriptReviewStore';
 import type { MeetingHistoryRetentionDays } from '../../history/historyService';
 import {
   adaptiveAudioLevelThreshold,
@@ -67,6 +76,15 @@ export function useMeetingAssistantController({
       return 'auto';
     }
   });
+  const [reviewBeforeSend, setReviewBeforeSend] = useState(() => {
+    try {
+      return localStorage.getItem('meeting-review-before-send') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [transcriptReviewLoad] = useState(() => readPendingTranscriptReviews(readMeetingHistoryRetention()));
+  const [pendingTranscriptReviews, setPendingTranscriptReviews] = useState(transcriptReviewLoad.reviews);
   const [meetingMenuOpen, setMeetingMenuOpen] = useState(false);
   const [transcriptOpen, setTranscriptOpen] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -187,6 +205,35 @@ export function useMeetingAssistantController({
   useEffect(() => {
     localStorage.setItem('meeting-transcription-language', transcriptionLanguage);
   }, [transcriptionLanguage]);
+  useEffect(() => {
+    localStorage.setItem('meeting-review-before-send', String(reviewBeforeSend));
+  }, [reviewBeforeSend]);
+  useEffect(() => {
+    if (transcriptReviewLoad.error && pendingTranscriptReviews === transcriptReviewLoad.reviews) {
+      setMeetingError(transcriptReviewLoad.error);
+      return;
+    }
+    const retainedReviews = prunePendingTranscriptReviews(pendingTranscriptReviews, historyRetentionDays);
+    if (retainedReviews.length !== pendingTranscriptReviews.length) {
+      setPendingTranscriptReviews(retainedReviews);
+      return;
+    }
+    if (!writePendingTranscriptReviews(retainedReviews, historyRetentionDays)) {
+      setMeetingError('Pending transcript reviews could not be saved on this device. Keep this window open and check local storage.');
+      return;
+    }
+    setMeetingError((current) => current.startsWith('Pending transcript reviews could not be saved')
+      || current.startsWith('Saved transcript reviews ')
+      ? ''
+      : current);
+  }, [historyRetentionDays, pendingTranscriptReviews, transcriptReviewLoad]);
+  useEffect(() => {
+    const pruneExpiredReviews = () => {
+      setPendingTranscriptReviews((current) => prunePendingTranscriptReviews(current, historyRetentionDays));
+    };
+    const timer = window.setInterval(pruneExpiredReviews, 60 * 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, [historyRetentionDays]);
   const sendQuestion = async (
     rawQuestion: string,
     options: {
@@ -195,18 +242,18 @@ export function useMeetingAssistantController({
       duplicateChecked?: boolean;
       preserveTranscriptionTiming?: boolean;
     } = {},
-  ) => {
+  ): Promise<boolean> => {
     const question = rawQuestion.trim();
-    if (!question || chatBusy) return;
+    if (!question || chatBusy) return false;
     const preparedQuestion = options.preparedQuestion || prepareQuestion(question);
     if (!preparedQuestion.acceptedQuestion) {
       onStatus(inputQualityMessage(preparedQuestion.qualityClassification));
-      return;
+      return false;
     }
     const acceptedQuestion = preparedQuestion.acceptedQuestion;
     if (!options.duplicateChecked && !shouldAcceptQuestion(acceptedQuestion)) {
       onStatus('This question was already submitted recently.');
-      return;
+      return false;
     }
     setDisplayedQuestion(acceptedQuestion);
     setDisplayedAnswer('');
@@ -236,7 +283,7 @@ export function useMeetingAssistantController({
         buildChatRequest(acceptedQuestion, history, options.screenImage),
         abortController.signal,
       );
-      if (answerRequestGenerationRef.current !== answerRequestGeneration) return;
+      if (answerRequestGenerationRef.current !== answerRequestGeneration) return false;
       if (!result.content.trim()) {
         throw new Error('The Meeting Assistant returned an empty answer. Please try the question again.');
       }
@@ -249,14 +296,16 @@ export function useMeetingAssistantController({
       appendAnsweredSegment({ question: acceptedQuestion, answer: result.content });
       setPipelineStatus('answer');
       onStatus('');
+      return true;
     } catch (failure) {
-      if (answerRequestGenerationRef.current !== answerRequestGeneration) return;
+      if (answerRequestGenerationRef.current !== answerRequestGeneration) return false;
       setLastStageTimings((current) => ({
         ...current,
         answerMs: Math.round(performance.now() - answerStartedAt),
       }));
       setPipelineStatus('error');
       onError(failure instanceof Error ? failure.message : String(failure));
+      return false;
     } finally {
       if (activeChatAbortRef.current === abortController) activeChatAbortRef.current = null;
       if (answerRequestGenerationRef.current === answerRequestGeneration) setChatBusy(false);
@@ -411,7 +460,19 @@ export function useMeetingAssistantController({
       addTranscript,
       onStatus,
       onError,
-      sendQuestion,
+      reviewBeforeSend,
+      onReviewQuestion: (text: string) => {
+        if (pendingTranscriptReviews.length >= MAX_PENDING_TRANSCRIPT_REVIEWS) {
+          setMeetingError(`The review queue is full (${MAX_PENDING_TRANSCRIPT_REVIEWS} questions). Review or skip an item before capturing more questions.`);
+          return;
+        }
+        setPendingTranscriptReviews((current) => [...current, {
+          id: crypto.randomUUID(),
+          text,
+          createdAt: new Date().toISOString(),
+        }]);
+      },
+      sendQuestion: async (question, options) => { await sendQuestion(question, options); },
     });
 
     const processPendingSegments = async () => {
@@ -771,6 +832,7 @@ export function useMeetingAssistantController({
   const clearMeetingHistory = () => {
     cancelCurrentRequest();
     clearSavedMeetingHistory();
+    setPendingTranscriptReviews([]);
     setDisplayedQuestion('');
     setDisplayedAnswer('');
     setAnswerPending(false);
@@ -793,6 +855,20 @@ export function useMeetingAssistantController({
     });
   };
 
+  const sendReviewedTranscript = async (id: string, text: string) => {
+    const sent = await sendQuestion(text, {
+      preparedQuestion: prepareTextRequest(text),
+      duplicateChecked: true,
+    });
+    if (sent) {
+      setPendingTranscriptReviews((current) => current.filter((review) => review.id !== id));
+    }
+  };
+
+  const skipReviewedTranscript = (id: string) => {
+    setPendingTranscriptReviews((current) => current.filter((review) => review.id !== id));
+  };
+
   useEffect(() => () => {
     captureActiveRef.current = false;
     captureSessionIdRef.current = '';
@@ -806,6 +882,8 @@ export function useMeetingAssistantController({
 
   return {
     meetingAudioMode, setMeetingAudioMode, transcriptionLanguage, setTranscriptionLanguage,
+    reviewBeforeSend, setReviewBeforeSend, pendingTranscriptReviews,
+    sendReviewedTranscript, skipReviewedTranscript,
     meetingMenuOpen, setMeetingMenuOpen,
     microphoneDevices, microphoneUnavailable, transcriptOpen, setTranscriptOpen,
     isRecording, isTranscribing, audioSourceLabel, audioLevel, audioStatus,

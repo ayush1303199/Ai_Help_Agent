@@ -1,5 +1,6 @@
 import { Search, X } from 'lucide-react';
-import type { HistorySession } from '../../history/historyService';
+import type { HistorySession, MeetingHistoryRetentionDays } from '../../history/historyService';
+import { HistoryRetentionControl } from './HistoryRetentionControl';
 
 interface ChatHistoryModalProps {
   sessions: HistorySession[];
@@ -7,6 +8,8 @@ interface ChatHistoryModalProps {
   search: string;
   copiedItem: string;
   hasCurrentMessages: boolean;
+  historyRetention: MeetingHistoryRetentionDays;
+  onRetentionChange: (retention: MeetingHistoryRetentionDays) => void;
   onSearchChange: (value: string) => void;
   onClose: () => void;
   onNewChat: () => void;
@@ -22,6 +25,8 @@ export function ChatHistoryModal({
   search,
   copiedItem,
   hasCurrentMessages,
+  historyRetention,
+  onRetentionChange,
   onSearchChange,
   onClose,
   onNewChat,
@@ -49,6 +54,14 @@ export function ChatHistoryModal({
         <div className="mb-3 flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2">
           <Search className="h-3.5 w-3.5 shrink-0 text-slate-500" />
           <input value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="Search all conversations..." className="min-w-0 flex-1 bg-transparent text-xs text-slate-200 outline-none placeholder:text-slate-500" />
+        </div>
+        <div className="mb-3 rounded-lg border border-slate-700 bg-slate-800/70 p-3">
+          <HistoryRetentionControl
+            value={historyRetention}
+            onChange={onRetentionChange}
+            ariaLabel="Chat history retention"
+            label="Automatically delete saved history"
+          />
         </div>
         <div className="mb-3 flex flex-wrap gap-2">
           <button type="button" onClick={onNewChat} className="flex-1 rounded-lg bg-emerald-500 px-3 py-2 text-xs font-medium text-slate-950 hover:bg-emerald-400">New chat</button>

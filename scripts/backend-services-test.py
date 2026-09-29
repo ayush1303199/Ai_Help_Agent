@@ -286,6 +286,16 @@ class SttServiceTests(unittest.TestCase):
         self.assertTrue(prompt.startswith("meeting-only exact speech prompt"))
         self.assertNotIn("generic prompt", prompt)
 
+    def test_default_meeting_prompt_preserves_hinglish_without_translation(self):
+        from backend_config import MEETING_TRANSCRIPTION_PROMPT
+
+        self.assertIn("original language or languages spoken", MEETING_TRANSCRIPTION_PROMPT)
+        self.assertIn("Preserve language switches and word order", MEETING_TRANSCRIPTION_PROMPT)
+        self.assertIn("without forcing transliteration", MEETING_TRANSCRIPTION_PROMPT)
+        self.assertIn("Never translate, paraphrase", MEETING_TRANSCRIPTION_PROMPT)
+        self.assertIn("repeat words that were not spoken", MEETING_TRANSCRIPTION_PROMPT)
+        self.assertNotIn("JavaScript, API, API key, and database", MEETING_TRANSCRIPTION_PROMPT)
+
     def test_meeting_audio_applies_language_and_bounded_glossary_hints(self):
         from urllib.parse import quote
 
@@ -327,7 +337,9 @@ class SttServiceTests(unittest.TestCase):
 
         self.assertEqual(result["text"], "What is Spring Boot?")
         prompt = post.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"]
-        self.assertIn("Preserve naturally mixed Hindi and English", prompt)
+        self.assertIn("Preserve naturally mixed Hindi and English exactly as spoken.", prompt)
+        self.assertIn("Do not translate or paraphrase the utterance.", prompt)
+        self.assertNotIn("Roman/Latin script", prompt)
         self.assertIn("Spring Boot, Kubernetes", prompt)
         self.assertIn("Never insert a term that is not audible.", prompt)
 
@@ -358,7 +370,9 @@ class SttServiceTests(unittest.TestCase):
             file=io.BytesIO(b"audio"),
             headers={"content-type": "audio/webm"},
         )
-        with patch("stt_service.OpenAI", return_value=client):
+        with patch.dict("os.environ", {"TRANSCRIPTION_MODEL": ""}), patch(
+            "stt_service.OpenAI", return_value=client
+        ):
             result = asyncio.run(service.transcribe(
                 SimpleNamespace(headers={
                     "x-stt-source": "meeting_microphone",
@@ -372,6 +386,58 @@ class SttServiceTests(unittest.TestCase):
         options = create_transcription.call_args.kwargs
         self.assertEqual(options["language"], "hi")
         self.assertIn("Spring Boot", options["prompt"])
+
+    def test_openai_meeting_mixed_language_uses_multilingual_whisper(self):
+        provider = SimpleNamespace(
+            id="groq-instance",
+            type="groq",
+            model="whisper-large-v3-turbo",
+            base_url="https://api.groq.com/openai/v1",
+        )
+        service = SttService(
+            get_provider=lambda: provider,
+            get_speech_capable_provider=lambda: provider,
+            get_api_key=lambda _provider_id: "test-key",
+            transcription_prompt="generic prompt",
+            meeting_transcription_prompt=(
+                "Transcribe only audible words in their original language. "
+                "Do not translate or paraphrase."
+            ),
+            max_upload_mb=1,
+            retry_attempts=0,
+            retry_delay=lambda _error, _attempt: 0,
+            retryable=lambda _error: False,
+        )
+        for language in ("auto", "hinglish"):
+            with self.subTest(language=language):
+                create_transcription = Mock(return_value="Mujhe JavaScript API samjhao.")
+                client = SimpleNamespace(audio=SimpleNamespace(
+                    transcriptions=SimpleNamespace(create=create_transcription),
+                ))
+                audio = UploadFile(
+                    filename="meeting.webm",
+                    file=io.BytesIO(b"audio"),
+                    headers={"content-type": "audio/webm"},
+                )
+                with patch.dict("os.environ", {"TRANSCRIPTION_MODEL": ""}), patch(
+                    "stt_service.OpenAI", return_value=client
+                ):
+                    result = asyncio.run(service.transcribe(
+                        SimpleNamespace(headers={
+                            "x-stt-source": "meeting_microphone",
+                            "x-stt-language": language,
+                        }),
+                        audio,
+                    ))
+
+                self.assertEqual(result["text"], "Mujhe JavaScript API samjhao.")
+                options = create_transcription.call_args.kwargs
+                self.assertNotIn("language", options, "Mixed-language audio should be auto-detected, not forced to Hindi.")
+                self.assertEqual(options["model"], "whisper-large-v3")
+                if language == "hinglish":
+                    self.assertIn("Preserve naturally mixed Hindi and English exactly as spoken.", options["prompt"])
+                    self.assertIn("Do not translate or paraphrase the utterance.", options["prompt"])
+                    self.assertNotIn("Roman/Latin script", options["prompt"])
 
     def test_development_diagnostics_capture_upstream_status_and_bounded_retry_safely(self):
         import index

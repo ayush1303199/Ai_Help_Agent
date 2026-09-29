@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
+  DEFAULT_MEETING_HISTORY_RETENTION_DAYS,
+  isMeetingHistoryRetentionDue,
   readMeetingHistoryRetention,
   type HistorySession,
   type MeetingHistoryRetentionDays,
@@ -80,6 +82,11 @@ export function useMeetingTranscriptHistory(maxSessions: number, maxTranscripts:
 
   useEffect(() => {
     const pruneExpiredMeetingData = () => {
+      if (isMeetingHistoryRetentionDue(historyRetentionDays)) {
+        if (writeMeetingHistoryRetention(DEFAULT_MEETING_HISTORY_RETENTION_DAYS)) {
+          setHistoryRetentionDaysState(DEFAULT_MEETING_HISTORY_RETENTION_DAYS);
+        }
+      }
       setTranscripts((current) => {
         const retained = pruneMeetingRecords(current, historyRetentionDays);
         return retained.length === current.length ? current : retained;
@@ -89,6 +96,7 @@ export function useMeetingTranscriptHistory(maxSessions: number, maxTranscripts:
         return retained.length === current.length ? current : retained;
       });
     };
+    pruneExpiredMeetingData();
     const timer = window.setInterval(pruneExpiredMeetingData, 60 * 60 * 1000);
     return () => window.clearInterval(timer);
   }, [historyRetentionDays]);

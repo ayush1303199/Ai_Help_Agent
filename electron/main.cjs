@@ -843,14 +843,25 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('screen:capture', async (event) => {
     assertTrustedOverlaySender(event);
-    const sources = await desktopCapturer.getSources({
-      types: ['screen'],
-      thumbnailSize: { width: 1600, height: 900 },
-      fetchWindowIcons: false,
-    });
-    const source = sources[0];
-    if (!source?.thumbnail || source.thumbnail.isEmpty()) throw new Error('No screen could be captured.');
-    return source.thumbnail.toDataURL();
+    const visibleWindows = [mainWindow, overlayWindow].filter((window) => (
+      window && !window.isDestroyed() && window.isVisible()
+    ));
+    visibleWindows.forEach((window) => window.hide());
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const sources = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 1600, height: 900 },
+        fetchWindowIcons: false,
+      });
+      const source = sources[0];
+      if (!source?.thumbnail || source.thumbnail.isEmpty()) throw new Error('No screen could be captured.');
+      return source.thumbnail.toDataURL();
+    } finally {
+      visibleWindows.forEach((window) => {
+        if (!window.isDestroyed()) window.showInactive();
+      });
+    }
   });
   ipcMain.handle('developer:choose-project', (event) => {
     developerAgent.getSession(event.sender.id);
