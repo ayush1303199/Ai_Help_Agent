@@ -22,6 +22,20 @@ assert.equal(developerFiles.getProjectRoot(), null);
 assert.equal((await developerFiles.readFile('alpha.txt', 'owner-a')).content, 'A');
 assert.equal((await developerFiles.readFile('beta.txt', 'owner-b')).content, 'B');
 assert.throws(() => developerFiles.assertProjectOwner('owner-c'), /not owned/i);
+assert.equal(developerFiles.normalizeScopedProjectPath(projectA, 'models', 'models'), 'models');
+assert.equal(
+  developerFiles.normalizeScopedProjectPath(projectA, 'models', 'models/AdmOuPrgList.php'),
+  'models/AdmOuPrgList.php',
+);
+assert.equal(
+  developerFiles.normalizeScopedProjectPath(projectA, 'models', 'AdmOuPrgList.php'),
+  'models/AdmOuPrgList.php',
+);
+assert.equal(developerFiles.normalizeScopedProjectPath(projectA, '.', 'models/AdmOuPrgList.php'), 'models/AdmOuPrgList.php');
+assert.throws(
+  () => developerFiles.normalizeScopedProjectPath(projectA, 'models', '../outside.php'),
+  /traversal|outside the selected scope/i,
+);
 
 developerFiles.releaseProject('owner-a');
 assert.equal(developerFiles.getProjectRoot('owner-a'), null);

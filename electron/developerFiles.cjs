@@ -287,6 +287,32 @@ async function resolveWithinRoot(root, requestedPath = '.') {
   return { root: canonicalRoot, target: realTarget };
 }
 
+function normalizeScopedProjectPath(root, scope, requestedPath) {
+  if (typeof requestedPath !== 'string' || requestedPath.length > 512 || path.isAbsolute(requestedPath)) {
+    throw new TypeError('Coding Agent tool path must be a bounded relative path.');
+  }
+  const clean = requestedPath.replace(/\\/g, '/').trim().replace(/^(?:\.\/)+/, '') || '.';
+  if (clean.split('/').includes('..')) throw new Error('Coding Agent tool path traversal is denied.');
+  const normalizedScope = String(scope || '.').replace(/\\/g, '/').replace(/\/+$/, '') || '.';
+  const scopePath = path.resolve(root, normalizedScope);
+  const alreadyScoped = normalizedScope === '.'
+    || clean === normalizedScope
+    || clean.startsWith(`${normalizedScope}/`);
+  const requested = path.resolve(
+    root,
+    clean === '.' ? normalizedScope : alreadyScoped ? clean : path.join(normalizedScope, clean),
+  );
+  const relativeToScope = path.relative(scopePath, requested);
+  if (relativeToScope === '..' || relativeToScope.startsWith(`..${path.sep}`) || path.isAbsolute(relativeToScope)) {
+    throw new Error('Coding Agent tool path is outside the selected scope.');
+  }
+  const relativeToRoot = path.relative(root, requested);
+  if (relativeToRoot === '..' || relativeToRoot.startsWith(`..${path.sep}`) || path.isAbsolute(relativeToRoot)) {
+    throw new Error('Coding Agent tool path is outside the selected project.');
+  }
+  return relativeToRoot.replace(/\\/g, '/') || '.';
+}
+
 function assertProjectOwner(ownerWebContentsId) {
   if (ownerWebContentsId === undefined) {
     throw new Error('Developer project owner is required.');
@@ -903,7 +929,7 @@ function getProjectRoot(ownerWebContentsId = null) {
 
 module.exports = {
   chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit,
-  getVerificationScripts, resolveWithinRoot, resolveProjectScope, clearProject, releaseProject,
+  getVerificationScripts, resolveWithinRoot, resolveProjectScope, normalizeScopedProjectPath, clearProject, releaseProject,
   assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY, isSensitivePath,
   discoverProjectByName, getProjectDiscoveryRoots, configureAuditDirectory,
   redactRuntimeValue, parseRuntimeFailure, mapRuntimeSource, classifyProjectSignals,

@@ -870,7 +870,10 @@ function App() {
         signal,
       });
       const hydratedData = await hydrated.json();
-      if (hydrated.ok && Array.isArray(hydratedData.providers)) {
+      const restoredProvider = Array.isArray(hydratedData.providers)
+        ? hydratedData.providers.find((item: ConfiguredProvider) => item.id === provider.id)
+        : undefined;
+      if (hydrated.ok && Array.isArray(hydratedData.providers) && restoredProvider?.hasApiKey === true) {
         providers = hydratedData.providers;
         const providerId = String(provider.id || '');
         if (providerId) {

@@ -1,4 +1,11 @@
-import { runtimeConfig } from '../../config/runtimeConfig';
+import { runtimeConfig } from '../../config/runtimeConfig.ts';
+
+export function latestCodingUserRequest(messages: Array<{ role: 'user' | 'assistant'; content: string }>) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === 'user') return messages[index].content;
+  }
+  return '';
+}
 
 export interface CodingReadFile {
   path: string;
@@ -13,8 +20,11 @@ export interface CodingTransportResult {
   toolCalls: Array<{ name: string; arguments: Record<string, unknown>; round: number }>;
   filesRead: CodingReadFile[];
   filesSearched: string[];
+  providerId?: string | null;
   provider?: string | null;
   model?: string | null;
+  configuredProviderId?: string | null;
+  fallback?: boolean;
 }
 
 export interface CodingActivity {
@@ -51,12 +61,13 @@ export class CodingAgentTransport {
     requestId: string,
     messages: Array<{ role: 'user' | 'assistant'; content: string }>,
     scope: string,
-    providerId: string | null,
     handlers: CodingHandlers,
   ): Promise<string> {
     if (!window.electronAPI) throw new Error('Coding Agent desktop IPC is unavailable.');
+    const request = latestCodingUserRequest(messages);
+    if (!request.trim()) throw new Error('The current Coding Agent request is missing. Please send it again.');
     const socket = await this.connect();
-    const turn = await window.electronAPI.beginDeveloperConversation(messages[messages.length - 1]?.content || '', scope);
+    const turn = await window.electronAPI.beginDeveloperConversation(request, scope);
     handlers.onStart(turn.turnId, turn.projectRoot, turn.scope);
     await window.electronAPI.advanceDeveloperConversation({
       turnId: turn.turnId,
@@ -75,7 +86,6 @@ export class CodingAgentTransport {
       type: 'chat',
       requestId,
       scope: turn.scope,
-      ...(providerId ? { providerId } : {}),
       messages,
     }));
     return turn.turnId;
@@ -191,8 +201,11 @@ export class CodingAgentTransport {
         toolCalls: request.toolCalls,
         filesRead: [...request.filesRead].map(([path, content]) => ({ path, content })),
         filesSearched: [...request.filesSearched],
+        providerId: typeof message.providerId === 'string' ? message.providerId : null,
         provider: typeof message.provider === 'string' ? message.provider : null,
         model: typeof message.model === 'string' ? message.model : null,
+        configuredProviderId: typeof message.configuredProviderId === 'string' ? message.configuredProviderId : null,
+        fallback: message.fallback === true,
       });
       return;
     }

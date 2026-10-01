@@ -17,6 +17,7 @@ import re
 import os
 from provider_service import classify_provider_error, redact_provider_error
 from provider_model_contract import (
+    PROVIDER_REGISTRY,
     ProviderModelConfigurationError,
     provider_model_error,
     provider_model_is_valid,
@@ -207,6 +208,7 @@ class ProviderRegistry:
                 data = json.load(f)
 
             providers_data = data.get("providers", [])
+            migrated_gemini_models = False
 
             for provider_data in providers_data:
                 if "adapterType" in provider_data and "type" not in provider_data:
@@ -230,6 +232,23 @@ class ProviderRegistry:
                     provider_data["status"] = ProviderStatus.CONFIGURED.value
 
                 provider_data["hasApiKey"] = bool(provider_data.get("hasApiKey", False))
+                provider_type = str(provider_data.get("type") or "").lower()
+                configured_model = str(provider_data.get("model") or "")
+                if (
+                    provider_type == "gemini"
+                    and configured_model
+                    and not provider_model_is_valid(provider_type, configured_model)
+                ):
+                    provider_data["model"] = str(PROVIDER_REGISTRY["gemini"]["defaultModel"])
+                    if provider_data.get("status") == ProviderStatus.CONFIGURATION_INVALID.value:
+                        provider_data["status"] = (
+                            ProviderStatus.CONFIGURED.value
+                            if provider_data["hasApiKey"]
+                            else ProviderStatus.UNCONFIGURED.value
+                        )
+                    for field in ("configurationError", "failureCategory", "failureDetails"):
+                        provider_data.pop(field, None)
+                    migrated_gemini_models = True
 
                 provider = ProviderInstance.from_dict(provider_data)
                 configuration_error = provider_model_error(
@@ -258,6 +277,8 @@ class ProviderRegistry:
                     self.active_provider_id = self._next_active_provider_id()
             self.fallback_enabled = data.get("fallbackEnabled", True)
             self.stt_provider_id = data.get("sttProvider")
+            if migrated_gemini_models:
+                self.save_to_file()
         except Exception as e:
             print(f"Error loading provider config from {self.config_path}: {e}")
 

@@ -145,7 +145,12 @@ function assertConversationOwner(turn, owner) {
 }
 function beginConversationTurn({ root, scope = '.', request, sessionId, ownerWebContentsId }) {
   if (!sessionId || ownerWebContentsId === undefined) throw new Error('Developer session ownership is required.');
-  if (typeof request !== 'string' || !request.trim() || request.length > developerSettings.maxRequestChars) throw new Error('Coding request is invalid or too long.');
+  if (typeof request !== 'string' || !request.trim()) throw new Error('Coding request must be a non-empty string.');
+  if (request.length > developerSettings.maxRequestChars) {
+    throw new Error(
+      `Coding request is too long (${request.length} characters; maximum ${developerSettings.maxRequestChars}). Shorten the current request or start a new Coding conversation.`,
+    );
+  }
   const turn = {
     turnId: crypto.randomUUID(), sessionId, ownerWebContentsId, root, scope,
     state: 'reading', createdAt: now(), updatedAt: now(),

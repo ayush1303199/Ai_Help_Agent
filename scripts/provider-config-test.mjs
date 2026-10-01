@@ -34,14 +34,14 @@ assert.equal(getCapabilityState('groq', 'qwen/qwen3.8-27b', 'vision'), 'SUPPORTE
 assert.equal(getCapabilityState('groq', 'openai/gpt-oss-20b', 'vision'), 'UNKNOWN');
 assert.deepEqual(
   getModelsForProvider('gemini').map((model) => model.id),
-  [
-    'gemini-3.6-flash', 'gemini-3.0-flash', 'gemini-3.0-pro', 'gemini-3.1-flash', 'gemini-3.1-pro',
-    'gemini-3.2-flash', 'gemini-3.2-pro', 'gemini-3.3-flash', 'gemini-3.3-pro', 'gemini-3.4-flash',
-    'gemini-3.4-pro', 'gemini-3.5-flash', 'gemini-3.5-pro', 'gemini-2.5-pro', 'gemini-2.5-flash',
-    'gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-2.0-pro',
-  ],
+  ['gemini-3.6-flash'],
 );
 assert.equal(getDefaultModel('gemini'), 'gemini-3.6-flash');
+assert.equal(
+  getDefaultModel('gemini'),
+  getModelsForProvider('gemini')[0].id,
+  'the Gemini default must come from the shared model registry rather than a separate fallback list',
+);
 assert.equal(getProviderConfig('groq').displayName, 'Groq');
 assert.equal(isValidCombination('groq', 'openai/gpt-oss-20b'), true);
 assert.equal(isValidCombination('groq', 'gemini-1.5-pro'), false);
@@ -219,6 +219,8 @@ const secretRehydrationFlow = appSource.slice(secretRehydrationStart, secretRehy
 assert.match(secretRehydrationFlow, /method: 'PATCH'/, 'secret rehydration does not rewrite provider configuration');
 assert.match(secretRehydrationFlow, /\/api\/settings\/providers\/\$\{encodeURIComponent\(provider\.id\)\}/);
 assert.match(secretRehydrationFlow, /body: JSON\.stringify\(\{ apiKey \}\)/);
+assert.match(secretRehydrationFlow, /restoredProvider\?\.hasApiKey === true/, 'hydration succeeds only when the backend confirms the key is available');
+assert.match(secretRehydrationFlow, /providers = hydratedData\.providers/, 'the provider UI state must use the backend response after the key is rehydrated');
 assert.doesNotMatch(providerLoadBeforeEmptyRestore, /writePersistedProviderSettings\(/);
 assert.match(emptyProviderRestore, /savedProviderSettings\.providers/);
 assert.match(emptyProviderRestore, /if \(restoredProviders\.length > 0\)/);

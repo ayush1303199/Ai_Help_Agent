@@ -3,8 +3,6 @@ import { runtimeConfig } from '../../config/runtimeConfig';
 import { ConfirmationDialog } from '../../ui/ConfirmationDialog';
 import { CodingAgentWorkspace } from './CodingAgentWorkspace';
 import { useCodingAgentController } from './useCodingAgentController';
-import { AgentProviderSelect } from '../provider-selection/AgentProviderSelect';
-import { useAgentProviderSelection, type AgentProviderOption } from '../provider-selection/useAgentProviderSelection';
 
 export interface CodingHistoryRestoreRequest {
   key: number;
@@ -14,18 +12,14 @@ export interface CodingHistoryRestoreRequest {
 interface CodingAgentPageProps {
   active: boolean;
   defaultProvider: { id?: string; label?: string; model?: string } | null;
-  providers: AgentProviderOption[];
+  providers: unknown[];
   onProviderStorageError: (message: string) => void;
   restoreRequest: CodingHistoryRestoreRequest | null;
   onBusyChange: (busy: boolean) => void;
 }
 
-export function CodingAgentPage({ active, defaultProvider, providers, onProviderStorageError, restoreRequest, onBusyChange }: CodingAgentPageProps) {
-  const { providerId, setProviderId } = useAgentProviderSelection('coding', providers, onProviderStorageError);
-  const provider = providers.find((item) => item.id === providerId) || defaultProvider;
+export function CodingAgentPage({ active, restoreRequest, onBusyChange }: CodingAgentPageProps) {
   const controller = useCodingAgentController({
-    provider,
-    providerId,
     maxContextChars: runtimeConfig.limits.maxContextChars,
     maxHistoryMessages: runtimeConfig.limits.maxChatHistoryMessages,
     maxMessageChars: runtimeConfig.limits.maxChatMessageChars,
@@ -53,8 +47,8 @@ export function CodingAgentPage({ active, defaultProvider, providers, onProvider
           <p className="text-[11px] font-semibold uppercase tracking-wider text-sky-300">Developer Mode</p>
           <h2 className="mt-1 text-xl font-semibold">Coding assistant</h2>
           <p className="mt-2 text-xs text-slate-500">Read and search are automatic. Source writes happen only through a validated proposal after you explicitly approve it; verification uses allow-listed project scripts.</p>
+          <p className="mt-2 text-xs text-slate-500">Coding follows the active global provider and model settings. The actual provider used appears after each response.</p>
         </div>
-        <AgentProviderSelect agentId="coding" providers={providers} value={providerId} onChange={setProviderId} />
         <CodingAgentWorkspace
           {...workspace}
           onResetCodingPreferences={() => setConfirmationOpen(true)}

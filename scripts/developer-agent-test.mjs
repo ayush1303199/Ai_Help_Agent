@@ -8,6 +8,28 @@ const root = await fs.mkdtemp(path.join(process.cwd(), '.developer-test-'));
 try {
   const ownerWebContentsId = 11;
   const sessionId = agent.getSession(ownerWebContentsId);
+  const conversation = agent.beginConversationTurn({
+    root,
+    request: 'is fix ka proposal banao',
+    sessionId,
+    ownerWebContentsId,
+  });
+  assert.equal(conversation.state, 'reading', 'A normal follow-up request must pass conversation-start validation.');
+  assert.throws(
+    () => agent.beginConversationTurn({
+      root,
+      request: 'x'.repeat(4001),
+      sessionId,
+      ownerWebContentsId,
+    }),
+    /Coding request is too long \(4001 characters; maximum 4000\)/,
+    'Only an oversized current request should hit the character limit, with an actionable message.',
+  );
+  assert.throws(
+    () => agent.beginConversationTurn({ root, request: '   ', sessionId, ownerWebContentsId }),
+    /Coding request must be a non-empty string/,
+    'An empty request should report a specific validation error.',
+  );
   const file = path.join(root, 'sample.txt');
   await fs.writeFile(file, 'one\ntwo\n', 'utf8');
   const proposal = await agent.createProposal({

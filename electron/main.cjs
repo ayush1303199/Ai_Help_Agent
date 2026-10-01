@@ -1042,30 +1042,12 @@ app.whenReady().then(async () => {
     const query = typeof args.query === 'string' ? args.query.trim() : '';
     const scope = await developerFiles.resolveProjectScope(event.sender.id, payload?.scope || '.');
     const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
-    const normalizeScopedPath = (requestedPath, expectedType) => {
-      if (typeof requestedPath !== 'string' || requestedPath.length > 512 || path.isAbsolute(requestedPath)) {
-        throw new TypeError('Coding Agent tool path must be a bounded relative path.');
-      }
-      const clean = requestedPath.replace(/\\/g, '/').trim() || '.';
-      if (clean.split('/').includes('..')) throw new Error('Coding Agent tool path traversal is denied.');
-      const scopePath = path.resolve(root, scope);
-      const requested = path.resolve(root, clean === '.' ? scope : clean.startsWith(`${scope}/`) || scope === '.' ? clean : path.join(scope, clean));
-      const relativeToScope = path.relative(scopePath, requested);
-      if (relativeToScope === '..' || relativeToScope.startsWith(`..${path.sep}`) || path.isAbsolute(relativeToScope)) {
-        throw new Error('Coding Agent tool path is outside the selected scope.');
-      }
-      const relativeToRoot = path.relative(root, requested);
-      if (relativeToRoot === '..' || relativeToRoot.startsWith(`..${path.sep}`) || path.isAbsolute(relativeToRoot)) {
-        throw new Error('Coding Agent tool path is outside the selected project.');
-      }
-      return relativeToRoot.replace(/\\/g, '/') || '.';
-    };
     if (name === 'list_directory') {
-      const relativePath = normalizeScopedPath(args.relativePath || '.', 'directory');
+      const relativePath = developerFiles.normalizeScopedProjectPath(root, scope, args.relativePath || '.');
       return { ok: true, tool: name, data: await developerFiles.listDirectory(relativePath, event.sender.id) };
     }
     if (name === 'read_file') {
-      const relativePath = normalizeScopedPath(args.relativePath, 'file');
+      const relativePath = developerFiles.normalizeScopedProjectPath(root, scope, args.relativePath);
       return { ok: true, tool: name, data: await developerFiles.readFile(relativePath, event.sender.id) };
     }
     if (name === 'search_code') {

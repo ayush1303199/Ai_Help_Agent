@@ -9,6 +9,7 @@ const generalControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'f
 const generalPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'general', 'GeneralAgentPage.tsx'), 'utf8');
 const codingControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'coding', 'useCodingAgentController.ts'), 'utf8');
 const codingPageSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'coding', 'CodingAgentPage.tsx'), 'utf8');
+const codingTransportSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'coding', 'codingTransport.ts'), 'utf8');
 const meetingControllerSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'useMeetingAssistantController.ts'), 'utf8');
 const meetingSttSegmentProcessorSource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'meetingSttSegmentProcessor.ts'), 'utf8');
 const meetingSttRetrySource = fs.readFileSync(path.join(projectRoot, 'src', 'features', 'meeting', 'meetingSttRetry.ts'), 'utf8');
@@ -201,6 +202,9 @@ assert.doesNotMatch(
   'Coding Agent transport, state, and proposal lifecycle must stay in the Coding feature.',
 );
 assert.match(codingPageSource, /useCodingAgentController\(/, 'The Coding Agent page must own its controller lifecycle.');
+assert.doesNotMatch(codingPageSource, /AgentProviderSelect|useAgentProviderSelection\(/, 'Coding must use the globally active provider, not keep a per-agent selection.');
+assert.doesNotMatch(codingControllerSource, /providerId:\s*string\s*\|\s*null/, 'Coding requests must not capture a stale per-agent provider instance.');
+assert.doesNotMatch(codingTransportSource, /scope:\s*turn\.scope,[\s\S]{0,100}providerId/, 'Coding transport must leave provider resolution to the global backend registry.');
 assert.doesNotMatch(appSource, /useCodingAgentController/, 'App composition must not construct the Coding Agent controller.');
 assert.match(codingControllerSource, /new CodingAgentTransport\(\)/, 'Coding Agent must own its transport lifecycle.');
 assert.match(meetingSttSegmentProcessorSource, /transcribeMeetingSegmentWithRetry\(/, 'Meeting STT retries must stay in the Meeting-owned STT processor.');

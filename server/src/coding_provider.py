@@ -1,13 +1,17 @@
 """Provider adapter owned exclusively by the Coding Agent pipeline."""
 
 import json
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
 from openai import OpenAI
-from provider_model_contract import ProviderModelConfigurationError, provider_model_error
+from provider_model_contract import (
+    ProviderModelConfigurationError,
+    provider_capability_states,
+    provider_model_error,
+)
+from provider_service import get_api_key as resolve_api_key
 from backend_config import CODING_COMPLETION_TOKENS, MODEL_REQUEST_TIMEOUT_SECONDS
 
 
@@ -20,27 +24,10 @@ CODING_MAX_COMPLETION_TOKENS = CODING_COMPLETION_TOKENS
 
 
 def _api_key(registry: Any, provider: Any, config_path: Path) -> str:
-    runtime_key = registry.get_api_key(provider.id)
-    if runtime_key:
-        return runtime_key
-    environment_key = os.getenv(f"{provider.type.upper()}_API_KEY", "").strip()
-    if environment_key:
-        return environment_key
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
-    except (OSError, json.JSONDecodeError):
-        config = {}
-    for entry in config.get("providers", []):
-        if (
-            str(entry.get("type") or entry.get("adapterType") or "").lower() == provider.type.lower()
-            and str(entry.get("apiKey") or "").strip()
-        ):
-            return str(entry["apiKey"]).strip()
-    return ""
+    return resolve_api_key(registry, config_path, provider.id)
 
 
 def _candidates(registry: Any, provider_id: Optional[str] = None) -> List[Any]:
-    result = []
     if provider_id:
         requested = registry.get_provider(provider_id)
         if not requested:
@@ -51,17 +38,21 @@ def _candidates(registry: Any, provider_id: Optional[str] = None) -> List[Any]:
         if configuration_error:
             raise ProviderModelConfigurationError(configuration_error)
         return [requested]
+
     active = registry.get_active_provider()
-    if active:
-        configuration_error = provider_model_error(active.type, active.model, active.base_url)
-        if configuration_error:
-            raise ProviderModelConfigurationError(configuration_error)
-        result.append(active)
-    result.extend(
-        provider for provider in registry.get_eligible_providers()
-        if provider.id not in {item.id for item in result}
-    )
-    return result
+    if not active:
+        return []
+    configuration_error = provider_model_error(active.type, active.model, active.base_url)
+    if configuration_error:
+        raise ProviderModelConfigurationError(configuration_error)
+
+    candidates = [active]
+    if registry.fallback_enabled:
+        candidates.extend(
+            provider for provider in registry.get_eligible_providers()
+            if provider.id != active.id
+        )
+    return candidates
 
 
 def _text(content: Any) -> str:
@@ -85,6 +76,11 @@ def _normalize(message: Dict[str, Any]) -> Dict[str, Any]:
     return message
 
 
+def _requires_tool_choice_retry(error: Exception) -> bool:
+    message = str(error).lower()
+    return "tool choice is required" in message or "tool_use_failed" in message or "did not call a tool" in message
+
+
 def _openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         {
@@ -98,6 +94,7 @@ def _openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _anthropic_request(
     provider: Any, api_key: str, messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]],
+    require_tool_call: bool = False,
 ) -> Dict[str, Any]:
     system_parts = []
     converted = []
@@ -142,6 +139,8 @@ def _anthropic_request(
             "description": (tool.get("function") or {}).get("description") or "",
             "input_schema": (tool.get("function") or {}).get("parameters") or {"type": "object", "properties": {}},
         } for tool in tools]
+        if require_tool_call:
+            body["tool_choice"] = {"type": "any"}
     response = httpx.post(
         f"{provider.base_url.rstrip('/')}/messages",
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
@@ -167,6 +166,7 @@ def _anthropic_request(
 def _gemini_request(
     provider: Any, api_key: str, messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]],
+    require_tool_call: bool = False,
 ) -> Dict[str, Any]:
     system = []
     contents = []
@@ -236,6 +236,9 @@ def _gemini_request(
                 ),
             } for tool in tools]
         }]
+        body["toolConfig"] = {
+            "functionCallingConfig": {"mode": "ANY" if require_tool_call else "AUTO"},
+        }
     response = httpx.post(
         f"{provider.base_url.rstrip('/')}/models/{provider.model}:generateContent",
         headers={"x-goog-api-key": api_key, "content-type": "application/json"},
@@ -270,6 +273,7 @@ def complete_coding_model(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
     provider_id: Optional[str] = None,
+    require_tool_call: bool = False,
 ) -> tuple[Dict[str, Any], Any]:
     """Run Coding-only provider selection and response adaptation."""
     candidates = _candidates(registry, provider_id)
@@ -278,24 +282,50 @@ def complete_coding_model(
     errors = []
     for provider in candidates:
         api_key = _api_key(registry, provider, config_path)
-        if not api_key or not provider.model:
+        if not api_key:
+            errors.append(f"{provider.type}: no API key is available for the configured provider instance.")
+            continue
+        if not provider.model:
+            errors.append(f"{provider.type}: no model is configured for the selected provider instance.")
+            continue
+        tool_calling = provider_capability_states(provider.type, provider.model)["toolCalling"]
+        if tools and tool_calling == "UNSUPPORTED":
+            errors.append(f"{provider.type}: the configured model does not support tool calling.")
             continue
         try:
             provider_type = str(provider.type or "").lower()
+            print(json.dumps({
+                "event": "CODING_LLM_REQUEST",
+                "providerId": provider.id,
+                "provider": provider_type,
+                "model": provider.model,
+                "source": "global-provider-config",
+                "capability": tool_calling,
+            }, ensure_ascii=False))
             if provider_type == "cohere" and tools:
                 raise RuntimeError("The configured Cohere model cannot run Coding Agent read tools.")
             if provider_type == "anthropic":
-                message = _anthropic_request(provider, api_key, messages, tools)
+                message = _anthropic_request(provider, api_key, messages, tools, require_tool_call)
             elif provider_type == "gemini" and not provider.base_url.rstrip("/").endswith("/openai"):
-                message = _gemini_request(provider, api_key, messages, tools)
+                message = _gemini_request(provider, api_key, messages, tools, require_tool_call)
             elif provider_type in OPENAI_COMPATIBLE or provider_type == "gemini":
-                response = OpenAI(api_key=api_key, base_url=provider.base_url or None).chat.completions.create(
-                    model=provider.model,
-                    messages=_openai_messages(messages),
-                    tools=tools or None,
-                    temperature=0.2,
-                    max_tokens=CODING_MAX_COMPLETION_TOKENS,
-                )
+                request = {
+                    "model": provider.model,
+                    "messages": _openai_messages(messages),
+                    "tools": tools or None,
+                    "temperature": 0.2,
+                    "max_tokens": CODING_MAX_COMPLETION_TOKENS,
+                }
+                if tools:
+                    request["tool_choice"] = "required" if require_tool_call else "auto"
+                client = OpenAI(api_key=api_key, base_url=provider.base_url or None)
+                try:
+                    response = client.chat.completions.create(**request)
+                except Exception as error:
+                    if not (tools and require_tool_call and _requires_tool_choice_retry(error)):
+                        raise
+                    request["tool_choice"] = "auto"
+                    response = client.chat.completions.create(**request)
                 raw = response.choices[0].message.model_dump(exclude_none=True) if response.choices else {}
                 message = _normalize(raw)
             else:

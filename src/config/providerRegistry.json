@@ -100,24 +100,7 @@
     "endpoint": { "required": true, "configurable": true },
     "capabilities": { "stt": "SUPPORTED" },
     "models": [
-      { "id": "gemini-3.6-flash", "displayName": "Gemini 3.6 Flash", "supportsToolCalling": true },
-      { "id": "gemini-3.0-flash", "displayName": "Gemini 3.0 Flash", "supportsToolCalling": true },
-      { "id": "gemini-3.0-pro", "displayName": "Gemini 3.0 Pro", "supportsToolCalling": true },
-      { "id": "gemini-3.1-flash", "displayName": "Gemini 3.1 Flash", "supportsToolCalling": true },
-      { "id": "gemini-3.1-pro", "displayName": "Gemini 3.1 Pro", "supportsToolCalling": true },
-      { "id": "gemini-3.2-flash", "displayName": "Gemini 3.2 Flash", "supportsToolCalling": true },
-      { "id": "gemini-3.2-pro", "displayName": "Gemini 3.2 Pro", "supportsToolCalling": true },
-      { "id": "gemini-3.3-flash", "displayName": "Gemini 3.3 Flash", "supportsToolCalling": true },
-      { "id": "gemini-3.3-pro", "displayName": "Gemini 3.3 Pro", "supportsToolCalling": true },
-      { "id": "gemini-3.4-flash", "displayName": "Gemini 3.4 Flash", "supportsToolCalling": true },
-      { "id": "gemini-3.4-pro", "displayName": "Gemini 3.4 Pro", "supportsToolCalling": true },
-      { "id": "gemini-3.5-flash", "displayName": "Gemini 3.5 Flash", "supportsToolCalling": true },
-      { "id": "gemini-3.5-pro", "displayName": "Gemini 3.5 Pro", "supportsToolCalling": true },
-      { "id": "gemini-2.5-pro", "displayName": "Gemini 2.5 Pro", "supportsToolCalling": true },
-      { "id": "gemini-2.5-flash", "displayName": "Gemini 2.5 Flash", "supportsToolCalling": true },
-      { "id": "gemini-2.0-flash", "displayName": "Gemini 2.0 Flash", "supportsToolCalling": true },
-      { "id": "gemini-2.0-flash-lite", "displayName": "Gemini 2.0 Flash Lite", "supportsToolCalling": true },
-      { "id": "gemini-2.0-pro", "displayName": "Gemini 2.0 Pro", "supportsToolCalling": true }
+      { "id": "gemini-3.6-flash", "displayName": "Gemini 3.6 Flash", "supportsToolCalling": true }
     ]
   },
   "xai": {

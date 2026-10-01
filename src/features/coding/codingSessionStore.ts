@@ -1,4 +1,4 @@
-import { runtimeConfig } from '../../config/runtimeConfig';
+import { runtimeConfig } from '../../config/runtimeConfig.ts';
 
 export interface CodingHistoryMessage {
   role: 'user' | 'assistant';
@@ -157,6 +157,15 @@ export function codingPreferenceContext(preferences: CodingPreference[]): string
     .map((preference) => `- [${preference.category}] ${preference.text}`).join('\n').slice(0, runtimeConfig.codingSession.maxPreferenceContextChars);
 }
 
+export function compactCodingMessageContent(content: string, maxChars: number) {
+  if (content.length <= maxChars) return content;
+  const marker = '\n[Middle content summarized for context] \n';
+  const availableChars = Math.max(0, maxChars - marker.length);
+  const headChars = Math.ceil(availableChars / 2);
+  const tailChars = Math.floor(availableChars / 2);
+  return `${content.slice(0, headChars)}${marker}${tailChars ? content.slice(-tailChars) : ''}`;
+}
+
 export function compactCodingConversation(
   session: Pick<CodingConversationState, 'messages' | 'projectRoot' | 'pendingPlan' | 'appliedPatchLog' | 'providerNeutralSummary'>,
   options: { maxTokens?: number; lastMessageCount?: number } = {},
@@ -190,9 +199,25 @@ export function compactCodingConversation(
   const messages = [contextMessage, ...recent];
   let estimatedTokens = messages.reduce((total, message) => total + estimate(message.content), 0);
   while (estimatedTokens > maxTokens) {
-    const last = messages[messages.length - 1];
-    if (!last || !last.content.length) break;
-    last.content = last.content.slice(0, Math.max(0, last.content.length - (estimatedTokens - maxTokens) * 4));
+    const latestUserIndex = messages.reduce(
+      (latestIndex, message, index) => message.role === 'user' ? index : latestIndex,
+      -1,
+    );
+    const compactableIndex = messages.findIndex((message, index) => (
+      index > 0 && index !== latestUserIndex && message.content.length > 120
+    ));
+    if (compactableIndex >= 0) {
+      const message = messages[compactableIndex];
+      const targetChars = Math.max(120, message.content.length - (estimatedTokens - maxTokens) * 4);
+      message.content = compactCodingMessageContent(message.content, targetChars);
+    } else if (contextMessage.content.length > 120) {
+      contextMessage.content = compactCodingMessageContent(
+        contextMessage.content,
+        Math.max(120, contextMessage.content.length - (estimatedTokens - maxTokens) * 4),
+      );
+    } else {
+      break;
+    }
     estimatedTokens = messages.reduce((total, message) => total + estimate(message.content), 0);
   }
   return {

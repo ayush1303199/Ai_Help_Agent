@@ -56,8 +56,6 @@ interface CodingProposal {
 }
 
 interface CodingControllerOptions {
-  provider: { id?: string; label?: string; model?: string } | null;
-  providerId: string | null;
   maxContextChars: number;
   maxHistoryMessages: number;
   maxMessageChars: number;
@@ -81,8 +79,6 @@ async function hashDeveloperContent(content: string) {
 }
 
 export function useCodingAgentController({
-  provider,
-  providerId,
   maxContextChars,
   maxHistoryMessages,
   maxMessageChars,
@@ -251,11 +247,6 @@ export function useCodingAgentController({
     if (projectContinuation) conversationHistory[conversationHistory.length - 1] = { role: 'user', content: projectContinuation };
     const preferencesContext = codingPreferenceContext(preferences);
     if (preferencesContext) conversationHistory.unshift({ role: 'assistant', content: `[CODING_STYLE_PREFERENCES]\n${preferencesContext}` });
-    const currentProvider = provider ? { ...provider, changedAt: new Date().toISOString() } : null;
-    if (currentProvider && lastProvider && (currentProvider.id !== lastProvider.id || currentProvider.model !== lastProvider.model)) {
-      onStatus('Coding session context restored after provider switch.');
-    }
-    if (currentProvider) setLastProvider(currentProvider);
     setMessages((previous) => [...previous, userMessage, assistantMessage]);
     setInput('');
     setActivity([]);
@@ -263,7 +254,7 @@ export function useCodingAgentController({
     try {
       const transport = transportRef.current;
       if (!transport) throw new Error('Coding Agent transport is unavailable.');
-      await transport.send(requestId, conversationHistory, currentScope, providerId, {
+      await transport.send(requestId, conversationHistory, currentScope, {
         onStart: (turnId, root, scope) => {
           turnIdsRef.current.set(requestId, turnId);
           setProjectRoot(root);
@@ -278,8 +269,17 @@ export function useCodingAgentController({
               const turnId = turnIdsRef.current.get(requestId);
               if (!turnId || !window.electronAPI) throw new Error('Coding conversation ownership was lost.');
               if (typeof result.provider === 'string' || typeof result.model === 'string') {
+                if (lastProvider && (lastProvider.id !== result.providerId || lastProvider.model !== result.model)) {
+                  onStatus('Coding session context restored after provider switch.');
+                }
+                onStatus(
+                  `Coding used ${result.provider || 'the configured provider'}`
+                  + `${result.model ? ` (${result.model})` : ''}`
+                  + `${result.providerId ? `, instance ${result.providerId}` : ''}`
+                  + `${result.fallback ? ' via the globally enabled fallback' : ''}.`,
+                );
                 setLastProvider({
-                  id: result.provider || undefined,
+                  id: result.providerId || undefined,
                   label: result.provider || undefined,
                   model: result.model || undefined,
                   changedAt: new Date().toISOString(),

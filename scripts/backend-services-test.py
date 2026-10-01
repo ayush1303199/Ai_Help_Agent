@@ -17,24 +17,37 @@ SERVER_SRC = Path(__file__).resolve().parents[1] / "server" / "src"
 sys.path.insert(0, str(SERVER_SRC))
 
 from agent_control_service import AgentControlService  # noqa: E402
-from coding_provider import CODING_MAX_COMPLETION_TOKENS, _candidates, _gemini_request, _normalize  # noqa: E402
+from coding_provider import (  # noqa: E402
+    CODING_MAX_COMPLETION_TOKENS,
+    _anthropic_request,
+    _candidates,
+    _gemini_request,
+    _normalize,
+    complete_coding_model,
+)
 from coding_websocket import (  # noqa: E402
     MAX_CODING_CONVERSATION_CHARS,
     MAX_CODING_FINAL_EVIDENCE_CHARS,
     MAX_CODING_TOOL_ROUNDS,
+    _coding_task_steps,
     _coding_finalization_messages,
     _compact_coding_conversation,
     _is_unified_diff_response,
+    _has_read_file_evidence,
     _proposal_prompt_instruction,
+    _proposal_goal,
     _proposal_response_shape,
     _requires_proposal,
+    _requires_proposal_for_conversation,
     _serialize_coding_tool_result,
     _validate_tool_call,
     _run_coding_turn,
 )
 from stt_service import SttService  # noqa: E402
 from provider_registry import ProviderInstance, ProviderRegistry, ProviderStatus  # noqa: E402
+from provider_presets import PROVIDER_PRESETS  # noqa: E402
 from provider_model_contract import (  # noqa: E402
+    PROVIDER_REGISTRY,
     provider_capability_states,
     provider_model_error,
     provider_model_for_capability,
@@ -523,13 +536,60 @@ class CodingIntentTests(unittest.TestCase):
         self.assertTrue(_requires_proposal("Fix N+1 queries in the academic controllers."))
         self.assertTrue(_requires_proposal("Explain this bug and then fix it."))
         self.assertTrue(_requires_proposal("Naya validation rule add karo email field ke liye."))
+        self.assertTrue(_requires_proposal(
+            "AdmOuPrgList.php ke getProgrammes() method mein duplicate-query issue ka fix proposal/diff banao."
+        ))
+
+    def test_coding_task_plan_requires_flow_trace_and_behavior_preservation(self):
+        analysis_steps = _coding_task_steps(False)
+        proposal_steps = _coding_task_steps(True)
+
+        self.assertTrue(any("callers, callees, and data/state" in step for step in analysis_steps))
+        self.assertTrue(any("tests, configuration, and contracts" in step for step in analysis_steps))
+        self.assertTrue(any("existing behavior to preserve" in step for step in proposal_steps))
+        self.assertIn("Prepare a validated diff from inspected source for explicit approval", proposal_steps)
+        self.assertNotIn("Report findings, the task checklist, and any unverified checks", proposal_steps)
+
+    def test_follow_up_pasted_diff_keeps_the_active_proposal_goal(self):
+        messages = [
+            {"role": "user", "content": "Fix the duplicate query in getProgrammes and prepare a proposal."},
+            {"role": "assistant", "content": "I identified repeated database queries."},
+            {"role": "user", "content": "--- a/models/AdmOuPrgList.php\n+++ b/models/AdmOuPrgList.php\n@@ -1 +1 @@\n-old\n+new"},
+        ]
+
+        self.assertTrue(_requires_proposal_for_conversation(messages))
+        self.assertEqual(_proposal_goal([
+            message["content"] for message in messages if message["role"] == "user"
+        ]), messages[0]["content"])
+
+    def test_explanatory_follow_up_does_not_inherit_an_older_proposal_goal(self):
+        messages = [
+            {"role": "user", "content": "Fix the duplicate query in getProgrammes and prepare a proposal."},
+            {"role": "assistant", "content": "I identified repeated database queries."},
+            {"role": "user", "content": "Explain what this diff does."},
+        ]
+
+        self.assertFalse(_requires_proposal_for_conversation(messages))
 
 
 class CodingConversationBudgetTests(unittest.TestCase):
     def test_tool_results_are_bounded(self):
-        serialized = _serialize_coding_tool_result({"content": "x" * 12000})
+        serialized = _serialize_coding_tool_result({
+            "ok": True,
+            "tool": "read_file",
+            "data": {"path": "models/AdmOuPrgList.php", "content": "x" * 12000},
+        })
 
         self.assertLessEqual(len(serialized), 6000)
+        parsed = json.loads(serialized)
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["data"]["path"], "models/AdmOuPrgList.php")
+        self.assertIn("[Tool result truncated", parsed["data"]["content"])
+        self.assertTrue(_has_read_file_evidence([{
+            "role": "tool",
+            "name": "read_file",
+            "content": serialized,
+        }]))
 
     def test_compaction_keeps_system_context_latest_request_and_recent_tool_exchange(self):
         messages = [
@@ -577,6 +637,24 @@ class CodingConversationBudgetTests(unittest.TestCase):
         self.assertIn("read_file", finalized[1]["content"])
         self.assertFalse(any(item.get("role") == "tool" or item.get("tool_calls") for item in finalized))
         self.assertIn("Finish the response now.", finalized[0]["content"])
+        self.assertIn("include the existing flow you traced", finalized[0]["content"])
+        self.assertIn("distinguish observed facts from inferences", finalized[0]["content"])
+        self.assertIn("tests or runtime checks that remain unverified", finalized[0]["content"])
+
+    def test_proposal_finalization_retains_the_active_goal_and_rejects_diff_summarization(self):
+        original_request = "Fix the duplicate query in getProgrammes and prepare a proposal."
+        messages = [
+            {"role": "system", "content": "Follow the project safety rules."},
+            {"role": "user", "content": original_request},
+            {"role": "assistant", "content": "I identified repeated database queries."},
+            {"role": "user", "content": "--- a/models/AdmOuPrgList.php\n+++ b/models/AdmOuPrgList.php\n@@ -1 +1 @@\n-old\n+new"},
+            {"role": "tool", "name": "read_file", "content": "source evidence"},
+        ]
+
+        finalized = _coding_finalization_messages(messages, proposal_required=True)
+
+        self.assertIn(original_request, finalized[1]["content"])
+        self.assertIn("do not merely summarize or repeat it", finalized[0]["content"])
 
     def test_proposal_prompt_has_explicit_git_diff_example_and_stronger_retry(self):
         instruction = _proposal_prompt_instruction()
@@ -626,14 +704,16 @@ class CodingConversationBudgetTests(unittest.TestCase):
         self.assertEqual(CODING_MAX_COMPLETION_TOKENS, 1024)
 
     def test_provider_repo_browser_alias_uses_the_confined_read_file_tool(self):
-        name, arguments = _validate_tool_call({
-            "function": {
-                "name": "repo_browser.read_file",
-                "arguments": "{\"path\":\"modules/academic/controller.js\"}",
-            },
-        })
+        for tool_name in ("open_file", "repo_browser.read_file", "repo_browser.open_file"):
+            with self.subTest(tool_name=tool_name):
+                name, arguments = _validate_tool_call({
+                    "function": {
+                        "name": tool_name,
+                        "arguments": "{\"path\":\"modules/academic/controller.js\"}",
+                    },
+                })
 
-        self.assertEqual((name, arguments), ("read_file", {"relativePath": "modules/academic/controller.js"}))
+                self.assertEqual((name, arguments), ("read_file", {"relativePath": "modules/academic/controller.js"}))
         self.assertEqual(MAX_CODING_TOOL_ROUNDS, 7)
 
 
@@ -667,9 +747,516 @@ class CodingProviderNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["reasoning_content"], "thinking")
 
 
+class CodingProviderToolChoiceTests(unittest.TestCase):
+    def test_openai_compatible_coding_requests_explicitly_allow_needed_tools(self):
+        for provider_type, model, base_url in (
+            ("groq", "openai/gpt-oss-20b", "https://api.groq.com/openai/v1"),
+            ("gemini", "gemini-3.6-flash", "https://generativelanguage.googleapis.com/v1beta/openai"),
+        ):
+            with self.subTest(provider=provider_type), tempfile.TemporaryDirectory() as temporary_directory:
+                registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+                provider = registry.add_provider(provider_type, model, base_url, "test-key")
+                client = Mock()
+                client.chat.completions.create.return_value.choices = [
+                    SimpleNamespace(message=SimpleNamespace(model_dump=lambda exclude_none: {
+                        "role": "assistant",
+                        "content": "I will inspect the relevant files.",
+                    })),
+                ]
+
+                with patch("coding_provider.OpenAI", return_value=client):
+                    message, selected_provider = complete_coding_model(
+                        registry,
+                        Path("unused-provider-config.json"),
+                        [{"role": "user", "content": "Search for duplicate queries."}],
+                        [{"type": "function", "function": {"name": "search_code"}}],
+                    )
+
+                request = client.chat.completions.create.call_args.kwargs
+                self.assertEqual(request["tool_choice"], "auto")
+                self.assertTrue(request["tools"])
+                self.assertEqual(selected_provider.id, provider.id)
+                self.assertEqual(message["content"], "I will inspect the relevant files.")
+
+    def test_openai_compatible_finalization_does_not_send_tool_choice(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            registry.add_provider("groq", "openai/gpt-oss-20b", "https://api.groq.com/openai/v1", "test-key")
+            client = Mock()
+            client.chat.completions.create.return_value.choices = [
+                SimpleNamespace(message=SimpleNamespace(model_dump=lambda exclude_none: {
+                    "role": "assistant",
+                    "content": "Final answer.",
+                })),
+            ]
+
+            with patch("coding_provider.OpenAI", return_value=client):
+                complete_coding_model(
+                    registry,
+                    Path("unused-provider-config.json"),
+                    [{"role": "user", "content": "Summarize the inspected code."}],
+                    None,
+                )
+
+        self.assertNotIn("tool_choice", client.chat.completions.create.call_args.kwargs)
+
+    def test_openai_compatible_proposal_inspection_requires_a_tool_call(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            registry.add_provider("groq", "openai/gpt-oss-20b", "https://api.groq.com/openai/v1", "test-key")
+            client = Mock()
+            client.chat.completions.create.return_value.choices = [
+                SimpleNamespace(message=SimpleNamespace(model_dump=lambda exclude_none: {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "read-1", "function": {
+                        "name": "read_file",
+                        "arguments": "{\"relativePath\":\"models/AdmOuPrgList.php\"}",
+                    }}],
+                })),
+            ]
+
+            with patch("coding_provider.OpenAI", return_value=client):
+                message, _ = complete_coding_model(
+                    registry,
+                    Path("unused-provider-config.json"),
+                    [{"role": "user", "content": "Prepare a proposal."}],
+                    [{"type": "function", "function": {"name": "read_file"}}],
+                    require_tool_call=True,
+                )
+
+        self.assertEqual(client.chat.completions.create.call_args.kwargs["tool_choice"], "required")
+        self.assertTrue(message["tool_calls"])
+
+    def test_required_tool_refusal_retries_with_auto_instead_of_aborting_request(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            registry.add_provider("groq", "openai/gpt-oss-20b", "https://api.groq.com/openai/v1", "test-key")
+            client = Mock()
+            client.chat.completions.create.side_effect = [
+                RuntimeError("Tool choice is required, but model did not call a tool"),
+                SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(model_dump=lambda exclude_none: {
+                    "role": "assistant",
+                    "content": "Please specify which file you want me to inspect.",
+                }))]),
+            ]
+
+            with patch("coding_provider.OpenAI", return_value=client):
+                message, provider = complete_coding_model(
+                    registry,
+                    Path("unused-provider-config.json"),
+                    [{"role": "user", "content": "Read the relevant source file."}],
+                    [{"type": "function", "function": {"name": "read_file"}}],
+                    require_tool_call=True,
+                )
+
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertEqual(client.chat.completions.create.call_args_list[0].kwargs["tool_choice"], "required")
+        self.assertEqual(client.chat.completions.create.call_args_list[1].kwargs["tool_choice"], "auto")
+        self.assertIn("specify which file", message["content"])
+        self.assertEqual(provider.type, "groq")
+
+    def test_native_gemini_coding_requests_explicitly_use_auto_function_calling(self):
+        provider = SimpleNamespace(
+            type="gemini",
+            model="gemini-3.6-flash",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+        response = Mock()
+        response.json.return_value = {
+            "candidates": [{
+                "content": {"parts": [{"text": "I will inspect the project."}]},
+            }],
+        }
+        tool = {"function": {"name": "search_code", "parameters": {"type": "object", "properties": {}}}}
+
+        with patch("coding_provider.httpx.post", return_value=response) as post:
+            _gemini_request(
+                provider,
+                "test-key",
+                [{"role": "user", "content": "Search for duplicate queries."}],
+                [tool],
+            )
+
+        request = post.call_args.kwargs["json"]
+        self.assertEqual(request["toolConfig"], {"functionCallingConfig": {"mode": "AUTO"}})
+
+    def test_native_gemini_proposal_inspection_requires_a_function_call(self):
+        provider = SimpleNamespace(
+            type="gemini",
+            model="gemini-3.6-flash",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+        response = Mock()
+        response.json.return_value = {"candidates": [{"content": {"parts": []}}]}
+        tool = {"function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}}
+
+        with patch("coding_provider.httpx.post", return_value=response) as post:
+            _gemini_request(
+                provider,
+                "test-key",
+                [{"role": "user", "content": "Prepare a proposal."}],
+                [tool],
+                require_tool_call=True,
+            )
+
+        self.assertEqual(
+            post.call_args.kwargs["json"]["toolConfig"],
+            {"functionCallingConfig": {"mode": "ANY"}},
+        )
+
+    def test_anthropic_proposal_inspection_requires_a_tool_call(self):
+        provider = SimpleNamespace(
+            type="anthropic",
+            model="claude-test",
+            base_url="https://api.anthropic.com/v1",
+        )
+        response = Mock()
+        response.json.return_value = {"content": []}
+        tool = {"function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}}
+
+        with patch("coding_provider.httpx.post", return_value=response) as post:
+            _anthropic_request(
+                provider,
+                "test-key",
+                [{"role": "user", "content": "Prepare a proposal."}],
+                [tool],
+                require_tool_call=True,
+            )
+
+        self.assertEqual(post.call_args.kwargs["json"]["tool_choice"], {"type": "any"})
+
+
 class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ambiguous_proposal_request_returns_clarification_without_http_tool_choice_failure(self):
+        sent = []
+        configured_provider = SimpleNamespace(id="global-gemini-instance")
+        runtime_provider = SimpleNamespace(
+            id="groq-fallback-instance",
+            type="groq",
+            model="openai/gpt-oss-20b",
+        )
+
+        async def send_json(payload):
+            sent.append(payload)
+
+        with patch(
+            "coding_websocket.complete_coding_model",
+            return_value=(
+                {"role": "assistant", "content": "Could you specify which file or issue you'd like to address?"},
+                runtime_provider,
+            ),
+        ) as complete:
+            await _run_coding_turn(
+                {
+                    "requestId": "proposal-clarification",
+                    "scope": ".",
+                    "providerId": "stale-client-provider",
+                    "messages": [{"role": "user", "content": "fix ka proposal/diff banao"}],
+                },
+                send_json,
+                {"pending": {}, "completed": {}, "tasks": set()},
+                SimpleNamespace(get_active_provider=lambda: configured_provider),
+                Path("provider-config.json"),
+            )
+
+        done = next(message for message in sent if message.get("type") == "done")
+        self.assertEqual(done["content"], "Could you specify which file or issue you'd like to address?")
+        self.assertFalse(done["proposalRequired"])
+        self.assertEqual(done["providerId"], runtime_provider.id)
+        self.assertEqual(done["configuredProviderId"], configured_provider.id)
+        self.assertTrue(done["fallback"])
+        self.assertIsNone(complete.call_args.args[4], "Client-supplied provider IDs must not override global selection.")
+        self.assertFalse(complete.call_args.args[5], "The first turn must not force a tool call.")
+
+    async def test_coding_turn_ignores_stale_client_provider_and_pins_actual_runtime_instance(self):
+        sent = []
+        active_provider = SimpleNamespace(id="global-gemini-instance")
+        runtime_provider = SimpleNamespace(
+            id="global-gemini-instance",
+            type="gemini",
+            model="gemini-3.6-flash",
+        )
+        responses = iter([
+            ({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "read-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"relativePath": "src/example.py"}),
+                    },
+                }],
+            }, runtime_provider),
+            ({"role": "assistant", "content": "The inspected file declares the requested function."}, runtime_provider),
+        ])
+
+        async def send_json(payload):
+            sent.append(payload)
+
+        with patch(
+            "coding_websocket.complete_coding_model",
+            side_effect=lambda *args, **kwargs: next(responses),
+        ) as complete, patch(
+            "coding_websocket._wait_for_tool",
+            new=AsyncMock(return_value={
+                "ok": True,
+                "data": {"path": "src/example.py", "content": "def target():\n    return None\n"},
+            }),
+        ):
+            await _run_coding_turn(
+                {
+                    "requestId": "coding-provider-pin",
+                    "scope": ".",
+                    "providerId": "stale-groq-instance",
+                    "messages": [{"role": "user", "content": "Explain the target function."}],
+                },
+                send_json,
+                {"pending": {}, "completed": {}, "tasks": set()},
+                SimpleNamespace(get_active_provider=lambda: active_provider),
+                Path("provider-config.json"),
+            )
+
+        done = next(message for message in sent if message.get("type") == "done")
+        self.assertEqual(complete.call_args_list[0].args[4], None)
+        self.assertEqual(complete.call_args_list[1].args[4], runtime_provider.id)
+        self.assertEqual(done["providerId"], runtime_provider.id)
+        self.assertEqual(done["provider"], "gemini")
+        self.assertEqual(done["model"], "gemini-3.6-flash")
+        self.assertFalse(done["fallback"])
+
+    async def test_proposal_search_is_followed_by_a_required_source_read(self):
+        provider = SimpleNamespace(type="groq", model="test-model")
+        diff = (
+            "--- a/models/AdmOuPrgList.php\n"
+            "+++ b/models/AdmOuPrgList.php\n"
+            "@@ -1 +1 @@\n"
+            "-return $query->all();\n"
+            "+return $query->all();\n"
+        )
+        responses = iter([
+            ({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "search-1",
+                    "function": {"name": "search_code", "arguments": "{\"query\":\"getProgrammes\"}"},
+                }],
+            }, provider),
+            ({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "read-1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"relativePath\":\"models/AdmOuPrgList.php\"}",
+                    },
+                }],
+            }, provider),
+            ({"role": "assistant", "content": diff}, provider),
+        ])
+        state = {"pending": {}, "completed": {}, "tasks": set()}
+        sent = []
+
+        async def send_json(payload):
+            sent.append(payload)
+            if payload.get("type") != "tool_call":
+                return
+            tool_name = payload["name"]
+            data = (
+                {"results": [{"path": "models/AdmOuPrgList.php"}]}
+                if tool_name == "search_code"
+                else {"path": "models/AdmOuPrgList.php", "content": "<?php\nreturn $query->all();\n"}
+            )
+            state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
+                "ok": True,
+                "tool": tool_name,
+                "data": data,
+            }
+
+        with patch("coding_websocket.complete_coding_model", side_effect=lambda *args, **kwargs: next(responses)) as complete:
+            await _run_coding_turn(
+                {
+                    "requestId": "proposal-must-read",
+                    "scope": ".",
+                    "messages": [{"role": "user", "content": "Fix the duplicate query and prepare a proposal."}],
+                },
+                send_json,
+                state,
+                object(),
+                Path("provider-config.json"),
+            )
+
+        self.assertEqual([call["name"] for call in next(
+            event for event in sent if event.get("type") == "done"
+        )["toolCalls"]], ["search_code", "read_file"])
+        read_attempt = complete.call_args_list[1]
+        self.assertEqual([tool["function"]["name"] for tool in read_attempt.args[3]], ["read_file"])
+        self.assertTrue(read_attempt.args[5])
+
+    async def test_duplicate_successful_tool_read_uses_cached_evidence_and_finalizes(self):
+        provider = SimpleNamespace(type="groq", model="test-model")
+        duplicate_read = {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "read-source",
+                "function": {
+                    "name": "read_file",
+                    "arguments": "{\"relativePath\":\"models/AdmOuPrgList.php\"}",
+                },
+            }],
+        }
+        diff = (
+            "--- a/models/AdmOuPrgList.php\n"
+            "+++ b/models/AdmOuPrgList.php\n"
+            "@@ -1 +1 @@\n"
+            "-return $query->all();\n"
+            "+return $query->all();\n"
+        )
+        responses = iter([
+            (duplicate_read, provider),
+            ({**duplicate_read, "tool_calls": [{**duplicate_read["tool_calls"][0], "id": "read-source-again"}]}, provider),
+            ({"role": "assistant", "content": diff}, provider),
+        ])
+        state = {"pending": {}, "completed": {}, "tasks": set()}
+        sent = []
+
+        async def send_json(payload):
+            sent.append(payload)
+            if payload.get("type") == "tool_call":
+                state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
+                    "ok": True,
+                    "tool": "read_file",
+                    "data": {
+                        "path": "models/AdmOuPrgList.php",
+                        "content": "<?php\nreturn $query->all();\n",
+                    },
+                }
+
+        with patch(
+            "coding_websocket.complete_coding_model",
+            side_effect=lambda *args, **kwargs: next(responses),
+        ) as complete:
+            await _run_coding_turn(
+                {
+                    "requestId": "proposal-duplicate-read",
+                    "scope": "models",
+                    "messages": [{
+                        "role": "user",
+                        "content": "Fix the duplicate query and prepare a proposal.",
+                    }],
+                },
+                send_json,
+                state,
+                object(),
+                Path("provider-config.json"),
+            )
+
+        done = next(event for event in sent if event.get("type") == "done")
+        self.assertEqual(done["content"], diff.strip())
+        self.assertTrue(done["proposalRequired"])
+        self.assertEqual(len([event for event in sent if event.get("type") == "tool_call"]), 1)
+        self.assertEqual(complete.call_count, 3)
+        finalization_messages = complete.call_args_list[-1].args[2]
+        self.assertIn("return $query->all()", finalization_messages[1]["content"])
+
+    async def test_follow_up_diff_is_treated_as_an_active_proposal_request(self):
+        diff = "--- a/models/AdmOuPrgList.php\n+++ b/models/AdmOuPrgList.php\n@@ -1 +1 @@\n-old\n+new"
+        provider = SimpleNamespace(type="groq", model="test-model")
+        sent = []
+
+        messages = [
+            {"role": "user", "content": "Fix the duplicate query in getProgrammes and prepare a proposal."},
+            {"role": "assistant", "content": "I found repeated query work in the method."},
+            {"role": "user", "content": diff},
+        ]
+        responses = iter([
+            ({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "read-source",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"relativePath\":\"models/AdmOuPrgList.php\"}",
+                    },
+                }],
+            }, provider),
+            ({"role": "assistant", "content": diff}, provider),
+        ])
+
+        async def send_json(payload):
+            sent.append(payload)
+            if payload.get("type") == "tool_call":
+                state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
+                    "ok": True,
+                    "data": {
+                        "path": "models/AdmOuPrgList.php",
+                        "content": "<?php\nfunction getProgrammes() { return []; }\n",
+                    },
+                }
+
+        state = {"pending": {}, "completed": {}, "tasks": set()}
+        with patch("coding_websocket.complete_coding_model", side_effect=lambda *args, **kwargs: next(responses)) as complete:
+            await _run_coding_turn(
+                {"requestId": "proposal-follow-up", "scope": ".", "messages": messages},
+                send_json,
+                state,
+                object(),
+                Path("provider-config.json"),
+            )
+
+        done = next(message for message in sent if message.get("type") == "done")
+        self.assertTrue(done["proposalRequired"])
+        self.assertEqual(done["content"], diff)
+        prompt = complete.call_args.args[2]
+        self.assertIn("active change request", prompt[0]["content"])
+        self.assertIn(messages[0]["content"], prompt[1]["content"])
+        self.assertIn("do not merely summarize or repeat it", prompt[0]["content"])
+        first_call = complete.call_args_list[0]
+        self.assertFalse(first_call.kwargs.get("require_tool_call", False), "The initial call must allow tool discovery or a clarification answer.")
+        self.assertFalse(
+            complete.call_args_list[1].kwargs.get("require_tool_call", False),
+            "Once the required source was read, tool calling must be optional again.",
+        )
+
+    async def test_proposal_without_file_inspection_fails_instead_of_claiming_no_changes(self):
+        sent = []
+
+        async def send_json(payload):
+            sent.append(payload)
+
+        with patch(
+            "coding_websocket.complete_coding_model",
+            return_value=({"role": "assistant", "content": "NO_CHANGES"}, SimpleNamespace(type="groq", model="test-model")),
+        ) as complete:
+            await _run_coding_turn(
+                {
+                    "requestId": "proposal-needs-evidence",
+                    "scope": ".",
+                    "messages": [{"role": "user", "content": "Fix the duplicate query and prepare a proposal."}],
+                },
+                send_json,
+                {"pending": {}, "completed": {}, "tasks": set()},
+                object(),
+                Path("provider-config.json"),
+            )
+
+        error = next(message for message in sent if message.get("type") == "error")
+        self.assertIn("could not read any project source file", error["message"])
+        self.assertTrue(complete.call_args.args[5])
+
     async def test_invalid_proposal_format_gets_one_strict_retry_and_redacted_diagnostic(self):
         responses = iter([
+            ({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "read-1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"relativePath\":\"src/academic.js\"}",
+                    },
+                }],
+            }, SimpleNamespace(type="groq", model="test-model")),
             ({"role": "assistant", "content": "I recommend reusing the existing query result."}, SimpleNamespace(type="groq", model="test-model")),
             ({
                 "role": "assistant",
@@ -682,8 +1269,14 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
 
         async def send_json(payload):
             sent.append(payload)
+            if payload.get("type") == "tool_call":
+                state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
+                    "ok": True,
+                    "data": {"path": "src/academic.js", "content": "const items = load();\n"},
+                }
 
         output = io.StringIO()
+        state = {"pending": {}, "completed": {}, "tasks": set()}
         with patch("coding_websocket.complete_coding_model", side_effect=lambda *args, **kwargs: next(responses)):
             with contextlib.redirect_stdout(output):
                 await _run_coding_turn(
@@ -693,7 +1286,7 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
                         "messages": [{"role": "user", "content": "Fix repeated academic queries."}],
                     },
                     send_json,
-                    {"pending": {}, "completed": {}, "tasks": set()},
+                    state,
                     object(),
                     Path("provider-config.json"),
                 )
@@ -709,7 +1302,7 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
 class LegacyNodeMigrationCoverageTests(unittest.TestCase):
     def test_shared_registry_replaces_legacy_gemini_capability_lookup(self):
         self.assertEqual(
-            provider_capability_states("gemini", "gemini-2.0-flash")["toolCalling"],
+            provider_capability_states("gemini", "gemini-3.6-flash")["toolCalling"],
             "SUPPORTED",
         )
         self.assertEqual(
@@ -729,14 +1322,23 @@ class LegacyNodeMigrationCoverageTests(unittest.TestCase):
             "UNKNOWN",
         )
 
-    def test_coding_provider_candidates_follow_registry_priority_and_configuration(self):
+    def test_coding_provider_candidates_follow_global_active_provider_and_fallback_setting(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            config_path = Path(temporary_directory) / "provider-config.json"
+            registry = ProviderRegistry(str(config_path))
             gemini = registry.add_provider(
                 "gemini",
                 "gemini-3.6-flash",
                 "https://generativelanguage.googleapis.com/v1beta",
                 "gemini-test-value",
+            )
+            gemini_second = registry.add_provider(
+                "gemini",
+                "gemini-3.6-flash",
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-second-test-value",
+                label="Gemini second instance",
+                create_new=True,
             )
             groq = registry.add_provider(
                 "groq",
@@ -751,12 +1353,174 @@ class LegacyNodeMigrationCoverageTests(unittest.TestCase):
                 "openai-test-value",
             )
             registry.set_provider_enabled(disabled.id, False)
-            registry.reorder_providers([groq.id, gemini.id, disabled.id])
+            registry.set_active_provider(gemini_second.id)
 
             candidates = _candidates(registry)
+            self.assertEqual([provider.id for provider in candidates], [gemini_second.id, gemini.id, groq.id])
 
-        self.assertEqual([provider.id for provider in candidates], [groq.id, gemini.id])
-        self.assertEqual(candidates[0].id, registry.active_provider_id)
+            registry.fallback_enabled = False
+            candidates_without_fallback = _candidates(registry)
+            self.assertEqual([provider.id for provider in candidates_without_fallback], [gemini_second.id])
+
+            registry.save_to_file()
+            restarted = ProviderRegistry(str(config_path))
+            restarted.initialize({}, {})
+            self.assertEqual(restarted.active_provider_id, gemini_second.id)
+            self.assertEqual([provider.id for provider in _candidates(restarted)], [gemini_second.id])
+
+            restarted.set_active_provider(groq.id)
+            self.assertEqual([provider.id for provider in _candidates(restarted)], [groq.id])
+
+    def test_coding_runtime_uses_the_exact_global_provider_instance_credentials_and_model(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            first = registry.add_provider(
+                "groq",
+                "openai/gpt-oss-20b",
+                "https://api.groq.com/openai/v1",
+                "first-instance-key",
+                label="Groq first",
+            )
+            selected = registry.add_provider(
+                "groq",
+                "llama-3.3-70b-versatile",
+                "https://api.groq.com/openai/v1",
+                "selected-instance-key",
+                label="Groq selected",
+                create_new=True,
+            )
+            registry.set_active_provider(selected.id)
+            registry.fallback_enabled = False
+            client = Mock()
+            client.chat.completions.create.return_value.choices = [
+                SimpleNamespace(message=SimpleNamespace(model_dump=lambda exclude_none: {
+                    "role": "assistant",
+                    "content": "Selected instance response.",
+                })),
+            ]
+
+            with patch("coding_provider.OpenAI", return_value=client) as openai_client:
+                message, runtime_provider = complete_coding_model(
+                    registry,
+                    Path("unused-provider-config.json"),
+                    [{"role": "user", "content": "Check the active configured provider."}],
+                )
+
+        self.assertEqual(runtime_provider.id, selected.id)
+        self.assertNotEqual(runtime_provider.id, first.id)
+        self.assertEqual(runtime_provider.model, "llama-3.3-70b-versatile")
+        self.assertEqual(message["content"], "Selected instance response.")
+        self.assertEqual(openai_client.call_args.kwargs["api_key"], "selected-instance-key")
+        self.assertEqual(
+            client.chat.completions.create.call_args.kwargs["model"],
+            "llama-3.3-70b-versatile",
+        )
+
+    def test_coding_runtime_tracks_global_provider_switches_with_provider_specific_adapters(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            groq = registry.add_provider(
+                "groq",
+                "openai/gpt-oss-20b",
+                "https://api.groq.com/openai/v1",
+                "groq-instance-key",
+            )
+            gemini = registry.add_provider(
+                "gemini",
+                "gemini-3.6-flash",
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-instance-key",
+                create_new=True,
+            )
+            registry.fallback_enabled = False
+            tool = {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a project file.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            groq_client = Mock()
+            groq_client.chat.completions.create.return_value.choices = [
+                SimpleNamespace(message=SimpleNamespace(model_dump=lambda exclude_none: {
+                    "role": "assistant",
+                    "content": "Groq response.",
+                })),
+            ]
+            gemini_response = Mock()
+            gemini_response.json.return_value = {
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "functionCall": {
+                                "name": "read_file",
+                                "args": {"relativePath": "src/example.py"},
+                            },
+                        }],
+                    },
+                }],
+            }
+
+            registry.set_active_provider(groq.id)
+            with patch("coding_provider.OpenAI", return_value=groq_client) as openai_client:
+                groq_message, groq_runtime = complete_coding_model(
+                    registry,
+                    Path("unused-provider-config.json"),
+                    [{"role": "user", "content": "Inspect the project."}],
+                    [tool],
+                )
+            registry.set_active_provider(gemini.id)
+            with patch("coding_provider.httpx.post", return_value=gemini_response) as gemini_post:
+                gemini_message, gemini_runtime = complete_coding_model(
+                    registry,
+                    Path("unused-provider-config.json"),
+                    [{"role": "user", "content": "Inspect the project."}],
+                    [tool],
+                )
+
+        self.assertEqual(groq_runtime.id, groq.id)
+        self.assertEqual(groq_runtime.model, "openai/gpt-oss-20b")
+        self.assertEqual(openai_client.call_args.kwargs["api_key"], "groq-instance-key")
+        self.assertEqual(groq_client.chat.completions.create.call_args.kwargs["model"], "openai/gpt-oss-20b")
+        self.assertEqual(groq_client.chat.completions.create.call_args.kwargs["tools"], [tool])
+        self.assertEqual(groq_message["content"], "Groq response.")
+        self.assertEqual(gemini_runtime.id, gemini.id)
+        self.assertEqual(gemini_runtime.model, "gemini-3.6-flash")
+        self.assertEqual(gemini_post.call_args.args[0], "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent")
+        self.assertEqual(gemini_post.call_args.kwargs["headers"]["x-goog-api-key"], "gemini-instance-key")
+        self.assertEqual(gemini_post.call_args.kwargs["json"]["tools"][0]["functionDeclarations"][0]["name"], "read_file")
+        self.assertEqual(len(gemini_message["tool_calls"]), 1)
+
+    def test_coding_provider_rejects_invalid_or_unavailable_global_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            provider = registry.add_provider(
+                "groq",
+                "openai/gpt-oss-20b",
+                "https://api.groq.com/openai/v1",
+                "test-key",
+            )
+            registry.set_api_key(provider.id, "")
+            with patch("coding_provider.resolve_api_key", return_value=""):
+                with self.assertRaisesRegex(RuntimeError, "no API key is available"):
+                    complete_coding_model(
+                        registry,
+                        Path("unused-provider-config.json"),
+                        [{"role": "user", "content": "Check configuration."}],
+                    )
+
+            with self.assertRaisesRegex(RuntimeError, "no longer configured"):
+                _candidates(registry, "removed-provider-instance")
+
+            provider.model = "unsupported-model"
+            self.assertEqual(_candidates(registry), [])
+            with self.assertRaisesRegex(RuntimeError, "No provider is configured"):
+                complete_coding_model(
+                    registry,
+                    Path("unused-provider-config.json"),
+                    [{"role": "user", "content": "Check invalid model handling."}],
+                )
 
     def test_coding_gemini_adapter_preserves_request_tool_and_error_contracts(self):
         signature = "opaque-migration-thought-signature"
@@ -929,7 +1693,13 @@ class LegacyNodeMigrationCoverageTests(unittest.TestCase):
         initial_messages = complete.call_args_list[0].args[2]
         self.assertIn("Never write files", initial_messages[0]["content"])
         self.assertIn("When multiple plausible targets remain", initial_messages[0]["content"])
+        self.assertIn("trace the existing execution path", initial_messages[0]["content"])
+        self.assertIn("explicitly preserve existing behavior outside the requested fix", initial_messages[0]["content"])
+        self.assertIn("never claim which query is actually fastest or slowest from source code alone", initial_messages[0]["content"])
+        self.assertIn("actual ranking requires database execution plans or profiling", initial_messages[0]["content"])
         self.assertIn("Current optional scope: src", initial_messages[1]["content"])
+        initial_plan = next(event["plan"] for event in events if event.get("phase") == "understanding")
+        self.assertTrue(any("callers, callees, and data/state" in step for step in initial_plan["steps"]))
         final_messages = complete.call_args_list[-1].args[2]
         self.assertTrue(any(
             item.get("role") == "tool" and "query = load_records()" in str(item.get("content"))
@@ -945,6 +1715,16 @@ class ProviderModelValidationTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def test_gemini_environment_preset_uses_shared_registry_default(self):
+        self.assertEqual(
+            PROVIDER_PRESETS["gemini"]["model"],
+            PROVIDER_REGISTRY["gemini"]["defaultModel"],
+        )
+        self.assertEqual(
+            PROVIDER_PRESETS["gemini"]["baseURL"],
+            PROVIDER_REGISTRY["gemini"]["baseURL"],
+        )
 
     def test_invalid_provider_model_pair_is_rejected_before_registry_mutation(self):
         with self.assertRaisesRegex(ValueError, "not supported by the selected provider"):
@@ -1127,8 +1907,9 @@ class ProviderModelValidationTests(unittest.TestCase):
         self.assertEqual(loaded.get_api_key("groq-legacy"), "")
         self.assertEqual(legacy.to_dict()["configurationError"]["code"], "MODEL_NOT_SUPPORTED_BY_PROVIDER")
 
-    def test_retired_gemini_models_are_retained_but_excluded_from_runtime(self):
-        for model in ("gemini-1.5-pro", "gemini-1.5-flash"):
+    def test_retired_gemini_models_migrate_to_the_shared_default_on_restart(self):
+        default_model = PROVIDER_REGISTRY["gemini"]["defaultModel"]
+        for model in ("gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-pro", "gemini-2.5-flash"):
             provider_id = f"gemini-legacy-{model.rsplit('-', 1)[-1]}"
             self.config_path.write_text(json.dumps({
                 "providers": [{
@@ -1139,7 +1920,7 @@ class ProviderModelValidationTests(unittest.TestCase):
                     "enabled": True,
                     "priority": 1,
                     "hasApiKey": True,
-                    "status": "CONFIGURED",
+                    "status": "CONFIGURATION_INVALID",
                 }],
                 "activeProvider": provider_id,
             }), encoding="utf-8")
@@ -1149,13 +1930,14 @@ class ProviderModelValidationTests(unittest.TestCase):
             legacy = loaded.get_provider(provider_id)
 
             self.assertIsNotNone(legacy)
-            self.assertEqual(legacy.status, ProviderStatus.CONFIGURATION_INVALID)
-            self.assertEqual(legacy.model, model)
-            self.assertEqual(loaded.get_eligible_providers(), [])
-            self.assertEqual(
-                legacy.to_dict()["configurationError"]["code"],
-                "MODEL_NOT_SUPPORTED_BY_PROVIDER",
-            )
+            self.assertEqual(legacy.status, ProviderStatus.CONFIGURED)
+            self.assertEqual(legacy.model, default_model)
+            self.assertTrue(legacy.has_api_key)
+            self.assertEqual([item.id for item in loaded.get_eligible_providers()], [provider_id])
+            persisted_provider = json.loads(self.config_path.read_text(encoding="utf-8"))["providers"][0]
+            self.assertEqual(persisted_provider["id"], provider_id)
+            self.assertEqual(persisted_provider["model"], default_model)
+            self.assertNotIn("apiKey", persisted_provider)
 
     def test_both_provider_save_routes_reject_before_persisting(self):
         import index
@@ -1437,31 +2219,35 @@ class ProviderSecretLifecycleTests(unittest.TestCase):
         self.assertEqual(restored["provider"]["id"], provider.id)
         self.assertTrue(restored["provider"]["hasApiKey"])
 
-    def test_retired_model_secret_rehydration_preserves_invalid_state_and_identity(self):
+    def test_retired_model_secret_rehydration_preserves_identity_after_model_migration(self):
         import index
 
-        invalid = ProviderRegistry(str(self.config_path))
-        provider = ProviderInstance(
-            "gemini-retired",
-            "gemini",
-            "gemini-1.5-flash",
-            "https://generativelanguage.googleapis.com/v1beta",
-            enabled=True,
-            has_api_key=True,
-            status=ProviderStatus.CONFIGURATION_INVALID,
-        )
-        provider.configuration_error = provider_model_error(provider.type, provider.model, provider.base_url)
-        invalid.providers[provider.id] = provider
+        self.config_path.write_text(json.dumps({
+            "providers": [{
+                "id": "gemini-retired",
+                "type": "gemini",
+                "model": "gemini-2.0-pro",
+                "baseURL": "https://generativelanguage.googleapis.com/v1beta",
+                "enabled": True,
+                "priority": 1,
+                "hasApiKey": True,
+                "status": "CONFIGURATION_INVALID",
+            }],
+            "activeProvider": "gemini-retired",
+        }), encoding="utf-8")
+        restarted = ProviderRegistry(str(self.config_path))
+        restarted.initialize({}, {})
+        provider = restarted.get_provider("gemini-retired")
 
-        with patch.object(index, "registry", invalid):
+        with patch.object(index, "registry", restarted):
             restored = index.update_provider(provider.id, {"apiKey": "rehydrated-test-secret"})
             restored_has_api_key = index.provider_response_data(provider)["hasApiKey"]
 
         self.assertTrue(restored_has_api_key)
-        self.assertEqual(invalid.get_api_key(provider.id), "rehydrated-test-secret")
-        self.assertEqual(provider.model, "gemini-1.5-flash")
-        self.assertEqual(provider.status, ProviderStatus.CONFIGURATION_INVALID)
-        self.assertIsNotNone(provider.configuration_error)
+        self.assertEqual(restarted.get_api_key(provider.id), "rehydrated-test-secret")
+        self.assertEqual(provider.model, PROVIDER_REGISTRY["gemini"]["defaultModel"])
+        self.assertEqual(provider.status, ProviderStatus.CONFIGURED)
+        self.assertIsNone(provider.configuration_error)
         self.assertEqual(restored["provider"]["id"], provider.id)
         self.assertTrue(restored["provider"]["hasApiKey"])
         self.assertNotIn("rehydrated-test-secret", self.config_path.read_text(encoding="utf-8"))
@@ -1667,7 +2453,7 @@ class ProviderDiagnosticCaptureTests(unittest.TestCase):
 
         provider = self.registry.add_provider(
             "gemini",
-            "gemini-2.5-flash",
+            "gemini-3.6-flash",
             "https://generativelanguage.googleapis.com/v1beta",
             "gemini-model-catalog-test-key",
         )
@@ -1676,7 +2462,7 @@ class ProviderDiagnosticCaptureTests(unittest.TestCase):
             json=lambda: {
                 "models": [
                     {
-                        "name": "models/gemini-2.5-flash",
+                        "name": "models/gemini-3.6-flash",
                         "supportedGenerationMethods": ["generateContent", "countTokens"],
                     },
                     {
@@ -1692,7 +2478,7 @@ class ProviderDiagnosticCaptureTests(unittest.TestCase):
             result = index.list_provider_models(provider.id)
 
         self.assertEqual(result["models"], [{
-            "id": "gemini-2.5-flash",
+            "id": "gemini-3.6-flash",
             "supportedGenerationMethods": ["generateContent", "countTokens"],
         }])
         self.assertEqual(get.call_args.args[0], f"{provider.base_url}/models")
@@ -1705,7 +2491,7 @@ class ProviderDiagnosticCaptureTests(unittest.TestCase):
 
         provider = self.registry.add_provider(
             "gemini",
-            "gemini-2.5-flash",
+            "gemini-3.6-flash",
             "https://generativelanguage.googleapis.com/v1beta",
             "gemini-model-catalog-test-key",
         )
