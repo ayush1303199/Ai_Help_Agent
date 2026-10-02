@@ -2,11 +2,29 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { developer: developerSettings } = require('../src/config/runtimeSettings.json');
+const { taskOrchestrator } = require('./coding-pipeline/orchestrator.cjs');
+const { artifactEngine, ARTIFACT_TYPES } = require('./coding-pipeline/artifacts.cjs');
+const { devServerManager } = require('./coding-pipeline/environment.cjs');
+const { browserVerifier } = require('./coding-pipeline/browserVerifier.cjs');
+const { multiRepoCoordinator } = require('./coding-pipeline/multiRepo.cjs');
+const { verificationOrchestrator } = require('./coding-pipeline/verificationOrchestrator.cjs');
+const { skillSystem } = require('./coding-pipeline/skillSystem.cjs');
+const { mcpToolAdapter } = require('./coding-pipeline/mcpAdapter.cjs');
+const { routeTaskMode, OPERATING_MODES, MODE_SPECIFICATIONS, COMPLEXITY_LEVELS } = require('./coding-pipeline/modes.cjs');
+const { dirtyWorktreeProtector } = require('./coding-pipeline/dirtyWorktree.cjs');
+const {
+  correctnessOracle,
+  patchQualityEngine,
+  diffReviewer,
+  mutationHarness,
+  defectClassifier,
+  edgeCaseValidator,
+} = require('./coding-pipeline/correctnessEngine.cjs');
 
 const STATES = Object.freeze([
   'idle', 'reading', 'understanding', 'proposal_ready', 'awaiting_approval',
   'approved', 'applying', 'verifying', 'completed', 'recovering', 'failed',
-  'cancelled', 'undone',
+  'cancelled', 'undone', 'paused', 'executing', 'blocked',
 ]);
 // Internal states are intentionally stable; these aliases make the contract
 // readable to callers that use the lifecycle terminology from the design.
@@ -19,6 +37,9 @@ const STATE_ALIASES = Object.freeze({
   recovering: 'DIAGNOSING',
   failed: 'FIX_PROPOSING',
   undone: 'RETESTING',
+  paused: 'PAUSED',
+  executing: 'EXECUTING',
+  blocked: 'BLOCKED',
 });
 const transitions = {
   idle: ['reading', 'proposal_ready', 'cancelled'],
@@ -26,12 +47,15 @@ const transitions = {
   understanding: ['proposal_ready', 'reading', 'failed', 'cancelled'],
   proposal_ready: ['awaiting_approval', 'failed', 'cancelled'],
   awaiting_approval: ['approved', 'verifying', 'failed', 'cancelled'],
-  approved: ['applying', 'failed', 'cancelled'],
+  approved: ['applying', 'executing', 'failed', 'cancelled'],
   applying: ['verifying', 'recovering', 'failed', 'cancelled'],
+  executing: ['verifying', 'recovering', 'failed', 'cancelled'],
   verifying: ['completed', 'recovering', 'failed', 'cancelled'],
   completed: ['undone', 'reading', 'cancelled'],
   recovering: ['verifying', 'awaiting_approval', 'failed', 'cancelled'],
   failed: ['reading', 'proposal_ready', 'recovering', 'verifying', 'cancelled'],
+  paused: ['reading', 'understanding', 'proposal_ready', 'applying', 'verifying', 'cancelled'],
+  blocked: ['reading', 'understanding', 'proposal_ready', 'cancelled'],
   cancelled: [],
   undone: ['reading', 'cancelled'],
 };
@@ -73,6 +97,13 @@ function journalTask(task) {
     progress: redact(task.progress),
     verification: redact(task.verification),
     outcome: redact(task.outcome),
+    checkpoint: task.checkpoint || null,
+    risk: task.risk || null,
+    selfReview: task.selfReview || null,
+    findings: Array.isArray(task.findings) ? task.findings.slice(0, 50) : [],
+    evidence: Array.isArray(task.evidence) ? task.evidence.slice(0, 50) : [],
+    hypotheses: Array.isArray(task.hypotheses) ? task.hypotheses.slice(0, 20) : [],
+    rejectedHypotheses: Array.isArray(task.rejectedHypotheses) ? task.rejectedHypotheses.slice(0, 20) : [],
   };
 }
 async function renameWithRetry(source, target, attempts = 4) {
@@ -157,7 +188,20 @@ function beginConversationTurn({ root, scope = '.', request, sessionId, ownerWeb
   };
   conversationTurns.set(turn.turnId, turn);
   recordMutation(turn, 'conversation_turn_started', { scope });
-  return { turnId: turn.turnId, state: turn.state };
+  return { turnId: turn.turnId, state: turn.state, sessionId: turn.sessionId };
+}
+function recordConversationFindings(turnId, findings, owner) {
+  const turn = conversationTurns.get(turnId);
+  assertConversationOwner(turn, owner);
+  turn.findings = Array.isArray(findings) ? [...findings] : [findings];
+  turn.updatedAt = now();
+  recordMutation(turn, 'conversation_findings_recorded', { findingsCount: turn.findings.length });
+  return { turnId, findingsCount: turn.findings.length };
+}
+function getConversationTurn(turnId, owner) {
+  const turn = conversationTurns.get(turnId);
+  assertConversationOwner(turn, owner);
+  return { ...turn };
 }
 function advanceConversationTurn(turnId, next, owner, details = {}) {
   const turn = conversationTurns.get(turnId);
@@ -185,6 +229,9 @@ function advanceConversationTurn(turnId, next, owner, details = {}) {
   return { turnId: turn.turnId, state: turn.state, updatedAt: turn.updatedAt };
 }
 function assertOwner(task, owner) {
+  if (!owner && (task.ownerWebContentsId === null || task.ownerWebContentsId === undefined)) {
+    return;
+  }
   if (!owner || task.sessionId !== owner.sessionId || task.ownerWebContentsId !== owner.ownerWebContentsId) {
     throw new Error('Developer task is not owned by this renderer session.');
   }
@@ -307,9 +354,9 @@ function publicTask(task) {
     id: task.taskId, taskId: task.taskId, sessionId: task.sessionId, state: task.state,
     lifecycleState: STATE_ALIASES[task.state] || task.state.toUpperCase(),
     proposalId: task.proposalId || task.taskId,
-    workspace: task.workspace, files: task.files.map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
-    targetFiles: task.files.map(({ path }) => path),
-    snapshotHashes: task.before.map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
+    workspace: task.workspace, files: (task.files || []).map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
+    targetFiles: (task.files || []).map(({ path }) => path),
+    snapshotHashes: (task.before || []).map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
     approval: task.approval ? { approvedAt: task.approval.approvedAt, actor: task.approval.actor } : null,
     progress: task.progress, verification: task.verification || null, verificationScript: task.verificationScript || null,
     verificationScripts: task.verificationScripts || [],
@@ -375,7 +422,179 @@ function applyFilePatch(original, lines) {
     if (Number(header[2] || 1) !== consumed) throw new Error('Patch hunk line count is invalid.');
     i -= 1;
   }
-  output.push(...source.slice(cursor)); return output.join('\n');
+  output.push(...source.slice(cursor));
+  return output.join('\n');
+}
+
+function assessTaskRisk({ files = [], root = '' }) {
+  const reasons = [];
+  let score = 10;
+  const paths = (files || []).map((f) => (typeof f === 'string' ? f : f?.path || ''));
+
+  for (const filePath of paths) {
+    if (SENSITIVE_PATH_PATTERN.test(filePath) || /(?:secret|password|credential|token|api[_-]?key)/i.test(filePath)) {
+      reasons.push(`Sensitive security/credential path touched: ${filePath}`);
+      score += 80;
+    }
+    if (/(?:migration|schema\.sql|database\.ya?ml|docker-compose)/i.test(filePath)) {
+      reasons.push(`Infrastructure or database schema touched: ${filePath}`);
+      score += 40;
+    }
+  }
+
+  if (paths.length > 5) {
+    reasons.push(`Broad blast radius: ${paths.length} files modified`);
+    score += 35;
+  } else if (paths.length >= 2) {
+    reasons.push(`Multi-file modification: ${paths.length} files modified`);
+    score += 15;
+  }
+
+  let level = 'LOW';
+  if (score >= 80) level = 'CRITICAL';
+  else if (score >= 50) level = 'HIGH';
+  else if (score >= 25) level = 'MEDIUM';
+
+  return {
+    level,
+    score: Math.min(score, 100),
+    reasons,
+    blastRadius: paths.length,
+    evaluatedAt: now(),
+  };
+}
+
+function selfReviewPatch(rawPatch) {
+  const issues = [];
+  if (!rawPatch || typeof rawPatch !== 'string' || !rawPatch.trim()) {
+    return { approved: false, issues: ['Patch is empty or invalid.'], risk: 'CRITICAL', fileCount: 0 };
+  }
+
+  let parsedFiles = [];
+  try {
+    parsedFiles = parsePatch(rawPatch);
+  } catch (err) {
+    return { approved: false, issues: [`Malformed patch syntax: ${err.message}`], risk: 'CRITICAL', fileCount: 0 };
+  }
+
+  if (parsedFiles.length === 0) {
+    issues.push('No valid file changes found in patch.');
+  }
+
+  for (const file of parsedFiles) {
+    if (SENSITIVE_PATH_PATTERN.test(file.path)) {
+      issues.push(`Forbidden file in patch: ${file.path}`);
+    }
+    const additions = file.lines.filter((l) => l.startsWith('+')).length;
+    const deletions = file.lines.filter((l) => l.startsWith('-')).length;
+    if (additions === 0 && deletions === 0) {
+      issues.push(`Empty file hunk for: ${file.path}`);
+    }
+  }
+
+  const approved = issues.length === 0;
+  const risk = issues.some((i) => i.includes('Forbidden')) ? 'CRITICAL' : issues.length > 0 ? 'HIGH' : 'LOW';
+
+  return {
+    approved,
+    issues,
+    risk,
+    fileCount: parsedFiles.length,
+    reviewedAt: now(),
+  };
+}
+
+function classifyVerificationFailure(stdout = '', stderr = '', exitCode = 1) {
+  const combined = `${stdout}\n${stderr}`.toLowerCase();
+  let category = 'runtime_issue';
+  let suggestedRecovery = 'Inspect error logs and check execution arguments.';
+
+  if (/syntaxerror|parse\s*error|unexpected\s+token|indentationerror/i.test(combined)) {
+    category = 'implementation_defect';
+    suggestedRecovery = 'Fix syntax or parse error in modified source lines.';
+  } else if (/assertionerror|assert\.ok|expected.*to\s+equal|failed\s+test|\b1\s+failed\b|\bfail\b/i.test(combined)) {
+    category = 'test_defect';
+    suggestedRecovery = 'Inspect test assertion mismatch and verify expected contract.';
+  } else if (/timed?\s*out|operation\s+timed\s+out|sigterm|sigkill/i.test(combined)) {
+    category = 'timeout';
+    suggestedRecovery = 'Increase execution timeout or reduce scope of checks.';
+  } else if (/cannot\s+find\s+module|no\s+such\s+file|module\s+not\s+found|import\s+error|modulenotfounderror/i.test(combined)) {
+    category = 'dependency_issue';
+    suggestedRecovery = 'Verify dependencies and import paths in target project.';
+  } else if (/permission\s+denied|eacces|eperm|econnrefused|connection\s+refused/i.test(combined)) {
+    category = 'environment_issue';
+    suggestedRecovery = 'Check filesystem permissions or environment service availability.';
+  } else if (/socket\s+hang\s+up|econnreset|flaky/i.test(combined)) {
+    category = 'flaky_failure';
+    suggestedRecovery = 'Retry transient network/socket operation.';
+  } else if (/invalid\s+json|yaml\s+parse|configuration\s+error/i.test(combined)) {
+    category = 'configuration_issue';
+    suggestedRecovery = 'Validate syntax of project configuration files.';
+  }
+
+  return {
+    category,
+    classification: category.toUpperCase(),
+    exitCode,
+    message: bounded(stderr || stdout || 'Unknown failure', 500),
+    suggestedRecovery,
+    classifiedAt: now(),
+  };
+}
+
+function saveTaskCheckpoint(taskId, phase, data = {}, owner) {
+  const task = getTask(taskId, owner);
+  task.checkpoint = {
+    phase: phase || task.state,
+    at: now(),
+    data: redact(data),
+  };
+  task.updatedAt = now();
+  recordMutation(task, 'task_checkpoint', { phase: task.checkpoint.phase });
+  return { taskId: task.taskId, checkpoint: task.checkpoint };
+}
+
+function restoreTaskCheckpoint(taskId, targetPhase, owner) {
+  const task = getTask(taskId, owner);
+  if (!task.checkpoint) {
+    throw new Error(`Task ${taskId} has no saved checkpoint to restore.`);
+  }
+  task.state = task.checkpoint.phase || 'proposal_ready';
+  task.updatedAt = now();
+  recordMutation(task, 'task_checkpoint_restored', { restoredPhase: task.state });
+  return publicTask(task);
+}
+
+function pauseTask(taskId, owner) {
+  const task = getTask(taskId, owner);
+  task.paused = true;
+  saveTaskCheckpoint(taskId, task.state, { pausedAt: now() }, owner);
+  recordMutation(task, 'task_paused', { at: now() });
+  return publicTask(task);
+}
+
+function resumeTask(taskId, targetPhase, owner) {
+  const task = getTask(taskId, owner);
+  task.paused = false;
+  if (targetPhase && task.checkpoint) {
+    task.state = targetPhase;
+  }
+  task.updatedAt = now();
+  recordMutation(task, 'task_resumed', { phase: task.state });
+  return publicTask(task);
+}
+
+function cancelTask(taskId, owner) {
+  const task = getTask(taskId, owner);
+  task.cancelRequested = true;
+  if (transitions[task.state]?.includes('cancelled')) {
+    transition(task, 'cancelled');
+  } else {
+    task.state = 'cancelled';
+    task.updatedAt = now();
+    recordMutation(task, 'task_cancelled', { at: now() });
+  }
+  return publicTask(task);
 }
 
 async function createProposal({
@@ -432,6 +651,24 @@ async function createProposal({
       history: [{ phase: 'PROPOSING', at: now(), message: 'Validated proposal ready for approval.' }],
       lastUpdated: now(),
     },
+    risk: assessTaskRisk({ files: changes, root }),
+    selfReview: selfReviewPatch(raw),
+    security: inspectPatchSecurity(raw),
+    artifacts: [],
+    checkpoint: {
+      phase: 'awaiting_approval',
+      at: now(),
+      data: { fileCount: changes.length, risk: assessTaskRisk({ files: changes, root }).level },
+    },
+    findings: [],
+    evidence: [],
+    hypotheses: [],
+    rejectedHypotheses: [],
+    subtasks: [],
+    testPlan: safeVerificationScripts,
+    testResults: [],
+    blocker: null,
+    nextAction: 'AWAIT_USER_APPROVAL',
     createdAt: now(), updatedAt: now(),
   };
   if (conversationTurnId) {
@@ -441,6 +678,29 @@ async function createProposal({
     recordMutation(turn, 'conversation_state_transition', { from: 'understanding', to: 'proposal_ready', fileCount: changes.length });
   }
   registry.set(task.taskId, task); recordMutation(task, 'proposal_registered', { proposalId: task.proposalId });
+  taskOrchestrator.createTask({
+    taskId: task.taskId,
+    sessionId,
+    ownerWebContentsId,
+    goal: task.runtime?.plan?.goal || 'Validate and propose a minimal safe code change.',
+    workspace: root,
+    repository: path.basename(root),
+  });
+  try {
+    artifactEngine.createArtifact({
+      taskId: task.taskId,
+      type: ARTIFACT_TYPES.IMPLEMENTATION_PLAN,
+      content: task.runtime?.plan,
+      phase: 'proposal_ready',
+    });
+    artifactEngine.createArtifact({
+      taskId: task.taskId,
+      type: ARTIFACT_TYPES.PATCH_PROPOSAL,
+      content: raw,
+      phase: 'proposal_ready',
+    });
+    task.artifacts = artifactEngine.getArtifacts(task.taskId);
+  } catch {}
   transition(task, 'awaiting_approval'); return publicTask(task);
 }
 function getTask(taskId, owner) { const task = registry.get(taskId); if (!task) throw new Error('Unknown Developer task.'); assertOwner(task, owner); return task; }
@@ -530,6 +790,7 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
   let writeStarted = false;
   recordMutation(task, 'transaction_started', { transactionId: task.transactionId });
   try {
+    await multiRepoCoordinator.captureBaselineSnapshot(task.taskId, task.root);
     transition(task, 'applying');
     task.runtime = task.runtime || {};
     task.runtime.phase = 'APPLYING';
@@ -571,6 +832,27 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     task.runtime.history = [...(task.runtime.history || []), { phase: 'COMPLETED', at: now(), message: 'Apply and verification completed.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'complete', 'Apply and verification completed.');
+    try {
+      artifactEngine.createArtifact({
+        taskId: task.taskId,
+        type: ARTIFACT_TYPES.TEST_REPORT,
+        content: task.verification || { status: 'PASS' },
+        phase: 'completed',
+      });
+      artifactEngine.createArtifact({
+        taskId: task.taskId,
+        type: ARTIFACT_TYPES.FINAL_SUMMARY,
+        content: {
+          taskId: task.taskId,
+          root: task.root,
+          files: task.files.map((f) => f.path),
+          verification: task.verification,
+          completedAt: now(),
+        },
+        phase: 'completed',
+      });
+      task.artifacts = artifactEngine.getArtifacts(task.taskId);
+    } catch {}
     return publicTask(task);
   } catch (error) {
     task.error = error.message;
@@ -813,15 +1095,250 @@ function isCancellationRequested(taskId, owner) {
   const task = getTask(taskId, owner);
   return Boolean(task.cancelRequested);
 }
+function steerTask(taskId, { action, direction, newGoal }, owner) {
+  const task = getTask(taskId, owner);
+  if (action === 'pause') {
+    return pauseTask(taskId, owner);
+  }
+  if (action === 'resume') {
+    return resumeTask(taskId, null, owner);
+  }
+  if (action === 'change_direction' && newGoal) {
+    saveTaskCheckpoint(taskId, 'pre_steering', { oldGoal: task.goal }, owner);
+    task.goal = newGoal;
+    task.updatedAt = now();
+    recordMutation(task, 'task_steered', { newGoal, direction });
+    return publicTask(task);
+  }
+  return publicTask(task);
+}
+
+function forkTask(taskId, strategyName, owner) {
+  const task = getTask(taskId, owner);
+  return taskOrchestrator.forkTask(taskId, strategyName);
+}
+
+function createTaskArtifact({ taskId, type, content, phase, sourceEvidence }, owner) {
+  const task = getTask(taskId, owner);
+  const artifact = artifactEngine.createArtifact({
+    taskId,
+    type,
+    content,
+    phase: phase || task.state,
+    sourceEvidence,
+  });
+  task.artifacts = artifactEngine.getArtifacts(taskId);
+  return artifact;
+}
+
+function getTaskArtifacts(taskId, owner) {
+  getTask(taskId, owner);
+  return artifactEngine.getArtifacts(taskId);
+}
+
+async function verifyTaskBrowser(taskId, options = {}, owner) {
+  const task = getTask(taskId, owner);
+  const result = await browserVerifier.verifyEndpoint(options);
+  if (result.ok) {
+    createTaskArtifact({
+      taskId,
+      type: ARTIFACT_TYPES.BROWSER_EVIDENCE,
+      content: result,
+      phase: 'browser_verify',
+    }, owner);
+  }
+  return result;
+}
+
+async function manageDevServer(taskId, action, projectRoot, owner) {
+  getTask(taskId, owner);
+  if (action === 'start') {
+    return devServerManager.startDevServer(taskId, projectRoot);
+  }
+  if (action === 'stop') {
+    return devServerManager.stopDevServer(taskId);
+  }
+  return devServerManager.getActiveServer(taskId);
+}
+
+function inspectPatchSecurity(rawPatch) {
+  return verificationOrchestrator.inspectSecurityGates(rawPatch);
+}
+
+function listSkills() {
+  return skillSystem.listSkills();
+}
+
+function getSkill(id) {
+  return skillSystem.getSkill(id);
+}
+
+function assignTaskSkill(taskId, skillId, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.assignSkill(taskId, skillId);
+}
+
+function setTaskOperatingMode(taskId, mode, complexity, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.setOperatingMode(taskId, mode, complexity);
+}
+
+function listMcpTools() {
+  return mcpToolAdapter.listTools();
+}
+
+async function invokeTaskMcpTool(taskId, toolName, params, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.invokeMcpTool(taskId, toolName, params);
+}
+
+function getOperatingModes() {
+  return OPERATING_MODES;
+}
+
+function getComplexityLevels() {
+  return COMPLEXITY_LEVELS;
+}
+
+async function saveTaskCheckpointToDisk(taskId, filePath, milestone = 'generic', owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.saveCheckpointToDisk(taskId, filePath, milestone);
+}
+
+async function restoreTaskFromDisk(filePath) {
+  const restored = await taskOrchestrator.restoreTaskFromDisk(filePath);
+  if (restored && restored.taskId && !registry.has(restored.taskId)) {
+    registry.set(restored.taskId, {
+      taskId: restored.taskId,
+      sessionId: restored.sessionId || 'restored-session',
+      state: restored.state || 'idle',
+      targets: restored.targets || [],
+      files: (restored.targets || []).map((t) => ({ path: t, hash: '' })),
+      before: [],
+      findings: restored.findings || [],
+      hypotheses: restored.hypotheses || [],
+      rejectedHypotheses: restored.rejectedHypotheses || [],
+      approvalState: restored.approvalState || 'UNAPPROVED',
+      plan: restored.plan || [],
+      workspace: { root: restored.workspace || '.' },
+      ownerWebContentsId: null,
+      createdAt: restored.createdAt || now(),
+      updatedAt: restored.updatedAt || now(),
+    });
+  }
+  return restored;
+}
+
+async function validateTaskContextFreshness(taskId, targetSnapshots = [], owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.validateContextFreshness(taskId, targetSnapshots);
+}
+
+function refuteTaskHypothesis(taskId, text, evidence = {}, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.refuteHypothesis(taskId, text, evidence);
+}
+
+async function rollbackMultiRepo(taskId) {
+  return multiRepoCoordinator.rollbackMultiRepoChanges(taskId);
+}
+
+function getTaskHeartbeat(taskId, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.getTaskHeartbeat(taskId);
+}
+
+function handleClientDisconnect(taskId, clientId, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.handleClientDisconnect(taskId, clientId);
+}
+
+function handleClientReconnect(taskId, clientId, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.handleClientReconnect(taskId, clientId);
+}
+
+function replayTaskEvents(taskId, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.replayTaskEvents(taskId);
+}
+
+async function executeParallelWorkers(taskId, workerConfigs, workerRunnerFn, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.executeParallelWorkers(taskId, workerConfigs, workerRunnerFn);
+}
+
+function cancelWorker(taskId, workerId, reason, owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.cancelWorker(taskId, workerId, reason);
+}
+
+async function captureWorktreeBaseline(taskId, repoRoot, files = []) {
+  return dirtyWorktreeProtector.capturePreExistingBaseline(taskId, repoRoot, files);
+}
+
+async function verifyDirtyWorktreePreserved(taskId, agentFiles = []) {
+  return dirtyWorktreeProtector.verifyDirtyWorktreePreserved(taskId, agentFiles);
+}
+
+function calculateAgentDelta(preSnapshots = [], postSnapshots = []) {
+  return dirtyWorktreeProtector.calculateAgentDelta(preSnapshots, postSnapshots);
+}
+
+function defineHiddenContract(taskId, contract, owner) {
+  getTask(taskId, owner);
+  return correctnessOracle.defineHiddenContract(taskId, contract);
+}
+
+async function evaluateIndependentCorrectness(taskId, patchPayload, workspaceContext, owner) {
+  getTask(taskId, owner);
+  return correctnessOracle.evaluateIndependentCorrectness(taskId, patchPayload, workspaceContext);
+}
+
+function evaluatePatchQuality(diffText, modifiedFiles, targetScope) {
+  return patchQualityEngine.evaluatePatchQuality(diffText, modifiedFiles, targetScope);
+}
+
+function reviewDiffIndependently(diffText, taskGoal, modifiedFiles) {
+  return diffReviewer.reviewDiffIndependently(diffText, taskGoal, modifiedFiles);
+}
+
+async function verifyMutationTest(buggyRunnerFn, repairedRunnerFn, mutationFn, testRunnerFn, context) {
+  const baseline = await mutationHarness.verifyBuggyBaselineFails(buggyRunnerFn, context);
+  const mutation = await mutationHarness.verifyMutationCatchesFault(repairedRunnerFn, mutationFn, testRunnerFn, context);
+  return { baseline, mutation };
+}
+
+function diagnoseFailureType(errorOutput, exitCode, environmentState) {
+  return defectClassifier.diagnoseFailureType(errorOutput, exitCode, environmentState);
+}
+
+function inspectEdgeCasesAndContract(symbolInfo, preInterface, postInterface) {
+  const edgeCases = edgeCaseValidator.identifyEdgeCaseRequirements(symbolInfo);
+  const contract = edgeCaseValidator.verifyContractPreservation(symbolInfo?.name || 'unknown', preInterface, postInterface);
+  return { edgeCases, contract };
+}
+
 function resetForTest() {
   registry.clear(); sessions.clear(); conversationTurns.clear(); locked = false; journalError = null; auditError = null;
   journalQueue = Promise.resolve(); auditQueue = Promise.resolve();
 }
+
 module.exports = {
-  STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, beginConversationTurn, advanceConversationTurn, createProposal, approve, reject, apply, undo,
+  STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, beginConversationTurn, advanceConversationTurn, recordConversationFindings, getConversationTurn, createProposal, approve, reject, apply, undo,
   getTask: (id, owner) => publicTask(getTask(id, owner)), getTaskForTest, normalizeCommandResult,
   classifyFailure, classifyFailureCategory, commandPolicy, selectVerificationChecks, extractFailure, normalizeObservation,
   diagnoseObservation, executeVerificationLoop, runVerificationChecks, runEngineeringLoop, isCancellationRequested,
   configureDurability, loadJournal,
   flushDurability, resumeSession, releaseSession, resetForTest, parsePatch, applyFilePatch,
+  assessTaskRisk, selfReviewPatch, classifyVerificationFailure,
+  saveTaskCheckpoint, restoreTaskCheckpoint, pauseTask, resumeTask, cancelTask,
+  steerTask, forkTask, createTaskArtifact, getTaskArtifacts, verifyTaskBrowser, manageDevServer, inspectPatchSecurity,
+  listSkills, getSkill, assignTaskSkill, setTaskOperatingMode, listMcpTools, invokeTaskMcpTool, getOperatingModes, getComplexityLevels,
+  saveTaskCheckpointToDisk, restoreTaskFromDisk, validateTaskContextFreshness, refuteTaskHypothesis, rollbackMultiRepo,
+  getTaskHeartbeat, handleClientDisconnect, handleClientReconnect, replayTaskEvents,
+  executeParallelWorkers, cancelWorker,
+  captureWorktreeBaseline, verifyDirtyWorktreePreserved, calculateAgentDelta,
+  defineHiddenContract, evaluateIndependentCorrectness, evaluatePatchQuality, reviewDiffIndependently,
+  verifyMutationTest, diagnoseFailureType, inspectEdgeCasesAndContract,
 };

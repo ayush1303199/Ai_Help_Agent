@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import {
   createUnvalidatedSuggestion,
   isUnifiedDiffResponse,
@@ -62,7 +63,7 @@ const compactedFollowUp = compactCodingConversation({
     { role: 'assistant', content: `${longPriorAnalysis}${longPriorAnalysis}` },
     { role: 'user', content: followUp },
   ],
-  projectRoot: 'C:\\candidate-portal-2026',
+  projectRoot: path.join(process.cwd(), '.synthetic-test-repo'),
 }, { maxTokens: 512, lastMessageCount: 4 });
 assert.equal(
   compactedFollowUp.messages.at(-1)?.content,

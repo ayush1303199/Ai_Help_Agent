@@ -87,28 +87,37 @@ function isExcludedDiscoveryPath(target) {
 }
 
 function getProjectDiscoveryRoots() {
-  const home = os.homedir();
-  const defaults = [
-    path.join(home, 'eclipse-workspace'),
-    path.join(home, 'source', 'repos'),
-    path.join(home, 'Documents', 'GitHub'),
-    path.join(home, 'Documents', 'Projects'),
-    path.join(home, 'Documents', 'source', 'repos'),
-    path.join(home, 'Projects'),
-    path.join(home, 'workspace'),
-    path.join(home, 'code'),
-  ];
-  if (process.platform === 'win32') {
-    defaults.push('C:\\xampp\\htdocs', 'C:\\wamp64\\www', 'C:\\laragon\\www');
-  } else {
-    defaults.push(path.join(home, 'Sites'), '/var/www/html');
-  }
   const configured = String(process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS || '')
     .split(path.delimiter)
     .map((entry) => entry.trim())
     .filter(Boolean);
+
+  const candidateRoots = [...configured];
+
+  // Derive roots from current runtime/application context if available
+  for (const assignedRoot of projectRoots.values()) {
+    if (assignedRoot && typeof assignedRoot === 'string') {
+      const parentDir = path.dirname(path.resolve(assignedRoot));
+      if (!candidateRoots.includes(parentDir)) candidateRoots.push(parentDir);
+    }
+  }
+
+  // If no configured roots, include current process working workspace if safe
+  if (candidateRoots.length === 0 && process.cwd()) {
+    try {
+      const cwd = path.resolve(process.cwd());
+      const cwdParent = path.dirname(cwd);
+      if (!isExcludedDiscoveryPath(cwd) && cwd.toLowerCase() !== path.parse(cwd).root.toLowerCase()) {
+        candidateRoots.push(cwd);
+      }
+      if (!isExcludedDiscoveryPath(cwdParent) && cwdParent.toLowerCase() !== path.parse(cwdParent).root.toLowerCase()) {
+        candidateRoots.push(cwdParent);
+      }
+    } catch {}
+  }
+
   const roots = [];
-  for (const entry of [...defaults, ...configured]) {
+  for (const entry of candidateRoots) {
     const isNetworkPath = process.platform === 'win32' && /^\\\\/.test(entry);
     if (!path.isAbsolute(entry) || isNetworkPath) {
       throw new Error(`Invalid Coding project discovery root: ${entry}`);
@@ -121,6 +130,101 @@ function getProjectDiscoveryRoots() {
     if (!roots.some((existing) => existing.toLowerCase() === root.toLowerCase())) roots.push(root);
   }
   return roots;
+}
+
+const PROJECT_ROOT_MANIFEST_SIGNATURES = [
+  'package.json',
+  'composer.json',
+  'pom.xml',
+  'build.gradle',
+  'build.gradle.kts',
+  'go.mod',
+  'Cargo.toml',
+  'requirements.txt',
+  'pyproject.toml',
+  'Gemfile',
+  'artisan',
+  'yii',
+];
+
+async function findEnclosingProjectRoot(filePath, boundaryRoots = []) {
+  const normalizedBoundaries = new Set(boundaryRoots.map((r) => path.resolve(r).toLowerCase()));
+  let currentDir = path.resolve(path.dirname(filePath));
+  let topCandidate = null;
+
+  while (currentDir) {
+    let canonicalCurrent;
+    try {
+      canonicalCurrent = await fs.realpath(currentDir);
+    } catch {
+      break;
+    }
+    const currentLower = canonicalCurrent.toLowerCase();
+    if (normalizedBoundaries.has(currentLower) || isExcludedDiscoveryPath(canonicalCurrent)) {
+      break;
+    }
+    const parsed = path.parse(canonicalCurrent);
+    if (currentLower === parsed.root.toLowerCase()) {
+      break;
+    }
+
+    for (const signature of PROJECT_ROOT_MANIFEST_SIGNATURES) {
+      try {
+        const manifestPath = path.join(canonicalCurrent, signature);
+        const stat = await fs.stat(manifestPath);
+        if (stat.isFile()) {
+          return canonicalCurrent;
+        }
+      } catch {}
+    }
+
+    try {
+      const gitPath = path.join(canonicalCurrent, '.git');
+      const gitStat = await fs.stat(gitPath);
+      if (gitStat.isDirectory() || gitStat.isFile()) {
+        return canonicalCurrent;
+      }
+    } catch {}
+
+    const parent = path.dirname(canonicalCurrent);
+    if (parent === canonicalCurrent || normalizedBoundaries.has(parent.toLowerCase())) {
+      topCandidate = canonicalCurrent;
+      break;
+    }
+    topCandidate = canonicalCurrent;
+    currentDir = parent;
+  }
+
+  return topCandidate;
+}
+
+async function rankProjectCandidates(candidates, targetName, roots = []) {
+  if (!Array.isArray(candidates) || candidates.length <= 1) return Array.isArray(candidates) ? [...candidates] : [];
+  const normalizedTarget = String(targetName || '').toLowerCase();
+  const scored = await Promise.all(candidates.map(async (candidateRoot) => {
+    let score = 0;
+    const folderName = path.basename(candidateRoot).toLowerCase();
+    if (folderName === normalizedTarget) score += 100;
+    for (const signature of PROJECT_ROOT_MANIFEST_SIGNATURES) {
+      try {
+        const stat = await fs.stat(path.join(candidateRoot, signature));
+        if (stat.isFile()) {
+          score += 30;
+          break;
+        }
+      } catch {}
+    }
+    try {
+      const entries = await fs.readdir(candidateRoot, { withFileTypes: true });
+      const hasStructure = entries.some((e) => e.isDirectory() && !PROJECT_DISCOVERY_EXCLUDED_NAMES.has(e.name.toLowerCase()));
+      if (hasStructure) score += 15;
+    } catch {}
+    const depth = candidateRoot.split(/[\\/]/).filter(Boolean).length;
+    score -= depth * 2;
+    return { root: candidateRoot, score };
+  }));
+  scored.sort((a, b) => b.score - a.score || a.root.localeCompare(b.root));
+  return scored.map((item) => item.root);
 }
 
 async function discoverProjectByName(projectName, ownerWebContentsId) {
@@ -143,20 +247,20 @@ async function discoverProjectByName(projectName, ownerWebContentsId) {
     }
     return { matches: [selected], projectRoot: selected, roots: [] };
   }
-  if (name.length > 128 || name === '.' || name === '..'
-    || path.basename(name) !== name || /[<>:"/\\|?*\u0000-\u001f]/.test(name)) {
+  if (!name || (name !== '*' && (name.length > 128 || name === '.' || name === '..'
+    || path.basename(name) !== name || /[<>:"/\\|?*\u0000-\u001f]/.test(name)))) {
     throw new TypeError('Coding project name must be a bounded folder name.');
   }
 
   const roots = getProjectDiscoveryRoots();
   const deadline = Date.now() + PROJECT_DISCOVERY_TIMEOUT_MS;
-  const targetName = name.toLocaleLowerCase();
+  const targetName = name.toLowerCase();
   const matches = new Set();
   const queue = [];
-  let visitedDirectories = 0;
+  const visitedDirectories = new Set();
   let timedOut = false;
   let directoryLimitReached = false;
-  const inaccessible = new Set(['ENOENT', 'EACCES', 'EPERM', 'ENOTDIR']);
+  const inaccessible = new Set(['ENOENT', 'EACCES', 'EPERM', 'ENOTDIR', 'ELOOP']);
 
   for (const root of roots) {
     if (Date.now() >= deadline) {
@@ -168,7 +272,11 @@ async function discoverProjectByName(projectName, ownerWebContentsId) {
       if (isExcludedDiscoveryPath(canonicalRoot)) continue;
       const stat = await fs.stat(canonicalRoot);
       if (!stat.isDirectory()) continue;
-      queue.push({ directory: canonicalRoot, depth: 0 });
+      const rootKey = canonicalRoot.toLowerCase();
+      if (!visitedDirectories.has(rootKey)) {
+        visitedDirectories.add(rootKey);
+        queue.push({ directory: canonicalRoot, depth: 0 });
+      }
     } catch (error) {
       if (!inaccessible.has(error.code)) throw error;
     }
@@ -179,13 +287,12 @@ async function discoverProjectByName(projectName, ownerWebContentsId) {
       timedOut = true;
       break;
     }
-    if (visitedDirectories >= PROJECT_DISCOVERY_MAX_DIRECTORIES) {
+    if (visitedDirectories.size >= PROJECT_DISCOVERY_MAX_DIRECTORIES) {
       directoryLimitReached = true;
       break;
     }
     const current = queue.shift();
     if (current.depth >= PROJECT_DISCOVERY_MAX_DEPTH) continue;
-    visitedDirectories += 1;
 
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
@@ -215,19 +322,78 @@ async function discoverProjectByName(projectName, ownerWebContentsId) {
         timedOut = true;
         break;
       }
-      if (!entry.isDirectory() || PROJECT_DISCOVERY_EXCLUDED_NAMES.has(entry.name.toLowerCase())) continue;
-      const candidate = path.join(current.directory, entry.name);
-      const depth = current.depth + 1;
-      if (entry.name.toLocaleLowerCase() === targetName) {
+      const entryNameLower = entry.name.toLowerCase();
+      if (PROJECT_DISCOVERY_EXCLUDED_NAMES.has(entryNameLower)) continue;
+
+      let isDirectory = entry.isDirectory();
+      let isFile = entry.isFile();
+      if (!isDirectory && !isFile) {
         try {
-          const canonicalCandidate = await fs.realpath(candidate);
-          const stat = await fs.stat(canonicalCandidate);
-          if (stat.isDirectory() && !isExcludedDiscoveryPath(canonicalCandidate)) matches.add(canonicalCandidate);
-        } catch (error) {
-          if (!inaccessible.has(error.code)) throw error;
+          const entryStat = await fs.stat(path.join(current.directory, entry.name));
+          isDirectory = entryStat.isDirectory();
+          isFile = entryStat.isFile();
+        } catch {
+          continue;
         }
       }
-      if (depth < PROJECT_DISCOVERY_MAX_DEPTH) queue.push({ directory: candidate, depth });
+
+      const candidatePath = path.join(current.directory, entry.name);
+
+      if (isDirectory) {
+        let canonicalCandidate;
+        try {
+          canonicalCandidate = await fs.realpath(candidatePath);
+        } catch (error) {
+          if (!inaccessible.has(error.code)) throw error;
+          continue;
+        }
+        if (isExcludedDiscoveryPath(canonicalCandidate)) continue;
+
+        if (targetName === '*' || entryNameLower === targetName) {
+          try {
+            const stat = await fs.stat(canonicalCandidate);
+            if (stat.isDirectory()) {
+              if (targetName === '*') {
+                let hasManifest = false;
+                for (const signature of PROJECT_ROOT_MANIFEST_SIGNATURES) {
+                  try {
+                    const s = await fs.stat(path.join(canonicalCandidate, signature));
+                    if (s.isFile()) { hasManifest = true; break; }
+                  } catch {}
+                }
+                if (hasManifest) matches.add(canonicalCandidate);
+              } else {
+                matches.add(canonicalCandidate);
+              }
+            }
+          } catch (error) {
+            if (!inaccessible.has(error.code)) throw error;
+          }
+        }
+
+        if (current.depth + 1 < PROJECT_DISCOVERY_MAX_DEPTH) {
+          const canonicalKey = canonicalCandidate.toLowerCase();
+          if (!visitedDirectories.has(canonicalKey)) {
+            visitedDirectories.add(canonicalKey);
+            queue.push({ directory: canonicalCandidate, depth: current.depth + 1 });
+          }
+        }
+      } else if (isFile) {
+        if (entryNameLower === targetName) {
+          try {
+            const enclosingRoot = await findEnclosingProjectRoot(candidatePath, roots);
+            if (enclosingRoot) {
+              const canonicalRoot = await fs.realpath(enclosingRoot);
+              const stat = await fs.stat(canonicalRoot);
+              if (stat.isDirectory() && !isExcludedDiscoveryPath(canonicalRoot)) {
+                matches.add(canonicalRoot);
+              }
+            }
+          } catch (error) {
+            if (!inaccessible.has(error.code)) throw error;
+          }
+        }
+      }
     }
   }
 
@@ -242,7 +408,8 @@ async function discoverProjectByName(projectName, ownerWebContentsId) {
     };
   }
 
-  const found = [...matches].sort().slice(0, PROJECT_DISCOVERY_MAX_MATCHES);
+  const foundUnsorted = [...matches].slice(0, PROJECT_DISCOVERY_MAX_MATCHES);
+  const found = await rankProjectCandidates(foundUnsorted, name, roots);
   const projectRoot = found.length === 1 ? found[0] : null;
   if (projectRoot) {
     projectDiscoveryMatches.delete(ownerWebContentsId);
@@ -258,6 +425,11 @@ async function discoverProjectByName(projectName, ownerWebContentsId) {
   } else {
     projectDiscoveryMatches.delete(ownerWebContentsId);
   }
+
+  if (process.env.DEBUG || process.env.AI_HELP_AGENT_LOG_DISCOVERY) {
+    console.log(`[CODING DISCOVERY] target=${name} visitedDirectories=${visitedDirectories.size} candidates=${matches.size} selectedProject=${projectRoot || 'none'}`);
+  }
+
   return { matches: found, projectRoot, roots, timedOut: false, directoryLimitReached: false };
 }
 
@@ -927,12 +1099,110 @@ function getProjectRoot(ownerWebContentsId = null) {
   return null;
 }
 
+async function detectDevServerConfiguration(projectRoot) {
+  if (!projectRoot || typeof projectRoot !== 'string') {
+    return { detected: false, reason: 'No project root provided' };
+  }
+
+  const resolvedRoot = path.resolve(projectRoot);
+
+  // 1. Check Node package.json
+  try {
+    const pkgPath = path.join(resolvedRoot, 'package.json');
+    const pkgStat = await fs.stat(pkgPath);
+    if (pkgStat.isFile()) {
+      const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf8'));
+      const scripts = pkg.scripts || {};
+      const devScript = ['dev', 'start', 'serve', 'watch'].find((s) => typeof scripts[s] === 'string');
+      let port = 3000;
+      let framework = 'node';
+
+      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+      if (deps.vite) { framework = 'vite'; port = 5173; }
+      else if (deps.next) { framework = 'next'; port = 3000; }
+      else if (deps['@angular/core']) { framework = 'angular'; port = 4200; }
+      else if (deps['react-scripts']) { framework = 'create-react-app'; port = 3000; }
+      else if (deps.nuxt) { framework = 'nuxt'; port = 3000; }
+      else if (deps.express) { framework = 'express'; port = 3000; }
+
+      if (devScript) {
+        const cmd = scripts[devScript];
+        const portMatch = String(cmd).match(/(?:--port|-p)\s+([0-9]+)/);
+        if (portMatch) port = parseInt(portMatch[1], 10);
+
+        return {
+          detected: true,
+          type: 'node',
+          framework,
+          scriptName: devScript,
+          command: `npm run ${devScript}`,
+          port,
+          confidence: 'HIGH',
+        };
+      }
+    }
+  } catch {}
+
+  // 2. Check Python
+  try {
+    const managePy = path.join(resolvedRoot, 'manage.py');
+    const manageStat = await fs.stat(managePy);
+    if (manageStat.isFile()) {
+      return {
+        detected: true,
+        type: 'python',
+        framework: 'django',
+        scriptName: 'runserver',
+        command: 'python manage.py runserver',
+        port: 8000,
+        confidence: 'HIGH',
+      };
+    }
+  } catch {}
+
+  try {
+    const appPy = path.join(resolvedRoot, 'app.py');
+    const appStat = await fs.stat(appPy);
+    if (appStat.isFile()) {
+      return {
+        detected: true,
+        type: 'python',
+        framework: 'flask-or-fastapi',
+        scriptName: 'app.py',
+        command: 'python app.py',
+        port: 5000,
+        confidence: 'MEDIUM',
+      };
+    }
+  } catch {}
+
+  // 3. Check PHP
+  try {
+    const artisanPath = path.join(resolvedRoot, 'artisan');
+    const artisanStat = await fs.stat(artisanPath);
+    if (artisanStat.isFile()) {
+      return {
+        detected: true,
+        type: 'php',
+        framework: 'laravel',
+        scriptName: 'serve',
+        command: 'php artisan serve',
+        port: 8000,
+        confidence: 'HIGH',
+      };
+    }
+  } catch {}
+
+  return { detected: false, reason: 'No dev server configuration recognized' };
+}
+
 module.exports = {
   chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit,
   getVerificationScripts, resolveWithinRoot, resolveProjectScope, normalizeScopedProjectPath, clearProject, releaseProject,
   assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY, isSensitivePath,
-  discoverProjectByName, getProjectDiscoveryRoots, configureAuditDirectory,
+  discoverProjectByName, getProjectDiscoveryRoots, configureAuditDirectory, findEnclosingProjectRoot,
+  rankProjectCandidates,
   redactRuntimeValue, parseRuntimeFailure, mapRuntimeSource, classifyProjectSignals,
   PROJECT_MANIFESTS, VERIFICATION_PROFILES,
-  detectProjectType,
+  detectProjectType, detectDevServerConfiguration,
 };

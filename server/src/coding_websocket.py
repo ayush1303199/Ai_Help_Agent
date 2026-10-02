@@ -3,7 +3,8 @@
 import asyncio
 import json
 import re
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from coding_provider import complete_coding_model
 from backend_config import (
@@ -33,6 +34,90 @@ def _proposal_prompt_instruction(retry: bool = False) -> str:
             "and now return only the required Git unified diff or exactly NO_CHANGES."
         )
     return instruction
+
+
+class ToolResultStatus:
+    SUCCESS = "SUCCESS"
+    NOT_FOUND = "NOT_FOUND"
+    INVALID_INPUT = "INVALID_INPUT"
+    PERMISSION_DENIED = "PERMISSION_DENIED"
+    TIMEOUT = "TIMEOUT"
+    CANCELLED = "CANCELLED"
+    EXECUTION_FAILED = "EXECUTION_FAILED"
+    UNAVAILABLE = "UNAVAILABLE"
+    RATE_LIMITED = "RATE_LIMITED"
+    AUTH_FAILURE = "AUTH_FAILURE"
+    ENVIRONMENT_FAILURE = "ENVIRONMENT_FAILURE"
+
+
+def classify_tool_result_status(result: Any) -> str:
+    if isinstance(result, dict):
+        if result.get("ok") is True:
+            return ToolResultStatus.SUCCESS
+        err = str(result.get("error") or "").lower()
+        if "auth" in err or "api key" in err or "unauthorized" in err:
+            return ToolResultStatus.AUTH_FAILURE
+        if "rate limit" in err or "429" in err:
+            return ToolResultStatus.RATE_LIMITED
+        if "permission" in err or "access denied" in err:
+            return ToolResultStatus.PERMISSION_DENIED
+        if "timeout" in err or "timed out" in err:
+            return ToolResultStatus.TIMEOUT
+        if "cancelled" in err or "aborted" in err:
+            return ToolResultStatus.CANCELLED
+        if "not found" in err or "no such file" in err:
+            return ToolResultStatus.NOT_FOUND
+        if "unavailable" in err:
+            return ToolResultStatus.UNAVAILABLE
+        if "invalid" in err or "too long" in err or "schema" in err:
+            return ToolResultStatus.INVALID_INPUT
+        return ToolResultStatus.EXECUTION_FAILED
+    if result is None:
+        return ToolResultStatus.UNAVAILABLE
+    return ToolResultStatus.SUCCESS
+
+
+def classify_provider_exception(error: Exception) -> Dict[str, Any]:
+    msg = str(error).lower()
+    if "429" in msg or "resource_exhausted" in msg or "quota" in msg or "rate limit" in msg:
+        return {
+            "classification": "EXTERNAL_RESOURCE_FAILURE",
+            "category": "PROVIDER_RATE_LIMITED",
+            "retryable": True,
+            "isCodeDefect": False,
+            "suggestedAction": "PAUSE_OR_FALLBACK",
+        }
+    if "timeout" in msg or "timed out" in msg:
+        return {
+            "classification": "EXTERNAL_RESOURCE_FAILURE",
+            "category": "PROVIDER_TIMEOUT",
+            "retryable": True,
+            "isCodeDefect": False,
+            "suggestedAction": "RETRY_WITH_BACKOFF",
+        }
+    if "503" in msg or "service unavailable" in msg or "connection error" in msg:
+        return {
+            "classification": "EXTERNAL_RESOURCE_FAILURE",
+            "category": "PROVIDER_UNAVAILABLE",
+            "retryable": True,
+            "isCodeDefect": False,
+            "suggestedAction": "FALLBACK_MODEL",
+        }
+    if "401" in msg or "403" in msg or "api key" in msg or "unauthorized" in msg:
+        return {
+            "classification": "EXTERNAL_RESOURCE_FAILURE",
+            "category": "PROVIDER_AUTH_ERROR",
+            "retryable": False,
+            "isCodeDefect": False,
+            "suggestedAction": "CHECK_CREDENTIALS",
+        }
+    return {
+        "classification": "RUN_ERROR",
+        "category": "RUNTIME_ISSUE",
+        "retryable": False,
+        "isCodeDefect": True,
+        "suggestedAction": "INSPECT_LOGS",
+    }
 
 
 CODING_TOOLS = [
@@ -164,18 +249,24 @@ def _coding_task_steps(proposal_required: bool) -> List[str]:
     return steps
 WRITE_PATTERN = re.compile(
     r"\b(fix|implement|add|create|change|modify|update|refactor|optimi[sz]e|improve|remove|rewrite|"
-    r"resolve|patch|migrate|convert|introduce)\b|(?:\b(?:karo|jodo|sudhar|badlo|banao)\b)",
+    r"resolve|patch|migrate|convert|introduce)\b|"
+    r"(?:\b(?:jodo|sudhar|sudharo|badlo|banao|hatao)\b)|"
+    r"(?:\b(?:fix|change|update|add|modify|refactor)\s+karo\b)",
     re.IGNORECASE,
 )
 EXPLANATION_PATTERN = re.compile(
     r"^\s*(?:please\s+)?(?:explain|describe|what\s+(?:does|do|is|are)|how\s+(?:does|do|is|can\s+i)|"
-    r"why\s+(?:does|do|is)|tell\s+me\s+about|can\s+you\s+explain|what\s+is\s+the\s+purpose\s+of)\b",
+    r"why\s+(?:does|do|is)|tell\s+me\s+about|can\s+you\s+explain|what\s+is\s+the\s+purpose\s+of)\b|"
+    r"\b(?:check\s+karo|inspect\s+karo|audit\s+karo|dekh\s+ke\s+batao|batao\s+kya|kya\s+slow)\b|"
+    r"\b(?:ko\s+check\s+karo\s+aur\s+batao)\b",
     re.IGNORECASE,
 )
 EXPLICIT_CHANGE_PATTERN = re.compile(
-    r"\b(?:and|also|then|please)\s+(?:fix|implement|add|create|change|modify|update|refactor|"
-    r"optimi[sz]e|improve|remove|rewrite|resolve|patch|migrate|convert|introduce)\b|"
-    r"\b(?:karo|jodo|sudhar|badlo|banao)\b",
+    r"\b(?:and|also|then|please|aur)\s+(?:fix|implement|add|create|change|modify|update|refactor|"
+    r"optimi[sz]e|improve|remove|rewrite|resolve|patch|migrate|convert|introduce|banao|badlo)\b|"
+    r"\b(?:proposal|diff|patch)\s*(?:banao|do|generate|create|prepare)\b|"
+    r"\b(?:fix\s+ka\s+proposal|fix\s+proposal|minimal\s+fix\s+proposal)\b|"
+    r"\b(?:jodo|sudhar|badlo|banao)\b",
     re.IGNORECASE,
 )
 EXPLANATION_FOLLOW_UP_PATTERN = re.compile(
@@ -240,6 +331,477 @@ def _requires_proposal_for_conversation(messages: List[Dict[str, Any]]) -> bool:
             or CHANGE_FOLLOW_UP_PATTERN.search(latest_request)
         )
     )
+
+
+class TaskIntent:
+    BUG_INVESTIGATION = "BUG_INVESTIGATION"
+    PERFORMANCE_INVESTIGATION = "PERFORMANCE_INVESTIGATION"
+    FEATURE_IMPLEMENTATION = "FEATURE_IMPLEMENTATION"
+    REFACTOR = "REFACTOR"
+    TEST_FAILURE = "TEST_FAILURE"
+    SECURITY_AUDIT = "SECURITY_AUDIT"
+    CODE_REVIEW = "CODE_REVIEW"
+    EXPLANATION = "EXPLANATION"
+    PROPOSAL_GENERATION = "PROPOSAL_GENERATION"
+    DIRECT_FIX = "DIRECT_FIX"
+    BUILD_FAILURE = "BUILD_FAILURE"
+    DEPENDENCY_AUDIT = "DEPENDENCY_AUDIT"
+    MIGRATION = "MIGRATION"
+    API_PROBLEM = "API_PROBLEM"
+    DATABASE_PROBLEM = "DATABASE_PROBLEM"
+    UI_TASK = "UI_TASK"
+    ARCHITECTURE_INVESTIGATION = "ARCHITECTURE_INVESTIGATION"
+
+
+def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    req = request.strip()
+    is_continuation = bool(re.search(
+        r"^\s*(?:continue|resume|retry|aage\s+badho|chalu\s+rakho)\b|"
+        r"\b(?:ab\s+(?:fix|proposal|patch|minimal)\s*(?:banao|karo|do))\b|"
+        r"\b(?:fix\s+karo\s+aur)\b",
+        req, re.I
+    ))
+
+    if re.search(r"\b(?:proposal|diff|patch)\s*(?:banao|do|generate|create|prepare)\b|\b(?:fix\s+ka\s+proposal|fix\s+proposal|minimal\s+fix\s+proposal)\b", req, re.I):
+        intent = TaskIntent.PROPOSAL_GENERATION
+        proposal_required = True
+    elif re.search(r"\b(?:fix|sudhar|badlo|implement)\s+(?:karo|it|this)\b|\b(?:fix\s+karo\s+aur)\b", req, re.I):
+        intent = TaskIntent.DIRECT_FIX
+        proposal_required = True
+    elif re.search(r"\b(?:build\s+fail(?:ure)?|compile\s+error|compilation\s+failed|build\s+broken|linker\s+error|tsc\s+error|syntax\s+error)\b", req, re.I):
+        intent = TaskIntent.BUILD_FAILURE
+        proposal_required = bool(re.search(r"\b(?:fix|patch|banao)\b", req, re.I))
+    elif re.search(r"\b(?:dependency|dependencies|outdated\s+packages?|vulnerab(?:le|ilities)|npm\s+audit|package\s+conflict)\b", req, re.I):
+        intent = TaskIntent.DEPENDENCY_AUDIT
+        proposal_required = False
+    elif re.search(r"\b(?:migration|schema\s+migration|migrate\s+database|version\s+upgrade|upgrade\s+to\s+v\d+)\b", req, re.I):
+        intent = TaskIntent.MIGRATION
+        proposal_required = bool(re.search(r"\b(?:apply|migrate|fix|banao)\b", req, re.I))
+    elif re.search(r"\b(?:api\s+endpoint|rest\s+api|graphql|502\s+bad\s+gateway|503\s+service|cors\s+error|payload\s+too\s+large|endpoint\s+timeout)\b", req, re.I):
+        intent = TaskIntent.API_PROBLEM
+        proposal_required = bool(re.search(r"\b(?:fix|patch|banao)\b", req, re.I))
+    elif re.search(r"\b(?:database\s+error|sql\s+syntax|foreign\s+key\s+constraint|deadlock|table\s+locked|query\s+timeout|connection\s+pool)\b", req, re.I):
+        intent = TaskIntent.DATABASE_PROBLEM
+        proposal_required = bool(re.search(r"\b(?:fix|patch|banao)\b", req, re.I))
+    elif re.search(r"\b(?:ui|layout|css|styling|responsive|component\s+render|button\s+click|modal\s+display|dropdown)\b", req, re.I):
+        intent = TaskIntent.UI_TASK
+        proposal_required = bool(re.search(r"\b(?:fix|change|update|add|banao)\b", req, re.I))
+    elif re.search(r"\b(?:architecture|system\s+design|module\s+boundary|circular\s+dependency|layering\s+violation)\b", req, re.I):
+        intent = TaskIntent.ARCHITECTURE_INVESTIGATION
+        proposal_required = False
+    elif re.search(r"\b(?:slow|latency|performance|optimi[sz]e|query\s+slow|kaunsi?\s+query\s+slow|bottleneck|n\+1|duplicate[-_\s]query)\b", req, re.I):
+        intent = TaskIntent.PERFORMANCE_INVESTIGATION
+        proposal_required = False
+    elif re.search(r"\b(?:tests?\s+fail(?:ing)?|failing\s+tests?|broken\s+tests?|tests?\s+chalao|run\s+tests?|tests?\s+pass)\b", req, re.I):
+        intent = TaskIntent.TEST_FAILURE
+        proposal_required = bool(re.search(r"\b(?:fix|patch|banao)\b", req, re.I))
+    elif re.search(r"\b(?:security|vulnerability|sql\s+injection|sanitize|auth|secret|token|credential|leak)\b", req, re.I):
+        intent = TaskIntent.SECURITY_AUDIT
+        proposal_required = False
+    elif re.search(r"\b(?:code\s+review|review\s+karo|review\s+this|review\s+karke|audit\s+karo)\b", req, re.I):
+        intent = TaskIntent.CODE_REVIEW
+        proposal_required = False
+    elif re.search(r"\b(?:refactor|clean\s*up|extract\s+method|reorganize)\b", req, re.I):
+        intent = TaskIntent.REFACTOR
+        proposal_required = bool(re.search(r"\b(?:proposal|banao|diff)\b", req, re.I))
+    elif re.search(r"\b(?:500|404|error|exception|bug|issue|kabhi\s+kabhi|fail|crash|wrong|incorrect)\b", req, re.I):
+        intent = TaskIntent.BUG_INVESTIGATION
+        proposal_required = False
+    elif re.search(r"\b(?:samjhao|samjha\s+do|kaise\s+kaam\s+karta\s+hai|kya\s+karta\s+hai|explain|describe|what\s+(?:does|do|is|are)|how\s+(?:does|do|is|can\s+i)|why\s+(?:does|do|is)|overview|walkthrough)\b", req, re.I):
+        intent = TaskIntent.EXPLANATION
+        proposal_required = False
+    elif re.search(r"\b(?:check\s+karo|inspect\s+karo|dekh\s+ke\s+batao|batao\s+kya)\b", req, re.I):
+        intent = TaskIntent.BUG_INVESTIGATION
+        proposal_required = False
+    elif _requires_proposal(req):
+        intent = TaskIntent.FEATURE_IMPLEMENTATION
+        proposal_required = True
+    else:
+        intent = TaskIntent.BUG_INVESTIGATION
+        proposal_required = False
+
+    symbol_matches = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\(\))?)\b", req)
+    candidate_symbols = [
+        s.rstrip("()") for s in symbol_matches
+        if len(s) >= 4 and not re.match(r"^(?:this|that|from|with|then|have|some|into|check|karo|batao|kya|aur|mein|slow|query|method|class|function|issue|file|project)$", s, re.I)
+    ]
+
+    candidate_files = re.findall(r"\b([A-Za-z0-9_-]+\.(?:php|ts|tsx|js|jsx|py|java|go|rb|cs|rs|json|ya?ml|html|css))\b", req, re.I)
+
+    return {
+        "intent": intent,
+        "proposal_required": proposal_required,
+        "is_continuation": is_continuation,
+        "target_symbols": candidate_symbols,
+        "target_files": candidate_files,
+        "confidence": "HIGH" if (candidate_files or candidate_symbols) else "MEDIUM",
+    }
+
+
+def generate_task_plan(intent_info: Dict[str, Any], request: str, scope: str = ".") -> Dict[str, Any]:
+    intent = intent_info.get("intent", TaskIntent.BUG_INVESTIGATION)
+    proposal_required = intent_info.get("proposal_required", False)
+
+    if intent == TaskIntent.PERFORMANCE_INVESTIGATION:
+        hypotheses = [
+            "Duplicate or repeated database queries within the method execution path",
+            "Scope override removing default filtering (such as ->where() overriding default scopes instead of ->andWhere())",
+            "In-memory aggregation loading large unconstrained result arrays into memory",
+            "Missing database index or unindexed scan",
+        ]
+        required_evidence = "Observed queries, scope filters, loops, and data volume handling."
+        verification_strategy = "Static code verification, query structure audit, behavior preservation check."
+
+    elif intent == TaskIntent.BUG_INVESTIGATION:
+        hypotheses = [
+            "Filter condition or scope override causing unexpected records to be processed",
+            "Null pointer or missing array key in response transformation",
+            "Unchecked exception during database or external service interaction",
+            "Parameter mismatch between caller and callee",
+        ]
+        required_evidence = "Observed source code flow, parameter handling, and return signatures."
+        verification_strategy = "Static flow analysis, syntax and type verification, unit test checks."
+
+    elif intent == TaskIntent.BUILD_FAILURE:
+        hypotheses = [
+            "Type mismatch or missing import following code modification",
+            "Compiler/bundler syntax error or target framework version mismatch",
+        ]
+        required_evidence = "Compiler diagnostics, build output, referenced type definitions."
+        verification_strategy = "Static build and compilation verification."
+
+    elif intent == TaskIntent.DEPENDENCY_AUDIT:
+        hypotheses = [
+            "Vulnerable or incompatible transitive dependency in package tree",
+            "Version mismatch between package manifest and lockfile",
+        ]
+        required_evidence = "Package manifests, lockfiles, and dependency graph."
+        verification_strategy = "Dependency resolution check."
+
+    elif intent == TaskIntent.MIGRATION:
+        hypotheses = [
+            "Schema migration script syntax or rollback defect",
+            "Missing foreign key or column default value in upgrade routine",
+        ]
+        required_evidence = "Migration files, target schema definitions, rollback routines."
+        verification_strategy = "Migration script verification and schema diff check."
+
+    elif intent == TaskIntent.API_PROBLEM:
+        hypotheses = [
+            "Malformed request/response contract or serialization error",
+            "Route handler middleware blocking request or throwing unhandled exception",
+        ]
+        required_evidence = "Route declarations, middleware pipeline, controller responses."
+        verification_strategy = "API contract testing and response verification."
+
+    elif intent == TaskIntent.DATABASE_PROBLEM:
+        hypotheses = [
+            "Unindexed scan causing query timeout or deadlock",
+            "Schema mismatch or missing column in query projection",
+        ]
+        required_evidence = "Query definitions, table schemas, ORM mapping."
+        verification_strategy = "Query analysis and schema verification."
+
+    elif intent == TaskIntent.UI_TASK:
+        hypotheses = [
+            "CSS selector or flex/grid layout property misconfiguration",
+            "Component state lifecycle race condition in rendering",
+        ]
+        required_evidence = "UI component templates, stylesheets, props/state handlers."
+        verification_strategy = "Component structure audit and visual/DOM checks."
+
+    elif intent == TaskIntent.ARCHITECTURE_INVESTIGATION:
+        hypotheses = [
+            "Leaky abstraction or boundary bypass between domains",
+            "Circular import or coupled service dependencies",
+        ]
+        required_evidence = "Import graph, module boundaries, domain contracts."
+        verification_strategy = "Architecture dependency analysis."
+
+    elif intent == TaskIntent.TEST_FAILURE:
+        hypotheses = [
+            "Behavioral regression in recently changed method",
+            "Outdated test fixture or contract mismatch",
+        ]
+        required_evidence = "Test assertion failures, expected vs actual behavior, tested method source."
+        verification_strategy = "Execute focused test checks and observe pass/fail outcomes."
+
+    elif intent in (TaskIntent.PROPOSAL_GENERATION, TaskIntent.DIRECT_FIX):
+        hypotheses = [
+            "Minimal diff targeting inspected lines resolves the identified issue",
+        ]
+        required_evidence = "Exact lines from read tools, verified root cause, behavior preservation checks."
+        verification_strategy = "Diff parsing, snapshot validation, and allow-listed verification."
+
+    else:
+        hypotheses = [
+            "Standard architectural alignment with requested outcome",
+        ]
+        required_evidence = "Project source implementation and related contracts."
+        verification_strategy = "Evidence audit and behavior preservation."
+
+    steps = _coding_task_steps(proposal_required)
+
+    return {
+        "intent": intent,
+        "goal": request[:CODING_MAX_REQUEST_CHARS],
+        "scope": scope,
+        "hypotheses": hypotheses,
+        "required_evidence": required_evidence,
+        "steps": steps,
+        "verification_strategy": verification_strategy,
+        "confidence": intent_info.get("confidence", "MEDIUM"),
+    }
+
+
+class TaskSessionStore:
+    def __init__(self, max_sessions: int = 100):
+        self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._max_sessions = max_sessions
+
+    def get_or_create(self, session_id: str, project_root: str = "", scope: str = ".") -> Dict[str, Any]:
+        key = session_id or "default-coding-session"
+        if key not in self._sessions:
+            if len(self._sessions) >= self._max_sessions:
+                oldest = min(self._sessions.keys(), key=lambda k: self._sessions[k].get("updatedAt", 0))
+                self._sessions.pop(oldest, None)
+            self._sessions[key] = {
+                "sessionId": key,
+                "projectRoot": project_root,
+                "scope": scope,
+                "targetFiles": [],
+                "targetSymbols": [],
+                "findings": [],
+                "evidence": [],
+                "activeHypotheses": [],
+                "rejectedHypotheses": [],
+                "toolHistory": [],
+                "unresolvedQuestions": [],
+                "proposalState": None,
+                "confidence": "MEDIUM",
+                "createdAt": time.time(),
+                "updatedAt": time.time(),
+            }
+        session = self._sessions[key]
+        if project_root and not session.get("projectRoot"):
+            session["projectRoot"] = project_root
+        if scope and scope != ".":
+            session["scope"] = scope
+        session["updatedAt"] = time.time()
+        return session
+
+    def record_tool_call(self, session_id: str, name: str, arguments: Dict[str, Any], role: str, outcome: str = "success") -> None:
+        session = self.get_or_create(session_id)
+        session["toolHistory"].append({
+            "name": name,
+            "arguments": arguments,
+            "role": role,
+            "outcome": outcome,
+            "timestamp": time.time(),
+        })
+        if name in ("read_file", "repo_browser.read_file", "repo_browser.open_file"):
+            path = arguments.get("relativePath") or arguments.get("path")
+            if path and path not in session["targetFiles"]:
+                session["targetFiles"].append(path)
+        if name in ("search_symbols", "find_references"):
+            query = arguments.get("query")
+            if query and query not in session["targetSymbols"]:
+                session["targetSymbols"].append(query)
+        session["updatedAt"] = time.time()
+
+    def record_evidence(self, session_id: str, tool_name: str, target: str, summary: str) -> None:
+        session = self.get_or_create(session_id)
+        session["evidence"].append({
+            "tool": tool_name,
+            "target": target,
+            "summary": summary[:1000],
+            "timestamp": time.time(),
+        })
+        session["updatedAt"] = time.time()
+
+    def record_finding(self, session_id: str, finding: str) -> None:
+        session = self.get_or_create(session_id)
+        if finding and finding not in session["findings"]:
+            session["findings"].append(finding)
+        session["updatedAt"] = time.time()
+
+    def reject_hypothesis(self, session_id: str, hypothesis: str, reason: str) -> None:
+        session = self.get_or_create(session_id)
+        session["rejectedHypotheses"].append({
+            "hypothesis": hypothesis,
+            "reason": reason,
+            "timestamp": time.time(),
+        })
+        if hypothesis in session["activeHypotheses"]:
+            session["activeHypotheses"].remove(hypothesis)
+        session["updatedAt"] = time.time()
+
+    def get_continuation_context(self, session_id: str) -> str:
+        session = self.get_or_create(session_id)
+        parts = []
+        if session["targetFiles"]:
+            parts.append(f"Target files from earlier investigation in this session: {', '.join(session['targetFiles'])}")
+        if session["targetSymbols"]:
+            parts.append(f"Target symbols from earlier investigation: {', '.join(session['targetSymbols'])}")
+        if session["findings"]:
+            parts.append("Key findings recorded:\n" + "\n".join(f"- {f}" for f in session["findings"][:10]))
+        if session["rejectedHypotheses"]:
+            parts.append("Disproven / rejected hypotheses:\n" + "\n".join(f"- {h['hypothesis']}: {h['reason']}" for h in session["rejectedHypotheses"][:5]))
+        return "\n".join(parts)
+
+    def save_checkpoint(self, session_id: str, label: str = "") -> Dict[str, Any]:
+        session = self.get_or_create(session_id)
+        if "checkpoints" not in session:
+            session["checkpoints"] = []
+        chk_id = f"chk_{int(time.time() * 1000)}_{len(session['checkpoints']) + 1}"
+        checkpoint = {
+            "checkpointId": chk_id,
+            "label": label or f"Checkpoint at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "timestamp": time.time(),
+            "targetFiles": list(session["targetFiles"]),
+            "targetSymbols": list(session["targetSymbols"]),
+            "findings": list(session["findings"]),
+            "evidenceCount": len(session["evidence"]),
+            "activeHypotheses": list(session["activeHypotheses"]),
+            "rejectedHypotheses": list(session["rejectedHypotheses"]),
+            "toolHistoryCount": len(session["toolHistory"]),
+            "proposalState": session.get("proposalState"),
+        }
+        session["checkpoints"].append(checkpoint)
+        session["updatedAt"] = time.time()
+        return checkpoint
+
+    def restore_checkpoint(self, session_id: str, checkpoint_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        session = self.get_or_create(session_id)
+        checkpoints = session.get("checkpoints", [])
+        if not checkpoints:
+            return None
+        target = None
+        if checkpoint_id:
+            for chk in checkpoints:
+                if chk.get("checkpointId") == checkpoint_id:
+                    target = chk
+                    break
+        else:
+            target = checkpoints[-1]
+        if not target:
+            return None
+
+        session["targetFiles"] = list(target["targetFiles"])
+        session["targetSymbols"] = list(target["targetSymbols"])
+        session["findings"] = list(target["findings"])
+        session["activeHypotheses"] = list(target["activeHypotheses"])
+        session["rejectedHypotheses"] = list(target["rejectedHypotheses"])
+        session["proposalState"] = target.get("proposalState")
+        session["updatedAt"] = time.time()
+        return target
+
+    def list_checkpoints(self, session_id: str) -> List[Dict[str, Any]]:
+        session = self.get_or_create(session_id)
+        return list(session.get("checkpoints", []))
+
+
+def compute_task_budget(intent_info: Dict[str, Any], complexity_hint: str = "normal") -> Dict[str, Any]:
+    intent = intent_info.get("intent", TaskIntent.BUG_INVESTIGATION)
+    confidence = intent_info.get("confidence", "MEDIUM")
+
+    rounds = MAX_CODING_TOOL_ROUNDS
+    max_chars = MAX_CODING_CONVERSATION_CHARS
+    max_evidence = MAX_CODING_FINAL_EVIDENCE_CHARS
+    depth = 3
+
+    if intent in (TaskIntent.PERFORMANCE_INVESTIGATION, TaskIntent.ARCHITECTURE_INVESTIGATION):
+        rounds = min(rounds + 2, 10)
+        depth = 4
+    elif intent in (TaskIntent.EXPLANATION, TaskIntent.CODE_REVIEW):
+        rounds = min(rounds, 4)
+        depth = 2
+    elif intent in (TaskIntent.BUILD_FAILURE, TaskIntent.DIRECT_FIX):
+        rounds = min(rounds, 5)
+        depth = 2
+
+    if complexity_hint == "high" or len(intent_info.get("target_files", [])) > 2:
+        rounds = min(rounds + 2, 12)
+        depth = min(depth + 1, 5)
+
+    return {
+        "maxToolRounds": rounds,
+        "maxConversationChars": max_chars,
+        "maxFinalEvidenceChars": max_evidence,
+        "explorationDepth": depth,
+        "confidence": confidence,
+    }
+
+
+def compute_next_best_action(session_data: Dict[str, Any], intent_info: Dict[str, Any]) -> Dict[str, Any]:
+    target_files = session_data.get("targetFiles", [])
+    target_symbols = session_data.get("targetSymbols", [])
+    evidence = session_data.get("evidence", [])
+    findings = session_data.get("findings", [])
+    proposal_required = intent_info.get("proposal_required", False)
+
+    if not target_files and not evidence:
+        if target_symbols:
+            return {
+                "action": "search_symbols",
+                "target": target_symbols[0],
+                "rationale": "Locate candidate files defining or referencing the target symbol.",
+            }
+        candidates = intent_info.get("target_files", [])
+        if candidates:
+            return {
+                "action": "read_file",
+                "target": candidates[0],
+                "rationale": "Read candidate target file identified from the user goal.",
+            }
+        return {
+            "action": "list_directory",
+            "target": session_data.get("scope", "."),
+            "rationale": "Inspect project structure to locate relevant modules.",
+        }
+
+    if target_files and not findings:
+        return {
+            "action": "inspect_target_file",
+            "target": target_files[0],
+            "rationale": "Trace execution flow and compare current logic against requested behavior.",
+        }
+
+    if findings and proposal_required and not session_data.get("proposalState"):
+        return {
+            "action": "prepare_proposal",
+            "target": target_files[0] if target_files else "",
+            "rationale": "Synthesize inspected evidence into a minimal unified diff for review.",
+        }
+
+    return {
+        "action": "synthesize_report",
+        "target": "",
+        "rationale": "Report findings, verification status, and preserved behavior.",
+    }
+
+
+def detect_evidence_contradictions(session_data: Dict[str, Any]) -> List[Dict[str, str]]:
+    contradictions = []
+    findings = session_data.get("findings", [])
+    rejected = session_data.get("rejectedHypotheses", [])
+
+    for r in rejected:
+        hyp = r.get("hypothesis", "").lower()
+        for f in findings:
+            f_lower = f.lower()
+            if any(term in f_lower for term in ["is the cause", "caused by", "culprit"]) and any(token in f_lower for token in hyp.split() if len(token) > 4):
+                contradictions.append({
+                    "type": "finding_vs_rejected_hypothesis",
+                    "finding": f,
+                    "rejected_hypothesis": r.get("hypothesis", ""),
+                    "reason": "Finding indicates cause which was marked rejected.",
+                })
+
+    return contradictions
+
+
+CODING_TASK_STORE = TaskSessionStore()
 
 
 def _last_user_message(messages: List[Dict[str, Any]]) -> str:
@@ -379,7 +941,17 @@ def _coding_finalization_messages(
             "Provide a concise answer using only the user's request and untrusted read-only evidence. "
             "For project analysis or debugging, include the existing flow you traced, distinguish observed facts "
             "from inferences, list the minimal follow-up tasks or behavior-preservation checks, and identify "
-            "tests or runtime checks that remain unverified."
+            "tests or runtime checks that remain unverified.\n\n"
+            "You are a Senior Principal Engineer reporting your code investigation. Provide a structured, evidence-based report:\n"
+            "## UNDERSTANDING & OBJECTIVE\n"
+            "State what was requested and which target files/symbols were investigated.\n\n"
+            "## OBSERVED CODE & QUERIES\n"
+            "Cite the exact files, methods, queries, and logic inspected from read tools (e.g. TargetFile::targetMethod).\n\n"
+            "## EVIDENCE & ROOT CAUSE ANALYSIS\n"
+            "Detail the concrete evidence found (e.g. repeated/duplicate queries, N+1 query loops, missing query cache, WHERE overriding default scope, large IN-clause memory arrays).\n"
+            "Separate static code facts from execution timings (note that measured latency requires DB EXPLAIN or profiling).\n\n"
+            "## RECOMMENDED MINIMAL FIX\n"
+            "Describe the smallest safe fix and behavior preservation strategy. Do NOT output a raw diff unless explicitly requested."
         )
     system += " Finish the response now."
     return [
@@ -556,22 +1128,23 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         await _send(send_json, {"type": "error", "requestId": request_id, "message": "The Coding Agent request is empty."})
         return
     proposal_required = _requires_proposal_for_conversation(supplied)
+    session_id = str(payload.get("sessionId") or payload.get("requestId") or "default-coding-session")
+    intent_info = classify_task_intent(request, supplied)
+    if intent_info.get("proposal_required"):
+        proposal_required = True
     proposal_goal = _proposal_goal([
         str(message.get("content") or "")
         for message in supplied
         if message.get("role") == "user"
     ]) if proposal_required else ""
     scope = str(payload.get("scope") or ".")[:CODING_MAX_PATH_CHARS]
-    plan = {
-        "goal": (proposal_goal or request)[:CODING_MAX_REQUEST_CHARS],
-        "scope": scope,
-        "steps": _coding_task_steps(proposal_required),
-    }
+    plan = generate_task_plan(intent_info, (proposal_goal or request), scope)
+    session = CODING_TASK_STORE.get_or_create(session_id, scope=scope)
     await _send(send_json, {
         "type": "activity",
         "requestId": request_id,
         "phase": "understanding",
-        "message": "I’m mapping your request to the project and will inspect relevant files automatically.",
+        "message": f"[{intent_info['intent']}] Planning investigation and inspecting relevant code evidence.",
         "plan": plan,
     })
     system = (
@@ -587,7 +1160,12 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         "which query is actually fastest or slowest from source code alone. Separate a static estimate from "
         "measured latency; actual ranking requires database execution plans or profiling on representative data. "
         "If those measurements are unavailable, say so explicitly, explain the evidence behind any likely candidate, "
-        "and state what measurement would confirm it. Never imply that a query was benchmarked or executed."
+        "and state what measurement would confirm it. Never imply that a query was benchmarked or executed. "
+        "Autonomous investigation rules: "
+        "1. Discover target files automatically from the user's natural-language request using search_code, search_symbols, or read_file. Never ask the user for paths you can find. "
+        "2. Trace code relationships (multi-hop): when inspecting a method or class, trace its queries, callers, callees, and helpers. "
+        "3. For performance and duplicate-query questions, inspect all queries in the method, check for loop executions (N+1), scope overrides (such as ->where() overriding default scopes instead of ->andWhere()), lack of request-level caching, and missing indexes. "
+        "4. Separate observed code facts from runtime execution latency: note that exact microsecond timings require database EXPLAIN or runtime profiling, but static code defects (e.g. duplicate queries or unindexed scans) must be identified with concrete file/line evidence."
     )
     if proposal_required:
         system += (
@@ -601,6 +1179,9 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         f"Task plan: {json.dumps(plan, ensure_ascii=False)}\n"
         "All file operations are read-only and project-root confined."
     )
+    continuation_context = CODING_TASK_STORE.get_continuation_context(session_id)
+    if continuation_context:
+        context += f"\nPersistent session knowledge from earlier in this task:\n{continuation_context}"
     if proposal_goal and proposal_goal != request:
         context += f"\nActive change request from earlier in this conversation:\n{proposal_goal}"
     conversation = [{"role": "system", "content": system}, {"role": "system", "content": context}, *supplied]
@@ -650,14 +1231,36 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                         "The Coding Agent could not read any project source file, so it cannot safely create a proposal. "
                         "Retry the request or choose a Coding provider with working tool calling."
                     )
+                elif not has_read_evidence and round_number == 0 and bool(re.search(r"\.(?:php|ts|js|py|java|cs|go|rs|rb|cpp|h)\b|\b(?:method|function|class|query|queries|bug|slow|performance|check|inspect|investigate)\b", request, re.I)):
+                    if not _is_clarification_response(message.get("content")):
+                        conversation.append({
+                            "role": "system",
+                            "content": (
+                                "You must inspect the relevant project source code using the read tools (e.g. search_code, read_file, search_symbols) before concluding. Inspect the actual method/file evidence now."
+                            ),
+                        })
+                        continue
                 final_message = message
                 break
             executed_tool_this_round = False
             reused_tool_result_this_round = False
+            consecutive_no_progress = 0
             for index, call in enumerate(calls):
                 name, arguments = _validate_tool_call(call)
                 tool_call_id = str(call.get("id") or f"{name}-{round_number}-{index}")
-                tool_calls.append({"name": name, "arguments": arguments, "round": round_number + 1})
+
+                if name in ("list_directory", "get_repository_map"):
+                    role = "Repository Explorer"
+                elif name in ("search_symbols", "find_references"):
+                    role = "Dependency Tracer"
+                elif name == "search_code" and re.search(r"\b(query|select|where|find|table|sql|index|slow|loop)\b", json.dumps(arguments), re.I):
+                    role = "Performance Investigator"
+                elif name in ("read_file", "repo_browser.read_file", "repo_browser.open_file"):
+                    role = "Code Investigator"
+                else:
+                    role = "Code Investigator"
+
+                tool_calls.append({"name": name, "arguments": arguments, "round": round_number + 1, "role": role})
                 cache_key = json.dumps(
                     {"name": name, "arguments": arguments},
                     ensure_ascii=False,
@@ -673,7 +1276,9 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                         "content": cached_result,
                     })
                     reused_tool_result_this_round = True
+                    consecutive_no_progress += 1
                     continue
+
                 await _send(send_json, {
                     "type": "tool_call",
                     "requestId": request_id,
@@ -685,6 +1290,21 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                 serialized = _serialize_coding_tool_result(result)
                 if isinstance(result, dict) and result.get("ok") is True:
                     tool_result_cache[cache_key] = serialized
+
+                is_empty_or_trivial = not serialized.strip() or serialized.strip() in ("[]", "{}", "null", '{"ok":true,"data":[]}')
+                if is_empty_or_trivial:
+                    consecutive_no_progress += 1
+                else:
+                    consecutive_no_progress = 0
+                    target_summary = arguments.get("relativePath") or arguments.get("path") or arguments.get("query") or name
+                    CODING_TASK_STORE.record_evidence(session_id, name, str(target_summary), serialized[:500])
+
+                outcome_status = classify_tool_result_status(result)
+                CODING_TASK_STORE.record_tool_call(
+                    session_id, name, arguments, role,
+                    "empty" if is_empty_or_trivial else outcome_status
+                )
+
                 executed_tool_this_round = True
                 conversation.append({
                     "role": "tool",
@@ -692,6 +1312,19 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     "name": name,
                     "content": serialized,
                 })
+
+            if consecutive_no_progress >= 2 and round_number > 0:
+                conversation.append({
+                    "role": "system",
+                    "content": (
+                        "Recent tool calls did not discover novel evidence. To avoid unhelpful repetition, the investigation "
+                        "loop is concluding now. Synthesize your final engineering conclusions immediately using the evidence "
+                        "already collected."
+                    ),
+                })
+                final_message = None
+                break
+
             if reused_tool_result_this_round and not executed_tool_this_round:
                 conversation.append({
                     "role": "system",
@@ -763,12 +1396,16 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             "requestId": request_id,
             "content": content,
         })
+        if content:
+            CODING_TASK_STORE.record_finding(session_id, content[:500])
         await _send(send_json, {
             "type": "done",
             "requestId": request_id,
             "content": content,
             "proposalRequired": proposal_required and _has_read_file_evidence(conversation),
             "plan": plan,
+            "intent": intent_info.get("intent"),
+            "confidence": intent_info.get("confidence"),
             "toolCalls": tool_calls,
             "providerId": getattr(selected_provider, "id", None),
             "provider": getattr(selected_provider, "type", None),
@@ -781,9 +1418,20 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             ),
         })
     except Exception as error:
+        provider_classification = classify_provider_exception(error)
+        CODING_TASK_STORE.save_checkpoint(session_id, label=f"Failure State: {provider_classification['category']}")
+        session = CODING_TASK_STORE.get_or_create(session_id)
+        session["proposalState"] = "BLOCKED" if not provider_classification["isCodeDefect"] else "FAILED"
+        session["lastErrorClassification"] = provider_classification
         await _send(send_json, {
             "type": "error",
             "requestId": request_id,
+            "classification": provider_classification["classification"],
+            "category": provider_classification["category"],
+            "retryable": provider_classification["retryable"],
+            "isCodeDefect": provider_classification["isCodeDefect"],
+            "suggestedAction": provider_classification["suggestedAction"],
+            "preservedSessionId": session_id,
             "message": f"Coding Agent could not complete this request: {str(error)[:500]}",
         })
 

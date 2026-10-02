@@ -67,7 +67,59 @@ try {
   assert.equal(vendor.matches.length, 0);
   const tooDeep = await developerFiles.discoverProjectByName('candidate-too-deep-discovery-test', 71004);
   assert.equal(tooDeep.matches.length, 0);
-  console.log('Coding project discovery tests passed (unique/ambiguous match, bounds, exclusions, and root confinement).');
+
+  // Cross-project generic tests: project-alpha (Node), project-beta (PHP), project-gamma (Go)
+  const projectAlpha = path.join(searchRootA, 'project-alpha');
+  const projectBeta = path.join(searchRootA, 'project-beta');
+  const projectGamma = path.join(searchRootB, 'project-gamma');
+  await Promise.all([
+    fs.mkdir(path.join(projectAlpha, 'src'), { recursive: true }),
+    fs.mkdir(path.join(projectBeta, 'models'), { recursive: true }),
+    fs.mkdir(path.join(projectGamma, 'pkg'), { recursive: true }),
+  ]);
+  await Promise.all([
+    fs.writeFile(path.join(projectAlpha, 'package.json'), JSON.stringify({ name: 'project-alpha' }), 'utf8'),
+    fs.writeFile(path.join(projectAlpha, 'src', 'BillingService.js'), 'module.exports = {};', 'utf8'),
+    fs.writeFile(path.join(projectAlpha, 'src', 'CommonUtil.ts'), 'export const x = 1;', 'utf8'),
+    fs.writeFile(path.join(projectBeta, 'composer.json'), JSON.stringify({ name: 'project-beta' }), 'utf8'),
+    fs.writeFile(path.join(projectBeta, 'models', 'Account.php'), '<?php class Account {}', 'utf8'),
+    fs.writeFile(path.join(projectGamma, 'go.mod'), 'module project-gamma', 'utf8'),
+    fs.writeFile(path.join(projectGamma, 'pkg', 'CommonUtil.ts'), 'export const y = 2;', 'utf8'),
+  ]);
+
+  // Generic directory match
+  const alphaResult = await developerFiles.discoverProjectByName('project-alpha', 71010);
+  assert.equal(alphaResult.projectRoot, await fs.realpath(projectAlpha));
+  developerFiles.releaseProject(71010);
+
+  // Case-insensitive match
+  const alphaCaseResult = await developerFiles.discoverProjectByName('PROJECT-ALPHA', 71011);
+  assert.equal(alphaCaseResult.projectRoot, await fs.realpath(projectAlpha));
+  developerFiles.releaseProject(71011);
+
+  // Target file discovery resolves to enclosing project root
+  const fileResult = await developerFiles.discoverProjectByName('BillingService.js', 71012);
+  assert.equal(fileResult.projectRoot, await fs.realpath(projectAlpha));
+  developerFiles.releaseProject(71012);
+
+  const phpFileResult = await developerFiles.discoverProjectByName('Account.php', 71013);
+  assert.equal(phpFileResult.projectRoot, await fs.realpath(projectBeta));
+  developerFiles.releaseProject(71013);
+
+  // Ambiguous target filename in multiple projects returns all matches without guessing
+  const ambiguousFile = await developerFiles.discoverProjectByName('CommonUtil.ts', 71014);
+  assert.equal(ambiguousFile.projectRoot, null);
+  assert.equal(ambiguousFile.matches.length, 2);
+  assert.deepEqual(ambiguousFile.matches, [await fs.realpath(projectAlpha), await fs.realpath(projectGamma)].sort());
+  developerFiles.releaseProject(71014);
+
+  // Non-existent target returns 0 matches
+  const nonExistent = await developerFiles.discoverProjectByName('totally-missing-target.xyz', 71015);
+  assert.equal(nonExistent.matches.length, 0);
+  assert.equal(nonExistent.projectRoot, null);
+  developerFiles.releaseProject(71015);
+
+  console.log('Coding project discovery tests passed (unique/ambiguous match, bounds, exclusions, cross-project, and file resolution).');
 } finally {
   developerFiles.releaseProject(uniqueOwner);
   developerFiles.releaseProject(ambiguousOwner);

@@ -1191,6 +1191,116 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:proposal-undo', (event, id) => developerAgent.undo(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
   ipcMain.handle('developer:proposal-get', (event, id) => developerAgent.getTask(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
   ipcMain.handle('developer:proposal-cancel', (event) => developerAgent.cancelSession(event.sender.id));
+  ipcMain.handle('developer:task-pause', (event, taskId) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.pauseTask(taskId, owner);
+  });
+  ipcMain.handle('developer:task-resume', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.resumeTask(payload?.taskId, payload?.targetPhase, owner);
+  });
+  ipcMain.handle('developer:task-steer', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.steerTask(payload?.taskId, payload || {}, owner);
+  });
+  ipcMain.handle('developer:task-checkpoint-save', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.saveTaskCheckpoint(payload?.taskId, payload?.milestone, {}, owner);
+  });
+  ipcMain.handle('developer:task-checkpoint-restore', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.restoreTaskCheckpoint(payload?.taskId, payload?.checkpointId, owner);
+  });
+  ipcMain.handle('developer:task-artifacts', (event, taskId) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.getTaskArtifacts(taskId, owner);
+  });
+  ipcMain.handle('developer:task-browser-verify', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.verifyTaskBrowser(payload?.taskId, payload?.options || {}, owner);
+  });
+  ipcMain.handle('developer:dev-server-manage', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.manageDevServer(payload?.taskId, payload?.action, payload?.projectRoot, owner);
+  });
+  ipcMain.handle('developer:skills-list', () => developerAgent.listSkills());
+  ipcMain.handle('developer:task-skill-assign', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.assignTaskSkill(payload?.taskId, payload?.skillId, owner);
+  });
+  ipcMain.handle('developer:task-mode-set', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.setTaskOperatingMode(payload?.taskId, payload?.mode, payload?.complexity, owner);
+  });
+  ipcMain.handle('developer:mcp-tools-list', () => developerAgent.listMcpTools());
+  ipcMain.handle('developer:task-mcp-invoke', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.invokeTaskMcpTool(payload?.taskId, payload?.toolName, payload?.params || {}, owner);
+  });
+  ipcMain.handle('developer:task-checkpoint-save-disk', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.saveTaskCheckpointToDisk(payload?.taskId, payload?.filePath, payload?.milestone, owner);
+  });
+  ipcMain.handle('developer:task-checkpoint-restore-disk', (_event, payload) => {
+    return developerAgent.restoreTaskFromDisk(payload?.filePath);
+  });
+  ipcMain.handle('developer:task-context-freshness', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.validateTaskContextFreshness(payload?.taskId, payload?.targetSnapshots || [], owner);
+  });
+  ipcMain.handle('developer:task-hypothesis-refute', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.refuteTaskHypothesis(payload?.taskId, payload?.text, payload?.evidence || {}, owner);
+  });
+  ipcMain.handle('developer:task-multi-repo-rollback', (_event, payload) => {
+    return developerAgent.rollbackMultiRepo(payload?.taskId);
+  });
+  ipcMain.handle('developer:task-heartbeat', (event, taskId) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.getTaskHeartbeat(taskId, owner);
+  });
+  ipcMain.handle('developer:task-disconnect', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.handleClientDisconnect(payload?.taskId, payload?.clientId || String(event.sender.id), owner);
+  });
+  ipcMain.handle('developer:task-reconnect', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.handleClientReconnect(payload?.taskId, payload?.clientId || String(event.sender.id), owner);
+  });
+  ipcMain.handle('developer:task-replay', (event, taskId) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.replayTaskEvents(taskId, owner);
+  });
+  ipcMain.handle('developer:task-worker-cancel', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.cancelWorker(payload?.taskId, payload?.workerId, payload?.reason, owner);
+  });
+  ipcMain.handle('developer:worktree-baseline-capture', (_event, payload) => {
+    return developerAgent.captureWorktreeBaseline(payload?.taskId, payload?.repoRoot, payload?.files || []);
+  });
+  ipcMain.handle('developer:worktree-preserve-verify', (_event, payload) => {
+    return developerAgent.verifyDirtyWorktreePreserved(payload?.taskId, payload?.agentFiles || []);
+  });
+  ipcMain.handle('developer:task-hidden-contract-define', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.defineHiddenContract(payload?.taskId, payload?.contract || {}, owner);
+  });
+  ipcMain.handle('developer:task-correctness-evaluate', (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    return developerAgent.evaluateIndependentCorrectness(payload?.taskId, payload?.patchPayload || {}, payload?.workspaceContext || {}, owner);
+  });
+  ipcMain.handle('developer:task-patch-quality-evaluate', (_event, payload) => {
+    return developerAgent.evaluatePatchQuality(payload?.diffText, payload?.modifiedFiles || [], payload?.targetScope || []);
+  });
+  ipcMain.handle('developer:task-diff-review-independent', (_event, payload) => {
+    return developerAgent.reviewDiffIndependently(payload?.diffText, payload?.taskGoal, payload?.modifiedFiles || []);
+  });
+  ipcMain.handle('developer:task-defect-diagnose', (_event, payload) => {
+    return developerAgent.diagnoseFailureType(payload?.errorOutput, payload?.exitCode, payload?.environmentState || {});
+  });
+  ipcMain.handle('developer:task-edge-cases-inspect', (_event, payload) => {
+    return developerAgent.inspectEdgeCasesAndContract(payload?.symbolInfo || {}, payload?.preInterface || {}, payload?.postInterface || {});
+  });
   ipcMain.handle('general:session', (event) => {
     registerGeneralRenderer(event);
     return generalAgent.getPublicSession(event.sender.id);

@@ -85,6 +85,9 @@ export class CodingAgentTransport {
     socket.send(JSON.stringify({
       type: 'chat',
       requestId,
+      sessionId: turn.sessionId,
+      turnId: turn.turnId,
+      projectRoot: turn.projectRoot,
       scope: turn.scope,
       messages,
     }));

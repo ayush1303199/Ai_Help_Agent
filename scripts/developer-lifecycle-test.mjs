@@ -61,6 +61,12 @@ try {
   await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({
     scripts: { typecheck: 'tsc --version', lint: 'eslint --version', deploy: 'echo deploy' },
   }), 'utf8');
+  await fs.mkdir(path.join(root, 'node_modules', '.bin'), { recursive: true });
+  if (process.platform === 'win32') {
+    await fs.writeFile(path.join(root, 'node_modules', '.bin', 'tsc.cmd'), '@echo 5.0.0\r\n@exit /b 0', 'utf8');
+  } else {
+    await fs.writeFile(path.join(root, 'node_modules', '.bin', 'tsc'), '#!/bin/sh\necho 5.0.0\nexit 0', { encoding: 'utf8', mode: 0o755 });
+  }
   const capturedOptions = [];
   await files.chooseProjectFolder({
     showOpenDialog: async (options) => {

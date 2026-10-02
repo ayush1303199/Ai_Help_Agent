@@ -66,10 +66,53 @@ function compactMessageContent(content: string, maxChars: number) {
   return `${content.slice(0, maxChars)}\n[Earlier content omitted for speed]`;
 }
 
+function extractCodingProjectCandidates(request: string): string[] {
+  const candidates: string[] = [];
+  const add = (candidate: string | undefined | null) => {
+    if (!candidate) return;
+    const clean = candidate.trim().replace(/^['"`<([{\\]+|['"`>)\]}\\.,;:]+$/g, '');
+    if (clean && clean.length >= 2 && clean.length <= 128 && !candidates.includes(clean)) {
+      candidates.push(clean);
+    }
+  };
+
+  const explicitAfter = request.match(/(?:^|[\s"'`])([A-Za-z0-9][A-Za-z0-9._-]{1,127})\s+(?:project|repo|repository|workspace|folder|app)\b/i);
+  add(explicitAfter?.[1]);
+  const explicitBefore = request.match(/\b(?:project|repo|repository|workspace|folder|app)\s+([A-Za-z0-9][A-Za-z0-9._-]{1,127})\b/i);
+  add(explicitBefore?.[1]);
+
+  const prepositionMatch = request.match(/\b(?:in|for|inside|under|within|on|open|select|use|switch\s+to)\s+([A-Za-z0-9][A-Za-z0-9._-]{1,127})\b/i);
+  add(prepositionMatch?.[1]);
+  const hinglishKeMein = request.match(/\b([A-Za-z0-9][A-Za-z0-9._-]{1,127})\s+(?:ke|mein|me|ka|ki)\b/i);
+  add(hinglishKeMein?.[1]);
+
+  const quoted = request.match(/[`"']([A-Za-z0-9][A-Za-z0-9._-]{1,127})[`"']/g);
+  if (quoted) {
+    for (const q of quoted) {
+      add(q.replace(/[`"']/g, ''));
+    }
+  }
+
+  const compoundNames = request.match(/\b([a-zA-Z0-9]+(?:[-_][a-zA-Z0-9]+)+)\b/g);
+  if (compoundNames) {
+    for (const name of compoundNames) {
+      add(name);
+    }
+  }
+
+  const fileNames = request.match(/\b([A-Za-z0-9_-]+\.(?:php|ts|tsx|js|jsx|py|java|go|rb|cs|rs|json|ya?ml|html|css|vue|c|cpp|h))\b/gi);
+  if (fileNames) {
+    for (const fn of fileNames) {
+      add(fn);
+    }
+  }
+
+  return candidates;
+}
+
 function extractCodingProjectName(request: string): string | null {
-  const beforeProject = request.match(/(?:^|[\s"'`])([A-Za-z0-9][A-Za-z0-9._-]{1,127})\s+project\b/i);
-  const afterProject = request.match(/\bproject\s+([A-Za-z0-9][A-Za-z0-9._-]{1,127})\b/i);
-  return beforeProject?.[1] || afterProject?.[1] || null;
+  const candidates = extractCodingProjectCandidates(request);
+  return candidates[0] || null;
 }
 
 async function hashDeveloperContent(content: string) {
@@ -189,29 +232,43 @@ export function useCodingAgentController({
         }
         projectName = selected;
       }
-      if (!projectName) {
-        appendDiscoveryReply('Tell me the project folder name in your message and I’ll look for it in the configured developer folders. You can also choose it under Advanced > Select folder.');
-        return;
+      const candidateList = projectCandidates.length > 0 && projectName ? [projectName] : extractCodingProjectCandidates(question);
+      if (candidateList.length === 0) {
+        candidateList.push('*');
       }
       setBusy(true);
       try {
         if (!window.electronAPI) throw new Error('Coding project discovery is available in the desktop app.');
-        const discovery = await window.electronAPI.discoverDeveloperProject(projectName);
-        if (!discovery.projectRoot) {
-          setProjectCandidates(discovery.matches);
-          appendDiscoveryReply(`I found more than one folder named "${projectName}". Which one should I use?\n${discovery.matches.map((candidate, index) => `${index + 1}. ${candidate}`).join('\n')}`);
+        let discovery: { projectRoot: string | null; matches: string[] } | null = null;
+        let matchedCandidate = '';
+        for (const candidate of candidateList) {
+          try {
+            const result = await window.electronAPI.discoverDeveloperProject(candidate);
+            if (result.projectRoot) {
+              discovery = result;
+              matchedCandidate = candidate;
+              break;
+            }
+            if (!discovery && result.matches.length > 0) {
+              discovery = result;
+              matchedCandidate = candidate;
+            }
+          } catch {
+            // Check next candidate
+          }
+        }
+        if (!discovery || !discovery.projectRoot) {
+          const matches = discovery?.matches || [];
+          if (matches.length > 0) {
+            setProjectCandidates(matches);
+            appendDiscoveryReply(`I found more than one project matching "${matchedCandidate || candidateList[0]}". Which one should I use?\n${matches.map((candidate, index) => `${index + 1}. ${candidate}`).join('\n')}`);
+          } else {
+            appendDiscoveryReply(`Could not find a project matching "${candidateList.join(', ')}". Tell me the project folder name or choose it under Advanced > Select folder.`);
+          }
           return;
         }
         setProjectCandidates([]);
         currentProjectRoot = discovery.projectRoot;
-        if (projectName !== extractCodingProjectName(question)) {
-          const originalRequest = [...messages].reverse().find((message) =>
-            message.role === 'user' && extractCodingProjectName(message.content),
-          );
-          if (originalRequest) {
-            projectContinuation = `${originalRequest.content}\n\nThe user selected project root: ${currentProjectRoot}. Continue this request and inspect files automatically.`;
-          }
-        }
         setProjectRoot(currentProjectRoot);
         currentScope = '.';
         setPath('.');
@@ -594,10 +651,69 @@ export function useCodingAgentController({
     setInput('');
   };
 
+  const taskStatus = proposal?.runtime?.taskState?.toLowerCase()
+    || proposal?.state
+    || (streaming ? 'running' : busy ? 'working' : 'idle');
+
+  const pauseTask = useCallback(async () => {
+    if (!proposal?.id || !window.electronAPI?.pauseDeveloperTask) return;
+    try {
+      await window.electronAPI.pauseDeveloperTask(proposal.id);
+      onStatus('Task paused.');
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    }
+  }, [onError, onStatus, proposal?.id]);
+
+  const resumeTask = useCallback(async (targetPhase?: string) => {
+    if (!proposal?.id || !window.electronAPI?.resumeDeveloperTask) return;
+    try {
+      await window.electronAPI.resumeDeveloperTask(proposal.id, targetPhase);
+      onStatus('Task resumed.');
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    }
+  }, [onError, onStatus, proposal?.id]);
+
+  const steerTask = useCallback(async (direction: string) => {
+    if (!proposal?.id || !window.electronAPI?.steerDeveloperTask) return;
+    try {
+      await window.electronAPI.steerDeveloperTask(proposal.id, { action: 'change_direction', direction });
+      onStatus(`Task steered: ${direction}`);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    }
+  }, [onError, onStatus, proposal?.id]);
+
+  const setTaskMode = useCallback(async (mode: string, complexity?: string) => {
+    if (!proposal?.id || !window.electronAPI?.setDeveloperTaskMode) return;
+    try {
+      await window.electronAPI.setDeveloperTaskMode(proposal.id, mode, complexity);
+      onStatus(`Mode set to ${mode}${complexity ? ` (${complexity})` : ''}`);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    }
+  }, [onError, onStatus, proposal?.id]);
+
+  const assignTaskSkill = useCallback(async (skillId: string) => {
+    if (!proposal?.id || !window.electronAPI?.assignDeveloperTaskSkill) return;
+    try {
+      await window.electronAPI.assignDeveloperTaskSkill(proposal.id, skillId);
+      onStatus(`Skill assigned: ${skillId}`);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    }
+  }, [onError, onStatus, proposal?.id]);
+
   return {
     workspace: {
       messages, input, projectRoot, directory, path, filePath, fileContent, searchQuery, searchResults,
-      proposal, activity, busy, streaming, errorMessage, statusMessage, onInputChange: setInput, onProjectPathChange: setPath,
+      proposal, activity, busy, streaming, errorMessage, statusMessage, taskStatus,
+      onPauseTask: () => void pauseTask(), onResumeTask: (phase?: string) => void resumeTask(phase),
+      onSteerTask: (dir: string) => void steerTask(dir),
+      onSetTaskMode: (mode: string, complexity?: string) => void setTaskMode(mode, complexity),
+      onAssignTaskSkill: (skillId: string) => void assignTaskSkill(skillId),
+      onInputChange: setInput, onProjectPathChange: setPath,
       onSearchQueryChange: setSearchQuery, onSelectProject: () => void selectProject(),
       onClearProject: () => void clearProject(), onListDirectory: () => void listDirectory(),
       onReadFile: (requestedPath?: string) => void readFile(requestedPath), onSearch: () => void searchCode(),
