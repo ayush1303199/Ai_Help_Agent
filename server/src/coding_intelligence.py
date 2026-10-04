@@ -1835,6 +1835,19 @@ class ConfigurationSymbolResolver:
     - Distinguishes CONFIGURED DATABASE from LIVE DATABASE.
     """
 
+    @staticmethod
+    def _looks_like_database_configuration(content: str) -> bool:
+        return bool(
+            re.search(
+                r"(?:['\"]?dsn['\"]?\s*(?:=>|=)|"
+                r"(?:DB_(?:HOST|PORT|DATABASE|NAME|USERNAME|USER|CONNECTION)|DATABASE_URL)\s*=|"
+                r"['\"]?(?:database|dbname|host|hostname)['\"]?\s*(?:=>|:)\s*['\"]|"
+                r"new\s+\\?PDO\s*\(|new\s+mysqli\s*\()",
+                content,
+                re.I,
+            )
+        )
+
     @classmethod
     def resolve_symbol_in_project(cls, project_root: str, symbol: Any) -> Dict[str, Any]:
         if symbol is None:
@@ -2007,10 +2020,12 @@ class ConfigurationSymbolResolver:
             if cand.is_file():
                 target_file = cand
             else:
-                matches = list(root.glob(f"**/{Path(specific_file).name}"))
-                matches = [m for m in matches if not any(x in str(m).lower() for x in ("vendor", "node_modules", ".git"))]
-                if matches:
-                    target_file = matches[0]
+                return {
+                    "discovered": False,
+                    "status": "NOT_FOUND",
+                    "configFile": str(specific_file).replace("\\", "/"),
+                    "message": f"The requested file {specific_file} was not found in the project.",
+                }
 
         if not target_file:
             search_patterns = [
@@ -2020,15 +2035,20 @@ class ConfigurationSymbolResolver:
             for pat in search_patterns:
                 cand = root / pat
                 if cand.is_file():
-                    target_file = cand
-                    break
+                    try:
+                        candidate_content = cand.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        continue
+                    if cls._looks_like_database_configuration(candidate_content):
+                        target_file = cand
+                        break
 
         if not target_file:
             for p in list(root.glob("config/*.php")) + list(root.glob("*.php")):
                 if not any(x in str(p).lower() for x in ("vendor", "node_modules", ".git")):
                     try:
                         c = p.read_text(encoding="utf-8", errors="ignore")
-                        if re.search(r"\b(?:dsn|database|dbname)\b", c, re.I):
+                        if cls._looks_like_database_configuration(c):
                             target_file = p
                             break
                     except Exception:
@@ -2042,6 +2062,23 @@ class ConfigurationSymbolResolver:
             content = target_file.read_text(encoding="utf-8", errors="ignore")
         except Exception as e:
             return {"discovered": False, "status": "ERROR", "message": str(e), "configFile": rel_path}
+
+        if not cls._looks_like_database_configuration(content):
+            return {
+                "discovered": False,
+                "status": "NOT_CONFIGURED",
+                "configFile": rel_path,
+                "activeComponent": "Unknown",
+                "componentClass": "Unknown",
+                "engine": "unknown",
+                "database": {"status": "NOT_SPECIFIED", "value": None, "symbol": None},
+                "host": {"status": "NOT_SPECIFIED", "value": None, "symbol": None},
+                "port": {"status": "NOT_SPECIFIED", "value": None, "symbol": None},
+                "username": {"status": "NOT_SPECIFIED", "value": None, "symbol": None},
+                "hasPassword": False,
+                "fileContent": SecretProtector.redact_text(content),
+                "message": f"{rel_path} does not contain database connection settings.",
+            }
 
         active_comp = "Database Connection"
         comp_class = "Native / Generic Connection"
@@ -2126,8 +2163,15 @@ class ConfigurationSymbolResolver:
             overall_status = "NOT_RESOLVED"
         elif res_db["status"] == "RESOLVED" and res_host["status"] in ("RESOLVED", "NOT_SPECIFIED"):
             overall_status = "RESOLVED"
-        else:
+        elif (
+            res_db["status"] == "RESOLVED"
+            or res_host["status"] == "RESOLVED"
+            or res_port["status"] == "RESOLVED"
+            or (res_user and res_user["status"] == "RESOLVED")
+        ):
             overall_status = "CONFIGURED"
+        else:
+            overall_status = "NOT_CONFIGURED"
 
         return {
             "discovered": True,
@@ -2218,10 +2262,17 @@ class ConfigurationSymbolResolver:
         include_file_preview: bool = False,
     ) -> str:
         lines = []
-        if include_file_preview and cfg.get("configFile") and cfg.get("fileContent"):
+        if (
+            include_file_preview
+            and cfg.get("status") != "NOT_CONFIGURED"
+            and cfg.get("configFile")
+            and cfg.get("fileContent")
+        ):
             ext = Path(cfg["configFile"]).suffix.lstrip(".") or "php"
             lines.append(f"### INSPECTED CONFIGURATION FILE: {cfg['configFile']}\n")
             lines.append(f"```{ext}\n{cfg['fileContent'].strip()}\n```\n")
+        if cfg.get("message"):
+            lines.append(f"> Notice: {cfg['message']}\n")
 
         lines.append("### DATABASE CONNECTION STATUS\n")
         tgt_id = cfg.get("targetId") or (live.get("targetId") if live else None)

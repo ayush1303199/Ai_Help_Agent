@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "server" / "src"))
 
 from coding_intelligence import (
+    ConfigurationSymbolResolver,
     SecretProtector,
     IncrementalRepositoryIndex,
     LazyCodeGraph,
@@ -291,6 +292,42 @@ return [
         assert db_info["existing_utility"] == "Yii::$app->db"
         assert db_info["driver"] == "yii\\db\\Connection"
         assert "super_secret_production_password_xyz" not in str(db_info)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        (tmp_path / "requirements.php").write_text(
+            "<?php\n"
+            "// Database requirements for PDO extensions.\n"
+            "$requirements = ['name' => 'PDO MySQL extension'];\n",
+            encoding="utf-8",
+        )
+
+        requested_missing = ConfigurationSymbolResolver.inspect_project_database_configuration(
+            str(tmp_path), specific_file="config.php"
+        )
+        assert requested_missing["status"] == "NOT_FOUND"
+        assert requested_missing["configFile"] == "config.php"
+        missing_report = ConfigurationSymbolResolver.format_connection_status_report(
+            requested_missing, include_file_preview=True
+        )
+        assert "requested file config.php was not found" in missing_report.lower()
+        assert "requirements.php" not in missing_report
+
+        discovered = ConfigurationSymbolResolver.inspect_project_database_configuration(str(tmp_path))
+        assert discovered["status"] == "NOT_FOUND"
+
+        unrelated_file = ConfigurationSymbolResolver.inspect_project_database_configuration(
+            str(tmp_path), specific_file="requirements.php"
+        )
+        assert unrelated_file["status"] == "NOT_CONFIGURED"
+        assert unrelated_file["activeComponent"] == "Unknown"
+        unrelated_report = ConfigurationSymbolResolver.format_connection_status_report(
+            unrelated_file, include_file_preview=True
+        )
+        assert "does not contain database connection settings" in unrelated_report
+        assert "- **Status:** NOT_CONFIGURED" in unrelated_report
+        assert "INSPECTED CONFIGURATION FILE" not in unrelated_report
+        assert "$requirements" not in unrelated_report
 
     # 2. Check all 8 capability paths
     caps = DatabaseIntelligenceEngine.check_database_capabilities(

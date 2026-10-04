@@ -80,6 +80,106 @@ interface CodingAgentWorkspaceProps {
   onResetCodingPreferences: () => void;
 }
 
+function renderInlineMarkdown(text: string) {
+  const normalized = text.replace(/\\([`*_#|>])/g, '$1');
+  const parts = normalized.split(/(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g);
+
+  return parts.map((part, index) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={index}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith('`') && part.endsWith('`')) {
+      return <code key={index} className="rounded bg-slate-800 px-1 py-0.5 text-sky-200">{part.slice(1, -1)}</code>;
+    }
+    if (part.startsWith('*') && part.endsWith('*')) {
+      return <em key={index}>{part.slice(1, -1)}</em>;
+    }
+    return part;
+  });
+}
+
+function CodingMarkdown({ content }: { content: string }) {
+  const normalizedContent = content
+    .replace(/\\r\\n|\\n|\\r/g, '\n')
+    .replace(/\\([`*_#|>])/g, '$1')
+    .replace(/[ \t]+(#{1,6}\s)/g, '\n$1')
+    .replace(/[ \t]+-\s+(?=\*\*)/g, '\n- ');
+  const lines = normalizedContent.split(/\r?\n/);
+  const blocks = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = line.match(/^\s*```([\w-]*)\s*$/);
+    if (fence) {
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      index += index < lines.length ? 1 : 0;
+      blocks.push(<pre key={`code-${index}`} className="overflow-x-auto rounded-md border border-slate-700 bg-slate-950 p-3 text-xs leading-relaxed text-slate-200"><code className={fence[1] ? `language-${fence[1]}` : undefined}>{code.join('\n')}</code></pre>);
+      continue;
+    }
+
+    const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      const level = heading[1].length;
+      const className = level <= 2 ? 'text-base font-semibold text-slate-100' : 'text-sm font-semibold text-slate-200';
+      const children = renderInlineMarkdown(heading[2]);
+      blocks.push(level === 1 ? <h1 key={index} className={className}>{children}</h1> : level === 2 ? <h2 key={index} className={className}>{children}</h2> : <h3 key={index} className={className}>{children}</h3>);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*[-*]\s+/, ''));
+        index += 1;
+      }
+      blocks.push(<ul key={`ul-${index}`} className="list-disc space-y-1 pl-5">{items.map((item, itemIndex) => <li key={itemIndex}>{renderInlineMarkdown(item)}</li>)}</ul>);
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*\d+\.\s+/, ''));
+        index += 1;
+      }
+      blocks.push(<ol key={`ol-${index}`} className="list-decimal space-y-1 pl-5">{items.map((item, itemIndex) => <li key={itemIndex}>{renderInlineMarkdown(item)}</li>)}</ol>);
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quote = [];
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+        quote.push(lines[index].replace(/^\s*>\s?/, ''));
+        index += 1;
+      }
+      blocks.push(<blockquote key={`quote-${index}`} className="border-l-2 border-sky-500/50 pl-3 text-slate-400">{quote.map((item) => renderInlineMarkdown(item))}</blockquote>);
+      continue;
+    }
+
+    const paragraph = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !/^\s*(?:```|#{1,6}\s|[-*]\s+|\d+\.\s+|>)/.test(lines[index])) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    blocks.push(<p key={`p-${index}`} className="whitespace-pre-wrap break-words">{renderInlineMarkdown(paragraph.join('\n'))}</p>);
+  }
+
+  return <div className="space-y-2 text-sm leading-relaxed text-slate-100">{blocks}</div>;
+}
+
 export function CodingAgentWorkspace({
   messages,
   input,
@@ -208,7 +308,7 @@ export function CodingAgentWorkspace({
         {messages.length === 0 && <p className="rounded-lg border border-dashed border-slate-700 p-6 text-center text-sm text-slate-500">Describe a coding task and name its project. I’ll locate the project and inspect relevant files automatically; folder browsing remains optional under Advanced.</p>}
         {messages.map((message, index) => <article key={message.requestId || `${message.role}-${index}`} className={`rounded-xl border p-4 ${message.role === 'user' ? 'border-slate-700 bg-slate-800/60' : 'border-sky-500/20 bg-slate-950/60'}`}>
           <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">{message.role === 'user' ? 'You' : 'Coding Agent'}</p>
-          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-100">{message.content || (message.streaming ? 'I’m understanding the request and inspecting the relevant files…' : '')}</p>
+          {message.content ? <CodingMarkdown content={message.content} /> : message.streaming && <p className="text-sm leading-relaxed text-slate-100">I’m understanding the request and inspecting the relevant files…</p>}
           {message.role === 'assistant' && index === messages.length - 1 && activity.length > 0 && <div className="mt-3 space-y-2 rounded-md border border-slate-700 bg-slate-900/70 p-2">
             {activity.slice(-8).map((item, activityIndex) => <div key={`${item.phase}-${activityIndex}`} className="text-[11px] text-slate-400"><p><span className="mr-2 font-semibold text-sky-300">{item.phase}</span>{item.message}</p>{item.plan && <div className="ml-2 mt-1 border-l border-slate-700 pl-2"><p>{String(item.plan.goal || '')}</p>{Array.isArray(item.plan.steps) && <ol className="mt-1 list-inside list-decimal">{item.plan.steps.map((step, stepIndex) => <li key={stepIndex}>{String(step)}</li>)}</ol>}</div>}</div>)}
           </div>}
