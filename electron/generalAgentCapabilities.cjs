@@ -132,6 +132,11 @@ const CAPABILITY_DEFINITIONS = [
   capability('RETURNS', 'Prepare a return or cancellation for user approval.', ['discover', 'prepare', 'requestConfirmation', 'execute', 'verify'], { riskLevel: 'EXTERNAL_COMMUNICATION', requiredConfirmation: true, supportedProviders: ['isolated-browser'] }),
   capability('TRACKING', 'Read order or booking status without changing external state.', ['read', 'track', 'verify'], { riskLevel: 'USER_DATA', supportedProviders: ['isolated-browser'] }),
   capability('GENERAL_COMPUTER_TASK', 'Route an otherwise uncategorized bounded computer task.', ['open', 'focus', 'click', 'type', 'keypress', 'scroll', 'screenshot', 'wait'], { riskLevel: 'LOW_RISK', requiredPermissions: ['desktop-allowlist'], supportedProviders: ['controlled-desktop'] }),
+  // Database related capabilities
+  capability('DATABASE_CONNECT', 'Establish a safe connection to the project database.', ['connect'], { riskLevel: 'USER_DATA', requiredPermissions: ['file-access'], supportedProviders: ['local-db-runtime'] }),
+  capability('DATABASE_CURRENT_TARGET', 'Get current database configuration and live connection details.', ['getCurrentTarget'], { riskLevel: 'USER_DATA', requiredPermissions: ['file-access'], supportedProviders: ['local-db-runtime'] }),
+  capability('DATABASE_QUERY', 'Execute a read‑only SQL query on the connected database.', ['query'], { riskLevel: 'READ_ONLY', requiredPermissions: ['file-access'], supportedProviders: ['local-db-runtime'] }),
+  capability('DATABASE_EXPLAIN', 'Explain a SQL query for performance analysis.', ['explain'], { riskLevel: 'READ_ONLY', requiredPermissions: ['file-access'], supportedProviders: ['local-db-runtime'] }),
 ];
 
 const DEFAULT_PROVIDER_DEFINITIONS = [
@@ -187,6 +192,15 @@ const DEFAULT_PROVIDER_DEFINITIONS = [
     capabilities: ['PRICE_TRACKING', 'REMINDERS', 'TASKS', 'MONITORING'],
     lifecycle: 'PERMISSION_REQUIRED',
     implemented: false,
+    supportsFallback: false,
+  },
+  {
+    providerId: 'local-db-runtime',
+    displayName: 'Local Database Runtime',
+    description: 'Provider for safe execution of read‑only database queries against the project\'s configured database.',
+    capabilities: ['DATABASE_CONNECT', 'DATABASE_CURRENT_TARGET', 'DATABASE_QUERY', 'DATABASE_EXPLAIN'],
+    lifecycle: 'AVAILABLE',
+    implemented: true,
     supportsFallback: false,
   },
 ];
