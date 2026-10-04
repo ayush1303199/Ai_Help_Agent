@@ -28,18 +28,20 @@ def _api_key(registry: Any, provider: Any, config_path: Path) -> str:
 
 
 def _candidates(registry: Any, provider_id: Optional[str] = None) -> List[Any]:
+    if not registry:
+        return []
     if provider_id:
-        requested = registry.get_provider(provider_id)
+        requested = registry.get_provider(provider_id) if hasattr(registry, "get_provider") else None
         if not requested:
             raise RuntimeError("The selected Coding Agent provider is no longer configured.")
-        if not requested.enabled:
+        if not getattr(requested, "enabled", True):
             raise RuntimeError("The selected Coding Agent provider is disabled.")
         configuration_error = provider_model_error(requested.type, requested.model, requested.base_url)
         if configuration_error:
             raise ProviderModelConfigurationError(configuration_error)
         return [requested]
 
-    active = registry.get_active_provider()
+    active = registry.get_active_provider() if hasattr(registry, "get_active_provider") else None
     if not active:
         return []
     configuration_error = provider_model_error(active.type, active.model, active.base_url)
@@ -47,10 +49,10 @@ def _candidates(registry: Any, provider_id: Optional[str] = None) -> List[Any]:
         raise ProviderModelConfigurationError(configuration_error)
 
     candidates = [active]
-    if registry.fallback_enabled:
+    if getattr(registry, "fallback_enabled", False) and hasattr(registry, "get_eligible_providers"):
         candidates.extend(
             provider for provider in registry.get_eligible_providers()
-            if provider.id != active.id
+            if getattr(provider, "id", None) != getattr(active, "id", None)
         )
     return candidates
 
@@ -78,7 +80,54 @@ def _normalize(message: Dict[str, Any]) -> Dict[str, Any]:
 
 def _requires_tool_choice_retry(error: Exception) -> bool:
     message = str(error).lower()
-    return "tool choice is required" in message or "tool_use_failed" in message or "did not call a tool" in message
+    return any(
+        phrase in message
+        for phrase in (
+            "tool choice is required",
+            "tool_use_failed",
+            "did not call a tool",
+            "tool_choice",
+            "tool choice",
+            "toolchoice",
+            "invalid_request_error",
+            "not supported",
+            "400",
+        )
+    )
+
+
+
+def _get_default_coding_tools() -> List[Dict[str, Any]]:
+    try:
+        from coding_websocket import CODING_TOOLS
+        return list(CODING_TOOLS)
+    except Exception:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a text file in the selected project. Read-only.",
+                    "parameters": {"type": "object", "required": ["relativePath"], "properties": {"relativePath": {"type": "string"}}, "additionalProperties": False},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_code",
+                    "description": "Search project filenames and source text. Read-only.",
+                    "parameters": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string", "maxLength": 200}}, "additionalProperties": False},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_directory",
+                    "description": "List project files and directories. Read-only.",
+                    "parameters": {"type": "object", "properties": {"relativePath": {"type": "string"}}, "additionalProperties": False},
+                },
+            },
+        ]
 
 
 def _openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -317,15 +366,36 @@ def complete_coding_model(
                     "max_tokens": CODING_MAX_COMPLETION_TOKENS,
                 }
                 if tools:
+                    declared_names = {t.get("function", {}).get("name") for t in tools if isinstance(t, dict)}
+                    called_names = set()
+                    for m in messages:
+                        if isinstance(m, dict) and m.get("tool_calls"):
+                            for tc in m["tool_calls"]:
+                                if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
+                                    called_names.add(tc["function"].get("name"))
+                    missing_tools = called_names - declared_names
+                    if missing_tools:
+                        defaults = {t.get("function", {}).get("name"): t for t in _get_default_coding_tools()}
+                        augmented_tools = list(tools)
+                        for t_name in missing_tools:
+                            if t_name in defaults:
+                                augmented_tools.append(defaults[t_name])
+                        request["tools"] = augmented_tools
                     request["tool_choice"] = "required" if require_tool_call else "auto"
                 client = OpenAI(api_key=api_key, base_url=provider.base_url or None)
                 try:
                     response = client.chat.completions.create(**request)
                 except Exception as error:
-                    if not (tools and require_tool_call and _requires_tool_choice_retry(error)):
+                    err_msg = str(error).lower()
+                    if "was not in request.tools" in err_msg or "attempted to call tool" in err_msg:
+                        request["tools"] = _get_default_coding_tools()
+                        request["tool_choice"] = "auto"
+                        response = client.chat.completions.create(**request)
+                    elif tools and require_tool_call and _requires_tool_choice_retry(error):
+                        request["tool_choice"] = "auto"
+                        response = client.chat.completions.create(**request)
+                    else:
                         raise
-                    request["tool_choice"] = "auto"
-                    response = client.chat.completions.create(**request)
                 raw = response.choices[0].message.model_dump(exclude_none=True) if response.choices else {}
                 message = _normalize(raw)
             else:

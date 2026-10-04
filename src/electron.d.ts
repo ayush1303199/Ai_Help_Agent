@@ -275,6 +275,8 @@ interface Window {
     onScreenReadShortcut: (callback: () => void) => () => void;
     chooseDeveloperProject: () => Promise<{ canceled: boolean; projectRoot: string | null }>;
     discoverDeveloperProject: (projectName: string) => Promise<{ matches: string[]; projectRoot: string | null }>;
+    getDeveloperProjectState: () => Promise<{ status: 'PROJECT_ATTACHED' | 'PROJECT_DETACHED' | 'PROJECT_MISSING' | 'PROJECT_NOT_ATTACHED' | 'PROJECT_STALE' | 'PROJECT_SESSION_RECONNECTING'; projectRoot: string | null; reason?: string | null }>;
+    attachDeveloperProject: (projectRoot: string) => Promise<{ status: string; projectRoot: string | null; reason?: string | null }>;
     clearDeveloperProject: () => Promise<void>;
     listDeveloperDirectory: (relativePath?: string) => Promise<Array<{ name: string; type: 'file' | 'directory' }>>;
     readDeveloperFile: (relativePath: string) => Promise<{ path: string; content: string }>;
@@ -331,6 +333,92 @@ interface Window {
     cancelDeveloperTaskWorker?: (taskId: string, workerId: string, reason?: string) => Promise<Record<string, unknown>>;
     captureDeveloperWorktreeBaseline?: (taskId: string, repoRoot: string, files?: string[]) => Promise<Record<string, unknown>>;
     verifyDeveloperWorktreePreserved?: (taskId: string, agentFiles?: string[]) => Promise<{ ok: boolean; preservedCount: number; violations: Array<Record<string, unknown>> }>;
+    defineDeveloperHiddenContract?: (taskId: string, contract: Record<string, unknown>) => Promise<boolean>;
+    evaluateDeveloperCorrectness?: (taskId: string, patchPayload?: Record<string, unknown>, workspaceContext?: Record<string, unknown>) => Promise<{
+      hasHiddenContract: boolean;
+      passed: boolean;
+      behavioralCorrectness: boolean;
+      hiddenTestsPassed: number;
+      hiddenTestsTotal: number;
+      hiddenTestPassRate: number;
+      regressionPassed: boolean;
+      securityPassed: boolean;
+      violations: string[];
+    }>;
+    evaluateDeveloperPatchQuality?: (diffText: string, modifiedFiles?: string[], targetScope?: string[]) => Promise<{
+      passed: boolean;
+      score: number;
+      minimalityRatio: number;
+      filesChanged: number;
+      linesAdded: number;
+      linesRemoved: number;
+      totalLinesChanged: number;
+      unrelatedFiles: string[];
+      unnecessaryChanges: string[];
+      penalties: Array<Record<string, unknown>>;
+    }>;
+    reviewDeveloperDiffIndependent?: (diffText: string, taskGoal?: string, modifiedFiles?: string[]) => Promise<{
+      whatChanged: string[];
+      why: string;
+      risks: string[];
+      whatIsMissing: string[];
+      whatIsUnnecessary: string[];
+      disagreementDetected: boolean;
+      approved: boolean;
+      recommendation?: string;
+    }>;
+    diagnoseDeveloperDefect?: (errorOutput: string, exitCode?: number, environmentState?: Record<string, unknown>) => Promise<{
+      classification: string;
+      isCodeDefect: boolean;
+      isEnvironmentIssue: boolean;
+      reason: string;
+      recommendedAction: string;
+    }>;
+    inspectDeveloperEdgeCases?: (symbolInfo: Record<string, unknown>, preInterface?: Record<string, unknown>, postInterface?: Record<string, unknown>) => Promise<{
+      edgeCases: Array<Record<string, unknown>>;
+      contract: { preserved: boolean; breakingChanges: string[] };
+    }>;
+    verifyDeveloperTaskBlindness?: (taskId: string) => Promise<{ isClean: boolean; leakageCount: number; leaks: Array<Record<string, unknown>> }>;
+    auditDeveloperOracleDiscovery?: (taskId: string) => Promise<{ accessBlocked: boolean; directAccessDetected: boolean; compromised: boolean }>;
+    adjudicateDeveloperWorkerConflict?: (workerA: Record<string, unknown>, workerB: Record<string, unknown>, repositoryEvidence?: Record<string, unknown>) => Promise<{
+      conflictDetected: boolean;
+      adjudicated: boolean;
+      winningWorkerId: string;
+      winningTarget?: string;
+      losingWorkerId?: string;
+      scores: Record<string, number>;
+      rationale: string;
+    }>;
+    classifyDeveloperRealityLevel?: (executionTrace: Record<string, unknown>) => Promise<{
+      realityLevel: string;
+      levelName: string;
+      confidence: string;
+      verifiedCapabilities: string[];
+    }>;
+    revalidateDeveloperBusinessTask?: (taskDef: Record<string, unknown>) => Promise<{
+      taskId: string;
+      status: string;
+      businessVerified: boolean;
+      visibleTestPassed: boolean;
+      baselineFailedAsExpected?: boolean;
+      mutationCaught?: boolean;
+      regressionClean?: boolean;
+      reason?: string;
+      before?: unknown;
+      after?: unknown;
+    }>;
+    redlineDeveloperBusinessClaim?: (claim: Record<string, unknown>) => Promise<{
+      taskId: string;
+      claimedStatus: string;
+      claimedScore: number;
+      actualStatus: string;
+      isFalsePass: boolean;
+      isMockOnly: boolean;
+      isVerified: boolean;
+      reason: string;
+      before?: unknown;
+      after?: unknown;
+    }>;
     getGeneralSession: () => Promise<{ sessionId: string; taskIds: string[]; tasks: GeneralTaskState[] }>;
     createGeneralTask: (input: { goal: string; requirements?: string[]; constraints?: string[] }) => Promise<GeneralTaskState>;
     getGeneralTask: (taskId: string) => Promise<GeneralTaskState>;

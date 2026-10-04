@@ -19,6 +19,10 @@ const {
   mutationHarness,
   defectClassifier,
   edgeCaseValidator,
+  blindnessGuard,
+  workerConflictAdjudicator,
+  realityLevelEvaluator,
+  businessRevalidationEngine,
 } = require('./coding-pipeline/correctnessEngine.cjs');
 
 const STATES = Object.freeze([
@@ -43,8 +47,8 @@ const STATE_ALIASES = Object.freeze({
 });
 const transitions = {
   idle: ['reading', 'proposal_ready', 'cancelled'],
-  reading: ['understanding', 'proposal_ready', 'failed', 'cancelled'],
-  understanding: ['proposal_ready', 'reading', 'failed', 'cancelled'],
+  reading: ['understanding', 'proposal_ready', 'completed', 'failed', 'cancelled'],
+  understanding: ['proposal_ready', 'reading', 'completed', 'failed', 'cancelled'],
   proposal_ready: ['awaiting_approval', 'failed', 'cancelled'],
   awaiting_approval: ['approved', 'verifying', 'failed', 'cancelled'],
   approved: ['applying', 'executing', 'failed', 'cancelled'],
@@ -207,7 +211,7 @@ function advanceConversationTurn(turnId, next, owner, details = {}) {
   const turn = conversationTurns.get(turnId);
   assertConversationOwner(turn, owner);
   const allowed = {
-    reading: ['understanding', 'failed', 'cancelled'],
+    reading: ['understanding', 'completed', 'failed', 'cancelled'],
     understanding: ['proposal_ready', 'completed', 'failed', 'cancelled'],
     proposal_ready: ['awaiting_approval', 'failed', 'cancelled'],
     awaiting_approval: ['approved', 'failed', 'cancelled'],
@@ -1319,6 +1323,34 @@ function inspectEdgeCasesAndContract(symbolInfo, preInterface, postInterface) {
   return { edgeCases, contract };
 }
 
+function verifyTaskBlindness(taskId, owner) {
+  const task = getTask(taskId, owner);
+  const hiddenContract = correctnessOracle._hiddenContracts?.get(taskId) || null;
+  return blindnessGuard.verifyTaskBlindness(task, hiddenContract);
+}
+
+function attemptOracleDiscovery(taskId) {
+  return blindnessGuard.attemptOracleDiscovery(taskId, {
+    getTask: (id) => publicTask(getTask(id)),
+  });
+}
+
+function adjudicateWorkerConflict(workerA, workerB, repositoryEvidence) {
+  return workerConflictAdjudicator.adjudicateConflict(workerA, workerB, repositoryEvidence);
+}
+
+function classifyRealityLevel(executionTrace) {
+  return realityLevelEvaluator.classifyRealityLevel(executionTrace);
+}
+
+function revalidateBusinessTask(taskDef) {
+  return businessRevalidationEngine.revalidateTask(taskDef);
+}
+
+function redlineBusinessClaim(claim) {
+  return businessRevalidationEngine.redlineClaim(claim);
+}
+
 function resetForTest() {
   registry.clear(); sessions.clear(); conversationTurns.clear(); locked = false; journalError = null; auditError = null;
   journalQueue = Promise.resolve(); auditQueue = Promise.resolve();
@@ -1341,4 +1373,6 @@ module.exports = {
   captureWorktreeBaseline, verifyDirtyWorktreePreserved, calculateAgentDelta,
   defineHiddenContract, evaluateIndependentCorrectness, evaluatePatchQuality, reviewDiffIndependently,
   verifyMutationTest, diagnoseFailureType, inspectEdgeCasesAndContract,
+  verifyTaskBlindness, attemptOracleDiscovery, adjudicateWorkerConflict, classifyRealityLevel,
+  revalidateBusinessTask, redlineBusinessClaim,
 };

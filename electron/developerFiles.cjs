@@ -67,8 +67,19 @@ const CHECK_COMMANDS = {
   'python-lint': { executable: 'python', args: ['-m', 'compileall', '-q', '.'] },
 };
 
+const PROJECT_STATUSES = Object.freeze({
+  ATTACHED: 'PROJECT_ATTACHED',
+  DETACHED: 'PROJECT_DETACHED',
+  STALE: 'PROJECT_STALE',
+  MISSING: 'PROJECT_MISSING',
+  RECONNECTING: 'PROJECT_SESSION_RECONNECTING',
+  NOT_ATTACHED: 'PROJECT_NOT_ATTACHED',
+});
+
 const projectRoots = new Map();
 const projectDiscoveryMatches = new Map();
+let authoritativeProjectRoot = null;
+let authoritativeProjectStatus = PROJECT_STATUSES.NOT_ATTACHED;
 let auditDirectory = null;
 
 function isInsideRoot(root, target) {
@@ -416,6 +427,7 @@ async function discoverProjectByName(projectName, ownerWebContentsId) {
     projectRoots.set(ownerWebContentsId, projectRoot);
     try {
       await validateProjectRoot(ownerWebContentsId);
+      await setAuthoritativeProject(projectRoot, ownerWebContentsId);
     } catch (error) {
       projectRoots.delete(ownerWebContentsId);
       throw error;
@@ -487,22 +499,73 @@ function normalizeScopedProjectPath(root, scope, requestedPath) {
 
 function assertProjectOwner(ownerWebContentsId) {
   if (ownerWebContentsId === undefined) {
-    throw new Error('Developer project owner is required.');
+    const err = new Error('Developer project owner is required.');
+    err.code = 'PROJECT_NOT_ATTACHED';
+    throw err;
   }
-  const assignedRoot = projectRoots.get(ownerWebContentsId);
+  if (authoritativeProjectStatus === PROJECT_STATUSES.DETACHED) {
+    const err = new Error('Developer project is detached (PROJECT_DETACHED).');
+    err.code = 'PROJECT_DETACHED';
+    throw err;
+  }
+  let assignedRoot = projectRoots.get(ownerWebContentsId);
+  if (!assignedRoot && projectRoots.size > 0) {
+    const err = new Error('Developer project access is not owned by this renderer session.');
+    err.code = 'PROJECT_NOT_OWNED';
+    throw err;
+  }
+  if (!assignedRoot && projectRoots.size === 0 && authoritativeProjectRoot && authoritativeProjectStatus === PROJECT_STATUSES.ATTACHED) {
+    assignedRoot = authoritativeProjectRoot;
+    projectRoots.set(ownerWebContentsId, assignedRoot);
+  }
   if (!assignedRoot) {
-    throw new Error('Developer project is not owned by this renderer session.');
+    const err = new Error('Developer project access is not owned by this renderer session.');
+    err.code = 'PROJECT_NOT_ATTACHED';
+    throw err;
   }
+  const fsSync = require('node:fs');
+  try {
+    const stat = fsSync.statSync(assignedRoot);
+    if (!stat.isDirectory()) {
+      authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
+      const err = new Error(`Developer project directory does not exist on disk (PROJECT_MISSING): ${assignedRoot}`);
+      err.code = 'PROJECT_MISSING';
+      throw err;
+    }
+  } catch (err) {
+    if (err.code === 'PROJECT_MISSING') throw err;
+    authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
+    const missingErr = new Error(`Developer project directory does not exist on disk (PROJECT_MISSING): ${assignedRoot}`);
+    missingErr.code = 'PROJECT_MISSING';
+    throw missingErr;
+  }
+  return assignedRoot;
 }
 
 async function validateProjectRoot(ownerWebContentsId) {
   assertProjectOwner(ownerWebContentsId);
-  const root = projectRoots.get(ownerWebContentsId);
-  if (!root) throw new Error('No project folder selected.');
-  const resolvedRoot = await fs.realpath(root);
-  const stat = await fs.stat(resolvedRoot);
-  if (!stat.isDirectory()) throw new Error('Invalid project path.');
-  return resolvedRoot;
+  const root = projectRoots.get(ownerWebContentsId) || authoritativeProjectRoot;
+  if (!root) {
+    const err = new Error('No project folder selected.');
+    err.code = 'PROJECT_NOT_ATTACHED';
+    throw err;
+  }
+  try {
+    const resolvedRoot = await fs.realpath(root);
+    const stat = await fs.stat(resolvedRoot);
+    if (!stat.isDirectory()) {
+      authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
+      const err = new Error(`Invalid project path (PROJECT_MISSING): ${root}`);
+      err.code = 'PROJECT_MISSING';
+      throw err;
+    }
+    return resolvedRoot;
+  } catch (err) {
+    authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
+    const error = new Error(`Invalid project path (PROJECT_MISSING): ${err.message}`);
+    error.code = 'PROJECT_MISSING';
+    throw error;
+  }
 }
 
 function appendAudit(root, tool, target, result) {
@@ -545,18 +608,19 @@ async function resolveProjectScope(ownerWebContentsId, relativePath = '.') {
 
 async function chooseProjectFolder(dialog, ownerWebContentsId) {
   if (ownerWebContentsId === undefined) throw new Error('Developer project ownership is required.');
-  const scaffoldPath = projectRoots.get(ownerWebContentsId) || process.cwd() || require('node:os').homedir();
+  const scaffoldPath = projectRoots.get(ownerWebContentsId) || authoritativeProjectRoot || process.cwd() || require('node:os').homedir();
   const result = await dialog.showOpenDialog({
     title: 'Select project folder',
     defaultPath: scaffoldPath,
     properties: ['openDirectory'],
   });
   if (result.canceled || !result.filePaths[0]) {
-    return { canceled: true, projectRoot: projectRoots.get(ownerWebContentsId) || null };
+    return { canceled: true, projectRoot: projectRoots.get(ownerWebContentsId) || authoritativeProjectRoot || null };
   }
   const selectedRoot = await fs.realpath(result.filePaths[0]);
   projectRoots.set(ownerWebContentsId, selectedRoot);
   projectDiscoveryMatches.delete(ownerWebContentsId);
+  await setAuthoritativeProject(selectedRoot, ownerWebContentsId);
   return { canceled: false, projectRoot: selectedRoot };
 }
 
@@ -1065,7 +1129,103 @@ async function getVerificationScripts(ownerWebContentsId, requested = []) {
   };
 }
 
+function syncProjectStateToBackend(projectRoot) {
+  try {
+    const url = 'http://localhost:3001/api/coding/project-state';
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectRoot: projectRoot || null }),
+    }).catch(() => undefined);
+  } catch {}
+}
+
+async function setAuthoritativeProject(selectedRoot, ownerWebContentsId = null) {
+  if (!selectedRoot || typeof selectedRoot !== 'string') {
+    throw new Error('Valid project path is required.');
+  }
+  const resolved = await fs.realpath(selectedRoot);
+  const stat = await fs.stat(resolved);
+  if (!stat.isDirectory()) throw new Error('Selected project path is not a directory.');
+  authoritativeProjectRoot = resolved;
+  authoritativeProjectStatus = PROJECT_STATUSES.ATTACHED;
+  syncProjectStateToBackend(resolved);
+  if (ownerWebContentsId !== undefined && ownerWebContentsId !== null) {
+    projectRoots.set(ownerWebContentsId, resolved);
+    projectDiscoveryMatches.delete(ownerWebContentsId);
+  }
+  return resolved;
+}
+
+function detachAuthoritativeProject() {
+  authoritativeProjectRoot = null;
+  authoritativeProjectStatus = PROJECT_STATUSES.DETACHED;
+  syncProjectStateToBackend(null);
+  projectRoots.clear();
+  projectDiscoveryMatches.clear();
+}
+
+async function getProjectState(ownerWebContentsId = null) {
+  if (authoritativeProjectStatus === PROJECT_STATUSES.DETACHED) {
+    return { status: PROJECT_STATUSES.DETACHED, projectRoot: null, reason: 'Project was intentionally detached.' };
+  }
+  let candidate = (ownerWebContentsId !== null && ownerWebContentsId !== undefined && projectRoots.get(ownerWebContentsId))
+    || authoritativeProjectRoot
+    || (projectRoots.size === 1 ? [...projectRoots.values()][0] : null);
+
+  if (!candidate && authoritativeProjectStatus !== PROJECT_STATUSES.DETACHED) {
+    try {
+      const response = await fetch('http://localhost:3001/api/coding/project-state', { signal: AbortSignal.timeout(500) });
+      if (response.ok) {
+        const backendState = await response.json();
+        if (backendState && backendState.status === 'PROJECT_ATTACHED' && backendState.projectRoot) {
+          candidate = backendState.projectRoot;
+        }
+      }
+    } catch {}
+  }
+
+  if (!candidate) {
+    if (authoritativeProjectStatus === PROJECT_STATUSES.MISSING) {
+      return { status: PROJECT_STATUSES.MISSING, projectRoot: null, reason: 'Project directory is missing from disk.' };
+    }
+    return { status: PROJECT_STATUSES.NOT_ATTACHED, projectRoot: null, reason: 'No project attached.' };
+  }
+
+  try {
+    const stat = await fs.stat(candidate);
+    if (!stat.isDirectory()) {
+      authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
+      return { status: PROJECT_STATUSES.MISSING, projectRoot: candidate, reason: 'Project path is not a directory.' };
+    }
+  } catch (error) {
+    authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
+    return { status: PROJECT_STATUSES.MISSING, projectRoot: candidate, reason: `Project directory missing: ${error.message}` };
+  }
+
+  authoritativeProjectRoot = candidate;
+  authoritativeProjectStatus = PROJECT_STATUSES.ATTACHED;
+  if (ownerWebContentsId !== null && ownerWebContentsId !== undefined) {
+    projectRoots.set(ownerWebContentsId, candidate);
+  }
+  return { status: PROJECT_STATUSES.ATTACHED, projectRoot: candidate };
+}
+
+async function attachProject(projectRoot, ownerWebContentsId = null) {
+  if (!projectRoot || typeof projectRoot !== 'string') {
+    return { status: PROJECT_STATUSES.NOT_ATTACHED, projectRoot: null, reason: 'No project path specified.' };
+  }
+  try {
+    const resolved = await setAuthoritativeProject(projectRoot, ownerWebContentsId);
+    return { status: PROJECT_STATUSES.ATTACHED, projectRoot: resolved };
+  } catch (error) {
+    authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
+    return { status: PROJECT_STATUSES.MISSING, projectRoot, reason: error.message };
+  }
+}
+
 function clearProject(ownerWebContentsId) {
+  detachAuthoritativeProject();
   if (ownerWebContentsId !== undefined) {
     projectRoots.delete(ownerWebContentsId);
     projectDiscoveryMatches.delete(ownerWebContentsId);
@@ -1096,6 +1256,9 @@ function getProjectRoot(ownerWebContentsId = null) {
     return projectRoots.get(ownerWebContentsId) || null;
   }
   if (projectRoots.size === 1) return [...projectRoots.values()][0];
+  if (projectRoots.size === 0 && authoritativeProjectStatus === PROJECT_STATUSES.ATTACHED && authoritativeProjectRoot) {
+    return authoritativeProjectRoot;
+  }
   return null;
 }
 
@@ -1205,4 +1368,5 @@ module.exports = {
   redactRuntimeValue, parseRuntimeFailure, mapRuntimeSource, classifyProjectSignals,
   PROJECT_MANIFESTS, VERIFICATION_PROFILES,
   detectProjectType, detectDevServerConfiguration,
+  getProjectState, attachProject, setAuthoritativeProject, detachAuthoritativeProject, PROJECT_STATUSES,
 };

@@ -16,6 +16,14 @@ export interface CodingTransportResult {
   requestId: string;
   content: string;
   proposalRequired: boolean;
+  status?: string;
+  readOnly?: boolean;
+  writeRequired?: boolean;
+  applyRequired?: boolean;
+  approvalRequired?: boolean;
+  intent?: string;
+  confidence?: string;
+  performanceEvidence?: Record<string, unknown> | null;
   plan?: Record<string, unknown>;
   toolCalls: Array<{ name: string; arguments: Record<string, unknown>; round: number }>;
   filesRead: CodingReadFile[];
@@ -62,20 +70,45 @@ export class CodingAgentTransport {
     messages: Array<{ role: 'user' | 'assistant'; content: string }>,
     scope: string,
     handlers: CodingHandlers,
+    conversationId?: string,
   ): Promise<string> {
-    if (!window.electronAPI) throw new Error('Coding Agent desktop IPC is unavailable.');
     const request = latestCodingUserRequest(messages);
     if (!request.trim()) throw new Error('The current Coding Agent request is missing. Please send it again.');
     const socket = await this.connect();
-    const turn = await window.electronAPI.beginDeveloperConversation(request, scope);
-    handlers.onStart(turn.turnId, turn.projectRoot, turn.scope);
-    await window.electronAPI.advanceDeveloperConversation({
-      turnId: turn.turnId,
-      state: 'understanding',
-      phase: 'understanding',
-    });
+    let turnId = `browser-turn-${requestId.slice(0, 8)}`;
+    let sessionId = conversationId
+      ? (conversationId.startsWith('coding-session-') ? conversationId : `coding-session-${conversationId}`)
+      : `browser-session-${requestId.slice(0, 8)}`;
+    let currentProjectRoot = '';
+    let currentScope = scope || '.';
+
+    if (window.electronAPI) {
+      const turn = await window.electronAPI.beginDeveloperConversation(request, scope);
+      turnId = turn.turnId;
+      sessionId = turn.sessionId || sessionId;
+      currentProjectRoot = turn.projectRoot;
+      currentScope = turn.scope;
+      handlers.onStart(turn.turnId, turn.projectRoot, turn.scope);
+      await window.electronAPI.advanceDeveloperConversation({
+        turnId: turn.turnId,
+        state: 'understanding',
+        phase: 'understanding',
+      });
+    } else {
+      try {
+        const stateRes = await fetch('http://127.0.0.1:3001/api/coding/project-state');
+        if (stateRes.ok) {
+          const st = await stateRes.json();
+          if (st.projectRoot) currentProjectRoot = st.projectRoot;
+        }
+      } catch {
+        // Fallback to unattached if backend query fails
+      }
+      handlers.onStart(turnId, currentProjectRoot, currentScope);
+    }
+
     this.requests.set(requestId, {
-      scope: turn.scope,
+      scope: currentScope,
       handlers,
       chunks: [],
       filesRead: new Map(),
@@ -85,18 +118,21 @@ export class CodingAgentTransport {
     socket.send(JSON.stringify({
       type: 'chat',
       requestId,
-      sessionId: turn.sessionId,
-      turnId: turn.turnId,
-      projectRoot: turn.projectRoot,
-      scope: turn.scope,
+      sessionId,
+      conversationId: conversationId || sessionId,
+      turnId,
+      projectRoot: currentProjectRoot,
+      scope: currentScope,
       messages,
     }));
-    return turn.turnId;
+    return turnId;
   }
 
   async markTurn(turnId: string, state: 'completed' | 'failed' | 'cancelled', phase?: string, fileCount?: number) {
-    if (!window.electronAPI) throw new Error('Coding Agent desktop IPC is unavailable.');
-    return window.electronAPI.advanceDeveloperConversation({ turnId, state, phase, fileCount });
+    if (window.electronAPI) {
+      return window.electronAPI.advanceDeveloperConversation({ turnId, state, phase, fileCount });
+    }
+    return { ok: true, state };
   }
 
   close() {
@@ -169,15 +205,62 @@ export class CodingAgentTransport {
     }
     if (message.type === 'tool_call') {
       const toolCallId = String(message.toolCallId || '');
-      const name = String(message.name || '');
-      const args = message.arguments && typeof message.arguments === 'object'
+      const rawName = String(message.name || '');
+      const rawArgs = message.arguments && typeof message.arguments === 'object'
         ? message.arguments as Record<string, unknown>
         : {};
+
+      let name = rawName;
+      const args = { ...rawArgs };
+
+      // Canonical tool aliases
+      if (name === 'repo_browser.search_code' || name === 'find_code' || name === 'search_files') {
+        name = 'search_code';
+      } else if (name === 'repo_browser.read_file' || name === 'open_file') {
+        name = 'read_file';
+      } else if (name === 'repo_browser.list_directory' || name === 'ls') {
+        name = 'list_directory';
+      }
+
+      // Argument aliases
+      if (name === 'search_code' && !args.query && typeof args.pattern === 'string') {
+        args.query = args.pattern;
+      }
+      if (name === 'search_code' && !args.query && typeof args.q === 'string') {
+        args.query = args.q;
+      }
+      if (name === 'read_file' && !args.relativePath && typeof args.path === 'string') {
+        args.relativePath = args.path;
+      }
+      if (name === 'list_directory' && !args.relativePath && typeof args.path === 'string') {
+        args.relativePath = args.path;
+      }
+
       request.toolCalls.push({ name, arguments: args, round: request.toolCalls.length + 1 });
       let result: unknown;
       try {
-        if (!window.electronAPI) throw new Error('Coding Agent desktop IPC is unavailable.');
-        result = await window.electronAPI.executeDeveloperTool(name, args, request.scope);
+        if (window.electronAPI) {
+          result = await window.electronAPI.executeDeveloperTool(name, args, request.scope);
+        } else {
+          const res = await fetch('http://127.0.0.1:3001/api/coding/tool', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, arguments: args, scope: request.scope }),
+          });
+          if (!res.ok) {
+            const errBody = await res.json().catch(() => ({}));
+            result = {
+              ok: false,
+              tool: name,
+              error: {
+                code: 'CODING_TOOL_FAILED',
+                message: (errBody as { detail?: string })?.detail || `HTTP ${res.status}`,
+              },
+            };
+          } else {
+            result = await res.json();
+          }
+        }
         this.collectFileEvidence(name, result, request);
       } catch (error) {
         result = {
@@ -200,9 +283,32 @@ export class CodingAgentTransport {
         requestId,
         content: String(message.content || request.chunks.join('')),
         proposalRequired: message.proposalRequired === true,
+        status: typeof message.status === 'string' ? message.status : undefined,
+        readOnly: message.readOnly === true,
+        writeRequired: message.writeRequired === true,
+        applyRequired: message.applyRequired === true,
+        approvalRequired: message.approvalRequired === true,
+        intent: typeof message.intent === 'string' ? message.intent : undefined,
+        confidence: typeof message.confidence === 'string' ? message.confidence : undefined,
+        performanceEvidence: message.performanceEvidence && typeof message.performanceEvidence === 'object'
+          ? (message.performanceEvidence as Record<string, unknown>)
+          : null,
         plan: message.plan && typeof message.plan === 'object' ? message.plan as Record<string, unknown> : undefined,
         toolCalls: request.toolCalls,
-        filesRead: [...request.filesRead].map(([path, content]) => ({ path, content })),
+        filesRead: (() => {
+          const map = new Map<string, string>(request.filesRead);
+          const rawIncoming = (message as Record<string, unknown>).filesRead;
+          const incoming = Array.isArray(rawIncoming) ? rawIncoming : [];
+          for (const item of incoming) {
+            if (item && typeof item === 'object') {
+              const file = item as Partial<CodingReadFile>;
+              if (typeof file.path === 'string' && typeof file.content === 'string' && !map.has(file.path)) {
+                map.set(file.path, file.content);
+              }
+            }
+          }
+          return [...map.entries()].map(([path, content]) => ({ path, content }));
+        })(),
         filesSearched: [...request.filesSearched],
         providerId: typeof message.providerId === 'string' ? message.providerId : null,
         provider: typeof message.provider === 'string' ? message.provider : null,
@@ -222,11 +328,14 @@ export class CodingAgentTransport {
     if (!value || typeof value !== 'object') return;
     const response = value as { data?: unknown };
     const data = response.data;
-    if (name === 'read_file' && data && typeof data === 'object') {
+    const isReadTool = name === 'read_file' || name === 'repo_browser.read_file' || name === 'repo_browser.open_file' || name === 'open_file';
+    const isSearchTool = name === 'search_code' || name === 'repo_browser.search_code' || name === 'find_code' || name === 'search_files' || name === 'get_context';
+
+    if (isReadTool && data && typeof data === 'object') {
       const file = data as Partial<CodingReadFile>;
       if (typeof file.path === 'string' && typeof file.content === 'string') request.filesRead.set(file.path, file.content);
     }
-    if ((name === 'search_code' || name === 'get_context') && data && typeof data === 'object') {
+    if (isSearchTool && data && typeof data === 'object') {
       const results = (data as { results?: unknown }).results;
       if (Array.isArray(results)) {
         for (const result of results) {

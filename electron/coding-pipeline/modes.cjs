@@ -119,7 +119,20 @@ function routeTaskMode({ goal = '', intent = '', userRequestedMode = null, expli
     const text = `${goal} ${intent}`.toLowerCase();
     if (text.includes('explain') || text.includes('how does') || text.includes('what is') || text.includes('where is')) {
       resolvedMode = OPERATING_MODES.ASK;
-    } else if (text.includes('investigate') || text.includes('diagnose') || text.includes('find cause') || text.includes('why is')) {
+    } else if (
+      text.includes('investigate') ||
+      text.includes('diagnose') ||
+      text.includes('find cause') ||
+      text.includes('why is') ||
+      text.includes('taking time') ||
+      text.includes('take time') ||
+      text.includes('slow') ||
+      text.includes('bottleneck') ||
+      text.includes('performance') ||
+      text.includes('measure') ||
+      text.includes('explain analyze') ||
+      text.includes('run explain')
+    ) {
       resolvedMode = OPERATING_MODES.INVESTIGATE;
     } else if (text.includes('plan') || text.includes('design') || text.includes('architect') || text.includes('roadmap')) {
       resolvedMode = OPERATING_MODES.PLAN;

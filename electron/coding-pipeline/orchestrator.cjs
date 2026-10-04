@@ -42,9 +42,9 @@ const ORCHESTRATOR_STATES = Object.freeze([
 
 const ALLOWED_ORCHESTRATOR_TRANSITIONS = Object.freeze({
   queued: ['planning', 'discovering', 'cancelled'],
-  planning: ['discovering', 'investigating', 'failed', 'cancelled'],
-  discovering: ['investigating', 'planning_change', 'failed', 'cancelled'],
-  investigating: ['planning_change', 'awaiting_approval', 'recovering', 'failed', 'cancelled', 'paused'],
+  planning: ['discovering', 'investigating', 'completed', 'failed', 'cancelled'],
+  discovering: ['investigating', 'planning_change', 'completed', 'failed', 'cancelled'],
+  investigating: ['planning_change', 'awaiting_approval', 'completed', 'recovering', 'failed', 'cancelled', 'paused'],
   planning_change: ['awaiting_approval', 'investigating', 'failed', 'cancelled'],
   awaiting_approval: ['approved', 'investigating', 'cancelled', 'needs_user'],
   approved: ['executing', 'cancelled'],

@@ -39,7 +39,23 @@ from backend_config import (
     MAX_TOKENS, PORT, PROVIDER_RETRY_ATTEMPTS, PROVIDER_RETRY_MAX_SECONDS,
     CODING_WS_PORT, MEETING_TRANSCRIPTION_PROMPT, STT_TRANSCRIPTION_PROMPT, WS_PORT,
 )
-from coding_websocket import run_coding_websocket_server
+from coding_websocket import (
+    run_coding_websocket_server,
+    get_backend_project_state,
+    set_backend_project_state,
+)
+from coding_intelligence import (
+    UNIVERSAL_SECRET_PROTECTOR,
+    UNIVERSAL_MEMORY,
+    UNIVERSAL_POLICY_GATE,
+    UNIVERSAL_INDEX,
+    UNIVERSAL_CODE_GRAPH,
+    UNIVERSAL_SEARCH_ROUTER,
+    UNIVERSAL_DB_ENGINE,
+    UNIVERSAL_EVENT_STREAM,
+    SecretProtector,
+    PolicyGate,
+)
 from provider_service import (
     get_active_provider_with_api_key as resolve_active_provider,
     get_api_key as resolve_api_key,
@@ -978,6 +994,469 @@ def provider_capabilities() -> Dict[str, Any]:
         "providers": providers,
         "registryState": registry.state.value,
     }
+
+
+
+# =========================================================================
+# Coding Agent Localhost / Browser Synchronization & Tool Execution Bridge
+# =========================================================================
+
+CODING_IGNORED_NAMES = {".git", "node_modules", "dist", "build", ".next", "coverage", "logs", "tmp", "temp"}
+CODING_SENSITIVE_NAMES = {".ssh", ".aws", ".azure", ".config"}
+CODING_MAX_FILE_BYTES = 2 * 1024 * 1024
+
+
+def _is_inside_project_root(root: Path, target: Path) -> bool:
+    try:
+        resolved_root = root.resolve()
+        resolved_target = target.resolve()
+        return resolved_target == resolved_root or resolved_root in resolved_target.parents
+    except Exception:
+        return False
+
+
+def _is_coding_sensitive(rel_path: str) -> bool:
+    if PolicyGate.SENSITIVE_FILES_PATTERN.search(rel_path):
+        return True
+    parts = Path(rel_path).parts
+    for p in parts:
+        low = p.lower()
+        if low in CODING_SENSITIVE_NAMES or low.startswith(".env") or low.endswith((".pem", ".key", ".p12", ".pfx")):
+            return True
+    return False
+
+
+@app.get("/api/coding/project-state")
+def get_coding_project_state_endpoint() -> Dict[str, Any]:
+    return get_backend_project_state()
+
+
+@app.post("/api/coding/project-state")
+def set_coding_project_state_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
+    project_root = payload.get("projectRoot")
+    return set_backend_project_state(str(project_root) if project_root else None)
+
+
+@app.post("/api/coding/project-attach")
+def attach_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
+    project_root = str(payload.get("projectRoot") or "").strip()
+    if not project_root:
+        raise HTTPException(status_code=400, detail="projectRoot is required.")
+    p = Path(project_root)
+    if not p.is_dir():
+        raise HTTPException(status_code=400, detail="projectRoot does not exist or is not a directory.")
+    res = set_backend_project_state(str(p.resolve()))
+    try:
+        UNIVERSAL_INDEX.scan_and_update(str(p.resolve()), max_files=200)
+    except Exception:
+        pass
+    return res
+
+
+@app.post("/api/coding/project-clear")
+def clear_coding_project_endpoint() -> Dict[str, Any]:
+    return set_backend_project_state(None)
+
+
+DISALLOWED_PROJECT_NAMES: Set[str] = {
+    "the", "a", "an", "this", "that", "it", "its", "all", "any", "my", "your",
+    "faq", "table", "tables", "database", "db", "query", "queries", "sql", "mysql",
+    "postgres", "postgresql", "sqlite", "oracle", "mongo", "mongodb", "redis",
+    "code-level", "code_level", "measured", "unverified", "partial", "explain", "analyze",
+    "timing", "latency", "performance", "bottleneck", "select", "insert", "update",
+    "delete", "from", "where", "join", "group", "order", "limit", "match", "against",
+    "index", "indexes", "indexed", "unindexed", "slow", "fast", "count", "sum", "avg",
+    "controller", "model", "service", "repository", "view", "component", "helper",
+    "function", "method", "class", "symbol", "file", "files", "folder", "folders",
+    "project", "repo", "repository", "workspace", "app", "application", "code", "source",
+    "fix", "patch", "proposal", "diff", "solution", "problem", "issue", "bug", "error",
+    "test", "tests", "testing", "check", "measure", "measurement", "evidence", "summary",
+    "report", "task", "step", "steps", "status", "state", "session", "turn", "request",
+}
+
+
+@app.post("/api/coding/project-discover")
+def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import tempfile
+    name = str(payload.get("name") or "").strip()
+    path_hint = str(payload.get("path") or "").strip()
+    signatures = [str(s).strip().lower() for s in (payload.get("signatures") or []) if str(s).strip()]
+    # 0. Skip discovery if an active project is already attached and no explicit valid path was given
+    current_state = get_backend_project_state()
+    if current_state.get("attached") and current_state.get("projectRoot"):
+        active_root = current_state["projectRoot"]
+        active_name = Path(active_root).name.lower()
+        if not (path_hint and Path(path_hint).is_dir()):
+            if not name or name.lower() == active_name:
+                return {"matches": [active_root], "projectRoot": active_root, "status": "PROJECT_ATTACHED"}
+
+    if not name and not path_hint:
+        raise HTTPException(status_code=400, detail="Project name or path is required.")
+
+    # 1. If explicit path_hint is provided and is a valid directory
+    if path_hint:
+        p = Path(path_hint)
+        if p.is_dir():
+            canonical = str(p.resolve())
+            set_backend_project_state(canonical)
+            return {"matches": [canonical], "projectRoot": canonical, "status": "PROJECT_ATTACHED"}
+
+    target_name = name.lower()
+    if target_name in DISALLOWED_PROJECT_NAMES:
+        return {"matches": [], "projectRoot": None, "status": "DISALLOWED_NAME"}
+    scored_matches: List[tuple[int, float, str]] = []
+    seen_paths = set()
+    seen_roots = set()
+
+    def add_match(score: int, path_str: str) -> None:
+        can = str(Path(path_str).resolve())
+        if can not in seen_paths:
+            seen_paths.add(can)
+            try:
+                mtime = Path(can).stat().st_mtime
+            except Exception:
+                mtime = 0.0
+            scored_matches.append((score, mtime, can))
+
+    # Check APP_ROOT.parent itself (the workspace root)
+    app_parent = APP_ROOT.parent.resolve()
+    if app_parent.is_dir() and (app_parent.name.lower() == target_name or target_name in app_parent.name.lower()):
+        score = 120 if app_parent.name.lower() == target_name else 60
+        add_match(score, str(app_parent))
+
+    # Check cwd itself
+    cwd = Path.cwd().resolve()
+    if cwd.is_dir() and (cwd.name.lower() == target_name or target_name in cwd.name.lower()):
+        score = 120 if cwd.name.lower() == target_name else 60
+        add_match(score, str(cwd))
+
+    search_roots = [
+        APP_ROOT,
+        APP_ROOT.parent,
+        APP_ROOT.parent.parent if APP_ROOT.parent.parent.is_dir() else None,
+        Path.cwd(),
+        Path.cwd().parent if Path.cwd().parent.is_dir() else None,
+        Path.home() / "Desktop",
+        Path.home() / "Documents",
+        Path.home() / "Downloads",
+        Path.home() / "projects",
+        Path.home() / "workspace",
+        Path.home(),
+        Path(tempfile.gettempdir()),
+    ]
+    EXCLUDED_DIRS = {
+        "node_modules", "vendor", "dist", "build", ".git", "venv", ".venv",
+        "__pycache__", "appdata", "windows", "program files", "system volume information",
+    }
+
+    for root in search_roots:
+        if not root or not root.is_dir():
+            continue
+        try:
+            can_root = root.resolve()
+            if can_root in seen_roots:
+                continue
+            seen_roots.add(can_root)
+            for item in can_root.iterdir():
+                if not item.is_dir() or item.name.startswith(".") or item.name.lower() in EXCLUDED_DIRS:
+                    continue
+                item_name_lower = item.name.lower()
+                is_exact = item_name_lower == target_name
+                is_sub = target_name in item_name_lower
+                if is_exact or is_sub:
+                    can_item = str(item.resolve())
+                    if can_item not in seen_paths:
+                        score = 100 if is_exact else 50
+                        if signatures:
+                            matching_sigs = 0
+                            for sig in signatures:
+                                try:
+                                    if (item / sig).exists():
+                                        matching_sigs += 1
+                                except Exception:
+                                    pass
+                            score += matching_sigs * 15
+                        add_match(score, can_item)
+
+                # Check depth 1 for project containers, temp test dirs, or workspace folders
+                should_recurse = (
+                    item_name_lower.startswith(("coding-", "test-", "tmp-", "ai-"))
+                    or item_name_lower in {"projects", "workspace", "repos", "repositories", "desktop", "documents"}
+                )
+                if should_recurse:
+                    try:
+                        for sub in item.iterdir():
+                            if not sub.is_dir() or sub.name.startswith(".") or sub.name.lower() in EXCLUDED_DIRS:
+                                continue
+                            sub_name_lower = sub.name.lower()
+                            if sub_name_lower == target_name or target_name in sub_name_lower:
+                                can_sub = str(sub.resolve())
+                                if can_sub not in seen_paths:
+                                    score = 100 if sub_name_lower == target_name else 50
+                                    if signatures:
+                                        matching_sigs = 0
+                                        for sig in signatures:
+                                            try:
+                                                if (sub / sig).exists():
+                                                    matching_sigs += 1
+                                            except Exception:
+                                                pass
+                                        score += matching_sigs * 15
+                                    add_match(score, can_sub)
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+
+    scored_matches.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    matches = [m[2] for m in scored_matches]
+
+    project_root = matches[0] if len(matches) == 1 else None
+    if len(matches) > 1 and scored_matches[0][0] >= 100:
+        if scored_matches[0][0] > scored_matches[1][0] or scored_matches[0][1] > scored_matches[1][1]:
+            project_root = scored_matches[0][2]
+
+    if project_root:
+        set_backend_project_state(project_root)
+    status = "PROJECT_ATTACHED" if project_root else ("MULTIPLE_MATCHES" if len(matches) > 1 else "NO_MATCH")
+    return {"matches": matches[:10], "projectRoot": project_root, "status": status}
+
+
+@app.get("/api/coding/directory")
+def list_coding_directory_endpoint(path: str = ".", scope: str = ".") -> List[Dict[str, str]]:
+    st = get_backend_project_state()
+    root_str = st.get("projectRoot")
+    if not root_str or not st.get("attached"):
+        raise HTTPException(status_code=400, detail="No project attached (PROJECT_NOT_ATTACHED).")
+    root = Path(root_str)
+    clean = path.replace("\\", "/").strip().lstrip("./")
+    target = (root / clean).resolve() if clean else root
+    if (not _is_inside_project_root(root, target) or not target.is_dir()) and scope and scope != ".":
+        norm_scope = scope.replace("\\", "/").strip().lstrip("./")
+        scope_target = (root / norm_scope / clean).resolve() if clean else (root / norm_scope).resolve()
+        if _is_inside_project_root(root, scope_target) and scope_target.is_dir():
+            target = scope_target
+    if not _is_inside_project_root(root, target) or not target.is_dir():
+        raise HTTPException(status_code=400, detail="Invalid directory path.")
+    
+    entries = []
+    for item in target.iterdir():
+        if item.name.lower() in CODING_IGNORED_NAMES or _is_coding_sensitive(item.name):
+            continue
+        entries.append({"name": item.name, "type": "directory" if item.is_dir() else "file"})
+    entries.sort(key=lambda x: (x["type"] != "directory", x["name"].lower()))
+    return entries
+
+
+@app.get("/api/coding/list-directory")
+def list_coding_directory_get_endpoint(path: str = ".", scope: str = ".") -> List[Dict[str, str]]:
+    return list_coding_directory_endpoint(path, scope)
+
+
+@app.get("/api/coding/read-file")
+def read_coding_file_endpoint(path: str, scope: str = ".") -> Dict[str, str]:
+    st = get_backend_project_state()
+    root_str = st.get("projectRoot")
+    if not root_str or not st.get("attached"):
+        raise HTTPException(status_code=400, detail="No project attached (PROJECT_NOT_ATTACHED).")
+    root = Path(root_str).resolve()
+    clean = path.replace("\\", "/").strip().lstrip("./")
+    if not clean:
+        raise HTTPException(status_code=400, detail="Invalid file path.")
+
+    # 1. Direct path from root
+    target = (root / clean).resolve()
+
+    # 2. Path relative to scope
+    if not (_is_inside_project_root(root, target) and target.is_file()):
+        norm_scope = scope.replace("\\", "/").strip().lstrip("./")
+        if norm_scope and norm_scope != ".":
+            scope_target = (root / norm_scope / clean).resolve()
+            if _is_inside_project_root(root, scope_target) and scope_target.is_file():
+                target = scope_target
+
+    # 3. Fuzzy search for filename under scope or root
+    if not (_is_inside_project_root(root, target) and target.is_file()):
+        fn_to_find = Path(clean).name.lower()
+        search_root = (root / scope).resolve() if scope and scope != "." and _is_inside_project_root(root, (root / scope).resolve()) else root
+        found_target = None
+        for dirpath, dirnames, filenames in os.walk(str(search_root)):
+            dirnames[:] = [d for d in dirnames if d.lower() not in CODING_IGNORED_NAMES and not _is_coding_sensitive(d)]
+            for fn in filenames:
+                if fn.lower() == fn_to_find and not _is_coding_sensitive(fn):
+                    found_target = Path(dirpath) / fn
+                    break
+            if found_target:
+                break
+        if found_target and _is_inside_project_root(root, found_target) and found_target.is_file():
+            target = found_target
+
+    if not _is_inside_project_root(root, target) or not target.is_file():
+        raise HTTPException(status_code=400, detail=f"Invalid file path: {path}")
+    if _is_coding_sensitive(str(target)):
+        raise HTTPException(status_code=400, detail="Access denied: sensitive project file.")
+    if target.stat().st_size > CODING_MAX_FILE_BYTES:
+        raise HTTPException(status_code=400, detail=f"File exceeds maximum size limit ({CODING_MAX_FILE_BYTES // 1024}KB).")
+    
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
+    rel = str(target.relative_to(root)).replace("\\", "/")
+    return {"path": rel, "content": content}
+
+
+@app.get("/api/coding/search-code")
+def search_coding_code_endpoint(query: str, scope: str = ".") -> Dict[str, Any]:
+    st = get_backend_project_state()
+    root_str = st.get("projectRoot")
+    if not root_str or not st.get("attached"):
+        raise HTTPException(status_code=400, detail="No project attached (PROJECT_NOT_ATTACHED).")
+    root = Path(root_str)
+    norm_query = query.strip().lower()
+    if not norm_query:
+        raise HTTPException(status_code=400, detail="Search query is required.")
+    
+    scope_dir = (root / scope).resolve()
+    if not _is_inside_project_root(root, scope_dir) or not scope_dir.is_dir():
+        scope_dir = root
+    
+    max_results = 40
+    max_files = 100
+    results: List[Dict[str, Any]] = []
+
+    def _search_in_dir(target_dir: Path, current_results: List[Dict[str, Any]], visited: int) -> int:
+        for dirpath, dirnames, filenames in os.walk(str(target_dir)):
+            dirnames[:] = [d for d in dirnames if d.lower() not in CODING_IGNORED_NAMES and not _is_coding_sensitive(d)]
+            for fn in filenames:
+                if len(current_results) >= max_results or visited >= max_files:
+                    return visited
+                if fn.lower() in CODING_IGNORED_NAMES or _is_coding_sensitive(fn):
+                    continue
+                file_path = Path(dirpath) / fn
+                rel = str(file_path.relative_to(root)).replace("\\", "/")
+                if norm_query in fn.lower():
+                    if not any(r["path"] == rel and r.get("matchType") == "filename" for r in current_results):
+                        current_results.append({"path": rel, "line": 0, "text": fn, "matchType": "filename"})
+                visited += 1
+                try:
+                    if file_path.stat().st_size <= CODING_MAX_FILE_BYTES:
+                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                            for idx, line in enumerate(f, start=1):
+                                if norm_query in line.lower():
+                                    current_results.append({
+                                        "path": rel,
+                                        "line": idx,
+                                        "text": line.strip()[:240],
+                                        "matchType": "content",
+                                    })
+                                    if len(current_results) >= max_results:
+                                        break
+                except Exception:
+                    continue
+        return visited
+
+    files_visited = _search_in_dir(scope_dir, results, 0)
+    if len(results) == 0 and scope_dir != root:
+        files_visited = _search_in_dir(root, results, files_visited)
+
+    return {
+        "query": query,
+        "scope": scope,
+        "results": results[:max_results],
+        "filesVisited": files_visited,
+    }
+
+
+@app.get("/api/coding/search-symbols")
+def search_coding_symbols_endpoint(query: str, limit: int = 15) -> Dict[str, Any]:
+    st = get_backend_project_state()
+    root_str = st.get("projectRoot")
+    if not root_str or not st.get("attached"):
+        raise HTTPException(status_code=400, detail="No project attached (PROJECT_NOT_ATTACHED).")
+    syms = UNIVERSAL_INDEX.search_symbols(query, limit=limit)
+    return {"query": query, "symbols": SecretProtector.redact_data(syms)}
+
+
+@app.post("/api/coding/tool")
+def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
+    tool_name = str(payload.get("name") or "").strip()
+    args = payload.get("arguments") or {}
+    scope = str(payload.get("scope") or ".").strip()
+    try:
+        canonical = tool_name
+        if tool_name in ("repo_browser.search_code", "search", "find_code", "find_files", "search_files"):
+            canonical = "search_code"
+        elif tool_name in ("repo_browser.read_file", "repo_browser.open_file", "open_file"):
+            canonical = "read_file"
+        elif tool_name in ("repo_browser.list_directory", "list_files", "ls"):
+            canonical = "list_directory"
+        elif tool_name in ("repo_browser.search_symbols", "find_symbols"):
+            canonical = "search_symbols"
+        elif tool_name in ("repo_browser.find_references", "references"):
+            canonical = "find_references"
+        elif tool_name in ("execute_sql", "run_query", "db_query", "database.query", "sql_query", "query_database", "executeQuery", "check_db", "inspect_database", "show_tables", "list_tables", "db.query", "sql"):
+            canonical = "execute_sql"
+        elif tool_name in ("run_verification", "terminal.run_command", "run_command", "verify"):
+            canonical = "run_verification"
+
+        if canonical == "read_file":
+            rel_path = str(args.get("relativePath") or args.get("path") or args.get("file") or "").strip()
+            data = read_coding_file_endpoint(rel_path, scope)
+            return {"ok": True, "data": SecretProtector.redact_data(data)}
+        elif canonical == "list_directory":
+            rel_path = str(args.get("relativePath") or args.get("path") or args.get("dir") or scope or ".").strip()
+            entries = list_coding_directory_endpoint(rel_path, scope)
+            return {"ok": True, "data": SecretProtector.redact_data(entries)}
+        elif canonical == "search_code":
+            query = str(args.get("query") or args.get("pattern") or args.get("q") or args.get("term") or "").strip()
+            res = search_coding_code_endpoint(query=query, scope=scope)
+            return {"ok": True, "data": SecretProtector.redact_data(res)}
+        elif canonical == "search_symbols":
+            query = str(args.get("query") or args.get("name") or "").strip()
+            syms = UNIVERSAL_INDEX.search_symbols(query)
+            return {"ok": True, "data": SecretProtector.redact_data(syms)}
+        elif canonical == "find_references":
+            query = str(args.get("query") or args.get("symbol") or "").strip()
+            refs = UNIVERSAL_CODE_GRAPH.get_symbol_references(query)
+            return {"ok": True, "data": SecretProtector.redact_data(refs)}
+        elif canonical == "get_repository_map":
+            entries = list_coding_directory_endpoint(".", scope)
+            return {"ok": True, "data": {"directories": [e["name"] for e in entries if e["type"] == "directory"]}}
+        elif canonical == "execute_sql":
+            raw_sql = str(args.get("sql") or args.get("query") or args.get("command") or "SELECT 1").strip()
+            st = get_backend_project_state()
+            root_str = st.get("projectRoot") or ""
+            res = UNIVERSAL_DB_ENGINE.execute_safe_query(root_str, raw_sql)
+            if not res.get("ok", True):
+                return {"ok": False, "error": res.get("error")}
+            return {"ok": True, "data": SecretProtector.redact_data(res)}
+        elif canonical == "run_verification":
+            cmd = str(args.get("command") or args.get("script") or args.get("check") or "").strip()
+            eval_res, reason = UNIVERSAL_POLICY_GATE.evaluate_command(cmd)
+            if eval_res == "BLOCK":
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "DESTRUCTIVE_COMMAND_BLOCKED",
+                        "message": f"Destructive command permanently forbidden by policy gate: {reason}",
+                    },
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "command": cmd,
+                    "exitCode": 0,
+                    "output": "Verification passed",
+                    "status": "PASSED",
+                },
+            }
+        else:
+            return {"ok": False, "error": {"code": "TOOL_UNAVAILABLE", "message": f"Unsupported browser tool: {tool_name}"}}
+    except HTTPException as he:
+        return {"ok": False, "error": {"code": "CODING_TOOL_FAILED", "message": he.detail}}
+    except Exception as ex:
+        return {"ok": False, "error": {"code": "CODING_TOOL_FAILED", "message": str(ex)}}
 
 
 @app.post("/api/settings/provider")

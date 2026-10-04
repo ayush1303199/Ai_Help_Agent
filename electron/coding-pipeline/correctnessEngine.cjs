@@ -463,6 +463,386 @@ class EdgeCaseContractValidator {
   }
 }
 
+class BlindnessIsolationGuard {
+  verifyTaskBlindness(task = {}, hiddenContract = null) {
+    const leaks = [];
+    if (!task) return { isClean: true, leakageCount: 0, leaks: [] };
+
+    // 1. Check direct properties
+    const forbiddenProps = ['hiddenContract', 'hiddenAssertions', 'expectedBehavior', 'oracleInternals'];
+    for (const prop of forbiddenProps) {
+      if (task[prop] !== undefined) {
+        leaks.push({ type: 'PROPERTY_LEAK', property: prop });
+      }
+    }
+
+    // 2. Check findings and hypotheses for leaked contract phrases
+    if (hiddenContract && Array.isArray(hiddenContract.hiddenAssertions)) {
+      const allText = [
+        ...(task.findings || []),
+        ...(task.evidence || []),
+        ...(task.hypotheses || []),
+        task.goal || '',
+      ].join(' ').toLowerCase();
+
+      for (const assertion of hiddenContract.hiddenAssertions) {
+        if (typeof assertion.testName === 'string' && assertion.testName.length > 5) {
+          if (allText.includes(assertion.testName.toLowerCase())) {
+            leaks.push({ type: 'TEST_NAME_LEAK', name: assertion.testName });
+          }
+        }
+      }
+    }
+
+    return {
+      isClean: leaks.length === 0,
+      leakageCount: leaks.length,
+      leaks,
+    };
+  }
+
+  attemptOracleDiscovery(taskId, publicApiObject = {}) {
+    // Audit check: verify public API refuses to disclose hidden oracle contracts
+    const hasHiddenGetter = typeof publicApiObject.getHiddenContract === 'function';
+    let task = null;
+    try {
+      task = typeof publicApiObject.getTask === 'function' ? publicApiObject.getTask(taskId) : null;
+    } catch {
+      task = null;
+    }
+    const directAccess = task ? task.hiddenAssertions || task.hiddenContract : null;
+
+    return {
+      accessBlocked: !hasHiddenGetter && !directAccess,
+      directAccessDetected: Boolean(directAccess),
+      compromised: Boolean(hasHiddenGetter || directAccess),
+    };
+  }
+}
+
+class WorkerConflictAdjudicator {
+  adjudicateConflict(workerA = {}, workerB = {}, repositoryEvidence = {}) {
+    const findingsA = Array.isArray(workerA.findings) ? workerA.findings : [];
+    const findingsB = Array.isArray(workerB.findings) ? workerB.findings : [];
+
+    // Conflict detection: do they propose contradictory root causes or targets?
+    const targetA = workerA.targetFile || workerA.scope;
+    const targetB = workerB.targetFile || workerB.scope;
+
+    const conflictDetected = Boolean(targetA && targetB && targetA !== targetB);
+
+    if (!conflictDetected) {
+      return {
+        conflictDetected: false,
+        adjudicated: true,
+        winningWorkerId: workerA.workerId || 'workerA',
+        rationale: 'No target conflict between parallel workers.',
+      };
+    }
+
+    // Score based on empirical evidence strength rather than first-answer-wins
+    const evidenceList = Array.isArray(repositoryEvidence.evidence) ? repositoryEvidence.evidence : [];
+    const evidenceText = evidenceList.join(' ').toLowerCase();
+
+    const scoreEvidence = (worker) => {
+      let score = 0;
+      const target = String(worker.targetFile || worker.scope || '').toLowerCase();
+      if (evidenceText.includes(target)) score += 2.0; // Direct evidence match
+      if (worker.hasStacktrace) score += 1.5;
+      if (worker.hasTestProof) score += 2.0;
+      if (worker.findings && worker.findings.length > 0) score += 0.5;
+      return score;
+    };
+
+    const scoreA = scoreEvidence(workerA);
+    const scoreB = scoreEvidence(workerB);
+
+    const winningWorker = scoreA >= scoreB ? workerA : workerB;
+    const losingWorker = scoreA >= scoreB ? workerB : workerA;
+
+    return {
+      conflictDetected: true,
+      adjudicated: true,
+      winningWorkerId: winningWorker.workerId || (scoreA >= scoreB ? 'workerA' : 'workerB'),
+      winningTarget: winningWorker.targetFile || winningWorker.scope,
+      losingWorkerId: losingWorker.workerId || (scoreA >= scoreB ? 'workerB' : 'workerA'),
+      scores: { scoreA, scoreB },
+      rationale: `Evidence-based adjudication selected ${winningWorker.workerId} (score: ${Math.max(scoreA, scoreB)}) over ${losingWorker.workerId} (score: ${Math.min(scoreA, scoreB)}) based on verifiable repository evidence.`,
+    };
+  }
+}
+
+class RealityLevelEvaluator {
+  classifyRealityLevel(executionTrace = {}) {
+    // Reality levels hierarchy:
+    // L0 = helper/unit
+    // L1 = orchestrator
+    // L2 = production API / IPC
+    // L3 = production runtime (real lifecycle apply)
+    // L4 = real provider (LLM tool loop)
+    // L5 = real repository (multi-file causal tracing)
+    // L6 = live browser (real DOM/visual interaction)
+    // L7 = restart/recovery (process termination & resume)
+    // L8 = independent hidden oracle validation
+
+    let level = 'L0';
+    let levelName = 'HELPER_UNIT';
+    const capabilities = [];
+
+    if (executionTrace.hasOrchestrator) {
+      level = 'L1';
+      levelName = 'ORCHESTRATOR';
+      capabilities.push('task_orchestration');
+    }
+    if (executionTrace.hasIpcGateway) {
+      level = 'L2';
+      levelName = 'PRODUCTION_API';
+      capabilities.push('typed_ipc');
+    }
+    if (executionTrace.hasProductionLifecycle) {
+      level = 'L3';
+      levelName = 'PRODUCTION_RUNTIME';
+      capabilities.push('lifecycle_apply_verify');
+    }
+    if (executionTrace.hasRealProvider) {
+      level = 'L4';
+      levelName = 'REAL_PROVIDER';
+      capabilities.push('live_llm_tool_loop');
+    }
+    if (executionTrace.hasRealRepository) {
+      level = 'L5';
+      levelName = 'REAL_REPOSITORY';
+      capabilities.push('multi_file_causal_tracing');
+    }
+    if (executionTrace.hasLiveBrowser) {
+      level = 'L6';
+      levelName = 'LIVE_BROWSER';
+      capabilities.push('browser_interaction');
+    }
+    if (executionTrace.hasProcessRestart) {
+      level = 'L7';
+      levelName = 'RESTART_RECOVERY';
+      capabilities.push('disk_checkpoint_restart');
+    }
+    if (executionTrace.hasHiddenOracle) {
+      level = 'L8';
+      levelName = 'INDEPENDENT_ORACLE';
+      capabilities.push('hidden_behavioral_validation');
+    }
+
+    return {
+      realityLevel: level,
+      levelName,
+      confidence: ['L5', 'L7', 'L8'].includes(level) ? 'HIGH' : 'MEDIUM',
+      verifiedCapabilities: capabilities,
+    };
+  }
+}
+
+class BusinessTruthRevalidationEngine {
+  constructor() {
+    this._revalidatedTasks = new Map();
+  }
+
+  async revalidateTask(taskDef = {}) {
+    const {
+      taskId,
+      goal,
+      businessIntent,
+      buggyBaselineRunner,
+      patchedRunner,
+      mutationRunner,
+      visibleTestRunner,
+      businessValidator,
+      regressionValidator,
+      isMockOnly = false,
+      isPassiveAssertionOnly = false,
+      infraBlocked = false,
+      infraBlockedReason = null,
+    } = taskDef;
+
+    if (infraBlocked) {
+      return {
+        taskId: taskId || 'unknown',
+        status: 'BLOCKED',
+        reason: infraBlockedReason || 'Required external infrastructure is offline',
+        businessVerified: false,
+        visibleTestPassed: false,
+      };
+    }
+
+    if (isMockOnly) {
+      return {
+        taskId: taskId || 'unknown',
+        status: 'MOCK_ONLY_PASS',
+        reason: 'Task outcome generated via in-memory simulation / mock without real execution',
+        businessVerified: false,
+        visibleTestPassed: true,
+      };
+    }
+
+    if (isPassiveAssertionOnly) {
+      return {
+        taskId: taskId || 'unknown',
+        status: 'INVALID_TEST',
+        reason: 'Test relies on passive assertion fraud (e.g. not null, truthy, function exists) without semantic verification',
+        businessVerified: false,
+        visibleTestPassed: true,
+      };
+    }
+
+    let baselineFailedAsExpected = false;
+    let baselineDetails = null;
+    if (typeof buggyBaselineRunner === 'function') {
+      try {
+        const baseRes = await buggyBaselineRunner();
+        const baseBusinessCheck = typeof businessValidator === 'function' ? await businessValidator(baseRes?.businessResult) : { pass: baseRes?.exitCode === 0 };
+        if (!baseBusinessCheck.pass || baseRes?.exitCode !== 0) {
+          baselineFailedAsExpected = true;
+          baselineDetails = 'Buggy baseline failed business check as expected.';
+        } else {
+          return {
+            taskId: taskId || 'unknown',
+            status: 'INVALID_BUG_FIX_FIXTURE',
+            reason: 'Buggy baseline already passed business check; cannot prove bug fix value',
+            businessVerified: false,
+            visibleTestPassed: true,
+          };
+        }
+      } catch (err) {
+        baselineFailedAsExpected = true;
+        baselineDetails = `Buggy baseline threw as expected: ${err.message}`;
+      }
+    } else {
+      baselineFailedAsExpected = true;
+    }
+
+    let visiblePass = false;
+    if (typeof visibleTestRunner === 'function') {
+      const vRes = await visibleTestRunner();
+      visiblePass = Boolean(vRes && (vRes.pass || vRes.exitCode === 0));
+    } else {
+      visiblePass = true;
+    }
+
+    let patchRes = null;
+    let businessCheck = { pass: false, reason: 'No business validator provided' };
+    if (typeof patchedRunner === 'function') {
+      patchRes = await patchedRunner();
+      if (typeof businessValidator === 'function') {
+        businessCheck = await businessValidator(patchRes?.businessResult);
+      } else {
+        businessCheck = { pass: patchRes?.exitCode === 0 };
+      }
+    }
+
+    if (visiblePass && !businessCheck.pass) {
+      return {
+        taskId: taskId || 'unknown',
+        status: 'FALSE_PASS',
+        reason: `Visible tests passed, but business requirement failed: ${businessCheck.reason || 'Semantic mismatch'}`,
+        businessVerified: false,
+        visibleTestPassed: true,
+        baselineFailedAsExpected,
+        beforeOutput: baselineDetails,
+        afterOutput: patchRes?.output || patchRes?.businessResult,
+      };
+    }
+
+    if (!businessCheck.pass) {
+      return {
+        taskId: taskId || 'unknown',
+        status: 'FAIL',
+        reason: businessCheck.reason || 'Business requirement not satisfied',
+        businessVerified: false,
+        visibleTestPassed: visiblePass,
+      };
+    }
+
+    let mutationCaught = false;
+    if (typeof mutationRunner === 'function') {
+      try {
+        const mutRes = await mutationRunner();
+        const mutBusinessCheck = typeof businessValidator === 'function' ? await businessValidator(mutRes?.businessResult) : { pass: mutRes?.exitCode === 0 };
+        if (!mutBusinessCheck.pass || mutRes?.exitCode !== 0) {
+          mutationCaught = true;
+        }
+      } catch {
+        mutationCaught = true;
+      }
+      if (!mutationCaught) {
+        return {
+          taskId: taskId || 'unknown',
+          status: 'PARTIAL_PASS',
+          reason: 'Implementation passes, but business oracle failed to catch injected mutation (weak verification)',
+          businessVerified: false,
+          visibleTestPassed: true,
+        };
+      }
+    } else {
+      mutationCaught = true;
+    }
+
+    let regressionClean = true;
+    if (typeof regressionValidator === 'function') {
+      const regCheck = await regressionValidator(patchRes?.businessResult);
+      if (!regCheck.pass) {
+        regressionClean = false;
+        return {
+          taskId: taskId || 'unknown',
+          status: 'FAIL',
+          reason: `Regression detected in untouched behavior: ${regCheck.reason}`,
+          businessVerified: false,
+          visibleTestPassed: true,
+        };
+      }
+    }
+
+    const result = {
+      taskId: taskId || 'unknown',
+      status: 'VERIFIED_PASS',
+      businessVerified: true,
+      visibleTestPassed: visiblePass,
+      baselineFailedAsExpected,
+      mutationCaught,
+      regressionClean,
+      before: baselineDetails,
+      after: patchRes?.businessResult || 'Correct business behavior observed',
+      timestamp: new Date().toISOString(),
+    };
+
+    this._revalidatedTasks.set(taskId, result);
+    return result;
+  }
+
+  redlineClaim(claim = {}) {
+    const {
+      taskId,
+      claimedStatus = 'PASS',
+      claimedScore = 1.0,
+      revalidatedResult = {},
+    } = claim;
+
+    const actualStatus = revalidatedResult.status || 'UNREVALIDATED';
+    const isFalsePass = claimedStatus === 'PASS' && actualStatus === 'FALSE_PASS';
+    const isMockOnly = actualStatus === 'MOCK_ONLY_PASS';
+    const isVerified = actualStatus === 'VERIFIED_PASS';
+
+    return {
+      taskId: taskId || 'unknown',
+      claimedStatus,
+      claimedScore,
+      actualStatus,
+      isFalsePass,
+      isMockOnly,
+      isVerified,
+      reason: revalidatedResult.reason || (isVerified ? 'All business requirements, regressions, and mutation checks verified.' : 'Discrepancy detected.'),
+      before: revalidatedResult.before || null,
+      after: revalidatedResult.after || null,
+    };
+  }
+}
+
 // Singletons
 const correctnessOracle = new IndependentCorrectnessOracle();
 const patchQualityEngine = new PatchQualityEngine();
@@ -470,6 +850,10 @@ const diffReviewer = new IndependentDiffReviewer();
 const mutationHarness = new MutationTestingHarness();
 const defectClassifier = new DefectEnvironmentClassifier();
 const edgeCaseValidator = new EdgeCaseContractValidator();
+const blindnessGuard = new BlindnessIsolationGuard();
+const workerConflictAdjudicator = new WorkerConflictAdjudicator();
+const realityLevelEvaluator = new RealityLevelEvaluator();
+const businessRevalidationEngine = new BusinessTruthRevalidationEngine();
 
 module.exports = {
   IndependentCorrectnessOracle,
@@ -478,10 +862,18 @@ module.exports = {
   MutationTestingHarness,
   DefectEnvironmentClassifier,
   EdgeCaseContractValidator,
+  BlindnessIsolationGuard,
+  WorkerConflictAdjudicator,
+  RealityLevelEvaluator,
+  BusinessTruthRevalidationEngine,
   correctnessOracle,
   patchQualityEngine,
   diffReviewer,
   mutationHarness,
   defectClassifier,
   edgeCaseValidator,
+  blindnessGuard,
+  workerConflictAdjudicator,
+  realityLevelEvaluator,
+  businessRevalidationEngine,
 };

@@ -45,6 +45,8 @@ interface CodingAgentWorkspaceProps {
   messages: CodingMessage[];
   input: string;
   projectRoot: string | null;
+  projectStatus?: string;
+  projectCandidates?: string[];
   directory: Array<{ name: string; type: 'file' | 'directory' }>;
   path: string;
   filePath: string;
@@ -61,6 +63,8 @@ interface CodingAgentWorkspaceProps {
   onProjectPathChange: (value: string) => void;
   onSearchQueryChange: (value: string) => void;
   onSelectProject: () => void;
+  onSelectCandidate?: (candidate: string) => void;
+  onAttachProjectByPath?: (targetPath: string) => void;
   onClearProject: () => void;
   onListDirectory: () => void;
   onReadFile: (path?: string) => void;
@@ -80,6 +84,8 @@ export function CodingAgentWorkspace({
   messages,
   input,
   projectRoot,
+  projectStatus,
+  projectCandidates = [],
   directory,
   path,
   filePath,
@@ -96,6 +102,7 @@ export function CodingAgentWorkspace({
   onProjectPathChange,
   onSearchQueryChange,
   onSelectProject,
+  onSelectCandidate,
   onClearProject,
   onListDirectory,
   onReadFile,
@@ -118,8 +125,25 @@ export function CodingAgentWorkspace({
       {statusMessage && <p role="status" className="mb-3 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-200">{statusMessage}</p>}
       <header className="mb-4 flex items-center justify-between gap-3 border-b border-slate-700 pb-4">
         <div className="min-w-0">
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-sky-300">Coding Agent</p>
-          <p className="mt-1 truncate text-xs text-slate-400">{projectRoot || 'Mention the project folder in chat for automatic discovery, or select it under Advanced.'}</p>
+          <div className="flex items-center gap-2">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-sky-300">Coding Agent</p>
+            {projectStatus && projectStatus !== 'NO_PROJECT' && (
+              <span className={`rounded px-1.5 py-0.5 text-[9px] font-mono font-semibold uppercase tracking-wider ${
+                projectStatus === 'PROJECT_ATTACHED'
+                  ? 'border border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                  : projectStatus === 'PROJECT_MISSING' || projectStatus === 'ATTACH_FAILED'
+                  ? 'border border-rose-500/40 bg-rose-500/10 text-rose-300'
+                  : projectStatus === 'PROJECT_DETACHED'
+                  ? 'border border-amber-500/40 bg-amber-500/10 text-amber-300'
+                  : 'border border-sky-500/40 bg-sky-500/10 text-sky-300'
+              }`}>
+                {projectStatus}
+              </span>
+            )}
+          </div>
+          <p className="mt-1 truncate text-xs text-slate-400">
+            {projectRoot || (projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : projectStatus === 'ATTACHING_PROJECT' ? 'Attaching project…' : 'Mention the project folder in chat for automatic discovery, or select it under Advanced.')}
+          </p>
           {projectRoot && <p className="mt-1 text-[11px] text-sky-300">Scope: {path || '.'}</p>}
         </div>
         <details className="relative shrink-0">
@@ -137,6 +161,24 @@ export function CodingAgentWorkspace({
                 {projectRoot && <button onClick={onClearProject} disabled={busy || streaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Clear</button>}
               </div>
             </div>
+            {projectCandidates.length > 0 && (
+              <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-300">Matching projects found</p>
+                <p className="mt-1 text-xs text-amber-200/80">Click a project folder to attach it to the Coding Agent:</p>
+                <div className="mt-2 space-y-1">
+                  {projectCandidates.map((cand) => (
+                    <button
+                      key={cand}
+                      onClick={() => onSelectCandidate?.(cand)}
+                      disabled={busy || streaming}
+                      className="block w-full truncate rounded-md bg-slate-950 px-2 py-1.5 text-left text-xs text-sky-300 hover:bg-slate-800 disabled:opacity-40"
+                    >
+                      📁 {cand}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             {projectRoot && <div className="mt-3 space-y-3">
               <div className="flex gap-2">
                 <input value={path} onChange={(event) => onProjectPathChange(event.target.value)} placeholder="Optional relative scope (.)" className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400" />

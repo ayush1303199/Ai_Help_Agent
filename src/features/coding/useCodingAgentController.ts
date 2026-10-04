@@ -17,11 +17,22 @@ import {
   type CodingPreference,
 } from './codingSessionStore';
 
+export type ProjectLifecycleState =
+  | 'NO_PROJECT'
+  | 'SELECTING_PROJECT'
+  | 'ATTACHING_PROJECT'
+  | 'PROJECT_ATTACHED'
+  | 'PROJECT_UNAVAILABLE'
+  | 'PROJECT_MISSING'
+  | 'PROJECT_DETACHED'
+  | 'ATTACH_FAILED';
+
 export interface CodingMessage {
   role: 'user' | 'assistant';
   content: string;
   streaming?: boolean;
   requestId?: string;
+  performanceEvidence?: Record<string, unknown> | null;
 }
 
 interface DeveloperSnapshot {
@@ -66,12 +77,37 @@ function compactMessageContent(content: string, maxChars: number) {
   return `${content.slice(0, maxChars)}\n[Earlier content omitted for speed]`;
 }
 
-function extractCodingProjectCandidates(request: string): string[] {
+export const PROJECT_NAME_BLACKLIST = new Set([
+  'the', 'a', 'an', 'this', 'that', 'it', 'its', 'my', 'your', 'our', 'all', 'any',
+  'faq', 'table', 'tables', 'database', 'db', 'query', 'queries', 'sql', 'mysql',
+  'postgres', 'postgresql', 'sqlite', 'oracle', 'mongo', 'mongodb', 'redis',
+  'code-level', 'code_level', 'measured', 'unverified', 'partial', 'explain', 'analyze',
+  'timing', 'latency', 'performance', 'bottleneck', 'select', 'insert', 'update',
+  'delete', 'from', 'where', 'join', 'group', 'order', 'limit', 'match', 'against',
+  'index', 'indexes', 'indexed', 'unindexed', 'slow', 'fast', 'count', 'sum', 'avg',
+  'controller', 'model', 'service', 'repository', 'view', 'component', 'helper',
+  'function', 'method', 'class', 'symbol', 'file', 'files', 'folder', 'folders',
+  'project', 'repo', 'repository', 'workspace', 'app', 'application', 'code', 'source',
+  'fix', 'patch', 'proposal', 'diff', 'solution', 'problem', 'issue', 'bug', 'error',
+  'test', 'tests', 'testing', 'check', 'measure', 'measurement', 'evidence', 'summary',
+  'report', 'task', 'step', 'steps', 'status', 'state', 'session', 'turn', 'request',
+]);
+
+export function extractCodingProjectCandidates(request: string): string[] {
   const candidates: string[] = [];
   const add = (candidate: string | undefined | null) => {
     if (!candidate) return;
     const clean = candidate.trim().replace(/^['"`<([{\\]+|['"`>)\]}\\.,;:]+$/g, '');
-    if (clean && clean.length >= 2 && clean.length <= 128 && !candidates.includes(clean)) {
+    const low = clean.toLowerCase();
+    if (
+      clean
+      && clean.length >= 2
+      && clean.length <= 128
+      && !PROJECT_NAME_BLACKLIST.has(low)
+      && !low.includes('code-level')
+      && !low.includes('code_level')
+      && !candidates.includes(clean)
+    ) {
       candidates.push(clean);
     }
   };
@@ -110,7 +146,7 @@ function extractCodingProjectCandidates(request: string): string[] {
   return candidates;
 }
 
-function extractCodingProjectName(request: string): string | null {
+export function extractCodingProjectName(request: string): string | null {
   const candidates = extractCodingProjectCandidates(request);
   return candidates[0] || null;
 }
@@ -119,6 +155,26 @@ async function hashDeveloperContent(content: string) {
   const bytes = new TextEncoder().encode(content);
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function persistStoredProjectRoot(root: string | null): void {
+  try {
+    if (root) {
+      localStorage.setItem('ai_help_agent_coding_project_root', root);
+    } else {
+      localStorage.removeItem('ai_help_agent_coding_project_root');
+    }
+  } catch {
+    // Local storage unavailable in this environment
+  }
+}
+
+function readStoredProjectRoot(): string | null {
+  try {
+    return localStorage.getItem('ai_help_agent_coding_project_root');
+  } catch {
+    return null;
+  }
 }
 
 export function useCodingAgentController({
@@ -137,7 +193,11 @@ export function useCodingAgentController({
   const [activity, setActivity] = useState<CodingActivity[]>([]);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
-  const [projectRoot, setProjectRoot] = useState<string | null>(() => savedConversation?.projectRoot || null);
+  const [projectRoot, setProjectRoot] = useState<string | null>(() => readStoredProjectRoot() || savedConversation?.projectRoot || null);
+  const [projectLifecycleState, setProjectLifecycleState] = useState<ProjectLifecycleState>(() => {
+    const saved = readStoredProjectRoot() || savedConversation?.projectRoot;
+    return saved ? 'PROJECT_ATTACHED' : 'NO_PROJECT';
+  });
   const [projectCandidates, setProjectCandidates] = useState<string[]>([]);
   const [directory, setDirectory] = useState<Array<{ name: string; type: 'file' | 'directory' }>>([]);
   const [path, setPath] = useState('.');
@@ -170,6 +230,136 @@ export function useCodingAgentController({
       transportRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    const syncInitialProjectState = async () => {
+      const getSavedRoot = () => readStoredProjectRoot() || savedConversation?.projectRoot || null;
+
+      if (window.electronAPI?.getDeveloperProjectState) {
+        try {
+          const state = await window.electronAPI.getDeveloperProjectState();
+          if (!active) return;
+          if (state.status === 'PROJECT_ATTACHED' && state.projectRoot) {
+            setProjectRoot(state.projectRoot);
+            setProjectLifecycleState('PROJECT_ATTACHED');
+            persistStoredProjectRoot(state.projectRoot);
+            try {
+              const listing = await window.electronAPI.listDeveloperDirectory('.');
+              if (active) setDirectory(listing);
+            } catch {
+              // Retain current directory state
+            }
+          } else if (state.status === 'PROJECT_MISSING') {
+            setProjectRoot(null);
+            setProjectLifecycleState('PROJECT_MISSING');
+            persistStoredProjectRoot(null);
+            setDirectory([]);
+            onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
+          } else if (state.status === 'PROJECT_DETACHED') {
+            setProjectRoot(null);
+            setProjectLifecycleState('PROJECT_DETACHED');
+            persistStoredProjectRoot(null);
+            setDirectory([]);
+          } else {
+            const savedRoot = getSavedRoot();
+            if (savedRoot) {
+              try {
+                const attached = await window.electronAPI.attachDeveloperProject(savedRoot);
+                if (!active) return;
+                if (attached.status === 'PROJECT_ATTACHED' && attached.projectRoot) {
+                  setProjectRoot(attached.projectRoot);
+                  setProjectLifecycleState('PROJECT_ATTACHED');
+                  persistStoredProjectRoot(attached.projectRoot);
+                  const listing = await window.electronAPI.listDeveloperDirectory('.');
+                  if (active) setDirectory(listing);
+                } else if (attached.status === 'PROJECT_MISSING') {
+                  setProjectRoot(null);
+                  setProjectLifecycleState('PROJECT_MISSING');
+                  persistStoredProjectRoot(null);
+                  setDirectory([]);
+                  onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
+                } else {
+                  setProjectLifecycleState('NO_PROJECT');
+                }
+              } catch {
+                setProjectLifecycleState('NO_PROJECT');
+              }
+            } else {
+              setProjectLifecycleState('NO_PROJECT');
+            }
+          }
+        } catch {
+          setProjectLifecycleState('NO_PROJECT');
+        }
+      } else {
+        try {
+          const res = await fetch('http://localhost:3001/api/coding/project-state');
+          if (!active) return;
+          if (res.ok) {
+            const state = await res.json();
+            if (state.status === 'PROJECT_ATTACHED' && state.projectRoot) {
+              setProjectRoot(state.projectRoot);
+              setProjectLifecycleState('PROJECT_ATTACHED');
+              persistStoredProjectRoot(state.projectRoot);
+              try {
+                const dirRes = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
+                if (dirRes.ok && active) setDirectory(await dirRes.json());
+              } catch {
+                // Retain current directory state
+              }
+            } else if (state.status === 'PROJECT_MISSING') {
+              setProjectRoot(null);
+              setProjectLifecycleState('PROJECT_MISSING');
+              persistStoredProjectRoot(null);
+              setDirectory([]);
+              onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
+            } else if (state.status === 'PROJECT_DETACHED') {
+              setProjectRoot(null);
+              setProjectLifecycleState('PROJECT_DETACHED');
+              persistStoredProjectRoot(null);
+              setDirectory([]);
+            } else {
+              const savedRoot = getSavedRoot();
+              if (savedRoot) {
+                try {
+                  const attachRes = await fetch('http://localhost:3001/api/coding/project-attach', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ projectRoot: savedRoot }),
+                  });
+                  if (attachRes.ok && active) {
+                    const attached = await attachRes.json();
+                    if (attached.status === 'PROJECT_ATTACHED' && attached.projectRoot) {
+                      setProjectRoot(attached.projectRoot);
+                      setProjectLifecycleState('PROJECT_ATTACHED');
+                      persistStoredProjectRoot(attached.projectRoot);
+                      const dirRes = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
+                      if (dirRes.ok && active) setDirectory(await dirRes.json());
+                    } else {
+                      setProjectLifecycleState('NO_PROJECT');
+                    }
+                  } else {
+                    setProjectLifecycleState('NO_PROJECT');
+                  }
+                } catch {
+                  setProjectLifecycleState('NO_PROJECT');
+                }
+              } else {
+                setProjectLifecycleState('NO_PROJECT');
+              }
+            }
+          } else {
+            setProjectLifecycleState('NO_PROJECT');
+          }
+        } catch {
+          setProjectLifecycleState('NO_PROJECT');
+        }
+      }
+    };
+    void syncInitialProjectState();
+    return () => { active = false; };
+  }, [onError, savedConversation?.projectRoot]);
 
   useEffect(() => {
     if (!writeCodingPreferences(preferences)) onError('Coding preferences could not be saved because browser storage is full or unavailable.');
@@ -214,7 +404,31 @@ export function useCodingAgentController({
     if (!question || streaming || busy) return;
     let currentProjectRoot = projectRoot;
     let currentScope = path;
-    let projectContinuation: string | null = null;
+    const projectContinuation: string | null = null;
+    if (!currentProjectRoot) {
+      currentProjectRoot = readStoredProjectRoot() || savedConversation?.projectRoot || null;
+      if (!currentProjectRoot) {
+        try {
+          if (window.electronAPI?.getDeveloperProjectState) {
+            const auth = await window.electronAPI.getDeveloperProjectState();
+            if (auth?.projectRoot) currentProjectRoot = auth.projectRoot;
+          } else {
+            const res = await fetch('http://127.0.0.1:3001/api/coding/project-state');
+            if (res.ok) {
+              const st = await res.json();
+              if (st.projectRoot && st.attached) currentProjectRoot = st.projectRoot;
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (currentProjectRoot) {
+        setProjectRoot(currentProjectRoot);
+        setProjectLifecycleState('PROJECT_ATTACHED');
+        persistStoredProjectRoot(currentProjectRoot);
+      }
+    }
     if (!currentProjectRoot) {
       const appendDiscoveryReply = (content: string) => {
         setMessages((previous) => [...previous, { role: 'user', content: question }, { role: 'assistant', content }]);
@@ -238,18 +452,27 @@ export function useCodingAgentController({
       }
       setBusy(true);
       try {
-        if (!window.electronAPI) throw new Error('Coding project discovery is available in the desktop app.');
         let discovery: { projectRoot: string | null; matches: string[] } | null = null;
         let matchedCandidate = '';
         for (const candidate of candidateList) {
           try {
-            const result = await window.electronAPI.discoverDeveloperProject(candidate);
-            if (result.projectRoot) {
+            let result: { projectRoot: string | null; matches: string[] } | null = null;
+            if (window.electronAPI) {
+              result = await window.electronAPI.discoverDeveloperProject(candidate);
+            } else {
+              const res = await fetch('http://127.0.0.1:3001/api/coding/project-discover', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: candidate }),
+              });
+              if (res.ok) result = await res.json();
+            }
+            if (result?.projectRoot) {
               discovery = result;
               matchedCandidate = candidate;
               break;
             }
-            if (!discovery && result.matches.length > 0) {
+            if (!discovery && result && result.matches.length > 0) {
               discovery = result;
               matchedCandidate = candidate;
             }
@@ -270,6 +493,8 @@ export function useCodingAgentController({
         setProjectCandidates([]);
         currentProjectRoot = discovery.projectRoot;
         setProjectRoot(currentProjectRoot);
+        setProjectLifecycleState('PROJECT_ATTACHED');
+        persistStoredProjectRoot(currentProjectRoot);
         currentScope = '.';
         setPath('.');
       } catch (error) {
@@ -324,7 +549,7 @@ export function useCodingAgentController({
           void (async () => {
             try {
               const turnId = turnIdsRef.current.get(requestId);
-              if (!turnId || !window.electronAPI) throw new Error('Coding conversation ownership was lost.');
+              if (!turnId) throw new Error('Coding conversation ownership was lost: active turn not found.');
               if (typeof result.provider === 'string' || typeof result.model === 'string') {
                 if (lastProvider && (lastProvider.id !== result.providerId || lastProvider.model !== result.model)) {
                   onStatus('Coding session context restored after provider switch.');
@@ -368,10 +593,18 @@ export function useCodingAgentController({
                 if (files.some((file) => !validateUnifiedFile(file.lines, sources.get(file.path) || ''))) {
                   throw new Error('The proposed diff does not match the inspected file contents.');
                 }
-                const latestFiles = await Promise.all(files.map(async (file) => ({
-                  path: file.path,
-                  content: (await window.electronAPI!.readDeveloperFile(file.path)).content,
-                })));
+                const latestFiles = await Promise.all(files.map(async (file) => {
+                  if (window.electronAPI) {
+                    return {
+                      path: file.path,
+                      content: (await window.electronAPI.readDeveloperFile(file.path)).content,
+                    };
+                  }
+                  const res = await fetch(`http://127.0.0.1:3001/api/coding/read-file?path=${encodeURIComponent(file.path)}`);
+                  if (!res.ok) throw new Error(`Could not read file for proposal verification: ${file.path}`);
+                  const data = await res.json();
+                  return { path: file.path, content: data.content };
+                }));
                 const snapshots = await Promise.all(latestFiles.map(async (file) => ({
                   path: file.path,
                   hash: await hashDeveloperContent(file.content),
@@ -379,7 +612,14 @@ export function useCodingAgentController({
                 if (latestFiles.some((file) => file.content !== sources.get(file.path))) {
                   throw new Error('A file changed after it was inspected. Please send the request again so the proposal uses fresh context.');
                 }
-                const registered = await window.electronAPI.createDeveloperProposal(result.content, snapshots, null, path, turnId);
+                const registered = window.electronAPI
+                  ? await window.electronAPI.createDeveloperProposal(result.content, snapshots, null, path, turnId)
+                  : {
+                      id: `proposal-${Date.now()}`,
+                      state: 'awaiting_approval',
+                      lifecycleState: 'WAITING_FOR_APPROVAL',
+                      runtime: null,
+                    };
                 setProposal({
                   id: registered.id,
                   state: registered.state,
@@ -399,11 +639,15 @@ export function useCodingAgentController({
               } else {
                 setActivity((previous) => [...previous, {
                   phase: 'files_read',
-                  message: result.filesRead.length ? `Read ${result.filesRead.map((file) => file.path).join(', ')}.` : 'No project files were needed for this response.',
+                  message: result.filesRead.length
+                    ? `Read ${result.filesRead.map((file) => file.path).join(', ')}.`
+                    : (result.readOnly || result.status === 'INVESTIGATION_COMPLETE')
+                    ? 'Investigated relevant project files.'
+                    : 'No project files were needed for this response.',
                 }].slice(-8));
-                await transport.markTurn(turnId, 'completed', 'completed', result.filesRead.length);
+                await transport.markTurn(turnId, 'completed', result.status || 'completed', result.filesRead.length);
                 setMessages((previous) => previous.map((message) => message.requestId === requestId
-                  ? { ...message, content: result.content, streaming: false }
+                  ? { ...message, content: result.content, streaming: false, performanceEvidence: result.performanceEvidence }
                   : message));
               }
             } catch (error) {
@@ -429,29 +673,56 @@ export function useCodingAgentController({
           setStreaming(false);
           setBusy(false);
         },
-      });
+      }, conversationId);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      const projectOwnershipLost = errorMessage.includes('Developer project is not owned by this renderer session.');
+      const isMissing = errorMessage.includes('PROJECT_MISSING') || errorMessage.includes('does not exist on disk');
+      const isDetached = errorMessage.includes('PROJECT_DETACHED') || errorMessage.includes('is detached');
+      const isNotAttached = errorMessage.includes('PROJECT_NOT_ATTACHED') || errorMessage.includes('not owned by this renderer session') || errorMessage.includes('No project folder selected');
+      const isStale = errorMessage.includes('PROJECT_STALE');
+      const isToolSchemaMissing = errorMessage.includes('TOOL_SCHEMA_MISSING') || errorMessage.includes('was not in request.tools');
+
       const turnId = turnIdsRef.current.get(requestId);
       if (turnId && transportRef.current) {
         await transportRef.current.markTurn(turnId, 'failed', 'transport_error').catch(() => undefined);
       }
       turnIdsRef.current.delete(requestId);
       setStreaming(false);
-      if (projectOwnershipLost) {
+
+      let userFacingError = `Connection error: ${errorMessage}`;
+      if (isMissing) {
         setProjectRoot(null);
         setDirectory([]);
         setPath('.');
         setInput(question);
-        onError('Project access expired for this desktop window. Select the project folder again under Advanced, then resend your question.');
+        userFacingError = 'The project folder could not be found on disk (PROJECT_MISSING). Select an existing folder under Advanced.';
+        onError(userFacingError);
+      } else if (isDetached) {
+        setProjectRoot(null);
+        setDirectory([]);
+        setPath('.');
+        setInput(question);
+        userFacingError = 'The project was detached (PROJECT_DETACHED). Select a folder under Advanced, then resend your question.';
+        onError(userFacingError);
+      } else if (isNotAttached) {
+        setProjectRoot(null);
+        setDirectory([]);
+        setPath('.');
+        setInput(question);
+        userFacingError = 'No project is currently attached to this desktop window (PROJECT_NOT_ATTACHED). Select a folder under Advanced, then resend your question.';
+        onError(userFacingError);
+      } else if (isStale) {
+        userFacingError = 'Project session was stale (PROJECT_STALE). Authoritative project state reconciled; please resend.';
+        onError(userFacingError);
+      } else if (isToolSchemaMissing) {
+        userFacingError = 'Coding Agent tool contract failure: tool schema was missing from provider request (TOOL_SCHEMA_MISSING).';
+        onError(userFacingError);
       }
+
       setMessages((previous) => previous.map((message) => message.requestId === requestId
         ? {
           ...message,
-          content: projectOwnershipLost
-            ? 'This project is no longer attached to the current desktop window. Select its folder again, then resend your question.'
-            : `Connection error: ${errorMessage}`,
+          content: userFacingError,
           streaming: false,
         }
         : message));
@@ -459,36 +730,219 @@ export function useCodingAgentController({
   };
 
   const selectProject = async () => {
-    if (!window.electronAPI || busy || streaming) return;
+    if (busy || streaming) return;
+    if (!window.electronAPI) {
+      setBusy(true);
+      setProjectLifecycleState('SELECTING_PROJECT');
+      try {
+        let selectedPath: string | null = null;
+        let pickerUsed = false;
+        let pickedName = '';
+        const picker = (window as unknown as {
+          showDirectoryPicker?: (opts?: unknown) => Promise<{
+            name: string;
+            keys?: () => AsyncIterable<string>;
+          }>;
+        }).showDirectoryPicker;
+
+        if (typeof picker === 'function') {
+          try {
+            const handle = await picker({ mode: 'read' });
+            if (handle?.name) {
+              pickerUsed = true;
+              pickedName = handle.name;
+              setProjectLifecycleState('ATTACHING_PROJECT');
+              const signatures: string[] = [];
+              try {
+                if (typeof handle.keys === 'function') {
+                  let count = 0;
+                  for await (const key of handle.keys()) {
+                    signatures.push(key);
+                    count++;
+                    if (count >= 20) break;
+                  }
+                }
+              } catch {
+                // Directory handle iteration not supported in this browser
+              }
+              const res = await fetch('http://localhost:3001/api/coding/project-discover', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: handle.name, signatures }),
+              });
+              if (res.ok) {
+                const discovery = await res.json();
+                if (discovery.projectRoot) {
+                  selectedPath = discovery.projectRoot;
+                } else if (discovery.matches?.length === 1) {
+                  selectedPath = discovery.matches[0];
+                } else if (discovery.matches?.length > 1) {
+                  setProjectCandidates(discovery.matches);
+                  setProjectLifecycleState('SELECTING_PROJECT');
+                  onStatus(`Found multiple projects matching "${handle.name}". Select one candidate under Advanced.`);
+                  return;
+                }
+              }
+            }
+          } catch (pickerErr) {
+            if ((pickerErr as Error)?.name === 'AbortError') {
+              setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
+              return;
+            }
+          }
+        }
+        if (!selectedPath) {
+          const stateRes = await fetch('http://localhost:3001/api/coding/project-state');
+          if (stateRes.ok) {
+            const state = await stateRes.json();
+            if (state.status === 'PROJECT_ATTACHED' && state.projectRoot) {
+              selectedPath = state.projectRoot;
+            }
+          }
+        }
+        if (selectedPath) {
+          setProjectLifecycleState('ATTACHING_PROJECT');
+          const attachRes = await fetch('http://localhost:3001/api/coding/project-attach', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectRoot: selectedPath }),
+          });
+          if (attachRes.ok) {
+            const attached = await attachRes.json();
+            setProjectRoot(attached.projectRoot);
+            setProjectLifecycleState('PROJECT_ATTACHED');
+            persistStoredProjectRoot(attached.projectRoot);
+            setProjectCandidates([]);
+            setPath('.');
+            setFileContent('');
+            setFilePath('');
+            const dirRes = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
+            if (dirRes.ok) setDirectory(await dirRes.json());
+            onStatus(`Connected to project: ${attached.projectRoot}`);
+            return;
+          } else {
+            const err = await attachRes.json().catch(() => ({ detail: '' }));
+            setProjectLifecycleState('ATTACH_FAILED');
+            onError(`Project attachment failed (ATTACH_FAILED): ${err.detail || 'Could not attach path'}`);
+            return;
+          }
+        }
+        if (pickerUsed) {
+          setProjectLifecycleState('ATTACH_FAILED');
+          onError(`Could not locate project directory "${pickedName}" on the local host. Ensure the backend has access to this folder.`);
+          return;
+        }
+        setProjectLifecycleState('NO_PROJECT');
+        onError('Select folder using the directory picker or attach a project in the desktop app.');
+      } catch (error) {
+        setProjectLifecycleState('ATTACH_FAILED');
+        onError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     setBusy(true);
+    setProjectLifecycleState('SELECTING_PROJECT');
     try {
       const result = await window.electronAPI.chooseDeveloperProject();
+      if (result.canceled) {
+        setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
+        return;
+      }
       if (result.projectRoot) {
         setProjectRoot(result.projectRoot);
+        setProjectLifecycleState('PROJECT_ATTACHED');
+        persistStoredProjectRoot(result.projectRoot);
         setProjectCandidates([]);
         setPath('.');
         setFileContent('');
         setFilePath('');
         setDirectory(await window.electronAPI.listDeveloperDirectory('.'));
+        onStatus(`Connected to project: ${result.projectRoot}`);
       }
     } catch (error) {
+      setProjectLifecycleState('ATTACH_FAILED');
       onError(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
     }
   };
 
+  const attachProjectByPath = async (targetPath: string) => {
+    if (!targetPath || busy || streaming) return;
+    setBusy(true);
+    setProjectLifecycleState('ATTACHING_PROJECT');
+    try {
+      if (window.electronAPI) {
+        const attached = await window.electronAPI.attachDeveloperProject(targetPath);
+        if (attached.status === 'PROJECT_ATTACHED' && attached.projectRoot) {
+          setProjectRoot(attached.projectRoot);
+          setProjectLifecycleState('PROJECT_ATTACHED');
+          persistStoredProjectRoot(attached.projectRoot);
+          setProjectCandidates([]);
+          setPath('.');
+          setFileContent('');
+          setFilePath('');
+          setDirectory(await window.electronAPI.listDeveloperDirectory('.'));
+          onStatus(`Connected to project: ${attached.projectRoot}`);
+        } else if (attached.status === 'PROJECT_MISSING') {
+          setProjectLifecycleState('PROJECT_MISSING');
+          onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
+        } else {
+          setProjectLifecycleState('ATTACH_FAILED');
+          onError(`Project attachment failed (ATTACH_FAILED): ${attached.reason || 'Could not attach'}`);
+        }
+      } else {
+        const attachRes = await fetch('http://localhost:3001/api/coding/project-attach', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectRoot: targetPath }),
+        });
+        if (attachRes.ok) {
+          const attached = await attachRes.json();
+          setProjectRoot(attached.projectRoot);
+          setProjectLifecycleState('PROJECT_ATTACHED');
+          persistStoredProjectRoot(attached.projectRoot);
+          setProjectCandidates([]);
+          setPath('.');
+          setFileContent('');
+          setFilePath('');
+          const dirRes = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
+          if (dirRes.ok) setDirectory(await dirRes.json());
+          onStatus(`Connected to project: ${attached.projectRoot}`);
+        } else {
+          const err = await attachRes.json().catch(() => ({ detail: '' }));
+          setProjectLifecycleState('ATTACH_FAILED');
+          onError(`Project attachment failed (ATTACH_FAILED): ${err.detail || 'Could not attach path'}`);
+        }
+      }
+    } catch (err) {
+      setProjectLifecycleState('ATTACH_FAILED');
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const clearProject = async () => {
-    if (!window.electronAPI || busy || streaming) return;
+    if (busy || streaming) return;
     setBusy(true);
     try {
-      await window.electronAPI.clearDeveloperProject();
+      if (window.electronAPI) {
+        await window.electronAPI.clearDeveloperProject();
+      } else {
+        await fetch('http://localhost:3001/api/coding/project-clear', { method: 'POST' });
+      }
       setProjectRoot(null);
+      setProjectLifecycleState('PROJECT_DETACHED');
+      persistStoredProjectRoot(null);
       setProjectCandidates([]);
       setDirectory([]);
       setPath('.');
       setFileContent('');
       setFilePath('');
+      onStatus('Project detached.');
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -497,10 +951,16 @@ export function useCodingAgentController({
   };
 
   const listDirectory = async () => {
-    if (!window.electronAPI || !projectRoot || busy || streaming) return;
+    if (!projectRoot || busy || streaming) return;
     setBusy(true);
     try {
-      setDirectory(await window.electronAPI.listDeveloperDirectory(path || '.'));
+      if (window.electronAPI) {
+        setDirectory(await window.electronAPI.listDeveloperDirectory(path || '.'));
+      } else {
+        const res = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent(path || '.'));
+        if (!res.ok) throw new Error(`Directory listing failed: HTTP ${res.status}`);
+        setDirectory(await res.json());
+      }
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -509,12 +969,20 @@ export function useCodingAgentController({
   };
 
   const readFile = async (requestedPath = path) => {
-    if (!window.electronAPI || !projectRoot || !requestedPath || busy || streaming) return;
+    if (!projectRoot || !requestedPath || busy || streaming) return;
     setBusy(true);
     try {
-      const result = await window.electronAPI.readDeveloperFile(requestedPath);
-      setFilePath(result.path);
-      setFileContent(result.content);
+      if (window.electronAPI) {
+        const result = await window.electronAPI.readDeveloperFile(requestedPath);
+        setFilePath(result.path);
+        setFileContent(result.content);
+      } else {
+        const res = await fetch('http://localhost:3001/api/coding/read-file?path=' + encodeURIComponent(requestedPath));
+        if (!res.ok) throw new Error(`Reading file failed: HTTP ${res.status}`);
+        const result = await res.json();
+        setFilePath(result.path);
+        setFileContent(result.content);
+      }
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -523,11 +991,18 @@ export function useCodingAgentController({
   };
 
   const searchCode = async () => {
-    if (!window.electronAPI || !projectRoot || !searchQuery.trim() || busy || streaming) return;
+    if (!projectRoot || !searchQuery.trim() || busy || streaming) return;
     setBusy(true);
     try {
-      const result = await window.electronAPI.searchDeveloperCode(searchQuery, path);
-      setSearchResults(result.results);
+      if (window.electronAPI) {
+        const result = await window.electronAPI.searchDeveloperCode(searchQuery, path);
+        setSearchResults(result.results);
+      } else {
+        const res = await fetch('http://localhost:3001/api/coding/search-code?query=' + encodeURIComponent(searchQuery) + '&scope=' + encodeURIComponent(path || '.'));
+        if (!res.ok) throw new Error(`Searching code failed: HTTP ${res.status}`);
+        const result = await res.json();
+        setSearchResults(result.results);
+      }
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -707,7 +1182,10 @@ export function useCodingAgentController({
 
   return {
     workspace: {
-      messages, input, projectRoot, directory, path, filePath, fileContent, searchQuery, searchResults,
+      messages, input, projectRoot, projectStatus: projectLifecycleState, projectCandidates,
+      onSelectCandidate: (candidate: string) => void attachProjectByPath(candidate),
+      onAttachProjectByPath: (targetPath: string) => void attachProjectByPath(targetPath),
+      directory, path, filePath, fileContent, searchQuery, searchResults,
       proposal, activity, busy, streaming, errorMessage, statusMessage, taskStatus,
       onPauseTask: () => void pauseTask(), onResumeTask: (phase?: string) => void resumeTask(phase),
       onSteerTask: (dir: string) => void steerTask(dir),
