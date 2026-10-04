@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -1992,6 +1993,13 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         active_db_sess = DatabaseSessionManager.get_session(project_root="", session_id=session_id)
         if active_db_sess and getattr(active_db_sess, "project_root", None):
             project_root = active_db_sess.project_root
+
+    # Check if user message explicitly provides an existing directory path on disk
+    path_cand_m = re.search(r"([a-zA-Z]:[/\\][a-zA-Z0-9_\-./\\]+|/[a-zA-Z0-9_\-./\\]+)", raw_request)
+    if path_cand_m:
+        cand_p = path_cand_m.group(1).rstrip(".,;\"'")
+        if os.path.isdir(cand_p):
+            project_root = os.path.normpath(cand_p)
 
     if project_root and isinstance(project_root, str):
         set_backend_project_state(project_root)
