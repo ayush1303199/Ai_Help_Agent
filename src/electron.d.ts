@@ -290,6 +290,25 @@ interface Window {
     runDeveloperVerification: (script: string) => Promise<{ ok: boolean; script: string; exitCode: number | null; stdout: string; stderr: string; durationMs: number; classification?: string; cancelled?: boolean }>;
     inspectDeveloperGit: (kind: 'status' | 'diff') => Promise<{ args: string[]; stdout: string; stderr: string }>;
     beginDeveloperConversation: (request: string, scope?: string) => Promise<{ turnId: string; state: string; projectRoot: string; scope: string; sessionId?: string }>;
+    inspectDeveloperDatabase: (request: string, contextMessages?: Array<{ role: 'user' | 'assistant'; content: string }>) => Promise<{
+      ok: boolean;
+      handled: boolean;
+      intents: string[];
+      turnId?: string;
+      data: {
+        status: string;
+        requestedFile: { path: string; role: string; confidence: number; preview: Array<{ line: number; text: string }> } | null;
+        configFile: { path: string; role: string; confidence: number; preview: Array<{ line: number; text: string }> } | null;
+        dependencies: string[];
+        unresolvedDependencies: string[];
+        unresolvedSymbols: string[];
+        configuration: { engine: string | null; database: string | null; host: string | null; port: string | null; username: string | null; password: string | null; source: string };
+        live: { status: string; reason: string };
+        excludedCandidates: Array<{ path: string; role: string; confidence: number; databaseConfigEligible: boolean }>;
+        report: string;
+      } | null;
+      error: { code: string; message: string } | null;
+    }>;
     advanceDeveloperConversation: (update: { turnId: string; state: 'understanding' | 'completed' | 'failed' | 'cancelled'; phase?: string; fileCount?: number }) => Promise<{ turnId: string; state: string; updatedAt: string }>;
     createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null, scope?: string, conversationTurnId?: string | null) => Promise<{ id: string; state: string; lifecycleState?: string; files: Array<{ path: string; hash: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     approveDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;

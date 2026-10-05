@@ -67,6 +67,10 @@ const CAPABILITY_CATEGORIES = Object.freeze([
   'RETURNS',
   'TRACKING',
   'GENERAL_COMPUTER_TASK',
+  'DATABASE_CONNECT',
+  'DATABASE_CURRENT_TARGET',
+  'DATABASE_QUERY',
+  'DATABASE_EXPLAIN',
 ]);
 
 function capability(name, description, allowedActions, options = {}) {

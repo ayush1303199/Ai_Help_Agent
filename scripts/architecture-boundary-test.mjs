@@ -29,6 +29,7 @@ const agentRoots = Object.freeze({
   coding: [
     'src/features/coding',
     'electron/coding-pipeline',
+    'electron/databaseDiscovery.cjs',
     'electron/developerAgent.cjs',
     'electron/developerBenchmark.cjs',
     'electron/developerContext.cjs',

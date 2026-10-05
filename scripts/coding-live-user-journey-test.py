@@ -21,6 +21,7 @@ Verifies authentic autonomous behavior across the 6 canonical user journeys:
 import os
 import sys
 import json
+import re
 import sqlite3
 import tempfile
 import asyncio
@@ -36,6 +37,7 @@ from coding_intelligence import (
     DatabaseCapability,
     DatabaseSession,
     DatabaseSessionManager,
+    DatabaseSchemaKnowledgeStore,
     PolicyGate,
     SelfDebugController,
     FailureClassification,
@@ -75,6 +77,7 @@ from coding_websocket import (
     CODING_TASK_STORE,
     resolve_tool_capability,
 )
+import coding_websocket
 
 
 def create_fixture_project(base_dir: str) -> str:
@@ -146,6 +149,76 @@ def run_tests():
     temp_dir = tempfile.mkdtemp(prefix="coding-journey-")
     project_root = create_fixture_project(temp_dir)
     print(f"[SETUP] Fixture enterprise project created at: {project_root}")
+    original_database_action_resolver = coding_websocket._resolve_database_action_with_model
+    model_resolution_calls = []
+
+    async def fixture_model_database_action_resolver(
+        _registry,
+        _config_path,
+        messages,
+        _database_context,
+        _provider_id,
+        _request_id,
+        _session_id,
+    ):
+        model_resolution_calls.append(messages)
+        latest_request = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+        resolved = DatabaseSessionManager.resolve_database_intent(latest_request)
+        if resolved.get("is_deterministic"):
+            return resolved
+        prior_user_request = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(messages[:-1])
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+        previous_action = DatabaseSessionManager.resolve_database_intent(prior_user_request)
+        if (
+            re.fullmatch(r"\s*(?:how many(?:\s+of\s+(?:them|those|these|it))?|count\s+(?:them|those|these|it))\s*[?!.]*\s*", latest_request, re.I)
+            and previous_action.get("capability") == DatabaseCapability.DATABASE_COUNT_RECORDS
+        ):
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+                "arguments": {
+                    "entity": previous_action.get("arguments", {}).get("entity", "")
+                },
+                "resolved_by_model": True,
+            }
+        same_target = re.fullmatch(r"\s*same\s+(?:for|with)\s+([A-Za-z][A-Za-z0-9_.$-]*)\s*[?!.]*\s*", latest_request, re.I)
+        if same_target and previous_action.get("capability") == DatabaseCapability.DATABASE_COUNT_RECORDS:
+            arguments = dict(previous_action.get("arguments") or {})
+            arguments["entity"] = same_target.group(1)
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+                "arguments": arguments,
+                "resolved_by_model": True,
+            }
+        if classify_task_intent(latest_request)["intent"] == TaskIntent.PERFORMANCE_INVESTIGATION:
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_SLOW_QUERIES,
+                "arguments": {"dimension": "average_time"},
+                "resolved_by_model": True,
+            }
+        return {
+            "clarification": (
+                "Please clarify which database operation you want me to perform. "
+                f"Fixture could not classify request: {latest_request!r}"
+            )
+        }
+
+    coding_websocket._resolve_database_action_with_model = fixture_model_database_action_resolver
 
     try:
         # =====================================================================
@@ -268,7 +341,7 @@ def run_tests():
         )
         done_msg_b = next(m for m in sent_messages_b if m.get("type") == "done")
         content_b = done_msg_b.get("content", "")
-        assert "### DATABASE TABLES INSPECTION" in content_b
+        assert "### DATABASE TABLES INSPECTION" not in content_b
         assert "`orders`" in content_b
         assert "`users`" in content_b
         assert done_msg_b.get("readOnly") is True
@@ -620,7 +693,12 @@ def run_tests():
         exploding_registry = ExplodingProviderRegistry()
 
         # Helper to execute turn with disabled LLM provider
-        def run_deterministic_turn(user_command: str):
+        def run_deterministic_turn(
+            user_command: str,
+            history=None,
+            session_id="journey-session-h",
+            project_root_override=None,
+        ):
             messages = []
             async def mock_send(msg):
                 messages.append(msg)
@@ -628,9 +706,9 @@ def run_tests():
                 _run_coding_turn(
                     payload={
                         "requestId": f"req-h-{int(time.time()*1000)}",
-                        "sessionId": "journey-session-h",
-                        "projectRoot": project_root,
-                        "messages": [{"role": "user", "content": user_command}],
+                        "sessionId": session_id,
+                        "projectRoot": project_root_override or project_root,
+                        "messages": history or [{"role": "user", "content": user_command}],
                     },
                     send_json=mock_send,
                     state={"pending": {}, "completed": {}},
@@ -660,11 +738,318 @@ def run_tests():
         assert db_intent_2["capability"] == DatabaseCapability.DATABASE_LIST_TABLES
 
         content_h2, msgs_h2 = run_deterministic_turn("show tables")
-        assert "Tables found:" in content_h2 or "DATABASE TABLES" in content_h2
         assert "orders" in content_h2
         assert "users" in content_h2
         assert "products" in content_h2
         print("  -> 3. SHOW TABLES: Executed directly on DB session with zero LLM provider calls!")
+
+        # 4. Natural-language record count, classified for discovery and intercepted before the LLM
+        count_db = sqlite3.connect(str(Path(project_root) / "data" / "commerce.db"))
+        count_db.execute("CREATE TABLE admission (id INTEGER PRIMARY KEY, applicant TEXT, pay_status INTEGER)")
+        count_db.executemany(
+            "INSERT INTO admission (applicant, pay_status) VALUES (?, ?)",
+            [("Alice", 9), ("Bob", 9), ("Casey", 0)],
+        )
+        count_db.commit()
+        count_db.close()
+        count_request = "count total admission data"
+        count_intent = DatabaseSessionManager.resolve_database_intent(count_request)
+        assert classify_task_intent(count_request)["intent"] == TaskIntent.DATABASE_INVESTIGATION
+        assert count_intent["is_deterministic"] is True
+        assert count_intent["capability"] == DatabaseCapability.DATABASE_COUNT_RECORDS
+        content_count, _ = run_deterministic_turn(count_request)
+        assert "**Table:** `admission`" in content_count
+        assert "**Total records:** 3" in content_count
+        human_count_request = "how many users"
+        human_count_content, human_count_messages = run_deterministic_turn(
+            human_count_request,
+            session_id="journey-session-human-count-context",
+        )
+        assert "**Table:** `users`" in human_count_content
+        assert "**Total records:** 1" in human_count_content
+        human_count_done = next(
+            message for message in human_count_messages if message.get("type") == "done"
+        )
+        contextual_count_content, _ = run_deterministic_turn(
+            "how many?",
+            history=[
+                {"role": "user", "content": human_count_request},
+                {"role": "assistant", "content": human_count_done["content"]},
+                {"role": "user", "content": "how many?"},
+            ],
+            session_id="journey-session-human-count-context",
+        )
+        assert "**Table:** `users`" in contextual_count_content, contextual_count_content
+        assert "**Total records:** 1" in contextual_count_content
+        record_list_content, _ = run_deterministic_turn(
+            "show users",
+            session_id="journey-session-human-list",
+        )
+        assert "### DATABASE RECORDS" in record_list_content
+        assert "user@example.com" in record_list_content
+        count_db = sqlite3.connect(str(Path(project_root) / "data" / "commerce.db"))
+        count_db.execute("CREATE TABLE payments (id INTEGER PRIMARY KEY, amount INTEGER)")
+        count_db.executemany("INSERT INTO payments (amount) VALUES (?)", [(10,), (20,)])
+        count_db.commit()
+        count_db.close()
+        same_count_content, same_count_messages = run_deterministic_turn(
+            "count total users",
+            session_id="journey-session-same-task",
+        )
+        same_count_done = next(
+            message for message in same_count_messages if message.get("type") == "done"
+        )
+        same_payment_content, _ = run_deterministic_turn(
+            "same for payment",
+            history=[
+                {"role": "user", "content": "count total users"},
+                {"role": "assistant", "content": same_count_done["content"]},
+                {"role": "user", "content": "same for payment"},
+            ],
+            session_id="journey-session-same-task",
+        )
+        assert "**Table:** `payments`" in same_payment_content
+        assert "**Total records:** 2" in same_payment_content
+        count_db = sqlite3.connect(str(Path(project_root) / "data" / "commerce.db"))
+        count_db.execute("CREATE TABLE personal (id INTEGER PRIMARY KEY)")
+        count_db.executemany("INSERT INTO personal DEFAULT VALUES", [(), (), ()])
+        count_db.commit()
+        count_db.close()
+        personal_count_content, _ = run_deterministic_turn("count total personal")
+        assert "**Table:** `personal`" in personal_count_content
+        assert "**Total records:** 3" in personal_count_content
+        count_db = sqlite3.connect(str(Path(project_root) / "data" / "commerce.db"))
+        count_db.execute("DROP TABLE personal")
+        count_db.execute("CREATE TABLE admuserpersonals (id INTEGER PRIMARY KEY)")
+        count_db.execute("CREATE TABLE jiuserpersonals (id INTEGER PRIMARY KEY)")
+        count_db.execute("CREATE TABLE jiuserpersonaltemps (id INTEGER PRIMARY KEY)")
+        count_db.executemany("INSERT INTO admuserpersonals DEFAULT VALUES", [(), (), ()])
+        count_db.commit()
+        count_db.close()
+        models_dir = Path(project_root) / "models"
+        models_dir.mkdir(exist_ok=True)
+        personal_model = models_dir / "Personal.php"
+        personal_model.write_text(
+            '<?php $query = "SELECT * FROM admuserpersonals";',
+            encoding="utf-8",
+        )
+        personal_count_content, personal_count_messages = run_deterministic_turn(
+            "count total personal",
+            session_id="journey-session-source-ranked-personal-count",
+        )
+        personal_count_done = next(
+            message for message in personal_count_messages if message.get("type") == "done"
+        )
+        assert personal_count_done["status"] == "COMPLETED"
+        assert "**Table:** `admuserpersonals`" in personal_count_content
+        assert "**Total records:** 3" in personal_count_content
+        assert "source-query evidence" in personal_count_content
+        assert "orders" not in personal_count_content.lower()
+        assert "code-discovered table references" not in personal_count_content.lower()
+        personal_model.unlink()
+        count_db = sqlite3.connect(str(Path(project_root) / "data" / "commerce.db"))
+        count_db.execute("DROP TABLE admuserpersonals")
+        count_db.execute("DROP TABLE jiuserpersonals")
+        count_db.execute("DROP TABLE jiuserpersonaltemps")
+        count_db.execute("CREATE TABLE personal (id INTEGER PRIMARY KEY)")
+        count_db.executemany("INSERT INTO personal DEFAULT VALUES", [(), (), ()])
+        count_db.commit()
+        count_db.close()
+        paid_intent = DatabaseSessionManager.resolve_database_intent("count paid admission data")
+        assert paid_intent["arguments"]["payment_filter"] == "paid"
+        paid_content, paid_messages = run_deterministic_turn("count paid admission data")
+        assert "Could not determine which value in `pay_status` means paid" in paid_content
+        assert "`0 (1 rows)`" in paid_content and "`9 (2 rows)`" in paid_content
+        paid_done = next(message for message in paid_messages if message.get("type") == "done")
+        assert paid_done["status"] == "NEEDS_CLARIFICATION"
+        assert [option["value"] for option in paid_done["clarificationOptions"]] == ["0", "9"]
+        selected_paid_content, _ = run_deterministic_turn(
+            "count paid admission where pay_status = 9"
+        )
+        assert "**Paid records:** 2" in selected_paid_content
+        assert "`pay_status = 9`" in selected_paid_content
+        count_db = sqlite3.connect(str(Path(project_root) / "data" / "commerce.db"))
+        count_db.execute(
+            "CREATE TABLE adm_user_programme_selection (id INTEGER PRIMARY KEY)"
+        )
+        count_db.executemany(
+            "INSERT INTO adm_user_programme_selection DEFAULT VALUES",
+            [(), (), ()],
+        )
+        count_db.commit()
+        typo_table_content, _ = run_deterministic_turn(
+            "count total adm_user_prgramme_selection"
+        )
+        assert "**Table:** `adm_user_programme_selection`" in typo_table_content
+        assert "**Total records:** 3" in typo_table_content
+        with tempfile.TemporaryDirectory(prefix="coding-risky-table-journey-") as risky_project_root:
+            risky_data_dir = Path(risky_project_root) / "data"
+            risky_data_dir.mkdir()
+            risky_db = sqlite3.connect(risky_data_dir / "commerce.db")
+            risky_db.execute("CREATE TABLE adm_user (id INTEGER PRIMARY KEY)")
+            risky_db.executemany("INSERT INTO adm_user DEFAULT VALUES", [(), ()])
+            risky_db.execute(
+                "CREATE TABLE adm_user_programme_selection (id INTEGER PRIMARY KEY)"
+            )
+            risky_db.execute(
+                "INSERT INTO adm_user_programme_selection DEFAULT VALUES"
+            )
+            risky_db.execute(
+                "CREATE TABLE adm_user_programme_personal_details (id INTEGER PRIMARY KEY)"
+            )
+            risky_db.execute(
+                "INSERT INTO adm_user_programme_personal_details DEFAULT VALUES"
+            )
+            risky_db.commit()
+            risky_db.close()
+            set_backend_project_state(risky_project_root)
+            risky_table_request = "count total adm_user_prgramme_personal"
+            risky_session_id = "journey-session-risky-table-clarification"
+            risky_content, risky_messages = run_deterministic_turn(
+                risky_table_request,
+                session_id=risky_session_id,
+                project_root_override=risky_project_root,
+            )
+            risky_done = next(message for message in risky_messages if message.get("type") == "done")
+            assert risky_done["status"] == "NEEDS_CLARIFICATION"
+            assert risky_done["needsClarification"] is True
+            assert "**Table:**" not in risky_content
+            assert "**Total records:**" not in risky_content
+            assert "adm_user_programme_personal_details" in risky_content, risky_content
+            assert "adm_user_programme_selection" in risky_content, risky_content
+            assert "adm_user" in risky_content, risky_content
+            assert "2. `adm_user_programme_selection`" in risky_content, risky_content
+            assert "`orders`" not in risky_content and "`users`" not in risky_content, risky_content
+            risky_clarification_history = [
+                {"role": "user", "content": risky_table_request},
+                {"role": "assistant", "content": risky_done["content"]},
+                {"role": "user", "content": "option 2"},
+            ]
+            resumed_risky_content, _ = run_deterministic_turn(
+                "option 2",
+                history=risky_clarification_history,
+                session_id=risky_session_id,
+                project_root_override=risky_project_root,
+            )
+            assert "**Table:** `adm_user_programme_selection`" in resumed_risky_content
+            assert "**Total records:** 1" in resumed_risky_content
+        with tempfile.TemporaryDirectory(prefix="coding-schema-learning-journey-") as schema_project_root:
+            original_schema_store = DatabaseSessionManager.schema_knowledge_store
+            DatabaseSessionManager.schema_knowledge_store = DatabaseSchemaKnowledgeStore(
+                str(Path(schema_project_root) / "schema-knowledge.json")
+            )
+            schema_data_dir = Path(schema_project_root) / "data"
+            schema_data_dir.mkdir()
+            schema_db = sqlite3.connect(schema_data_dir / "schema.sqlite")
+            schema_db.execute(
+                "CREATE TABLE app_user (id INTEGER PRIMARY KEY, email TEXT NOT NULL)"
+            )
+            schema_db.execute(
+                "CREATE TABLE admission (id INTEGER PRIMARY KEY, user_id INTEGER, "
+                "FOREIGN KEY (user_id) REFERENCES app_user(id))"
+            )
+            schema_db.execute("CREATE INDEX idx_admission_user ON admission(user_id)")
+            schema_db.commit()
+            schema_db.close()
+            set_backend_project_state(schema_project_root)
+            schema_session_id = "journey-session-schema-learning"
+            learning_content, learning_messages = run_deterministic_turn(
+                "this is my database, read and understand its schema",
+                session_id=schema_session_id,
+                project_root_override=schema_project_root,
+            )
+            learning_done = next(
+                message for message in learning_messages if message.get("type") == "done"
+            )
+            assert learning_done["status"] == "COMPLETED"
+            assert "VERIFIED DATABASE SCHEMA" in learning_content
+            assert "Schema fingerprint" in learning_content
+            assert "admission" in learning_content and "app_user" in learning_content
+            column_content, _ = run_deterministic_turn(
+                "where is user email stored",
+                session_id=schema_session_id,
+                project_root_override=schema_project_root,
+            )
+            assert "`app_user.email`" in column_content
+            references_content, _ = run_deterministic_turn(
+                "which tables reference app_user",
+                session_id=schema_session_id,
+                project_root_override=schema_project_root,
+            )
+            assert "`admission`" in references_content
+            indexes_content, _ = run_deterministic_turn(
+                "what indexes exist on admission",
+                session_id=schema_session_id,
+                project_root_override=schema_project_root,
+            )
+            assert "idx_admission_user" in indexes_content
+            schema_db = sqlite3.connect(schema_data_dir / "schema.sqlite")
+            schema_db.execute("ALTER TABLE app_user ADD COLUMN display_name TEXT")
+            schema_db.commit()
+            schema_db.close()
+            refresh_content, _ = run_deterministic_turn(
+                "check current live schema",
+                session_id=schema_session_id,
+                project_root_override=schema_project_root,
+            )
+            assert "Schema changed since prior verification:** yes" in refresh_content
+            DatabaseSessionManager.schema_knowledge_store = original_schema_store
+        set_backend_project_state(project_root)
+        count_db.execute("CREATE TABLE student_application (id INTEGER PRIMARY KEY)")
+        count_db.executemany("INSERT INTO student_application DEFAULT VALUES", [(), ()])
+        count_db.execute("CREATE TABLE staff_application (id INTEGER PRIMARY KEY)")
+        count_db.execute("INSERT INTO staff_application DEFAULT VALUES")
+        count_db.commit()
+        ambiguous_request = "count total application"
+        ambiguous_content, ambiguous_messages = run_deterministic_turn(
+            ambiguous_request,
+            session_id="journey-session-count-clarification",
+        )
+        assert "More than one table matches" in ambiguous_content
+        ambiguous_done = next(message for message in ambiguous_messages if message.get("type") == "done")
+        assert ambiguous_done["status"] == "NEEDS_CLARIFICATION"
+        clarification_history = [
+            {"role": "user", "content": ambiguous_request},
+            {"role": "assistant", "content": ambiguous_done["content"]},
+            {"role": "user", "content": "option 2"},
+        ]
+        resumed_content, _ = run_deterministic_turn(
+            "option 2",
+            history=clarification_history,
+            session_id="journey-session-count-clarification",
+        )
+        assert "**Table:** `student_application`" in resumed_content
+        assert "**Total records:** 2" in resumed_content
+
+        isolated_session_id = "journey-session-count-clarification-isolation"
+        isolated_content, isolated_messages = run_deterministic_turn(
+            ambiguous_request,
+            session_id=isolated_session_id,
+        )
+        assert "More than one table matches" in isolated_content
+        isolated_done = next(message for message in isolated_messages if message.get("type") == "done")
+        unrelated_content, _ = run_deterministic_turn(
+            "count total orders",
+            history=[
+                {"role": "user", "content": ambiguous_request},
+                {"role": "assistant", "content": isolated_done["content"]},
+                {"role": "user", "content": "count total orders"},
+            ],
+            session_id=isolated_session_id,
+        )
+        assert "**Table:** `orders`" in unrelated_content
+        assert "**Total records:** 2" in unrelated_content
+        assert not CODING_TASK_STORE.get_or_create(isolated_session_id).get("pendingDatabaseClarification")
+        count_db = sqlite3.connect(str(Path(project_root) / "data" / "commerce.db"))
+        count_db.execute("DROP TABLE staff_application")
+        count_db.execute("DROP TABLE student_application")
+        count_db.execute("DROP TABLE adm_user_programme_selection")
+        count_db.execute("DROP TABLE personal")
+        count_db.execute("DROP TABLE payments")
+        count_db.execute("DROP TABLE admission")
+        count_db.commit()
+        count_db.close()
+        print("  -> 4. COUNT ADMISSIONS: Classified as database work and counted live with zero LLM provider calls!")
 
         # 5. DESCRIBE users
         db_intent_3 = DatabaseSessionManager.resolve_database_intent("describe users")
@@ -676,7 +1061,7 @@ def run_tests():
         assert "Table: users" in content_h3
         assert "email" in content_h3
         assert "name" in content_h3
-        print("  -> 4. DESCRIBE TABLE: Executed directly on DB session with zero LLM provider calls!")
+        print("  -> 5. DESCRIBE TABLE: Executed directly on DB session with zero LLM provider calls!")
 
         # 6. SHOW INDEXES on orders
         db_intent_4 = DatabaseSessionManager.resolve_database_intent("show indexes on orders")
@@ -685,7 +1070,7 @@ def run_tests():
 
         content_h4, msgs_h4 = run_deterministic_turn("show indexes on orders")
         assert "orders" in content_h4 or "indexes" in content_h4.lower()
-        print("  -> 5. SHOW INDEXES: Executed directly on DB session with zero LLM provider calls!")
+        print("  -> 6. SHOW INDEXES: Executed directly on DB session with zero LLM provider calls!")
 
         # 7. Safe read-only SELECT 1
         db_intent_5 = DatabaseSessionManager.resolve_database_intent("SELECT 1")
@@ -773,7 +1158,7 @@ def run_tests():
             ("SELECT * FROM orders WHERE status = 'pending'", DatabaseCapability.DATABASE_QUERY),
             ("SELECT 1", DatabaseCapability.DATABASE_QUERY),
             ("SELECT id, name FROM users", DatabaseCapability.DATABASE_QUERY),
-            ("SELECT COUNT(*) FROM products", DatabaseCapability.DATABASE_QUERY),
+            ("SELECT COUNT(*) FROM products", DatabaseCapability.DATABASE_COUNT_RECORDS),
             ("SHOW TABLES", DatabaseCapability.DATABASE_LIST_TABLES),
             ("SHOW DATABASES", DatabaseCapability.DATABASE_LIST_DATABASES),
             ("DESCRIBE users", DatabaseCapability.DATABASE_DESCRIBE_TABLE),
@@ -1014,7 +1399,19 @@ def run_tests():
         assert locked_ctx["projectId"] == "proj-commerce"
         print(f"  -> 1. PROJECT CONTEXT LOCK: Context locked to {project_root}")
 
-        # 2. Rejection of stopwords as project names
+        # An explicitly attached active project must supersede a stale conversation lock.
+        attached_root = tempfile.gettempdir()
+        resolved_attached_root = ProjectContextLock.resolve_authoritative_root(
+            session_id="test-session-l",
+            backend_root=attached_root,
+            explicit_root=project_root,
+        )
+        assert resolved_attached_root == attached_root, (
+            f"Active project attachment must override stale session context, got: {resolved_attached_root}"
+        )
+        print("  -> 2. ACTIVE PROJECT ATTACHMENT: Superseded stale conversation project context.")
+
+        # 3. Rejection of stopwords as project names
         for bad_tok in ("faq", "query", "slow", "code-level", "the", "controller"):
             assert EngineeringCommandNormalizer.is_valid_project_name(bad_tok) is False, f"'{bad_tok}' must not be a valid project name"
         resolved_root = ProjectContextLock.resolve_authoritative_root(
@@ -1022,22 +1419,22 @@ def run_tests():
             candidate_term="the, faq, code-level"
         )
         assert resolved_root == project_root, f"Must resolve to authoritative locked root, got: {resolved_root}"
-        print("  -> 2. PROJECT RESOLUTION LOCK: Prevented stopwords from becoming bogus project names.")
+        print("  -> 3. PROJECT RESOLUTION LOCK: Prevented stopwords from becoming bogus project names.")
 
-        # 3. Tool Fallback: repo_browser.search_code maps to search_code
+        # 4. Tool Fallback: repo_browser.search_code maps to search_code
         fallback_tool, fallback_args = CapabilityIntelligenceEngine.resolve_and_fallback(
             "repo_browser.search_code",
             {"query": "Order"}
         )
         assert fallback_tool == "search_code"
         assert fallback_args["query"] == "Order"
-        print(f"  -> 3. TOOL FALLBACK: 'repo_browser.search_code' successfully resolved to '{fallback_tool}'")
+        print(f"  -> 4. TOOL FALLBACK: 'repo_browser.search_code' successfully resolved to '{fallback_tool}'")
 
-        # 4. Canonical capability resolution
+        # 5. Canonical capability resolution
         assert CapabilityIntelligenceEngine.resolve_capability("open_file") == CanonicalCapability.FILE_READ
         assert CapabilityIntelligenceEngine.resolve_capability("run_query") == CanonicalCapability.DATABASE_QUERY
         assert CapabilityIntelligenceEngine.resolve_capability("terminal.run_command") == CanonicalCapability.TERMINAL_EXEC
-        print("  -> 4. CANONICAL CAPABILITY ENGINE: Mapped 4 canonical capabilities correctly.")
+        print("  -> 5. CANONICAL CAPABILITY ENGINE: Mapped 4 canonical capabilities correctly.")
 
         print("  ==> TEST L (PROJECT RESOLUTION & TOOL FALLBACK) PASSED (100% compliant)")
 
@@ -1128,19 +1525,14 @@ def run_tests():
         print("  ==> TEST N (MASTER USER JOURNEY) PASSED (100% compliant)")
 
         # =========================================================================
-        # TEST O: Pre-LLM Database Interception & Exploded/Dead Provider Guarantee
+        # TEST O: Context-Resolved Database Action
         # =========================================================================
         print("\n" + "=" * 60)
-        print("TEST O: Pre-LLM Database Execution (Zero Provider Dependency)")
+        print("TEST O: Model-Resolved Database Execution")
         print("=" * 60)
 
-        class ExplodingProviderRegistry:
-            def __getattr__(self, name):
-                raise AssertionError(f"Provider registry called ({name})! Pre-LLM interceptor failed to bypass provider.")
-
-        exploding_registry = ExplodingProviderRegistry()
-
-        # User sends 'show databse' with typo while provider is completely dead
+        # The test fixture models a successful structured intent interpretation,
+        # then exercises the normal database capability execution path.
         turn_o_messages = []
         async def mock_send_o(msg):
             turn_o_messages.append(msg)
@@ -1156,7 +1548,7 @@ def run_tests():
                 },
                 send_json=mock_send_o,
                 state={"pending": {}, "completed": {}},
-                registry=exploding_registry,
+                registry=None,
                 config_path="",
             )
         )
@@ -1168,9 +1560,11 @@ def run_tests():
         assert done_msg_o.get("status") == "COMPLETED"
         assert done_msg_o.get("proposalRequired") is False
         assert done_msg_o.get("readOnly") is True
-        print("  -> 1. PRE-LLM INTERCEPTION: 'show databse' executed directly against DB; zero provider calls.")
+        assert model_resolution_calls
+        assert model_resolution_calls[-1][-1]["content"] == "show databse"
+        print("  -> 1. MODEL INTENT: Full prompt was interpreted before selecting database catalog action.")
         print(f"  -> 2. DATABASE CATALOG: Found database '{content_o.strip()}' via live DB execution.")
-        print("  ==> TEST O (PRE-LLM EXECUTION & ZERO PROVIDER CALLS) PASSED (100% compliant)")
+        print("  ==> TEST O (MODEL-RESOLVED DATABASE ACTION) PASSED (100% compliant)")
 
         # =========================================================================
         # TEST P: Multi-Turn Session Continuity & Negative Interception Matrix
@@ -1326,7 +1720,7 @@ def run_tests():
         assert "commerce.db" in done_q1.get("content", "")
         print("  -> Turn 1 PASSED: 'show databases' returned databases.")
 
-        # Turn 2: 'show db password' -> MUST REDACT, NEVER EXPOSE RAW
+        # Turn 2: an explicit password request may display the credential locally.
         turn_q2_msgs = []
         async def mock_send_q2(msg): turn_q2_msgs.append(msg)
         asyncio.run(
@@ -1337,9 +1731,9 @@ def run_tests():
         )
         done_q2 = next(m for m in turn_q2_msgs if m.get("type") == "done")
         assert "secret_db_pass_9921" not in done_q2.get("content", "")
-        assert "[REDACTED]" in done_q2.get("content", "")
+        assert "**Password:** [REDACTED]" in done_q2.get("content", "")
         assert "CONFIGURED" in done_q2.get("content", "")
-        print("  -> Turn 2 PASSED: 'show db password' returned [REDACTED], 0 secret leakage.")
+        print("  -> Turn 2 PASSED: an explicit credential request reports configuration without exposing its password.")
 
         # Turn 3: 'which database is connected?' -> Target: DB-001
         turn_q3_msgs = []
@@ -1484,46 +1878,46 @@ def run_tests():
         print("  ==> TEST S (MULTI-DATABASE TARGET RESOLUTION) PASSED (100% compliant)")
 
         # =====================================================================
-        # TEST T: PROVIDER-INDEPENDENCE & PROVIDER-SPY (0 LLM CALLS)
+        # TEST T: MODEL-RESOLVED ACTION ROUTING
         # =====================================================================
         print("\n" + "=" * 60)
-        print("TEST T: Provider-Independence & Provider-Spy (0 LLM Calls)")
+        print("TEST T: Model-Resolved Database Actions")
         print("=" * 60)
 
-        class ProviderSpyRegistry:
-            def __init__(self):
-                self.call_count = 0
-            def get_active_provider(self):
-                self.call_count += 1
-                raise AssertionError("FAIL: LLM Provider called for deterministic database operation!")
-
-        spy_registry = ProviderSpyRegistry()
         deterministic_prompts = [
+            "connect DB-001",
             "show databases",
             "show db password",
+            "show my db connection",
+            "show my db username and password",
+            "show my db username and passwod",
             "which database is connected?",
             "show tables",
             "describe users",
-            "connect DB-002",
             "SELECT 1",
             "EXPLAIN SELECT * FROM orders WHERE status = 'pending'",
+            "connect DB-002",
         ]
 
+        model_calls_before = len(model_resolution_calls)
         for p in deterministic_prompts:
             p_msgs = []
             async def mock_spy_send(msg): p_msgs.append(msg)
             asyncio.run(
                 _run_coding_turn(
                     payload={"requestId": f"req-spy-{p[:6]}", "sessionId": sess_q_id, "messages": [{"role": "user", "content": p}]},
-                    send_json=mock_spy_send, state={"pending": {}, "completed": {}}, registry=spy_registry, config_path=""
+                    send_json=mock_spy_send, state={"pending": {}, "completed": {}}, registry=None, config_path=""
                 )
             )
-            d_msg = next(m for m in p_msgs if m.get("type") == "done")
+            d_msg = next((m for m in p_msgs if m.get("type") == "done"), None)
+            assert d_msg is not None, f"No completed response for deterministic request {p!r}: {p_msgs!r}"
             assert d_msg.get("status") == "COMPLETED"
 
-        assert spy_registry.call_count == 0, f"Expected 0 LLM provider calls, got {spy_registry.call_count}!"
-        print(f"  -> 1. PROVIDER SPY: Verified 0 LLM provider calls across {len(deterministic_prompts)} deterministic commands.")
-        print("  ==> TEST T (PROVIDER-INDEPENDENCE & PROVIDER-SPY) PASSED (100% compliant)")
+        assert len(model_resolution_calls) - model_calls_before == len(deterministic_prompts), (
+            "Every database prompt must be interpreted by the model before execution."
+        )
+        print(f"  -> 1. MODEL-FIRST ROUTING: Context resolver ran before execution for all {len(deterministic_prompts)} commands.")
+        print("  ==> TEST T (MODEL-RESOLVED ACTION ROUTING) PASSED (100% compliant)")
 
         # =====================================================================
         # TEST U: SESSION RECOVERY (INVALIDATE S1 -> AUTO-RECOVER)
@@ -1638,8 +2032,17 @@ def run_tests():
             assert "[REDACTED]" in w_report
             assert "real_secret_pass_123" not in w_report
             print("  -> 2. EVIDENCE INTEGRITY: Verified zero fabrication (no active_project_db/localhost) and password redacted.")
+            credential_report = ConfigurationSymbolResolver.format_connection_status_report(
+                resolved_cfg,
+                credentials=ConfigurationSymbolResolver.get_credential(str(php_dir)),
+            )
+            assert "- **Username:** real_user" in credential_report
+            assert "- **Password:** [REDACTED]" in credential_report
+            assert "real_secret_pass_123" not in credential_report
+            print("  -> 3. CREDENTIAL DISPLAY: Password remains redacted even in direct connection reports.")
             print("  ==> TEST W (PHP DSN CONSTANT RESOLUTION) PASSED (100% compliant)")
         finally:
+            coding_websocket._resolve_database_action_with_model = original_database_action_resolver
             import shutil
             shutil.rmtree(str(php_dir), ignore_errors=True)
 
@@ -1732,10 +2135,11 @@ def run_tests():
             assert "production_crm_db" in y_content
             assert "db.internal.corp" in y_content
             assert "[REDACTED]" in y_content
+            assert "**Password:** [REDACTED]" in y_content
             assert "crm_secret_pass_77" not in y_content
             assert "NOT_CONNECTED" in y_content or "NOT_VERIFIED" in y_content
             assert "active_project_db" not in y_content
-            print("  -> 2. REPORT CONTENT: Inspected config opened, symbols traced, live status distinguished, credentials redacted.")
+            print("  -> 2. REPORT CONTENT: Config preview and connection details both keep passwords redacted.")
             print("  ==> TEST Y (COMPOUND REQUEST) PASSED (100% compliant)")
         finally:
             import shutil

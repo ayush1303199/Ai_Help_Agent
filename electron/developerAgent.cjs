@@ -11,6 +11,7 @@ const { verificationOrchestrator } = require('./coding-pipeline/verificationOrch
 const { skillSystem } = require('./coding-pipeline/skillSystem.cjs');
 const { mcpToolAdapter } = require('./coding-pipeline/mcpAdapter.cjs');
 const { routeTaskMode, OPERATING_MODES, MODE_SPECIFICATIONS, COMPLEXITY_LEVELS } = require('./coding-pipeline/modes.cjs');
+const { classifyDatabaseRequestIntent, discoverDatabaseConfig } = require('./databaseDiscovery.cjs');
 const { dirtyWorktreeProtector } = require('./coding-pipeline/dirtyWorktree.cjs');
 const {
   correctnessOracle,
@@ -193,6 +194,63 @@ function beginConversationTurn({ root, scope = '.', request, sessionId, ownerWeb
   conversationTurns.set(turn.turnId, turn);
   recordMutation(turn, 'conversation_turn_started', { scope });
   return { turnId: turn.turnId, state: turn.state, sessionId: turn.sessionId };
+}
+async function inspectDatabaseRequest({ root, request, contextMessages = [], sessionId, ownerWebContentsId }) {
+  const intents = classifyDatabaseRequestIntent(request, contextMessages);
+  const localConfigurationRequest = intents.includes('DATABASE_CONFIGURATION')
+    && !intents.includes('DATABASE_CURRENT_TARGET');
+  const credentialStatusRequest = intents.includes('DATABASE_CREDENTIAL_REQUEST');
+  if (!localConfigurationRequest && !credentialStatusRequest) {
+    return { ok: true, handled: false, intents, data: null, error: null };
+  }
+  if (!root || !sessionId || ownerWebContentsId === undefined || sessions.get(ownerWebContentsId) !== sessionId) {
+    return {
+      ok: false,
+      handled: true,
+      intents,
+      data: null,
+      error: { code: 'DEVELOPER_OWNERSHIP_REQUIRED', message: 'An owned, attached Developer project session is required.' },
+    };
+  }
+  const owner = { sessionId, ownerWebContentsId };
+  const turn = beginConversationTurn({ root, request, ...owner });
+  try {
+    advanceConversationTurn(turn.turnId, 'understanding', owner, { phase: 'database_configuration' });
+    const requestedFile = request.match(/(?:^|[\s"'`])((?:[\w.-]+[\\/])*[\w.-]+\.php)\b/i)?.[1] || null;
+    const data = await discoverDatabaseConfig(root, requestedFile, ownerWebContentsId);
+    if (credentialStatusRequest) {
+      const configuration = data.configuration || {};
+      data.report = [
+        '## Database credential status (source configuration)',
+        '',
+        `**Username:** ${configuration.username || 'NOT_RESOLVED'}`,
+        `**Password:** ${configuration.password ? '[REDACTED]' : 'NOT_CONFIGURED'}`,
+        `**Credential source:** ${data.configFile?.path || 'NOT_FOUND'}`,
+        `**Live database:** ${data.live?.status || 'NOT_VERIFIED'}`,
+        '**Note:** This reports configured values only; live runtime identity was not verified.',
+      ].join('\n');
+    }
+    recordConversationFindings(turn.turnId, [{
+      kind: 'database_configuration',
+      requestedFile: data.requestedFile,
+      configFile: data.configFile,
+      status: data.status,
+      liveStatus: data.live.status,
+      credentialStatus: credentialStatusRequest ? 'REDACTED' : undefined,
+    }], owner);
+    advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'database_configuration', fileCount: data.configFile ? 1 : 0 });
+    return { ok: true, handled: true, intents, turnId: turn.turnId, data, error: null };
+  } catch (error) {
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'database_configuration' });
+    return {
+      ok: false,
+      handled: true,
+      intents,
+      turnId: turn.turnId,
+      data: null,
+      error: { code: 'DATABASE_DISCOVERY_FAILED', message: bounded(error?.message || error, 500) },
+    };
+  }
 }
 function recordConversationFindings(turnId, findings, owner) {
   const turn = conversationTurns.get(turnId);
@@ -1357,7 +1415,7 @@ function resetForTest() {
 }
 
 module.exports = {
-  STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, beginConversationTurn, advanceConversationTurn, recordConversationFindings, getConversationTurn, createProposal, approve, reject, apply, undo,
+  STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, beginConversationTurn, inspectDatabaseRequest, advanceConversationTurn, recordConversationFindings, getConversationTurn, createProposal, approve, reject, apply, undo,
   getTask: (id, owner) => publicTask(getTask(id, owner)), getTaskForTest, normalizeCommandResult,
   classifyFailure, classifyFailureCategory, commandPolicy, selectVerificationChecks, extractFailure, normalizeObservation,
   diagnoseObservation, executeVerificationLoop, runVerificationChecks, runEngineeringLoop, isCancellationRequested,

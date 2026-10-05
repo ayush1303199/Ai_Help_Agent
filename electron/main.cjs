@@ -983,6 +983,22 @@ app.whenReady().then(async () => {
     });
     return { ...turn, projectRoot: root, scope };
   });
+  ipcMain.handle('developer:database-inspect', async (event, payload) => {
+    const owner = ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
+    return developerAgent.inspectDatabaseRequest({
+      root,
+      request: payload?.request,
+      contextMessages: Array.isArray(payload?.contextMessages)
+        ? payload.contextMessages
+          .filter((message) => message && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string')
+          .slice(-8)
+          .map((message) => ({ role: message.role, content: message.content.slice(-2000) }))
+        : [],
+      ...owner,
+    });
+  });
   ipcMain.handle('developer:conversation-update', (event, payload) => {
     const owner = ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
@@ -1126,33 +1142,26 @@ app.whenReady().then(async () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: 'execute_sql', arguments: { sql: rawSql }, scope }),
         });
-        if (res.ok) {
-          const body = await res.json();
-          if (body && body.data) {
-            return {
-              ok: true,
-              tool: rawToolName || 'execute_sql',
-              data: body.data,
-            };
-          }
+        const body = await res.json().catch(() => null);
+        if (res.ok && body?.ok === true && body.data) {
+          return {
+            ok: true,
+            tool: rawToolName || 'execute_sql',
+            data: body.data,
+          };
         }
+        return {
+          ok: false,
+          tool: rawToolName || 'execute_sql',
+          error: body?.error?.message || body?.error || `Database query backend returned HTTP ${res.status}.`,
+        };
       } catch {
-        // Fallback to local stub if backend unreachable
+        return {
+          ok: false,
+          tool: rawToolName || 'execute_sql',
+          error: 'Database query backend is unavailable; no query was executed.',
+        };
       }
-      return {
-        ok: true,
-        tool: rawToolName || 'execute_sql',
-        data: {
-          query: rawSql,
-          executed: true,
-          status: 'SUCCESS',
-          timingMs: 1.2,
-          rows: /\bEXPLAIN\b/i.test(rawSql)
-            ? [{ id: 1, select_type: 'SIMPLE', table: 'target_table', type: 'ALL', rows: 100, Extra: 'Using where' }]
-            : [{ '1': 1 }],
-          mode: 'READ_ONLY',
-        },
-      };
     }
     if (name === 'run_verification' || name === 'terminal.run_command') {
       const script = String(args.command || args.script || args.check || '');

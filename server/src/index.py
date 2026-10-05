@@ -55,6 +55,9 @@ from coding_intelligence import (
     UNIVERSAL_EVENT_STREAM,
     SecretProtector,
     PolicyGate,
+    DatabaseCapability,
+    DatabaseIntelligenceEngine,
+    DatabaseSessionManager,
 )
 from provider_service import (
     get_active_provider_with_api_key as resolve_active_provider,
@@ -1427,9 +1430,27 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
             raw_sql = str(args.get("sql") or args.get("query") or args.get("command") or "SELECT 1").strip()
             st = get_backend_project_state()
             root_str = st.get("projectRoot") or ""
-            res = UNIVERSAL_DB_ENGINE.execute_safe_query(root_str, raw_sql)
-            if not res.get("ok", True):
-                return {"ok": False, "error": res.get("error")}
+            if not st.get("attached") or not root_str:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "PROJECT_NOT_ATTACHED",
+                        "message": "Attach a project before querying its database.",
+                    },
+                }
+            db_config = DatabaseIntelligenceEngine.discover_database_configuration(root_str)
+            db_session = DatabaseSessionManager.get_or_create_session(
+                root_str,
+                db_config=db_config,
+            )
+            res = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_QUERY,
+                {"sql": raw_sql},
+                db_session,
+                root_str,
+            )
+            if not res.get("ok"):
+                return {"ok": False, "error": res.get("error") or {"code": "DATABASE_QUERY_FAILED", "message": res.get("content") or "The database query failed."}}
             return {"ok": True, "data": SecretProtector.redact_data(res)}
         elif canonical == "run_verification":
             cmd = str(args.get("command") or args.get("script") or args.get("check") or "").strip()

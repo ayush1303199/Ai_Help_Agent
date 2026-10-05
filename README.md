@@ -65,6 +65,13 @@ run with output limits and environment redaction. Change proposals use content
 snapshots so a proposal cannot silently overwrite a file that changed after it
 was reviewed.
 
+Database inspection supports read-only health checks, schema browsing, and
+queries for MySQL, PostgreSQL/Supabase, MongoDB, SQLite, and Java H2 databases.
+H2 support uses the project's H2 JDBC driver JAR (or `H2_JAR`) and works with
+file-based databases and H2 TCP servers. H2 in-memory databases are scoped to
+the Java application's JVM and cannot be inspected from the separate agent
+process.
+
 General Agent tasks use explicit phases such as planning, researching,
 preparing, waiting for login, waiting for confirmation, executing, verifying,
 recovering, completed, blocked, failed, and cancelled. Read-only research can

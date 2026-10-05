@@ -506,6 +506,36 @@ export function useCodingAgentController({
       }
     }
 
+    if (window.electronAPI?.inspectDeveloperDatabase) {
+      setBusy(true);
+      try {
+        const contextMessages = messages
+          .filter((message) => !message.streaming)
+          .slice(-8)
+          .map((message) => ({ role: message.role, content: message.content }));
+        const inspection = await window.electronAPI.inspectDeveloperDatabase(question, contextMessages);
+        if (inspection.handled) {
+          const content = inspection.ok && inspection.data
+            ? inspection.data.report
+            : `Database configuration inspection failed: ${inspection.error?.message || 'No safe result was returned.'}`;
+          setMessages((previous) => [...previous, { role: 'user', content: question }, { role: 'assistant', content }]);
+          setInput('');
+          if (inspection.ok) onStatus(
+            inspection.intents.includes('DATABASE_CREDENTIAL_REQUEST')
+              ? 'Database credential status was read from project source; the password remains redacted and live identity was not verified.'
+              : 'Database configuration was read from project source; live runtime identity was not verified.',
+          );
+          else onError(inspection.error?.message || 'Database configuration inspection failed.');
+          return;
+        }
+      } catch (error) {
+        onError(error instanceof Error ? error.message : String(error));
+        return;
+      } finally {
+        setBusy(false);
+      }
+    }
+
     const detectedPreference = extractCodingPreference(question);
     if (detectedPreference) {
       setPreferences((previous) => upsertCodingPreference(previous, detectedPreference));
@@ -1109,6 +1139,20 @@ export function useCodingAgentController({
     setPath('.');
   };
 
+  const deleteConversation = (targetId: string) => {
+    setConversationStates((previous) => previous.filter((session) => session.id !== targetId));
+    if (targetId !== conversationId) return;
+    setMessages([]);
+    setInput('');
+    setActivity([]);
+    setProjectCandidates([]);
+    setProposal(null);
+    setAppliedPatchLog([]);
+    setLastProvider(null);
+    setPath('.');
+    setConversationId(crypto.randomUUID());
+  };
+
   const restoreHistory = (session: {
     id: string;
     messages: CodingMessage[];
@@ -1198,6 +1242,8 @@ export function useCodingAgentController({
       onApproveProposal: () => void approveProposal(), onRejectProposal: () => void rejectProposal(),
       onApplyProposal: () => void applyProposal(), onUndoProposal: () => void undoProposal(),
       onSendMessage: () => void sendMessage(), onClearMessages: clearMessages,
+      conversations: conversationStates, activeConversationId: conversationId,
+      onRestoreConversation: restoreHistory, onDeleteConversation: deleteConversation,
       codingPreferences: preferences, onToggleCodingPreference: togglePreference,
       onResetCodingPreferences: clearPreferences,
     },

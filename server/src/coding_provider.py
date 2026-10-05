@@ -1,6 +1,7 @@
 """Provider adapter owned exclusively by the Coding Agent pipeline."""
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,7 @@ from provider_model_contract import (
 )
 from provider_service import get_api_key as resolve_api_key
 from backend_config import CODING_COMPLETION_TOKENS, MODEL_REQUEST_TIMEOUT_SECONDS
+from coding_intelligence import SecretTransformer
 
 
 OPENAI_COMPATIBLE = {
@@ -21,6 +23,88 @@ OPENAI_COMPATIBLE = {
     "custom-openai",
 }
 CODING_MAX_COMPLETION_TOKENS = CODING_COMPLETION_TOKENS
+_logger = logging.getLogger(__name__)
+
+
+class ModelOutputValidationError(RuntimeError):
+    def __init__(self, message: str, diagnostic: Dict[str, Any]):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+def normalize_model_output(
+    message: Any,
+    *,
+    provider: str,
+    model: str,
+    request_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate provider output before it reaches the Coding tool router."""
+    failure = None
+    normalized: Dict[str, Any] = {}
+    if not isinstance(message, dict):
+        failure = "response message must be an object"
+    else:
+        role = message.get("role") or "assistant"
+        if role != "assistant":
+            failure = "response role must be assistant"
+        else:
+            content = _text(message.get("content") or message.get("output_text") or message.get("text"))
+            raw_calls = message.get("tool_calls") or []
+            if not isinstance(raw_calls, list):
+                failure = "tool_calls must be an array"
+            else:
+                calls = []
+                for index, call in enumerate(raw_calls):
+                    function = call.get("function") if isinstance(call, dict) else None
+                    name = function.get("name") if isinstance(function, dict) else None
+                    arguments = function.get("arguments") if isinstance(function, dict) else None
+                    if not isinstance(name, str) or not name.strip():
+                        failure = f"tool call {index} has no valid function name"
+                        break
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            failure = f"tool call {index} arguments are malformed JSON"
+                            break
+                    if arguments is None:
+                        arguments = {}
+                    if not isinstance(arguments, dict):
+                        failure = f"tool call {index} arguments must be an object"
+                        break
+                    calls.append({
+                        "id": str(call.get("id") or f"normalized-tool-{index + 1}"),
+                        "type": "function",
+                        "function": {"name": name.strip(), "arguments": json.dumps(arguments, ensure_ascii=False)},
+                    })
+                if failure is None and not content and not calls:
+                    failure = "response contains neither non-empty text nor a valid tool call"
+                if failure is None:
+                    normalized = {
+                        "role": "assistant",
+                        "content": content or None,
+                        **({"tool_calls": calls} if calls else {}),
+                    }
+
+    if failure is not None:
+        diagnostic = {
+            "provider": str(provider or "unknown")[:80],
+            "model": str(model or "unknown")[:160],
+            "requestId": str(request_id)[:128] if request_id else None,
+            "sessionId": str(session_id)[:128] if session_id else None,
+            "outputType": type(message).__name__,
+            "validationFailure": failure,
+            "toolName": _first_tool_name(message),
+        }
+        _logger.error("CODING_MODEL_OUTPUT_REJECTED %s", json.dumps(diagnostic, ensure_ascii=True))
+        raise ModelOutputValidationError(
+            "The model response could not be interpreted as a valid Coding Agent action. "
+            "The response was rejected before tool execution.",
+            diagnostic,
+        )
+    return normalized
 
 
 def _api_key(registry: Any, provider: Any, config_path: Path) -> str:
@@ -68,7 +152,20 @@ def _text(content: Any) -> str:
     return ""
 
 
-def _normalize(message: Dict[str, Any]) -> Dict[str, Any]:
+def _first_tool_name(message: Any) -> Optional[str]:
+    if not isinstance(message, dict):
+        return None
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list) or not calls or not isinstance(calls[0], dict):
+        return None
+    function = calls[0].get("function")
+    name = function.get("name") if isinstance(function, dict) else None
+    return str(name)[:120] if name is not None else None
+
+
+def _normalize(message: Any) -> Any:
+    if not isinstance(message, dict):
+        return message
     if _text(message.get("content")) or message.get("tool_calls"):
         return message
     for field in ("output_text", "text"):
@@ -323,8 +420,11 @@ def complete_coding_model(
     tools: Optional[List[Dict[str, Any]]] = None,
     provider_id: Optional[str] = None,
     require_tool_call: bool = False,
+    request_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> tuple[Dict[str, Any], Any]:
     """Run Coding-only provider selection and response adaptation."""
+    messages = SecretTransformer.sanitize_context_for_llm(messages)
     candidates = _candidates(registry, provider_id)
     if not candidates:
         raise RuntimeError("No provider is configured for the Coding Agent.")
@@ -396,13 +496,19 @@ def complete_coding_model(
                         response = client.chat.completions.create(**request)
                     else:
                         raise
-                raw = response.choices[0].message.model_dump(exclude_none=True) if response.choices else {}
+                choice = response.choices[0] if response and response.choices else None
+                raw = choice.message.model_dump(exclude_none=True) if choice and choice.message else None
                 message = _normalize(raw)
             else:
                 raise RuntimeError(f"No Coding Agent adapter is available for provider '{provider_type}'.")
-            if _text(message.get("content")) or message.get("tool_calls"):
-                return message, provider
-            raise RuntimeError("The Coding Agent provider returned neither text nor a tool call.")
+            message = normalize_model_output(
+                message,
+                provider=provider_type,
+                model=provider.model,
+                request_id=request_id,
+                session_id=session_id,
+            )
+            return message, provider
         except Exception as error:
             errors.append(f"{provider.type}: {str(error)[:240]}")
     raise RuntimeError("Coding Agent provider request failed. " + " | ".join(errors))

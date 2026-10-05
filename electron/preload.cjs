@@ -70,6 +70,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   runDeveloperVerification: (script) => ipcRenderer.invoke('developer:run-verification', script),
   inspectDeveloperGit: (kind) => ipcRenderer.invoke('developer:git-inspect', kind),
   beginDeveloperConversation: (request, scope = '.') => ipcRenderer.invoke('developer:conversation-start', { request, scope }),
+  inspectDeveloperDatabase: (request, contextMessages = []) => ipcRenderer.invoke('developer:database-inspect', { request, contextMessages }),
   advanceDeveloperConversation: (update) => ipcRenderer.invoke('developer:conversation-update', update),
   createDeveloperProposal: (raw, snapshots, verificationScript = null, scope = '.', conversationTurnId = null) => ipcRenderer.invoke('developer:proposal-create', { raw, snapshots, verificationScript, scope, conversationTurnId }),
   approveDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-approve', id),

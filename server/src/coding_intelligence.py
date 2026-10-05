@@ -19,8 +19,11 @@ import json
 import time
 import hashlib
 import hmac
+import threading
+from difflib import SequenceMatcher
 from typing import Dict, List, Any, Optional, Set, Tuple
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 
 # =====================================================================
@@ -81,7 +84,11 @@ class SecretTransformer:
     def transform_secret(cls, secret_value: str, secret_type: str = "db-password") -> str:
         if not secret_value or not isinstance(secret_value, str):
             return "[REDACTED]"
-        digest = hmac.new(cls._runtime_hmac_key, secret_value.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+        digest = hmac.new(
+            cls._runtime_hmac_key,
+            f"{secret_type}\0{secret_value}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
         return f"secret:{secret_type}:{digest}"
 
     @classmethod
@@ -93,7 +100,7 @@ class SecretTransformer:
             out = {}
             for k, v in data.items():
                 k_str = str(k).lower()
-                if any(s in k_str for s in ("password", "passwd", "pwd", "secret", "private_key", "token", "auth")):
+                if any(s in k_str for s in ("password", "passwd", "pwd", "secret", "private_key", "token", "auth", "credential", "username", "db_user", "database_user", "api_key", "access_key", "cookie", "session", "jwt")):
                     out[k] = cls.transform_secret(str(v), secret_type=k_str)
                 elif isinstance(v, (dict, list)):
                     out[k] = cls.sanitize_context_for_llm(v)
@@ -112,13 +119,24 @@ class SecretTransformer:
     def sanitize_text_for_llm(cls, text: str) -> str:
         if not text:
             return ""
+        protected: Dict[str, str] = {}
+
+        def _protect(value: str) -> str:
+            marker = f"COPILOTPROTECTED{os.urandom(12).hex().upper()}X"
+            protected[marker] = value
+            return marker
+
         def _replace_uri(m):
             scheme = m.group(1)
             user = m.group(2)
             pwd = m.group(3)
             rest = m.group(4)
-            tr = cls.transform_secret(pwd, secret_type="db-password")
-            return f"{scheme}://{user}:{tr}@{rest}"
+            safe_uri = (
+                f"{scheme}://"
+                f"{cls.transform_secret(user, secret_type='db-username')}:"
+                f"{cls.transform_secret(pwd, secret_type='db-password')}@{rest}"
+            )
+            return _protect(safe_uri)
 
         res = re.sub(
             r"([a-zA-Z0-9_+]+):\/\/([^:\s]+):([^@\s]+)@([^\s]+)",
@@ -128,18 +146,44 @@ class SecretTransformer:
 
         def _replace_kv(m):
             prefix = m.group(1)
-            pwd = m.group(2)
+            value = m.group(2)
             suffix = m.group(3)
-            tr = cls.transform_secret(pwd, secret_type="password")
-            return f"{prefix}{tr}{suffix}"
+            if re.fullmatch(r"secret:[\w-]+:[a-f0-9]{64}", value, re.I):
+                safe_value = value
+            else:
+                key_match = re.search(r"([a-z0-9_-]+)['\"]?\s*(?:=>|[:=])\s*['\"]?$", prefix, re.I)
+                secret_type = key_match.group(1).lower() if key_match else "credential"
+                safe_value = cls.transform_secret(value, secret_type=secret_type)
+            return _protect(f"{prefix}{safe_value}{suffix}")
 
         res = re.sub(
-            r"(['\"]?(?:api[_-]?key|token|secret|password|passwd|pwd|pass)['\"]?\s*(?:=>|[:=])\s*['\"]?)([^'\"\s,\r\n;]+)(['\"]?)",
+            r"(['\"]?\b(?:[a-z0-9_-]*[_-])?(?:api[_-]?key|access[_-]?key|private[_-]?key|token|secret|password|passwd|pwd|pass|username|db_user|database_user|cookie|session|jwt|auth(?:orization)?|credential)\b['\"]?\s*(?:=>|[:=]|\bis\b)\s*['\"]?)([^'\"\s,\r\n;]+)(['\"]?)",
             _replace_kv,
             res,
             flags=re.I
         )
-        return SecretProtector.redact_text(res)
+        res = re.sub(
+            r"\b(sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,})\b",
+            lambda m: _protect(cls.transform_secret(m.group(1), "api-token")),
+            res,
+            flags=re.I,
+        )
+        res = re.sub(
+            r"\b(Bearer\s+)([A-Za-z0-9._~+/-]{16,})",
+            lambda m: _protect(f"{m.group(1)}{cls.transform_secret(m.group(2), 'bearer-token')}"),
+            res,
+            flags=re.I,
+        )
+        res = re.sub(
+            r"-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----[\s\S]+?-----END\s+(?:RSA\s+)?PRIVATE\s+KEY-----",
+            lambda m: _protect(cls.transform_secret(m.group(0), "private-key")),
+            res,
+            flags=re.I,
+        )
+        res = SecretProtector.redact_text(res)
+        for marker, safe_value in protected.items():
+            res = res.replace(marker, safe_value)
+        return res
 
 
 # =====================================================================
@@ -833,18 +877,18 @@ class ProjectContextLock:
         explicit_root: Optional[str] = None,
         candidate_term: Optional[str] = None,
     ) -> Optional[str]:
-        # 1. Active locked context
+        # The active Coding project attachment must override stale session context.
+        if backend_root and os.path.isdir(backend_root):
+            return backend_root
+
+        # 2. Session-scoped lock
         locked = cls.get_locked_context(session_id)
         if locked and locked.get("rootPath") and os.path.isdir(locked["rootPath"]):
             return locked["rootPath"]
 
-        # 2. Session root
+        # 3. Session root
         if session_root and os.path.isdir(session_root):
             return session_root
-
-        # 3. Backend project state
-        if backend_root and os.path.isdir(backend_root):
-            return backend_root
 
         # 4. Explicit project path
         if explicit_root and os.path.isdir(explicit_root):
@@ -1460,6 +1504,7 @@ class DatabaseCapability:
     DATABASE_LIST_TABLES = "DATABASE_LIST_TABLES"
     DATABASE_LIST_COLUMNS = "DATABASE_LIST_COLUMNS"
     DATABASE_DESCRIBE_TABLE = "DATABASE_DESCRIBE_TABLE"
+    DATABASE_COUNT_RECORDS = "DATABASE_COUNT_RECORDS"
     DATABASE_LIST_INDEXES = "DATABASE_LIST_INDEXES"
     DATABASE_LIST_VIEWS = "DATABASE_LIST_VIEWS"
     DATABASE_LIST_CONSTRAINTS = "DATABASE_LIST_CONSTRAINTS"
@@ -1475,6 +1520,33 @@ class DatabaseCapability:
     DATABASE_SOURCE_TRACE = "DATABASE_SOURCE_TRACE"
     DATABASE_BENCHMARK = "DATABASE_BENCHMARK"
     DATABASE_OPTIMIZATION = "DATABASE_OPTIMIZATION"
+
+
+DATABASE_CREDENTIAL_REQUEST_PATTERN = re.compile(
+    r"\b(?:"
+    r"(?:show|display|tell\s+me|give\s+me)\s+(?:(?:my|the)\s+)?"
+    r"(?:db|database)\s+(?:connection\s+)?"
+    r"(?:user(?:name)?\s+(?:and|&)\s+pass(?:word|wod|wd)|credentials?|pass(?:word|wod|wd))|"
+    r"(?:show|display|tell\s+me|give\s+me)\s+(?:(?:my|the)\s+)?"
+    r"user(?:name)?\s+(?:and|&)\s+pass(?:word|wod|wd)|"
+    r"show\s+(?:passwords?|credentials?)|"
+    r"get\s+(?:the\s+)?(?:db|database)\s+passwords?|"
+    r"what\s+is\s+(?:the\s+)?(?:db|database)\s+passwords?|"
+    r"(?:db|database)\s+(?:passwords?|credentials?)|"
+    r"my\s*db\s+connection\s+(?:user(?:name)?\s+(?:and|&)\s+pass(?:word|wod|wd)|credentials?)\s+(?:kya|kiya)\s+(?:hai|hain)"
+    r")\b",
+    re.I,
+)
+DATABASE_CONNECTION_STATUS_PATTERN = re.compile(
+    r"\b(?:(?:show|display|tell\s+me|what\s+is|which\s+is)\s+"
+    r"(?:(?:my|the)\s+)?(?:db|database)\s+connection(?:\s+(?:status|details?))?|"
+    r"(?:show|display|tell\s+me)\s+(?:me\s+)?(?:(?:my|the)\s+)?"
+    r"(?:db|database)\s+(?:which|what)\s+(?:one\s+)?(?:is\s+)?connected|"
+    r"(?:my|the)\s+(?:db|database)\s+connection(?:\s+(?:status|details?))?|"
+    r"(?:db|database)\s+connection\s+(?:status|details?))\b|"
+    r"^\s*(?:show|display|tell\s+me)\s+my\s+(?:db|database)\s*[.!?]*\s*$",
+    re.I,
+)
 
 
 class DatabaseTarget:
@@ -1570,7 +1642,9 @@ class DatabaseTargetRegistry:
         return targets
 
     @classmethod
-    def get_target(cls, project_root: str, target_id: str) -> Optional[DatabaseTarget]:
+    def get_target(cls, project_root: str, target_id: Optional[str]) -> Optional[DatabaseTarget]:
+        if not target_id:
+            return None
         norm = os.path.normpath(project_root) if project_root else "default"
         t_map = cls._targets_by_project.get(norm, {})
         if target_id in t_map:
@@ -1601,13 +1675,6 @@ class DatabaseTargetRegistry:
             t = cls.get_target(project_root, active_id)
             if t:
                 return t
-        targets = cls.get_targets(project_root)
-        if len(targets) == 1:
-            return targets[0]
-        for norm_key, active_id in cls._active_target_by_project.items():
-            t = cls.get_target(norm_key, active_id)
-            if t:
-                return t
         return None
 
     @classmethod
@@ -1619,12 +1686,12 @@ class DatabaseTargetRegistry:
         sess = session
         if not sess and "DatabaseSessionManager" in globals():
             sess = DatabaseSessionManager.get_session(project_root)
-        t_id = target.target_id if target else getattr(sess, "target_id", "DB-001")
-        engine = target.engine if target else getattr(sess, "database_type", "sqlite")
-        db_name = target.database_name if target else getattr(sess, "database_name", "commerce.db")
-        s_host = target.safe_host if target else getattr(sess, "safe_host", "localhost")
+        t_id = target.target_id if target else getattr(sess, "target_id", None)
+        engine = target.engine if target else getattr(sess, "database_type", None)
+        db_name = target.database_name if target else getattr(sess, "database_name", None)
+        s_host = target.safe_host if target else getattr(sess, "safe_host", None)
         s_port = target.safe_port if target else getattr(sess, "safe_port", None)
-        s_state = getattr(sess, "connection_state", "CONNECTED") if sess else "CONNECTED"
+        s_state = getattr(sess, "connection_state", "NOT_CONNECTED") if sess else "NOT_CONNECTED"
         p_name = Path(project_root).name if project_root else "default"
         return {
             "projectId": p_name,
@@ -1636,9 +1703,9 @@ class DatabaseTargetRegistry:
             "safeHost": s_host,
             "safePort": s_port,
             "connectionState": s_state,
-            "healthState": "HEALTHY" if s_state == "CONNECTED" else "UNHEALTHY",
-            "runtimeVerified": True,
-            "lastVerifiedAt": getattr(sess, "last_touch", time.time()) if sess else time.time(),
+            "healthState": "HEALTHY" if sess and sess.is_connected() else "UNHEALTHY",
+            "runtimeVerified": bool(sess and sess.is_connected() and getattr(sess, "health_proof", None)),
+            "lastVerifiedAt": getattr(getattr(sess, "health_proof", None), "timestamp", None) if sess else None,
         }
 
     @classmethod
@@ -1848,6 +1915,64 @@ class DatabasePerformanceEngine:
         }
 
     @classmethod
+    def _mysql_runtime_query_stats(
+        cls,
+        project_root: str,
+        session: Any,
+        dimension: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        order_by = "AVG_TIMER_WAIT" if any(
+            term in (dimension or "").lower() for term in ("avg", "time", "slow", "latency")
+        ) else "SUM_TIMER_WAIT"
+        query = (
+            "SELECT DIGEST_TEXT AS query_digest, COUNT_STAR AS executions, "
+            "ROUND(SUM_TIMER_WAIT / 1000000000, 3) AS total_time_ms, "
+            "ROUND(AVG_TIMER_WAIT / 1000000000, 3) AS average_time_ms, "
+            "ROUND(MAX_TIMER_WAIT / 1000000000, 3) AS max_time_ms, "
+            "SUM_ROWS_EXAMINED AS rows_examined, SUM_ROWS_SENT AS rows_sent "
+            "FROM performance_schema.events_statements_summary_by_digest "
+            "WHERE SCHEMA_NAME = DATABASE() AND DIGEST_TEXT IS NOT NULL AND COUNT_STAR > 0 "
+            "AND DIGEST_TEXT REGEXP '^(SELECT|WITH)' "
+            "AND DIGEST_TEXT NOT LIKE '%EVENTS_STATEMENTS_SUMMARY_BY_DIGEST%' "
+            f"ORDER BY {order_by} DESC LIMIT 10"
+        )
+        credentials = getattr(session, "_protected_credentials", {}) or {}
+        result = DatabaseIntelligenceEngine.execute_safe_query(
+            project_root,
+            query,
+            {
+                "engine": getattr(session, "database_type", "mysql"),
+                "database": getattr(session, "database_name", None),
+                "host": getattr(session, "safe_host", None),
+                "port": getattr(session, "safe_port", None),
+                "username": credentials.get("username"),
+                "password": credentials.get("password"),
+            },
+        )
+        if not result.get("ok"):
+            return None
+        records = []
+        for row in result.get("rows") or []:
+            digest = str(row.get("query_digest") or "").strip()
+            if not digest:
+                continue
+            records.append({
+                "queryFingerprint": DatabaseQueryFingerprinter.compute_fingerprint(digest),
+                "rawQuery": digest,
+                "normalizedQuery": DatabaseQueryFingerprinter.normalize_sql(digest),
+                "targetId": getattr(session, "target_id", "DB-001"),
+                "executionCount": int(row.get("executions") or 0),
+                "totalTimeMs": float(row.get("total_time_ms") or 0),
+                "averageTimeMs": float(row.get("average_time_ms") or 0),
+                "maxTimeMs": float(row.get("max_time_ms") or 0),
+                "rowsExamined": int(row.get("rows_examined") or 0),
+                "rowsReturned": int(row.get("rows_sent") or 0),
+                "sourceLocation": None,
+                "evidenceSource": DatabaseEvidenceSource.DB_RUNTIME,
+            })
+        return records
+
+    @classmethod
     def autonomous_investigate_expensive_queries(
         cls,
         project_root: str,
@@ -1877,6 +2002,98 @@ class DatabasePerformanceEngine:
         db_type = getattr(sess, "database_type", "sqlite") if sess else "sqlite"
         db_name = getattr(sess, "database_name", "commerce.db") if sess else "commerce.db"
         sq_file = getattr(sess, "sqlite_file", None) if sess else None
+        db_exec_config = {"engine": db_type, "database": db_name, "sqlite_file": sq_file}
+        if sess:
+            db_exec_config.update({
+                "host": getattr(sess, "safe_host", None),
+                "port": getattr(sess, "safe_port", None),
+                **getattr(sess, "_protected_credentials", {}),
+            })
+
+        if sess and db_type in ("mysql", "mariadb"):
+            top_q = cls._mysql_runtime_query_stats(eff_root, sess, intent_detail)
+            if top_q is None:
+                return {
+                    "ok": True,
+                    "content": (
+                        "### DATABASE QUERY PERFORMANCE\n\n"
+                        f"Runtime query statistics are unavailable for `{db_name}`. "
+                        "MySQL Performance Schema could not provide statement summaries, so no query can be "
+                        "ranked by measured runtime. No timing was inferred from source code."
+                    ),
+                    "queries": [],
+                    "candidate": None,
+                    "explain": None,
+                    "classification": None,
+                    "timingMs": None,
+                    "evidenceQuality": "UNVERIFIED",
+                }
+            if not top_q:
+                return {
+                    "ok": True,
+                    "content": (
+                        "### DATABASE QUERY PERFORMANCE\n\n"
+                        f"MySQL Performance Schema returned no SELECT/CTE statement samples for `{db_name}`. "
+                        "No slow query can be identified from the available runtime history."
+                    ),
+                    "queries": [],
+                    "candidate": None,
+                    "explain": None,
+                    "classification": None,
+                    "timingMs": None,
+                    "evidenceQuality": "UNVERIFIED",
+                }
+
+            for query in top_q:
+                query["sourceCandidates"] = QueryToSourceMapper.find_query_source_candidates(
+                    eff_root, query["rawQuery"], limit=5
+                )
+
+            top_sections = [
+                f"#### Query {index} (average: {q['averageTimeMs']:.3f} ms)\n\n"
+                f"```sql\n{q['rawQuery']}\n```\n\n"
+                f"Total: {q['totalTimeMs']:.3f} ms; maximum: {q['maxTimeMs']:.3f} ms; "
+                f"{q['executionCount']} executions; {q['rowsExamined']} rows examined, "
+                f"{q['rowsReturned']} rows sent.\n\n"
+                + (
+                    "Source query call sites found in project code:\n"
+                    + "\n".join(
+                        f"- `{source['sourceFile']}:{source['line']}`"
+                        + (f" in `{source['functionName']}`" if source.get("functionName") else "")
+                        + (
+                            f" — possible repeated-call location (loop near line {source['loopContextLine']}; "
+                            "static evidence only)"
+                            if source.get("loopContextLine") else ""
+                        )
+                        for source in q["sourceCandidates"]
+                    )
+                    if q["sourceCandidates"]
+                    else "No source query call site was confidently matched."
+                )
+                for index, q in enumerate(top_q, 1)
+            ]
+            report = (
+                f"### DIRECT ANSWER: SLOWEST OBSERVED QUERIES IN `{db_name}`\n\n"
+                "Ranked by average execution time from MySQL Performance Schema "
+                "(statement summaries since the server statistics were last reset):\n\n"
+                + "\n\n".join(top_sections)
+                + "\n\nPerformance Schema execution counts are accumulated database-wide since the last reset; "
+                "they are not counts for one academic action or request. Source matches and loop proximity are "
+                "static code evidence, not proof that a particular action executed them or that an N+1 occurred. "
+                "Request-scoped query logging is required to confirm per-action call counts."
+            )
+            return {
+                "ok": True,
+                "content": report,
+                "queries": top_q,
+                "candidate": top_q[0],
+                "mappedSource": top_q[0]["sourceCandidates"][0] if top_q[0]["sourceCandidates"] else None,
+                "explain": None,
+                "classification": None,
+                "timingMs": top_q[0]["averageTimeMs"],
+                "bottleneckClass": None,
+                "evidenceQuality": "VERIFIED_LIVE",
+            }
 
         # Seed or discover queries
         top_q = cls.rank_queries(dimension=intent_detail, limit=5)
@@ -1885,108 +2102,172 @@ class DatabasePerformanceEngine:
             if discovered:
                 target_sql = discovered[0]["query"]
                 meas = DatabaseIntelligenceEngine.execute_query_and_explain(
-                    eff_root, target_sql, {"engine": db_type, "database": db_name, "sqlite_file": sq_file}
+                    eff_root, target_sql, db_exec_config
                 )
-                rec = cls.record_query_execution(
-                    sql=target_sql,
-                    timing_ms=meas.get("timing_ms", 14.2),
-                    rows_returned=meas.get("rows_returned", 1),
-                    target_id=getattr(sess, "target_id", "DB-001"),
-                    source_location=f"{discovered[0].get('file')}:{discovered[0].get('line', 1)}",
-                )
-                top_q = [rec]
+                if isinstance(meas.get("timing_ms"), (int, float)):
+                    rec = cls.record_query_execution(
+                        sql=target_sql,
+                        timing_ms=float(meas["timing_ms"]),
+                        rows_returned=int(meas.get("rows_returned") or 0),
+                        target_id=getattr(sess, "target_id", "DB-001"),
+                        source_location=f"{discovered[0].get('file')}:{discovered[0].get('line', 1)}",
+                    )
+                    top_q = [rec]
 
-        candidate = top_q[0] if top_q else {
-            "rawQuery": "SELECT * FROM orders WHERE status = 'pending'",
-            "normalizedQuery": "SELECT * FROM orders WHERE status = 'pending'",
-            "queryFingerprint": "qf_orders_pending",
-            "totalTimeMs": 14.2,
-            "averageTimeMs": 14.2,
-            "executionCount": 1,
-            "rowsExamined": 1000,
-            "rowsReturned": 1,
-        }
-        cand_sql = candidate.get("rawQuery") or candidate.get("normalizedQuery", "SELECT 1")
+        if not top_q:
+            return {
+                "ok": True,
+                "content": (
+                    "### DATABASE QUERY PERFORMANCE\n\n"
+                    "No runtime query timing is currently available. Static source discovery did not yield "
+                    "a query that could be measured safely, so no slow-query ranking or sample timing is reported."
+                ),
+                "queries": [],
+                "candidate": None,
+                "explain": None,
+                "classification": None,
+                "timingMs": None,
+                "evidenceQuality": "UNVERIFIED",
+            }
+
+        candidate = top_q[0]
+        cand_sql = candidate.get("rawQuery") or candidate.get("normalizedQuery")
+        if not cand_sql:
+            return {
+                "ok": True,
+                "content": (
+                    "### DATABASE QUERY PERFORMANCE\n\n"
+                    "A performance candidate was found, but it contains no SQL text to investigate. "
+                    "No query, plan, timing, or bottleneck was inferred."
+                ),
+                "queries": top_q,
+                "candidate": candidate,
+                "explain": None,
+                "classification": None,
+                "timingMs": None,
+                "evidenceQuality": "UNVERIFIED",
+            }
 
         # Map to source
         mapped_src = QueryToSourceMapper.map_query_to_source(eff_root, cand_sql)
-        src_file = mapped_src.get("sourceFile") or candidate.get("sourceLocation") or "models/Order.php"
-        symbol_name = mapped_src.get("symbol") or "Order::getSlowOrders"
-        call_path = mapped_src.get("callPath") or "OrderController -> Order::getSlowOrders"
+        mapped_src = mapped_src or {}
+        src_file = mapped_src.get("sourceFile") or candidate.get("sourceLocation")
+        symbol_name = mapped_src.get("symbol")
+        call_path = mapped_src.get("callPath")
 
         # Schema & Index inspection
-        target_tbl = mapped_src.get("table") or "orders"
-        schema_res = DatabaseIntelligenceEngine.inspect_database_schema(eff_root, {"engine": db_type, "database": db_name, "sqlite_file": sq_file})
-        tbl_info = (schema_res.get("schema_details") or {}).get(target_tbl, {})
-        existing_indexes = tbl_info.get("indexes", [])
+        target_tbl = mapped_src.get("table")
+        schema_res = DatabaseIntelligenceEngine.inspect_database_schema(eff_root, db_exec_config)
+        tbl_info = (schema_res.get("schema_details") or {}).get(target_tbl, {}) if target_tbl else {}
+        existing_indexes = tbl_info.get("indexes") if target_tbl else None
 
         # Live EXPLAIN
         explain_res = DatabaseIntelligenceEngine.execute_query_and_explain(
-            eff_root, cand_sql, {"engine": db_type, "database": db_name, "sqlite_file": sq_file}
-        )
-        plan_output = explain_res.get("plan", "SCAN TABLE orders")
-        index_used = explain_res.get("index_used", "None")
-        access_type = explain_res.get("access_type", "ALL")
+            eff_root, cand_sql, db_exec_config
+        ) or {}
+        plan_output = explain_res.get("plan")
+        index_used = explain_res.get("index_used")
+        access_type = explain_res.get("access_type")
         m_time_raw = explain_res.get("timing_ms")
-        if m_time_raw is None:
-            m_time_raw = candidate.get("averageTimeMs", 14.2)
-        try:
-            measured_time = float(m_time_raw) if m_time_raw is not None else 14.2
-        except (ValueError, TypeError):
-            measured_time = 14.2
+        if not isinstance(m_time_raw, (int, float)) or m_time_raw < 0:
+            m_time_raw = candidate.get("averageTimeMs")
+        measured_time = (
+            float(m_time_raw)
+            if isinstance(m_time_raw, (int, float)) and m_time_raw >= 0
+            else None
+        )
 
         # Bottleneck classification
-        classification = cls.classify_bottleneck(
-            sql=cand_sql,
-            explain_plan=plan_output,
-            timing_ms=measured_time,
-            index_used=index_used,
-            access_type=access_type,
-            rows_examined=candidate.get("rowsExamined", 1000),
-            rows_returned=candidate.get("rowsReturned", 1),
+        has_plan_evidence = bool(plan_output)
+        classification = (
+            cls.classify_bottleneck(
+                sql=cand_sql,
+                explain_plan=plan_output or "",
+                timing_ms=measured_time or 0,
+                index_used=index_used,
+                access_type=access_type,
+                rows_examined=candidate.get("rowsExamined") or 0,
+                rows_returned=candidate.get("rowsReturned") or 0,
+            )
+            if has_plan_evidence
+            else None
         )
 
         # Build comprehensive Evidence-First Markdown Report
         top_lines = []
         for q in top_q:
             q_str = q.get("rawQuery") or q.get("normalizedQuery")
+            if not q_str:
+                continue
             top_lines.append(
                 f"- **Query:** `{q_str}`\n"
-                f"  - **Fingerprint:** `{q.get('queryFingerprint')}`\n"
-                f"  - **Execution Count:** {q.get('executionCount', 1)}\n"
-                f"  - **Total Time:** {q.get('totalTimeMs', 0.0)}ms\n"
-                f"  - **Average Time:** {q.get('averageTimeMs', 0.0)}ms\n"
-                f"  - **Max Time:** {q.get('maxTimeMs', 0.0)}ms\n"
-                f"  - **Source Location:** `{src_file}`\n"
-                f"  - **Bottleneck:** Full table sequential scan without index filter\n"
+                f"  - **Fingerprint:** `{q.get('queryFingerprint') or 'UNAVAILABLE'}`\n"
+                f"  - **Execution Count:** {q.get('executionCount') if q.get('executionCount') is not None else 'UNAVAILABLE'}\n"
+                f"  - **Total Time:** {q.get('totalTimeMs') if q.get('totalTimeMs') is not None else 'UNAVAILABLE'}ms\n"
+                f"  - **Average Time:** {q.get('averageTimeMs') if q.get('averageTimeMs') is not None else 'UNAVAILABLE'}ms\n"
+                f"  - **Max Time:** {q.get('maxTimeMs') if q.get('maxTimeMs') is not None else 'UNAVAILABLE'}ms\n"
+                f"  - **Source Location:** `{q.get('sourceLocation') or 'UNAVAILABLE'}`\n"
             )
 
+        timing_text = f"{measured_time:.2f} ms" if measured_time is not None else "UNAVAILABLE"
+        rows_examined = candidate.get("rowsExamined")
+        rows_returned = candidate.get("rowsReturned")
+        index_text = index_used or "UNAVAILABLE"
+        access_text = access_type or "UNAVAILABLE"
+        plan_text = plan_output or "UNAVAILABLE (no live query plan)"
+        source_text = f"`{src_file}`" if src_file else "UNAVAILABLE"
+        symbol_text = f"`{symbol_name}`" if symbol_name else "UNAVAILABLE"
+        call_path_text = f"`{call_path}`" if call_path else "UNAVAILABLE"
+        index_finding = (
+            f"Inspected indexes on `{target_tbl}`: "
+            + (
+                ", ".join(
+                    str(index.get("name") or index) if isinstance(index, dict) else str(index)
+                    for index in existing_indexes
+                )
+                or "none reported"
+            )
+            if existing_indexes is not None
+            else "UNAVAILABLE (no table-specific index evidence)"
+        )
+        bottleneck_text = (
+            f"`{classification['bottleneckClass']}` ({classification['description']})"
+            if classification
+            else "UNVERIFIED (no live query plan)"
+        )
+        remediation_text = (
+            classification["remediation"] if classification else "UNAVAILABLE (insufficient evidence)"
+        )
+        evidence_quality = (
+            "VERIFIED_LIVE" if measured_time is not None or has_plan_evidence else "UNVERIFIED"
+        )
         report = (
             f"### DIRECT ANSWER: TOP SLOW QUERIES REPORT\n\n"
             f"- **QUERY:** `{cand_sql}`\n"
-            f"- **FILE/SYMBOL:** `{src_file}` / `{symbol_name}`\n"
+            f"- **FILE/SYMBOL:** {source_text} / {symbol_text}\n"
             f"- **DATABASE:** `{db_name}` ({db_type})\n"
-            f"- **ACTUAL TIMING:** {measured_time:.2f} ms\n"
-            f"- **ROWS EXAMINED:** {candidate.get('rowsExamined', 1000)}\n"
-            f"- **ROWS RETURNED:** {candidate.get('rowsReturned', 1)}\n"
-            f"- **INDEX USED:** {index_used}\n"
-            f"- **ACCESS TYPE:** {access_type}\n"
-            f"- **EXPLAIN:** {plan_output}\n"
-            f"- **BOTTLENECK:** {classification['bottleneckClass']} ({classification['description']})\n"
-            f"- **CONFIDENCE:** MEASURED\n\n"
+            f"- **ACTUAL TIMING:** {timing_text}\n"
+            f"- **ROWS EXAMINED:** {rows_examined if rows_examined is not None else 'UNAVAILABLE'}\n"
+            f"- **ROWS RETURNED:** {rows_returned if rows_returned is not None else 'UNAVAILABLE'}\n"
+            f"- **INDEX USED:** {index_text}\n"
+            f"- **ACCESS TYPE:** {access_text}\n"
+            f"- **EXPLAIN:** {plan_text}\n"
+            f"- **BOTTLENECK:** {bottleneck_text}\n"
+            f"- **CONFIDENCE:** {classification['confidence'] if classification else 'UNVERIFIED'}\n\n"
             f"---\n\n"
             f"### TOP SLOW QUERIES REPORT\n\n"
-            f"Discovered and measured slow queries ({len(top_q)}):\n\n"
+            f"Discovered candidate queries ({len(top_q)}):\n\n"
             + "\n".join(top_lines) + "\n\n"
             f"---\n\n"
             f"### AUTONOMOUS DATABASE PERFORMANCE INVESTIGATION\n\n"
-            f"- **LIVE FACT:** Measured execution time = {measured_time:.2f} ms across {candidate.get('executionCount', 1)} executions.\n"
-            f"- **SOURCE FINDING:** Query originates from `{src_file}` at symbol `{symbol_name}` (Call path: `{call_path}`).\n"
-            f"- **LIVE PLAN:** `{plan_output}` (Access Type: `{access_type}`, Index Used: `{index_used}`).\n"
-            f"- **INDEX FINDING:** Table `{target_tbl}` has {len(existing_indexes)} index(es). Filter column lacks secondary index.\n"
-            f"- **BOTTLENECK CLASSIFICATION:** `{classification['bottleneckClass']}` ({classification['description']})\n"
-            f"- **OPTIMIZATION HYPOTHESIS:** {classification['remediation']}\n"
-            f"- **EVIDENCE QUALITY:** `VERIFIED_LIVE` (timing & plan) + `VERIFIED_SOURCE` (origin location).\n"
+            f"- **LIVE FACT:** Execution timing = {timing_text}; execution count = "
+            f"{candidate.get('executionCount') if candidate.get('executionCount') is not None else 'UNAVAILABLE'}.\n"
+            f"- **SOURCE FINDING:** Source = {source_text}; symbol = {symbol_text}; call path = {call_path_text}.\n"
+            f"- **LIVE PLAN:** `{plan_text}` (Access Type: `{access_text}`, Index Used: `{index_text}`).\n"
+            f"- **INDEX FINDING:** {index_finding}.\n"
+            f"- **BOTTLENECK CLASSIFICATION:** {bottleneck_text}\n"
+            f"- **OPTIMIZATION HYPOTHESIS:** {remediation_text}\n"
+            f"- **EVIDENCE QUALITY:** `{evidence_quality}`.\n"
         )
 
         return {
@@ -1998,8 +2279,8 @@ class DatabasePerformanceEngine:
             "explain": explain_res,
             "classification": classification,
             "timingMs": measured_time,
-            "bottleneckClass": classification["bottleneckClass"],
-            "evidenceQuality": "VERIFIED_LIVE",
+            "bottleneckClass": classification["bottleneckClass"] if classification else None,
+            "evidenceQuality": evidence_quality,
         }
 
     @classmethod
@@ -2011,66 +2292,128 @@ class QueryToSourceMapper:
     """
     Closed loop mapping from SQL queries / query fingerprints to project source code across ORMs and raw SQL.
     """
+    SOURCE_EXTENSIONS = {".php", ".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".go", ".cs", ".rb"}
+    IGNORED_DIRS = {".git", "node_modules", "vendor", "dist", "build", "runtime", "cache", "tests", "test"}
+    QUERY_CALL_PATTERN = re.compile(
+        r"(?:->|::|\.)\s*(?:find|findAll|findOne|all|one|query|queryAll|queryOne|"
+        r"count|exists|createCommand|createQuery|createQueryBuilder)\s*\(|"
+        r"\b(?:createCommand|createQuery|queryAll|queryOne|findAll|findOne)\s*\(",
+        re.I,
+    )
+    FUNCTION_PATTERN = re.compile(
+        r"\b(?:function|def)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(|"
+        r"\b(?:public|protected|private)\s+(?:static\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        re.I,
+    )
+
+    @classmethod
+    def find_query_source_candidates(
+        cls,
+        project_root: str,
+        sql: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        root = Path(project_root) if project_root and os.path.isdir(project_root) else None
+        if not root:
+            return []
+
+        table_names = {
+            match.group(1).split(".")[-1].strip("`\"'[]").lower()
+            for match in re.finditer(
+                r"\b(?:FROM|JOIN|UPDATE|INTO)\s+([`\"'\[]?[A-Za-z0-9_`.\"\[\]]+)",
+                sql,
+                re.I,
+            )
+        }
+        table_names.discard("")
+        if not table_names:
+            return []
+        model_names = {
+            re.sub(
+                r"[^a-z0-9]",
+                "",
+                "".join(part.capitalize() for part in table.split("_")).lower(),
+            )
+            for table in table_names
+        }
+        table_patterns = [
+            re.compile(rf"\b{re.escape(name)}\b", re.I)
+            for name in table_names | model_names
+            if len(name) >= 3
+        ]
+
+        candidates: List[Dict[str, Any]] = []
+        scanned_files = 0
+        for current_root, dirs, files in os.walk(root):
+            dirs[:] = sorted(directory for directory in dirs if directory.lower() not in cls.IGNORED_DIRS)
+            for filename in sorted(files):
+                path = Path(current_root) / filename
+                if path.suffix.lower() not in cls.SOURCE_EXTENSIONS:
+                    continue
+                scanned_files += 1
+                if scanned_files > 500:
+                    return candidates[:limit]
+                try:
+                    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                except OSError:
+                    continue
+
+                for line_index, line in enumerate(lines):
+                    if not any(pattern.search(line) for pattern in table_patterns):
+                        continue
+                    start = max(0, line_index - 3)
+                    end = min(len(lines), line_index + 4)
+                    context = "\n".join(lines[start:end])
+                    if not cls.QUERY_CALL_PATTERN.search(context) and not re.search(
+                        r"\b(?:SELECT|INSERT|UPDATE|DELETE)\b", context, re.I
+                    ):
+                        continue
+
+                    function_name = None
+                    for prior_line in reversed(lines[:line_index + 1]):
+                        function_match = cls.FUNCTION_PATTERN.search(prior_line)
+                        if function_match:
+                            function_name = function_match.group(1) or function_match.group(2)
+                            break
+
+                    loop_line = None
+                    for prior_index in range(max(0, line_index - 15), line_index):
+                        if re.search(r"\b(?:foreach|for|while)\s*\(", lines[prior_index], re.I):
+                            loop_line = prior_index + 1
+
+                    relative_path = path.relative_to(root).as_posix()
+                    candidates.append({
+                        "sourceFile": relative_path,
+                        "line": line_index + 1,
+                        "functionName": function_name,
+                        "table": next(
+                            (name for name in table_names if re.search(rf"\b{re.escape(name)}\b", line, re.I)),
+                            sorted(table_names)[0],
+                        ),
+                        "evidence": "SQL_OR_QUERY_CALL_NEAR_TABLE_REFERENCE",
+                        "loopContextLine": loop_line,
+                    })
+                    if len(candidates) >= limit:
+                        return candidates
+
+        return candidates
+
     @classmethod
     def map_query_to_source(cls, project_root: str, sql: str) -> Dict[str, Any]:
-        queries = DatabaseIntelligenceEngine.discover_relevant_queries(project_root)
-        tbl_m = re.search(r"\bFROM\s+([a-zA-Z0-9_]+)", sql, re.I)
-        target_tbl = tbl_m.group(1).lower() if tbl_m else ""
-        for q in queries:
-            if target_tbl and q.get("table", "").lower() == target_tbl:
-                return {
-                    "sourceFile": q.get("file"),
-                    "table": target_tbl,
-                    "symbol": f"{target_tbl.capitalize()}::find",
-                    "functionName": q.get("function") or "find",
-                    "callPath": f"{target_tbl.capitalize()}Controller -> {target_tbl.capitalize()}::{q.get('function', 'find')}",
-                    "ormFramework": "ActiveRecord",
-                    "line": q.get("line", 1),
-                    "status": "CONFIRMED",
-                }
-            if q.get("query") and (q["query"] in sql or sql in q.get("query", "")):
-                return {
-                    "sourceFile": q.get("file"),
-                    "table": q.get("table"),
-                    "symbol": f"{q.get('table', 'model').capitalize()}::query",
-                    "functionName": q.get("function") or "query",
-                    "callPath": f"{q.get('table', 'model').capitalize()}::{q.get('function', 'query')}",
-                    "ormFramework": "ORM",
-                    "line": q.get("line", 1),
-                    "status": "CONFIRMED",
-                }
-
-        # Scan project files on disk for ORM and model patterns
-        if project_root and os.path.isdir(project_root) and target_tbl:
-            for root, dirs, files in os.walk(project_root):
-                dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "vendor", "dist", "build")]
-                for f in files:
-                    ext = os.path.splitext(f)[1].lower()
-                    if ext in (".php", ".ts", ".js", ".py", ".java", ".go"):
-                        fpath = os.path.join(root, f)
-                        rel_path = os.path.normpath(os.path.relpath(fpath, project_root)).replace("\\", "/")
-                        try:
-                            with open(fpath, "r", encoding="utf-8", errors="ignore") as fp:
-                                content = fp.read()
-                            if target_tbl in content.lower():
-                                func_m = re.search(r"(?:function|public\s+function|def)\s+([a-zA-Z0-9_]+)", content)
-                                func_name = func_m.group(1) if func_m else "find"
-                                return {
-                                    "sourceFile": rel_path,
-                                    "table": target_tbl,
-                                    "symbol": f"{target_tbl.capitalize()}::{func_name}",
-                                    "functionName": func_name,
-                                    "callPath": f"{target_tbl.capitalize()}::{func_name}",
-                                    "ormFramework": "Yii/ActiveRecord" if ext == ".php" else "ORM",
-                                    "line": 1,
-                                    "status": "CONFIRMED",
-                                }
-                        except Exception:
-                            continue
-
+        matches = cls.find_query_source_candidates(project_root, sql, limit=1)
+        if matches:
+            match = matches[0]
+            return {
+                **match,
+                "symbol": match.get("functionName"),
+                "callPath": None,
+                "ormFramework": "Yii/ActiveRecord" if Path(match["sourceFile"]).suffix.lower() == ".php" else None,
+                "status": "STATIC_SOURCE_MATCH",
+            }
+        tbl_m = re.search(r"\b(?:FROM|JOIN|UPDATE|INTO)\s+([A-Za-z0-9_`.]+)", sql, re.I)
         return {
             "sourceFile": None,
-            "table": target_tbl or None,
+            "table": tbl_m.group(1).split(".")[-1].strip("`").lower() if tbl_m else None,
             "symbol": None,
             "functionName": None,
             "callPath": None,
@@ -2106,24 +2449,60 @@ class DatabaseSession:
         self.project_id = project_id
         self.repository_id = repository_id
         self.project_root = project_root
-        self.database_type = database_type if database_type not in ("unknown", "unverified") else "sqlite"
+        self.database_type = database_type
         self.database_name = database_name
         self.connection_handle = connection_handle
         self.connection_state = connection_state
         self.connection_capabilities = connection_capabilities or []
         self.sqlite_file = sqlite_file
         self.session_id = session_id or f"db-sess-{int(time.time()*1000)}"
-        self.target_id = target_id or "DB-001"
+        self.target_id = target_id
         self.safe_host = safe_host
-        self.safe_port = safe_port or (3306 if "mysql" in self.database_type.lower() and self.safe_host else (5432 if "postgre" in self.database_type.lower() and self.safe_host else None))
+        self.safe_port = safe_port
         self.created_at = time.time()
         self.last_used_at = time.time()
         self._protected_credentials: Dict[str, Any] = {}
         self.health_check_latency_ms = health_check_latency_ms
         self.health_proof: Optional[DatabaseExecutionProof] = None
         self.last_plan_proof: Optional[DatabaseExecutionProof] = None
+        self.schema_knowledge: Optional[Dict[str, Any]] = None
         self.binding = DatabaseSessionBinding(self.session_id, self.database_type, self.database_name)
-        self.engine_verified = (self.database_type not in ("unknown", "unverified"))
+        self.engine_verified = False
+
+    def schema_knowledge_key(self) -> Optional[str]:
+        if not self.project_root:
+            return None
+        project_root = os.path.normcase(
+            os.path.realpath(os.path.abspath(self.project_root))
+        )
+        sqlite_target = self.sqlite_file
+        if sqlite_target and not os.path.isabs(sqlite_target):
+            sqlite_target = os.path.join(self.project_root, sqlite_target)
+        if sqlite_target:
+            sqlite_target = os.path.normcase(os.path.realpath(os.path.abspath(sqlite_target)))
+        identity = {
+            "projectRoot": project_root,
+            "engine": self.database_type.lower(),
+            "database": self.database_name,
+            "targetId": self.target_id,
+            "sqliteTarget": sqlite_target,
+            "host": self.safe_host,
+            "port": self.safe_port,
+        }
+        serialized = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def restore_schema_knowledge(self, knowledge: Dict[str, Any]) -> bool:
+        if (
+            not isinstance(knowledge, dict)
+            or knowledge.get("schemaKnowledgeKey") != self.schema_knowledge_key()
+            or str(knowledge.get("engine") or "").lower() != self.database_type.lower()
+            or knowledge.get("database") != self.database_name
+            or knowledge.get("targetId") != self.target_id
+        ):
+            return False
+        self.schema_knowledge = knowledge
+        return True
 
     def is_connected(self) -> bool:
         return self.connection_state in (
@@ -2138,6 +2517,74 @@ class DatabaseSession:
 
     def touch(self) -> None:
         self.last_used_at = time.time()
+
+    def record_schema_knowledge(self, schema_result: Dict[str, Any]) -> Dict[str, Any]:
+        if (
+            schema_result.get("status") != "SUCCESS"
+            or schema_result.get("source") != DatabaseEvidenceSource.LIVE_DB_EXECUTION
+        ):
+            raise ValueError("Only successfully inspected live schema may be stored as verified knowledge.")
+
+        normalized_schema = {
+            "engine": self.database_type,
+            "database": self.database_name,
+            "tables": sorted(str(table) for table in schema_result.get("live_tables", [])),
+            "details": {
+                str(table): schema_result["schema_details"][table]
+                for table in sorted(schema_result.get("schema_details", {}))
+            },
+            "relationships": schema_result.get("relationships", []),
+            "views": sorted(str(view) for view in schema_result.get("views", [])),
+        }
+        serialized = json.dumps(
+            normalized_schema,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        fingerprint = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        now = time.time()
+        previous = self.schema_knowledge or {}
+        same_schema = previous.get("fingerprint") == fingerprint
+        knowledge = {
+            "engine": self.database_type,
+            "database": self.database_name,
+            "targetId": self.target_id,
+            "schemaKnowledgeKey": self.schema_knowledge_key(),
+            "databaseSessionId": self.session_id,
+            "fingerprint": fingerprint,
+            "previousFingerprint": (
+                previous.get("previousFingerprint")
+                if same_schema
+                else previous.get("fingerprint")
+            ),
+            "discoveredAt": previous.get("discoveredAt") if same_schema else now,
+            "lastVerifiedAt": now,
+            "changed": bool(previous and not same_schema),
+            "provenance": {
+                "source": schema_result.get("source"),
+                "evidenceId": schema_result.get("evidenceId"),
+                "databaseSessionId": self.session_id,
+            },
+            "schema": SecretProtector.redact_data(normalized_schema),
+        }
+        self.schema_knowledge = knowledge
+        self.connection_state = DatabaseState.SCHEMA_INSPECTED
+        return knowledge
+
+    def get_schema_knowledge(self) -> Optional[Dict[str, Any]]:
+        knowledge = self.schema_knowledge
+        if not knowledge:
+            return None
+        if (
+            knowledge.get("schemaKnowledgeKey") != self.schema_knowledge_key()
+            or str(knowledge.get("engine") or "").lower() != self.database_type.lower()
+            or knowledge.get("database") != self.database_name
+            or knowledge.get("targetId") != self.target_id
+        ):
+            return None
+        return knowledge
 
     def to_safe_dict(self) -> Dict[str, Any]:
         return {
@@ -2155,7 +2602,16 @@ class DatabaseSession:
             "lastUsedAt": self.last_used_at,
             "sessionId": self.session_id,
             "healthCheckLatencyMs": self.health_check_latency_ms,
-            "engineVerified": self.engine_verified,
+            "engineVerified": bool(
+                self.is_connected()
+                and (not self.project_root or os.path.isdir(self.project_root))
+                and self.health_proof
+                and self.health_proof.mode == "LIVE"
+                and self.health_proof.source in DatabaseEvidenceSource.AUTHORITATIVE_LIVE_SOURCES
+                and self.health_proof.execution_status == "SUCCESS"
+                and str(self.health_proof.database_engine or "").casefold()
+                == str(self.database_type or "").casefold()
+            ),
         }
 
 
@@ -2190,9 +2646,11 @@ class ConfigurationSymbolResolver:
         return bool(
             re.search(
                 r"(?:['\"]?dsn['\"]?\s*(?:=>|=)|"
-                r"(?:DB_(?:HOST|PORT|DATABASE|NAME|USERNAME|USER|CONNECTION)|DATABASE_URL)\s*=|"
+                r"(?:DB_(?:HOST|PORT|DATABASE|NAME|USERNAME|USER|CONNECTION)|"
+                r"DATABASE_URL|POSTGRES(?:QL)?_URL|SUPABASE_(?:DB|DATABASE)_URL|"
+                r"MONGO(?:DB)?_(?:URL|URI)|SPRING\.DATASOURCE\.URL)\s*=|"
                 r"['\"]?(?:database|dbname|host|hostname)['\"]?\s*(?:=>|:)\s*['\"]|"
-                r"new\s+\\?PDO\s*\(|new\s+mysqli\s*\()",
+                r"jdbc:h2:|new\s+\\?PDO\s*\(|new\s+mysqli\s*\()",
                 content,
                 re.I,
             )
@@ -2201,7 +2659,13 @@ class ConfigurationSymbolResolver:
     _credential_vault: Dict[str, Dict[str, Any]] = {}
 
     @classmethod
-    def store_credential(cls, project_root: str, username: Optional[str] = None, password: Optional[str] = None) -> None:
+    def store_credential(
+        cls,
+        project_root: str,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        connection_uri: Optional[str] = None,
+    ) -> None:
         if not project_root:
             return
         key = os.path.abspath(project_root).lower()
@@ -2211,6 +2675,8 @@ class ConfigurationSymbolResolver:
             cls._credential_vault[key]["username"] = username
         if password is not None:
             cls._credential_vault[key]["password"] = password
+        if connection_uri is not None:
+            cls._credential_vault[key]["connection_uri"] = connection_uri
 
     @classmethod
     def get_credential(cls, project_root: str) -> Dict[str, Any]:
@@ -2421,11 +2887,6 @@ class ConfigurationSymbolResolver:
                 matches = [m for m in matches if not any(x in str(m).lower() for x in ("vendor", "node_modules", ".git"))]
                 if matches:
                     target_file = matches[0]
-                elif specific_file.lower() in ("config.php", "db.php", "database.php"):
-                    for pat in ("config/db.php", "config/database.php", "config/main-local.php", "db.php"):
-                        if (root / pat).is_file():
-                            target_file = root / pat
-                            break
                 if not target_file:
                     return {
                         "discovered": False,
@@ -2437,7 +2898,11 @@ class ConfigurationSymbolResolver:
         if not target_file:
             search_patterns = [
                 "config/db.php", "config/database.php", "config/main-local.php",
-                "config.php", "config/web.php", ".env", "settings.py"
+                "config.php", "config/web.php", ".env", "settings.py",
+                "application.properties", "application.yml", "application.yaml",
+                "src/main/resources/application.properties",
+                "src/main/resources/application.yml",
+                "src/main/resources/application.yaml",
             ]
             for pat in search_patterns:
                 cand = root / pat
@@ -2469,6 +2934,70 @@ class ConfigurationSymbolResolver:
             content = target_file.read_text(encoding="utf-8", errors="ignore")
         except Exception as e:
             return {"discovered": False, "status": "ERROR", "message": str(e), "configFile": rel_path}
+
+        url_assignment = re.search(
+            r"^\s*(?:DATABASE_URL|POSTGRES_URL|POSTGRESQL_URL|SUPABASE_DB_URL|SUPABASE_DATABASE_URL|MONGO_URL|MONGODB_URI|MONGODB_URL|SPRING\.DATASOURCE\.URL)\s*[:=]\s*['\"]?([^'\"\r\n#]+)",
+            content,
+            re.I | re.M,
+        )
+        if not url_assignment:
+            url_assignment = re.search(r"(jdbc:h2:[^\s'\";]+(?:;[^,\r\n'\"#]+)*)", content, re.I)
+        if url_assignment:
+            connection_uri = url_assignment.group(1).strip()
+            parsed_url = DatabaseIntelligenceEngine.parse_database_url(connection_uri)
+            if parsed_url:
+                username_match = re.search(
+                    r"^\s*(?:spring\.datasource\.username|username)\s*[:=]\s*['\"]?([^'\"\r\n#]*)",
+                    content,
+                    re.I | re.M,
+                )
+                password_match = re.search(
+                    r"^\s*(?:spring\.datasource\.password|password)\s*[:=]\s*['\"]?([^'\"\r\n#]*)",
+                    content,
+                    re.I | re.M,
+                )
+                username = parsed_url.get("username") or (
+                    username_match.group(1).strip() if username_match else None
+                )
+                password = parsed_url.get("password")
+                if password is None and password_match:
+                    password = password_match.group(1).strip()
+                cls.store_credential(
+                    project_root,
+                    username=username,
+                    password=password,
+                    connection_uri=connection_uri,
+                )
+                return {
+                    "discovered": True,
+                    "configFile": rel_path,
+                    "activeComponent": "Database Connection",
+                    "componentClass": "Native / Generic Connection",
+                    "engine": parsed_url["engine"],
+                    "database": {
+                        "status": "RESOLVED" if parsed_url.get("database") else "NOT_SPECIFIED",
+                        "value": parsed_url.get("database"),
+                        "symbol": url_assignment.group(0).split("=", 1)[0].strip(),
+                    },
+                    "host": {
+                        "status": "RESOLVED" if parsed_url.get("host") else "NOT_SPECIFIED",
+                        "value": parsed_url.get("host"),
+                        "symbol": url_assignment.group(0).split("=", 1)[0].strip(),
+                    },
+                    "port": {
+                        "status": "RESOLVED" if parsed_url.get("port") else "NOT_SPECIFIED",
+                        "value": parsed_url.get("port"),
+                    },
+                    "username": {
+                        "status": "RESOLVED" if username else "NOT_SPECIFIED",
+                        "value": username,
+                        "symbol": "connection URL or datasource username",
+                    },
+                    "hasPassword": password is not None,
+                    "status": "RESOLVED" if parsed_url.get("database") else "CONFIGURED",
+                    "fileContent": SecretProtector.redact_text(content),
+                    "sqliteFile": None,
+                }
 
         if not cls._looks_like_database_configuration(content):
             return {
@@ -2504,17 +3033,31 @@ class ConfigurationSymbolResolver:
         user_token = None
         pass_token = None
         sqlite_file = None
+        connection_uri = None
 
         is_literal_dsn = False
         m_dsn = re.search(r"['\"]?dsn['\"]?\s*=>\s*(.+?)(?:,\s*(?:\r?\n|$)|;\s*(?:\r?\n|$)|$)", content, re.I)
         if m_dsn:
             dsn_expr = m_dsn.group(1).strip()
             is_literal_dsn = (dsn_expr.startswith("'") and dsn_expr.endswith("'")) or (dsn_expr.startswith('"') and dsn_expr.endswith('"'))
-            m_eng = re.search(r"(mysql|mariadb|pgsql|postgres|sqlite|sqlsrv|oci)", dsn_expr, re.I)
+            m_eng = re.search(r"(mysql|mariadb|pgsql|postgres|sqlite|sqlsrv|oci|mongodb(?:\+srv)?|h2)", dsn_expr, re.I)
             if m_eng:
                 engine = m_eng.group(1).lower()
                 if engine == "mariadb": engine = "mysql"
                 elif engine == "postgres": engine = "postgresql"
+                elif engine.startswith("mongodb"): engine = "mongodb"
+
+            uri_match = re.search(r"(?:jdbc:h2:[^\s'\";]+(?:;[^,\r\n'\" ]+)*)|\b(?:postgres(?:ql)?|mongodb(?:\+srv)?|mysql|mariadb)://[^\s'\";]+", dsn_expr, re.I)
+            if uri_match:
+                parsed_url = DatabaseIntelligenceEngine.parse_database_url(uri_match.group(0))
+                if parsed_url:
+                    connection_uri = uri_match.group(0)
+                    engine = parsed_url["engine"]
+                    host_token = f"'{parsed_url['host']}'" if parsed_url.get("host") else None
+                    db_token = f"'{parsed_url['database']}'" if parsed_url.get("database") else None
+                    port_token = str(parsed_url["port"]) if parsed_url.get("port") else None
+                    user_token = f"'{parsed_url['username']}'" if parsed_url.get("username") else None
+                    pass_token = f"'{parsed_url['password']}'" if parsed_url.get("password") else None
 
             if engine == "sqlite" or "sqlite:" in dsn_expr.lower():
                 engine = "sqlite"
@@ -2586,8 +3129,7 @@ class ConfigurationSymbolResolver:
         if engine == "sqlite" and sqlite_file and not res_db.get("value"):
             db_fname = Path(sqlite_file).name
             res_db = {"status": "RESOLVED", "value": db_fname, "symbol": "sqlite_file", "source": "dsn_file"}
-            res_host = {"status": "RESOLVED", "value": "localhost", "symbol": "localhost", "source": "filesystem"}
-        res_port = cls.resolve_symbol_in_project(project_root, port_token) if port_token else {"status": "NOT_SPECIFIED", "value": (3306 if engine == "mysql" else (5432 if engine == "postgresql" else None))}
+        res_port = cls.resolve_symbol_in_project(project_root, port_token) if port_token else {"status": "NOT_SPECIFIED", "value": None}
         res_user = cls.resolve_symbol_in_project(project_root, user_token) if user_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
         res_pass = cls.resolve_symbol_in_project(project_root, pass_token) if pass_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
 
@@ -2620,42 +3162,82 @@ class ConfigurationSymbolResolver:
             "fileContent": SecretProtector.redact_text(content),
             "sqliteFile": sqlite_file,
         }
-        if res_pass.get("value") or (res_user and res_user.get("value")):
+        if connection_uri or res_pass.get("value") or (res_user and res_user.get("value")):
             cls.store_credential(
                 project_root,
                 username=res_user.get("value") if res_user else None,
                 password=res_pass.get("value") if res_pass else None,
+                connection_uri=connection_uri,
             )
         return res_dict
 
     @classmethod
     def verify_live_database_identity(cls, project_root: str, cfg: Dict[str, Any], session: Optional[Any] = None) -> Dict[str, Any]:
         root = Path(project_root) if project_root and os.path.isdir(project_root) else None
-        engine = (cfg.get("engine") or "").lower()
+        engine = (cfg.get("engine") or getattr(session, "database_type", "") or "").lower()
+        if not session:
+            return {
+                "connected": False,
+                "status": "NOT_VERIFIED",
+                "database": None,
+                "host": None,
+                "port": None,
+                "verificationQuery": None,
+                "message": "No project-owned database session is available for runtime verification.",
+                "engine": engine or "unknown",
+                "targetId": None,
+            }
 
         # 1. SQLite Verification
         if root and (engine == "sqlite" or cfg.get("sqliteFile")):
-            sqlite_files = list(root.glob("**/*.sqlite")) + list(root.glob("**/*.sqlite3")) + list(root.glob("**/*.db"))
-            sqlite_files = [f for f in sqlite_files if not any(x in str(f).lower() for x in ("node_modules", ".git", "vendor"))]
-            if sqlite_files:
+            configured_file = cfg.get("sqliteFile") or (session and session.sqlite_file)
+            sqlite_path = Path(configured_file) if configured_file else None
+            if sqlite_path and not sqlite_path.is_absolute():
+                sqlite_path = root / sqlite_path
+            if sqlite_path and sqlite_path.is_file():
                 import sqlite3
-                sqf = sqlite_files[0]
                 try:
-                    conn = sqlite3.connect(f"file:{sqf}?mode=ro", uri=True)
+                    started_at = time.perf_counter()
+                    conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
                     cur = conn.cursor()
                     cur.execute("SELECT 1")
                     res = cur.fetchone()
                     conn.close()
                     if res and res[0] == 1:
+                        elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 3)
+                        proof = DatabaseExecutionProof(
+                            session_id=session.session_id if session else None,
+                            project_id=session.project_id if session else None,
+                            repository_id=session.repository_id if session else None,
+                            database_session_id=session.session_id if session else None,
+                            database_engine="sqlite",
+                            operation=DatabaseCapability.DATABASE_CURRENT_TARGET,
+                            source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                            mode="LIVE",
+                            execution_status="SUCCESS",
+                            execution_time_ms=max(elapsed_ms, 0.01),
+                            rows_returned=1,
+                            query="SELECT 1",
+                        )
+                        DatabaseEvidenceStore.record_proof(proof)
+                        if session:
+                            session.connection_state = DatabaseState.CONNECTED
+                            session.database_name = sqlite_path.name
+                            session.database_type = "sqlite"
+                            session.sqlite_file = str(sqlite_path)
+                            session.health_proof = proof
+                            session.binding.bind_proof(proof)
                         return {
                             "connected": True,
-                            "database": sqf.name,
-                            "host": "localhost",
+                            "database": sqlite_path.name,
+                            "host": None,
                             "port": None,
                             "verificationQuery": "SELECT 1",
                             "status": "LIVE_VERIFIED",
                             "engine": "sqlite",
-                            "targetId": session.target_id if session else "DB-001",
+                            "targetId": session.target_id if session else None,
+                            "databaseSessionId": session.session_id if session else None,
+                            "evidence": proof.to_dict(),
                         }
                 except Exception as e:
                     return {
@@ -2669,20 +3251,26 @@ class ConfigurationSymbolResolver:
         if engine == "mysql":
             target_host = (cfg.get("host") or {}).get("value") if isinstance(cfg.get("host"), dict) else (cfg.get("host") or (session and session.safe_host))
             target_db = (cfg.get("database") or {}).get("value") if isinstance(cfg.get("database"), dict) else (cfg.get("database") or (session and session.database_name))
-            target_port = (cfg.get("port") or {}).get("value") if isinstance(cfg.get("port"), dict) else (cfg.get("port") or (session and session.safe_port) or 3306)
-            target_user = (cfg.get("username") or {}).get("value") if isinstance(cfg.get("username"), dict) else (cfg.get("username") or "root")
+            target_port = (cfg.get("port") or {}).get("value") if isinstance(cfg.get("port"), dict) else (cfg.get("port") or (session and session.safe_port))
+            target_user = (cfg.get("username") or {}).get("value") if isinstance(cfg.get("username"), dict) else (
+                cfg.get("username")
+                or cls.get_credential(project_root).get("username")
+                or (cfg.get("_protected_credentials") or {}).get("username")
+                or (session and getattr(session, "_protected_credentials", {}).get("username"))
+            )
             target_pw = (
                 cls.get_credential(project_root).get("password")
                 or (cfg.get("_protected_credentials") or {}).get("password")
                 or (session and getattr(session, "_protected_credentials", {}).get("password"))
                 or ""
             )
-            if target_host and target_db:
+            if target_host and target_db and target_user:
                 try:
                     import pymysql
+                    started_at = time.perf_counter()
                     conn = pymysql.connect(
                         host=str(target_host),
-                        port=int(target_port or 3306),
+                        **({"port": int(target_port)} if target_port else {}),
                         user=str(target_user or "root"),
                         password=str(target_pw),
                         database=str(target_db),
@@ -2696,36 +3284,90 @@ class ConfigurationSymbolResolver:
                         if session:
                             session.connection_state = DatabaseState.CONNECTED
                             session.database_name = row[0] or target_db
-                            session.safe_host = row[1] or target_host
-                            session.safe_port = row[2] or target_port
                             session.database_type = "mysql"
+                        elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 3)
+                        proof = DatabaseExecutionProof(
+                            session_id=session.session_id if session else None,
+                            project_id=session.project_id if session else None,
+                            repository_id=session.repository_id if session else None,
+                            database_session_id=session.session_id if session else None,
+                            database_engine="mysql",
+                            operation=DatabaseCapability.DATABASE_CURRENT_TARGET,
+                            source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                            mode="LIVE",
+                            execution_status="SUCCESS",
+                            execution_time_ms=max(elapsed_ms, 0.01),
+                            rows_returned=1,
+                            query="SELECT DATABASE(), @@hostname, @@port;",
+                        )
+                        DatabaseEvidenceStore.record_proof(proof)
+                        if session:
+                            session.health_proof = proof
+                            session.binding.bind_proof(proof)
                         return {
                             "connected": True,
                             "database": row[0] or target_db,
                             "host": row[1] or target_host,
-                            "port": row[2] or target_port,
+                            "port": row[2],
                             "verificationQuery": "SELECT DATABASE(), @@hostname, @@port;",
                             "status": "LIVE_VERIFIED",
                             "engine": "mysql",
-                            "targetId": session.target_id if session else "DB-001",
+                            "targetId": session.target_id if session else None,
+                            "databaseSessionId": session.session_id if session else None,
+                            "evidence": proof.to_dict(),
                         }
-                except Exception:
-                    pass
+                except Exception as error:
+                    return {
+                        "connected": False,
+                        "status": "FAILED",
+                        "engine": "mysql",
+                        "failureClassification": DatabaseIntelligenceEngine.classify_db_error(str(error)),
+                        "targetId": session.target_id if session else None,
+                        "databaseSessionId": session.session_id if session else None,
+                    }
 
-        # 3. Live Session / Verification Query
-        if session and getattr(session, "is_connected", None) and session.is_connected():
-            live_db = session.database_name
-            live_host = session.safe_host
-            live_port = session.safe_port
+        if engine in ("postgres", "postgresql", "supabase", "mongo", "mongodb", "h2"):
+            credentials = cls.get_credential(project_root)
+            resolved_config = {
+                "engine": engine,
+                "host": (cfg.get("host") or {}).get("value") if isinstance(cfg.get("host"), dict) else cfg.get("host"),
+                "database": (cfg.get("database") or {}).get("value") if isinstance(cfg.get("database"), dict) else cfg.get("database"),
+                "port": (cfg.get("port") or {}).get("value") if isinstance(cfg.get("port"), dict) else cfg.get("port"),
+                "username": (cfg.get("username") or {}).get("value") if isinstance(cfg.get("username"), dict) else cfg.get("username"),
+                "connection_uri": credentials.get("connection_uri"),
+            }
+            health = DatabaseIntelligenceEngine.real_connect_and_health_check(project_root, resolved_config)
+            if health.get("connected"):
+                session.connection_state = DatabaseState.CONNECTED
+                session.database_name = health.get("database") or session.database_name
+                session.database_type = health.get("engine") or engine
+                session.safe_host = health.get("host") or session.safe_host
+                session.safe_port = health.get("port") or session.safe_port
+                proof = health.get("health_proof")
+                if proof:
+                    session.health_proof = proof
+                    session.binding.bind_proof(proof)
+                verification_query = health.get("healthQuery") or "SELECT 1"
+                return {
+                    "connected": True,
+                    "database": health.get("database") or session.database_name,
+                    "host": health.get("host") or session.safe_host,
+                    "port": health.get("port") or session.safe_port,
+                    "verificationQuery": verification_query,
+                    "status": "LIVE_VERIFIED",
+                    "engine": session.database_type,
+                    "targetId": session.target_id,
+                    "databaseSessionId": session.session_id,
+                    "evidence": proof.to_dict() if proof else None,
+                }
             return {
-                "connected": True,
-                "database": live_db,
-                "host": live_host,
-                "port": live_port,
-                "verificationQuery": "SELECT DATABASE(), @@hostname, @@port;",
-                "status": "LIVE_VERIFIED",
-                "engine": session.database_type,
+                "connected": False,
+                "status": "FAILED",
+                "engine": engine,
+                "failureClassification": health.get("classification") or DbFailureClassification.HOST_UNREACHABLE,
+                "message": health.get("message"),
                 "targetId": session.target_id,
+                "databaseSessionId": session.session_id,
             }
 
         return {
@@ -2746,6 +3388,7 @@ class ConfigurationSymbolResolver:
         cfg: Dict[str, Any],
         live: Optional[Dict[str, Any]] = None,
         include_file_preview: bool = False,
+        credentials: Optional[Dict[str, Any]] = None,
     ) -> str:
         lines = []
         if (
@@ -2756,28 +3399,34 @@ class ConfigurationSymbolResolver:
         ):
             ext = Path(cfg["configFile"]).suffix.lstrip(".") or "php"
             lines.append(f"### INSPECTED CONFIGURATION FILE: {cfg['configFile']}\n")
-            lines.append(f"```{ext}\n{cfg['fileContent'].strip()}\n```\n")
+            preview = SecretProtector.redact_text(str(cfg["fileContent"]).strip())
+            lines.append(f"```{ext}\n{preview}\n```\n")
         if cfg.get("message"):
             lines.append(f"> Notice: {cfg['message']}\n")
+        if live and live.get("message"):
+            lines.append(f"> Notice: {live['message']}\n")
+        if cfg.get("requestedConfigNotice"):
+            lines.append(f"> Notice: {cfg['requestedConfigNotice']}\n")
 
         lines.append("### DATABASE CONNECTION STATUS\n")
         tgt_id = cfg.get("targetId") or (live.get("targetId") if live else None)
         if tgt_id:
             lines.append(f"- **Target:** {tgt_id}")
-        lines.append(f"- **Engine:** {cfg.get('engine', 'Unknown')}")
+        lines.append(f"- **Engine:** {cfg.get('engine') or 'Unknown'}")
         db_disp_val = cfg.get("activeDatabaseName") or (live.get("database") if live else None) or cfg.get("database", {}).get("value") or "Unknown"
         lines.append(f"- **Database:** {db_disp_val}")
         host_disp_val = cfg.get("host", {}).get("value") or (live.get("host") if live else None) or "Unknown"
         lines.append(f"- **Host:** {host_disp_val}")
-        port_disp_val = cfg.get("port", {}).get("value") or (live.get("port") if live else None) or "Default"
+        port_disp_val = cfg.get("port", {}).get("value") or (live.get("port") if live else None) or "NOT_SPECIFIED"
         lines.append(f"- **Port:** {port_disp_val}")
         is_conn = (live and live.get("connected")) or cfg.get("status") in ("CONNECTED", "LIVE_VERIFIED")
-        lines.append(f"- **Status:** {'CONNECTED' if is_conn else 'DISCONNECTED'}\n")
+        report_status = (live or {}).get("status") or ("LIVE_VERIFIED" if is_conn else "NOT_VERIFIED")
+        lines.append(f"- **Status:** {report_status}\n")
 
         lines.append("#### 1. CONFIGURED DATABASE (Source Code)")
         lines.append(f"- **Configuration File:** {cfg.get('configFile') or 'None'}")
         lines.append(f"- **Active Component:** {cfg.get('activeComponent', 'Unknown')} ({cfg.get('componentClass', 'Unknown')})")
-        lines.append(f"- **Engine:** {cfg.get('engine', 'Unknown')}")
+        lines.append(f"- **Engine:** {cfg.get('engine') or 'Unknown'}")
 
         # Database display
         db_obj = cfg.get("database", {})
@@ -2804,11 +3453,16 @@ class ConfigurationSymbolResolver:
         # Port display
         port_obj = cfg.get("port", {})
         port_val = port_obj.get("value")
-        lines.append(f"- **Port:** {port_val if port_val else 'Default'}")
+        lines.append(f"- **Port:** {port_val if port_val else 'NOT_SPECIFIED'}")
 
         # Username
         user_obj = cfg.get("username", {})
-        u_val = user_obj.get("value") or user_obj.get("symbol") or "N/A"
+        u_val = (
+            (credentials or {}).get("username")
+            or user_obj.get("value")
+            or user_obj.get("symbol")
+            or "N/A"
+        )
         lines.append(f"- **Username:** {u_val}")
         lines.append("- **Password:** [REDACTED]")
         lines.append(f"- **Status:** {cfg.get('status', 'CONFIGURED')}\n")
@@ -2826,7 +3480,7 @@ class ConfigurationSymbolResolver:
             lines.append("- **Connection State:** CONNECTED")
             lines.append(f"- **Live Database:** {live_info.get('database') or 'Unknown'}")
             lines.append(f"- **Live Host:** {live_info.get('host') or 'Unknown'}")
-            lines.append(f"- **Live Port:** {live_info.get('port') or 'Default'}")
+            lines.append(f"- **Live Port:** {live_info.get('port') or 'NOT_REPORTED'}")
             lines.append(f"- **Verification Query:** {live_info.get('verificationQuery', 'SELECT 1')}")
             lines.append(f"- **Verification Status:** {live_info.get('status', 'LIVE_VERIFIED')}")
 
@@ -2844,8 +3498,10 @@ class ConfigurationSymbolResolver:
         else:
             lines.append("- **Connection State:** NOT_CONNECTED")
             lines.append("- **Live Database:** NOT_CONNECTED")
-            lines.append("- **Verification Status:** NOT_VERIFIED")
-            lines.append("> Notice: No live connection established to verify runtime database server identity.")
+            lines.append(f"- **Verification Status:** {live_info.get('status', 'NOT_VERIFIED')}")
+            if live_info.get("failureClassification"):
+                lines.append(f"- **Failure Classification:** {live_info['failureClassification']}")
+            lines.append(f"> Notice: {live_info.get('message') or 'No live connection established to verify runtime database server identity.'}")
 
         return "\n".join(lines)
 
@@ -2869,6 +3525,207 @@ class DatabaseIntelligenceEngine:
         r"^\s*(?:SELECT|EXPLAIN|EXPLAIN\s+ANALYZE|SHOW\s+TABLES|SHOW\s+CREATE\s+TABLE|SHOW\s+INDEXES|DESCRIBE|PRAGMA\s+table_info)\b",
         re.I
     )
+
+    @staticmethod
+    def _config_value(config: Dict[str, Any], name: str) -> Any:
+        value = config.get(name)
+        return value.get("value") if isinstance(value, dict) else value
+
+    @classmethod
+    def _open_mysql_connection(cls, project_root: str, config: Dict[str, Any]) -> Any:
+        import pymysql
+
+        credentials = ConfigurationSymbolResolver.get_credential(project_root)
+        connection_uri = credentials.get("connection_uri") or config.get("connection_uri")
+        uri_config = cls.parse_database_url(connection_uri) if connection_uri else {}
+        return pymysql.connect(
+            host=str(cls._config_value(config, "host") or uri_config.get("host") or ""),
+            port=int(cls._config_value(config, "port") or uri_config.get("port") or 3306),
+            user=str(cls._config_value(config, "username") or credentials.get("username") or uri_config.get("username") or ""),
+            password=str(credentials.get("password") or config.get("password") or uri_config.get("password") or ""),
+            database=cls._config_value(config, "database") or uri_config.get("database") or None,
+            connect_timeout=3,
+            read_timeout=10,
+            write_timeout=5,
+            autocommit=False,
+        )
+
+    @classmethod
+    def _open_postgresql_connection(cls, project_root: str, config: Dict[str, Any]) -> Any:
+        import psycopg
+
+        credentials = ConfigurationSymbolResolver.get_credential(project_root)
+        connection_uri = credentials.get("connection_uri") or config.get("connection_uri")
+        if connection_uri:
+            return psycopg.connect(connection_uri, connect_timeout=3)
+        return psycopg.connect(
+            host=str(cls._config_value(config, "host") or ""),
+            port=int(cls._config_value(config, "port") or 5432),
+            dbname=str(cls._config_value(config, "database") or "postgres"),
+            user=str(cls._config_value(config, "username") or credentials.get("username") or ""),
+            password=str(credentials.get("password") or config.get("password") or ""),
+            connect_timeout=3,
+        )
+
+    @classmethod
+    def _open_mongodb_client(cls, project_root: str, config: Dict[str, Any]) -> Any:
+        from pymongo import MongoClient
+
+        credentials = ConfigurationSymbolResolver.get_credential(project_root)
+        connection_uri = credentials.get("connection_uri") or config.get("connection_uri")
+        if connection_uri:
+            return MongoClient(
+                connection_uri,
+                serverSelectionTimeoutMS=3000,
+                connectTimeoutMS=3000,
+            )
+        host = cls._config_value(config, "host")
+        port = cls._config_value(config, "port") or 27017
+        return MongoClient(
+            f"mongodb://{host}:{int(port)}",
+            username=cls._config_value(config, "username") or credentials.get("username"),
+            password=credentials.get("password") or config.get("password"),
+            serverSelectionTimeoutMS=3000,
+            connectTimeoutMS=3000,
+        )
+
+    @classmethod
+    def _find_h2_jar(cls, project_root: str) -> Optional[str]:
+        configured_jar = os.environ.get("H2_JAR")
+        if configured_jar and os.path.isfile(configured_jar):
+            return configured_jar
+
+        root = Path(project_root) if project_root and os.path.isdir(project_root) else None
+        if root:
+            for relative_dir in ("lib", "libs", "target/dependency", "build/libs", "build/dependencies"):
+                candidate_dir = root / relative_dir
+                if candidate_dir.is_dir():
+                    jars = sorted(candidate_dir.glob("h2-*.jar"))
+                    if jars:
+                        return str(jars[-1])
+
+        home = Path.home()
+        candidate_dirs = [
+            home / ".m2" / "repository" / "com" / "h2database" / "h2",
+            home / ".gradle" / "caches" / "modules-2" / "files-2.1" / "com.h2database" / "h2",
+        ]
+        jars = []
+        for candidate_dir in candidate_dirs:
+            if candidate_dir.is_dir():
+                jars.extend(candidate_dir.glob("**/h2-*.jar"))
+        return str(sorted(jars)[-1]) if jars else None
+
+    @classmethod
+    def _open_h2_connection(cls, project_root: str, config: Dict[str, Any]) -> Any:
+        credentials = ConfigurationSymbolResolver.get_credential(project_root)
+        connection_uri = credentials.get("connection_uri") or config.get("connection_uri")
+        parsed_url = cls.parse_database_url(connection_uri) if connection_uri else {}
+        if not connection_uri or not parsed_url:
+            raise ValueError("A valid jdbc:h2 connection URL was not discovered.")
+        if parsed_url.get("in_memory"):
+            raise ValueError(
+                "H2 in-memory databases belong to the Java application's JVM and cannot be inspected from the separate Coding Agent process."
+            )
+
+        h2_jar = cls._find_h2_jar(project_root)
+        if not h2_jar:
+            raise RuntimeError(
+                "H2 JDBC driver JAR was not found. Add the H2 dependency to the project, install it in Maven/Gradle, or set H2_JAR."
+            )
+        try:
+            import jaydebeapi
+        except ImportError as error:
+            raise RuntimeError("The Python JayDeBeApi adapter is not installed in the Coding Agent backend.") from error
+
+        jdbc_url = connection_uri
+        if parsed_url.get("file_database"):
+            if re.search(r"(?:^|;)ACCESS_MODE_DATA=", jdbc_url, re.I):
+                jdbc_url = re.sub(
+                    r"(?<=;)ACCESS_MODE_DATA=[^;]*",
+                    "ACCESS_MODE_DATA=r",
+                    jdbc_url,
+                    flags=re.I,
+                )
+            else:
+                jdbc_url += ";ACCESS_MODE_DATA=r"
+        username = (
+            cls._config_value(config, "username")
+            or credentials.get("username")
+            or parsed_url.get("username")
+            or "sa"
+        )
+        password = (
+            cls._config_value(config, "password")
+            if cls._config_value(config, "password") is not None
+            else credentials.get("password", parsed_url.get("password") or "")
+        )
+        connection = jaydebeapi.connect(
+            "org.h2.Driver",
+            jdbc_url,
+            [str(username), str(password or "")],
+            h2_jar,
+        )
+        connection.jconn.setReadOnly(True)
+        return connection
+
+    @staticmethod
+    def parse_database_url(connection_uri: str) -> Dict[str, Any]:
+        if connection_uri.lower().startswith("jdbc:h2:"):
+            target = connection_uri[len("jdbc:h2:"):].split(";", 1)[0]
+            options = {
+                key.strip().upper(): value.strip()
+                for key, value in re.findall(r"(?:^|;)\s*([A-Z_]+)\s*=\s*([^;]*)", connection_uri, re.I)
+            }
+            tcp_match = re.match(r"(?:tcp|ssl)://([^/:]+)(?::(\d+))?/(.+)", target, re.I)
+            in_memory = bool(re.match(r"mem:", target, re.I))
+            if tcp_match:
+                database = tcp_match.group(3).split(";", 1)[0].rsplit("/", 1)[-1] or None
+                host = tcp_match.group(1)
+                port = int(tcp_match.group(2) or 9092)
+                file_database = False
+            else:
+                local_target = target.removeprefix("file:") if target.lower().startswith("file:") else target
+                database = local_target.rsplit("/", 1)[-1] or None
+                host = None
+                port = None
+                file_database = not in_memory
+            if database:
+                database = re.sub(r"\.(?:mv\.db|h2\.db)$", "", database, flags=re.I)
+            return {
+                "engine": "h2",
+                "host": host,
+                "port": port,
+                "database": database,
+                "username": options.get("USER", "").strip("'\"") or None,
+                "password": options.get("PASSWORD", "").strip("'\"") or None,
+                "connection_uri": connection_uri,
+                "in_memory": in_memory,
+                "file_database": file_database,
+            }
+
+        parsed = urlparse(connection_uri)
+        scheme = parsed.scheme.lower()
+        if scheme in ("postgres", "postgresql"):
+            engine, default_port = "postgresql", 5432
+        elif scheme in ("mongodb", "mongodb+srv"):
+            engine, default_port = "mongodb", 27017
+        elif scheme in ("mysql", "mariadb"):
+            engine, default_port = "mysql", 3306
+        else:
+            return {}
+        try:
+            port = parsed.port or default_port
+        except ValueError:
+            return {}
+        return {
+            "engine": engine,
+            "host": parsed.hostname,
+            "port": port,
+            "database": unquote(parsed.path.lstrip("/")) or None,
+            "username": unquote(parsed.username) if parsed.username else None,
+            "password": unquote(parsed.password) if parsed.password else None,
+            "connection_uri": connection_uri,
+        }
 
     @classmethod
     def is_destructive_sql(cls, sql: str) -> bool:
@@ -3065,6 +3922,12 @@ class DatabaseIntelligenceEngine:
                 discovered_info["sqlite_file"] = res_cfg.get("sqliteFile")
             discovered_info["evidence"].append(f"Authoritative config resolved from {res_cfg.get('configFile')}")
             discovered_info["_symbol_details"] = res_cfg
+            if (
+                str(res_cfg.get("configFile") or "").lower().startswith(".env")
+                and discovered_info["engine"] == "unknown"
+                and not any(discovered_info.get(field) for field in ("database", "host", "username"))
+            ):
+                discovered_info["discovered"] = False
 
         # Scan for db config files only if not yet discovered
         found_files = []
@@ -3073,6 +3936,9 @@ class DatabaseIntelligenceEngine:
                 "config/db*.php", "config/database*.php", "config/main-local.php",
                 "config/*.php", "settings.py", "application*.properties",
                 "application*.yml", "schema.prisma", "ormconfig.*",
+                "src/main/resources/application*.properties",
+                "src/main/resources/application*.yml",
+                "src/main/resources/application*.yaml",
                 ".env", ".env.local", ".env.production",
             ]
             for pat in config_patterns:
@@ -3109,10 +3975,20 @@ class DatabaseIntelligenceEngine:
                         discovered_info["port"] = 3306
                     if not discovered_info["configFile"]:
                         discovered_info["configFile"] = rel_path
+                elif re.search(r"\bmongodb(?:\+srv)?\b|\bMONGODB_URI\b", content, re.I):
+                    if discovered_info["engine"] == "unknown":
+                        discovered_info["engine"] = "mongodb"
+                        discovered_info["port"] = 27017
+                    if not discovered_info["configFile"]:
+                        discovered_info["configFile"] = rel_path
                 elif re.search(r"\b(?:pgsql|postgres|postgresql)\b", content, re.I):
                     if discovered_info["engine"] == "unknown":
                         discovered_info["engine"] = "postgresql"
                         discovered_info["port"] = 5432
+                    if not discovered_info["configFile"]:
+                        discovered_info["configFile"] = rel_path
+                elif re.search(r"\bjdbc:h2:", content, re.I):
+                    discovered_info["engine"] = "h2"
                     if not discovered_info["configFile"]:
                         discovered_info["configFile"] = rel_path
                 elif re.search(r"\b(?:sqlite3?|db\.sqlite3)\b", content, re.I):
@@ -3135,9 +4011,31 @@ class DatabaseIntelligenceEngine:
                                 discovered_info["engine"] = "mysql"
                             elif "pgsql" in v.lower() or "postgres" in v.lower():
                                 discovered_info["engine"] = "postgresql"
+                            elif "h2" in v.lower():
+                                discovered_info["engine"] = "h2"
                             elif "sqlite" in v.lower():
                                 discovered_info["engine"] = "sqlite"
                             discovered_info["configFile"] = rel_path
+                        elif k in (
+                            "DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL",
+                            "SUPABASE_DB_URL", "SUPABASE_DATABASE_URL",
+                            "MONGO_URL", "MONGODB_URI", "MONGODB_URL",
+                            "SPRING.DATASOURCE.URL",
+                        ):
+                            connection = cls.parse_database_url(v)
+                            if connection:
+                                discovered_info.update({
+                                    key: value for key, value in connection.items()
+                                    if value is not None
+                                })
+                                discovered_info["discovered"] = True
+                                discovered_info["configFile"] = rel_path
+                                ConfigurationSymbolResolver.store_credential(
+                                    project_root,
+                                    username=connection.get("username"),
+                                    password=connection.get("password"),
+                                    connection_uri=connection.get("connection_uri"),
+                                )
                         elif k in ("DB_HOST", "DATABASE_HOST") and not discovered_info["host"]:
                             discovered_info["host"] = v
                         elif k in ("DB_PORT", "DATABASE_PORT") and not discovered_info["port"]:
@@ -3273,7 +4171,7 @@ class DatabaseIntelligenceEngine:
         """
         Executes or prepares a safe minimal diagnostic health check query (SELECT 1).
         """
-        engine = (db_info.get("engine") or "mysql").lower()
+        engine = (db_info.get("engine") or "unknown").lower()
         query = "SELECT 1" if engine != "sqlite" else "SELECT 1"
         return {
             "healthQuery": query,
@@ -3293,6 +4191,7 @@ class DatabaseIntelligenceEngine:
         tables = []
         source = "project_metadata"
         root = Path(project_root) if project_root and os.path.isdir(project_root) else None
+        db_type = str((db_info or {}).get("engine") or "").lower()
 
         if root:
             # Check for real SQLite database files
@@ -3315,7 +4214,7 @@ class DatabaseIntelligenceEngine:
                         continue
 
             # If no tables found from real sqlite, scan models & migrations dynamically
-            if not tables:
+            if not tables and db_type not in ("postgres", "postgresql", "supabase", "mongo", "mongodb"):
                 found_tables = set()
                 # Scan SQL migrations/schemas
                 for sql_file in list(root.glob("**/*.sql"))[:15]:
@@ -3365,7 +4264,7 @@ class DatabaseIntelligenceEngine:
         Verifies actual connectivity rather than merely validating config strings.
         Updates explicit database state to HEALTH_CHECKED with live DatabaseExecutionProof.
         """
-        engine = (db_info.get("engine") or "mysql").lower()
+        engine = (db_info.get("engine") or "unknown").lower()
         root = Path(project_root) if project_root and os.path.isdir(project_root) else None
 
         # Check for real SQLite database
@@ -3429,6 +4328,25 @@ class DatabaseIntelligenceEngine:
                         "classification": cls.classify_db_error(str(e)),
                         "engine": "sqlite",
                     }
+
+        has_database_target = any(
+            db_info.get(key)
+            for key in ("host", "database", "sqlite_file", "connection_uri")
+        )
+        if engine in ("", "unknown", "unverified") and not has_database_target:
+            return {
+                "state": DatabaseState.DISCONNECTED,
+                "status": "NOT_CONFIGURED",
+                "connected": False,
+                "healthCheck": "NOT_ATTEMPTED",
+                "healthQuery": None,
+                "timing_ms": None,
+                "database": None,
+                "engine": "unknown",
+                "host": None,
+                "port": None,
+                "message": "No authoritative project database target is configured.",
+            }
 
         # Check for real MySQL connection
         if engine == "mysql":
@@ -3502,6 +4420,205 @@ class DatabaseIntelligenceEngine:
                         "host": target_host,
                     }
 
+        if engine in ("postgres", "postgresql", "supabase"):
+            target_host = (db_info.get("host") or {}).get("value") if isinstance(db_info.get("host"), dict) else db_info.get("host")
+            target_db = (db_info.get("database") or {}).get("value") if isinstance(db_info.get("database"), dict) else db_info.get("database")
+            target_port = (db_info.get("port") or {}).get("value") if isinstance(db_info.get("port"), dict) else (db_info.get("port") or 5432)
+            target_user = (db_info.get("username") or {}).get("value") if isinstance(db_info.get("username"), dict) else db_info.get("username")
+            credentials = ConfigurationSymbolResolver.get_credential(project_root)
+            connection_uri = credentials.get("connection_uri") or db_info.get("connection_uri")
+            if connection_uri or target_host:
+                try:
+                    started_at = time.perf_counter()
+                    connection = cls._open_postgresql_connection(project_root, db_info)
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT 1")
+                        row = cursor.fetchone()
+                        cursor.execute("SELECT current_database(), inet_server_addr()::text, inet_server_port()")
+                        identity = cursor.fetchone()
+                    connection.close()
+                    if row and row[0] == 1:
+                        measured = max(round((time.perf_counter() - started_at) * 1000.0, 3), 0.01)
+                        proof = DatabaseExecutionProof(
+                            operation=DatabaseCapability.DATABASE_HEALTH_CHECK,
+                            engine="postgresql",
+                            mode="LIVE",
+                            source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                            execution_status="SUCCESS",
+                            execution_time_ms=measured,
+                            rows_returned=1,
+                            query="SELECT 1",
+                        )
+                        DatabaseEvidenceStore.record_proof(proof)
+                        return {
+                            "state": DatabaseState.HEALTH_CHECKED,
+                            "status": "CONNECTED",
+                            "connected": True,
+                            "healthCheck": "HEALTHY",
+                            "healthQuery": "SELECT 1",
+                            "timing_ms": measured,
+                            "database": (identity[0] if identity else None) or target_db,
+                            "engine": "postgresql",
+                            "host": (identity[1] if identity else None) or target_host,
+                            "port": (identity[2] if identity else None) or target_port,
+                            "driver": "psycopg",
+                            "client": db_info.get("existing_utility") or "Project Database Driver",
+                            "evidenceId": proof.evidence_id,
+                            "health_proof": proof,
+                        }
+                except Exception as error:
+                    return {
+                        "state": DatabaseState.FAILED,
+                        "status": "FAILED",
+                        "connected": False,
+                        "healthCheck": "FAILED",
+                        "healthQuery": "SELECT 1",
+                        "timing_ms": None,
+                        "classification": cls.classify_db_error(str(error)),
+                        "engine": "postgresql",
+                        "database": target_db,
+                        "host": target_host,
+                    }
+
+        if engine == "h2":
+            try:
+                started_at = time.perf_counter()
+                connection = cls._open_h2_connection(project_root, db_info)
+                try:
+                    cursor = connection.cursor()
+                    cursor.execute("SELECT 1")
+                    row = cursor.fetchone()
+                finally:
+                    connection.close()
+                if row and row[0] == 1:
+                    parsed_url = cls.parse_database_url(
+                        ConfigurationSymbolResolver.get_credential(project_root).get("connection_uri")
+                        or db_info.get("connection_uri")
+                        or ""
+                    )
+                    measured = max(round((time.perf_counter() - started_at) * 1000.0, 3), 0.01)
+                    proof = DatabaseExecutionProof(
+                        operation=DatabaseCapability.DATABASE_HEALTH_CHECK,
+                        engine="h2",
+                        mode="LIVE",
+                        source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                        execution_status="SUCCESS",
+                        execution_time_ms=measured,
+                        rows_returned=1,
+                        query="SELECT 1",
+                    )
+                    DatabaseEvidenceStore.record_proof(proof)
+                    return {
+                        "state": DatabaseState.HEALTH_CHECKED,
+                        "status": "CONNECTED",
+                        "connected": True,
+                        "healthCheck": "HEALTHY",
+                        "healthQuery": "SELECT 1",
+                        "timing_ms": measured,
+                        "database": db_info.get("database") or parsed_url.get("database"),
+                        "engine": "h2",
+                        "host": db_info.get("host") or parsed_url.get("host"),
+                        "port": db_info.get("port") or parsed_url.get("port"),
+                        "driver": "H2 JDBC",
+                        "client": db_info.get("existing_utility") or "Project Database Driver",
+                        "evidenceId": proof.evidence_id,
+                        "health_proof": proof,
+                    }
+            except Exception as error:
+                parsed_url = cls.parse_database_url(
+                    ConfigurationSymbolResolver.get_credential(project_root).get("connection_uri")
+                    or db_info.get("connection_uri")
+                    or ""
+                )
+                unsupported_memory = bool(parsed_url.get("in_memory"))
+                safe_runtime_message = next(
+                    (
+                        known_message
+                        for known_message in (
+                            "H2 JDBC driver JAR was not found.",
+                            "The Python JayDeBeApi adapter is not installed in the Coding Agent backend.",
+                        )
+                        if str(error).startswith(known_message)
+                    ),
+                    None,
+                )
+                return {
+                    "state": DatabaseState.FAILED,
+                    "status": "FAILED",
+                    "connected": False,
+                    "healthCheck": "FAILED",
+                    "healthQuery": "SELECT 1",
+                    "timing_ms": None,
+                    "classification": (
+                        "H2_IN_MEMORY_NOT_ACCESSIBLE"
+                        if unsupported_memory
+                        else cls.classify_db_error(str(error))
+                    ),
+                    "message": (
+                        "H2 in-memory databases are scoped to the Java application's JVM; use a file-based URL or an H2 TCP server URL."
+                        if unsupported_memory
+                        else safe_runtime_message
+                        if safe_runtime_message
+                        else "H2 connection failed; verify the URL, H2 server, and credentials."
+                    ),
+                    "engine": "h2",
+                    "database": db_info.get("database"),
+                }
+
+        if engine in ("mongo", "mongodb"):
+            target_host = (db_info.get("host") or {}).get("value") if isinstance(db_info.get("host"), dict) else db_info.get("host")
+            target_port = (db_info.get("port") or {}).get("value") if isinstance(db_info.get("port"), dict) else (db_info.get("port") or 27017)
+            credentials = ConfigurationSymbolResolver.get_credential(project_root)
+            connection_uri = credentials.get("connection_uri") or db_info.get("connection_uri")
+            if connection_uri or target_host:
+                try:
+                    started_at = time.perf_counter()
+                    client = cls._open_mongodb_client(project_root, db_info)
+                    client.admin.command("ping")
+                    address = client.address
+                    client.close()
+                    measured = max(round((time.perf_counter() - started_at) * 1000.0, 3), 0.01)
+                    proof = DatabaseExecutionProof(
+                        operation=DatabaseCapability.DATABASE_HEALTH_CHECK,
+                        engine="mongodb",
+                        mode="LIVE",
+                        source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                        execution_status="SUCCESS",
+                        execution_time_ms=measured,
+                        rows_returned=1,
+                        query="admin.command('ping')",
+                    )
+                    DatabaseEvidenceStore.record_proof(proof)
+                    return {
+                        "state": DatabaseState.HEALTH_CHECKED,
+                        "status": "CONNECTED",
+                        "connected": True,
+                        "healthCheck": "HEALTHY",
+                        "healthQuery": "admin.command('ping')",
+                        "timing_ms": measured,
+                        "database": db_info.get("database"),
+                        "engine": "mongodb",
+                        "host": address[0] if address else target_host,
+                        "port": address[1] if address else target_port,
+                        "driver": "pymongo",
+                        "client": db_info.get("existing_utility") or "Project Database Driver",
+                        "evidenceId": proof.evidence_id,
+                        "health_proof": proof,
+                    }
+                except Exception as error:
+                    return {
+                        "state": DatabaseState.FAILED,
+                        "status": "FAILED",
+                        "connected": False,
+                        "healthCheck": "FAILED",
+                        "healthQuery": "admin.command('ping')",
+                        "timing_ms": None,
+                        "classification": cls.classify_db_error(str(error)),
+                        "engine": "mongodb",
+                        "database": db_info.get("database"),
+                        "host": target_host,
+                    }
+
         # For non-sqlite databases without a verified reachable host:
         # Never fabricate connected=True or hardcoded 1.2ms latency!
         return {
@@ -3531,44 +4648,390 @@ class DatabaseIntelligenceEngine:
         schema_details: Dict[str, Any] = {}
         source = DatabaseEvidenceSource.UNVERIFIED
         code_referenced_tables: List[str] = []
+        relationships: List[Dict[str, Any]] = []
+        views: List[str] = []
+        schema_error = None
 
         if root:
             # Check for real SQLite database files
-            sqlite_files = list(root.glob("**/*.sqlite")) + list(root.glob("**/*.sqlite3")) + list(root.glob("**/*.db"))
-            sqlite_files = [f for f in sqlite_files if not any(x in str(f).lower() for x in ("node_modules", ".git", "vendor"))]
-            if sqlite_files:
+            configured_sqlite_file = (db_info or {}).get("sqlite_file")
+            if configured_sqlite_file and not Path(configured_sqlite_file).is_absolute():
+                configured_path = root / configured_sqlite_file
+                if configured_path.is_file():
+                    configured_sqlite_file = str(configured_path)
+                elif Path(configured_sqlite_file).parent == Path("."):
+                    matching_files = [
+                        candidate
+                        for candidate in root.rglob(Path(configured_sqlite_file).name)
+                        if candidate.is_file()
+                        and not any(
+                            ignored in str(candidate).lower()
+                            for ignored in ("node_modules", ".git", "vendor")
+                        )
+                    ]
+                    if len(matching_files) == 1:
+                        configured_sqlite_file = str(matching_files[0])
+                    elif len(matching_files) > 1:
+                        schema_error = "DATABASE_TARGET_AMBIGUOUS"
+                    else:
+                        schema_error = "DATABASE_NOT_FOUND"
+                else:
+                    schema_error = "DATABASE_NOT_FOUND"
+            if configured_sqlite_file:
+                sqlite_files = (
+                    [Path(configured_sqlite_file)]
+                    if not schema_error
+                    else []
+                )
+            else:
+                sqlite_files = (
+                    list(root.glob("**/*.sqlite"))
+                    + list(root.glob("**/*.sqlite3"))
+                    + list(root.glob("**/*.db"))
+                )
+            sqlite_files = [
+                f for f in sqlite_files
+                if not any(x in str(f).lower() for x in ("node_modules", ".git", "vendor"))
+            ]
+            engine = str((db_info or {}).get("engine") or "").lower()
+            if engine == "sqlite" and configured_sqlite_file and not Path(configured_sqlite_file).is_file():
+                schema_error = schema_error or "DATABASE_NOT_FOUND"
+            elif sqlite_files and engine in ("", "sqlite"):
                 import sqlite3
                 sqf = sqlite_files[0]
                 try:
                     conn = sqlite3.connect(f"file:{sqf}?mode=ro", uri=True)
                     cur = conn.cursor()
-                    cur.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%';")
+                    cur.execute(
+                        "SELECT name, type FROM sqlite_master "
+                        "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' "
+                        "ORDER BY name;"
+                    )
                     rows = cur.fetchall()
+                    source = DatabaseEvidenceSource.LIVE_DB_EXECUTION
                     if rows:
-                        live_tables = [r[0] for r in rows]
-                        source = DatabaseEvidenceSource.LIVE_DB_EXECUTION
-                        for t in live_tables:
+                        live_tables = [str(row[0]) for row in rows]
+                        views = [str(row[0]) for row in rows if row[1] == "view"]
+                        for t, table_type in rows:
+                            escaped_table = str(t).replace('"', '""')
                             # Columns
-                            cur.execute(f'PRAGMA table_info("{t}");')
+                            cur.execute(f'PRAGMA table_info("{escaped_table}");')
                             col_rows = cur.fetchall()
                             cols = [{"name": c[1], "type": c[2], "notnull": bool(c[3]), "pk": bool(c[5])} for c in col_rows]
                             # Indexes
-                            cur.execute(f'PRAGMA index_list("{t}");')
+                            cur.execute(f'PRAGMA index_list("{escaped_table}");')
                             idx_rows = cur.fetchall()
                             indexes = []
                             for idx in idx_rows:
                                 idx_name = idx[1]
-                                cur.execute(f'PRAGMA index_info("{idx_name}");')
+                                escaped_index = str(idx_name).replace('"', '""')
+                                cur.execute(f'PRAGMA index_info("{escaped_index}");')
                                 idx_cols = [c[2] for c in cur.fetchall()]
                                 indexes.append({"name": idx_name, "unique": bool(idx[2]), "columns": idx_cols})
+                            cur.execute(f'PRAGMA foreign_key_list("{escaped_table}");')
+                            foreign_keys = [
+                                {
+                                    "name": None,
+                                    "columns": [str(row[3])],
+                                    "referencedTable": str(row[2]),
+                                    "referencedColumns": [str(row[4])],
+                                    "provenance": "database_foreign_key",
+                                }
+                                for row in cur.fetchall()
+                            ]
+                            relationships.extend(
+                                {"table": str(t), **foreign_key}
+                                for foreign_key in foreign_keys
+                            )
                             schema_details[t] = {
                                 "columns": cols,
                                 "indexes": indexes,
                                 "primary_keys": [c["name"] for c in cols if c["pk"]],
+                                "foreign_keys": foreign_keys,
+                                "table_type": str(table_type).upper(),
                             }
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as error:
+                    schema_error = cls.classify_db_error(str(error))
+
+            if engine in ("mysql", "mariadb"):
+                try:
+                    connection = cls._open_mysql_connection(project_root, db_info or {})
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.tables "
+                            "WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME LIMIT 200"
+                        )
+                        table_rows = cursor.fetchall()
+                        live_tables = [str(row[0]) for row in table_rows]
+                        views = [str(row[0]) for row in table_rows if str(row[1]).upper() == "VIEW"]
+                        for table_name, table_type in table_rows:
+                            table_name = str(table_name)
+                            cursor.execute(
+                                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, "
+                                "COLUMN_KEY, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE "
+                                "FROM information_schema.columns "
+                                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+                                "ORDER BY ORDINAL_POSITION",
+                                (table_name,),
+                            )
+                            columns = [
+                                {
+                                    "name": row[0],
+                                    "type": row[1],
+                                    "notnull": row[2] == "NO",
+                                    "default": row[3],
+                                    "generated": bool(row[4] and "GENERATED" in str(row[4]).upper()),
+                                    "auto_increment": bool(row[4] and "AUTO_INCREMENT" in str(row[4]).upper()),
+                                    "pk": str(row[5] or "").upper() == "PRI",
+                                    "length": row[6],
+                                    "precision": row[7],
+                                    "scale": row[8],
+                                }
+                                for row in cursor.fetchall()
+                            ]
+                            cursor.execute(
+                                "SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, INDEX_TYPE "
+                                "FROM information_schema.statistics "
+                                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+                                "ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+                                (table_name,),
+                            )
+                            indexes_by_name: Dict[str, Dict[str, Any]] = {}
+                            for index_name, non_unique, _sequence, column_name, index_type in cursor.fetchall():
+                                index = indexes_by_name.setdefault(
+                                    str(index_name),
+                                    {
+                                        "name": str(index_name),
+                                        "unique": not bool(non_unique),
+                                        "type": str(index_type),
+                                        "columns": [],
+                                    },
+                                )
+                                if column_name is not None:
+                                    index["columns"].append(str(column_name))
+                            cursor.execute(
+                                "SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, "
+                                "CONSTRAINT_NAME, ORDINAL_POSITION "
+                                "FROM information_schema.key_column_usage "
+                                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s "
+                                "AND REFERENCED_TABLE_NAME IS NOT NULL "
+                                "ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+                                (table_name,),
+                            )
+                            foreign_keys_by_name: Dict[str, Dict[str, Any]] = {}
+                            for column, referenced_table, referenced_column, constraint_name, _position in cursor.fetchall():
+                                foreign_key = foreign_keys_by_name.setdefault(
+                                    str(constraint_name),
+                                    {
+                                        "name": str(constraint_name),
+                                        "columns": [],
+                                        "referencedTable": str(referenced_table),
+                                        "referencedColumns": [],
+                                        "provenance": "database_foreign_key",
+                                    },
+                                )
+                                foreign_key["columns"].append(str(column))
+                                foreign_key["referencedColumns"].append(str(referenced_column))
+                            foreign_keys = list(foreign_keys_by_name.values())
+                            relationships.extend(
+                                {"table": table_name, **foreign_key}
+                                for foreign_key in foreign_keys
+                            )
+                            schema_details[table_name] = {
+                                "columns": columns,
+                                "indexes": list(indexes_by_name.values()),
+                                "primary_keys": [column["name"] for column in columns if column["pk"]],
+                                "foreign_keys": foreign_keys,
+                                "table_type": str(table_type).upper(),
+                            }
+                    finally:
+                        connection.close()
+                    source = DatabaseEvidenceSource.LIVE_DB_EXECUTION
+                except Exception as error:
+                    schema_error = cls.classify_db_error(str(error))
+            elif engine in ("postgres", "postgresql", "supabase"):
+                try:
+                    connection = cls._open_postgresql_connection(project_root, db_info or {})
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            "SELECT table_name, table_type FROM information_schema.tables "
+                            "WHERE table_schema = current_schema() "
+                            "AND table_type IN ('BASE TABLE', 'VIEW') "
+                            "ORDER BY table_name LIMIT 200"
+                        )
+                        table_rows = cursor.fetchall()
+                        live_tables = [str(row[0]) for row in table_rows]
+                        views = [str(row[0]) for row in table_rows if str(row[1]).upper() == "VIEW"]
+                        for table, table_type in table_rows:
+                            table = str(table)
+                            cursor.execute(
+                                "SELECT c.column_name, c.data_type, c.is_nullable, "
+                                "EXISTS (SELECT 1 FROM information_schema.table_constraints tc "
+                                "JOIN information_schema.key_column_usage kcu "
+                                "ON tc.constraint_name = kcu.constraint_name "
+                                "AND tc.table_schema = kcu.table_schema "
+                                "WHERE tc.constraint_type = 'PRIMARY KEY' "
+                                "AND tc.table_schema = current_schema() "
+                                "AND tc.table_name = c.table_name "
+                                "AND kcu.column_name = c.column_name) "
+                                "FROM information_schema.columns c "
+                                "WHERE c.table_schema = current_schema() AND c.table_name = %s "
+                                "ORDER BY c.ordinal_position",
+                                (table,),
+                            )
+                            columns = [
+                                {"name": row[0], "type": row[1], "notnull": row[2] == "NO", "pk": bool(row[3])}
+                                for row in cursor.fetchall()
+                            ]
+                            cursor.execute(
+                                "SELECT indexname, indexdef FROM pg_indexes "
+                                "WHERE schemaname = current_schema() AND tablename = %s",
+                                (table,),
+                            )
+                            indexes = [
+                                {"name": row[0], "unique": "UNIQUE INDEX" in str(row[1]).upper(), "definition": row[1]}
+                                for row in cursor.fetchall()
+                            ]
+                            cursor.execute(
+                                "SELECT kcu.constraint_name, kcu.column_name, "
+                                "ccu.table_name AS referenced_table, ccu.column_name AS referenced_column, "
+                                "kcu.ordinal_position "
+                                "FROM information_schema.key_column_usage kcu "
+                                "JOIN information_schema.constraint_column_usage ccu "
+                                "ON ccu.constraint_name = kcu.constraint_name "
+                                "AND ccu.constraint_schema = kcu.constraint_schema "
+                                "WHERE kcu.table_schema = current_schema() "
+                                "AND kcu.table_name = %s AND kcu.position_in_unique_constraint IS NOT NULL "
+                                "ORDER BY kcu.constraint_name, kcu.ordinal_position",
+                                (table,),
+                            )
+                            foreign_keys_by_name: Dict[str, Dict[str, Any]] = {}
+                            for constraint_name, column, referenced_table, referenced_column, _position in cursor.fetchall():
+                                foreign_key = foreign_keys_by_name.setdefault(
+                                    str(constraint_name),
+                                    {
+                                        "name": str(constraint_name),
+                                        "columns": [],
+                                        "referencedTable": str(referenced_table),
+                                        "referencedColumns": [],
+                                        "provenance": "database_foreign_key",
+                                    },
+                                )
+                                foreign_key["columns"].append(str(column))
+                                foreign_key["referencedColumns"].append(str(referenced_column))
+                            foreign_keys = list(foreign_keys_by_name.values())
+                            relationships.extend(
+                                {"table": table, **foreign_key}
+                                for foreign_key in foreign_keys
+                            )
+                            schema_details[table] = {
+                                "columns": columns,
+                                "indexes": indexes,
+                                "primary_keys": [column["name"] for column in columns if column["pk"]],
+                                "foreign_keys": foreign_keys,
+                                "table_type": str(table_type).upper(),
+                            }
+                    finally:
+                        connection.close()
+                    source = DatabaseEvidenceSource.LIVE_DB_EXECUTION
+                except Exception as error:
+                    schema_error = cls.classify_db_error(str(error))
+            elif engine == "h2":
+                try:
+                    connection = cls._open_h2_connection(project_root, db_info or {})
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                            "WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') "
+                            "ORDER BY TABLE_NAME"
+                        )
+                        live_tables = [str(row[0]) for row in cursor.fetchall()]
+                        for table in live_tables:
+                            cursor.execute(
+                                "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE "
+                                "FROM INFORMATION_SCHEMA.COLUMNS "
+                                "WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_NAME = ? "
+                                "ORDER BY ORDINAL_POSITION",
+                                (table,),
+                            )
+                            columns = [
+                                {"name": row[0], "type": row[1], "notnull": row[2] == "NO", "pk": False}
+                                for row in cursor.fetchall()
+                            ]
+                            cursor.execute(
+                                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
+                                "WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_NAME = ? "
+                                "AND CONSTRAINT_NAME IN (SELECT CONSTRAINT_NAME "
+                                "FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS "
+                                "WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_NAME = ? "
+                                "AND CONSTRAINT_TYPE = 'PRIMARY KEY')",
+                                (table, table),
+                            )
+                            primary_keys = {str(row[0]) for row in cursor.fetchall()}
+                            for column in columns:
+                                column["pk"] = column["name"] in primary_keys
+                            cursor.execute(
+                                "SELECT I.INDEX_NAME, I.INDEX_TYPE_NAME, C.COLUMN_NAME "
+                                "FROM INFORMATION_SCHEMA.INDEXES I "
+                                "JOIN INFORMATION_SCHEMA.INDEX_COLUMNS C "
+                                "ON C.INDEX_SCHEMA = I.INDEX_SCHEMA AND C.INDEX_NAME = I.INDEX_NAME "
+                                "WHERE I.TABLE_SCHEMA = 'PUBLIC' AND I.TABLE_NAME = ? "
+                                "ORDER BY I.INDEX_NAME, C.ORDINAL_POSITION",
+                                (table,),
+                            )
+                            indexes_by_name: Dict[str, Dict[str, Any]] = {}
+                            for index_name, index_type, column_name in cursor.fetchall():
+                                index = indexes_by_name.setdefault(
+                                    str(index_name),
+                                    {
+                                        "name": str(index_name),
+                                        "unique": str(index_type).upper().startswith(("UNIQUE", "PRIMARY KEY")),
+                                        "columns": [],
+                                    },
+                                )
+                                if column_name:
+                                    index["columns"].append(str(column_name))
+                            schema_details[table] = {
+                                "columns": columns,
+                                "indexes": list(indexes_by_name.values()),
+                                "primary_keys": sorted(primary_keys),
+                            }
+                    finally:
+                        connection.close()
+                    source = DatabaseEvidenceSource.LIVE_DB_EXECUTION
+                except Exception as error:
+                    schema_error = cls.classify_db_error(str(error))
+            elif engine in ("mongo", "mongodb"):
+                try:
+                    client = cls._open_mongodb_client(project_root, db_info or {})
+                    try:
+                        database = client[str((db_info or {}).get("database") or "admin")]
+                        live_tables = database.list_collection_names()
+                        for collection_name in live_tables[:200]:
+                            collection = database[collection_name]
+                            sample = collection.find_one()
+                            columns = [
+                                {"name": name, "type": type(value).__name__, "notnull": value is not None, "pk": name == "_id"}
+                                for name, value in (sample or {}).items()
+                            ]
+                            indexes = [
+                                {"name": name, "unique": bool(details.get("unique")), "keys": details.get("key", [])}
+                                for name, details in collection.index_information().items()
+                            ]
+                            schema_details[collection_name] = {
+                                "columns": columns,
+                                "indexes": indexes,
+                                "primary_keys": ["_id"] if sample and "_id" in sample else [],
+                            }
+                    finally:
+                        client.close()
+                    source = DatabaseEvidenceSource.LIVE_DB_EXECUTION
+                except Exception as error:
+                    schema_error = cls.classify_db_error(str(error))
 
             # Scan models & migrations for code-level references
             found_tables = set()
@@ -3596,9 +5059,11 @@ class DatabaseIntelligenceEngine:
         # Build execution proof if live execution succeeded
         evidence_id = None
         if source == DatabaseEvidenceSource.LIVE_DB_EXECUTION:
+            schema_engine = str((db_info or {}).get("engine") or "sqlite").lower()
             proof = DatabaseExecutionProof(
+                database_session_id=(db_info or {}).get("database_session_id"),
                 operation=DatabaseCapability.DATABASE_LIST_TABLES,
-                engine="sqlite",
+                engine=schema_engine,
                 mode="LIVE",
                 source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
                 execution_status="SUCCESS",
@@ -3613,13 +5078,16 @@ class DatabaseIntelligenceEngine:
             "tables": live_tables,
             "count": len(live_tables),
             "live_tables": live_tables,
+            "views": views,
             "code_referenced_tables": code_referenced_tables,
             "schema_details": schema_details,
+            "relationships": relationships,
             "source": source,
             "schema_source": source,
-            "status": "SUCCESS" if live_tables else ("CODE_REFERENCES_ONLY" if code_referenced_tables else "NO_SCHEMA_FOUND"),
+            "status": "SUCCESS" if source == DatabaseEvidenceSource.LIVE_DB_EXECUTION else ("DATABASE_ERROR" if schema_error else "CODE_REFERENCES_ONLY" if code_referenced_tables else "NO_SCHEMA_FOUND"),
             "database": (db_info or {}).get("database"),
             "engine": (db_info or {}).get("engine") or "sqlite",
+            "error": schema_error,
             "evidenceId": evidence_id,
             "schema_evidence_id": evidence_id,
         }
@@ -3709,7 +5177,7 @@ class DatabaseIntelligenceEngine:
         db_name = (db_info or {}).get("database")
 
         # Check for real SQLite DB
-        if root:
+        if root and engine == "sqlite":
             sqlite_files = list(root.glob("**/*.sqlite")) + list(root.glob("**/*.sqlite3")) + list(root.glob("**/*.db"))
             sqlite_files = [f for f in sqlite_files if not any(x in str(f).lower() for x in ("node_modules", ".git", "vendor"))]
             if sqlite_files:
@@ -3789,6 +5257,61 @@ class DatabaseIntelligenceEngine:
                 except Exception:
                     pass
 
+        if engine in ("postgres", "postgresql", "supabase", "h2"):
+            execution = cls.execute_safe_query(project_root, query, db_info)
+            if execution.get("ok"):
+                explain = cls.execute_safe_query(project_root, f"EXPLAIN {query}", db_info)
+                plan_rows = explain.get("rows", []) if explain.get("ok") else []
+                plan_output = "\n".join(
+                    str(value)
+                    for row in plan_rows
+                    for value in row.values()
+                )
+                q_fp = DatabaseExecutionProof.compute_fingerprint(query)
+                plan_fp = q_fp if plan_rows else None
+                index_match = re.search(r"\b(?:Index Scan|Index Only Scan)\s+using\s+([^\s]+)", plan_output, re.I)
+                seq_scan = bool(re.search(r"\bSeq Scan\b", plan_output, re.I))
+                index_used = index_match.group(1) if index_match else ("None (Sequential Scan)" if seq_scan else "INDEX_INFORMATION_UNAVAILABLE")
+                access_type = "index" if index_match else "ALL" if seq_scan else "UNVERIFIED"
+                measured_timing = max(float(execution.get("timingMs") or 0), 0.01)
+                proof = DatabaseExecutionProof(
+                    operation=DatabaseCapability.DATABASE_EXPLAIN,
+                    engine=engine,
+                    mode="LIVE",
+                    source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                    execution_status="SUCCESS",
+                    execution_time_ms=measured_timing,
+                    rows_returned=len(execution.get("rows") or []),
+                    query=query,
+                    query_fingerprint=q_fp,
+                    plan_output=plan_output or None,
+                    plan_fingerprint=plan_fp,
+                )
+                DatabaseEvidenceStore.record_proof(proof)
+                return {
+                    "state": DatabaseState.TIMING_MEASURED,
+                    "query": query,
+                    "query_fingerprint": q_fp,
+                    "plan_fingerprint": plan_fp,
+                    "timing_ms": measured_timing,
+                    "rows_returned": len(execution.get("rows") or []),
+                    "plan": plan_output or None,
+                    "index_used": index_used,
+                    "access_type": access_type,
+                    "bottleneck": (
+                        "Execution plan reports a sequential scan."
+                        if seq_scan
+                        else "Plan measured; no sequential scan identified."
+                        if plan_rows
+                        else "EXPLAIN plan unavailable."
+                    ),
+                    "confidence": "MEASURED" if plan_rows else "UNVERIFIED",
+                    "database": db_name,
+                    "engine": engine,
+                    "status": "SUCCESS" if plan_rows else "PLAN_UNAVAILABLE",
+                    "evidenceId": proof.evidence_id,
+                }
+
         # Code-only fallback when live execution cannot run:
         # Never fabricate 1.2ms, fake row counts, or fake EXPLAIN plans!
         return {
@@ -3820,24 +5343,23 @@ class DatabaseIntelligenceEngine:
         Formats report strictly adhering to Section 24 Response Contract,
         Section 25 No-Suggestion Rule, and Anti-Fabrication Evidence Provenance.
         """
-        db_type = db_info.get("engine") or health.get("engine") or "sqlite"
+        db_type = db_info.get("engine") or health.get("engine") or "NOT_VERIFIED"
         raw_latency = health.get("timing_ms")
-        latency_str = f"{raw_latency}ms" if isinstance(raw_latency, (int, float)) and raw_latency > 0 else "UNMEASURED"
+        latency_str = f"{raw_latency}ms" if isinstance(raw_latency, (int, float)) and raw_latency >= 0 else "UNAVAILABLE"
         
         tables = schema.get("tables", [])
         code_tables = schema.get("code_referenced_tables", [])
         tables_str = ", ".join(f"`{t}`" for t in tables) or "None"
 
-        # Relevant table/query
-        rel_q = (query_info or {}).get("query") or "SELECT * FROM orders WHERE status = 'pending'"
-        target_tbl = (query_info or {}).get("table") or (tables[0] if tables else "orders")
+        rel_q = (query_info or {}).get("query") or "UNAVAILABLE (no query evidence)"
+        target_tbl = (query_info or {}).get("table")
 
         # Schema findings
         schema_findings = f"- Discovered {len(tables)} tables: {tables_str}\n"
         if code_tables and code_tables != tables:
             schema_findings += f"- Code-discovered table references: {', '.join(f'`{t}`' for t in code_tables)}\n"
 
-        tbl_details = (schema.get("schema_details") or {}).get(target_tbl)
+        tbl_details = (schema.get("schema_details") or {}).get(target_tbl) if target_tbl else None
         if tbl_details:
             cols = [c["name"] for c in tbl_details.get("columns", [])]
             if cols:
@@ -3847,42 +5369,53 @@ class DatabaseIntelligenceEngine:
                 schema_findings += f"- Primary key: {', '.join(pks)}"
 
         # Indexes
-        idx_str = "None (Full Table Scan)"
+        idx_str = "UNAVAILABLE (no index evidence)"
         if tbl_details and tbl_details.get("indexes"):
             idx_list = [i.get("name") for i in tbl_details["indexes"]]
             idx_str = f"Existing indexes on `{target_tbl}`: {', '.join(idx_list)}"
-        elif query_info and query_info.get("index_used"):
+        elif (query_info or {}).get("index_used"):
             idx_str = query_info["index_used"]
-        else:
-            idx_str = f"No index on query filter column in table `{target_tbl}`."
+        elif target_tbl and tbl_details is not None:
+            idx_str = f"No indexes were reported for `{target_tbl}` by the inspected schema."
 
         # Query execution timing
         raw_q_timing = (query_info or {}).get("timing_ms")
-        if isinstance(raw_q_timing, (int, float)) and raw_q_timing > 0:
+        if isinstance(raw_q_timing, (int, float)) and raw_q_timing >= 0:
             q_timing = f"{raw_q_timing}ms"
-        elif raw_latency and isinstance(raw_latency, (int, float)) and raw_latency > 0:
-            q_timing = f"{raw_latency}ms"
         else:
-            q_timing = "UNMEASURED (Static code inspection only)"
+            q_timing = "UNAVAILABLE (no query-specific timing evidence)"
 
         if (query_info or {}).get("rows_returned") is not None:
             q_timing += f" ({(query_info or {}).get('rows_returned')} rows returned)"
 
         # Execution plan
-        plan_str = (query_info or {}).get("plan") or "SCAN TABLE orders (Sequential full table scan without index)"
+        plan_str = (query_info or {}).get("plan") or "UNAVAILABLE (no query plan evidence)"
 
-        # Finding
-        finding_str = (
-            f"Database connected and health-checked successfully. "
-            f"The query on `{target_tbl}` runs with access type `{(query_info or {}).get('access_type', 'ALL')}` "
-            f"and index status `{idx_str}`. Root cause of latency is unindexed sequential scanning."
+        connected = health.get("connected") is True
+        health_status = "successful" if connected else (
+            str(health.get("status") or health.get("classification") or "NOT_VERIFIED")
         )
+        connection_status = "successful" if connected else "NOT_VERIFIED"
+        report_heading = (
+            "Database discovered and connected."
+            if connected and db_info.get("discovered", True)
+            else "Database connection not verified."
+        )
+        access_type = (query_info or {}).get("access_type") or "UNAVAILABLE"
+        if (query_info or {}).get("plan") or isinstance(raw_q_timing, (int, float)):
+            finding_str = (
+                f"Query-specific evidence is available for `{target_tbl or 'UNRESOLVED_TABLE'}`; "
+                f"access type: `{access_type}`; index evidence: `{idx_str}`. "
+                "No latency root cause is asserted unless supported by the returned plan and measurements."
+            )
+        else:
+            finding_str = "No query-specific plan or timing evidence is available; no latency root cause can be concluded."
 
         report = (
-            f"Database discovered and connected.\n\n"
+            f"{report_heading}\n\n"
             f"Database: {db_type}\n"
-            f"Connection: successful\n"
-            f"Health check: successful\n"
+            f"Connection: {connection_status}\n"
+            f"Health check: {health_status}\n"
             f"Latency: {latency_str}\n\n"
             f"Relevant table/query discovered:\n"
             f"```sql\n{rel_q}\n```\n\n"
@@ -3940,13 +5473,45 @@ class DatabaseIntelligenceEngine:
             }
 
         root = Path(project_root) if project_root and os.path.isdir(project_root) else None
-        engine = ((db_info or {}).get("engine") or "mysql").lower()
-        db_name = (db_info or {}).get("database")
+        config = db_info or {}
+        engine = (config.get("engine") or "unknown").lower()
+        db_name = config.get("database")
 
-        # If real SQLite DB exists, execute real read-only query
+        if not re.match(r"^\s*(?:SELECT|WITH|EXPLAIN|SHOW|DESCRIBE|PRAGMA)\b", raw_sql, re.I):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "READ_ONLY_QUERY_REQUIRED",
+                    "message": "Only read-only SELECT, WITH, EXPLAIN, SHOW, DESCRIBE, and PRAGMA queries are permitted.",
+                },
+            }
+        if re.search(r"\b(?:INTO\s+(?:OUTFILE|DUMPFILE)|FOR\s+UPDATE|LOCK\s+IN\s+SHARE\s+MODE|CALL)\b", raw_sql, re.I):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "READ_ONLY_QUERY_REQUIRED",
+                    "message": "This query can write data or acquire write locks and is not permitted.",
+                },
+            }
+
+        # Execute against the project's real SQLite file in read-only mode.
         if root and engine == "sqlite":
-            sqlite_files = list(root.glob("**/*.sqlite")) + list(root.glob("**/*.sqlite3")) + list(root.glob("**/*.db"))
-            sqlite_files = [f for f in sqlite_files if not any(x in str(f).lower() for x in ("node_modules", ".git", "vendor"))]
+            configured_file = config.get("sqlite_file")
+            sqlite_path = Path(configured_file) if configured_file else None
+            if sqlite_path and not sqlite_path.is_absolute():
+                sqlite_path = root / sqlite_path
+            sqlite_files = [sqlite_path] if sqlite_path and sqlite_path.is_file() else []
+            if not sqlite_files and configured_file:
+                matches = [
+                    candidate for candidate in root.glob(f"**/{sqlite_path.name}")
+                    if candidate.is_file()
+                    and not any(x in str(candidate).lower() for x in ("node_modules", ".git", "vendor"))
+                ]
+                if len(matches) == 1:
+                    sqlite_files = matches
+            elif not sqlite_files:
+                sqlite_files = list(root.glob("**/*.sqlite")) + list(root.glob("**/*.sqlite3")) + list(root.glob("**/*.db"))
+                sqlite_files = [f for f in sqlite_files if not any(x in str(f).lower() for x in ("node_modules", ".git", "vendor"))]
             if sqlite_files:
                 import sqlite3
                 try:
@@ -3954,8 +5519,14 @@ class DatabaseIntelligenceEngine:
                     conn = sqlite3.connect(f"file:{sqlite_files[0]}?mode=ro", uri=True)
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
-                    cursor.execute(raw_sql)
-                    rows = [dict(r) for r in cursor.fetchall()[:50]]
+                    sqlite_sql = raw_sql
+                    if re.match(r"^\s*SHOW\s+TABLES\b", raw_sql, re.I):
+                        sqlite_sql = (
+                            "SELECT name FROM sqlite_master "
+                            "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                        )
+                    cursor.execute(sqlite_sql)
+                    rows = [dict(r) for r in cursor.fetchmany(50)]
                     duration_ms = round((time.perf_counter() - start_t) * 1000.0, 2)
                     conn.close()
                     return {
@@ -3969,30 +5540,193 @@ class DatabaseIntelligenceEngine:
                         "database": db_name,
                         "engine": engine,
                     }
-                except Exception:
-                    pass
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "error": {
+                            "code": "DATABASE_QUERY_FAILED",
+                            "message": f"Read-only SQLite query failed: {error}",
+                        },
+                    }
+            return {
+                "ok": False,
+                "error": {
+                    "code": "DATABASE_NOT_CONNECTED",
+                    "message": "No configured SQLite database file is available for a live query.",
+                },
+            }
 
-        # Diagnostic read-only execution
-        is_explain = bool(re.search(r"\bEXPLAIN\b", raw_sql, re.I))
-        is_show = bool(re.search(r"\bSHOW\s+TABLES\b", raw_sql, re.I))
-        if is_explain:
-            rows = [{"id": 1, "select_type": "SIMPLE", "table": "target_table", "type": "ALL", "rows": 100, "Extra": "Using where"}]
-        elif is_show:
-            tbl_res = cls.list_tables(project_root, db_info)
-            rows = [{"Tables_in_db": t} for t in tbl_res["tables"]]
-        else:
-            rows = [{"1": 1}]
+        if engine in ("mysql", "mariadb"):
+            host = config.get("host")
+            port = config.get("port")
+            username = config.get("username")
+            password = config.get("password")
+            if not all((host, db_name, username)):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "DATABASE_NOT_CONNECTED",
+                        "message": "The live database connection is missing a configured host, database, or username.",
+                    },
+                }
+            try:
+                import pymysql
+
+                started_at = time.perf_counter()
+                connection = pymysql.connect(
+                    host=str(host),
+                    port=int(port or 3306),
+                    user=str(username),
+                    password=str(password or ""),
+                    database=str(db_name),
+                    connect_timeout=3,
+                    read_timeout=10,
+                    write_timeout=5,
+                    autocommit=False,
+                    init_command="SET SESSION TRANSACTION READ ONLY",
+                )
+                try:
+                    connection.begin()
+                    cursor = connection.cursor()
+                    cursor.execute(raw_sql)
+                    description = cursor.description or ()
+                    column_names = [column[0] for column in description]
+                    rows = cursor.fetchmany(50)
+                    if rows and not isinstance(rows[0], dict):
+                        rows = [dict(zip(column_names, row)) for row in rows]
+                    rows = json.loads(json.dumps(rows[:50], default=str))
+                    duration_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+                    return {
+                        "ok": True,
+                        "query": raw_sql,
+                        "executed": True,
+                        "status": "SUCCESS",
+                        "timingMs": duration_ms,
+                        "rows": rows,
+                        "mode": "READ_ONLY",
+                        "database": db_name,
+                        "engine": engine,
+                    }
+                finally:
+                    try:
+                        connection.rollback()
+                    finally:
+                        connection.close()
+            except Exception as error:
+                classification = DatabaseIntelligenceEngine.classify_db_error(str(error))
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "DATABASE_QUERY_FAILED",
+                        "message": f"Live {engine} query failed ({classification}).",
+                    },
+                }
+
+        if engine in ("postgres", "postgresql", "supabase"):
+            host = config.get("host")
+            port = config.get("port") or 5432
+            username = config.get("username")
+            password = config.get("password")
+            connection_uri = config.get("connection_uri")
+            if not connection_uri and not all((host, db_name, username)):
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "DATABASE_NOT_CONNECTED",
+                        "message": "The live PostgreSQL connection is missing a configured host, database, or username.",
+                    },
+                }
+            try:
+                import psycopg
+
+                started_at = time.perf_counter()
+                connection = psycopg.connect(
+                    connection_uri,
+                    connect_timeout=3,
+                ) if connection_uri else psycopg.connect(
+                    host=str(host),
+                    port=int(port),
+                    dbname=str(db_name),
+                    user=str(username),
+                    password=str(password or ""),
+                    connect_timeout=3,
+                )
+                try:
+                    cursor = connection.cursor()
+                    cursor.execute("SET TRANSACTION READ ONLY")
+                    cursor.execute(raw_sql)
+                    column_names = [column.name for column in (cursor.description or ())]
+                    rows = cursor.fetchmany(50)
+                    rows = [dict(zip(column_names, row)) for row in rows]
+                    rows = json.loads(json.dumps(rows, default=str))
+                    duration_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+                    return {
+                        "ok": True,
+                        "query": raw_sql,
+                        "executed": True,
+                        "status": "SUCCESS",
+                        "timingMs": duration_ms,
+                        "rows": rows,
+                        "mode": "READ_ONLY",
+                        "database": db_name,
+                        "engine": "postgresql",
+                    }
+                finally:
+                    try:
+                        connection.rollback()
+                    finally:
+                        connection.close()
+            except Exception as error:
+                classification = DatabaseIntelligenceEngine.classify_db_error(str(error))
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "DATABASE_QUERY_FAILED",
+                        "message": f"Live PostgreSQL query failed ({classification}).",
+                    },
+                }
+
+        if engine == "h2":
+            try:
+                started_at = time.perf_counter()
+                connection = DatabaseIntelligenceEngine._open_h2_connection(project_root, config)
+                try:
+                    cursor = connection.cursor()
+                    cursor.execute(raw_sql)
+                    column_names = [column[0] for column in (cursor.description or ())]
+                    rows = cursor.fetchmany(50)
+                    rows = [dict(zip(column_names, row)) for row in rows]
+                    rows = json.loads(json.dumps(rows, default=str))
+                    duration_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+                    return {
+                        "ok": True,
+                        "query": raw_sql,
+                        "executed": True,
+                        "status": "SUCCESS",
+                        "timingMs": duration_ms,
+                        "rows": rows,
+                        "mode": "READ_ONLY",
+                        "database": db_name,
+                        "engine": "h2",
+                    }
+                finally:
+                    connection.close()
+            except Exception as error:
+                classification = DatabaseIntelligenceEngine.classify_db_error(str(error))
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "DATABASE_QUERY_FAILED",
+                        "message": f"Live H2 query failed ({classification}).",
+                    },
+                }
 
         return {
-            "ok": True,
-            "query": raw_sql,
-            "executed": True,
-            "status": "SUCCESS",
-            "timingMs": 1.2,
-            "rows": rows,
-            "mode": "READ_ONLY",
-            "database": db_name,
-            "engine": engine,
+            "ok": False,
+            "error": {
+                "code": "DATABASE_EXECUTION_UNAVAILABLE",
+                "message": f"No live read-only query adapter is available for database engine '{engine}'.",
+            },
         }
 
     @classmethod
@@ -4060,6 +5794,75 @@ class DatabaseIntelligenceEngine:
         }
 
 
+class DatabaseSchemaKnowledgeStore:
+    """Persists verified schema metadata in the backend's existing user-data directory."""
+
+    _write_lock = threading.Lock()
+
+    def __init__(self, path: Optional[str] = None):
+        if path:
+            self.path = Path(path)
+        else:
+            from backend_config import CONFIG_PATH
+
+            self.path = Path(CONFIG_PATH).parent / "coding-schema-knowledge.json"
+
+    def load(self, schema_key: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not schema_key or not self.path.exists():
+            return None
+        try:
+            stored = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"Could not read persisted Coding Agent schema knowledge: {error}") from error
+        if (
+            not isinstance(stored, dict)
+            or stored.get("version") != 1
+            or not isinstance(stored.get("entries"), dict)
+        ):
+            raise RuntimeError("Persisted Coding Agent schema knowledge has an unsupported format.")
+        knowledge = stored["entries"].get(schema_key)
+        return knowledge if isinstance(knowledge, dict) else None
+
+    def save(self, schema_key: Optional[str], knowledge: Dict[str, Any]) -> None:
+        if not schema_key:
+            raise RuntimeError("A project-scoped database target is required to persist schema knowledge.")
+        with self._write_lock:
+            entries: Dict[str, Any] = {}
+            if self.path.exists():
+                try:
+                    stored = json.loads(self.path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    raise RuntimeError(f"Could not update persisted Coding Agent schema knowledge: {error}") from error
+                if (
+                    not isinstance(stored, dict)
+                    or stored.get("version") != 1
+                    or not isinstance(stored.get("entries"), dict)
+                ):
+                    raise RuntimeError("Persisted Coding Agent schema knowledge has an unsupported format.")
+                entries = stored["entries"]
+            entries[schema_key] = SecretProtector.redact_data(knowledge)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = self.path.with_name(
+                f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            try:
+                temporary_path.write_text(
+                    json.dumps(
+                        {"version": 1, "entries": entries},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+                os.replace(temporary_path, self.path)
+            except OSError as error:
+                raise RuntimeError(f"Could not persist Coding Agent schema knowledge: {error}") from error
+            finally:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+
+
 class DatabaseSessionManager:
     """
     Authoritative Database Session and Tool Router.
@@ -4069,19 +5872,40 @@ class DatabaseSessionManager:
     _sessions: Dict[str, DatabaseSession] = {}
     _sessions_by_id: Dict[str, DatabaseSession] = {}
     _active_session: Optional[DatabaseSession] = None
+    schema_knowledge_store = DatabaseSchemaKnowledgeStore()
+
+    @staticmethod
+    def _session_project_is_available(session: DatabaseSession) -> bool:
+        project_root = getattr(session, "project_root", "")
+        if not project_root or os.path.isdir(project_root):
+            return True
+        if session.is_connected():
+            session.connection_state = DatabaseState.DISCONNECTED
+        return False
 
     @classmethod
     def get_session(cls, project_root: str = "", session_id: Optional[str] = None) -> Optional[DatabaseSession]:
         norm = os.path.normpath(project_root) if project_root else ""
         if norm and norm in cls._sessions:
-            return cls._sessions[norm]
+            session = cls._sessions[norm]
+            if cls._session_project_is_available(session):
+                return session
+            return None
         if session_id and session_id in cls._sessions_by_id:
-            return cls._sessions_by_id[session_id]
-        if cls._active_session and cls._active_session.is_connected():
+            session = cls._sessions_by_id[session_id]
+            if cls._session_project_is_available(session):
+                return session
+        if (
+            not norm
+            and cls._active_session
+            and cls._active_session.is_connected()
+            and cls._session_project_is_available(cls._active_session)
+        ):
             return cls._active_session
-        for s in reversed(list(cls._sessions.values())):
-            if s.is_connected():
-                return s
+        if not norm:
+            for s in reversed(list(cls._sessions.values())):
+                if s.is_connected() and cls._session_project_is_available(s):
+                    return s
         return None
 
     @classmethod
@@ -4114,7 +5938,11 @@ class DatabaseSessionManager:
         norm = os.path.normpath(project_root) if project_root else ""
         if norm and norm in cls._sessions:
             existing = cls._sessions[norm]
-            if existing and existing.is_connected():
+            if (
+                existing
+                and existing.is_connected()
+                and cls._session_project_is_available(existing)
+            ):
                 existing.touch()
                 if session_id:
                     existing.session_id = session_id
@@ -4126,15 +5954,19 @@ class DatabaseSessionManager:
         if not norm:
             if session_id and session_id in cls._sessions_by_id:
                 s = cls._sessions_by_id[session_id]
-                if s.is_connected():
+                if s.is_connected() and cls._session_project_is_available(s):
                     s.touch()
                     cls._active_session = s
                     return s
-            if cls._active_session and cls._active_session.is_connected():
+            if (
+                cls._active_session
+                and cls._active_session.is_connected()
+                and cls._session_project_is_available(cls._active_session)
+            ):
                 cls._active_session.touch()
                 return cls._active_session
             for s in reversed(list(cls._sessions.values())):
-                if s.is_connected():
+                if s.is_connected() and cls._session_project_is_available(s):
                     s.touch()
                     cls._active_session = s
                     return s
@@ -4144,7 +5976,7 @@ class DatabaseSessionManager:
         health = DatabaseIntelligenceEngine.real_connect_and_health_check(project_root, cfg)
         caps = DatabaseIntelligenceEngine.check_database_capabilities(project_root)
 
-        db_type = cfg.get("engine") or health.get("engine") or "sqlite"
+        db_type = cfg.get("engine") or health.get("engine") or "unverified"
         db_name = cfg.get("database") or health.get("database") or (cfg.get("sqlite_file") and Path(cfg["sqlite_file"]).name) or None
         safe_h = cfg.get("host") or health.get("host")
         safe_p = cfg.get("port") or health.get("port")
@@ -4173,6 +6005,9 @@ class DatabaseSessionManager:
             sess._protected_credentials = cred
         elif "_protected_credentials" in cfg:
             sess._protected_credentials = cfg["_protected_credentials"]
+        persisted_schema = cls.schema_knowledge_store.load(sess.schema_knowledge_key())
+        if persisted_schema:
+            sess.restore_schema_knowledge(persisted_schema)
 
         if norm:
             cls._sessions[norm] = sess
@@ -4182,7 +6017,11 @@ class DatabaseSessionManager:
         return sess
 
     @classmethod
-    def resolve_database_intent(cls, request: str) -> Dict[str, Any]:
+    def resolve_database_intent(
+        cls,
+        request: str,
+        task_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Classifies user request into deterministic database capabilities that bypass the LLM.
         Applies command normalization first for typo resilience.
@@ -4190,17 +6029,32 @@ class DatabaseSessionManager:
         raw = (request or "").strip()
         norm_req = EngineeringCommandNormalizer.normalize(raw)
         low = norm_req.lower().strip()
+        sql_request = re.sub(
+            r"\s+(?:data|records?|rows?)\s+(?:dikho|dikhao|dikhaiye|show|display)\s*[.!?]*\s*$",
+            "",
+            norm_req,
+            flags=re.I,
+        ).strip()
+        sql_request = re.sub(r";\s*$", "", sql_request).strip()
 
         # 0A. CREDENTIAL / PASSWORD REQUEST
-        if re.search(
-            r"\b(?:show\s+(?:the\s+)?(?:db|database)\s+passwords?|show\s+passwords?|get\s+(?:the\s+)?(?:db|database)\s+passwords?|what\s+is\s+(?:the\s+)?(?:db|database)\s+passwords?|db\s+passwords?|database\s+passwords?|show\s+(?:the\s+)?(?:db|database)\s+credentials?|db\s+credentials?|database\s+credentials?|show\s+credentials?)\b",
-            low,
-        ):
+        if DATABASE_CREDENTIAL_REQUEST_PATTERN.search(low):
             return {
                 "is_deterministic": True,
                 "capability": DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
                 "arguments": {},
             }
+
+        schema_refresh = bool(
+            re.search(r"\b(?:live|current|refresh|recheck)\b.*\b(?:database\s+)?schema\b", low)
+        )
+        schema_learning_request = bool(
+            re.search(
+                r"\b(?:understand|learn|read|map|index|check|refresh|recheck|inspect)\b.{0,80}\b(?:database|db|schema|tables?)\b|"
+                r"\b(?:database|db|schema|tables?)\b.{0,80}\b(?:understand|learn|read|map|index|check|refresh|recheck|inspect)\b",
+                low,
+            )
+        )
 
         # 0B. CURRENT TARGET / WHICH DB IS CONNECTED / OPEN CONFIG & WHICH DB
         current_target_match = False
@@ -4209,7 +6063,7 @@ class DatabaseSessionManager:
         if re.search(
             r"\b(?:which\s+(?:db|database|target)\b|what\s+(?:db|database|target)\b|current\s+(?:db|database|target)\b|active\s+(?:db|database|target)\b|status\s+(?:of\s+)?(?:db|database)\b|(?:db|database)\s+status\b|connected\s+(?:db|database|target)\b)\b",
             low,
-        ) or "which db connection" in low or "db connection current" in low or "which db is connected" in low:
+        ) or DATABASE_CONNECTION_STATUS_PATTERN.search(low) or "which db connection" in low or "db connection current" in low or "which db is connected" in low:
             current_target_match = True
 
         compound_m = re.search(r"\b(?:open|inspect|check|read|show)\s+(?:my\s+)?(?:project\s+)?([a-zA-Z0-9_\-./\\]+\.(?:php|json|env|ya?ml|py|properties|ts|js))\b", norm_req, re.I)
@@ -4218,7 +6072,7 @@ class DatabaseSessionManager:
             if any(x in low for x in ("db", "database", "connection")):
                 current_target_match = True
 
-        if current_target_match:
+        if current_target_match and not schema_learning_request:
             args = {"user_request": norm_req}
             if target_file_match:
                 args["configFile"] = target_file_match
@@ -4256,7 +6110,7 @@ class DatabaseSessionManager:
 
         # 0E. SLOW QUERIES / TOP QUERIES / HIGH-LOAD QUERIES / PERFORMANCE INVESTIGATION
         if re.search(
-            r"\b(?:which\s+query\s+(?:is\s+taking\s+(?:the\s+)?(?:most|more)\s+(?:time|load)|has\s+(?:the\s+)?highest\s+(?:db\s+)?load|takes\s+(?:the\s+)?most\s+time|is\s+(?:the\s+)?slowest|causes?\s+cpu\s+load|does\s+(?:a\s+)?full\s+table\s+scan|is\s+missing\s+(?:an?\s+)?index)|show\s+(?:all\s+)?slow\s+queries?|find\s+slow\s+queries?|check\s+slow\s+queries?|list\s+slow\s+queries?|top\s+slow\s+queries?|slowest\s+queries?|top\s+queries?|query\s+performance\s+stats?|find\s+expensive\s+queries?|which\s+query\s+is\s+expensive)\b",
+            r"\b(?:which\s+query\s+(?:is\s+)?(?:taking|take|takes)\s+(?:the\s+)?(?:most\s+|more\s+)?(?:time|load)|which\s+query\s+(?:has\s+(?:the\s+)?highest\s+(?:db\s+)?load|takes\s+(?:the\s+)?most\s+time|is\s+(?:the\s+)?slowest|causes?\s+cpu\s+load|does\s+(?:a\s+)?full\s+table\s+scan|is\s+missing\s+(?:an?\s+)?index)|show\s+(?:all\s+)?slow\s+queries?|find\s+slow\s+queries?|check\s+slow\s+queries?|list\s+slow\s+queries?|top\s+slow\s+queries?|slowest\s+queries?|top\s+queries?|query\s+performance\s+stats?|find\s+expensive\s+queries?|which\s+query\s+is\s+expensive)\b",
             low,
         ) or low in ("slow queries", "slow query", "top queries", "top slow queries", "find slow queries", "find expensive queries"):
             dim = "total_load"
@@ -4302,6 +6156,175 @@ class DatabaseSessionManager:
                 "arguments": {},
             }
 
+        if schema_learning_request and not re.search(
+            r"\b(?:where|which|what|find|locate)\b.{0,40}\b(?:column|field|email|index|key|reference|table)\b",
+            low,
+        ):
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_LIST_TABLES,
+                "arguments": {
+                    "learn_schema": True,
+                    "refresh_schema": schema_refresh,
+                },
+            }
+
+        schema_query = None
+        column_location = re.search(
+            r"\bwhere\s+is\s+(?:(?P<context>[a-zA-Z_][a-zA-Z0-9_]*)\s+)?"
+            r"(?P<column>[a-zA-Z_][a-zA-Z0-9_]*)\s+(?:stored|kept|located)\b|"
+            r"\bwhich\s+table\s+(?:contains|has)\s+(?:(?P<context2>[a-zA-Z_][a-zA-Z0-9_]*)\s+)?"
+            r"(?P<column2>[a-zA-Z_][a-zA-Z0-9_]*)\b|"
+            r"\bwhere\s+(?:(?P<context3>[a-zA-Z_][a-zA-Z0-9_]*)\s+)?"
+            r"(?P<column3>email|e-?mail|phone|mobile|[a-zA-Z_][a-zA-Z0-9_]*)\b"
+            r"(?!\s*(?:=|is\b))",
+            norm_req,
+            re.I,
+        )
+        if column_location:
+            schema_query = {
+                "kind": "column_location",
+                "term": (
+                    column_location.group("column")
+                    or column_location.group("column2")
+                    or column_location.group("column3")
+                ),
+                "context": (
+                    column_location.group("context")
+                    or column_location.group("context2")
+                    or column_location.group("context3")
+                ),
+            }
+        reference_query = re.search(
+            r"\bwhich\s+tables?\s+(?:reference|refer(?:s)?\s+to|have\s+(?:a\s+)?foreign\s+key\s+to)\s+"
+            r"[`'\"]?(?P<table>[a-zA-Z_][a-zA-Z0-9_]*)[`'\"]?",
+            norm_req,
+            re.I,
+        )
+        if reference_query:
+            schema_query = {"kind": "referencing_tables", "table": reference_query.group("table")}
+        primary_key_query = re.search(
+            r"\b(?:what(?:\s+is)?|show|find)?\s*(?:the\s+)?(?:primary\s+key|pk)\s+"
+            r"(?:of|for|on)\s+[`'\"]?(?P<table>[a-zA-Z_][a-zA-Z0-9_]*)[`'\"]?",
+            norm_req,
+            re.I,
+        )
+        if primary_key_query:
+            schema_query = {"kind": "primary_key", "table": primary_key_query.group("table")}
+        index_lookup = re.search(
+            r"\b(?:what|which)\s+indexes?\s+(?:exist\s+)?(?:are\s+)?(?:on|for)\s+"
+            r"[`'\"]?(?P<table>[a-zA-Z_][a-zA-Z0-9_]*)[`'\"]?",
+            norm_req,
+            re.I,
+        )
+        if index_lookup:
+            schema_query = {"kind": "indexes", "table": index_lookup.group("table")}
+        table_exists = re.search(
+            r"\b(?:does|do)\s+(?:this\s+|that\s+)?(?:table|collection)\s+"
+            r"[`'\"]?(?P<table>[A-Za-z][A-Za-z0-9_.$-]*)[`'\"]?\s+exist\b|"
+            r"\b(?:is|does)\s+[`'\"]?(?P<table2>[A-Za-z][A-Za-z0-9_.$-]*)[`'\"]?"
+            r"\s+(?:a\s+)?(?:table|collection)\b",
+            norm_req,
+            re.I,
+        )
+        if table_exists:
+            schema_query = {
+                "kind": "table_exists",
+                "table": table_exists.group("table") or table_exists.group("table2"),
+            }
+        if schema_query:
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_LIST_TABLES,
+                "arguments": {
+                    "schema_query": schema_query,
+                    "refresh_schema": schema_refresh,
+                },
+            }
+
+        count_prefix = re.search(
+            r"\b(?:count|calculate)\s+(?:me\s+)?(?:the\s+)?"
+            r"(?:(?:total|overall)\s+)?(?:number\s+of\s+)?|"
+            r"\b(?:show|give|tell)\s+(?:me\s+)?(?:the\s+)?(?:total|number\s+of)\s+|"
+            r"\bhow\s+many\s+|"
+            r"\b(?:what\s+is\s+)?(?:the\s+)?(?:total|number\s+of)\s+",
+            norm_req,
+            re.I,
+        )
+        if count_prefix:
+            entity = norm_req[count_prefix.end():].strip(" \t\r\n.!?`'\"")
+            requested_filters = []
+            if re.search(r"\bactive\b", entity, re.I):
+                requested_filters.append("active")
+                entity = re.sub(r"\bactive\b", " ", entity, flags=re.I)
+            if re.search(r"\btoday\b", entity, re.I):
+                requested_filters.append("today")
+                entity = re.sub(r"\btoday\b", " ", entity, flags=re.I)
+            paid_count = bool(re.search(r"\b(?:paid|payment\s+complete|payment\s+successful)\b", entity, re.I))
+            explicit_payment_value = re.search(
+                r"\b(?P<column>pay_status|payment_status|paid_status)\s*(?:=|is)\s*"
+                r"(?P<quote>['\"]?)(?P<value>[a-zA-Z0-9_.-]+)(?P=quote)\b",
+                entity,
+                re.I,
+            )
+            explicit_payment_column = re.search(
+                r"\b(?:using|from|in)\s+(?:the\s+)?(?:field|column)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b|"
+                r"\busing\s+([a-zA-Z_][a-zA-Z0-9_]*status)\b",
+                entity,
+                re.I,
+            )
+            if explicit_payment_value:
+                entity = re.sub(
+                    r"\b(?:(?:where|with|using)\s+)?(?:pay_status|payment_status|paid_status)\s*(?:=|is)\s*(['\"]?)[a-zA-Z0-9_.-]+\1\b",
+                    " ",
+                    entity,
+                    flags=re.I,
+                )
+            if explicit_payment_column:
+                entity = re.sub(
+                    r"\busing\s+(?:(?:the\s+)?(?:field|column)\s+)?[a-zA-Z_][a-zA-Z0-9_]*\b",
+                    " ",
+                    entity,
+                    flags=re.I,
+                )
+            entity = re.sub(
+                r"\s+(?:data|records?|rows?|entries|items|in\s+(?:the\s+)?(?:database|db|table)|"
+                r"from\s+(?:the\s+)?(?:database|db|table))\s*[.!?]*$",
+                "",
+                entity,
+                flags=re.I,
+            ).strip()
+            entity = re.sub(r"^(?:of|for|all)\s+", "", entity, flags=re.I).strip()
+            entity = re.sub(r"\b(?:paid|payment\s+complete|payment\s+successful)\b", " ", entity, flags=re.I)
+            entity = re.sub(r"\s+", " ", entity).strip()
+            if "_" not in entity:
+                entity = re.sub(r"\b([a-zA-Z]+)ies$", r"\1y", entity, flags=re.I)
+                if entity.lower().endswith("s") and len(entity) > 3:
+                    entity = entity[:-1]
+            if (
+                entity
+                and len(entity) <= 80
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9 _.-]*", entity)
+            ):
+                return {
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    "arguments": {
+                        "entity": entity,
+                        **({"filters": requested_filters} if requested_filters else {}),
+                        **({"payment_filter": "paid"} if paid_count else {}),
+                        **({"payment_value": explicit_payment_value.group("value")} if explicit_payment_value else {}),
+                        **({
+                            "payment_column": next(
+                                group for group in explicit_payment_column.groups() if group
+                            )
+                        } if explicit_payment_column else (
+                            {"payment_column": explicit_payment_value.group("column")}
+                            if explicit_payment_value else {}
+                        )),
+                    },
+                }
+
         # 1. SHOW DATABASES / LIST DATABASES
         if re.search(r"\b(?:show\s+(?:all\s+)?databases?|list\s+databases?|show\s+dbs?|list\s+dbs?|show\s+schemas?|list\s+schemas?)\b", low) or low in ("databases", "dbs", "schemas"):
             return {
@@ -4311,11 +6334,28 @@ class DatabaseSessionManager:
             }
 
         # 2. SHOW TABLES / LIST TABLES
-        if re.search(r"\b(?:show\s+(?:all\s+)?tables?|list\s+tables?|what\s+tables?|table\s+list)\b", low) or low in ("tables", "table list"):
+        if re.search(
+            r"\b(?:show\s+(?:(?:(?:me|my)\s+)?(?:all\s+)?|all\s+my\s+)?(?:tables?|collections?)|"
+            r"list\s+(?:(?:me|my)\s+)?(?:all\s+)?(?:tables?|collections?)|"
+            r"what\s+tables?|table\s+list)\b",
+            low,
+        ) or low in ("tables", "collections", "table list"):
             return {
                 "is_deterministic": True,
                 "capability": DatabaseCapability.DATABASE_LIST_TABLES,
                 "arguments": {},
+            }
+
+        mongo_find_m = re.fullmatch(
+            r"\s*(?:find|show)\s+(?:documents?\s+)?(?:in|from)\s+(?:collection\s+)?[`'\"\[]?([a-zA-Z0-9_.-]{1,120})[`'\"\]]?\s*",
+            norm_req,
+            re.I,
+        )
+        if mongo_find_m:
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_QUERY,
+                "arguments": {"collection": mongo_find_m.group(1), "filter": {}},
             }
 
         # 3. DESCRIBE <table> / DESC <table> / SHOW COLUMNS
@@ -4365,10 +6405,22 @@ class DatabaseSessionManager:
                 "arguments": {"table": tbl} if tbl else {},
             }
 
+        mongo_explain_m = re.fullmatch(
+            r"\s*explain\s+(?:find|documents?)\s+(?:in|from)\s+(?:collection\s+)?[`'\"\[]?([a-zA-Z0-9_.-]{1,120})[`'\"\]]?\s*",
+            norm_req,
+            re.I,
+        )
+        if mongo_explain_m:
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_EXPLAIN,
+                "arguments": {"collection": mongo_explain_m.group(1), "filter": {}},
+            }
+
         # 7. EXPLAIN <SQL>
-        explain_sql_m = re.search(r"^\s*explain(?:\s+plan(?:\s+for)?|\s+analyze)?\s+(select\b[\s\S]+|with\b[\s\S]+)$", norm_req, re.I)
+        explain_sql_m = re.search(r"^\s*explain(?:\s+plan(?:\s+for)?|\s+analyze)?\s+(select\b[\s\S]+|with\b[\s\S]+)$", sql_request, re.I)
         if not explain_sql_m:
-            explain_sql_m = re.search(r"^\s*(?:explain\s+query|run\s+explain)(?:\s+(select\b[\s\S]+|with\b[\s\S]+))?$", norm_req, re.I)
+            explain_sql_m = re.search(r"^\s*(?:explain\s+query|run\s+explain)(?:\s+(select\b[\s\S]+|with\b[\s\S]+))?$", sql_request, re.I)
         if explain_sql_m:
             sql_target = explain_sql_m.group(1).strip() if explain_sql_m.group(1) else "SELECT 1"
             return {
@@ -4377,37 +6429,327 @@ class DatabaseSessionManager:
                 "arguments": {"sql": sql_target},
             }
 
+        count_sql_match = re.fullmatch(
+            r"\s*SELECT\s+COUNT\s*\(\s*\*\s*\)"
+            r"(?:\s+AS\s+[`'\"]?[A-Za-z_][A-Za-z0-9_]*[`'\"]?)?"
+            r"\s+FROM\s+[`'\"]?([A-Za-z][A-Za-z0-9_$.-]*)[`'\"]?\s*",
+            sql_request,
+            re.I,
+        )
+        if count_sql_match:
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+                "arguments": {"entity": count_sql_match.group(1)},
+            }
+
         # 8. DIRECT SAFE READ-ONLY SQL: SELECT ... or SHOW ...
         is_sql_select = False
-        if re.match(r"^\s*SELECT\b", norm_req, re.I):
-            if re.search(r"\bFROM\b", norm_req, re.I) or re.match(
+        if re.match(r"^\s*SELECT\b", sql_request, re.I):
+            if re.search(r"\bFROM\b", sql_request, re.I) or re.match(
                 r"^\s*SELECT\s+(?:\d+|'[^']*'|\"[^\"]*\"|COUNT\(|NOW\(|VERSION\(|DATABASE\(|@@|CURRENT_|\*|\bTRUE\b|\bFALSE\b|\bNULL\b)",
-                norm_req,
+                sql_request,
                 re.I,
             ):
                 is_sql_select = True
 
-        is_sql_cte = bool(re.match(r"^\s*WITH\s+(?:RECURSIVE\s+)?[a-zA-Z0-9_]+\s*(?:\([^\)]+\)\s*)?AS\s*\(", norm_req, re.I))
+        is_sql_cte = bool(re.match(r"^\s*WITH\s+(?:RECURSIVE\s+)?[a-zA-Z0-9_]+\s*(?:\([^\)]+\)\s*)?AS\s*\(", sql_request, re.I))
 
         if is_sql_select or is_sql_cte:
             return {
                 "is_deterministic": True,
                 "capability": DatabaseCapability.DATABASE_QUERY,
-                "arguments": {"sql": norm_req.strip()},
+                "arguments": {"sql": sql_request},
             }
 
-        if re.match(r"^\s*SHOW\s+(?:DATABASES|SCHEMAS|TABLES|COLUMNS|INDEXES|INDEX|KEYS|VIEWS|CREATE\s+TABLE|VARIABLES|STATUS|WARNINGS|ERRORS)\b", norm_req, re.I):
+        if re.match(r"^\s*SHOW\s+(?:DATABASES|SCHEMAS|TABLES|COLUMNS|INDEXES|INDEX|KEYS|VIEWS|CREATE\s+TABLE|VARIABLES|STATUS|WARNINGS|ERRORS)\b", sql_request, re.I):
             return {
                 "is_deterministic": True,
                 "capability": DatabaseCapability.DATABASE_QUERY,
-                "arguments": {"sql": norm_req.strip()},
+                "arguments": {"sql": sql_request},
             }
+
+        record_request = re.fullmatch(
+            r"\s*(?:show|display|fetch|get|list)\s+(?:me\s+)?(?:the\s+)?(?P<target>.+?)\s*",
+            norm_req,
+            re.I,
+        )
+        if record_request:
+            target = record_request.group("target").strip(" \t\r\n.!?`'\"")
+            if not re.match(
+                r"^(?:(?:(?:me|my)\s+)?(?:all\s+)?|all\s+my\s+)?"
+                r"(?:tables?|collections?|databases?|dbs?|schemas?|indexes?|indices?|views?|constraints?)\b",
+                target,
+                re.I,
+            ):
+                schema_object_match = re.fullmatch(
+                    r"(?P<entity>.+?)\s+(?P<kind>table|columns?|fields?|indexes?)",
+                    target,
+                    re.I,
+                )
+                if schema_object_match:
+                    table_name = schema_object_match.group("entity").strip(" `\"'")
+                    if table_name and re.fullmatch(r"[A-Za-z][A-Za-z0-9 _.$-]{0,119}", table_name):
+                        if schema_object_match.group("kind").casefold().startswith("index"):
+                            return {
+                                "is_deterministic": True,
+                                "capability": DatabaseCapability.DATABASE_LIST_INDEXES,
+                                "arguments": {"table": table_name},
+                            }
+                        return {
+                            "is_deterministic": True,
+                            "capability": DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+                            "arguments": {"table": table_name},
+                        }
+                latest_match = re.search(r"\b(?:latest|newest|most\s+recent)\s*(\d+)?\b", target, re.I)
+                row_limit = int(latest_match.group(1) or 10) if latest_match else 10
+                target = re.sub(
+                    r"\b(?:latest|newest|most\s+recent)\s*\d*\b",
+                    " ",
+                    target,
+                    flags=re.I,
+                )
+                target = re.sub(
+                    r"\s+(?:data|records?|rows?|entries|items)\s*$",
+                    "",
+                    target,
+                    flags=re.I,
+                ).strip()
+                target = re.sub(r"^(?:all|of|for)\s+", "", target, flags=re.I).strip()
+                if (
+                    target
+                    and len(target) <= 80
+                    and re.fullmatch(r"[A-Za-z][A-Za-z0-9 _.-]*", target)
+                    and not re.search(r"\b(?:how|why|where|what|which)\b", target, re.I)
+                ):
+                    if target.lower().endswith("s") and len(target) > 3 and "_" not in target:
+                        target = target[:-1]
+                    return {
+                        "is_deterministic": True,
+                        "capability": DatabaseCapability.DATABASE_QUERY,
+                        "arguments": {
+                            "entity": target,
+                            "row_limit": min(max(row_limit, 1), 50),
+                            "latest": bool(latest_match),
+                            "user_request": norm_req,
+                        },
+                    }
+
+        context = task_context if isinstance(task_context, dict) else {}
+        previous_capability = context.get("capability")
+        previous_arguments = context.get("arguments")
+        previous_arguments = previous_arguments if isinstance(previous_arguments, dict) else {}
+        previous_entity = (
+            context.get("table")
+            or previous_arguments.get("entity")
+            or previous_arguments.get("table")
+        )
+        if previous_entity and previous_capability in (
+            DatabaseCapability.DATABASE_COUNT_RECORDS,
+            DatabaseCapability.DATABASE_QUERY,
+        ):
+            follow_up = re.fullmatch(
+                r"\s*(?:how\s+many(?:\s+(?:of\s+)?(?:them|those|these|it))?|count\s+(?:them|those|these|it))\s*[?!.]*\s*",
+                low,
+                re.I,
+            )
+            latest_follow_up = re.fullmatch(
+                r"\s*(?:show|fetch|get|list)\s+(?:me\s+)?(?:the\s+)?"
+                r"(?:latest|newest|most\s+recent)\s*(\d+)?(?:\s+(?:records?|rows?|data))?\s*[?!.]*\s*",
+                norm_req,
+                re.I,
+            )
+            current_table_count = re.fullmatch(
+                r"\s*(?:check|count)\s+(?:this|that|the\s+current)\s+table\s+"
+                r"(?:total|count|records?)\s*[?!.]*\s*",
+                low,
+                re.I,
+            )
+            same_target = re.fullmatch(
+                r"\s*(?:do\s+the\s+)?same\s+(?:for|with)\s+(.+?)\s*[?!.]*\s*",
+                norm_req,
+                re.I,
+            )
+            correction = re.fullmatch(
+                r"\s*(?:no[,.]?\s+)?(?:i\s+mean|i\s+meant|rather|not\s+that[,.]?\s+i\s+mean)\s+(.+?)\s*[?!.]*\s*",
+                norm_req,
+                re.I,
+            )
+            if follow_up:
+                return {
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    "arguments": {"entity": str(previous_entity)},
+                    "contextual": True,
+                }
+            if current_table_count:
+                return {
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    "arguments": {"entity": str(previous_entity)},
+                    "contextual": True,
+                }
+            if latest_follow_up:
+                return {
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_QUERY,
+                    "arguments": {
+                        "entity": str(previous_entity),
+                        "row_limit": min(max(int(latest_follow_up.group(1) or 10), 1), 50),
+                        "latest": True,
+                    },
+                    "contextual": True,
+                }
+            if same_target or correction:
+                new_entity = (same_target or correction).group(1).strip(" `\"'")
+                new_entity = re.sub(r"^(?:the\s+)?(?:table\s+)?", "", new_entity, flags=re.I)
+                new_entity = re.sub(r"\s+(?:data|records?|rows?)$", "", new_entity, flags=re.I).strip()
+                if (
+                    new_entity
+                    and len(new_entity) <= 120
+                    and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.$-]*", new_entity)
+                ):
+                    if previous_capability == DatabaseCapability.DATABASE_COUNT_RECORDS:
+                        arguments = {
+                            key: value
+                            for key, value in previous_arguments.items()
+                            if key != "entity"
+                        }
+                        arguments["entity"] = new_entity
+                        return {
+                            "is_deterministic": True,
+                            "capability": previous_capability,
+                            "arguments": arguments,
+                            "contextual": True,
+                        }
+                    return {
+                        "is_deterministic": True,
+                        "capability": DatabaseCapability.DATABASE_QUERY,
+                        "arguments": {
+                            "entity": new_entity,
+                            "row_limit": previous_arguments.get("row_limit", 10),
+                            "latest": previous_arguments.get("latest", False),
+                        },
+                        "contextual": True,
+                    }
 
         return {
             "is_deterministic": False,
             "capability": None,
             "arguments": {},
         }
+
+    @staticmethod
+    def _resolve_schema_table_matches(entity: str, tables: List[str]) -> List[str]:
+        requested = re.sub(r"[^a-z0-9]", "", str(entity or "").casefold())
+        if not requested:
+            return []
+
+        def singularize(value: str) -> str:
+            if value.endswith("ies") and len(value) > 3:
+                return value[:-3] + "y"
+            if value.endswith("s") and len(value) > 3:
+                return value[:-1]
+            return value
+
+        exact = []
+        token_matches = []
+        approximate = []
+        for table in tables:
+            table_name = str(table)
+            table_key = re.sub(r"[^a-z0-9]", "", table_name.casefold())
+            if table_key == requested or singularize(table_key) == requested:
+                exact.append(table_name)
+                continue
+            tokens = {
+                singularize(re.sub(r"[^a-z0-9]", "", token.casefold()))
+                for token in re.findall(r"[A-Za-z0-9]+", table_name)
+            }
+            if singularize(requested) in tokens:
+                token_matches.append(table_name)
+            elif len(requested) >= 10:
+                similarity = SequenceMatcher(None, requested, table_key).ratio()
+                if similarity >= 0.90:
+                    approximate.append((similarity, table_name))
+
+        matches = exact or token_matches
+        if matches:
+            return sorted(set(matches), key=str.casefold)
+        if approximate:
+            best_similarity = max(score for score, _ in approximate)
+            return sorted(
+                {
+                    table
+                    for score, table in approximate
+                    if best_similarity - score < 0.08
+                },
+                key=str.casefold,
+            )
+        return []
+
+    @classmethod
+    def _rank_database_table_candidates(
+        cls,
+        entity: str,
+        candidates: List[str],
+        project_root: str,
+    ) -> List[Dict[str, Any]]:
+        requested = re.sub(r"[^a-z0-9]", "", str(entity or "").casefold())
+        if not requested or not candidates:
+            return []
+
+        def normalize(value: Any) -> str:
+            return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+        query_usage: Dict[str, List[Dict[str, Any]]] = {}
+        for query in DatabaseIntelligenceEngine.discover_relevant_queries(project_root):
+            table = normalize(query.get("table"))
+            if table:
+                query_usage.setdefault(table, []).append(query)
+
+        ranked = []
+        for table in candidates:
+            table_key = normalize(table)
+            score = 0
+            evidence = []
+            singular_table = (
+                table_key[:-3] + "y"
+                if table_key.endswith("ies") and len(table_key) > 3
+                else table_key[:-1]
+                if table_key.endswith("s") and len(table_key) > 3
+                else table_key
+            )
+            singular_requested = (
+                requested[:-3] + "y"
+                if requested.endswith("ies") and len(requested) > 3
+                else requested[:-1]
+                if requested.endswith("s") and len(requested) > 3
+                else requested
+            )
+            if table_key == requested or singular_table == singular_requested:
+                score += 100
+                evidence.append("exact live table-name match")
+            elif requested in singular_table:
+                score += 55
+                evidence.append("live table name contains requested entity")
+            else:
+                continue
+
+            matching_queries = query_usage.get(table_key, [])
+            if matching_queries:
+                score += 35
+                evidence.append("referenced by a project source query")
+            if re.search(r"(?:temp|temporary|history|archive|backup|log)$", table_key):
+                score -= 20
+                evidence.append("table name indicates a temporary or historical variant")
+            ranked.append({
+                "table": str(table),
+                "score": score,
+                "evidence": evidence,
+                "sourceQueries": matching_queries[:3],
+            })
+
+        return sorted(ranked, key=lambda item: (-item["score"], item["table"].casefold()))
 
     @classmethod
     def execute_database_capability(
@@ -4427,11 +6769,18 @@ class DatabaseSessionManager:
         root = Path(eff_root) if eff_root and os.path.isdir(eff_root) else None
         db_type = session.database_type.lower()
         start_t = time.perf_counter()
+        session_db_config = {
+            "engine": db_type,
+            "database": session.database_name,
+            "sqlite_file": session.sqlite_file,
+            "host": session.safe_host,
+            "port": session.safe_port,
+            **session._protected_credentials,
+        }
 
         # Session Auto-Recovery: if session connection was interrupted, reconnect automatically
         if not session.is_connected() and capability not in (DatabaseCapability.DATABASE_DISCONNECT, DatabaseCapability.DATABASE_HEALTH_CHECK, DatabaseCapability.DATABASE_CONNECT):
-            db_cfg = {"engine": session.database_type, "database": session.database_name, "sqlite_file": session.sqlite_file}
-            health = DatabaseIntelligenceEngine.real_connect_and_health_check(eff_root, db_cfg)
+            health = DatabaseIntelligenceEngine.real_connect_and_health_check(eff_root, session_db_config)
             if health.get("connected") or health.get("status") == "CONNECTED":
                 session.connection_state = DatabaseState.CONNECTED
                 if health.get("health_proof"):
@@ -4450,9 +6799,102 @@ class DatabaseSessionManager:
                 if not databases:
                     databases = [session.database_name or "commerce.db"]
             elif db_type in ("mysql", "mariadb"):
-                databases = ["information_schema", "mysql", "performance_schema", session.database_name or "project_db", "sys"]
+                try:
+                    connection = DatabaseIntelligenceEngine._open_mysql_connection(eff_root, session_db_config)
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute("SHOW DATABASES")
+                        databases = [str(row[0]) for row in cursor.fetchmany(100)]
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live MySQL database listing failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif db_type in ("postgres", "postgresql", "supabase"):
+                try:
+                    connection = DatabaseIntelligenceEngine._open_postgresql_connection(eff_root, {
+                        "engine": db_type,
+                        "database": session.database_name,
+                        "host": session.safe_host,
+                        "port": session.safe_port,
+                        "username": session._protected_credentials.get("username"),
+                        "password": session._protected_credentials.get("password"),
+                        "connection_uri": session._protected_credentials.get("connection_uri"),
+                    })
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute("SELECT datname FROM pg_database WHERE datallowconn ORDER BY datname")
+                        databases = [str(row[0]) for row in cursor.fetchmany(100)]
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live PostgreSQL database listing failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif db_type == "h2":
+                try:
+                    connection = DatabaseIntelligenceEngine._open_h2_connection(eff_root, session_db_config)
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute("SELECT 1")
+                        if cursor.fetchone() and session.database_name:
+                            databases = [session.database_name]
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live H2 database verification failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif db_type in ("mongo", "mongodb"):
+                try:
+                    client = DatabaseIntelligenceEngine._open_mongodb_client(eff_root, {
+                        "host": session.safe_host,
+                        "port": session.safe_port,
+                        **session._protected_credentials,
+                    })
+                    try:
+                        databases = client.list_database_names()
+                    finally:
+                        client.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live MongoDB database listing failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
             else:
-                databases = ["postgres", session.database_name or "project_db", "template1"]
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": f"Database listing is not supported for engine '{db_type}'.",
+                    "executionStatus": "UNAVAILABLE",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
 
             duration_ms = round((time.perf_counter() - start_t) * 1000.0, 3)
             measured_timing = max(duration_ms, 0.01)
@@ -4490,37 +6932,476 @@ class DatabaseSessionManager:
 
         # 2. DATABASE_LIST_TABLES
         if capability == DatabaseCapability.DATABASE_LIST_TABLES:
-            target_obj = DatabaseTargetRegistry.get_target(eff_root, getattr(session, "target_id", "DB-001"))
+            schema_query = arguments.get("schema_query")
+            learn_schema = bool(arguments.get("learn_schema"))
+            refresh_schema = bool(arguments.get("refresh_schema"))
+            schema_knowledge = session.get_schema_knowledge()
+            if (learn_schema or schema_query) and (refresh_schema or not schema_knowledge):
+                schema_started = time.perf_counter()
+                schema_result = DatabaseIntelligenceEngine.inspect_database_schema(
+                    eff_root,
+                    {
+                        **session_db_config,
+                        "database_session_id": session.session_id,
+                    },
+                )
+                if (
+                    schema_result.get("status") != "SUCCESS"
+                    or schema_result.get("source") != DatabaseEvidenceSource.LIVE_DB_EXECUTION
+                ):
+                    status = schema_result.get("status") or "SCHEMA_DISCOVERY_FAILED"
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": (
+                            f"Live schema discovery failed ({status}). "
+                            "No verified schema knowledge was stored."
+                        ),
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "schemaError": schema_result.get("error"),
+                        "executed": False,
+                    }
+                schema_knowledge = session.record_schema_knowledge(schema_result)
+                try:
+                    cls.schema_knowledge_store.save(
+                        session.schema_knowledge_key(),
+                        schema_knowledge,
+                    )
+                except RuntimeError as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": (
+                            "Live schema was discovered, but verified schema knowledge "
+                            f"could not be persisted ({error})."
+                        ),
+                        "executionStatus": "SCHEMA_PERSISTENCE_FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "schemaError": str(error),
+                        "executed": False,
+                    }
+                schema_elapsed_ms = max(
+                    round((time.perf_counter() - schema_started) * 1000.0, 3),
+                    0.01,
+                )
+            else:
+                schema_result = None
+                schema_elapsed_ms = None
+
+            if learn_schema or schema_query:
+                if not schema_knowledge:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "No verified schema knowledge is available for this database session.",
+                        "executionStatus": "SCHEMA_NOT_LEARNED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                schema = schema_knowledge.get("schema") or {}
+                schema_tables = schema.get("tables") or []
+                schema_details = schema.get("details") or {}
+                content_lines = []
+
+                if schema_query:
+                    query_kind = str(schema_query.get("kind") or "")
+                    if query_kind == "table_exists":
+                        requested_table = str(schema_query.get("table") or "")
+                        actual_table = next(
+                            (
+                                table for table in schema_tables
+                                if str(table).casefold() == requested_table.casefold()
+                            ),
+                            None,
+                        )
+                        content_lines.append(
+                            f"Table `{actual_table or requested_table}` "
+                            + ("exists in the verified schema." if actual_table else "was not found in the verified schema.")
+                        )
+                    elif query_kind == "column_location":
+                        requested_column = str(schema_query.get("term") or "").casefold()
+                        context = str(schema_query.get("context") or "").casefold()
+                        matches = []
+                        for table_name, details in schema_details.items():
+                            for column in details.get("columns", []):
+                                column_name = str(column.get("name") or "")
+                                if column_name.casefold() == requested_column:
+                                    context_match = bool(context and context in str(table_name).casefold())
+                                    matches.append((not context_match, str(table_name), column))
+                        matches.sort(key=lambda match: (match[0], match[1].casefold()))
+                        if matches:
+                            content_lines.append(f"Verified schema matches for column `{schema_query.get('term')}`:")
+                            for _context_rank, table_name, column in matches:
+                                content_lines.append(
+                                    f"- `{table_name}.{column.get('name')}` "
+                                    f"(type: {column.get('type') or 'not reported by adapter'})"
+                                )
+                        else:
+                            content_lines.append(
+                                f"No exact live schema column named `{schema_query.get('term')}` was found."
+                            )
+                    elif query_kind == "referencing_tables":
+                        target_table = str(schema_query.get("table") or "")
+                        references = [
+                            relationship for relationship in schema.get("relationships", [])
+                            if str(relationship.get("referencedTable") or "").casefold()
+                            == target_table.casefold()
+                        ]
+                        if references:
+                            content_lines.append(
+                                f"Database-enforced foreign keys referencing `{target_table}`:"
+                            )
+                            content_lines.extend(
+                                f"- `{reference.get('table')}` "
+                                f"({', '.join(reference.get('columns') or [])}) -> "
+                                f"`{target_table}` ({', '.join(reference.get('referencedColumns') or [])})"
+                                for reference in references
+                            )
+                        else:
+                            content_lines.append(
+                                f"No database-enforced foreign key referencing `{target_table}` "
+                                "was found in the inspected schema."
+                            )
+                    elif query_kind == "primary_key":
+                        target_table = str(schema_query.get("table") or "")
+                        actual_table = next(
+                            (
+                                table for table in schema_tables
+                                if str(table).casefold() == target_table.casefold()
+                            ),
+                            None,
+                        )
+                        if actual_table is None:
+                            content_lines.append(f"Table `{target_table}` was not found in the verified schema.")
+                        else:
+                            primary_keys = schema_details.get(actual_table, {}).get("primary_keys") or []
+                            content_lines.append(
+                                f"Primary key for `{actual_table}`: "
+                                + (", ".join(f"`{column}`" for column in primary_keys) if primary_keys else "not reported by the database adapter.")
+                            )
+                    elif query_kind == "indexes":
+                        target_table = str(schema_query.get("table") or "")
+                        actual_table = next(
+                            (
+                                table for table in schema_tables
+                                if str(table).casefold() == target_table.casefold()
+                            ),
+                            None,
+                        )
+                        if actual_table is None:
+                            content_lines.append(f"Table `{target_table}` was not found in the verified schema.")
+                        else:
+                            indexes = schema_details.get(actual_table, {}).get("indexes") or []
+                            if not indexes:
+                                content_lines.append(
+                                    f"No indexes were reported for `{actual_table}` by the database adapter."
+                                )
+                            else:
+                                content_lines.append(f"Verified indexes on `{actual_table}`:")
+                                content_lines.extend(
+                                    f"- `{index.get('name')}`"
+                                    f"{' UNIQUE' if index.get('unique') else ''}: "
+                                    f"{', '.join(str(column) for column in (index.get('columns') or [])) or index.get('definition') or 'column details unavailable'}"
+                                    for index in indexes
+                                )
+                    else:
+                        return {
+                            "ok": False,
+                            "capability": capability,
+                            "content": "The requested schema lookup is not supported by the inspected metadata.",
+                            "executionStatus": "UNSUPPORTED_OPERATION",
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                        }
+                    content = "\n".join(content_lines)
+                    schema_provenance = schema_knowledge.get("provenance") or {}
+                    schema_state = (
+                        "Live database inspection"
+                        if schema_result
+                        else "Cached previously verified schema"
+                    )
+                    content += (
+                        f"\n\n**Schema metadata:** {schema_state}.\n"
+                        f"- **Fingerprint:** `{schema_knowledge.get('fingerprint')}`\n"
+                        f"- **Last live verification:** {schema_knowledge.get('lastVerifiedAt')}\n"
+                        f"- **Provenance:** `{schema_provenance.get('source')}`"
+                        f" / `{schema_provenance.get('evidenceId')}`"
+                    )
+                    schema_operation = "SCHEMA_SEARCH"
+                else:
+                    total_columns = sum(
+                        len(details.get("columns") or [])
+                        for details in schema_details.values()
+                    )
+                    total_indexes = sum(
+                        len(details.get("indexes") or [])
+                        for details in schema_details.values()
+                    )
+                    total_relationships = len(schema.get("relationships") or [])
+                    content = (
+                        "### VERIFIED DATABASE SCHEMA\n\n"
+                        f"- **Engine:** `{schema_knowledge.get('engine')}`\n"
+                        f"- **Database:** `{schema_knowledge.get('database')}`\n"
+                        f"- **Tables/collections:** {len(schema_tables)}\n"
+                        f"- **Columns/observed fields:** {total_columns}\n"
+                        f"- **Indexes:** {total_indexes}\n"
+                        f"- **Database-enforced relationships:** {total_relationships}\n"
+                        f"- **Schema fingerprint:** `{schema_knowledge.get('fingerprint')}`\n"
+                        f"- **Discovered at:** {schema_knowledge.get('discoveredAt')}\n"
+                        f"- **Last live verification:** {schema_knowledge.get('lastVerifiedAt')}\n"
+                        f"- **Provenance:** `{(schema_knowledge.get('provenance') or {}).get('source')}`"
+                        f" / `{(schema_knowledge.get('provenance') or {}).get('evidenceId')}`\n"
+                        f"- **Schema changed since prior verification:** "
+                        f"{'yes' if schema_knowledge.get('changed') else 'no'}\n\n"
+                        "**Discovered tables/collections:**\n"
+                        + ("\n".join(f"- `{table}`" for table in schema_tables) if schema_tables else "- None")
+                    )
+                    if not schema_result:
+                        content += "\n\n- **Metadata state:** Cached previously verified schema."
+                    schema_operation = "SCHEMA_DISCOVERY"
+
+                schema_proof_id = (
+                    (schema_knowledge.get("provenance") or {}).get("evidenceId")
+                )
+                return {
+                    "ok": True,
+                    "capability": capability,
+                    "content": content,
+                    "tables": schema_tables,
+                    "schemaKnowledge": schema_knowledge,
+                    "schemaFingerprint": schema_knowledge.get("fingerprint"),
+                    "schemaChanged": schema_knowledge.get("changed"),
+                    "schemaRefreshed": bool(refresh_schema or not schema_query and learn_schema),
+                    "executionTimeMs": schema_elapsed_ms,
+                    "executionStatus": "SUCCESS",
+                    "databaseType": db_type,
+                    "engine": db_type,
+                    "databaseSessionId": session.session_id,
+                    "evidenceId": schema_proof_id,
+                    "mode": "LIVE" if schema_result else "CACHED_VERIFIED_SCHEMA",
+                    "resultSource": (
+                        DatabaseEvidenceSource.LIVE_DB_EXECUTION
+                        if schema_result
+                        else "CACHED_VERIFIED_SCHEMA"
+                    ),
+                    "schemaOperation": schema_operation,
+                    "executed": bool(schema_result),
+                }
+
+            target_obj = DatabaseTargetRegistry.get_target(eff_root, getattr(session, "target_id", None))
             if not target_obj:
                 target_obj = DatabaseTargetRegistry.get_active_target(eff_root)
             tables = []
-            if target_obj and target_obj.tables:
+            if db_type in ("mysql", "mariadb"):
+                if not session.database_name:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "A selected MySQL database is required to list tables.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                try:
+                    connection = DatabaseIntelligenceEngine._open_mysql_connection(eff_root, session_db_config)
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            "SELECT table_name FROM information_schema.tables "
+                            "WHERE table_schema = DATABASE() ORDER BY table_name LIMIT 200"
+                        )
+                        tables = [str(row[0]) for row in cursor.fetchall()]
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live MySQL table listing failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif db_type in ("postgres", "postgresql", "supabase"):
+                try:
+                    connection = DatabaseIntelligenceEngine._open_postgresql_connection(eff_root, {
+                        "engine": db_type,
+                        "database": session.database_name,
+                        "host": session.safe_host,
+                        "port": session.safe_port,
+                        **session._protected_credentials,
+                    })
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            "SELECT table_name FROM information_schema.tables "
+                            "WHERE table_schema = current_schema() ORDER BY table_name LIMIT 200"
+                        )
+                        tables = [str(row[0]) for row in cursor.fetchall()]
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live PostgreSQL table listing failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif db_type == "h2":
+                try:
+                    connection = DatabaseIntelligenceEngine._open_h2_connection(eff_root, session_db_config)
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                            "WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') "
+                            "ORDER BY TABLE_NAME"
+                        )
+                        tables = [str(row[0]) for row in cursor.fetchmany(200)]
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live H2 table listing failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif db_type in ("mongo", "mongodb"):
+                try:
+                    client = DatabaseIntelligenceEngine._open_mongodb_client(eff_root, {
+                        "host": session.safe_host,
+                        "port": session.safe_port,
+                        **session._protected_credentials,
+                    })
+                    try:
+                        tables = client[session.database_name].list_collection_names()
+                    finally:
+                        client.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live MongoDB collection listing failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif target_obj and target_obj.tables:
                 tables = list(target_obj.tables)
-            elif target_obj and target_obj.sqlite_file and os.path.isfile(target_obj.sqlite_file):
-                import sqlite3
-                try:
-                    conn = sqlite3.connect(f"file:{target_obj.sqlite_file}?mode=ro", uri=True)
-                    cur = conn.cursor()
-                    cur.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%';")
-                    tables = [r[0] for r in cur.fetchall()]
-                    conn.close()
-                except Exception:
-                    pass
-            elif session.sqlite_file and os.path.isfile(session.sqlite_file):
-                import sqlite3
-                try:
-                    conn = sqlite3.connect(f"file:{session.sqlite_file}?mode=ro", uri=True)
-                    cur = conn.cursor()
-                    cur.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%';")
-                    tables = [r[0] for r in cur.fetchall()]
-                    conn.close()
-                except Exception:
-                    pass
+            else:
+                configured_sqlite_file = (
+                    target_obj.sqlite_file
+                    if target_obj and target_obj.sqlite_file
+                    else session.sqlite_file
+                )
+                sqlite_path = Path(configured_sqlite_file) if configured_sqlite_file else None
+                if sqlite_path and not sqlite_path.is_absolute() and root:
+                    rooted_path = root / sqlite_path
+                    if rooted_path.is_file():
+                        sqlite_path = rooted_path
+                    else:
+                        matching_files = [
+                            candidate
+                            for candidate in root.rglob(sqlite_path.name)
+                            if candidate.is_file()
+                            and not any(
+                                ignored in str(candidate).lower()
+                                for ignored in ("node_modules", ".git", "vendor")
+                            )
+                        ]
+                        sqlite_path = matching_files[0] if len(matching_files) == 1 else None
+                if sqlite_path and sqlite_path.is_file():
+                    import sqlite3
+                    try:
+                        conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+                        cur = conn.cursor()
+                        cur.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%';")
+                        tables = [r[0] for r in cur.fetchall()]
+                        conn.close()
+                    except Exception:
+                        pass
 
             if not tables:
-                db_cfg = {"engine": db_type, "database": session.database_name, "sqlite_file": session.sqlite_file}
-                tbl_res = DatabaseIntelligenceEngine.list_tables(eff_root, db_cfg)
-                tables = tbl_res.get("tables", [])
+                configured_sqlite_file = (
+                    session.sqlite_file
+                    or (target_obj.sqlite_file if target_obj else None)
+                )
+                project_sqlite_files = []
+                if root and db_type == "sqlite" and not configured_sqlite_file:
+                    project_sqlite_files = [
+                        path
+                        for path in (
+                            list(root.glob("**/*.sqlite"))
+                            + list(root.glob("**/*.sqlite3"))
+                            + list(root.glob("**/*.db"))
+                        )
+                        if not any(
+                            ignored in str(path).lower()
+                            for ignored in ("node_modules", ".git", "vendor")
+                        )
+                    ]
+                selected_sqlite_files = []
+                if session.database_name:
+                    database_filename = Path(session.database_name).name.casefold()
+                    selected_sqlite_files = [
+                        path
+                        for path in project_sqlite_files
+                        if path.name.casefold() == database_filename
+                    ]
+                if not selected_sqlite_files and len(project_sqlite_files) == 1:
+                    selected_sqlite_files = project_sqlite_files
+                if len(selected_sqlite_files) == 1:
+                    discovered = DatabaseIntelligenceEngine.list_tables(
+                        eff_root,
+                        {
+                            "engine": db_type,
+                            "database": session.database_name,
+                            "sqlite_file": str(selected_sqlite_files[0]),
+                        },
+                    )
+                    if str(discovered.get("source") or "").startswith("sqlite:"):
+                        tables = discovered.get("tables", [])
+
+            if not tables:
+                supported_live_engines = {
+                    "sqlite",
+                    "mysql",
+                    "mariadb",
+                    "postgres",
+                    "postgresql",
+                    "supabase",
+                    "h2",
+                    "mongo",
+                    "mongodb",
+                }
+                if db_type not in supported_live_engines:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": (
+                            f"Live table discovery is not supported for database engine `{db_type or 'unknown'}`. "
+                            "Project model or migration references were not treated as live tables."
+                        ),
+                        "executionStatus": "UNSUPPORTED_ENGINE",
+                        "databaseType": db_type or "unknown",
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
             duration_ms = round((time.perf_counter() - start_t) * 1000.0, 3)
             measured_timing = max(duration_ms, 0.01)
 
@@ -4538,8 +7419,7 @@ class DatabaseSessionManager:
             DatabaseEvidenceStore.record_proof(proof)
             session.binding.bind_proof(proof)
 
-            tbl_text = "\n".join(f"- `{t}`" for t in tables)
-            content = f"### DATABASE TABLES INSPECTION\n\nTables found: {len(tables)}\n\n{tbl_text}"
+            content = "\n".join(f"- `{table}`" for table in tables) or "No tables found."
             return {
                 "ok": True,
                 "capability": capability,
@@ -4559,8 +7439,254 @@ class DatabaseSessionManager:
 
         # 3. DATABASE_DESCRIBE_TABLE
         if capability == DatabaseCapability.DATABASE_DESCRIBE_TABLE:
-            target_table = arguments.get("table") or "users"
+            requested_table = str(arguments.get("table") or "").strip()
+            if not requested_table:
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": "Name the table whose columns you want to inspect.",
+                    "executionStatus": "INVALID_INPUT",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
+            listed_tables = cls.execute_database_capability(
+                DatabaseCapability.DATABASE_LIST_TABLES,
+                {},
+                session,
+                eff_root,
+            )
+            if not listed_tables.get("ok"):
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": listed_tables.get("content")
+                    or "Could not resolve the table against the selected database.",
+                    "executionStatus": listed_tables.get("executionStatus", "FAILED"),
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
+            table_matches = cls._resolve_schema_table_matches(
+                requested_table,
+                [str(table) for table in listed_tables.get("tables") or []],
+            )
+            if not table_matches:
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": f"Table `{requested_table}` was not found in the selected database.",
+                    "executionStatus": "NOT_FOUND",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
+            if len(table_matches) > 1:
+                options = [{"label": table, "value": table} for table in table_matches]
+                numbered = "\n".join(
+                    f"{index}. `{option['value']}`"
+                    for index, option in enumerate(options, start=1)
+                )
+                return {
+                    "ok": True,
+                    "capability": capability,
+                    "content": (
+                        f"More than one table matches **{requested_table}**. "
+                        f"Which table should I describe?\n{numbered}\nNo schema detail query was run."
+                    ),
+                    "executionStatus": "NEEDS_CLARIFICATION",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                    "candidateTables": table_matches,
+                    "clarificationOptions": options,
+                    "clarificationType": "table",
+                }
+            target_table = table_matches[0]
             columns = []
+            if db_type in ("mysql", "mariadb"):
+                if not re.fullmatch(r"[A-Za-z0-9_$-]{1,120}", target_table):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "MySQL table name is invalid.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                try:
+                    connection = DatabaseIntelligenceEngine._open_mysql_connection(eff_root, session_db_config)
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY "
+                            "FROM information_schema.columns "
+                            "WHERE table_schema = DATABASE() AND table_name = %s "
+                            "ORDER BY ORDINAL_POSITION",
+                            (target_table,),
+                        )
+                        columns = [
+                            {
+                                "name": row[0],
+                                "type": row[1],
+                                "notnull": row[2] == "NO",
+                                "pk": row[3] == "PRI",
+                            }
+                            for row in cursor.fetchall()
+                        ]
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live MySQL table inspection failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif db_type in ("postgres", "postgresql", "supabase"):
+                if not re.fullmatch(r"[A-Za-z0-9_$-]{1,120}", target_table):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "PostgreSQL table name is invalid.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                try:
+                    connection = DatabaseIntelligenceEngine._open_postgresql_connection(eff_root, session_db_config)
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            "SELECT c.column_name, c.data_type, c.is_nullable, "
+                            "EXISTS (SELECT 1 FROM information_schema.table_constraints tc "
+                            "JOIN information_schema.key_column_usage kcu "
+                            "ON tc.constraint_name = kcu.constraint_name "
+                            "AND tc.table_schema = kcu.table_schema "
+                            "WHERE tc.constraint_type = 'PRIMARY KEY' "
+                            "AND tc.table_schema = current_schema() "
+                            "AND tc.table_name = c.table_name "
+                            "AND kcu.column_name = c.column_name) "
+                            "FROM information_schema.columns c "
+                            "WHERE c.table_schema = current_schema() AND c.table_name = %s "
+                            "ORDER BY c.ordinal_position",
+                            (target_table,),
+                        )
+                        columns = [
+                            {"name": row[0], "type": row[1], "notnull": row[2] == "NO", "pk": bool(row[3])}
+                            for row in cursor.fetchall()
+                        ]
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live PostgreSQL table inspection failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif db_type == "h2":
+                if not re.fullmatch(r"[A-Za-z0-9_$-]{1,120}", target_table):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "H2 table name is invalid.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                try:
+                    connection = DatabaseIntelligenceEngine._open_h2_connection(eff_root, session_db_config)
+                    try:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE "
+                            "FROM INFORMATION_SCHEMA.COLUMNS "
+                            "WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_NAME = ? "
+                            "ORDER BY ORDINAL_POSITION",
+                            (target_table.upper(),),
+                        )
+                        rows = cursor.fetchall()
+                        cursor.execute(
+                            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
+                            "WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_NAME = ? "
+                            "AND CONSTRAINT_NAME IN (SELECT CONSTRAINT_NAME "
+                            "FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS "
+                            "WHERE TABLE_SCHEMA = 'PUBLIC' AND TABLE_NAME = ? "
+                            "AND CONSTRAINT_TYPE = 'PRIMARY KEY')",
+                            (target_table.upper(), target_table.upper()),
+                        )
+                        primary_keys = {str(row[0]) for row in cursor.fetchall()}
+                        columns = [
+                            {
+                                "name": row[0],
+                                "type": row[1],
+                                "notnull": row[2] == "NO",
+                                "pk": str(row[0]) in primary_keys,
+                            }
+                            for row in rows
+                        ]
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live H2 table inspection failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            elif db_type in ("mongo", "mongodb"):
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", target_table):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "MongoDB collection name is invalid.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                try:
+                    client = DatabaseIntelligenceEngine._open_mongodb_client(eff_root, {
+                        "host": session.safe_host,
+                        "port": session.safe_port,
+                        **session._protected_credentials,
+                    })
+                    try:
+                        sample = client[session.database_name][target_table].find_one()
+                        columns = [
+                            {
+                                "name": name,
+                                "type": type(value).__name__,
+                                "notnull": value is not None,
+                                "pk": name == "_id",
+                            }
+                            for name, value in (sample or {}).items()
+                        ]
+                    finally:
+                        client.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"MongoDB collection inspection failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
             if db_type == "sqlite" and session.sqlite_file and os.path.isfile(session.sqlite_file):
                 import sqlite3
                 try:
@@ -4577,13 +7703,21 @@ class DatabaseSessionManager:
                     conn.close()
                 except Exception:
                     pass
-            if not columns:
+            if not columns and db_type not in ("mysql", "mariadb", "postgres", "postgresql", "supabase", "mongo", "mongodb", "h2"):
                 schema_res = DatabaseIntelligenceEngine.inspect_database_schema(project_root)
                 tbl_details = (schema_res.get("schema_details") or {}).get(target_table, {})
-                columns = tbl_details.get("columns", [
-                    {"name": "id", "type": "INTEGER", "pk": True, "notnull": True},
-                    {"name": "name", "type": "VARCHAR(255)", "pk": False, "notnull": False},
-                ])
+                columns = tbl_details.get("columns", [])
+
+            if not columns:
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": f"Table '{target_table}' was not found in the selected database.",
+                    "executionStatus": "NOT_FOUND",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
 
             duration_ms = round((time.perf_counter() - start_t) * 1000.0, 3)
             measured_timing = max(duration_ms, 0.01)
@@ -4628,6 +7762,60 @@ class DatabaseSessionManager:
         # 4. DATABASE_LIST_INDEXES
         if capability == DatabaseCapability.DATABASE_LIST_INDEXES:
             target_table = arguments.get("table")
+            if target_table:
+                listed_tables = cls.execute_database_capability(
+                    DatabaseCapability.DATABASE_LIST_TABLES,
+                    {},
+                    session,
+                    eff_root,
+                )
+                if not listed_tables.get("ok"):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": listed_tables.get("content")
+                        or "Could not resolve the table against the selected database.",
+                        "executionStatus": listed_tables.get("executionStatus", "FAILED"),
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                table_matches = cls._resolve_schema_table_matches(
+                    str(target_table),
+                    [str(table) for table in listed_tables.get("tables") or []],
+                )
+                if not table_matches:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Table `{target_table}` was not found in the selected database.",
+                        "executionStatus": "NOT_FOUND",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                if len(table_matches) > 1:
+                    options = [{"label": table, "value": table} for table in table_matches]
+                    numbered = "\n".join(
+                        f"{index}. `{option['value']}`"
+                        for index, option in enumerate(options, start=1)
+                    )
+                    return {
+                        "ok": True,
+                        "capability": capability,
+                        "content": (
+                            f"More than one table matches **{target_table}**. "
+                            f"Which table should I inspect?\n{numbered}\nNo index query was run."
+                        ),
+                        "executionStatus": "NEEDS_CLARIFICATION",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                        "candidateTables": table_matches,
+                        "clarificationOptions": options,
+                        "clarificationType": "table",
+                    }
+                target_table = table_matches[0]
             indexes = []
             if db_type == "sqlite" and session.sqlite_file and os.path.isfile(session.sqlite_file):
                 import sqlite3
@@ -4652,6 +7840,61 @@ class DatabaseSessionManager:
                     conn.close()
                 except Exception:
                     pass
+            elif db_type == "h2":
+                if target_table and not re.fullmatch(r"[A-Za-z0-9_$-]{1,120}", target_table):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "H2 table name is invalid.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                try:
+                    connection = DatabaseIntelligenceEngine._open_h2_connection(eff_root, session_db_config)
+                    try:
+                        cursor = connection.cursor()
+                        query = (
+                            "SELECT I.TABLE_NAME, I.INDEX_NAME, I.INDEX_TYPE_NAME, C.COLUMN_NAME "
+                            "FROM INFORMATION_SCHEMA.INDEXES I "
+                            "JOIN INFORMATION_SCHEMA.INDEX_COLUMNS C "
+                            "ON C.INDEX_SCHEMA = I.INDEX_SCHEMA AND C.INDEX_NAME = I.INDEX_NAME "
+                            "WHERE I.TABLE_SCHEMA = 'PUBLIC'"
+                        )
+                        parameters = ()
+                        if target_table:
+                            query += " AND I.TABLE_NAME = ?"
+                            parameters = (target_table.upper(),)
+                        query += " ORDER BY I.TABLE_NAME, I.INDEX_NAME, C.ORDINAL_POSITION"
+                        cursor.execute(query, parameters)
+                        indexes_by_name: Dict[Tuple[str, str], Dict[str, Any]] = {}
+                        for table_name, index_name, index_type, column_name in cursor.fetchall():
+                            key = (str(table_name), str(index_name))
+                            index = indexes_by_name.setdefault(
+                                key,
+                                {
+                                    "table": str(table_name),
+                                    "name": str(index_name),
+                                    "unique": str(index_type).upper().startswith(("UNIQUE", "PRIMARY KEY")),
+                                    "columns": [],
+                                },
+                            )
+                            if column_name:
+                                index["columns"].append(str(column_name))
+                        indexes = list(indexes_by_name.values())
+                    finally:
+                        connection.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live H2 index inspection failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
 
             duration_ms = round((time.perf_counter() - start_t) * 1000.0, 3)
             measured_timing = max(duration_ms, 0.01)
@@ -4698,8 +7941,1147 @@ class DatabaseSessionManager:
                 "executed": True,
             }
 
+        if capability == DatabaseCapability.DATABASE_COUNT_RECORDS:
+            requested_entity = str(arguments.get("entity") or "").strip()
+            payment_filter = str(arguments.get("payment_filter") or "").strip().lower()
+            payment_value = arguments.get("payment_value")
+            requested_filters = {
+                str(item).strip().casefold()
+                for item in arguments.get("filters", [])
+                if isinstance(item, str)
+            } if isinstance(arguments.get("filters", []), (list, tuple, set)) else set()
+            unsupported_filters = requested_filters - {"active", "today"}
+            if unsupported_filters:
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": (
+                        "The requested count condition could not be verified safely; "
+                        "no count query was run."
+                    ),
+                    "executionStatus": "UNSUPPORTED_FILTER",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
+            entity_key = re.sub(r"[^a-z0-9]", "", requested_entity.lower())
+            is_table_identifier = bool(
+                re.fullmatch(r"[A-Za-z][A-Za-z0-9_$.-]*", requested_entity)
+                and (
+                    re.search(r"[_$.-]", requested_entity)
+                    or requested_entity != requested_entity.lower()
+                )
+            )
+            if not is_table_identifier:
+                if entity_key.endswith("ies") and len(entity_key) > 3:
+                    entity_key = f"{entity_key[:-3]}y"
+                elif entity_key.endswith("s") and len(entity_key) > 3:
+                    entity_key = entity_key[:-1]
+            if not entity_key:
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": "Name the kind of records to count, such as admissions or users.",
+                    "executionStatus": "INVALID_INPUT",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
+
+            table_result = cls.execute_database_capability(
+                DatabaseCapability.DATABASE_LIST_TABLES,
+                {},
+                session,
+                eff_root,
+            )
+            if not table_result.get("ok"):
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": table_result.get("content") or "Could not inspect the connected database tables.",
+                    "executionStatus": table_result.get("executionStatus", "FAILED"),
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
+            if not table_result.get("tables"):
+                refreshed_tables = cls.execute_database_capability(
+                    DatabaseCapability.DATABASE_LIST_TABLES,
+                    {"learn_schema": True, "refresh_schema": True},
+                    session,
+                    eff_root,
+                )
+                if not refreshed_tables.get("ok"):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": (
+                            "The connected database returned no tables, and a fresh verified-schema "
+                            f"check failed: {refreshed_tables.get('content') or 'schema refresh failed'}. "
+                            "No count query was run."
+                        ),
+                        "executionStatus": refreshed_tables.get("executionStatus", "FAILED"),
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                if refreshed_tables.get("tables"):
+                    table_result = refreshed_tables
+                else:
+                    database_label = session.database_name or "the selected database"
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": (
+                            f"A fresh live-schema check found no accessible tables in {database_label}. "
+                            "No count query was run. Verify that the intended database/schema is selected "
+                            "and that this connection can list its tables."
+                        ),
+                        "executionStatus": "NO_LIVE_TABLES",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+
+            scored_tables = []
+            target_resolution = None
+            for table in table_result.get("tables", []):
+                table_name = str(table)
+                table_key = re.sub(r"[^a-z0-9]", "", table_name.lower())
+                singular_table_key = table_key
+                if not is_table_identifier:
+                    singular_table_key = (
+                        f"{table_key[:-3]}y"
+                        if table_key.endswith("ies") and len(table_key) > 3
+                        else table_key[:-1]
+                        if table_key.endswith("s") and len(table_key) > 3
+                        else table_key
+                    )
+                if table_key == entity_key or singular_table_key == entity_key:
+                    score = 100
+                elif not is_table_identifier and entity_key in singular_table_key:
+                    score = 50
+                elif (
+                    not is_table_identifier
+                    and singular_table_key in entity_key
+                    and len(singular_table_key) >= 4
+                ):
+                    score = 25
+                else:
+                    continue
+                scored_tables.append((score, table_name))
+
+            if not scored_tables:
+                fuzzy_matches = []
+                fuzzy_similarities = []
+                if is_table_identifier and len(entity_key) >= 10:
+                    for table in table_result.get("tables", []):
+                        table_name = str(table)
+                        table_key = re.sub(r"[^a-z0-9]", "", table_name.lower())
+                        similarity = SequenceMatcher(None, entity_key, table_key).ratio()
+                        if similarity >= 0.90:
+                            fuzzy_similarities.append((similarity, table_name))
+                if fuzzy_similarities:
+                    best_similarity = max(similarity for similarity, _ in fuzzy_similarities)
+                    fuzzy_matches = [
+                        (round(similarity * 100), table_name)
+                        for similarity, table_name in fuzzy_similarities
+                        if best_similarity - similarity < 0.08
+                    ]
+                if fuzzy_matches:
+                    best_score = max(score for score, _ in fuzzy_matches)
+                    scored_tables = [
+                        (score, table_name)
+                        for score, table_name in fuzzy_matches
+                        if score == best_score
+                    ]
+            if not scored_tables:
+                available_tables = table_result.get("tables", [])
+                requested_tokens = [
+                    token
+                    for token in re.findall(r"[a-z0-9]+", requested_entity.lower())
+                    if len(token) >= 3
+                ]
+                suggested_tables = []
+                for table in available_tables:
+                    table_name = str(table)
+                    table_tokens = [
+                        token
+                        for token in re.findall(r"[a-z0-9]+", table_name.lower())
+                        if len(token) >= 3
+                    ]
+                    exact_token_matches = sum(
+                        1 for token in requested_tokens if token in table_tokens
+                    )
+                    near_token_matches = sum(
+                        1
+                        for token in requested_tokens
+                        if token not in table_tokens
+                        and len(token) >= 4
+                        and any(
+                            SequenceMatcher(None, token, candidate_token).ratio() >= 0.8
+                            for candidate_token in table_tokens
+                        )
+                    )
+                    whole_name_similarity = SequenceMatcher(
+                        None,
+                        entity_key,
+                        re.sub(r"[^a-z0-9]", "", table_name.lower()),
+                    ).ratio()
+                    is_relevant_candidate = (
+                        exact_token_matches >= 2
+                        or (exact_token_matches >= 1 and near_token_matches >= 1)
+                        or (len(requested_tokens) == 1 and whole_name_similarity >= 0.65)
+                    )
+                    if is_relevant_candidate:
+                        relevance = (
+                            exact_token_matches * 2
+                            + near_token_matches
+                            + whole_name_similarity
+                        )
+                        suggested_tables.append((relevance, table_name))
+                suggested_tables.sort(key=lambda item: (-item[0], item[1].casefold()))
+                relevant_tables = [table for _, table in suggested_tables[:10]]
+                if relevant_tables:
+                    ranking = cls._rank_database_table_candidates(
+                        requested_entity,
+                        relevant_tables,
+                        eff_root,
+                    )
+                    if (
+                        len(ranking) > 1
+                        and ranking[0]["score"] >= 70
+                        and ranking[0]["score"] - ranking[1]["score"] >= 20
+                    ):
+                        scored_tables = [(ranking[0]["score"], ranking[0]["table"])]
+                        target_resolution = ranking[0]
+                    else:
+                        options = [
+                            {"label": str(table), "value": str(table)}
+                            for table in relevant_tables
+                        ]
+                        numbered_options = "\n".join(
+                            f"{index}. `{option['value']}`"
+                            for index, option in enumerate(options, start=1)
+                        )
+                        return {
+                            "ok": True,
+                            "capability": capability,
+                            "content": (
+                                f"No single table is sufficiently supported for **{requested_entity}**. "
+                                f"Which table should I count?\n{numbered_options}\n"
+                                "No count query was run."
+                            ),
+                            "executionStatus": "NEEDS_CLARIFICATION",
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                            "candidateTables": [option["value"] for option in options],
+                            "clarificationOptions": options,
+                            "clarificationType": "table",
+                        }
+                table_list = ", ".join(f"`{name}`" for name in available_tables[:30]) or "none discovered"
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": (
+                        f"No table matching **{requested_entity}** was found in the connected database. "
+                        f"Discovered tables: {table_list}."
+                    ),
+                    "executionStatus": "NOT_FOUND",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
+
+            best_score = max(score for score, _ in scored_tables)
+            best_tables = sorted({name for score, name in scored_tables if score == best_score})
+            if len(best_tables) != 1:
+                ranking = cls._rank_database_table_candidates(
+                    requested_entity,
+                    best_tables,
+                    eff_root,
+                )
+                if (
+                    len(ranking) > 1
+                    and ranking[0]["score"] >= 70
+                    and ranking[0]["score"] - ranking[1]["score"] >= 20
+                ):
+                    best_tables = [ranking[0]["table"]]
+                    target_resolution = ranking[0]
+                else:
+                    candidates = ", ".join(f"`{name}`" for name in best_tables)
+                    return {
+                        "ok": True,
+                        "capability": capability,
+                        "content": (
+                            f"More than one table matches **{requested_entity}** in the live schema, and project evidence "
+                            f"does not clearly favor one: {candidates}. "
+                            "Which should I count? No count query was run."
+                        ),
+                        "executionStatus": "NEEDS_CLARIFICATION",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                        "candidateTables": best_tables,
+                        "clarificationOptions": [
+                            {"label": table, "value": table}
+                            for table in best_tables
+                        ],
+                        "clarificationType": "table",
+                    }
+
+            target_table = best_tables[0]
+            if not re.fullmatch(r"[A-Za-z0-9_$-]{1,120}", target_table):
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": "The matching database table name cannot be safely queried.",
+                    "executionStatus": "INVALID_INPUT",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
+
+            filter_rules = []
+            if db_type in ("mongo", "mongodb"):
+                if payment_filter or requested_filters:
+                    return {
+                        "ok": True,
+                        "capability": capability,
+                        "content": (
+                            "The requested count condition cannot be verified safely for this MongoDB collection; "
+                            "no count was run."
+                        ),
+                        "executionStatus": "NEEDS_CLARIFICATION",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                try:
+                    client = DatabaseIntelligenceEngine._open_mongodb_client(eff_root, session_db_config)
+                    try:
+                        total_records = client[session.database_name][target_table].count_documents({})
+                    finally:
+                        client.close()
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"MongoDB record count failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+            else:
+                quote_char = "`" if db_type in ("mysql", "mariadb") else '"'
+                where_clause = ""
+                if payment_filter == "paid":
+                    table_schema = cls.execute_database_capability(
+                        DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+                        {"table": target_table},
+                        session,
+                        eff_root,
+                    )
+                    if not table_schema.get("ok"):
+                        return {
+                            "ok": False,
+                            "capability": capability,
+                            "content": table_schema.get("content") or "Could not verify the payment-status column; no paid count was run.",
+                            "executionStatus": table_schema.get("executionStatus", "FAILED"),
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                        }
+                    columns = table_schema.get("columns") or []
+                    payment_columns = [
+                        str(column.get("name", ""))
+                        for column in columns
+                        if re.search(r"(?:pay|payment|paid).*status|status.*(?:pay|payment|paid)", str(column.get("name", "")), re.I)
+                    ]
+                    if not payment_columns:
+                        payment_columns = [
+                            str(column.get("name", ""))
+                            for column in columns
+                            if re.search(r"\bstatus\b", str(column.get("name", "")), re.I)
+                        ]
+                    if not payment_columns:
+                        return {
+                            "ok": False,
+                            "capability": capability,
+                            "content": (
+                                f"Table `{target_table}` has no clearly named payment-status column, so paid records "
+                                "cannot be identified safely; no count was run."
+                            ),
+                            "executionStatus": "NEEDS_CLARIFICATION",
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                        }
+                    requested_payment_column = str(arguments.get("payment_column") or "")
+                    if requested_payment_column:
+                        if requested_payment_column not in payment_columns:
+                            return {
+                                "ok": True,
+                                "capability": capability,
+                                "content": (
+                                    f"`{requested_payment_column}` is not an available status field on `{target_table}`. "
+                                    f"Choose one of: {', '.join(f'`{column}`' for column in payment_columns)}. "
+                                    "No count query was run."
+                                ),
+                                "executionStatus": "NEEDS_CLARIFICATION",
+                                "databaseType": db_type,
+                                "databaseSessionId": session.session_id,
+                                "executed": False,
+                                "clarificationOptions": [
+                                    {"label": column, "value": column}
+                                    for column in payment_columns
+                                ],
+                                "clarificationType": "payment_column",
+                            }
+                        payment_columns = [requested_payment_column]
+                    if len(payment_columns) > 1:
+                        options = [
+                            {"label": column, "value": column}
+                            for column in payment_columns
+                        ]
+                        return {
+                            "ok": True,
+                            "capability": capability,
+                            "content": (
+                                f"More than one payment-status column exists on `{target_table}`. "
+                                f"Choose a field: {', '.join(f'`{column}`' for column in payment_columns)}. "
+                                "No count query was run."
+                            ),
+                            "executionStatus": "NEEDS_CLARIFICATION",
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                            "clarificationOptions": options,
+                            "clarificationType": "payment_column",
+                        }
+                    payment_column = payment_columns[0]
+                    if not re.fullmatch(r"[A-Za-z0-9_$-]{1,120}", payment_column):
+                        return {
+                            "ok": False,
+                            "capability": capability,
+                            "content": "The payment-status column name cannot be safely queried.",
+                            "executionStatus": "INVALID_INPUT",
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                        }
+                    status_sql = (
+                        f"SELECT {quote_char}{payment_column}{quote_char} AS status_value, "
+                        f"COUNT(*) AS matching_records FROM {quote_char}{target_table}{quote_char} "
+                        f"GROUP BY {quote_char}{payment_column}{quote_char} "
+                        f"ORDER BY {quote_char}{payment_column}{quote_char}"
+                    )
+                    status_result = DatabaseIntelligenceEngine.execute_safe_query(
+                        eff_root,
+                        status_sql,
+                        session_db_config,
+                    )
+                    if not status_result.get("ok"):
+                        error = status_result.get("error") or {}
+                        return {
+                            "ok": False,
+                            "capability": capability,
+                            "content": error.get("message") or "Could not inspect payment-status values; no paid count was run.",
+                            "error": error,
+                            "executionStatus": "FAILED",
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                        }
+                    status_rows = status_result.get("rows") or []
+                    if payment_value is None:
+                        paid_values = [
+                            row["status_value"]
+                            for row in status_rows
+                            if isinstance(row, dict)
+                            and isinstance(row.get("status_value"), str)
+                            and re.search(r"\bpaid\b", row["status_value"], re.I)
+                        ]
+                        if len(paid_values) == 1:
+                            payment_value = paid_values[0]
+                        else:
+                            options = [
+                                {
+                                    "label": f"{row.get('status_value')} ({row.get('matching_records')} rows)",
+                                    "value": str(row.get("status_value")),
+                                }
+                                for row in status_rows
+                                if isinstance(row, dict)
+                            ]
+                            available = ", ".join(f"`{option['label']}`" for option in options) or "none"
+                            return {
+                                "ok": True,
+                                "capability": capability,
+                                "content": (
+                                    f"Could not determine which value in `{payment_column}` means paid. "
+                                    f"Available values and row counts: {available}. Choose the value that represents "
+                                    "paid; no count query was run."
+                                ),
+                                "executionStatus": "NEEDS_CLARIFICATION",
+                                "databaseType": db_type,
+                                "databaseSessionId": session.session_id,
+                                "executed": False,
+                                "clarificationOptions": options,
+                                "clarificationType": "payment_value",
+                            }
+                    matching_values = [
+                        row.get("status_value")
+                        for row in status_rows
+                        if isinstance(row, dict)
+                    ]
+                    matching_value = next(
+                        (value for value in matching_values if str(value) == str(payment_value)),
+                        None,
+                    )
+                    if matching_value is None:
+                        return {
+                            "ok": True,
+                            "capability": capability,
+                            "content": (
+                                f"`{payment_value}` is not an observed value in `{payment_column}`. "
+                                "Choose one of the listed live values; no count query was run."
+                            ),
+                            "executionStatus": "NEEDS_CLARIFICATION",
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                            "clarificationOptions": [
+                                {"label": str(value), "value": str(value)}
+                                for value in matching_values
+                            ],
+                            "clarificationType": "payment_value",
+                        }
+                    payment_value = matching_value
+                    if isinstance(payment_value, (int, float)) and not isinstance(payment_value, bool):
+                        sql_value = str(payment_value)
+                    else:
+                        sql_value = "'" + str(payment_value).replace("'", "''") + "'"
+                    where_clause = (
+                        f" WHERE {quote_char}{payment_column}{quote_char} = {sql_value}"
+                    )
+                    filter_rules.append(f"{payment_column} = {payment_value}")
+                if "active" in requested_filters or "today" in requested_filters:
+                    table_schema = cls.execute_database_capability(
+                        DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+                        {"table": target_table},
+                        session,
+                        eff_root,
+                    )
+                    if not table_schema.get("ok"):
+                        return {
+                            "ok": False,
+                            "capability": capability,
+                            "content": (
+                                table_schema.get("content")
+                                or "Could not verify the requested count conditions; no count was run."
+                            ),
+                            "executionStatus": table_schema.get("executionStatus", "FAILED"),
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                        }
+                    columns = [
+                        column for column in table_schema.get("columns") or []
+                        if isinstance(column, dict)
+                        and re.fullmatch(
+                            r"[A-Za-z0-9_$-]{1,120}",
+                            str(column.get("name") or ""),
+                        )
+                    ]
+
+                    if "active" in requested_filters:
+                        status_columns = [
+                            column for column in columns
+                            if re.fullmatch(
+                                r"(?:is_?active|active|status|state|account_status|user_status)",
+                                str(column.get("name") or ""),
+                                re.I,
+                            )
+                        ]
+                        active_matches = []
+                        observed_by_column = {}
+                        for column in status_columns:
+                            column_name = str(column["name"])
+                            quoted_column = f"{quote_char}{column_name}{quote_char}"
+                            values_result = DatabaseIntelligenceEngine.execute_safe_query(
+                                eff_root,
+                                (
+                                    f"SELECT {quoted_column} AS status_value, COUNT(*) AS matching_records "
+                                    f"FROM {quote_char}{target_table}{quote_char} "
+                                    f"GROUP BY {quoted_column} ORDER BY {quoted_column} LIMIT 20"
+                                ),
+                                session_db_config,
+                            )
+                            if not values_result.get("ok"):
+                                return {
+                                    "ok": False,
+                                    "capability": capability,
+                                    "content": (
+                                        "Could not inspect status values to identify active records; "
+                                        "no count query was run."
+                                    ),
+                                    "executionStatus": "FAILED",
+                                    "databaseType": db_type,
+                                    "databaseSessionId": session.session_id,
+                                    "executed": False,
+                                }
+                            status_rows = [
+                                row for row in values_result.get("rows") or []
+                                if isinstance(row, dict) and "status_value" in row
+                            ]
+                            observed_by_column[column_name] = status_rows
+                            column_type = str(column.get("type") or "").casefold()
+                            boolean_column = (
+                                "bool" in column_type
+                                or re.fullmatch(r"is_?active", column_name, re.I) is not None
+                            )
+                            for row in status_rows:
+                                value = row.get("status_value")
+                                if isinstance(value, str) and value.strip().casefold() == "active":
+                                    active_matches.append((column_name, value))
+                                elif boolean_column and (
+                                    value is True
+                                    or isinstance(value, (int, float)) and value == 1
+                                    or isinstance(value, str) and value.strip().casefold() in ("1", "true", "yes")
+                                ):
+                                    active_matches.append((column_name, value))
+
+                        requested_active_column = str(arguments.get("active_column") or "")
+                        requested_active_value = arguments.get("active_value")
+                        if requested_active_column:
+                            requested_match = next(
+                                (
+                                    (requested_active_column, row.get("status_value"))
+                                    for row in observed_by_column.get(requested_active_column, [])
+                                    if str(row.get("status_value")) == str(requested_active_value)
+                                ),
+                                None,
+                            )
+                            active_matches = [requested_match] if requested_match else []
+                        if len(active_matches) != 1:
+                            options = [
+                                {
+                                    "label": f"{column_name} = {row.get('status_value')}",
+                                    "value": f"{column_name}={row.get('status_value')}",
+                                }
+                                for column_name, values in observed_by_column.items()
+                                for row in values
+                            ]
+                            return {
+                                "ok": True,
+                                "capability": capability,
+                                "content": (
+                                    f"Could not determine an unambiguous active-state rule for `{target_table}`. "
+                                    "Choose the status field/value that represents active; no count query was run."
+                                ),
+                                "executionStatus": "NEEDS_CLARIFICATION",
+                                "databaseType": db_type,
+                                "databaseSessionId": session.session_id,
+                                "executed": False,
+                                "clarificationOptions": options,
+                                "clarificationType": "active_rule",
+                            }
+                        active_column, active_value = active_matches[0]
+                        active_value_sql = (
+                            str(active_value)
+                            if isinstance(active_value, (int, float)) and not isinstance(active_value, bool)
+                            else "'" + str(active_value).replace("'", "''") + "'"
+                        )
+                        filter_rules.append(f"{active_column} = {active_value}")
+                        where_clause = (
+                            f"{where_clause} AND " if where_clause else " WHERE "
+                        ) + f"{quote_char}{active_column}{quote_char} = {active_value_sql}"
+
+                    if "today" in requested_filters:
+                        date_columns = [
+                            str(column["name"])
+                            for column in columns
+                            if re.search(
+                                r"date|time|timestamp",
+                                str(column.get("type") or ""),
+                                re.I,
+                            )
+                        ]
+                        requested_date_column = str(arguments.get("today_column") or "")
+                        if requested_date_column:
+                            if requested_date_column not in date_columns:
+                                return {
+                                    "ok": False,
+                                    "capability": capability,
+                                    "content": (
+                                        f"`{requested_date_column}` is not a verified date/time column "
+                                        f"on `{target_table}`; no count query was run."
+                                    ),
+                                    "executionStatus": "INVALID_INPUT",
+                                    "databaseType": db_type,
+                                    "databaseSessionId": session.session_id,
+                                    "executed": False,
+                                }
+                            date_columns = [requested_date_column]
+                        preferred_date_columns = [
+                            name for name in date_columns
+                            if name.casefold() in {
+                                "created_at", "created_on", "created", "date",
+                                "timestamp", "updated_at", "updated_on",
+                            }
+                        ]
+                        if len(preferred_date_columns) == 1:
+                            date_columns = preferred_date_columns
+                        if len(date_columns) != 1:
+                            options = [
+                                {"label": name, "value": name}
+                                for name in date_columns
+                            ]
+                            return {
+                                "ok": True,
+                                "capability": capability,
+                                "content": (
+                                    f"Could not determine which date/time column defines 'today' for `{target_table}`. "
+                                    + (
+                                        "Choose a column: "
+                                        + ", ".join(f"`{option['value']}`" for option in options)
+                                        if options
+                                        else "No date/time column was reported by the live schema."
+                                    )
+                                    + " No count query was run."
+                                ),
+                                "executionStatus": "NEEDS_CLARIFICATION" if options else "NOT_FOUND",
+                                "databaseType": db_type,
+                                "databaseSessionId": session.session_id,
+                                "executed": False,
+                                "clarificationOptions": options,
+                                "clarificationType": "count_date_column",
+                            }
+                        date_column = date_columns[0]
+                        where_clause = (
+                            f"{where_clause} AND " if where_clause else " WHERE "
+                        ) + f"DATE({quote_char}{date_column}{quote_char}) = CURRENT_DATE"
+                        filter_rules.append(f"{date_column} is today (database CURRENT_DATE)")
+                count_sql = (
+                    f"SELECT COUNT(*) AS total_records FROM {quote_char}{target_table}{quote_char}"
+                    f"{where_clause}"
+                )
+                count_result = DatabaseIntelligenceEngine.execute_safe_query(
+                    eff_root,
+                    count_sql,
+                    session_db_config,
+                )
+                if not count_result.get("ok"):
+                    error = count_result.get("error") or {}
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": error.get("message") or "The read-only record count query failed.",
+                        "error": error,
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                count_rows = count_result.get("rows") or []
+                if not count_rows or not isinstance(count_rows[0], dict) or not count_rows[0]:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "The database returned no count value; no total can be reported.",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                total_records = next(iter(count_rows[0].values()))
+
+            if not isinstance(total_records, int):
+                try:
+                    total_records = int(total_records)
+                except (TypeError, ValueError):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "The database returned a non-numeric count; no total can be reported.",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+
+            measured_timing = max(round((time.perf_counter() - start_t) * 1000.0, 3), 0.01)
+            query_text = (
+                f"count_documents({target_table})"
+                if db_type in ("mongo", "mongodb")
+                else count_sql
+            )
+            proof = DatabaseExecutionProof(
+                database_session_id=session.session_id,
+                database_engine=db_type,
+                operation=capability,
+                source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                mode="LIVE",
+                execution_status="SUCCESS",
+                execution_time_ms=measured_timing,
+                rows_returned=1,
+                schema_object=target_table,
+                query=query_text,
+                actual_rows=[{"total_records": total_records}],
+            )
+            DatabaseEvidenceStore.record_proof(proof)
+            session.binding.bind_proof(proof)
+            resolution_note = ""
+            if target_resolution:
+                source_file = (
+                    (target_resolution.get("sourceQueries") or [{}])[0].get("file")
+                )
+                resolution_note = (
+                    "- **Target resolution:** Selected from the live schema using stronger "
+                    "project source-query evidence"
+                    + (f" in `{source_file}`" if source_file else "")
+                    + ".\n"
+                )
+            return {
+                "ok": True,
+                "capability": capability,
+                "content": (
+                    f"### {'FILTERED ' if requested_filters else ''}{'PAID ' if payment_filter == 'paid' else ''}RECORD COUNT\n\n"
+                    f"- **Table:** `{target_table}`\n"
+                    f"- **{'Matching records' if requested_filters else 'Paid records' if payment_filter == 'paid' else 'Total records'}:** {total_records:,}\n"
+                    f"{f'- **Payment rule:** `{payment_column} = {payment_value}`\n' if payment_filter == 'paid' else ''}"
+                    f"{'- **Verified conditions:** ' + '; '.join(filter_rules) + chr(10) if filter_rules else ''}"
+                    f"{resolution_note}"
+                    f"- **Database:** `{session.database_name or 'connected database'}`\n"
+                    f"- **Result:** Live read-only count ({measured_timing} ms)"
+                ),
+                "table": target_table,
+                "targetResolution": target_resolution,
+                "totalRecords": total_records,
+                "rowCount": 1,
+                "executionTimeMs": measured_timing,
+                "executionStatus": "SUCCESS",
+                "databaseType": db_type,
+                "engine": db_type,
+                "databaseSessionId": session.session_id,
+                "evidenceId": proof.evidence_id,
+                "mode": "LIVE",
+                "resultSource": DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                "executed": True,
+            }
+
         # 5. DATABASE_QUERY
         if capability == DatabaseCapability.DATABASE_QUERY:
+            if arguments.get("entity") and not arguments.get("sql") and db_type not in ("mongo", "mongodb"):
+                requested_entity = str(arguments.get("entity") or "").strip()
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9 _.$-]{0,119}", requested_entity):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "The requested table name is invalid.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+
+                table_result = cls.execute_database_capability(
+                    DatabaseCapability.DATABASE_LIST_TABLES,
+                    {},
+                    session,
+                    project_root,
+                )
+                if not table_result.get("ok"):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": table_result.get("content")
+                        or "Could not resolve the requested table against the selected database.",
+                        "executionStatus": table_result.get("executionStatus", "FAILED"),
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+
+                entity_key = re.sub(r"[^a-z0-9]", "", requested_entity.casefold())
+
+                def singularize(value: str) -> str:
+                    if value.endswith("ies") and len(value) > 3:
+                        return value[:-3] + "y"
+                    if value.endswith("s") and len(value) > 3:
+                        return value[:-1]
+                    return value
+
+                scored_tables = []
+                for table_name in table_result.get("tables") or []:
+                    table_name = str(table_name)
+                    table_key = re.sub(r"[^a-z0-9]", "", table_name.casefold())
+                    table_tokens = {
+                        re.sub(r"[^a-z0-9]", "", token.casefold())
+                        for token in re.findall(r"[A-Za-z0-9]+", table_name)
+                    }
+                    table_tokens.update(singularize(token) for token in tuple(table_tokens))
+                    if table_key == entity_key or singularize(table_key) == entity_key:
+                        score = 100
+                    elif entity_key in table_tokens or singularize(entity_key) in table_tokens:
+                        score = 80
+                    else:
+                        continue
+                    scored_tables.append((score, table_name))
+
+                if not scored_tables and len(entity_key) >= 10:
+                    approximate = []
+                    for table_name in table_result.get("tables") or []:
+                        table_key = re.sub(r"[^a-z0-9]", "", str(table_name).casefold())
+                        similarity = SequenceMatcher(None, entity_key, table_key).ratio()
+                        if similarity >= 0.90:
+                            approximate.append((similarity, str(table_name)))
+                    if approximate:
+                        best_similarity = max(score for score, _ in approximate)
+                        scored_tables = [
+                            (round(score * 100), name)
+                            for score, name in approximate
+                            if best_similarity - score < 0.08
+                        ]
+
+                if not scored_tables:
+                    available = ", ".join(
+                        f"`{name}`" for name in (table_result.get("tables") or [])[:30]
+                    ) or "none discovered"
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": (
+                            f"No table matching **{requested_entity}** was found in the selected database. "
+                            f"Discovered tables: {available}."
+                        ),
+                        "executionStatus": "NOT_FOUND",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+
+                best_score = max(score for score, _ in scored_tables)
+                candidates = sorted(
+                    {name for score, name in scored_tables if score == best_score},
+                    key=str.casefold,
+                )
+                if len(candidates) != 1:
+                    options = [{"label": name, "value": name} for name in candidates]
+                    numbered_options = "\n".join(
+                        f"{index}. `{option['value']}`"
+                        for index, option in enumerate(options, start=1)
+                    )
+                    return {
+                        "ok": True,
+                        "capability": capability,
+                        "content": (
+                            f"More than one table matches **{requested_entity}**. "
+                            f"Which table should I show?\n{numbered_options}\n"
+                            "No data query was run."
+                        ),
+                        "executionStatus": "NEEDS_CLARIFICATION",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                        "candidateTables": candidates,
+                        "clarificationOptions": options,
+                        "clarificationType": "table",
+                    }
+
+                target_table = candidates[0]
+                if not re.fullmatch(r"[A-Za-z0-9_$.-]{1,120}", target_table):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "The matched database table name cannot be queried safely.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+
+                limit = arguments.get("row_limit", 10)
+                if not isinstance(limit, int) or isinstance(limit, bool):
+                    limit = 10
+                limit = min(max(limit, 1), 50)
+                sql = f"SELECT * FROM {target_table}"
+                if arguments.get("latest"):
+                    described = cls.execute_database_capability(
+                        DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+                        {"table": target_table},
+                        session,
+                        project_root,
+                    )
+                    if not described.get("ok"):
+                        return {
+                            "ok": False,
+                            "capability": capability,
+                            "content": described.get("content")
+                            or "Could not inspect the table to determine a latest-record ordering.",
+                            "executionStatus": described.get("executionStatus", "FAILED"),
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                        }
+                    date_columns = [
+                        str(column.get("name") or "")
+                        for column in described.get("columns") or []
+                        if re.fullmatch(
+                            r"[A-Za-z0-9_$-]{1,120}",
+                            str(column.get("name") or ""),
+                        )
+                        and re.search(
+                            r"date|time|timestamp",
+                            str(column.get("type") or ""),
+                            re.I,
+                        )
+                    ]
+                    requested_latest_column = str(arguments.get("latest_column") or "")
+                    if requested_latest_column:
+                        if requested_latest_column not in date_columns:
+                            return {
+                                "ok": False,
+                                "capability": capability,
+                                "content": (
+                                    f"`{requested_latest_column}` is not a verified date/time column "
+                                    f"on `{target_table}`."
+                                ),
+                                "executionStatus": "INVALID_INPUT",
+                                "databaseType": db_type,
+                                "databaseSessionId": session.session_id,
+                                "executed": False,
+                            }
+                        date_columns = [requested_latest_column]
+                    preferred_date_columns = [
+                        name for name in date_columns
+                        if name.casefold() in {
+                            "created_at", "created_on", "created", "date", "timestamp",
+                            "updated_at", "updated_on", "modified_at",
+                        }
+                    ]
+                    if len(preferred_date_columns) == 1:
+                        date_columns = preferred_date_columns
+                    if len(date_columns) != 1:
+                        options = [
+                            {"label": name, "value": name}
+                            for name in date_columns
+                        ]
+                        return {
+                            "ok": True,
+                            "capability": capability,
+                            "content": (
+                                f"Which date/time column defines the latest records in `{target_table}`? "
+                                + (
+                                    "\n" + "\n".join(
+                                        f"{index}. `{option['value']}`"
+                                        for index, option in enumerate(options, start=1)
+                                    )
+                                    if options
+                                    else "No date/time column was reported by the live schema."
+                                )
+                                + "\nNo data query was run."
+                            ),
+                            "executionStatus": "NEEDS_CLARIFICATION" if options else "NOT_FOUND",
+                            "databaseType": db_type,
+                            "databaseSessionId": session.session_id,
+                            "executed": False,
+                            "clarificationOptions": options,
+                            "clarificationType": "latest_column",
+                        }
+                    sql += f" ORDER BY {date_columns[0]} DESC"
+                sql += f" LIMIT {limit}"
+                result = cls.execute_database_capability(
+                    DatabaseCapability.DATABASE_QUERY,
+                    {"sql": sql},
+                    session,
+                    project_root,
+                )
+                if result.get("ok"):
+                    result["table"] = target_table
+                    result["content"] = (
+                        f"### DATABASE RECORDS\n\n"
+                        f"- **Table:** `{target_table}`\n"
+                        f"- **Rows returned:** {result.get('rowCount', 0)} (limit {limit})\n"
+                        f"- **Result:** Live read-only query\n\n"
+                        + str(result.get("content") or "")
+                    )
+                return result
+
+            if db_type in ("mongo", "mongodb"):
+                collection_name = str(arguments.get("collection") or arguments.get("entity") or "")
+                filter_document = arguments.get("filter") or {}
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", collection_name) or not isinstance(filter_document, dict):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "MongoDB read requires a valid collection name and a JSON object filter.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                try:
+                    client = DatabaseIntelligenceEngine._open_mongodb_client(eff_root, {
+                        "host": session.safe_host,
+                        "port": session.safe_port,
+                        **session._protected_credentials,
+                    })
+                    try:
+                        cursor = client[session.database_name][collection_name].find(filter_document).limit(50)
+                        rows = json.loads(json.dumps(list(cursor), default=str))
+                    finally:
+                        client.close()
+                    measured_timing = max(round((time.perf_counter() - start_t) * 1000.0, 3), 0.01)
+                    proof = DatabaseExecutionProof(
+                        database_session_id=session.session_id,
+                        database_engine=db_type,
+                        operation=capability,
+                        source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                        mode="LIVE",
+                        execution_status="SUCCESS",
+                        execution_time_ms=measured_timing,
+                        rows_returned=len(rows),
+                        schema_object=collection_name,
+                        query=f"find({collection_name}, {json.dumps(filter_document, default=str)})",
+                        actual_rows=rows,
+                    )
+                    DatabaseEvidenceStore.record_proof(proof)
+                    session.binding.bind_proof(proof)
+                    content = (
+                        f"Collection: {collection_name}\nStatus: SUCCESS (Read-only)\n"
+                        f"Timing: {measured_timing}ms\nDocuments returned: {len(rows)} (limit 50)\n\n"
+                        f"```json\n{json.dumps(rows, indent=2, default=str)}\n```"
+                    )
+                    return {
+                        "ok": True,
+                        "capability": capability,
+                        "content": content,
+                        "rows": rows,
+                        "rowCount": len(rows),
+                        "executionTimeMs": measured_timing,
+                        "executionStatus": "SUCCESS",
+                        "databaseType": db_type,
+                        "engine": db_type,
+                        "databaseSessionId": session.session_id,
+                        "evidenceId": proof.evidence_id,
+                        "mode": "LIVE",
+                        "resultSource": DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                        "executed": True,
+                    }
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live MongoDB collection read failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+
             sql = arguments.get("sql", "SELECT 1")
             cmd_eval, reason = PolicyGate.check_sql(sql)
             if cmd_eval == "BLOCK":
@@ -4713,11 +9095,35 @@ class DatabaseSessionManager:
                     "databaseSessionId": session.session_id,
                 }
             exec_res = DatabaseIntelligenceEngine.execute_safe_query(
-                project_root, sql, {"engine": db_type, "database": session.database_name, "sqlite_file": session.sqlite_file}
+                project_root,
+                sql,
+                {
+                    "engine": db_type,
+                    "database": session.database_name,
+                    "sqlite_file": session.sqlite_file,
+                    "host": session.safe_host,
+                    "port": session.safe_port,
+                    "username": session._protected_credentials.get("username"),
+                    "password": session._protected_credentials.get("password"),
+                    "connection_uri": session._protected_credentials.get("connection_uri"),
+                },
             )
+            if not exec_res.get("ok"):
+                error = exec_res.get("error") or {}
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": error.get("message") or "The live database query failed.",
+                    "error": error,
+                    "executionStatus": "FAILED",
+                    "databaseType": db_type,
+                    "engine": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
             duration_ms = round((time.perf_counter() - start_t) * 1000.0, 3)
             measured_timing = max(duration_ms, 0.01)
-            data_rows = exec_res.get("data", [])
+            data_rows = exec_res.get("rows", exec_res.get("data", []))
 
             q_fp = DatabaseExecutionProof.compute_fingerprint(sql)
             proof = DatabaseExecutionProof(
@@ -4736,7 +9142,7 @@ class DatabaseSessionManager:
             DatabaseEvidenceStore.record_proof(proof)
             session.binding.bind_proof(proof)
 
-            content = f"Query: {sql}\nStatus: SUCCESS (Read-only)\nTiming: {measured_timing}ms\nRows returned: {len(data_rows)}\n\n```json\n{json.dumps(data_rows, indent=2)}\n```"
+            content = f"Query: {sql}\nStatus: SUCCESS (Read-only)\nTiming: {measured_timing}ms\nRows returned: {len(data_rows)}\n\n```json\n{json.dumps(data_rows, indent=2, default=str)}\n```"
             return {
                 "ok": True,
                 "capability": capability,
@@ -4757,6 +9163,72 @@ class DatabaseSessionManager:
 
         # 6. DATABASE_EXPLAIN
         if capability == DatabaseCapability.DATABASE_EXPLAIN:
+            if db_type in ("mongo", "mongodb"):
+                collection_name = str(arguments.get("collection") or "")
+                filter_document = arguments.get("filter") or {}
+                if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", collection_name) or not isinstance(filter_document, dict):
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": "MongoDB explain requires a valid collection name and a JSON object filter.",
+                        "executionStatus": "INVALID_INPUT",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+                try:
+                    client = DatabaseIntelligenceEngine._open_mongodb_client(eff_root, {
+                        "host": session.safe_host,
+                        "port": session.safe_port,
+                        **session._protected_credentials,
+                    })
+                    try:
+                        plan = client[session.database_name][collection_name].find(filter_document).limit(50).explain("executionStats")
+                    finally:
+                        client.close()
+                    plan_text = json.dumps(plan, indent=2, default=str)
+                    measured_timing = max(round((time.perf_counter() - start_t) * 1000.0, 3), 0.01)
+                    proof = DatabaseExecutionProof(
+                        database_session_id=session.session_id,
+                        database_engine=db_type,
+                        operation=capability,
+                        source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                        mode="LIVE",
+                        execution_status="SUCCESS",
+                        execution_time_ms=measured_timing,
+                        rows_returned=int((plan.get("executionStats") or {}).get("nReturned", 0)),
+                        schema_object=collection_name,
+                        query=f"find({collection_name}, {json.dumps(filter_document, default=str)}).explain()",
+                        plan_output=plan_text,
+                        plan_fingerprint=DatabaseExecutionProof.compute_fingerprint(plan_text),
+                    )
+                    DatabaseEvidenceStore.record_proof(proof)
+                    session.binding.bind_proof(proof)
+                    return {
+                        "ok": True,
+                        "capability": capability,
+                        "content": f"MongoDB execution plan for `{collection_name}` (executionStats):\n\n```json\n{plan_text}\n```",
+                        "executionTimeMs": measured_timing,
+                        "executionStatus": "SUCCESS",
+                        "databaseType": db_type,
+                        "engine": db_type,
+                        "databaseSessionId": session.session_id,
+                        "evidenceId": proof.evidence_id,
+                        "mode": "LIVE",
+                        "resultSource": DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+                        "executed": True,
+                    }
+                except Exception as error:
+                    return {
+                        "ok": False,
+                        "capability": capability,
+                        "content": f"Live MongoDB explain failed ({DatabaseIntelligenceEngine.classify_db_error(str(error))}).",
+                        "executionStatus": "FAILED",
+                        "databaseType": db_type,
+                        "databaseSessionId": session.session_id,
+                        "executed": False,
+                    }
+
             sql = arguments.get("sql", "SELECT 1")
             cmd_eval, reason = PolicyGate.check_sql(sql)
             if cmd_eval == "BLOCK":
@@ -4770,7 +9242,7 @@ class DatabaseSessionManager:
                     "databaseSessionId": session.session_id,
                 }
             explain_res = DatabaseIntelligenceEngine.execute_query_and_explain(
-                project_root, sql, {"engine": db_type, "database": session.database_name, "sqlite_file": session.sqlite_file}
+                project_root, sql, session_db_config
             )
             duration_ms = round((time.perf_counter() - start_t) * 1000.0, 3)
             measured_timing = max(duration_ms, 0.01)
@@ -4838,8 +9310,18 @@ class DatabaseSessionManager:
                 }
 
             health = DatabaseIntelligenceEngine.real_connect_and_health_check(
-                eff_root, {"engine": db_type, "database": session.database_name, "sqlite_file": session.sqlite_file}
+                eff_root, session_db_config
             )
+            if db_type in ("postgres", "postgresql", "supabase", "mongo", "mongodb") and not health.get("connected"):
+                return {
+                    "ok": False,
+                    "capability": capability,
+                    "content": f"Live {db_type} connection failed ({health.get('classification') or 'CONNECTION_FAILED'}).",
+                    "executionStatus": "FAILED",
+                    "databaseType": db_type,
+                    "databaseSessionId": session.session_id,
+                    "executed": False,
+                }
             duration_ms = round((time.perf_counter() - start_t) * 1000.0, 2)
             measured_lat = max(duration_ms, 0.01)
             proof = health.get("health_proof")
@@ -4850,18 +9332,18 @@ class DatabaseSessionManager:
             session.connection_state = DatabaseState.CONNECTED
 
             schema_res = DatabaseIntelligenceEngine.inspect_database_schema(
-                eff_root, {"engine": db_type, "database": session.database_name, "sqlite_file": session.sqlite_file}
+                eff_root, session_db_config
             )
             found_queries = DatabaseIntelligenceEngine.discover_relevant_queries(eff_root)
             if found_queries:
                 query_eval = DatabaseIntelligenceEngine.execute_query_and_explain(
-                    eff_root, found_queries[0]["query"], {"engine": db_type, "database": session.database_name, "sqlite_file": session.sqlite_file}
+                    eff_root, found_queries[0]["query"], session_db_config
                 )
                 query_eval["file"] = found_queries[0].get("file")
                 query_eval["table"] = found_queries[0].get("table")
             else:
                 query_eval = DatabaseIntelligenceEngine.execute_query_and_explain(
-                    eff_root, "SELECT 1", {"engine": db_type, "database": session.database_name, "sqlite_file": session.sqlite_file}
+                    eff_root, "SELECT 1", session_db_config
                 )
 
             content = DatabaseIntelligenceEngine.format_database_investigation_report(
@@ -4889,18 +9371,37 @@ class DatabaseSessionManager:
         # 8. DATABASE_CREDENTIAL_REQUEST
         if capability == DatabaseCapability.DATABASE_CREDENTIAL_REQUEST:
             active_target = DatabaseTargetRegistry.get_active_target(eff_root)
-            tgt_id = session.target_id or (active_target.target_id if active_target else "DB-001")
-            username = active_target.username if (active_target and active_target.username) else "app_user"
-            cfg_file = active_target.config_file if (active_target and active_target.config_file) else "config/db.php"
+            tgt_id = session.target_id or (active_target.target_id if active_target else None)
+            discovered = DatabaseIntelligenceEngine.discover_database_configuration(eff_root)
+            credentials = ConfigurationSymbolResolver.get_credential(eff_root)
+            username = (
+                discovered.get("username")
+                or credentials.get("username")
+                or (active_target.username if active_target and active_target.username else None)
+                or "NOT_RESOLVED"
+            )
+            database_name = (
+                session.database_name
+                or discovered.get("database")
+                or (active_target.database_name if active_target and active_target.database_name else None)
+                or "NOT_RESOLVED"
+            )
+            cfg_file = discovered.get("configFile") or (
+                active_target.config_file if active_target and active_target.config_file else "config/db.php"
+            )
+            has_password = bool(
+                credentials.get("password")
+                or discovered.get("has_credentials")
+                or (discovered.get("_symbol_details") or {}).get("hasPassword")
+            )
             content = (
                 f"### DATABASE CREDENTIALS REPORT\n\n"
-                f"- **Credential status:** CONFIGURED\n"
-                f"- **Target:** {tgt_id}\n"
+                f"- **Credential status:** {'CONFIGURED' if has_password else 'NOT_VERIFIED'}\n"
+                f"- **Target:** {tgt_id or 'NOT_RESOLVED'}\n"
+                f"- **Database:** {database_name}\n"
                 f"- **Username:** {username}\n"
                 f"- **Password:** [REDACTED]\n"
-                f"- **Credential source:** {cfg_file}\n\n"
-                f"> Security Notice: Plaintext database passwords are protected by Layer A runtime isolation "
-                f"and redacted at Layer B user presentation. Raw passwords cannot be displayed."
+                f"- **Credential source:** {cfg_file}"
             )
             return {
                 "ok": True,
@@ -4908,6 +9409,7 @@ class DatabaseSessionManager:
                 "content": content,
                 "credentialStatus": "CONFIGURED",
                 "targetId": tgt_id,
+                "database": database_name,
                 "username": username,
                 "password": "[REDACTED]",
                 "credentialSource": cfg_file,
@@ -4922,41 +9424,57 @@ class DatabaseSessionManager:
         if capability == DatabaseCapability.DATABASE_CURRENT_TARGET:
             target_file = arguments.get("configFile") or arguments.get("target_file")
             cfg_res = ConfigurationSymbolResolver.inspect_project_database_configuration(eff_root, specific_file=target_file)
+            if target_file and cfg_res.get("status") == "NOT_FOUND":
+                requested_file = cfg_res.get("configFile") or target_file
+                discovered_cfg = ConfigurationSymbolResolver.inspect_project_database_configuration(eff_root)
+                if discovered_cfg.get("status") not in ("NOT_FOUND", "ERROR"):
+                    discovered_cfg["requestedConfigFile"] = requested_file
+                    discovered_cfg["requestedConfigStatus"] = "NOT_FOUND"
+                    discovered_cfg["requestedConfigNotice"] = (
+                        f"Requested configuration file {requested_file} was not found; "
+                        "the configured and runtime details below use the database configuration discovered in the project."
+                    )
+                    cfg_res = discovered_cfg
             live_res = ConfigurationSymbolResolver.verify_live_database_identity(eff_root, cfg_res, session=session)
 
             req_text = str(arguments.get("user_request") or "").lower()
-            include_preview = bool(target_file or "open" in req_text or "show" in req_text or "cat" in req_text)
+            include_preview = bool(target_file or re.search(r"\b(?:open|read|cat)\b", req_text))
 
             active_target = DatabaseTargetRegistry.get_active_target(eff_root)
-            active_tgt_id = session.target_id or (active_target.target_id if active_target else "DB-001")
+            active_tgt_id = session.target_id or (active_target.target_id if active_target else None)
             cfg_res["targetId"] = active_tgt_id
             if session.database_name:
                 cfg_res["activeDatabaseName"] = session.database_name
             elif active_target and active_target.database_name:
                 cfg_res["activeDatabaseName"] = active_target.database_name
             content = ConfigurationSymbolResolver.format_connection_status_report(
-                cfg_res, live=live_res, include_file_preview=include_preview
+                cfg_res,
+                live=live_res,
+                include_file_preview=include_preview,
+                credentials=ConfigurationSymbolResolver.get_credential(eff_root),
             )
 
             db_val = cfg_res.get("database", {}).get("value") or live_res.get("database") or session.database_name
             host_val = cfg_res.get("host", {}).get("value") or live_res.get("host") or session.safe_host
             port_val = cfg_res.get("port", {}).get("value") or live_res.get("port") or session.safe_port
-            eng_val = cfg_res.get("engine") or live_res.get("engine") or session.database_type or "mysql"
+            eng_val = cfg_res.get("engine") or live_res.get("engine") or session.database_type
 
-            if cfg_res.get("status") == "NOT_RESOLVED":
-                status_val = "NOT_RESOLVED"
+            if live_res.get("status") == "FAILED":
+                status_val = "FAILED"
             elif live_res.get("connected"):
-                status_val = "LIVE_VERIFIED" if live_res.get("status") == "LIVE_VERIFIED" else "CONNECTED"
+                status_val = "LIVE_VERIFIED"
+            elif cfg_res.get("status") == "NOT_RESOLVED":
+                status_val = "NOT_RESOLVED"
             elif cfg_res.get("status") in ("RESOLVED", "CONFIGURED"):
                 status_val = cfg_res.get("status")
             else:
-                status_val = "DISCONNECTED"
+                status_val = live_res.get("status") or "NOT_VERIFIED"
 
             return {
                 "ok": True,
                 "capability": capability,
                 "content": content,
-                "targetId": session.target_id or "DB-001",
+                "targetId": session.target_id or (active_target.target_id if active_target else None),
                 "databaseType": eng_val,
                 "engine": eng_val,
                 "databaseName": db_val,
@@ -5146,7 +9664,7 @@ class DatabaseSessionManager:
         # 14. DATABASE_RECONNECT
         if capability == DatabaseCapability.DATABASE_RECONNECT:
             health = DatabaseIntelligenceEngine.real_connect_and_health_check(
-                eff_root, {"engine": db_type, "database": session.database_name, "sqlite_file": session.sqlite_file}
+                eff_root, session_db_config
             )
             session.connection_state = DatabaseState.CONNECTED
             if health.get("health_proof"):

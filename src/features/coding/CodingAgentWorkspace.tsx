@@ -1,4 +1,5 @@
-import type { CodingPreference } from './codingSessionStore';
+import { useEffect, useRef, useState } from 'react';
+import type { CodingConversationState, CodingPreference } from './codingSessionStore';
 import type { CodingActivity } from './codingTransport';
 
 interface CodingMessage {
@@ -75,6 +76,12 @@ interface CodingAgentWorkspaceProps {
   onUndoProposal: () => void;
   onSendMessage: () => void;
   onClearMessages: () => void;
+  conversations: CodingConversationState[];
+  activeConversationId: string;
+  onRestoreConversation: (session: CodingConversationState) => void;
+  onRequestDeleteConversation: (id: string) => void;
+  onCopyMessages: (messages: CodingMessage[], key: string) => Promise<void>;
+  copiedItem: string | null;
   codingPreferences: CodingPreference[];
   onToggleCodingPreference: (id: string) => void;
   onResetCodingPreferences: () => void;
@@ -82,9 +89,13 @@ interface CodingAgentWorkspaceProps {
 
 function renderInlineMarkdown(text: string) {
   const normalized = text.replace(/\\([`*_#|>])/g, '$1');
-  const parts = normalized.split(/(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g);
+  const parts = normalized.split(/(\[[^\]]+\]\(https?:\/\/[^)\s]+\)|\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g);
 
   return parts.map((part, index) => {
+    const link = part.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/);
+    if (link) {
+      return <a key={index} href={link[2]} target="_blank" rel="noopener noreferrer" className="text-sky-300 underline decoration-sky-500/50 underline-offset-2 hover:text-sky-200">{link[1]}</a>;
+    }
     if (part.startsWith('**') && part.endsWith('**')) {
       return <strong key={index}>{part.slice(2, -2)}</strong>;
     }
@@ -98,12 +109,16 @@ function renderInlineMarkdown(text: string) {
   });
 }
 
-function CodingMarkdown({ content }: { content: string }) {
+export function CodingMarkdown({ content }: { content: string }) {
   const normalizedContent = content
     .replace(/\\r\\n|\\n|\\r/g, '\n')
     .replace(/\\([`*_#|>])/g, '$1')
+    .replace(/(^|[ \t])```([\w-]*)[ \t]+(?!(?:#{1,6}\s|[-*]\s|$))/g, '$1\n```$2\n')
+    .replace(/([^\n])```(?=[ \t]*(?:#{1,6}\s|[-*]\s|$))/g, '$1\n```\n')
     .replace(/[ \t]+(#{1,6}\s)/g, '\n$1')
-    .replace(/[ \t]+-\s+(?=\*\*)/g, '\n- ');
+    .replace(/[ \t]+(-\s+(?:\*\*|\[[ xX]\]))/g, '\n$1')
+    .replace(/[ \t]+(>\s?)/g, '\n$1')
+    .replace(/[ \t]*\|[ \t]*(?=\|)/g, ' | ');
   const lines = normalizedContent.split(/\r?\n/);
   const blocks = [];
   let index = 0;
@@ -164,7 +179,39 @@ function CodingMarkdown({ content }: { content: string }) {
         quote.push(lines[index].replace(/^\s*>\s?/, ''));
         index += 1;
       }
-      blocks.push(<blockquote key={`quote-${index}`} className="border-l-2 border-sky-500/50 pl-3 text-slate-400">{quote.map((item) => renderInlineMarkdown(item))}</blockquote>);
+      blocks.push(<blockquote key={`quote-${index}`} className="border-l-2 border-sky-500/50 pl-3 text-slate-400">{quote.map((item, quoteIndex) => <span key={quoteIndex} className="block">{renderInlineMarkdown(item)}</span>)}</blockquote>);
+      continue;
+    }
+
+    const nextLine = lines[index + 1] || '';
+    const tableSeparator = nextLine.trim().replace(/^\||\|$/g, '').split('|').map((cell) => /^\s*:?-{3,}:?\s*$/.test(cell));
+    if (line.includes('|') && tableSeparator.length > 1 && tableSeparator.every(Boolean)) {
+      const parseCells = (row: string) => row.trim().replace(/^\||\|$/g, '').split('|').map((cell) => cell.trim());
+      const headers = parseCells(line);
+      index += 2;
+      const rows: string[][] = [];
+      while (index < lines.length && lines[index].includes('|') && lines[index].trim()) {
+        rows.push(parseCells(lines[index]));
+        index += 1;
+      }
+      blocks.push(
+        <div key={`table-${index}`} className="overflow-x-auto rounded-md border border-slate-700">
+          <table className="min-w-full border-collapse text-left text-xs">
+            <thead className="bg-slate-800 text-slate-200">
+              <tr>{headers.map((header, cellIndex) => <th key={cellIndex} className="border-b border-slate-700 px-3 py-2 font-semibold">{renderInlineMarkdown(header)}</th>)}</tr>
+            </thead>
+            <tbody>{rows.map((row, rowIndex) => <tr key={rowIndex} className="odd:bg-slate-950/60 even:bg-slate-900/50">
+              {headers.map((_, cellIndex) => <td key={cellIndex} className="border-t border-slate-800 px-3 py-2 align-top text-slate-300">{renderInlineMarkdown(row[cellIndex] || '')}</td>)}
+            </tr>)}</tbody>
+          </table>
+        </div>,
+      );
+      continue;
+    }
+
+    if (/^\s*(?:[-*_]\s*){3,}$/.test(line)) {
+      blocks.push(<hr key={`rule-${index}`} className="border-slate-700" />);
+      index += 1;
       continue;
     }
 
@@ -213,11 +260,40 @@ export function CodingAgentWorkspace({
   onUndoProposal,
   onSendMessage,
   onClearMessages,
+  conversations,
+  activeConversationId,
+  onRestoreConversation,
+  onRequestDeleteConversation,
+  onCopyMessages,
+  copiedItem,
   codingPreferences,
   onToggleCodingPreference,
   onResetCodingPreferences,
 }: CodingAgentWorkspaceProps) {
   const proposalNeedsDecision = Boolean(proposal && ['awaiting_approval', 'approved', 'applying', 'verifying'].includes(proposal.state || ''));
+  const [showAllMessages, setShowAllMessages] = useState(false);
+  const [copyError, setCopyError] = useState('');
+  const lastConversationId = useRef(activeConversationId);
+  const olderConversationStates = conversations
+    .filter((conversation) => conversation.id !== activeConversationId && conversation.messages.length > 0)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const visibleMessages = showAllMessages || messages.length <= 10 ? messages : messages.slice(-10);
+  const hiddenMessageCount = messages.length - visibleMessages.length;
+  useEffect(() => {
+    if (lastConversationId.current === activeConversationId) return;
+    lastConversationId.current = activeConversationId;
+    setShowAllMessages(false);
+  }, [activeConversationId]);
+  const copyMessages = async (items: CodingMessage[], key: string) => {
+    setCopyError('');
+    try {
+      await onCopyMessages(items, key);
+    } catch {
+      setCopyError('Copy failed. Clipboard access was denied by the browser.');
+    }
+    window.setTimeout(() => setCopyError(''), 2200);
+    return key;
+  };
 
   return (
     <>
@@ -304,15 +380,94 @@ export function CodingAgentWorkspace({
         </details>
       </header>
 
-      <div className="flex-1 space-y-4 overflow-y-auto">
+      {olderConversationStates.length > 0 && (
+        <details className="mb-3 rounded-lg border border-slate-700 bg-slate-950/50">
+          <summary className="cursor-pointer list-none px-3 py-2 text-xs font-medium text-slate-300 hover:text-sky-200">
+            Older Coding conversations <span className="text-slate-500">({olderConversationStates.length})</span>
+          </summary>
+          <div className="max-h-56 space-y-1 overflow-y-auto border-t border-slate-700 p-2">
+            {olderConversationStates.map((conversation) => {
+              const firstUserMessage = conversation.messages.find((message) => message.role === 'user')?.content || 'Empty conversation';
+              return (
+                <div key={conversation.id} className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-slate-800/70">
+                  <button
+                    type="button"
+                    onClick={() => { setShowAllMessages(false); onRestoreConversation(conversation); }}
+                    disabled={busy || streaming}
+                    className="min-w-0 flex-1 text-left disabled:opacity-40"
+                    title={firstUserMessage}
+                  >
+                    <span className="block truncate text-xs text-slate-200">{firstUserMessage.replace(/\s+/g, ' ')}</span>
+                    <span className="mt-0.5 block text-[10px] text-slate-500">{new Date(conversation.updatedAt).toLocaleString()} · {conversation.messages.length} messages</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onRequestDeleteConversation(conversation.id)}
+                    disabled={busy || streaming}
+                    className="shrink-0 rounded px-2 py-1 text-[11px] text-rose-300 hover:bg-rose-500/10 disabled:opacity-40"
+                    aria-label="Delete Coding conversation"
+                  >
+                    Delete
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      )}
+
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[11px] text-slate-500">{messages.length ? `${messages.length} messages in this conversation` : 'New conversation'}</p>
+        {messages.length > 0 && (
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => { void copyMessages(messages, 'coding-all'); }}
+              className="rounded-md border border-slate-700 px-2.5 py-1.5 text-[11px] text-slate-300 hover:border-sky-500/60 hover:text-sky-200"
+            >
+              {copiedItem === 'coding-all' ? 'Copied Markdown' : 'Copy conversation'}
+            </button>
+            <button
+              type="button"
+              onClick={() => onRequestDeleteConversation(activeConversationId)}
+              disabled={busy || streaming || proposalNeedsDecision}
+              className="rounded-md border border-rose-500/30 px-2.5 py-1.5 text-[11px] text-rose-300 hover:border-rose-400/60 disabled:opacity-40"
+              title={proposalNeedsDecision ? 'Finish the pending proposal before deleting this conversation.' : 'Delete this conversation'}
+            >
+              Delete conversation
+            </button>
+          </div>
+        )}
+      </div>
+      {copyError && <p role="status" className="mb-2 text-[11px] text-rose-300">{copyError}</p>}
+
+      <div className="flex-1 space-y-7 overflow-y-auto px-1 py-2 sm:px-3">
         {messages.length === 0 && <p className="rounded-lg border border-dashed border-slate-700 p-6 text-center text-sm text-slate-500">Describe a coding task and name its project. I’ll locate the project and inspect relevant files automatically; folder browsing remains optional under Advanced.</p>}
-        {messages.map((message, index) => <article key={message.requestId || `${message.role}-${index}`} className={`rounded-xl border p-4 ${message.role === 'user' ? 'border-slate-700 bg-slate-800/60' : 'border-sky-500/20 bg-slate-950/60'}`}>
-          <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">{message.role === 'user' ? 'You' : 'Coding Agent'}</p>
-          {message.content ? <CodingMarkdown content={message.content} /> : message.streaming && <p className="text-sm leading-relaxed text-slate-100">I’m understanding the request and inspecting the relevant files…</p>}
-          {message.role === 'assistant' && index === messages.length - 1 && activity.length > 0 && <div className="mt-3 space-y-2 rounded-md border border-slate-700 bg-slate-900/70 p-2">
+        {hiddenMessageCount > 0 && (
+          <button type="button" onClick={() => setShowAllMessages(true)} className="mx-auto block rounded-md border border-slate-700 px-3 py-1.5 text-xs text-sky-300 hover:border-sky-500/50">
+            Show {hiddenMessageCount} older messages
+          </button>
+        )}
+        {visibleMessages.map((message) => {
+          const messageIndex = messages.indexOf(message);
+          const copyKey = `coding-message-${messageIndex}`;
+          return <article key={message.requestId || `${message.role}-${messageIndex}`} className={message.role === 'user' ? 'ml-auto max-w-[88%] rounded-2xl border border-slate-700 bg-slate-800/80 px-4 py-3 sm:max-w-[78%]' : 'mr-auto w-full max-w-4xl py-1'}>
+          <div className={`mb-2 flex items-center gap-2 ${message.role === 'user' ? 'justify-end' : ''}`}>
+            {message.role === 'assistant' && <span aria-hidden="true" className="grid h-6 w-6 place-items-center rounded-full border border-sky-400/30 bg-sky-400/10 text-[10px] font-bold text-sky-200">AI</span>}
+            <p className={`text-xs font-semibold ${message.role === 'user' ? 'text-slate-400' : 'text-sky-200'}`}>{message.role === 'user' ? 'You' : 'Coding Agent'}</p>
+            {message.content && <button type="button" onClick={() => { void copyMessages([message], copyKey); }} className="rounded px-1.5 py-0.5 text-[10px] text-slate-500 hover:text-sky-200" aria-label={`Copy ${message.role} message`}>{copiedItem === copyKey ? 'Copied' : 'Copy Markdown'}</button>}
+          </div>
+          {message.content ? <CodingMarkdown content={message.content} /> : message.streaming && <p className="text-sm leading-relaxed text-slate-300">I’m understanding the request and inspecting the relevant files…</p>}
+          {message.role === 'assistant' && messageIndex === messages.length - 1 && activity.length > 0 && <div className="mt-3 space-y-2 rounded-md border border-slate-700 bg-slate-900/70 p-2">
             {activity.slice(-8).map((item, activityIndex) => <div key={`${item.phase}-${activityIndex}`} className="text-[11px] text-slate-400"><p><span className="mr-2 font-semibold text-sky-300">{item.phase}</span>{item.message}</p>{item.plan && <div className="ml-2 mt-1 border-l border-slate-700 pl-2"><p>{String(item.plan.goal || '')}</p>{Array.isArray(item.plan.steps) && <ol className="mt-1 list-inside list-decimal">{item.plan.steps.map((step, stepIndex) => <li key={stepIndex}>{String(step)}</li>)}</ol>}</div>}</div>)}
           </div>}
-        </article>)}
+        </article>;
+        })}
+        {showAllMessages && messages.length > 10 && (
+          <button type="button" onClick={() => setShowAllMessages(false)} className="mx-auto block rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:text-sky-200">
+            Collapse older messages
+          </button>
+        )}
       {proposal && <article className="rounded-xl border border-sky-500/20 bg-slate-950/60 p-4">
         <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Coding Agent</p>
         <p className="mb-3 text-sm leading-relaxed text-slate-100">Here is the proposed change for review. Nothing is written until you approve it.</p>
@@ -340,9 +495,9 @@ export function CodingAgentWorkspace({
       </article>}
       </div>
 
-      <div className="mt-4 flex items-end gap-2">
-        <textarea value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSendMessage(); } }} placeholder="Describe what to fix, explain, or improve…" rows={2} className="min-w-0 flex-1 resize-y rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-sky-400" />
-        <button onClick={onSendMessage} disabled={!input.trim() || streaming || busy || proposalNeedsDecision} title={proposalNeedsDecision ? 'Approve, apply, or reject the pending proposal first.' : undefined} className="rounded-lg bg-sky-500 px-4 py-2.5 text-sm font-medium text-slate-950 disabled:opacity-40">{streaming || busy ? 'Working…' : 'Send'}</button>
+      <div className="mt-4 flex items-end gap-2 rounded-2xl border border-slate-700 bg-slate-950/80 p-2 shadow-lg">
+        <textarea value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSendMessage(); } }} placeholder="Ask about the project or describe a change…" rows={2} className="min-w-0 flex-1 resize-y bg-transparent px-2 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500" />
+        <button onClick={onSendMessage} disabled={!input.trim() || streaming || busy || proposalNeedsDecision} title={proposalNeedsDecision ? 'Approve, apply, or reject the pending proposal first.' : undefined} className="rounded-xl bg-sky-400 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-300 disabled:opacity-40">{streaming || busy ? 'Working…' : 'Send'}</button>
       </div>
       {messages.length > 0 && <button onClick={onClearMessages} disabled={busy || streaming || proposalNeedsDecision} title={proposalNeedsDecision ? 'Finish the pending proposal before starting a new conversation.' : undefined} className="mt-2 self-start text-xs text-slate-400 hover:text-slate-200 disabled:opacity-40">New Coding conversation</button>}
     </>

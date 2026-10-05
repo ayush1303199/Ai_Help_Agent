@@ -2,13 +2,14 @@ import asyncio
 import contextlib
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
 import httpx
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from starlette.datastructures import UploadFile
 
@@ -24,6 +25,26 @@ from coding_provider import (  # noqa: E402
     _gemini_request,
     _normalize,
     complete_coding_model,
+    ModelOutputValidationError,
+    normalize_model_output,
+)
+from coding_intelligence import (  # noqa: E402
+    DatabaseCapability,
+    DATABASE_CREDENTIAL_REQUEST_PATTERN,
+    DATABASE_CONNECTION_STATUS_PATTERN,
+    DatabaseEvidenceSource,
+    DatabaseExecutionProof,
+    DatabaseIntelligenceEngine,
+    DatabasePerformanceEngine,
+    ConfigurationSymbolResolver,
+    DatabaseEvidenceStore,
+    DatabaseSchemaKnowledgeStore,
+    DatabaseSession,
+    DatabaseSessionManager,
+    DatabaseState,
+    DatabaseTargetRegistry,
+    QueryToSourceMapper,
+    SecretTransformer,
 )
 from coding_websocket import (  # noqa: E402
     MAX_CODING_CONVERSATION_CHARS,
@@ -37,11 +58,19 @@ from coding_websocket import (  # noqa: E402
     _proposal_prompt_instruction,
     _proposal_goal,
     _proposal_response_shape,
+    _match_pending_database_clarification,
+    _has_verified_live_database_evidence,
+    _is_contextual_database_credential_request,
+    _resolve_database_action_with_model,
+    _validate_database_action_selection,
     _requires_proposal,
     _requires_proposal_for_conversation,
     _serialize_coding_tool_result,
     _validate_tool_call,
     _run_coding_turn,
+    classify_task_intent,
+    understand_human_request,
+    TaskIntent,
 )
 from stt_service import SttService  # noqa: E402
 from provider_registry import ProviderInstance, ProviderRegistry, ProviderStatus  # noqa: E402
@@ -748,6 +777,2210 @@ class CodingProviderNormalizationTests(unittest.TestCase):
 
 
 class CodingProviderToolChoiceTests(unittest.TestCase):
+    def test_malformed_model_output_is_rejected_with_safe_diagnostics(self):
+        with self.assertLogs("coding_provider", level="ERROR") as captured:
+            with self.assertRaises(ModelOutputValidationError) as raised:
+                normalize_model_output(
+                    None,
+                    provider="groq",
+                    model="test-model",
+                    request_id="request-123",
+                    session_id="session-456",
+                )
+
+        self.assertIn("request-123", captured.output[0])
+        self.assertIn("session-456", captured.output[0])
+        self.assertEqual(raised.exception.diagnostic["outputType"], "NoneType")
+        self.assertNotIn("secret", captured.output[0].lower())
+
+    def test_malformed_nested_tool_output_does_not_break_diagnostics(self):
+        with self.assertRaises(ModelOutputValidationError) as raised:
+            normalize_model_output(
+                {"role": "assistant", "tool_calls": [{"function": "invalid"}]},
+                provider="groq",
+                model="test-model",
+            )
+
+        self.assertIsNone(raised.exception.diagnostic["toolName"])
+
+    def test_empty_openai_choice_is_rejected_before_coding_tool_routing(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            registry.add_provider("groq", "openai/gpt-oss-20b", "https://api.groq.com/openai/v1", "test-key")
+            client = Mock()
+            client.chat.completions.create.return_value.choices = []
+
+            with patch("coding_provider.OpenAI", return_value=client):
+                with self.assertLogs("coding_provider", level="ERROR") as captured:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "Coding Agent provider request failed.*could not be interpreted",
+                    ):
+                        complete_coding_model(
+                            registry,
+                            Path("unused-provider-config.json"),
+                            [{"role": "user", "content": "Inspect the project."}],
+                            [{"type": "function", "function": {"name": "search_code"}}],
+                            request_id="empty-output-request",
+                            session_id="empty-output-session",
+                        )
+
+        self.assertIn("empty-output-request", captured.output[0])
+        self.assertIn("empty-output-session", captured.output[0])
+
+    def test_current_target_requires_owned_session_and_does_not_invent_target(self):
+        result = ConfigurationSymbolResolver.verify_live_database_identity(
+            ".",
+            {"engine": "mysql", "targetId": "DB-001"},
+            session=None,
+        )
+
+        self.assertFalse(result["connected"])
+        self.assertEqual(result["status"], "NOT_VERIFIED")
+        self.assertIsNone(result["targetId"])
+
+    def test_current_schema_refresh_is_not_misrouted_as_current_database_target(self):
+        refresh = DatabaseSessionManager.resolve_database_intent(
+            "refresh current database schema"
+        )
+        self.assertEqual(refresh["capability"], DatabaseCapability.DATABASE_LIST_TABLES)
+        self.assertTrue(refresh["arguments"]["learn_schema"])
+        self.assertTrue(refresh["arguments"]["refresh_schema"])
+
+        current_target = DatabaseSessionManager.resolve_database_intent(
+            "which db connection current now"
+        )
+        self.assertEqual(
+            current_target["capability"],
+            DatabaseCapability.DATABASE_CURRENT_TARGET,
+        )
+
+    def test_unconfigured_database_does_not_default_to_verified_mysql_or_measured(self):
+        health = DatabaseIntelligenceEngine.real_connect_and_health_check("", {})
+        self.assertEqual(health["status"], "NOT_CONFIGURED")
+        self.assertEqual(health["state"], DatabaseState.DISCONNECTED)
+        self.assertEqual(health["engine"], "unknown")
+        self.assertIsNone(health["database"])
+        self.assertIsNone(health["host"])
+        self.assertIsNone(health["port"])
+
+        session = DatabaseSession(
+            project_id="audit",
+            repository_id="audit",
+            database_type="unknown",
+            database_name=None,
+            connection_state=DatabaseState.DISCONNECTED,
+            session_id="coding-conversation",
+        )
+        self.assertFalse(session.to_safe_dict()["engineVerified"])
+        self.assertFalse(_has_verified_live_database_evidence({
+            "executionStatus": "SUCCESS",
+            "liveDatabase": {"status": "NOT_VERIFIED", "evidence": None},
+        }))
+        self.assertTrue(_has_verified_live_database_evidence({
+            "mode": "LIVE",
+            "source": DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+            "executionStatus": "SUCCESS",
+            "evidenceId": "live-proof",
+        }))
+
+        verified_session = DatabaseSession(
+            project_id="audit",
+            repository_id="audit",
+            database_type="sqlite",
+            database_name="live.sqlite",
+            connection_state=DatabaseState.CONNECTED,
+            session_id="database-session",
+        )
+        verified_session.health_proof = DatabaseExecutionProof(
+            database_session_id="database-session",
+            database_engine="sqlite",
+            operation=DatabaseCapability.DATABASE_HEALTH_CHECK,
+            source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+            mode="LIVE",
+            execution_status="SUCCESS",
+        )
+        self.assertTrue(verified_session.to_safe_dict()["engineVerified"])
+
+    def test_current_target_does_not_reuse_session_from_deleted_project(self):
+        original_sessions = DatabaseSessionManager._sessions
+        original_sessions_by_id = DatabaseSessionManager._sessions_by_id
+        original_active_session = DatabaseSessionManager._active_session
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                stale_session = DatabaseSession(
+                    project_id="stale-project",
+                    repository_id="stale-project",
+                    database_type="sqlite",
+                    database_name="deleted.sqlite",
+                    connection_state=DatabaseState.HEALTH_CHECKED,
+                    project_root=temporary_directory,
+                    session_id="stale-database-session",
+                )
+                DatabaseSessionManager._sessions = {
+                    temporary_directory: stale_session,
+                }
+                DatabaseSessionManager._sessions_by_id = {
+                    "stale-database-session": stale_session,
+                }
+                DatabaseSessionManager._active_session = stale_session
+
+            self.assertIsNone(DatabaseSessionManager.get_session(session_id="stale-database-session"))
+            self.assertEqual(stale_session.connection_state, DatabaseState.DISCONNECTED)
+            self.assertFalse(stale_session.to_safe_dict()["engineVerified"])
+        finally:
+            DatabaseSessionManager._sessions = original_sessions
+            DatabaseSessionManager._sessions_by_id = original_sessions_by_id
+            DatabaseSessionManager._active_session = original_active_session
+
+    def test_database_tool_endpoint_executes_sql_through_owned_project_session(self):
+        import index
+
+        database_config = {"engine": "mysql", "database": "admissions"}
+        db_session = Mock()
+        execution = {
+            "ok": True,
+            "executionStatus": "SUCCESS",
+            "executed": True,
+            "rows": [{"id": 32875}],
+            "rowCount": 1,
+        }
+        with patch.object(index, "get_backend_project_state", return_value={
+            "attached": True,
+            "projectRoot": "C:/projects/admissions",
+        }), patch.object(
+            index.DatabaseIntelligenceEngine,
+            "discover_database_configuration",
+            return_value=database_config,
+        ), patch.object(
+            index.DatabaseSessionManager,
+            "get_or_create_session",
+            return_value=db_session,
+        ) as get_session, patch.object(
+            index.DatabaseSessionManager,
+            "execute_database_capability",
+            return_value=execution,
+        ) as execute:
+            result = index.execute_coding_tool_endpoint({
+                "name": "execute_sql",
+                "arguments": {"sql": "SELECT * FROM admission"},
+            })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["rows"], [{"id": 32875}])
+        get_session.assert_called_once_with("C:/projects/admissions", db_config=database_config)
+        execute.assert_called_once_with(
+            DatabaseCapability.DATABASE_QUERY,
+            {"sql": "SELECT * FROM admission"},
+            db_session,
+            "C:/projects/admissions",
+        )
+
+    def test_database_tool_endpoint_rejects_sql_without_an_attached_project(self):
+        import index
+
+        with patch.object(index, "get_backend_project_state", return_value={
+            "attached": False,
+            "projectRoot": None,
+        }), patch.object(index.DatabaseIntelligenceEngine, "discover_database_configuration") as discover:
+            result = index.execute_coding_tool_endpoint({
+                "name": "execute_sql",
+                "arguments": {"sql": "SELECT * FROM admission"},
+            })
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "PROJECT_NOT_ATTACHED")
+        discover.assert_not_called()
+
+    def test_mysql_select_uses_live_read_only_connection_and_returns_actual_rows(self):
+        from datetime import datetime
+        from decimal import Decimal
+
+        cursor = Mock()
+        cursor.description = (("id",), ("status",), ("created_at",), ("paid_amount",))
+        cursor.fetchmany.return_value = [{
+            "id": 32875,
+            "status": "Admission Granted",
+            "created_at": datetime(2026, 8, 6, 15, 58, 35),
+            "paid_amount": Decimal("435235.00"),
+        }]
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        mysql = SimpleNamespace(connect=Mock(return_value=connection))
+        session = DatabaseSession(
+            project_id="test-project",
+            repository_id="test-repository",
+            project_root=".",
+            database_type="mysql",
+            database_name="admissions",
+            connection_state="CONNECTED",
+            safe_host="db.internal",
+            safe_port=3307,
+        )
+        session._protected_credentials = {"username": "app_user", "password": "test-only-secret"}
+
+        with patch.dict(sys.modules, {"pymysql": mysql}):
+            result = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_QUERY,
+                {"sql": "SELECT * FROM admission"},
+                session,
+                ".",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["executionStatus"], "SUCCESS")
+        self.assertEqual(result["rows"][0]["id"], 32875)
+        self.assertEqual(result["rows"][0]["paid_amount"], "435235.00")
+        self.assertEqual(result["rowCount"], 1)
+        self.assertIn('"created_at": "2026-08-06 15:58:35"', result["content"])
+        mysql.connect.assert_called_once()
+        connection_args = mysql.connect.call_args.kwargs
+        self.assertEqual(connection_args["database"], "admissions")
+        self.assertEqual(connection_args["user"], "app_user")
+        self.assertEqual(connection_args["password"], "test-only-secret")
+        self.assertEqual(connection_args["init_command"], "SET SESSION TRANSACTION READ ONLY")
+        connection.begin.assert_called_once()
+        connection.rollback.assert_called_once()
+        connection.close.assert_called_once()
+        self.assertNotIn("test-only-secret", json.dumps(result))
+
+    def test_mysql_query_without_real_connection_fails_instead_of_fabricating_rows(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_QUERY,
+                {"sql": "SELECT * FROM admission"},
+                DatabaseSession(
+                    project_id="test-project",
+                    repository_id="test-repository",
+                    project_root=temporary_directory,
+                    database_type="mysql",
+                    database_name="admissions",
+                    connection_state="NOT_CONNECTED",
+                ),
+                temporary_directory,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["executionStatus"], "FAILED")
+        self.assertEqual(result["error"]["code"], "DATABASE_NOT_CONNECTED")
+        self.assertNotIn('"1": 1', result["content"])
+
+    def test_select_request_with_hindi_display_instruction_runs_as_deterministic_sql(self):
+        resolved = DatabaseSessionManager.resolve_database_intent("select * from admission data dikho")
+
+        self.assertTrue(resolved["is_deterministic"])
+        self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_QUERY)
+        self.assertEqual(resolved["arguments"]["sql"], "select * from admission")
+
+    def test_count_total_admission_data_resolves_to_safe_count_operation(self):
+        for request in (
+            "count total admission data",
+            "count admissions",
+            "how many admission records",
+        ):
+            with self.subTest(request=request):
+                resolved = DatabaseSessionManager.resolve_database_intent(request)
+                self.assertTrue(resolved["is_deterministic"])
+                self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+                self.assertIn("admission", resolved["arguments"]["entity"].lower())
+
+    def test_count_total_personal_routes_to_deterministic_count_and_clarifies_ambiguous_tables(self):
+        resolved = DatabaseSessionManager.resolve_database_intent("count total personal")
+        self.assertTrue(resolved["is_deterministic"])
+        self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+        self.assertEqual(resolved["arguments"]["entity"], "personal")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "personal.sqlite"
+            connection = sqlite3.connect(db_path)
+            connection.execute("CREATE TABLE adm_user_personal (id INTEGER PRIMARY KEY)")
+            connection.executemany("INSERT INTO adm_user_personal DEFAULT VALUES", [(), (), ()])
+            connection.execute("CREATE TABLE adm_staff_personal (id INTEGER PRIMARY KEY)")
+            connection.commit()
+            connection.close()
+            session = DatabaseSession(
+                project_id="personal-count-test",
+                repository_id="personal-count-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="personal.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+            )
+
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"), patch.object(
+                DatabaseIntelligenceEngine, "execute_safe_query"
+            ) as run_count:
+                ambiguous = DatabaseSessionManager.execute_database_capability(
+                    resolved["capability"],
+                    resolved["arguments"],
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(ambiguous["ok"])
+            self.assertEqual(ambiguous["executionStatus"], "NEEDS_CLARIFICATION")
+            self.assertFalse(ambiguous["executed"])
+            self.assertGreaterEqual(len(ambiguous["candidateTables"]), 2)
+            run_count.assert_not_called()
+
+            models_directory = Path(temporary_directory) / "models"
+            models_directory.mkdir()
+            (models_directory / "UserPersonal.php").write_text(
+                '<?php $query = "SELECT * FROM adm_user_personal";',
+                encoding="utf-8",
+            )
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                source_supported = DatabaseSessionManager.execute_database_capability(
+                    resolved["capability"],
+                    resolved["arguments"],
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(source_supported["ok"])
+            self.assertEqual(source_supported["executionStatus"], "SUCCESS")
+            self.assertEqual(source_supported["table"], "adm_user_personal")
+            self.assertEqual(source_supported["totalRecords"], 3)
+            self.assertIn(
+                "project source-query evidence",
+                source_supported["content"],
+            )
+            self.assertEqual(
+                source_supported["targetResolution"]["sourceQueries"][0]["table"],
+                "adm_user_personal",
+            )
+
+            connection = sqlite3.connect(db_path)
+            connection.execute("DROP TABLE adm_staff_personal")
+            connection.commit()
+            connection.close()
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                counted = DatabaseSessionManager.execute_database_capability(
+                    resolved["capability"],
+                    resolved["arguments"],
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(counted["ok"])
+            self.assertEqual(counted["table"], "adm_user_personal")
+            self.assertEqual(counted["totalRecords"], 3)
+
+    def test_count_refreshes_verified_schema_when_initial_live_table_listing_is_empty(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "personal.sqlite"
+            connection = sqlite3.connect(db_path)
+            connection.execute("CREATE TABLE adm_user_personal (id INTEGER PRIMARY KEY)")
+            connection.executemany(
+                "INSERT INTO adm_user_personal DEFAULT VALUES",
+                [(), (), ()],
+            )
+            connection.commit()
+            connection.close()
+            session = DatabaseSession(
+                project_id="personal-count-refresh-test",
+                repository_id="personal-count-refresh-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="personal.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+            )
+            original_execute = DatabaseSessionManager.execute_database_capability
+            empty_listing_returned = False
+
+            def execute_with_transient_empty_listing(capability, arguments, active_session, root):
+                nonlocal empty_listing_returned
+                if (
+                    capability == DatabaseCapability.DATABASE_LIST_TABLES
+                    and not arguments
+                    and not empty_listing_returned
+                ):
+                    empty_listing_returned = True
+                    return {"ok": True, "tables": [], "executionStatus": "SUCCESS"}
+                return original_execute(capability, arguments, active_session, root)
+
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"), patch.object(
+                DatabaseSessionManager,
+                "execute_database_capability",
+                side_effect=execute_with_transient_empty_listing,
+            ):
+                counted = DatabaseSessionManager.execute_database_capability(
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    {"entity": "personal"},
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(empty_listing_returned)
+            self.assertTrue(counted["ok"])
+            self.assertEqual(counted["executionStatus"], "SUCCESS")
+            self.assertEqual(counted["table"], "adm_user_personal")
+            self.assertEqual(counted["totalRecords"], 3)
+
+    def test_count_does_not_run_when_fresh_live_schema_has_no_accessible_tables(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "empty.sqlite"
+            sqlite3.connect(db_path).close()
+            session = DatabaseSession(
+                project_id="empty-database-count-test",
+                repository_id="empty-database-count-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="empty.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+            )
+
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"), patch.object(
+                DatabaseIntelligenceEngine, "execute_safe_query"
+            ) as run_count:
+                result = DatabaseSessionManager.execute_database_capability(
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    {"entity": "personal"},
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["executionStatus"], "NO_LIVE_TABLES")
+            self.assertFalse(result["executed"])
+            self.assertIn("fresh live-schema check found no accessible tables", result["content"])
+            self.assertIn("No count query was run", result["content"])
+            run_count.assert_not_called()
+
+    def test_human_database_requests_resolve_actions_targets_and_task_references(self):
+        count = DatabaseSessionManager.resolve_database_intent("how many users")
+        self.assertTrue(count["is_deterministic"])
+        self.assertEqual(count["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+        self.assertEqual(count["arguments"]["entity"], "user")
+
+        for request, expected_target in (
+            ("show users", "user"),
+            ("show me user data", "user"),
+            ("show latest 10 users", "user"),
+        ):
+            with self.subTest(request=request):
+                resolved = DatabaseSessionManager.resolve_database_intent(request)
+                self.assertTrue(resolved["is_deterministic"])
+                self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_QUERY)
+                self.assertEqual(resolved["arguments"]["entity"], expected_target)
+
+        location = DatabaseSessionManager.resolve_database_intent("where user email")
+        self.assertTrue(location["is_deterministic"])
+        self.assertEqual(location["arguments"]["schema_query"]["kind"], "column_location")
+        self.assertEqual(location["arguments"]["schema_query"]["term"], "email")
+        self.assertEqual(location["arguments"]["schema_query"]["context"], "user")
+        exists = DatabaseSessionManager.resolve_database_intent(
+            "does table payment_transaction exist"
+        )
+        self.assertEqual(exists["arguments"]["schema_query"]["kind"], "table_exists")
+        described = DatabaseSessionManager.resolve_database_intent("show user table")
+        self.assertEqual(described["capability"], DatabaseCapability.DATABASE_DESCRIBE_TABLE)
+        self.assertEqual(described["arguments"]["table"], "user")
+        indexes = DatabaseSessionManager.resolve_database_intent("show user indexes")
+        self.assertEqual(indexes["capability"], DatabaseCapability.DATABASE_LIST_INDEXES)
+        self.assertEqual(indexes["arguments"]["table"], "user")
+
+        prior_count = {
+            "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+            "arguments": {"entity": "users"},
+            "table": "users",
+        }
+        how_many = DatabaseSessionManager.resolve_database_intent(
+            "how many?",
+            task_context=prior_count,
+        )
+        self.assertEqual(how_many["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+        self.assertEqual(how_many["arguments"]["entity"], "users")
+        same_for_payment = DatabaseSessionManager.resolve_database_intent(
+            "same for payment",
+            task_context=prior_count,
+        )
+        self.assertEqual(same_for_payment["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+        self.assertEqual(same_for_payment["arguments"]["entity"], "payment")
+        corrected = DatabaseSessionManager.resolve_database_intent(
+            "No, I mean payment_transaction",
+            task_context=prior_count,
+        )
+        self.assertEqual(corrected["arguments"]["entity"], "payment_transaction")
+
+        semantics = {
+            "how many users": ("COUNT", "verified total count"),
+            "show users": ("LIST", "bounded records or requested catalog"),
+            "show user table": ("SCHEMA", "verified table schema"),
+            "where is user email stored": ("LOCATE", "source or schema location"),
+            "how is this data fetched": ("DATA_FLOW_TRACE", "actual application data flow"),
+            "how do I fetch users": ("FETCH_GUIDANCE", "project-specific retrieval guidance"),
+            "which query fetches this": ("LOCATE_QUERY", "source query and its evidence"),
+            "why is this query slow": (
+                "PERFORMANCE_ANALYSIS",
+                "measured performance evidence and supported cause",
+            ),
+            "which database is connected": ("RUNTIME_DATABASE_STATUS", "verified active database target"),
+            "which migration created this": ("SOURCE_LOOKUP", "migration file and schema change evidence"),
+        }
+        for request, expected in semantics.items():
+            with self.subTest(semantic_request=request):
+                understood = understand_human_request(request)
+                self.assertEqual(
+                    (understood["action"], understood["expected_output"]),
+                    expected,
+                )
+                self.assertEqual(understood["evidence_confidence"], "UNVERIFIED")
+        self.assertEqual(classify_task_intent("how many users")["intent"], TaskIntent.DATABASE_INVESTIGATION)
+        self.assertEqual(classify_task_intent("show users")["intent"], TaskIntent.DATABASE_INVESTIGATION)
+        self.assertEqual(classify_task_intent("how many users")["confidence"], "UNVERIFIED")
+        active_today = understand_human_request("how many active users today")
+        self.assertEqual(active_today["target"], "users")
+        self.assertEqual(active_today["constraints"], ["active", "today"])
+        self.assertEqual(understand_human_request("count total personal")["target"], "personal")
+
+    def test_show_records_resolves_live_table_bounds_rows_and_clarifies_ambiguous_target(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "records.sqlite"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, created_at DATETIME)"
+            )
+            connection.executemany(
+                "INSERT INTO users (email, created_at) VALUES (?, ?)",
+                [
+                    ("first@example.test", "2026-10-01 10:00:00"),
+                    ("second@example.test", "2026-10-02 10:00:00"),
+                    ("third@example.test", "2026-10-03 10:00:00"),
+                ],
+            )
+            connection.execute("CREATE TABLE adm_user_personal (id INTEGER PRIMARY KEY)")
+            connection.execute("INSERT INTO adm_user_personal DEFAULT VALUES")
+            connection.execute("CREATE TABLE adm_staff_personal (id INTEGER PRIMARY KEY)")
+            connection.execute("INSERT INTO adm_staff_personal DEFAULT VALUES")
+            connection.commit()
+            connection.close()
+            session = DatabaseSession(
+                project_id="list-records-test",
+                repository_id="list-records-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="records.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+            )
+
+            latest_intent = DatabaseSessionManager.resolve_database_intent("show latest 2 users")
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                latest = DatabaseSessionManager.execute_database_capability(
+                    latest_intent["capability"],
+                    latest_intent["arguments"],
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(latest["ok"])
+            self.assertEqual(latest["table"], "users")
+            self.assertEqual(latest["rowCount"], 2)
+            self.assertEqual(
+                [row["email"] for row in latest["rows"]],
+                ["third@example.test", "second@example.test"],
+            )
+            self.assertIn("ORDER BY created_at DESC LIMIT 2", latest["content"])
+
+            describe_intent = DatabaseSessionManager.resolve_database_intent("show user table")
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                described = DatabaseSessionManager.execute_database_capability(
+                    describe_intent["capability"],
+                    describe_intent["arguments"],
+                    session,
+                    temporary_directory,
+                )
+            self.assertTrue(described["ok"])
+            self.assertEqual(described["table"], "users")
+            self.assertIn("email", [column["name"] for column in described["columns"]])
+
+            ambiguous_intent = DatabaseSessionManager.resolve_database_intent("show personal data")
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"), patch.object(
+                DatabaseIntelligenceEngine, "execute_safe_query"
+            ) as execute_query:
+                ambiguous = DatabaseSessionManager.execute_database_capability(
+                    ambiguous_intent["capability"],
+                    ambiguous_intent["arguments"],
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(ambiguous["ok"])
+            self.assertEqual(ambiguous["executionStatus"], "NEEDS_CLARIFICATION")
+            self.assertFalse(ambiguous["executed"])
+            self.assertEqual(
+                set(ambiguous["candidateTables"]),
+                {"adm_user_personal", "adm_staff_personal"},
+            )
+            execute_query.assert_not_called()
+
+    def test_filtered_count_uses_live_schema_and_never_drops_requested_conditions(self):
+        request = "how many active users today"
+        resolved = DatabaseSessionManager.resolve_database_intent(request)
+        self.assertTrue(resolved["is_deterministic"])
+        self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+        self.assertEqual(resolved["arguments"]["entity"], "user")
+        self.assertEqual(set(resolved["arguments"]["filters"]), {"active", "today"})
+        self.assertEqual(
+            understand_human_request(request)["constraints"],
+            ["active", "today"],
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "filtered-users.sqlite"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, is_active BOOLEAN, created_at DATE)"
+            )
+            connection.execute(
+                "INSERT INTO users (is_active, created_at) VALUES "
+                "(1, CURRENT_DATE), (1, DATE('now', '-1 day')), (0, CURRENT_DATE)"
+            )
+            connection.commit()
+            connection.close()
+            session = DatabaseSession(
+                project_id="filtered-count-test",
+                repository_id="filtered-count-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="filtered-users.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+            )
+
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                counted = DatabaseSessionManager.execute_database_capability(
+                    resolved["capability"],
+                    resolved["arguments"],
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(counted["ok"])
+            self.assertEqual(counted["executionStatus"], "SUCCESS")
+            self.assertEqual(counted["totalRecords"], 1)
+            self.assertIn("is_active = 1", counted["content"])
+            self.assertIn("created_at is today", counted["content"])
+
+            unresolved_db = sqlite3.connect(db_path)
+            unresolved_db.execute("DROP TABLE users")
+            unresolved_db.execute(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, status INTEGER, created_at DATE)"
+            )
+            unresolved_db.execute(
+                "INSERT INTO users (status, created_at) VALUES "
+                "(1, CURRENT_DATE), (0, CURRENT_DATE)"
+            )
+            unresolved_db.commit()
+            unresolved_db.close()
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"), patch.object(
+                DatabaseIntelligenceEngine, "execute_safe_query", wraps=DatabaseIntelligenceEngine.execute_safe_query
+            ) as run_query:
+                needs_clarification = DatabaseSessionManager.execute_database_capability(
+                    resolved["capability"],
+                    resolved["arguments"],
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(needs_clarification["ok"])
+            self.assertEqual(needs_clarification["executionStatus"], "NEEDS_CLARIFICATION")
+            self.assertFalse(needs_clarification["executed"])
+            self.assertIn("no count query was run", needs_clarification["content"].lower())
+            self.assertTrue(
+                all("SELECT COUNT(*)" not in call.args[1] for call in run_query.call_args_list)
+            )
+
+    def test_count_arbitrary_misspelled_table_identifier_matches_unique_live_table(self):
+        request = "count total adm_user_prgramme_selection"
+        resolved = DatabaseSessionManager.resolve_database_intent(request)
+        self.assertTrue(resolved["is_deterministic"])
+        self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+        self.assertEqual(resolved["arguments"]["entity"], "adm_user_prgramme_selection")
+        sql_resolved = DatabaseSessionManager.resolve_database_intent(
+            "SELECT COUNT(*) AS total FROM adm_user_prgramme_selection;"
+        )
+        self.assertTrue(sql_resolved["is_deterministic"])
+        self.assertEqual(
+            sql_resolved["capability"],
+            DatabaseCapability.DATABASE_COUNT_RECORDS,
+        )
+        self.assertEqual(
+            sql_resolved["arguments"]["entity"],
+            "adm_user_prgramme_selection",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "admissions.sqlite"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                "CREATE TABLE adm_user_programme_selection (id INTEGER PRIMARY KEY)"
+            )
+            connection.executemany(
+                "INSERT INTO adm_user_programme_selection DEFAULT VALUES",
+                [(), (), ()],
+            )
+            connection.commit()
+            connection.close()
+            session = DatabaseSession(
+                project_id="table-typo-count-test",
+                repository_id="table-typo-count-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="admissions.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+            )
+
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                counted = DatabaseSessionManager.execute_database_capability(
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    resolved["arguments"],
+                    session,
+                    temporary_directory,
+                )
+                sql_counted = DatabaseSessionManager.execute_database_capability(
+                    sql_resolved["capability"],
+                    sql_resolved["arguments"],
+                    session,
+                    temporary_directory,
+                )
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseIntelligenceEngine, "execute_safe_query") as run_count:
+                unknown = DatabaseSessionManager.execute_database_capability(
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    {"entity": "unrelated_table_identifier"},
+                    session,
+                    temporary_directory,
+                )
+                run_count.assert_not_called()
+
+        self.assertTrue(counted["ok"])
+        self.assertEqual(counted["table"], "adm_user_programme_selection")
+        self.assertEqual(counted["totalRecords"], 3)
+        self.assertTrue(sql_counted["ok"])
+        self.assertEqual(sql_counted["table"], counted["table"])
+        self.assertEqual(sql_counted["totalRecords"], counted["totalRecords"])
+        self.assertFalse(unknown["ok"])
+        self.assertEqual(unknown["executionStatus"], "NOT_FOUND")
+        self.assertFalse(unknown["executed"])
+        self.assertNotIn("clarificationOptions", unknown)
+
+    def test_count_long_table_identifier_does_not_substitute_short_substring_table(self):
+        request = "count total adm_user_prgramme_personal"
+        resolved = DatabaseSessionManager.resolve_database_intent(request)
+        self.assertTrue(resolved["is_deterministic"])
+        self.assertEqual(
+            resolved["arguments"]["entity"],
+            "adm_user_prgramme_personal",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "admissions.sqlite"
+            connection = sqlite3.connect(db_path)
+            for table in (
+                "adm_user",
+                "adm_user_programme_selection",
+                "adm_user_programme_personal_details",
+            ):
+                connection.execute(f'CREATE TABLE "{table}" (id INTEGER PRIMARY KEY)')
+            connection.executemany(
+                "INSERT INTO adm_user (id) VALUES (?)",
+                [(1,), (2,)],
+            )
+            connection.commit()
+            connection.close()
+            session = DatabaseSession(
+                project_id="long-table-identifier-count-test",
+                repository_id="long-table-identifier-count-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="admissions.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+            )
+
+            with patch.object(
+                DatabaseTargetRegistry,
+                "get_target",
+                return_value=None,
+            ), patch.object(
+                DatabaseTargetRegistry,
+                "get_active_target",
+                return_value=None,
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                result = DatabaseSessionManager.execute_database_capability(
+                    resolved["capability"],
+                    resolved["arguments"],
+                    session,
+                    temporary_directory,
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["executionStatus"], "NEEDS_CLARIFICATION")
+        self.assertFalse(result["executed"])
+        self.assertNotIn("totalRecords", result)
+        self.assertEqual(
+            set(result["candidateTables"]),
+            {
+                "adm_user",
+                "adm_user_programme_personal_details",
+                "adm_user_programme_selection",
+            },
+        )
+        self.assertIn("2. `adm_user_programme_selection`", result["content"])
+
+    def test_schema_learning_fingerprints_live_metadata_and_serves_cached_searches(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = DatabaseSchemaKnowledgeStore(str(root / "schema-knowledge.json"))
+            original_store = DatabaseSessionManager.schema_knowledge_store
+            self.addCleanup(
+                setattr,
+                DatabaseSessionManager,
+                "schema_knowledge_store",
+                original_store,
+            )
+            DatabaseSessionManager.schema_knowledge_store = store
+            db_path = root / "selected.sqlite"
+            other_db_path = root / "another.sqlite"
+            other = sqlite3.connect(other_db_path)
+            other.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+            other.commit()
+            other.close()
+
+            connection = sqlite3.connect(db_path)
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(
+                "CREATE TABLE app_user ("
+                "id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE)"
+            )
+            connection.execute(
+                "CREATE TABLE admission ("
+                "id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, "
+                "FOREIGN KEY (user_id) REFERENCES app_user(id))"
+            )
+            connection.execute("CREATE INDEX idx_admission_user ON admission(user_id)")
+            connection.commit()
+            connection.close()
+
+            session = DatabaseSession(
+                project_id="schema-learning-test",
+                repository_id="schema-learning-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="selected.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+                session_id="schema-learning-session",
+            )
+            learn_intent = DatabaseSessionManager.resolve_database_intent(
+                "this is my database, read and understand its schema"
+            )
+            self.assertTrue(learn_intent["is_deterministic"])
+            self.assertEqual(learn_intent["capability"], DatabaseCapability.DATABASE_LIST_TABLES)
+            self.assertTrue(learn_intent["arguments"]["learn_schema"])
+
+            learned = DatabaseSessionManager.execute_database_capability(
+                learn_intent["capability"],
+                learn_intent["arguments"],
+                session,
+                temporary_directory,
+            )
+
+            self.assertTrue(learned["ok"])
+            self.assertEqual(learned["executionStatus"], "SUCCESS")
+            self.assertEqual(learned["resultSource"], DatabaseEvidenceSource.LIVE_DB_EXECUTION)
+            self.assertEqual(set(learned["tables"]), {"app_user", "admission"})
+            knowledge = learned["schemaKnowledge"]
+            self.assertEqual(knowledge["provenance"]["databaseSessionId"], session.session_id)
+            self.assertTrue(knowledge["fingerprint"])
+            self.assertEqual(
+                knowledge["schema"]["details"]["admission"]["foreign_keys"][0]["referencedTable"],
+                "app_user",
+            )
+            persisted = store.load(session.schema_knowledge_key())
+            self.assertEqual(persisted["fingerprint"], knowledge["fingerprint"])
+            restarted_session = DatabaseSession(
+                project_id="schema-learning-test",
+                repository_id="schema-learning-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="selected.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+                session_id="schema-learning-session-after-restart",
+            )
+            self.assertTrue(restarted_session.restore_schema_knowledge(persisted))
+            self.assertEqual(
+                restarted_session.get_schema_knowledge()["fingerprint"],
+                knowledge["fingerprint"],
+            )
+            session = restarted_session
+
+            column_intent = DatabaseSessionManager.resolve_database_intent(
+                "where is user email stored"
+            )
+            self.assertEqual(
+                column_intent["arguments"]["schema_query"]["kind"],
+                "column_location",
+            )
+            with patch.object(
+                DatabaseIntelligenceEngine,
+                "inspect_database_schema",
+                side_effect=AssertionError("A learned schema search must use the verified session cache."),
+            ):
+                column_result = DatabaseSessionManager.execute_database_capability(
+                    column_intent["capability"],
+                    column_intent["arguments"],
+                    session,
+                    temporary_directory,
+                )
+                references_intent = DatabaseSessionManager.resolve_database_intent(
+                    "which tables reference app_user"
+                )
+                references_result = DatabaseSessionManager.execute_database_capability(
+                    references_intent["capability"],
+                    references_intent["arguments"],
+                    session,
+                    temporary_directory,
+                )
+                indexes_intent = DatabaseSessionManager.resolve_database_intent(
+                    "what indexes exist on admission"
+                )
+                indexes_result = DatabaseSessionManager.execute_database_capability(
+                    indexes_intent["capability"],
+                    indexes_intent["arguments"],
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertIn("`app_user.email`", column_result["content"])
+            self.assertEqual(column_result["resultSource"], "CACHED_VERIFIED_SCHEMA")
+            self.assertIn("Cached previously verified schema", column_result["content"])
+            self.assertIn(knowledge["fingerprint"], column_result["content"])
+            self.assertIn("`admission`", references_result["content"])
+            self.assertIn("foreign keys", references_result["content"])
+            self.assertIn("idx_admission_user", indexes_result["content"])
+
+            old_fingerprint = knowledge["fingerprint"]
+            old_discovered_at = knowledge["discoveredAt"]
+            connection = sqlite3.connect(db_path)
+            connection.execute("ALTER TABLE app_user ADD COLUMN display_name TEXT")
+            connection.commit()
+            connection.close()
+            refresh_intent = DatabaseSessionManager.resolve_database_intent(
+                "check current live schema"
+            )
+            self.assertTrue(refresh_intent["arguments"]["refresh_schema"])
+            refreshed = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_LIST_TABLES,
+                {**refresh_intent["arguments"], "learn_schema": True},
+                session,
+                temporary_directory,
+            )
+            self.assertNotEqual(refreshed["schemaFingerprint"], old_fingerprint)
+            self.assertTrue(refreshed["schemaChanged"])
+            self.assertEqual(refreshed["schemaKnowledge"]["discoveredAt"], refreshed["schemaKnowledge"]["lastVerifiedAt"])
+            self.assertNotEqual(refreshed["schemaKnowledge"]["discoveredAt"], old_discovered_at)
+            self.assertIn(
+                "display_name",
+                [
+                    column["name"]
+                    for column in refreshed["schemaKnowledge"]["schema"]["details"]["app_user"]["columns"]
+                ],
+            )
+
+    def test_database_clarification_accepts_option_number(self):
+        clarification = "Choose a table: 1. `users`; 2. `accounts`"
+        pending = {
+            "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+            "clarificationContent": clarification,
+            "clarificationType": "table",
+            "arguments": {"entity": "account"},
+            "request": "count accounts",
+            "options": [
+                {"label": "users", "value": "users"},
+                {"label": "accounts", "value": "accounts"},
+            ],
+        }
+        resumed = _match_pending_database_clarification(
+            pending,
+            [
+                {"role": "user", "content": "count accounts"},
+                {"role": "assistant", "content": clarification},
+                {"role": "user", "content": "option 2"},
+            ],
+            project_root="",
+        )
+        self.assertEqual(resumed["arguments"]["entity"], "accounts")
+        self.assertEqual(resumed["original_request"], "count accounts")
+
+        corrected = _match_pending_database_clarification(
+            pending,
+            [
+                {"role": "user", "content": "count accounts"},
+                {"role": "assistant", "content": clarification},
+                {"role": "user", "content": "No, I mean student_accounts"},
+            ],
+            project_root="",
+        )
+        self.assertEqual(corrected["arguments"]["entity"], "student_accounts")
+        self.assertEqual(corrected["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+
+    def test_count_paid_admission_resolves_to_pay_status_filter_and_counts_only_paid_rows(self):
+        for request in ("count paid admission data", "count paid admissions"):
+            with self.subTest(request=request):
+                resolved = DatabaseSessionManager.resolve_database_intent(request)
+                self.assertTrue(resolved["is_deterministic"])
+                self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+                self.assertEqual(resolved["arguments"]["payment_filter"], "paid")
+                self.assertIn("admission", resolved["arguments"]["entity"].lower())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "admissions.sqlite"
+            connection = sqlite3.connect(db_path)
+            connection.execute("CREATE TABLE admission (id INTEGER PRIMARY KEY, pay_status INTEGER)")
+            connection.executemany(
+                "INSERT INTO admission (pay_status) VALUES (?)",
+                [(9,), (9,), (9,), (9,), (9,), (9,), (0,)],
+            )
+            connection.commit()
+            connection.close()
+            session = DatabaseSession(
+                project_id="paid-count-test",
+                repository_id="paid-count-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="admissions.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+            )
+
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                counted = DatabaseSessionManager.execute_database_capability(
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    {"entity": "admission", "payment_filter": "paid"},
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(counted["ok"])
+            self.assertEqual(counted["executionStatus"], "NEEDS_CLARIFICATION")
+            self.assertFalse(counted["executed"])
+            self.assertEqual(
+                [option["value"] for option in counted["clarificationOptions"]],
+                ["0", "9"],
+            )
+            self.assertIn("Choose the value that represents paid", counted["content"])
+
+            count_request = DatabaseSessionManager.resolve_database_intent(
+                "count paid admission where pay_status = 9"
+            )
+            self.assertEqual(count_request["arguments"]["entity"], "admission")
+            self.assertEqual(count_request["arguments"]["payment_value"], "9")
+            self.assertEqual(count_request["arguments"]["payment_column"], "pay_status")
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                confirmed_count = DatabaseSessionManager.execute_database_capability(
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    {**count_request["arguments"], "payment_filter": "paid"},
+                    session,
+                    temporary_directory,
+                )
+            self.assertTrue(confirmed_count["ok"])
+            self.assertEqual(confirmed_count["totalRecords"], 6)
+            self.assertIn("**Paid records:** 6", confirmed_count["content"])
+            self.assertIn("`pay_status = 9`", confirmed_count["content"])
+
+            connection = sqlite3.connect(db_path)
+            connection.execute("DELETE FROM admission")
+            connection.executemany(
+                "INSERT INTO admission (pay_status) VALUES (?)",
+                [("paid",), ("unpaid",), ("pending",)],
+            )
+            connection.commit()
+            connection.close()
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                inferred_count = DatabaseSessionManager.execute_database_capability(
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    {"entity": "admission", "payment_filter": "paid"},
+                    session,
+                    temporary_directory,
+                )
+            self.assertTrue(inferred_count["ok"])
+            self.assertEqual(inferred_count["totalRecords"], 1)
+            self.assertIn("`pay_status = paid`", inferred_count["content"])
+
+    def test_count_admission_data_uses_live_sqlite_rows_and_never_guesses_ambiguous_tables(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            db_path = Path(temporary_directory) / "admissions.sqlite"
+            connection = sqlite3.connect(db_path)
+            connection.execute("CREATE TABLE admission (id INTEGER PRIMARY KEY, applicant TEXT)")
+            connection.executemany(
+                "INSERT INTO admission (applicant) VALUES (?)",
+                [("A",), ("B",), ("C",)],
+            )
+            connection.commit()
+            connection.close()
+            session = DatabaseSession(
+                project_id="count-test",
+                repository_id="count-test",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name="admissions.sqlite",
+                connection_state=DatabaseState.CONNECTED,
+                sqlite_file=str(db_path),
+            )
+
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"):
+                counted = DatabaseSessionManager.execute_database_capability(
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    {"entity": "admission"},
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(counted["ok"])
+            self.assertEqual(counted["table"], "admission")
+            self.assertEqual(counted["totalRecords"], 3)
+            self.assertIn("Total records:** 3", counted["content"])
+            self.assertTrue(counted["executed"])
+
+            connection = sqlite3.connect(db_path)
+            connection.execute("CREATE TABLE app_application_archive (id INTEGER)")
+            connection.execute("CREATE TABLE student_application_history (id INTEGER)")
+            connection.commit()
+            connection.close()
+            with patch.object(DatabaseTargetRegistry, "get_target", return_value=None), patch.object(
+                DatabaseTargetRegistry, "get_active_target", return_value=None
+            ), patch.object(DatabaseEvidenceStore, "record_proof"), patch.object(
+                DatabaseIntelligenceEngine, "execute_safe_query"
+            ) as run_count:
+                ambiguous = DatabaseSessionManager.execute_database_capability(
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    {"entity": "application"},
+                    session,
+                    temporary_directory,
+                )
+
+            self.assertTrue(ambiguous["ok"])
+            self.assertEqual(ambiguous["executionStatus"], "NEEDS_CLARIFICATION")
+            self.assertFalse(ambiguous["executed"])
+            self.assertEqual(len(ambiguous["candidateTables"]), 2)
+            run_count.assert_not_called()
+
+    def test_hinglish_slow_query_request_uses_deterministic_performance_path(self):
+        for request in ("which query is take time", "which query takes time", "which query is taking time"):
+            with self.subTest(request=request):
+                resolved = DatabaseSessionManager.resolve_database_intent(request)
+                self.assertTrue(resolved["is_deterministic"])
+                self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_SLOW_QUERIES)
+
+    def test_show_database_connection_routes_to_status_without_schema_or_config_dump(self):
+        request = "show my db connection"
+        resolved = DatabaseSessionManager.resolve_database_intent(request)
+        intent = classify_task_intent(request)
+
+        self.assertTrue(DATABASE_CONNECTION_STATUS_PATTERN.search(request))
+        self.assertTrue(resolved["is_deterministic"])
+        self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_CURRENT_TARGET)
+        self.assertEqual(intent["intent"], TaskIntent.DATABASE_CURRENT_TARGET)
+        for short_request in ("show my db", "show my database"):
+            with self.subTest(request=short_request):
+                short_resolved = DatabaseSessionManager.resolve_database_intent(short_request)
+                short_intent = classify_task_intent(short_request)
+                self.assertTrue(DATABASE_CONNECTION_STATUS_PATTERN.search(short_request))
+                self.assertTrue(short_resolved["is_deterministic"])
+                self.assertEqual(short_resolved["capability"], DatabaseCapability.DATABASE_CURRENT_TARGET)
+                self.assertEqual(short_intent["intent"], TaskIntent.DATABASE_CURRENT_TARGET)
+
+        session = DatabaseSession(
+            project_id="test-project",
+            repository_id="test-repository",
+            project_root=".",
+            database_type="mysql",
+            database_name="admissions",
+            connection_state="CONNECTED",
+            target_id="DB-001",
+            safe_host="db.internal",
+            safe_port=3306,
+        )
+        config = {
+            "status": "CONFIGURED",
+            "configFile": "config/db.php",
+            "fileContent": "'password' => 'must-not-be-shown'",
+            "engine": "mysql",
+            "database": {"value": "admissions", "status": "RESOLVED"},
+            "host": {"value": "db.internal", "status": "RESOLVED"},
+            "port": {"value": 3306, "status": "RESOLVED"},
+            "username": {"value": "app_user", "status": "RESOLVED"},
+            "activeComponent": "Yii::$app->db",
+            "componentClass": "yii\\db\\Connection",
+        }
+        live = {
+            "status": "LIVE_VERIFIED",
+            "connected": True,
+            "database": "admissions",
+            "host": "mysql-node",
+            "port": 3306,
+            "engine": "mysql",
+        }
+        with patch.object(
+            ConfigurationSymbolResolver,
+            "inspect_project_database_configuration",
+            return_value=config,
+        ), patch.object(
+            ConfigurationSymbolResolver,
+            "verify_live_database_identity",
+            return_value=live,
+        ):
+            result = DatabaseSessionManager.execute_database_capability(
+                resolved["capability"],
+                {"user_request": request},
+                session,
+                ".",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("DATABASE CONNECTION STATUS", result["content"])
+        self.assertIn("LIVE_VERIFIED", result["content"])
+        self.assertIn("Username:** app_user", result["content"])
+        self.assertNotIn("INSPECTED CONFIGURATION FILE", result["content"])
+        self.assertNotIn("must-not-be-shown", result["content"])
+        self.assertNotIn("Relevant table/query discovered", result["content"])
+        self.assertNotIn("SCAN TABLE orders", result["content"])
+
+    def test_mysql_query_performance_uses_live_digest_statistics(self):
+        session = SimpleNamespace(
+            database_type="mysql",
+            database_name="appdb",
+            sqlite_file=None,
+            safe_host="localhost",
+            safe_port=3306,
+            target_id="DB-001",
+            _protected_credentials={"username": "configured_user", "password": "test-secret"},
+        )
+        digest = {
+            "query_digest": "SELECT * FROM `adm_user_academic`",
+            "executions": 4,
+            "total_time_ms": 200.0,
+            "average_time_ms": 50.0,
+            "max_time_ms": 75.0,
+            "rows_examined": 400,
+            "rows_sent": 400,
+        }
+        with tempfile.TemporaryDirectory() as project_root, patch.object(
+            DatabaseIntelligenceEngine,
+            "execute_safe_query",
+            return_value={"ok": True, "rows": [digest]},
+        ) as execute_query:
+            source_dir = Path(project_root) / "controllers"
+            source_dir.mkdir()
+            (source_dir / "AcademicController.php").write_text(
+                "<?php\n"
+                "class AcademicController {\n"
+                "    public function actionIndex() {\n"
+                "        foreach ($applications as $application) {\n"
+                "            $academic = AdmUserAcademic::find()->where(['id' => $application->id])->one();\n"
+                "        }\n"
+                "    }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            result = DatabasePerformanceEngine.autonomous_investigate_expensive_queries(
+                project_root,
+                session=session,
+                intent_detail="average_time",
+            )
+
+        self.assertEqual(result["evidenceQuality"], "VERIFIED_LIVE")
+        self.assertEqual(result["timingMs"], 50.0)
+        self.assertEqual(result["candidate"]["executionCount"], 4)
+        self.assertIn("50.000 ms", result["content"])
+        self.assertIn("#### Query 1 (average: 50.000 ms)", result["content"])
+        self.assertIn("```sql\nSELECT * FROM `adm_user_academic`\n```", result["content"])
+        self.assertNotIn("test-secret", result["content"])
+        self.assertEqual(result["candidate"]["sourceCandidates"][0]["sourceFile"], "controllers/AcademicController.php")
+        self.assertEqual(result["candidate"]["sourceCandidates"][0]["functionName"], "actionIndex")
+        self.assertIsNotNone(result["candidate"]["sourceCandidates"][0]["loopContextLine"])
+        self.assertIn("not counts for one academic action or request", result["content"])
+        self.assertIn("SCHEMA_NAME = DATABASE()", execute_query.call_args.args[1])
+        self.assertIn("EVENTS_STATEMENTS_SUMMARY_BY_DIGEST", execute_query.call_args.args[1])
+
+    def test_query_source_mapping_requires_query_evidence_not_only_a_table_name(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            source_dir = Path(project_root) / "models"
+            source_dir.mkdir()
+            (source_dir / "Academic.php").write_text(
+                "<?php\n"
+                "class Academic {\n"
+                "    public function label() {\n"
+                "        return 'adm_user_academic';\n"
+                "    }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+
+            result = QueryToSourceMapper.map_query_to_source(
+                project_root,
+                "SELECT * FROM `adm_user_academic`",
+            )
+
+        self.assertEqual(result["status"], "SOURCE_MAPPING_UNVERIFIED")
+        self.assertIsNone(result["sourceFile"])
+
+    def test_missing_performance_samples_never_fabricate_query_timings(self):
+        session = SimpleNamespace(
+            database_type="mysql",
+            database_name="appdb",
+            sqlite_file=None,
+            safe_host="localhost",
+            safe_port=3306,
+            target_id="DB-001",
+            _protected_credentials={},
+        )
+        with tempfile.TemporaryDirectory() as project_root, patch.object(
+            DatabaseIntelligenceEngine,
+            "execute_safe_query",
+            return_value={"ok": False, "error": {"code": "DATABASE_QUERY_FAILED"}},
+        ):
+            result = DatabasePerformanceEngine.autonomous_investigate_expensive_queries(
+                project_root,
+                session=session,
+                intent_detail="average_time",
+            )
+
+        self.assertIsNone(result["timingMs"])
+        self.assertEqual(result["evidenceQuality"], "UNVERIFIED")
+        self.assertEqual(result["queries"], [])
+        self.assertIn("Runtime query statistics are unavailable", result["content"])
+        self.assertNotIn("14.2", result["content"])
+        self.assertNotIn("orders", result["content"])
+
+    def test_performance_investigation_without_live_evidence_does_not_invent_orders_or_plan(self):
+        candidate = {
+            "rawQuery": "SELECT * FROM personal",
+            "averageTimeMs": None,
+            "rowsExamined": None,
+            "rowsReturned": None,
+        }
+        with tempfile.TemporaryDirectory() as project_root, patch.object(
+            DatabasePerformanceEngine,
+            "rank_queries",
+            return_value=[candidate],
+        ), patch.object(
+            QueryToSourceMapper,
+            "map_query_to_source",
+            return_value={},
+        ), patch.object(
+            DatabaseIntelligenceEngine,
+            "inspect_database_schema",
+            return_value={"tables": ["personal"], "schema_details": {}},
+        ), patch.object(
+            DatabaseIntelligenceEngine,
+            "execute_query_and_explain",
+            return_value={},
+        ):
+            result = DatabasePerformanceEngine.autonomous_investigate_expensive_queries(
+                project_root,
+                intent_detail="average_time",
+            )
+
+        self.assertIsNone(result["timingMs"])
+        self.assertIsNone(result["classification"])
+        self.assertEqual(result["evidenceQuality"], "UNVERIFIED")
+        self.assertIn("UNAVAILABLE (no live query plan)", result["content"])
+        self.assertIn("UNAVAILABLE (insufficient evidence)", result["content"])
+        self.assertNotIn("orders", result["content"])
+        self.assertNotIn("models/Order.php", result["content"])
+        self.assertNotIn("SCAN TABLE", result["content"])
+        self.assertNotIn("14.2", result["content"])
+        self.assertNotIn("1000", result["content"])
+
+    def test_database_investigation_report_does_not_invent_query_or_orders_scan(self):
+        report = DatabaseIntelligenceEngine.format_database_investigation_report(
+            {},
+            {"connected": False, "status": "UNVERIFIED"},
+            {"tables": ["personal"], "schema_details": {}},
+        )
+
+        self.assertIn("Database connection not verified.", report)
+        self.assertIn("Connection: NOT_VERIFIED", report)
+        self.assertIn("UNAVAILABLE (no query evidence)", report)
+        self.assertIn("UNAVAILABLE (no query plan evidence)", report)
+        self.assertIn("UNAVAILABLE (no query-specific timing evidence)", report)
+        self.assertNotIn("orders", report)
+        self.assertNotIn("SCAN TABLE", report)
+        self.assertNotIn("Full Table Scan", report)
+        self.assertNotIn("unindexed sequential scanning", report)
+
+    def test_hinglish_database_credentials_request_is_deterministic_and_reports_configured_user(self):
+        for request in (
+            "mydb connection user and passwd kiya hai",
+            "show my db username and password",
+            "show my db username and passwod",
+        ):
+            with self.subTest(request=request):
+                resolved = DatabaseSessionManager.resolve_database_intent(request)
+                self.assertTrue(resolved["is_deterministic"])
+                self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_CREDENTIAL_REQUEST)
+                self.assertTrue(DATABASE_CREDENTIAL_REQUEST_PATTERN.search(request))
+
+        session = DatabaseSession(
+            project_id="test-project",
+            repository_id="test-repository",
+            project_root=".",
+            database_type="mysql",
+            database_name="admissions",
+            connection_state="CONNECTED",
+            target_id="DB-004",
+        )
+        discovered = {
+            "username": "configured_user",
+            "configFile": "config/db.php",
+            "has_credentials": True,
+            "_symbol_details": {"hasPassword": True},
+        }
+        credentials = {"username": "configured_user", "password": "test-only-secret"}
+        with patch.object(
+            DatabaseIntelligenceEngine,
+            "discover_database_configuration",
+            return_value=discovered,
+        ), patch.object(
+            ConfigurationSymbolResolver,
+            "get_credential",
+            return_value=credentials,
+        ), patch.object(
+            DatabaseTargetRegistry,
+            "get_active_target",
+            return_value=SimpleNamespace(
+                target_id="DB-004",
+                username="stale_user",
+                config_file="old/config.php",
+            ),
+        ):
+            result = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                {},
+                session,
+                ".",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("**Database:** admissions", result["content"])
+        self.assertIn("**Username:** configured_user", result["content"])
+        self.assertIn("**Credential status:** CONFIGURED", result["content"])
+        self.assertIn("**Password:** [REDACTED]", result["content"])
+        self.assertNotIn("test-only-secret", result["content"])
+        self.assertNotIn("test-only-secret", json.dumps(result))
+        self.assertEqual(result["database"], "admissions")
+        self.assertEqual(result["password"], "[REDACTED]")
+        self.assertEqual(result["targetId"], "DB-004")
+        self.assertNotIn("stale_user", result["content"])
+
+    def test_generic_username_password_request_uses_redacted_database_credential_path(self):
+        request = "show my username and passwd"
+        self.assertTrue(_is_contextual_database_credential_request(request, [
+            {"role": "user", "content": "Explain the login form."},
+            {"role": "user", "content": request},
+        ]))
+        self.assertTrue(_is_contextual_database_credential_request(request, [
+            {"role": "user", "content": "SELECT COUNT(*) FROM adm_user_programme_selection"},
+            {"role": "assistant", "content": "There are 11 rows."},
+            {"role": "user", "content": request},
+        ]))
+        self.assertTrue(_is_contextual_database_credential_request(
+            "show db username and passwd",
+            [{"role": "user", "content": "show db username and passwd"}],
+        ))
+
+    def test_standalone_credential_fields_require_recent_database_context(self):
+        prior_turns = [
+            {"role": "user", "content": "show me all table"},
+            {
+                "role": "assistant",
+                "content": "### DATABASE TABLES INSPECTION\nDatabase: final_admission\nTables found: 200",
+            },
+        ]
+        for request in ("show me username", "show me passwd"):
+            with self.subTest(request=request):
+                self.assertTrue(_is_contextual_database_credential_request(
+                    request,
+                    [*prior_turns, {"role": "user", "content": request}],
+                ))
+                self.assertFalse(_is_contextual_database_credential_request(
+                    request,
+                    [{"role": "user", "content": request}],
+                ))
+
+    def test_table_list_and_connected_database_phrasings_resolve_deterministically(self):
+        for table_request in ("show me all table", "show my all table"):
+            with self.subTest(request=table_request):
+                table_intent = DatabaseSessionManager.resolve_database_intent(table_request)
+                self.assertTrue(table_intent["is_deterministic"])
+                self.assertEqual(table_intent["capability"], DatabaseCapability.DATABASE_LIST_TABLES)
+                self.assertEqual(classify_task_intent(table_request)["intent"], TaskIntent.DATABASE_LIST_TABLES)
+
+        for request in (
+            "show me database which one connected",
+            "which database one connected",
+        ):
+            with self.subTest(request=request):
+                resolved = DatabaseSessionManager.resolve_database_intent(request)
+                self.assertTrue(resolved["is_deterministic"])
+                self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_CURRENT_TARGET)
+                self.assertEqual(classify_task_intent(request)["intent"], TaskIntent.DATABASE_CURRENT_TARGET)
+
+    def test_model_database_action_selection_is_allowlisted_and_validated(self):
+        selected = _validate_database_action_selection({
+            "tool_calls": [{
+                "function": {
+                    "name": "select_database_action",
+                    "arguments": json.dumps({
+                        "operation": DatabaseCapability.DATABASE_COUNT_RECORDS,
+                        "arguments": {
+                            "entity": "personal",
+                            "filters": ["active"],
+                            "row_limit": 100,
+                        },
+                    }),
+                },
+            }],
+        })
+        self.assertEqual(selected["capability"], DatabaseCapability.DATABASE_COUNT_RECORDS)
+        self.assertEqual(selected["arguments"]["entity"], "personal")
+        self.assertEqual(selected["arguments"]["filters"], ["active"])
+        self.assertEqual(selected["arguments"]["row_limit"], 50)
+        self.assertTrue(selected["resolved_by_model"])
+
+        clarification = _validate_database_action_selection({
+            "tool_calls": [{
+                "function": {
+                    "name": "select_database_action",
+                    "arguments": json.dumps({
+                        "operation": "CLARIFY",
+                        "arguments": {},
+                        "clarification": "Which of these two databases do you mean?",
+                    }),
+                },
+            }],
+        })
+        self.assertEqual(clarification["clarification"], "Which of these two databases do you mean?")
+
+        for selection in (
+            {"operation": "DROP_DATABASE", "arguments": {}},
+            {"operation": DatabaseCapability.DATABASE_QUERY, "arguments": {"sql": "DROP TABLE users"}},
+            {"operation": DatabaseCapability.DATABASE_COUNT_RECORDS, "arguments": {"entity": "users", "unsafe": True}},
+        ):
+            with self.subTest(selection=selection), self.assertRaises(RuntimeError):
+                _validate_database_action_selection({
+                    "tool_calls": [{
+                        "function": {
+                            "name": "select_database_action",
+                            "arguments": json.dumps(selection),
+                        },
+                    }],
+                })
+
+    def test_database_intent_model_receives_full_conversation_and_only_action_selector(self):
+        messages = [
+            {"role": "user", "content": "Which database is connected?"},
+            {"role": "assistant", "content": "Connected database: admissions."},
+            {"role": "user", "content": "show my all table"},
+        ]
+        provider = SimpleNamespace(id="configured-coding-provider")
+        response = {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "select-db-action",
+                "function": {
+                    "name": "select_database_action",
+                    "arguments": json.dumps({
+                        "operation": DatabaseCapability.DATABASE_LIST_TABLES,
+                        "arguments": {},
+                    }),
+                },
+            }],
+        }
+        registry = SimpleNamespace()
+        safe_context = {
+            "engine": "mysql",
+            "database": "admissions",
+            "connectionState": "CONNECTED",
+            "targetId": "DB-001",
+        }
+        with patch(
+            "coding_websocket.complete_coding_model",
+            return_value=(response, provider),
+        ) as complete:
+            selected = asyncio.run(_resolve_database_action_with_model(
+                registry,
+                Path("unused-provider-config.json"),
+                messages,
+                safe_context,
+                provider.id,
+                "database-intent-request",
+                "database-intent-session",
+            ))
+
+        self.assertEqual(selected["capability"], DatabaseCapability.DATABASE_LIST_TABLES)
+        self.assertTrue(selected["resolved_by_model"])
+        call = complete.call_args
+        self.assertEqual(call.args[2][-3:], messages)
+        self.assertEqual(
+            call.args[2][0]["content"].split("Safe active database context: ", 1)[1],
+            json.dumps(safe_context, ensure_ascii=False),
+        )
+        self.assertEqual([tool["function"]["name"] for tool in call.args[3]], ["select_database_action"])
+        self.assertEqual(call.args[4], provider.id)
+        self.assertTrue(call.args[5], "Action resolution must require a structured model tool call.")
+
+    def test_provider_messages_hash_credentials_before_external_request(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            registry.add_provider("groq", "openai/gpt-oss-20b", "https://api.groq.com/openai/v1", "test-key")
+            client = Mock()
+            client.chat.completions.create.return_value.choices = [
+                SimpleNamespace(message=SimpleNamespace(model_dump=lambda exclude_none: {
+                    "role": "assistant",
+                    "content": "Credential references are protected.",
+                })),
+            ]
+            messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        "Config: 'username' => 'db_operator', 'password' => 'provider-only-secret-7', "
+                        "'api_key' => 'sk-abcdefghijklmnop'; Bearer abcdefghijklmnop"
+                    ),
+                },
+                {
+                    "role": "tool",
+                    "content": json.dumps({"database_password": "tool-only-secret-8"}),
+                },
+            ]
+
+            with patch("coding_provider.OpenAI", return_value=client):
+                complete_coding_model(
+                    registry,
+                    Path("unused-provider-config.json"),
+                    messages,
+                )
+
+        sent_messages = json.dumps(client.chat.completions.create.call_args.kwargs["messages"])
+        self.assertNotIn("provider-only-secret-7", sent_messages)
+        self.assertNotIn("tool-only-secret-8", sent_messages)
+        self.assertNotIn("db_operator", sent_messages)
+        self.assertNotIn("sk-abcdefghijklmnop", sent_messages)
+        self.assertNotIn("abcdefghijklmnop", sent_messages)
+        self.assertIn("secret:password:", sent_messages)
+        self.assertIn("secret:username:", sent_messages)
+        self.assertIn("secret:api_key:", sent_messages)
+        self.assertIn("secret:bearer-token:", sent_messages)
+        self.assertIn("secret:database_password:", sent_messages)
+        self.assertIn("provider-only-secret-7", json.dumps(messages))
+        self.assertIn("tool-only-secret-8", json.dumps(messages))
+
+    def test_database_urls_discover_postgres_supabase_and_mongodb_without_provider_secrets(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            urls = (
+                ("DATABASE_URL", "postgresql://db_user:pg-secret@db.example:5433/admissions", "postgresql"),
+                ("SUPABASE_DB_URL", "postgresql://postgres:sb-secret@db.project.supabase.co:5432/postgres", "postgresql"),
+                ("MONGODB_URI", "mongodb+srv://mongo_user:mg-secret@cluster.example/app", "mongodb"),
+            )
+            for env_key, connection_uri, expected_engine in urls:
+                (root / ".env").write_text(f"{env_key}={connection_uri}\n", encoding="utf-8")
+                discovered = DatabaseIntelligenceEngine.discover_database_configuration(str(root))
+                credentials = ConfigurationSymbolResolver.get_credential(str(root))
+                self.assertEqual(discovered["engine"], expected_engine)
+                self.assertEqual(discovered["host"], connection_uri.split("@", 1)[1].split("/", 1)[0].split(":", 1)[0].replace("mongodb+srv://", ""))
+                self.assertEqual(credentials["connection_uri"], connection_uri)
+                sanitized = SecretTransformer.sanitize_context_for_llm({**discovered, **credentials})
+                self.assertNotIn("pg-secret", json.dumps(sanitized))
+                self.assertNotIn("sb-secret", json.dumps(sanitized))
+                self.assertNotIn("mg-secret", json.dumps(sanitized))
+                self.assertIn("secret:db-password:", json.dumps(sanitized))
+                config_details = ConfigurationSymbolResolver.inspect_project_database_configuration(str(root))
+                local_report = ConfigurationSymbolResolver.format_connection_status_report(
+                    config_details,
+                    credentials=credentials,
+                )
+                self.assertIn(credentials["username"], local_report)
+                self.assertIn("**Password:** [REDACTED]", local_report)
+                self.assertNotIn(credentials["password"], local_report)
+
+    def test_h2_spring_configuration_is_discovered_and_secrets_stay_provider_sanitized(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_file = root / "application.properties"
+            config_file.write_text(
+                "spring.datasource.url=jdbc:h2:file:./data/admissions;AUTO_SERVER=TRUE\n"
+                "spring.datasource.username=sa\n"
+                "spring.datasource.password=h2-local-secret\n",
+                encoding="utf-8",
+            )
+
+            config = ConfigurationSymbolResolver.inspect_project_database_configuration(str(root))
+            credentials = ConfigurationSymbolResolver.get_credential(str(root))
+            discovered = DatabaseIntelligenceEngine.discover_database_configuration(str(root))
+
+            self.assertTrue(config["discovered"])
+            self.assertEqual(config["engine"], "h2")
+            self.assertEqual(config["database"]["value"], "admissions")
+            self.assertEqual(config["username"]["value"], "sa")
+            self.assertTrue(config["hasPassword"])
+            self.assertEqual(credentials["password"], "h2-local-secret")
+            self.assertEqual(credentials["connection_uri"], "jdbc:h2:file:./data/admissions;AUTO_SERVER=TRUE")
+            self.assertEqual(discovered["engine"], "h2")
+            sanitized = SecretTransformer.sanitize_context_for_llm({
+                **discovered,
+                **credentials,
+                "fileContent": config["fileContent"],
+            })
+            self.assertNotIn("h2-local-secret", json.dumps(sanitized))
+            self.assertIn("secret:password:", json.dumps(sanitized))
+            sanitized_uri = SecretTransformer.sanitize_context_for_llm({
+                "connection_uri": "jdbc:h2:file:./data/admissions;USER=sa;PASSWORD=h2-uri-secret"
+            })
+            self.assertNotIn("h2-uri-secret", json.dumps(sanitized_uri))
+
+    def test_h2_jdbc_parsing_and_read_only_query_adapter(self):
+        file_url = "jdbc:h2:file:./data/admissions;AUTO_SERVER=TRUE"
+        parsed_file = DatabaseIntelligenceEngine.parse_database_url(file_url)
+        parsed_tcp = DatabaseIntelligenceEngine.parse_database_url("jdbc:h2:tcp://db.internal:9123/~/admissions")
+        parsed_memory = DatabaseIntelligenceEngine.parse_database_url("jdbc:h2:mem:admissions")
+        self.assertEqual(parsed_file["engine"], "h2")
+        self.assertEqual(parsed_file["database"], "admissions")
+        self.assertTrue(parsed_file["file_database"])
+        self.assertEqual((parsed_tcp["host"], parsed_tcp["port"]), ("db.internal", 9123))
+        self.assertEqual(parsed_tcp["database"], "admissions")
+        self.assertTrue(parsed_memory["in_memory"])
+
+        cursor = Mock()
+        cursor.description = [("ANSWER",)]
+        cursor.fetchmany.return_value = [(42,)]
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        connection.jconn = Mock()
+        fake_jaydebeapi = SimpleNamespace(connect=Mock(return_value=connection))
+        with tempfile.TemporaryDirectory() as temporary_directory, patch.dict(
+            sys.modules, {"jaydebeapi": fake_jaydebeapi}
+        ), patch.object(DatabaseIntelligenceEngine, "_find_h2_jar", return_value="h2.jar"):
+            opened = DatabaseIntelligenceEngine._open_h2_connection(
+                temporary_directory,
+                {"engine": "h2", "connection_uri": file_url},
+            )
+            self.assertIs(opened, connection)
+            self.assertEqual(
+                fake_jaydebeapi.connect.call_args.args[1],
+                f"{file_url};ACCESS_MODE_DATA=r",
+            )
+            connection.jconn.setReadOnly.assert_called_once_with(True)
+
+            with patch.object(DatabaseIntelligenceEngine, "_open_h2_connection", return_value=connection):
+                result = DatabaseIntelligenceEngine.execute_safe_query(
+                    temporary_directory,
+                    "SELECT 42 AS answer",
+                    {"engine": "h2", "database": "admissions", "connection_uri": file_url},
+                )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["rows"], [{"ANSWER": 42}])
+            self.assertEqual(result["mode"], "READ_ONLY")
+
+            with patch.object(DatabaseIntelligenceEngine, "_open_h2_connection") as open_h2:
+                rejected = DatabaseIntelligenceEngine.execute_safe_query(
+                    temporary_directory,
+                    "DELETE FROM USERS",
+                    {"engine": "h2", "database": "admissions", "connection_uri": file_url},
+                )
+            self.assertFalse(rejected["ok"])
+            open_h2.assert_not_called()
+
+            cursor.fetchall.side_effect = [
+                [("USERS",)],
+                [("ID", "INTEGER", "NO"), ("NAME", "VARCHAR", "YES")],
+                [("ID",)],
+                [("IDX_USERS_NAME", "NON_UNIQUE", "NAME")],
+            ]
+            with patch.object(DatabaseIntelligenceEngine, "_open_h2_connection", return_value=connection), patch.object(
+                DatabaseEvidenceStore, "record_proof"
+            ):
+                schema = DatabaseIntelligenceEngine.inspect_database_schema(
+                    temporary_directory,
+                    {"engine": "h2", "database": "admissions", "connection_uri": file_url},
+                )
+            self.assertEqual(schema["tables"], ["USERS"])
+            self.assertEqual(schema["schema_details"]["USERS"]["primary_keys"], ["ID"])
+            self.assertFalse(schema["schema_details"]["USERS"]["indexes"][0]["unique"])
+
+            unavailable_memory = DatabaseIntelligenceEngine.real_connect_and_health_check(
+                temporary_directory,
+                {"engine": "h2", "connection_uri": "jdbc:h2:mem:admissions"},
+            )
+            self.assertFalse(unavailable_memory["connected"])
+            self.assertEqual(unavailable_memory["classification"], "H2_IN_MEMORY_NOT_ACCESSIBLE")
+            self.assertIn("Java application's JVM", unavailable_memory["message"])
+
+            with self.assertRaisesRegex(ValueError, "in-memory databases"):
+                DatabaseIntelligenceEngine._open_h2_connection(
+                    temporary_directory,
+                    {"engine": "h2", "connection_uri": "jdbc:h2:mem:admissions"},
+                )
+
+    def test_postgresql_read_only_query_uses_read_only_transaction(self):
+        cursor = Mock()
+        cursor.description = [SimpleNamespace(name="answer")]
+        cursor.fetchmany.return_value = [(42,)]
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        fake_psycopg = SimpleNamespace(connect=Mock(return_value=connection))
+
+        with patch.dict(sys.modules, {"psycopg": fake_psycopg}):
+            result = DatabaseIntelligenceEngine.execute_safe_query(
+                ".",
+                "SELECT 42 AS answer",
+                {"engine": "postgresql", "database": "app", "connection_uri": "postgresql://user:pass@db/app"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["rows"], [{"answer": 42}])
+        self.assertEqual(result["mode"], "READ_ONLY")
+        self.assertEqual(cursor.execute.call_args_list[0].args[0], "SET TRANSACTION READ ONLY")
+        self.assertEqual(cursor.execute.call_args_list[1].args[0], "SELECT 42 AS answer")
+        connection.rollback.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_postgresql_and_mongodb_health_checks_require_live_driver_responses(self):
+        pg_cursor = MagicMock()
+        pg_cursor.fetchone.side_effect = [(1,), ("admissions", "10.0.0.8", 5432)]
+        pg_connection = MagicMock()
+        pg_connection.cursor.return_value.__enter__.return_value = pg_cursor
+        mongo_client = MagicMock()
+        mongo_client.address = ("mongo.internal", 27017)
+        fake_psycopg = SimpleNamespace(connect=Mock(return_value=pg_connection))
+        fake_pymongo = SimpleNamespace(MongoClient=Mock(return_value=mongo_client))
+
+        with patch.dict(sys.modules, {"psycopg": fake_psycopg, "pymongo": fake_pymongo}), patch.object(
+            DatabaseEvidenceStore, "record_proof"
+        ):
+            postgres = DatabaseIntelligenceEngine.real_connect_and_health_check(
+                ".",
+                {"engine": "postgresql", "connection_uri": "postgresql://user:pass@db/app"},
+            )
+            mongodb = DatabaseIntelligenceEngine.real_connect_and_health_check(
+                ".",
+                {"engine": "mongodb", "connection_uri": "mongodb://user:pass@db/app"},
+            )
+
+        self.assertTrue(postgres["connected"])
+        self.assertEqual(postgres["database"], "admissions")
+        self.assertEqual(postgres["host"], "10.0.0.8")
+        self.assertEqual(postgres["port"], 5432)
+        self.assertTrue(mongodb["connected"])
+        self.assertEqual(mongodb["engine"], "mongodb")
+        self.assertEqual(mongodb["host"], "mongo.internal")
+        mongo_client.close.assert_called_once()
+
+    def test_postgresql_and_mysql_schema_operations_use_live_catalog_queries(self):
+        pg_cursor = Mock()
+        pg_cursor.fetchall.side_effect = [
+            [("users",)],
+            [("users",)],
+            [("id", "integer", "NO", True), ("name", "text", "YES", False)],
+        ]
+        pg_connection = Mock()
+        pg_connection.cursor.return_value = pg_cursor
+        mysql_cursor = Mock()
+        mysql_cursor.fetchmany.return_value = [("app",)]
+        mysql_cursor.fetchall.side_effect = [
+            [("users",)],
+            [("users",)],
+            [("id", "int", "NO", "PRI")],
+        ]
+        mysql_connection = Mock()
+        mysql_connection.cursor.return_value = mysql_cursor
+        session_pg = DatabaseSession(
+            project_id="test-project",
+            repository_id="test-repository",
+            project_root=".",
+            database_type="postgresql",
+            database_name="app",
+            connection_state="CONNECTED",
+        )
+        session_pg._protected_credentials = {"connection_uri": "postgresql://user:pass@db/app"}
+        session_mysql = DatabaseSession(
+            project_id="test-project",
+            repository_id="test-repository",
+            project_root=".",
+            database_type="mysql",
+            database_name="app",
+            connection_state="CONNECTED",
+            safe_host="db.internal",
+            safe_port=3306,
+        )
+        session_mysql._protected_credentials = {"username": "user", "password": "pass"}
+
+        with patch.dict(sys.modules, {"psycopg": SimpleNamespace(connect=Mock(return_value=pg_connection)), "pymysql": SimpleNamespace(connect=Mock(return_value=mysql_connection))}), patch.object(
+            DatabaseEvidenceStore, "record_proof"
+        ):
+            pg_tables = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_LIST_TABLES, {}, session_pg, "."
+            )
+            pg_columns = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_DESCRIBE_TABLE, {"table": "users"}, session_pg, "."
+            )
+            mysql_dbs = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_LIST_DATABASES, {}, session_mysql, "."
+            )
+            mysql_tables = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_LIST_TABLES, {}, session_mysql, "."
+            )
+            mysql_columns = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_DESCRIBE_TABLE, {"table": "users"}, session_mysql, "."
+            )
+
+        self.assertEqual(pg_tables["tables"], ["users"])
+        self.assertEqual(pg_columns["columns"][0]["name"], "id")
+        self.assertEqual(pg_columns["columns"][0]["pk"], True)
+        self.assertEqual(mysql_dbs["databases"], ["app"])
+        self.assertEqual(mysql_tables["tables"], ["users"])
+        self.assertEqual(mysql_columns["columns"][0]["name"], "id")
+        self.assertEqual(mysql_columns["columns"][0]["pk"], True)
+
+    def test_mongodb_lists_live_collections_and_reads_limited_documents(self):
+        collection = Mock()
+        cursor = MagicMock()
+        cursor.limit.return_value = cursor
+        cursor.__iter__.return_value = iter([{"_id": "doc-1", "name": "Ada"}])
+        cursor.explain.return_value = {
+            "executionStats": {"nReturned": 1},
+            "queryPlanner": {"winningPlan": {"stage": "IXSCAN"}},
+        }
+        collection.find.return_value = cursor
+        database = MagicMock()
+        database.list_collection_names.return_value = ["users"]
+        database.__getitem__.return_value = collection
+        client = MagicMock()
+        client.__getitem__.return_value = database
+        fake_pymongo = SimpleNamespace(MongoClient=Mock(return_value=client))
+        session = DatabaseSession(
+            project_id="test-project",
+            repository_id="test-repository",
+            project_root=".",
+            database_type="mongodb",
+            database_name="app",
+            connection_state="CONNECTED",
+        )
+        session._protected_credentials = {
+            "connection_uri": "mongodb://user:password@db.example/app",
+        }
+
+        with patch.dict(sys.modules, {"pymongo": fake_pymongo}), patch.object(DatabaseEvidenceStore, "record_proof"):
+            listed = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_LIST_TABLES, {}, session, "."
+            )
+            found = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_QUERY,
+                {"collection": "users", "filter": {}},
+                session,
+                ".",
+            )
+            explained = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_EXPLAIN,
+                {"collection": "users", "filter": {}},
+                session,
+                ".",
+            )
+
+        self.assertTrue(listed["ok"])
+        self.assertIn("users", listed["tables"])
+        self.assertEqual(listed["content"], "- `users`")
+        self.assertTrue(found["ok"])
+        self.assertEqual(found["rows"], [{"_id": "doc-1", "name": "Ada"}])
+        self.assertEqual(found["mode"], "LIVE")
+        self.assertTrue(explained["ok"])
+        self.assertIn("IXSCAN", explained["content"])
+        self.assertGreaterEqual(fake_pymongo.MongoClient.call_count, 2)
+
+    def test_missing_requested_config_does_not_substitute_another_file_or_database(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "config").mkdir()
+            (root / "config" / "db.php").write_text(
+                "<?php return ['dsn' => 'mysql:host=db.internal;dbname=app_db'];",
+                encoding="utf-8",
+            )
+            unrelated_db = root / "unrelated.sqlite"
+            unrelated_db.touch()
+            missing_config = ConfigurationSymbolResolver.inspect_project_database_configuration(
+                temporary_directory,
+                specific_file="config.php",
+            )
+            session = DatabaseSession(
+                project_id="test-project",
+                repository_id="test-repository",
+                project_root=temporary_directory,
+                database_type="sqlite",
+                database_name=None,
+                connection_state="NOT_CONNECTED",
+                target_id=None,
+            )
+            live = ConfigurationSymbolResolver.verify_live_database_identity(
+                temporary_directory,
+                {"engine": "sqlite", "sqliteFile": "configured.sqlite"},
+                session=session,
+            )
+
+        self.assertEqual(missing_config["status"], "NOT_FOUND")
+        self.assertEqual(missing_config["configFile"], "config.php")
+        self.assertEqual(live["status"], "NOT_VERIFIED")
+        self.assertIsNone(live["database"])
+        self.assertIsNone(live["targetId"])
+
+    def test_compound_current_target_reports_missing_requested_file_and_discovered_config(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_dir = root / "config"
+            config_dir.mkdir()
+            (config_dir / "db.php").write_text(
+                "<?php return [\n"
+                "    'dsn' => 'mysql:host=db.internal;dbname=app_db',\n"
+                "    'username' => 'app_user',\n"
+                "    'password' => 'test-only-secret',\n"
+                "];\n",
+                encoding="utf-8",
+            )
+            session = DatabaseSession(
+                project_id="test-project",
+                repository_id="test-repository",
+                project_root=temporary_directory,
+                database_type="mysql",
+                database_name="app_db",
+                connection_state="CONNECTED",
+                target_id=None,
+                safe_host="db.internal",
+            )
+            fake_mysql = SimpleNamespace(
+                connect=Mock(side_effect=OSError("connection unavailable"))
+            )
+
+            try:
+                with patch.dict(sys.modules, {"pymysql": fake_mysql}):
+                    result = DatabaseSessionManager.execute_database_capability(
+                        DatabaseCapability.DATABASE_CURRENT_TARGET,
+                        {"configFile": "config.php", "user_request": "open config.php and current database"},
+                        session,
+                        temporary_directory,
+                    )
+            finally:
+                ConfigurationSymbolResolver._credential_vault.pop(
+                    str(root.resolve()).lower(),
+                    None,
+                )
+
+        report = result["content"]
+        self.assertIn("Requested configuration file config.php was not found", report)
+        self.assertIn("INSPECTED CONFIGURATION FILE: config/db.php", report)
+        self.assertNotIn("INSPECTED CONFIGURATION FILE: config.php", report)
+        self.assertNotIn("DB-001", report)
+        preview = report.split("### DATABASE CONNECTION STATUS", 1)[0]
+        self.assertNotIn("test-only-secret", preview)
+        self.assertIn("**Password:** [REDACTED]", report)
+        self.assertNotIn("test-only-secret", report)
+        self.assertEqual(result["status"], "FAILED")
+
+    def test_mysql_current_target_records_live_runtime_identity(self):
+        session = DatabaseSession(
+            project_id="test-project",
+            repository_id="test-repository",
+            project_root=".",
+            database_type="mysql",
+            database_name="configured_db",
+            connection_state="NOT_CONNECTED",
+            target_id=None,
+            safe_host="db.internal",
+            safe_port=3306,
+        )
+        session._protected_credentials = {"username": "app_user", "password": "test-password"}
+        cursor = Mock()
+        cursor.fetchone.return_value = ("actual_db", "mysql-node-2", 3307)
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        config = {
+            "engine": "mysql",
+            "host": {"value": "db.internal"},
+            "database": {"value": "configured_db"},
+            "port": {"value": 3306},
+            "username": {"value": "app_user"},
+        }
+
+        with patch.dict(sys.modules, {"pymysql": SimpleNamespace(connect=Mock(return_value=connection))}):
+            with patch.object(DatabaseEvidenceStore, "record_proof"):
+                result = ConfigurationSymbolResolver.verify_live_database_identity(
+                    ".",
+                    config,
+                    session=session,
+                )
+
+        self.assertEqual(result["status"], "LIVE_VERIFIED")
+        self.assertEqual(result["database"], "actual_db")
+        self.assertEqual(result["host"], "mysql-node-2")
+        self.assertEqual(result["port"], 3307)
+        self.assertIsNone(result["targetId"])
+        self.assertEqual(result["databaseSessionId"], session.session_id)
+        self.assertTrue(result["evidence"]["executed"])
+        self.assertNotIn("test-password", json.dumps(result))
+        self.assertEqual(session.safe_host, "db.internal")
+        self.assertEqual(session.safe_port, 3306)
+        report = ConfigurationSymbolResolver.format_connection_status_report(config, result)
+        self.assertIn("MISMATCH DETECTED", report)
+        credential_report = ConfigurationSymbolResolver.format_connection_status_report(
+            config,
+            result,
+            credentials={"username": "app_user", "password": "test-password"},
+        )
+        self.assertIn("- **Username:** app_user", credential_report)
+        self.assertIn("- **Password:** [REDACTED]", credential_report)
+        self.assertNotIn("test-password", credential_report)
+        cursor.execute.assert_called_once_with("SELECT DATABASE(), @@hostname, @@port;")
+        connection.close.assert_called_once()
+
     def test_openai_compatible_coding_requests_explicitly_allow_needed_tools(self):
         for provider_type, model, base_url in (
             ("groq", "openai/gpt-oss-20b", "https://api.groq.com/openai/v1"),
@@ -925,6 +3158,190 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
             )
 
         self.assertEqual(post.call_args.kwargs["json"]["tool_choice"], {"type": "any"})
+
+
+class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
+    async def test_database_model_resolution_failure_never_executes_action(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            session = SimpleNamespace(
+                project_root=project_root,
+                database_type="mysql",
+                database_name="test_db",
+                connection_state="CONNECTED",
+                target_id="DB-TEST",
+            )
+            with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                "coding_websocket.ProjectContextLock.lock"
+            ), patch("coding_websocket.set_backend_project_state"), patch(
+                "coding_websocket.detect_project_architecture", return_value={}
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+                return_value={"engine": "mysql", "database": "test_db"},
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "check_database_capabilities",
+                return_value={"available_paths": ["application_client"]},
+            ), patch.object(
+                DatabaseSessionManager,
+                "get_session",
+                return_value=session,
+            ), patch(
+                "coding_websocket._resolve_database_action_with_model",
+                new=AsyncMock(side_effect=RuntimeError("No provider is configured for the Coding Agent.")),
+            ), patch.object(
+                DatabaseSessionManager,
+                "execute_database_capability",
+            ) as execute_capability:
+                await _run_coding_turn(
+                    {
+                        "requestId": "database-intent-provider-failure",
+                        "sessionId": "database-intent-provider-failure-session",
+                        "projectRoot": project_root,
+                        "messages": [{"role": "user", "content": "show all tables"}],
+                    },
+                    send_json,
+                    {"pending": {}, "completed": {}, "tasks": set()},
+                    None,
+                    "",
+                )
+
+            execute_capability.assert_not_called()
+            error = next(message for message in sent if message.get("type") == "error")
+            self.assertIn("not executed", error["message"])
+            self.assertEqual(error["category"], "DATABASE_INTENT_RESOLUTION_FAILED")
+            self.assertFalse(any(message.get("type") == "done" for message in sent))
+
+    async def test_database_requests_are_model_resolved_then_use_safe_capabilities(self):
+        scenarios = [
+            (
+                [{"role": "user", "content": "show my db"}],
+                DatabaseCapability.DATABASE_CURRENT_TARGET,
+            ),
+            (
+                [
+                    {"role": "user", "content": "SELECT COUNT(*) FROM adm_user_programme_selection"},
+                    {"role": "assistant", "content": "There are 11 rows."},
+                    {"role": "user", "content": "show my username and passwd"},
+                ],
+                DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+            ),
+            (
+                [
+                    {"role": "user", "content": "show me all table"},
+                ],
+                DatabaseCapability.DATABASE_LIST_TABLES,
+            ),
+            (
+                [
+                    {"role": "user", "content": "show my all table"},
+                ],
+                DatabaseCapability.DATABASE_LIST_TABLES,
+            ),
+            (
+                [
+                    {"role": "user", "content": "show me database which one connected"},
+                ],
+                DatabaseCapability.DATABASE_CURRENT_TARGET,
+            ),
+            (
+                [
+                    {"role": "user", "content": "show me database which one connected"},
+                    {"role": "assistant", "content": "Connected database: test_db (MySQL)."},
+                    {"role": "user", "content": "show me username"},
+                ],
+                DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+            ),
+        ]
+
+        for index, (messages, expected_capability) in enumerate(scenarios):
+            with self.subTest(capability=expected_capability), tempfile.TemporaryDirectory() as project_root:
+                sent = []
+                session = SimpleNamespace(
+                    project_root=project_root,
+                    target_id="DB-TEST",
+                    database_type="mysql",
+                    database_name="test_db",
+                    connection_state="CONNECTED",
+                    connection_capabilities={},
+                    to_safe_dict=lambda: {"targetId": "DB-TEST"},
+                )
+
+                async def send_json(payload):
+                    sent.append(payload)
+
+                registry = SimpleNamespace(
+                    get_active_provider=lambda: SimpleNamespace(id="test-provider")
+                )
+                resolve_action = AsyncMock(return_value={
+                    "is_deterministic": True,
+                    "capability": expected_capability,
+                    "arguments": {},
+                    "resolved_by_model": True,
+                })
+                capability_result = {
+                    "ok": True,
+                    "content": "Password: [REDACTED]",
+                    "executionStatus": "SUCCESS",
+                    "databaseType": "mysql",
+                    "executed": True,
+                }
+                with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                    "coding_websocket.ProjectContextLock.lock"
+                ), patch("coding_websocket.set_backend_project_state"), patch(
+                    "coding_websocket.detect_project_architecture", return_value={}
+                ), patch.object(
+                    DatabaseIntelligenceEngine,
+                    "discover_database_configuration",
+                    return_value={"engine": "mysql", "database": "test_db"},
+                ), patch.object(
+                    DatabaseIntelligenceEngine,
+                    "check_database_capabilities",
+                    return_value={"available_paths": ["application_client"]},
+                ), patch.object(
+                    DatabaseSessionManager,
+                    "get_session",
+                    return_value=session,
+                ), patch.object(
+                    DatabaseSessionManager,
+                    "get_or_create_session",
+                    return_value=session,
+                ), patch.object(
+                    DatabaseSessionManager,
+                    "execute_database_capability",
+                    return_value=capability_result,
+                ) as execute_capability, patch(
+                    "coding_websocket._resolve_database_action_with_model",
+                    resolve_action,
+                ):
+                    await _run_coding_turn(
+                        {
+                            "requestId": f"db-fast-path-{index}",
+                            "sessionId": f"db-fast-path-session-{index}",
+                            "projectRoot": project_root,
+                            "messages": messages,
+                        },
+                        send_json,
+                        {"pending": {}, "completed": {}, "tasks": set()},
+                        registry,
+                        "",
+                    )
+
+                resolve_action.assert_awaited_once()
+                self.assertEqual(
+                    resolve_action.await_args.args[2],
+                    messages,
+                    "The model must receive the full user/assistant context before database execution.",
+                )
+                self.assertEqual(execute_capability.call_args.args[0], expected_capability)
+                done = next(message for message in sent if message.get("type") == "done")
+                self.assertEqual(done["status"], "COMPLETED")
+                self.assertIn("[REDACTED]", done["content"])
 
 
 class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -1672,7 +4089,10 @@ class LegacyNodeMigrationCoverageTests(unittest.TestCase):
                 key = f"{event['requestId']}:{event['toolCallId']}"
                 state["completed"][key] = tool_results[event["toolCallId"]]
 
-        with patch("coding_websocket.complete_coding_model", side_effect=responses) as complete:
+        with patch(
+            "coding_websocket._resolve_database_action_with_model",
+            new=AsyncMock(return_value={"is_deterministic": False}),
+        ), patch("coding_websocket.complete_coding_model", side_effect=responses) as complete:
             asyncio.run(_run_coding_turn(payload, send_json, state, None, Path("unused-config.json")))
 
         done = next(event for event in events if event.get("type") == "done")
@@ -1682,7 +4102,7 @@ class LegacyNodeMigrationCoverageTests(unittest.TestCase):
         )
         self.assertEqual(
             [event["phase"] for event in events if event.get("type") == "activity"],
-            ["understanding", "reading", "context", "context"],
+            ["understanding", "understanding", "reading", "context", "context"],
         )
         self.assertEqual(done["content"], "The query loop in src/data.py is the likely bottleneck.")
         self.assertFalse(done["proposalRequired"])
@@ -1698,7 +4118,11 @@ class LegacyNodeMigrationCoverageTests(unittest.TestCase):
         self.assertIn("never claim which query is actually fastest or slowest from source code alone", initial_messages[0]["content"])
         self.assertIn("actual ranking requires database execution plans or profiling", initial_messages[0]["content"])
         self.assertIn("Current optional scope: src", initial_messages[1]["content"])
-        initial_plan = next(event["plan"] for event in events if event.get("phase") == "understanding")
+        initial_plan = next(
+            event["plan"]
+            for event in events
+            if event.get("phase") == "understanding" and "plan" in event
+        )
         self.assertTrue(any("callers, callees, and data/state" in step for step in initial_plan["steps"]))
         final_messages = complete.call_args_list[-1].args[2]
         self.assertTrue(any(

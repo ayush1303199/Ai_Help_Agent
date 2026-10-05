@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -28,12 +29,13 @@ from coding_intelligence import (
     UNIVERSAL_DB_ENGINE,
     UNIVERSAL_EVENT_STREAM,
     SecretProtector,
-    SecretTransformer,
     DatabaseTargetRegistry,
     DatabasePerformanceEngine,
     PolicyGate,
     DatabaseIntelligenceEngine,
     DatabaseCapability,
+    DATABASE_CREDENTIAL_REQUEST_PATTERN,
+    DATABASE_CONNECTION_STATUS_PATTERN,
     DatabaseSession,
     DatabaseSessionManager,
     DatabaseState,
@@ -109,6 +111,35 @@ def classify_tool_result_status(result: Any) -> str:
     if result is None:
         return ToolResultStatus.UNAVAILABLE
     return ToolResultStatus.SUCCESS
+
+
+def _has_verified_live_database_evidence(
+    result: Dict[str, Any],
+    investigation: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if isinstance(investigation, dict) and investigation.get("evidenceQuality") == "VERIFIED_LIVE":
+        return True
+
+    evidence_candidates = [
+        result,
+        result.get("evidence"),
+        result.get("executionProof"),
+        (result.get("liveDatabase") or {}).get("evidence")
+        if isinstance(result.get("liveDatabase"), dict)
+        else None,
+    ]
+    for evidence in evidence_candidates:
+        if not isinstance(evidence, dict):
+            continue
+        source = evidence.get("source") or evidence.get("resultSource")
+        if (
+            source in {"LIVE_DB_EXECUTION", "DB_METADATA_API", "DB_DRIVER_METADATA", "DB_RUNTIME"}
+            and evidence.get("mode") == "LIVE"
+            and evidence.get("executionStatus") == "SUCCESS"
+            and evidence.get("evidenceId")
+        ):
+            return True
+    return False
 
 
 def classify_provider_exception(error: Exception) -> Dict[str, Any]:
@@ -588,12 +619,21 @@ PERFORMANCE_FIX_PATTERN = re.compile(
 
 DATABASE_INVESTIGATION_PATTERN = re.compile(
     r"\b(?:"
+    r"(?:count|calculate)\s+(?:me\s+)?(?:the\s+)?(?:(?:total|overall)\s+)?(?:number\s+of\s+)?"
+    r"[a-zA-Z][a-zA-Z0-9_$.-]*(?:\s+(?:data|records?|rows?|entries|admissions?|applications?|students?|users?|orders?|payments?|transactions?|employees?|customers?|products?))?|"
+    r"how\s+many\s+(?!times?\b|requests?\b|calls?\b)[a-zA-Z][a-zA-Z0-9_$.-]*(?:\s+(?:data|records?|rows?))?|"
+    r"(?:show|display|fetch|get|list)\s+(?:me\s+)?(?:the\s+)?"
+    r"(?!how\b|a\b|an\b)(?:latest\s+)?[a-zA-Z][a-zA-Z0-9_$.-]*"
+    r"(?:\s+(?:data|records?|rows?|entries))?|"
     r"connect\s+(?:to\s+)?(?:them\s+|the\s+)?(?:database|db)|"
     r"check\s+(?:the\s+)?(?:database|db|table|tables|indexes|indices|schema|sql|data|db\s+config|database\s+config)|"
     r"inspect\s+(?:the\s+)?(?:database|db|table|tables|indexes|indices|schema)|"
     r"query\s+(?:the\s+)?(?:database|db)|"
     r"db\s+(?:inspection|check|connect|connection|schema|config|configuration)|"
     r"database\s+(?:inspection|check|connect|connection|schema|config|configuration)|"
+    r"where\s+is\s+(?:[a-zA-Z_][a-zA-Z0-9_]*\s+)?(?:email|e-?mail|phone|mobile|column|field)\s+(?:stored|kept|located)|"
+    r"which\s+tables?\s+(?:reference|refer\s+to|have\s+(?:a\s+)?foreign\s+key\s+to)|"
+    r"(?:primary\s+key|foreign\s+key)\s+(?:of|for|on)|"
     r"figure\s+out\s+(?:by\s+yourself\s+)?(?:the\s+)?(?:db|database)|"
     r"(?:only\s+)?connect\s+(?:them\s+|the\s+)?db|"
     r"investigate\s+(?:database|db)|"
@@ -607,6 +647,41 @@ DATABASE_INVESTIGATION_PATTERN = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+GENERIC_DATABASE_CREDENTIAL_REQUEST_PATTERN = re.compile(
+    r"^\s*(?:(?:show|display)\s+(?:me\s+)?|tell\s+me\s+|give\s+me\s+)(?:(?:my|the)\s+)?"
+    r"username\s+(?:and|&)\s+(?:password|passwd|passwod|passwrd)\s*[.!?]*\s*$",
+    re.I,
+)
+CONTEXTUAL_DATABASE_CREDENTIAL_FIELD_REQUEST_PATTERN = re.compile(
+    r"^\s*(?:(?:show|display)\s+(?:me\s+)?|tell\s+me\s+|give\s+me\s+)(?:(?:my|the)\s+)?"
+    r"(?:username|user\s+name|password|passwd|passwod|passwrd)\s*[.!?]*\s*$",
+    re.I,
+)
+RECENT_DATABASE_CONTEXT_PATTERN = re.compile(
+    r"\b(?:databases?|db|mysql|postgres(?:ql)?|sqlite|sql|schema|tables?|"
+    r"connected|connection|credentials?)\b|"
+    r"\b(?:select|show|describe)\s+.{0,80}\b(?:from|table|database|db)\b",
+    re.I | re.S,
+)
+
+
+def _is_contextual_database_credential_request(request: str, messages: List[Dict[str, Any]]) -> bool:
+    if DATABASE_CREDENTIAL_REQUEST_PATTERN.search(request):
+        return True
+    if GENERIC_DATABASE_CREDENTIAL_REQUEST_PATTERN.fullmatch(request or ""):
+        return True
+    if not CONTEXTUAL_DATABASE_CREDENTIAL_FIELD_REQUEST_PATTERN.fullmatch(request or ""):
+        return False
+    prior_messages = [
+        message
+        for message in messages[:-1]
+        if isinstance(message, dict) and isinstance(message.get("content"), str)
+    ][-6:]
+    return any(
+        RECENT_DATABASE_CONTEXT_PATTERN.search(str(message.get("content") or ""))
+        for message in prior_messages
+    )
 
 
 def _requires_proposal_for_conversation(messages: List[Dict[str, Any]]) -> bool:
@@ -688,8 +763,235 @@ class TaskIntent:
     UI_TASK = "FEATURE_REQUEST"
 
 
+def understand_human_request(
+    request: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+    task_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Extract a compact, evidence-neutral intent description before tool routing."""
+    normalized = EngineeringCommandNormalizer.normalize(str(request or "").strip())
+    lower = normalized.casefold()
+    action = "FACT"
+    target = None
+    expected_output = "evidence-backed answer"
+
+    data_flow = re.search(
+        r"\bhow\s+(?:is|are|does|do)\s+(?P<target>.+?)\s+"
+        r"(?:fetched|loaded|retrieved|queried|coming\s+from|comes\s+from)\b|"
+        r"\bhow\s+(?:(?:is|are)\s+)?(?:this|that|the)\s+data\s+(?:fetch|load|retrieve)\b",
+        normalized,
+        re.I,
+    )
+    how_to_fetch = re.search(
+        r"\bhow\s+(?:do\s+i|can\s+i|to)\s+(?:fetch|load|retrieve|get)\s+(?P<target>.+)",
+        normalized,
+        re.I,
+    )
+    count = re.search(
+        r"\b(?:how\s+many|count|calculate\s+(?:the\s+)?(?:total|number\s+of)|"
+        r"(?:total|number)\s+of)\s+(?P<target>[A-Za-z][A-Za-z0-9 _.$-]*)",
+        normalized,
+        re.I,
+    )
+    list_request = re.fullmatch(
+        r"\s*(?:show|display|fetch|get|list)\s+(?:me\s+)?(?:the\s+)?"
+        r"(?P<target>.+?)\s*[?!.]*\s*",
+        normalized,
+        re.I,
+    )
+    contextual_count = bool(
+        re.fullmatch(r"\s*(?:how\s+many|count\s+(?:them|those|these|it))\s*[?!.]*\s*", normalized, re.I)
+    )
+    same_target = re.fullmatch(
+        r"\s*(?:do\s+the\s+)?same\s+(?:for|with)\s+(?P<target>.+?)\s*[?!.]*\s*",
+        normalized,
+        re.I,
+    )
+    correction_target = re.fullmatch(
+        r"\s*(?:no[,.]?\s+)?(?:i\s+mean|i\s+meant|rather)\s+(?P<target>.+?)\s*[?!.]*\s*",
+        normalized,
+        re.I,
+    )
+    contextual_latest = re.fullmatch(
+        r"\s*(?:show|fetch|get|list)\s+(?:me\s+)?(?:the\s+)?"
+        r"(?:latest|newest|most\s+recent)\s*\d*(?:\s+(?:records?|rows?|data))?\s*[?!.]*\s*",
+        normalized,
+        re.I,
+    )
+    location = re.search(
+        r"\bwhere\s+(?:is|are)\s+(?P<target>.+?)(?:\s+(?:stored|kept|located|defined))?(?:[?.!]|$)|"
+        r"\bwhich\s+(?:file|table|column|field|model|migration)\s+(?:contains|stores|defines|created)\s+(?P<target2>.+)",
+        normalized,
+        re.I,
+    )
+    query_question = re.search(
+        r"\bwhich\s+query\b|\bwhat\s+query\b|\bshow\s+(?:me\s+)?(?:the\s+)?query\b",
+        normalized,
+        re.I,
+    )
+    current_database = bool(
+        re.search(r"\b(?:which|what)\s+(?:db|database)\b|\b(?:current|active)\s+(?:db|database)\b|\bconnected\s+(?:db|database)\b", lower)
+    )
+    migration_lookup = re.search(
+        r"\bwhich\s+migrations?\s+(?:created|added|introduced)\b",
+        lower,
+    )
+    if count or contextual_count:
+        action = "COUNT"
+        target = count.group("target").strip(" `\"'") if count else None
+        expected_output = "verified total count"
+    elif data_flow:
+        action = "DATA_FLOW_TRACE"
+        target = (data_flow.groupdict().get("target") or "").strip(" `\"'") or None
+        expected_output = "actual application data flow"
+    elif how_to_fetch:
+        action = "FETCH_GUIDANCE"
+        target = how_to_fetch.group("target").strip(" `\"'")
+        expected_output = "project-specific retrieval guidance"
+    elif re.search(r"\b(?:why|what\s+is\s+causing)\b.*\b(?:slow|latency|performance|taking\s+time)\b", lower):
+        action = "PERFORMANCE_ANALYSIS"
+        expected_output = "measured performance evidence and supported cause"
+    elif PERFORMANCE_INVESTIGATION_PATTERN.search(normalized):
+        action = "PERFORMANCE_ANALYSIS"
+        expected_output = "query performance evidence"
+    elif current_database:
+        action = "RUNTIME_DATABASE_STATUS"
+        expected_output = "verified active database target"
+    elif query_question:
+        action = "LOCATE_QUERY"
+        expected_output = "source query and its evidence"
+    elif migration_lookup:
+        action = "SOURCE_LOOKUP"
+        target = "migration"
+        expected_output = "migration file and schema change evidence"
+    elif location:
+        action = "LOCATE"
+        target = (location.groupdict().get("target") or location.groupdict().get("target2") or "").strip(" `\"'") or None
+        expected_output = "source or schema location"
+    elif same_target:
+        target = same_target.group("target").strip(" `\"'")
+        previous_capability = (task_context or {}).get("capability") if isinstance(task_context, dict) else None
+        action = (
+            "COUNT" if previous_capability == DatabaseCapability.DATABASE_COUNT_RECORDS else
+            "LIST" if previous_capability == DatabaseCapability.DATABASE_QUERY else
+            "FACT"
+        )
+        expected_output = (
+            "verified total count" if action == "COUNT" else
+            "bounded records or requested catalog" if action == "LIST" else
+            "evidence-backed answer"
+        )
+    elif correction_target:
+        target = correction_target.group("target").strip(" `\"'")
+        previous_capability = (task_context or {}).get("capability") if isinstance(task_context, dict) else None
+        action = (
+            "COUNT" if previous_capability == DatabaseCapability.DATABASE_COUNT_RECORDS else
+            "LIST" if previous_capability == DatabaseCapability.DATABASE_QUERY else
+            "FACT"
+        )
+        expected_output = (
+            "verified total count" if action == "COUNT" else
+            "bounded records or requested catalog" if action == "LIST" else
+            "evidence-backed answer"
+        )
+    elif contextual_latest:
+        action = "LIST"
+        expected_output = "bounded records or requested catalog"
+    elif list_request:
+        target = list_request.group("target").strip(" `\"'")
+        if re.search(r"\bindexes?\b", target, re.I):
+            action = "SCHEMA"
+            expected_output = "verified table indexes"
+        elif re.search(r"\b(?:columns?|fields?)\b", target, re.I):
+            action = "SCHEMA"
+            expected_output = "verified table columns"
+        elif re.search(r"\btable\b", target, re.I):
+            action = "SCHEMA"
+            expected_output = "verified table schema"
+        elif re.search(r"\bquery\b", target, re.I):
+            action = "LOCATE_QUERY"
+            expected_output = "source query and its evidence"
+        else:
+            action = "LIST"
+            expected_output = "bounded records or requested catalog"
+    elif re.search(r"\b(?:show|display|list|fetch|get)\b", lower):
+        action = "LIST"
+        expected_output = "bounded records or requested catalog"
+    elif re.search(r"\b(?:fix|repair|change|update|modify|implement)\b", lower):
+        action = "CHANGE"
+        expected_output = "approved change proposal"
+    elif re.search(r"\b(?:how|why|explain|describe)\b", lower):
+        action = "EXPLANATION"
+        expected_output = "evidence-backed explanation"
+
+    if target:
+        target = re.sub(r"\s+(?:data|records?|rows?|entries|items)$", "", target, flags=re.I).strip()
+        if action == "COUNT":
+            target = re.sub(r"^(?:total|overall|all|of|for|number\s+of)\s+", "", target, flags=re.I)
+            target = re.sub(r"\b(?:active|today)\b", " ", target, flags=re.I)
+            target = re.sub(r"\s+", " ", target).strip()
+        elif action == "LIST":
+            target = re.sub(r"^(?:all|of|for)\s+", "", target, flags=re.I).strip()
+            target = re.sub(r"\b(?:latest|newest|most\s+recent)\s*\d*\b", " ", target, flags=re.I)
+            target = re.sub(r"\s+", " ", target).strip()
+    constraints = []
+    if re.search(r"\bactive\b", lower):
+        constraints.append("active")
+    if re.search(r"\btoday\b", lower):
+        constraints.append("today")
+    latest_match = re.search(r"\b(?:latest|newest|most\s+recent)\s*(\d+)?\b", lower)
+    if latest_match:
+        constraints.append({"kind": "latest", "limit": int(latest_match.group(1) or 10)})
+    references = re.findall(
+        r"\b(?:this|that|it|them|those|these|same|other\s+one|current\s+one|here|there)\b",
+        lower,
+    )
+    if contextual_count or same_target or correction_target or contextual_latest:
+        references.append("ellipsis")
+    resolved_target = target
+    if references and not resolved_target and isinstance(task_context, dict):
+        resolved_target = task_context.get("table") or (
+            (task_context.get("arguments") or {}).get("entity")
+            if isinstance(task_context.get("arguments"), dict)
+            else None
+        )
+    if references and resolved_target and isinstance(task_context, dict):
+        if not target or contextual_count or contextual_latest:
+            target = str(resolved_target)
+
+    requires_execution = action in {
+        "COUNT", "LIST", "RUNTIME_DATABASE_STATUS", "PERFORMANCE_ANALYSIS"
+    }
+    requires_explanation = action in {
+        "DATA_FLOW_TRACE", "FETCH_GUIDANCE", "LOCATE_QUERY", "LOCATE",
+        "PERFORMANCE_ANALYSIS", "EXPLANATION",
+    }
+    return {
+        "action": action,
+        "target": target,
+        "constraints": constraints,
+        "context_references": references,
+        "context_resolution": (
+            "CURRENT_TASK" if references and target else
+            "UNRESOLVED" if references else
+            "EXPLICIT"
+        ),
+        "expected_output": expected_output,
+        "requires_execution": requires_execution,
+        "requires_explanation": requires_explanation,
+        "clarification_required": bool(references and not target),
+        "interpretation_confidence": (
+            "LOW" if references and not target else
+            "MEDIUM" if target or action != "FACT" else
+            "LOW"
+        ),
+        "evidence_confidence": "UNVERIFIED",
+    }
+
+
 def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     req = EngineeringCommandNormalizer.normalize(request.strip())
+    understanding = understand_human_request(req, history)
     is_continuation = bool(re.search(
         r"^\s*(?:continue|resume|retry|aage\s+badho|chalu\s+rakho)\b|"
         r"\b(?:ab\s+(?:fix|proposal|patch|minimal)\s*(?:banao|karo|do))\b|"
@@ -724,10 +1026,10 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     elif re.search(r"\b(?:dependency|dependencies|outdated\s+packages?|package\s+conflict|docker|dockerfile|env\b|config\b|configuration)\b", req, re.I):
         intent = TaskIntent.CONFIGURATION
         proposal_required = bool(re.search(r"\b(?:fix|update|modify|change|banao)\b", req, re.I))
-    elif re.search(r"\b(?:show\s+(?:the\s+)?(?:db|database)\s+passwords?|show\s+passwords?|get\s+(?:the\s+)?(?:db|database)\s+passwords?|what\s+is\s+(?:the\s+)?(?:db|database)\s+passwords?|db\s+passwords?|database\s+passwords?|show\s+(?:the\s+)?(?:db|database)\s+credentials?|db\s+credentials?|database\s+credentials?|show\s+credentials?)\b", req, re.I):
+    elif DATABASE_CREDENTIAL_REQUEST_PATTERN.search(req):
         intent = TaskIntent.DATABASE_CREDENTIAL_REQUEST
         proposal_required = False
-    elif re.search(r"\b(?:which\s+(?:db|database|target)\s+is\s+connected|what\s+(?:db|database|target)\s+is\s+connected|which\s+(?:db|database)\b|current\s+(?:db|database|target)\b|active\s+(?:db|database|target)\b|status\s+(?:of\s+)?(?:db|database)\b|(?:db|database)\s+status\b|connected\s+(?:db|database|target)\b)\b", req, re.I):
+    elif DATABASE_CONNECTION_STATUS_PATTERN.search(req) or re.search(r"\b(?:which\s+(?:db|database|target)\s+is\s+connected|what\s+(?:db|database|target)\s+is\s+connected|which\s+(?:db|database)\s+(?:one\s+)?(?:is\s+)?connected|(?:show|display|tell\s+me)\s+(?:me\s+)?(?:my\s+|the\s+)?(?:db|database)\s+(?:which|what)\s+(?:one\s+)?(?:is\s+)?connected|which\s+(?:db|database)\b|current\s+(?:db|database|target)\b|active\s+(?:db|database|target)\b|status\s+(?:of\s+)?(?:db|database)\b|(?:db|database)\s+status\b|connected\s+(?:db|database|target)\b)\b", req, re.I):
         intent = TaskIntent.DATABASE_CURRENT_TARGET
         proposal_required = False
     elif re.search(r"^\s*(?:connect(?:\s+to)?|switch\s+to|use)\s+(db[-_]\d+|[a-zA-Z0-9_-]+)\s*$", req, re.I) and not re.search(r"^\s*(?:connect(?:\s+to)?|switch\s+to|use)\s+(?:db|database|the\s+db|the\s+database)\s*$", req, re.I):
@@ -757,6 +1059,13 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
         proposal_required = False
     elif re.search(r"\b(?:show\s+(?:all\s+)?databases?|list\s+databases?|show\s+dbs?|list\s+dbs?|show\s+schemas?|list\s+schemas?)\b", req, re.I) or req.lower().strip() in ("databases", "dbs", "schemas"):
         intent = TaskIntent.DATABASE_LIST_DATABASES
+        proposal_required = False
+    elif re.search(
+        r"\bshow\s+(?:me|my)\s+all\s+(?:tables?|collections?)\b",
+        req,
+        re.I,
+    ):
+        intent = TaskIntent.DATABASE_LIST_TABLES
         proposal_required = False
     elif DATABASE_INVESTIGATION_PATTERN.search(req):
         intent = TaskIntent.DATABASE_INVESTIGATION
@@ -809,7 +1118,8 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
         "is_continuation": is_continuation,
         "target_symbols": candidate_symbols,
         "target_files": candidate_files,
-        "confidence": "HIGH" if (candidate_files or candidate_symbols) else "MEDIUM",
+        "confidence": "UNVERIFIED",
+        "understanding": understanding,
         "execution_contract": contract.to_dict(),
         "execution_required": contract.execution_required,
         "no_suggestion_mode": NoSuggestionGuard.is_no_suggestion_mode(req),
@@ -1553,6 +1863,295 @@ def _last_user_message(messages: List[Dict[str, Any]]) -> str:
     )
 
 
+def _match_pending_database_clarification(
+    pending: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    project_root: str,
+) -> Optional[Dict[str, Any]]:
+    if not pending or not messages or messages[-1].get("role") != "user":
+        return None
+    if pending.get("projectRoot") and project_root:
+        if os.path.normcase(os.path.normpath(str(pending["projectRoot"]))) != os.path.normcase(os.path.normpath(project_root)):
+            return None
+    last_user_index = len(messages) - 1
+    assistant_index = last_user_index - 1
+    if assistant_index < 0 or messages[assistant_index].get("role") != "assistant":
+        return None
+    assistant_content = str(messages[assistant_index].get("content") or "").strip()
+    if assistant_content != str(pending.get("clarificationContent") or "").strip():
+        return None
+
+    answer = str(messages[last_user_index].get("content") or "").strip().strip("`'\" .,!?:;")
+    if not answer:
+        return None
+    answer_key = answer.casefold()
+    option_number = re.fullmatch(r"(?:option\s*)?(\d+)", answer_key)
+    options = [
+        option for option in pending.get("options", [])
+        if isinstance(option, dict)
+    ]
+    selected = None
+    if option_number:
+        option_index = int(option_number.group(1)) - 1
+        if 0 <= option_index < len(options):
+            selected = options[option_index]
+    if not selected:
+        selected = next(
+            (
+                option
+                for option in options
+                if answer_key in {
+                    str(option.get("value") or "").strip().casefold(),
+                    str(option.get("label") or "").strip().casefold(),
+                }
+            ),
+            None,
+        )
+    arguments = dict(pending.get("arguments") or {})
+    selection_type = pending.get("clarificationType")
+    if not selected and selection_type == "table":
+        corrected_target = re.fullmatch(
+            r"\s*(?:no[,.]?\s+)?(?:i\s+mean|i\s+meant|rather|not\s+that[,.]?\s+i\s+mean)\s+"
+            r"(?:the\s+)?(?:table\s+)?[`'\"]?([A-Za-z][A-Za-z0-9_.$-]{0,119})[`'\"]?\s*[.!?]*\s*",
+            answer,
+            re.I,
+        )
+        if corrected_target:
+            arguments["entity"] = corrected_target.group(1)
+            return {
+                "is_deterministic": True,
+                "capability": pending.get("capability"),
+                "arguments": arguments,
+                "resumed": True,
+                "original_request": str(pending.get("request") or ""),
+            }
+    if not selected:
+        return None
+
+    if selection_type == "table":
+        arguments["entity"] = str(selected.get("value") or "")
+    elif selection_type == "payment_column":
+        arguments["payment_column"] = str(selected.get("value") or "")
+    elif selection_type == "payment_value":
+        arguments["payment_value"] = selected.get("value")
+    elif selection_type == "active_rule":
+        selected_rule = str(selected.get("value") or "")
+        if "=" not in selected_rule:
+            return None
+        arguments["active_column"], arguments["active_value"] = selected_rule.split("=", 1)
+    elif selection_type == "latest_column":
+        arguments["latest_column"] = str(selected.get("value") or "")
+    elif selection_type == "count_date_column":
+        arguments["today_column"] = str(selected.get("value") or "")
+    else:
+        return None
+    return {
+        "is_deterministic": True,
+        "capability": pending.get("capability"),
+        "arguments": arguments,
+        "resumed": True,
+        "original_request": str(pending.get("request") or ""),
+    }
+
+
+DATABASE_ACTION_OPERATIONS = (
+    DatabaseCapability.DATABASE_CONNECT,
+    DatabaseCapability.DATABASE_CONNECT_TARGET,
+    DatabaseCapability.DATABASE_RECONNECT,
+    DatabaseCapability.DATABASE_DISCONNECT,
+    DatabaseCapability.DATABASE_CURRENT_TARGET,
+    DatabaseCapability.DATABASE_LIST_DATABASES,
+    DatabaseCapability.DATABASE_LIST_TABLES,
+    DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+    DatabaseCapability.DATABASE_LIST_INDEXES,
+    DatabaseCapability.DATABASE_COUNT_RECORDS,
+    DatabaseCapability.DATABASE_QUERY,
+    DatabaseCapability.DATABASE_EXPLAIN,
+    DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+    DatabaseCapability.DATABASE_HEALTH_CHECK,
+    DatabaseCapability.DATABASE_SLOW_QUERIES,
+    DatabaseCapability.DATABASE_BENCHMARK,
+)
+
+
+DATABASE_ACTION_SELECTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "select_database_action",
+        "description": (
+            "Interpret the user's latest request using the full conversation context and select exactly one "
+            "database capability, or ask one clarification question. Data operations must be read-only. "
+            "Connection controls may be selected only when explicitly requested. This selects an action only; "
+            "the application will independently validate and execute it."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["operation", "arguments"],
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": [*DATABASE_ACTION_OPERATIONS, "CLARIFY"],
+                },
+                "arguments": {
+                    "type": "object",
+                    "properties": {
+                        "entity": {"type": "string"},
+                        "table": {"type": "string"},
+                        "sql": {"type": "string"},
+                        "row_limit": {"type": "integer"},
+                        "latest": {"type": "boolean"},
+                        "filters": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["active", "today"]},
+                        },
+                        "payment_filter": {"type": "string", "enum": ["paid"]},
+                        "payment_column": {"type": "string"},
+                        "payment_value": {"type": ["string", "number"]},
+                        "active_column": {"type": "string"},
+                        "active_value": {"type": ["string", "number", "boolean"]},
+                        "today_column": {"type": "string"},
+                        "latest_column": {"type": "string"},
+                        "dimension": {
+                            "type": "string",
+                            "enum": ["total_load", "average_time", "frequency", "rows_examined"],
+                        },
+                        "target": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "clarification": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _validate_database_action_selection(message: Dict[str, Any]) -> Dict[str, Any]:
+    calls = message.get("tool_calls") if isinstance(message, dict) else None
+    if not isinstance(calls, list) or len(calls) != 1:
+        raise RuntimeError("The AI model did not select exactly one database action; no database operation was run.")
+    call = calls[0]
+    function = call.get("function") if isinstance(call, dict) else None
+    if not isinstance(function, dict) or function.get("name") != "select_database_action":
+        raise RuntimeError("The AI model returned an unsupported database action; no database operation was run.")
+    raw_arguments = function.get("arguments") or "{}"
+    try:
+        selection = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError("The AI model returned invalid database action arguments; no database operation was run.") from error
+    if not isinstance(selection, dict):
+        raise RuntimeError("The AI model returned invalid database action arguments; no database operation was run.")
+    operation = selection.get("operation")
+    if operation == "CLARIFY":
+        clarification = str(selection.get("clarification") or "").strip()
+        if not clarification:
+            raise RuntimeError("The AI model requested clarification without a question; no database operation was run.")
+        return {"clarification": clarification}
+    if operation not in DATABASE_ACTION_OPERATIONS:
+        raise RuntimeError("The AI model selected an unavailable database capability; no database operation was run.")
+    arguments = selection.get("arguments")
+    if not isinstance(arguments, dict):
+        raise RuntimeError("The AI model returned invalid database action arguments; no database operation was run.")
+    allowed_arguments = {
+        "entity", "table", "sql", "row_limit", "latest", "filters",
+        "payment_filter", "payment_column", "payment_value", "active_column",
+        "active_value", "today_column", "latest_column", "dimension", "target",
+    }
+    if set(arguments) - allowed_arguments:
+        raise RuntimeError("The AI model returned unsupported database arguments; no database operation was run.")
+    normalized: Dict[str, Any] = {}
+    for key in ("entity", "table", "sql", "payment_column", "active_column", "today_column", "latest_column", "dimension", "target"):
+        if key in arguments:
+            if not isinstance(arguments[key], str):
+                raise RuntimeError(f"The AI model returned an invalid `{key}` value; no database operation was run.")
+            normalized[key] = arguments[key].strip()
+    if "row_limit" in arguments:
+        row_limit = arguments["row_limit"]
+        if isinstance(row_limit, bool) or not isinstance(row_limit, int):
+            raise RuntimeError("The AI model returned an invalid row limit; no database operation was run.")
+        normalized["row_limit"] = min(max(row_limit, 1), 50)
+    if "latest" in arguments:
+        if not isinstance(arguments["latest"], bool):
+            raise RuntimeError("The AI model returned an invalid latest-record flag; no database operation was run.")
+        normalized["latest"] = arguments["latest"]
+    if "filters" in arguments:
+        filters = arguments["filters"]
+        if not isinstance(filters, list) or any(value not in ("active", "today") for value in filters):
+            raise RuntimeError("The AI model returned invalid database filters; no database operation was run.")
+        normalized["filters"] = list(dict.fromkeys(filters))
+    if arguments.get("payment_filter") is not None:
+        if arguments["payment_filter"] != "paid":
+            raise RuntimeError("The AI model returned an unsupported payment filter; no database operation was run.")
+        normalized["payment_filter"] = "paid"
+    for key in ("payment_value", "active_value"):
+        if key in arguments:
+            value = arguments[key]
+            if not isinstance(value, (str, int, float, bool)) or isinstance(value, (int, float)) and not math.isfinite(value):
+                raise RuntimeError(f"The AI model returned an invalid `{key}` value; no database operation was run.")
+            normalized[key] = value
+    if operation in (DatabaseCapability.DATABASE_DESCRIBE_TABLE, DatabaseCapability.DATABASE_LIST_INDEXES) and not (normalized.get("table") or normalized.get("entity")):
+        raise RuntimeError("The AI model did not identify a table to inspect; no database operation was run.")
+    if operation == DatabaseCapability.DATABASE_COUNT_RECORDS and not normalized.get("entity"):
+        raise RuntimeError("The AI model did not identify what to count; no database operation was run.")
+    if operation == DatabaseCapability.DATABASE_QUERY and not (normalized.get("sql") or normalized.get("entity")):
+        raise RuntimeError("The AI model did not identify a safe query target; no database operation was run.")
+    if operation == DatabaseCapability.DATABASE_EXPLAIN and not normalized.get("sql"):
+        raise RuntimeError("The AI model did not provide a query to explain; no database operation was run.")
+    if operation in (DatabaseCapability.DATABASE_QUERY, DatabaseCapability.DATABASE_EXPLAIN) and normalized.get("sql"):
+        sql_decision, reason = PolicyGate.check_sql(normalized["sql"])
+        if sql_decision != "ALLOW":
+            raise RuntimeError(
+                f"The selected SQL is not permitted for this read-only action ({reason}); no database operation was run."
+            )
+    return {
+        "is_deterministic": True,
+        "capability": operation,
+        "arguments": normalized,
+        "resolved_by_model": True,
+    }
+
+
+async def _resolve_database_action_with_model(
+    registry: Any,
+    config_path: Any,
+    messages: List[Dict[str, Any]],
+    database_context: Dict[str, Any],
+    provider_id: Optional[str],
+    request_id: str,
+    session_id: str,
+) -> Dict[str, Any]:
+    system = (
+        "You are the Coding Agent's database intent interpreter. Read the entire conversation and understand the "
+        "latest user request in context before selecting an action. Use only facts present in that conversation "
+        "and the safe database context below. Select the narrowest matching read-only operation. Select a connection "
+        "control only when the user explicitly requests connecting, reconnecting, disconnecting, or switching targets; "
+        "never infer connection changes from an inspection or query request. If the user asks "
+        "to list tables, select DATABASE_LIST_TABLES and return only the requested table names after execution. "
+        "Do not select a record query when the user asks for schema/table names. Do not expose credentials; "
+        "DATABASE_CREDENTIAL_REQUEST always returns a redacted password. Use CLARIFY only when essential target "
+        "information is genuinely ambiguous. Never invent table names, SQL results, or database state. The selected "
+        "operation is only a proposal: application policy validates and executes it after this response.\n"
+        f"Safe active database context: {json.dumps(database_context, ensure_ascii=False)}"
+    )
+    conversation = [
+        {"role": "system", "content": system},
+        *messages[-CODING_MAX_HISTORY_MESSAGES:],
+    ]
+    message, _provider = await asyncio.to_thread(
+        complete_coding_model,
+        registry,
+        config_path,
+        _compact_coding_conversation(conversation),
+        [DATABASE_ACTION_SELECTION_TOOL],
+        provider_id,
+        True,
+        request_id,
+        session_id,
+    )
+    return _validate_database_action_selection(message)
+
+
 def _message_size(message: Dict[str, Any]) -> int:
     return len(json.dumps(message, ensure_ascii=False, default=str))
 
@@ -2004,8 +2603,74 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
     if project_root and isinstance(project_root, str):
         set_backend_project_state(project_root)
         ProjectContextLock.lock(project_root, session_id=session_id, scope=scope)
+    session = CODING_TASK_STORE.get_or_create(session_id, project_root=project_root or "", scope=scope)
+    previous_messages = [
+        message for message in supplied[:-1]
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    active_database_task = session.get("activeDatabaseTask")
+    if (
+        not previous_messages
+        or not supplied
+        or len(supplied) < 2
+        or supplied[-2].get("role") != "assistant"
+        or not isinstance(active_database_task, dict)
+        or str(supplied[-2].get("content") or "")
+        != str(active_database_task.get("assistantContent") or "")
+        or active_database_task.get("projectRoot") != str(project_root or "")
+    ):
+        active_database_task = None
+    latest_db_intent = DatabaseSessionManager.resolve_database_intent(
+        request,
+        task_context=active_database_task,
+    )
+    if not latest_db_intent.get("is_deterministic"):
+        latest_db_intent = DatabaseSessionManager.resolve_database_intent(
+            raw_request,
+            task_context=active_database_task,
+        )
+    contextual_db_credentials = _is_contextual_database_credential_request(raw_request, supplied)
+    if contextual_db_credentials:
+        latest_db_intent = {
+            "is_deterministic": True,
+            "capability": DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+            "arguments": {},
+        }
+    resumed_db_intent = None
+    pending_clarification = session.get("pendingDatabaseClarification")
+    if pending_clarification:
+        if not latest_db_intent.get("is_deterministic"):
+            resumed_db_intent = _match_pending_database_clarification(
+                pending_clarification,
+                supplied,
+                str(project_root or ""),
+            )
+        session.pop("pendingDatabaseClarification", None)
+        if resumed_db_intent:
+            request = resumed_db_intent["original_request"] or request
     arch = detect_project_architecture(project_root or "", scope=scope)
     intent_info = classify_task_intent(request, supplied)
+    request_understanding = understand_human_request(
+        request,
+        supplied,
+        task_context=active_database_task,
+    )
+    intent_info["understanding"] = request_understanding
+    if latest_db_intent.get("is_deterministic") and latest_db_intent.get("capability") in (
+        DatabaseCapability.DATABASE_COUNT_RECORDS,
+        DatabaseCapability.DATABASE_QUERY,
+        DatabaseCapability.DATABASE_LIST_TABLES,
+        DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+        DatabaseCapability.DATABASE_LIST_INDEXES,
+    ):
+        intent_info["intent"] = TaskIntent.DATABASE_INVESTIGATION
+        intent_info["proposal_required"] = False
+    if contextual_db_credentials:
+        intent_info = {
+            **intent_info,
+            "intent": TaskIntent.DATABASE_CREDENTIAL_REQUEST,
+            "proposal_required": False,
+        }
     if intent_info.get("proposal_required"):
         proposal_required = True
     elif intent_info.get("intent") in (
@@ -2029,11 +2694,15 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         if message.get("role") == "user"
     ]) if proposal_required else ""
     plan = generate_task_plan(intent_info, (proposal_goal or request), scope)
-    session = CODING_TASK_STORE.get_or_create(session_id, project_root=project_root or "", scope=scope)
     CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_STARTED", {"requestId": request_id, "goal": request})
     CODING_TASK_STORE.emit_lifecycle_event(session_id, "CONTEXT_RESOLVED", {"projectRoot": project_root, "scope": scope})
     CODING_TASK_STORE.emit_lifecycle_event(session_id, "INTENT_CLASSIFIED", {"intent": intent_info["intent"], "proposalRequired": proposal_required})
     CODING_TASK_STORE.emit_lifecycle_event(session_id, "DISCOVERY_STARTED", {"architecture": arch, "plan": plan})
+    if resumed_db_intent:
+        CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_RESUMED_AFTER_CLARIFICATION", {
+            "intent": resumed_db_intent["capability"],
+            "requestId": request_id,
+        })
 
     db_config = None
     db_caps = None
@@ -2064,11 +2733,98 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         })
 
     # -----------------------------------------------------------------
-    # DETERMINISTIC DATABASE FAST-PATH (BYPASSES LLM PROVIDER COMPLETELY)
+    # MODEL-LED DATABASE INTENT RESOLUTION
     # -----------------------------------------------------------------
-    db_det = DatabaseSessionManager.resolve_database_intent(request)
-    if not db_det.get("is_deterministic"):
-        db_det = DatabaseSessionManager.resolve_database_intent(raw_request)
+    db_det = resumed_db_intent or latest_db_intent
+    model_resolvable_db_intents = {
+        TaskIntent.PERFORMANCE_INVESTIGATION,
+        TaskIntent.DATABASE_INVESTIGATION,
+        TaskIntent.DATABASE_LIST_DATABASES,
+        TaskIntent.DATABASE_LIST_TABLES,
+        TaskIntent.DATABASE_DESCRIBE_TABLE,
+        TaskIntent.DATABASE_LIST_INDEXES,
+        TaskIntent.DATABASE_CREDENTIAL_REQUEST,
+        TaskIntent.DATABASE_CURRENT_TARGET,
+        TaskIntent.DATABASE_CONNECT_TARGET,
+        TaskIntent.DATABASE_SLOW_QUERIES,
+        TaskIntent.DATABASE_BENCHMARK,
+    }
+    should_resolve_db_with_model = bool(
+        not resumed_db_intent
+        and (
+            db_det.get("is_deterministic")
+            or intent_info.get("intent") in model_resolvable_db_intents
+        )
+    )
+    if should_resolve_db_with_model:
+        existing_db_session = DatabaseSessionManager.get_session(
+            project_root=project_root or "",
+            session_id=session_id,
+        )
+        safe_database_context = {
+            "engine": (db_config or {}).get("engine")
+            or getattr(existing_db_session, "database_type", None),
+            "database": (db_config or {}).get("database")
+            or getattr(existing_db_session, "database_name", None),
+            "connectionState": getattr(existing_db_session, "connection_state", None),
+            "targetId": getattr(existing_db_session, "target_id", None),
+        }
+        await _send(send_json, {
+            "type": "activity",
+            "requestId": request_id,
+            "phase": "understanding",
+            "message": "Understanding your database request and conversation context before choosing an action.",
+        })
+        try:
+            db_det = await _resolve_database_action_with_model(
+                registry,
+                config_path,
+                supplied,
+                safe_database_context,
+                selected_provider_id,
+                request_id,
+                session_id,
+            )
+        except Exception as error:
+            CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_FAILED", {
+                "category": "DATABASE_INTENT_RESOLUTION_FAILED",
+            })
+            await _send(send_json, {
+                "type": "error",
+                "requestId": request_id,
+                "classification": "PROVIDER_FAILURE",
+                "category": "DATABASE_INTENT_RESOLUTION_FAILED",
+                "retryable": True,
+                "isCodeDefect": False,
+                "suggestedAction": "CHECK_CODING_AGENT_PROVIDER",
+                "message": (
+                    "The database request was not executed because the AI model could not resolve its intent: "
+                    f"{str(error)[:400]}"
+                ),
+            })
+            return
+        if db_det.get("clarification"):
+            content = db_det["clarification"]
+            await _send(send_json, {
+                "type": "token",
+                "requestId": request_id,
+                "content": content,
+            })
+            await _send(send_json, {
+                "type": "done",
+                "requestId": request_id,
+                "content": content,
+                "status": "NEEDS_CLARIFICATION",
+                "readOnly": True,
+                "writeRequired": False,
+                "proposalRequired": False,
+                "applyRequired": False,
+                "approvalRequired": False,
+                "plan": plan,
+                "intent": "DATABASE_CLARIFICATION",
+                "confidence": "MODEL_CONTEXT",
+            })
+            return
     if db_det.get("is_deterministic"):
         effective_root = project_root or ""
         sess_obj = DatabaseSessionManager.get_or_create_session(effective_root, session_id=session_id, db_config=db_config)
@@ -2078,13 +2834,72 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             db_det["capability"], db_det.get("arguments", {}), sess_obj, project_root=effective_root
         )
         content = cap_res.get("content", "")
+        performance_investigation = cap_res.get("investigation") or {}
+        performance_confidence = (
+            "MEASURED"
+            if _has_verified_live_database_evidence(cap_res, performance_investigation)
+            else "UNVERIFIED"
+        )
 
         CODING_TASK_STORE.emit_lifecycle_event(session_id, "TOOL_EXECUTED", {
             "tool": db_det["capability"],
-            "outcome": cap_res.get("executionStatus", "SUCCESS"),
+            "outcome": cap_res.get("executionStatus", "FAILED"),
             "databaseType": cap_res.get("databaseType"),
             "executionTimeMs": cap_res.get("executionTimeMs"),
         })
+        if cap_res.get("executionStatus") == "NEEDS_CLARIFICATION":
+            clarification_options = cap_res.get("clarificationOptions", [])
+            clarification_type = cap_res.get("clarificationType")
+            if clarification_options and clarification_type:
+                session["pendingDatabaseClarification"] = {
+                    "capability": db_det["capability"],
+                    "arguments": dict(db_det.get("arguments") or {}),
+                    "clarificationType": clarification_type,
+                    "options": clarification_options,
+                    "clarificationContent": str(cap_res.get("content") or ""),
+                    "request": str(request),
+                    "projectRoot": str(effective_root or ""),
+                    "createdAt": time.time(),
+                }
+            CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_NEEDS_CLARIFICATION", {
+                "intent": db_det["capability"],
+                "deterministic": True,
+            })
+            await _send(send_json, {
+                "type": "token",
+                "requestId": request_id,
+                "content": cap_res.get("content", ""),
+            })
+            await _send(send_json, {
+                "type": "done",
+                "requestId": request_id,
+                "content": cap_res.get("content", ""),
+                "status": "NEEDS_CLARIFICATION",
+                "needsClarification": True,
+                "clarificationOptions": clarification_options,
+                "readOnly": True,
+                "writeRequired": False,
+                "proposalRequired": False,
+                "applyRequired": False,
+                "approvalRequired": False,
+                "plan": plan,
+                "intent": db_det["capability"],
+                "databaseConfig": sess_obj.to_safe_dict(),
+                "databaseCapabilities": sess_obj.connection_capabilities,
+                "databaseSession": sess_obj.to_safe_dict(),
+            })
+            return
+        if not cap_res.get("ok"):
+            CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_FAILED", {
+                "intent": db_det["capability"],
+                "deterministic": True,
+            })
+            await _send(send_json, {
+                "type": "error",
+                "requestId": request_id,
+                "message": cap_res.get("content") or "The requested database operation failed; no result was returned.",
+            })
+            return
         CODING_TASK_STORE.emit_lifecycle_event(session_id, "EVIDENCE_CAPTURED", {
             "target": cap_res.get("databaseType") or "database",
             "type": "database",
@@ -2097,6 +2912,25 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             "intent": db_det["capability"],
             "deterministic": True,
         })
+
+        active_table = cap_res.get("table")
+        if not active_table:
+            active_table_match = re.search(
+                r"\bFROM\s+[`'\"]?([A-Za-z0-9_$.-]+)",
+                str((db_det.get("arguments") or {}).get("sql") or ""),
+                re.I,
+            )
+            active_table = active_table_match.group(1) if active_table_match else None
+        active_arguments = dict(db_det.get("arguments") or {})
+        if active_table and db_det["capability"] == DatabaseCapability.DATABASE_COUNT_RECORDS:
+            active_arguments["entity"] = active_table
+        session["activeDatabaseTask"] = {
+            "capability": db_det["capability"],
+            "arguments": active_arguments,
+            "table": active_table or active_arguments.get("entity"),
+            "projectRoot": str(effective_root or ""),
+            "assistantContent": str(content or ""),
+        }
 
         await _send(send_json, {
             "type": "token",
@@ -2115,7 +2949,8 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             "approvalRequired": False,
             "plan": plan,
             "intent": db_det["capability"],
-            "confidence": "MEASURED",
+            "confidence": performance_confidence,
+            "evidenceQuality": performance_investigation.get("evidenceQuality"),
             "databaseConfig": sess_obj.to_safe_dict(),
             "databaseCapabilities": sess_obj.connection_capabilities,
             "databaseSession": sess_obj.to_safe_dict(),
@@ -2180,6 +3015,40 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             "If runtime timing/profiling is not present in logs or evidence, state clearly: 'Runtime query timing is not currently available.' "
             "and classify confidence as CODE-LEVEL or UNVERIFIED."
         )
+    if request_understanding.get("action") == "DATA_FLOW_TRACE":
+        system += (
+            "\n[DATA-FLOW TRACE]\n"
+            "Trace the user's requested data through the existing application path using read-only repository tools. "
+            "Search and inspect the actual caller, route/UI request, controller/handler, service/repository/model, "
+            "query/ORM call, and response/UI consumer where present. Report only verified links with file and line "
+            "evidence; mark missing links as unverified. Do not substitute a schema-only answer for an application flow."
+        )
+    elif request_understanding.get("action") == "FETCH_GUIDANCE":
+        system += (
+            "\n[FETCH GUIDANCE]\n"
+            "The user asks how they can fetch data, not how the current application fetches it. "
+            "Inspect the project-specific API, model, repository, or client conventions and explain the existing "
+            "safe method with source evidence. Do not claim that data was fetched."
+        )
+    elif request_understanding.get("action") == "LOCATE_QUERY":
+        system += (
+            "\n[QUERY LOCATION]\n"
+            "Find the query that retrieves the currently referenced data. Resolve references from the current task "
+            "context only, then search and read actual project source. Return query and file/line evidence; do not "
+            "invent SQL or infer runtime execution from source."
+        )
+    elif request_understanding.get("action") == "LOCATE":
+        system += (
+            "\n[LOCATION QUESTION]\n"
+            "Locate the requested field, data, function, or migration in source/schema evidence. "
+            "Distinguish schema location from source-code location and report exact evidence."
+        )
+    elif request_understanding.get("action") == "SOURCE_LOOKUP":
+        system += (
+            "\n[SOURCE ARTIFACT LOOKUP]\n"
+            "Search repository migration files and inspect the matching change. Report the migration path and "
+            "verified schema operation; do not infer it from current schema alone."
+        )
     if intent_info.get("intent") == TaskIntent.DATABASE_INVESTIGATION or re.search(DATABASE_INVESTIGATION_PATTERN, request):
         system += (
             "\n[DATABASE INVESTIGATION RELEVANCE GATE]\n"
@@ -2200,6 +3069,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
     context = (
         f"Current optional scope: {scope}\n"
         f"Task plan: {json.dumps(plan, ensure_ascii=False)}\n"
+        f"Human request understanding: {json.dumps(request_understanding, ensure_ascii=False)}\n"
         "All file operations are read-only and project-root confined."
     )
     if arch.get("languages") or arch.get("frameworks"):
@@ -2227,12 +3097,20 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
     continuation_context = CODING_TASK_STORE.get_continuation_context(session_id)
     if continuation_context:
         context += f"\nPersistent session knowledge from earlier in this task:\n{continuation_context}"
+    if active_database_task:
+        active_arguments = active_database_task.get("arguments") or {}
+        context += (
+            "\nCurrent task-scoped database reference (use only when the user's wording refers to the current "
+            "task, such as 'this', 'same', or 'how many'): "
+            f"operation={active_database_task.get('capability')}; "
+            f"table={active_database_task.get('table') or active_arguments.get('entity') or 'UNRESOLVED'}."
+        )
     if proposal_goal and proposal_goal != request:
         context += f"\nActive change request from earlier in this conversation:\n{proposal_goal}"
     conversation = [
-        {"role": "system", "content": SecretTransformer.sanitize_text_for_llm(system)},
-        {"role": "system", "content": SecretTransformer.sanitize_text_for_llm(context)},
-        *[SecretTransformer.sanitize_context_for_llm(m) for m in supplied],
+        {"role": "system", "content": system},
+        {"role": "system", "content": context},
+        *supplied,
     ]
     tool_calls = []
     tool_result_cache: Dict[str, str] = {}
@@ -2261,6 +3139,8 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                 inspection_tools,
                 selected_provider_id,
                 require_tool,
+                request_id,
+                session_id,
             )
             selected_provider_id = getattr(selected_provider, "id", None) or selected_provider_id
             conversation.append(message)
@@ -2590,6 +3470,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             final_message, selected_provider = await asyncio.to_thread(
                 complete_coding_model, registry, config_path,
                 _coding_finalization_messages(conversation, proposal_required), None, selected_provider_id,
+                False, request_id, session_id,
             )
             selected_provider_id = getattr(selected_provider, "id", None) or selected_provider_id
         content = str(final_message.get("content") or "").strip()
@@ -2605,6 +3486,9 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     _coding_finalization_messages(conversation, proposal_required=True, retry=True),
                     None,
                     selected_provider_id,
+                    False,
+                    request_id,
+                    session_id,
                 )
                 selected_provider_id = getattr(selected_provider, "id", None) or selected_provider_id
                 content = str(final_message.get("content") or "").strip()

@@ -25,6 +25,8 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
     maxMessageChars: runtimeConfig.limits.maxChatMessageChars,
   });
   const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const [deleteConversationId, setDeleteConversationId] = useState<string | null>(null);
+  const [copiedItem, setCopiedItem] = useState<string | null>(null);
   const lastRestoreKey = useRef<number | null>(null);
   const restoreHistoryRef = useRef(controller.restoreHistory);
   restoreHistoryRef.current = controller.restoreHistory;
@@ -42,7 +44,7 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
 
   return (
     <>
-      <section hidden={!active} className={`${active ? 'flex' : 'hidden'} m-auto w-full max-w-3xl flex-1 flex-col rounded-2xl border border-sky-500/20 bg-slate-900/80 p-5 shadow-xl sm:p-7`}>
+      <section hidden={!active} className={`${active ? 'flex' : 'hidden'} m-auto w-full max-w-5xl flex-1 flex-col rounded-2xl border border-sky-500/20 bg-slate-900/80 p-4 shadow-xl sm:p-6`}>
         <div className="mb-5">
           <p className="text-[11px] font-semibold uppercase tracking-wider text-sky-300">Developer Mode</p>
           <h2 className="mt-1 text-xl font-semibold">Coding assistant</h2>
@@ -51,6 +53,16 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
         </div>
         <CodingAgentWorkspace
           {...workspace}
+          copiedItem={copiedItem}
+          onCopyMessages={async (messages, key) => {
+            const markdown = key === 'coding-all'
+              ? messages.map((message) => `## ${message.role === 'user' ? 'You' : 'Coding Agent'}\n\n${message.content}`).join('\n\n---\n\n')
+              : messages[0]?.content || '';
+            await navigator.clipboard.writeText(markdown);
+            setCopiedItem(key);
+            window.setTimeout(() => setCopiedItem((current) => current === key ? null : current), 1800);
+          }}
+          onRequestDeleteConversation={setDeleteConversationId}
           onResetCodingPreferences={() => setConfirmationOpen(true)}
         />
       </section>
@@ -64,6 +76,18 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
         onConfirm={() => {
           workspace.onResetCodingPreferences();
           setConfirmationOpen(false);
+        }}
+      />
+      <ConfirmationDialog
+        open={deleteConversationId !== null}
+        title="Delete Coding conversation?"
+        description="This permanently removes the selected Coding conversation from this device. Project files and applied changes will not be affected."
+        confirmLabel="Delete conversation"
+        variant="danger"
+        onCancel={() => setDeleteConversationId(null)}
+        onConfirm={() => {
+          if (deleteConversationId) workspace.onDeleteConversation(deleteConversationId);
+          setDeleteConversationId(null);
         }}
       />
     </>
