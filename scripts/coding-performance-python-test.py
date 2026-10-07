@@ -122,8 +122,8 @@ try:
     )
     set_backend_project_state(str(proj_dir))
 
-    # 5. Verify model intent selection routes to measured performance execution
-    print("[TEST] 4. Simulating _run_coding_turn with live performance evidence...")
+    # 5. A VERIFIED_LIVE label without a registered live proof is not evidence.
+    print("[TEST] 4. Rejecting unproven live-performance labels...")
     runtime_provider = SimpleNamespace(id="test-provider", type="custom-openai", model="gpt-4o")
     sent_events = []
 
@@ -147,17 +147,24 @@ try:
         "evidenceQuality": "VERIFIED_LIVE",
     }
     state = {"pending": {}, "completed": {}, "tasks": set()}
-    select_slow_queries = AsyncMock(return_value={
-        "is_deterministic": True,
-        "capability": DatabaseCapability.DATABASE_SLOW_QUERIES,
-        "arguments": {},
-        "resolved_by_model": True,
-    })
+    select_slow_queries = AsyncMock(side_effect=[
+        {
+            "is_deterministic": True,
+            "capability": DatabaseCapability.DATABASE_SLOW_QUERIES,
+            "arguments": {},
+            "resolved_by_model": True,
+        },
+        {
+            "is_deterministic": False,
+            "answer": "Measured query: SELECT * FROM `orders` — average 42.0 ms",
+            "resolved_by_model": True,
+        },
+    ])
 
     async def run_turn():
         with patch.object(DatabaseSessionManager, "get_or_create_session", return_value=session), \
              patch.object(DatabasePerformanceEngine, "autonomous_investigate_expensive_queries", return_value=measured_report), \
-             patch("coding_websocket._resolve_database_action_with_model", new=select_slow_queries), \
+             patch("coding_websocket._resolve_semantic_task_with_model", new=select_slow_queries), \
              patch("coding_websocket.complete_coding_model", side_effect=AssertionError("Performance inquiry must not call the LLM")):
             await _run_coding_turn(
                 {
@@ -176,16 +183,18 @@ try:
 
     asyncio.run(run_turn())
 
-    assert select_slow_queries.await_count == 1, "Performance intent must be resolved from model context before execution"
+    assert select_slow_queries.await_count == 2, "The model must resolve intent, then reason again from measured evidence"
     done_msg = next(m for m in sent_events if m.get("type") == "done")
     content = done_msg.get("content", "")
     assert "average 42.0 ms" in content, "Must include the measured performance report"
     assert done_msg.get("intent") == DatabaseCapability.DATABASE_SLOW_QUERIES
     assert done_msg.get("proposalRequired") is False, "Done message must have proposalRequired=False"
     assert done_msg.get("readOnly") is True, "Done message must have readOnly=True"
-    assert done_msg.get("confidence") == "MEASURED"
+    assert done_msg.get("confidence") == "UNVERIFIED", (
+        "A VERIFIED_LIVE label without a registered live execution proof must not produce MEASURED confidence"
+    )
     assert not any(event.get("type") == "tool_call" for event in sent_events)
-    print("  -> Passed: Model-selected performance action returns measured query evidence")
+    print("  -> Passed: Unproven performance labels remain unverified")
 
     print("[TEST] 6. Verifying unavailable runtime statistics never invent a slow query...")
     unavailable_report = {
@@ -200,10 +209,24 @@ try:
     async def send_json_unavailable(payload):
         sent_events_unavailable.append(payload)
 
+    select_unavailable_queries = AsyncMock(side_effect=[
+        {
+            "is_deterministic": True,
+            "capability": DatabaseCapability.DATABASE_SLOW_QUERIES,
+            "arguments": {},
+            "resolved_by_model": True,
+        },
+        {
+            "is_deterministic": False,
+            "answer": "Runtime query statistics are unavailable; no query was ranked.",
+            "resolved_by_model": True,
+        },
+    ])
+
     async def run_turn_unavailable():
         with patch.object(DatabaseSessionManager, "get_or_create_session", return_value=session), \
              patch.object(DatabasePerformanceEngine, "autonomous_investigate_expensive_queries", return_value=unavailable_report), \
-             patch("coding_websocket._resolve_database_action_with_model", new=select_slow_queries), \
+             patch("coding_websocket._resolve_semantic_task_with_model", new=select_unavailable_queries), \
              patch("coding_websocket.complete_coding_model", side_effect=AssertionError("Performance inquiry must not call the LLM")):
             await _run_coding_turn(
                 {
@@ -221,7 +244,7 @@ try:
             )
 
     asyncio.run(run_turn_unavailable())
-    assert select_slow_queries.await_count == 2
+    assert select_unavailable_queries.await_count == 2
     done_unavailable = next(event for event in sent_events_unavailable if event.get("type") == "done")
     assert "Runtime query statistics are unavailable" in done_unavailable.get("content", "")
     assert "14.2" not in done_unavailable.get("content", "")

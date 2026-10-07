@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { runtimeConfig } from '../../config/runtimeConfig';
 import { createUnvalidatedSuggestion, parseUnifiedDiff, validateUnifiedFile, type DeveloperDiffFile } from './codingDiff';
-import { CodingAgentTransport, type CodingActivity, type CodingTransportResult } from './codingTransport';
+import { codingFetch, CodingAgentTransport, type CodingActivity, type CodingTransportResult } from './codingTransport';
 import {
   codingPreferenceContext,
   compactCodingConversation,
@@ -294,7 +294,7 @@ export function useCodingAgentController({
         }
       } else {
         try {
-          const res = await fetch('http://localhost:3001/api/coding/project-state');
+          const res = await codingFetch('http://localhost:3001/api/coding/project-state');
           if (!active) return;
           if (res.ok) {
             const state = await res.json();
@@ -303,7 +303,7 @@ export function useCodingAgentController({
               setProjectLifecycleState('PROJECT_ATTACHED');
               persistStoredProjectRoot(state.projectRoot);
               try {
-                const dirRes = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
+                const dirRes = await codingFetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
                 if (dirRes.ok && active) setDirectory(await dirRes.json());
               } catch {
                 // Retain current directory state
@@ -323,7 +323,7 @@ export function useCodingAgentController({
               const savedRoot = getSavedRoot();
               if (savedRoot) {
                 try {
-                  const attachRes = await fetch('http://localhost:3001/api/coding/project-attach', {
+                  const attachRes = await codingFetch('http://localhost:3001/api/coding/project-attach', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ projectRoot: savedRoot }),
@@ -334,7 +334,7 @@ export function useCodingAgentController({
                       setProjectRoot(attached.projectRoot);
                       setProjectLifecycleState('PROJECT_ATTACHED');
                       persistStoredProjectRoot(attached.projectRoot);
-                      const dirRes = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
+                      const dirRes = await codingFetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
                       if (dirRes.ok && active) setDirectory(await dirRes.json());
                     } else {
                       setProjectLifecycleState('NO_PROJECT');
@@ -413,7 +413,7 @@ export function useCodingAgentController({
             const auth = await window.electronAPI.getDeveloperProjectState();
             if (auth?.projectRoot) currentProjectRoot = auth.projectRoot;
           } else {
-            const res = await fetch('http://127.0.0.1:3001/api/coding/project-state');
+            const res = await codingFetch('http://127.0.0.1:3001/api/coding/project-state');
             if (res.ok) {
               const st = await res.json();
               if (st.projectRoot && st.attached) currentProjectRoot = st.projectRoot;
@@ -460,7 +460,7 @@ export function useCodingAgentController({
             if (window.electronAPI) {
               result = await window.electronAPI.discoverDeveloperProject(candidate);
             } else {
-              const res = await fetch('http://127.0.0.1:3001/api/coding/project-discover', {
+              const res = await codingFetch('http://127.0.0.1:3001/api/coding/project-discover', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: candidate }),
@@ -506,36 +506,6 @@ export function useCodingAgentController({
       }
     }
 
-    if (window.electronAPI?.inspectDeveloperDatabase) {
-      setBusy(true);
-      try {
-        const contextMessages = messages
-          .filter((message) => !message.streaming)
-          .slice(-8)
-          .map((message) => ({ role: message.role, content: message.content }));
-        const inspection = await window.electronAPI.inspectDeveloperDatabase(question, contextMessages);
-        if (inspection.handled) {
-          const content = inspection.ok && inspection.data
-            ? inspection.data.report
-            : `Database configuration inspection failed: ${inspection.error?.message || 'No safe result was returned.'}`;
-          setMessages((previous) => [...previous, { role: 'user', content: question }, { role: 'assistant', content }]);
-          setInput('');
-          if (inspection.ok) onStatus(
-            inspection.intents.includes('DATABASE_CREDENTIAL_REQUEST')
-              ? 'Database credential status was read from project source; the password remains redacted and live identity was not verified.'
-              : 'Database configuration was read from project source; live runtime identity was not verified.',
-          );
-          else onError(inspection.error?.message || 'Database configuration inspection failed.');
-          return;
-        }
-      } catch (error) {
-        onError(error instanceof Error ? error.message : String(error));
-        return;
-      } finally {
-        setBusy(false);
-      }
-    }
-
     const detectedPreference = extractCodingPreference(question);
     if (detectedPreference) {
       setPreferences((previous) => upsertCodingPreference(previous, detectedPreference));
@@ -571,7 +541,7 @@ export function useCodingAgentController({
           turnIdsRef.current.set(requestId, turnId);
           setProjectRoot(root);
           setPath(scope);
-          setActivity([{ phase: 'reading', message: 'I’m starting from the project context and will find relevant files automatically.' }]);
+          setActivity([{ phase: 'reading', message: 'Starting the Coding Agent task with the attached project context.' }]);
         },
         onActivity: (entry) => setActivity((previous) => [...previous, entry].slice(-8)),
         onToken: () => undefined,
@@ -630,7 +600,7 @@ export function useCodingAgentController({
                       content: (await window.electronAPI.readDeveloperFile(file.path)).content,
                     };
                   }
-                  const res = await fetch(`http://127.0.0.1:3001/api/coding/read-file?path=${encodeURIComponent(file.path)}`);
+                  const res = await codingFetch(`http://127.0.0.1:3001/api/coding/read-file?path=${encodeURIComponent(file.path)}`);
                   if (!res.ok) throw new Error(`Could not read file for proposal verification: ${file.path}`);
                   const data = await res.json();
                   return { path: file.path, content: data.content };
@@ -667,14 +637,12 @@ export function useCodingAgentController({
                   ? { ...message, content: `I inspected ${result.filesRead.length} file${result.filesRead.length === 1 ? '' : 's'} and prepared a proposal for your review. Nothing has been written.`, streaming: false }
                   : message));
               } else {
-                setActivity((previous) => [...previous, {
-                  phase: 'files_read',
-                  message: result.filesRead.length
-                    ? `Read ${result.filesRead.map((file) => file.path).join(', ')}.`
-                    : (result.readOnly || result.status === 'INVESTIGATION_COMPLETE')
-                    ? 'Investigated relevant project files.'
-                    : 'No project files were needed for this response.',
-                }].slice(-8));
+                if (result.filesRead.length) {
+                  setActivity((previous) => [...previous, {
+                    phase: 'files_read',
+                    message: `Read ${result.filesRead.map((file) => file.path).join(', ')}.`,
+                  }].slice(-8));
+                }
                 await transport.markTurn(turnId, 'completed', result.status || 'completed', result.filesRead.length);
                 setMessages((previous) => previous.map((message) => message.requestId === requestId
                   ? { ...message, content: result.content, streaming: false, performanceEvidence: result.performanceEvidence }
@@ -795,7 +763,7 @@ export function useCodingAgentController({
               } catch {
                 // Directory handle iteration not supported in this browser
               }
-              const res = await fetch('http://localhost:3001/api/coding/project-discover', {
+              const res = await codingFetch('http://localhost:3001/api/coding/project-discover', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: handle.name, signatures }),
@@ -822,7 +790,7 @@ export function useCodingAgentController({
           }
         }
         if (!selectedPath) {
-          const stateRes = await fetch('http://localhost:3001/api/coding/project-state');
+          const stateRes = await codingFetch('http://localhost:3001/api/coding/project-state');
           if (stateRes.ok) {
             const state = await stateRes.json();
             if (state.status === 'PROJECT_ATTACHED' && state.projectRoot) {
@@ -832,7 +800,7 @@ export function useCodingAgentController({
         }
         if (selectedPath) {
           setProjectLifecycleState('ATTACHING_PROJECT');
-          const attachRes = await fetch('http://localhost:3001/api/coding/project-attach', {
+          const attachRes = await codingFetch('http://localhost:3001/api/coding/project-attach', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectRoot: selectedPath }),
@@ -846,7 +814,7 @@ export function useCodingAgentController({
             setPath('.');
             setFileContent('');
             setFilePath('');
-            const dirRes = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
+            const dirRes = await codingFetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
             if (dirRes.ok) setDirectory(await dirRes.json());
             onStatus(`Connected to project: ${attached.projectRoot}`);
             return;
@@ -924,7 +892,7 @@ export function useCodingAgentController({
           onError(`Project attachment failed (ATTACH_FAILED): ${attached.reason || 'Could not attach'}`);
         }
       } else {
-        const attachRes = await fetch('http://localhost:3001/api/coding/project-attach', {
+        const attachRes = await codingFetch('http://localhost:3001/api/coding/project-attach', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ projectRoot: targetPath }),
@@ -938,7 +906,7 @@ export function useCodingAgentController({
           setPath('.');
           setFileContent('');
           setFilePath('');
-          const dirRes = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
+          const dirRes = await codingFetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
           if (dirRes.ok) setDirectory(await dirRes.json());
           onStatus(`Connected to project: ${attached.projectRoot}`);
         } else {
@@ -962,7 +930,7 @@ export function useCodingAgentController({
       if (window.electronAPI) {
         await window.electronAPI.clearDeveloperProject();
       } else {
-        await fetch('http://localhost:3001/api/coding/project-clear', { method: 'POST' });
+        await codingFetch('http://localhost:3001/api/coding/project-clear', { method: 'POST' });
       }
       setProjectRoot(null);
       setProjectLifecycleState('PROJECT_DETACHED');
@@ -987,7 +955,7 @@ export function useCodingAgentController({
       if (window.electronAPI) {
         setDirectory(await window.electronAPI.listDeveloperDirectory(path || '.'));
       } else {
-        const res = await fetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent(path || '.'));
+        const res = await codingFetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent(path || '.'));
         if (!res.ok) throw new Error(`Directory listing failed: HTTP ${res.status}`);
         setDirectory(await res.json());
       }
@@ -1007,7 +975,7 @@ export function useCodingAgentController({
         setFilePath(result.path);
         setFileContent(result.content);
       } else {
-        const res = await fetch('http://localhost:3001/api/coding/read-file?path=' + encodeURIComponent(requestedPath));
+        const res = await codingFetch('http://localhost:3001/api/coding/read-file?path=' + encodeURIComponent(requestedPath));
         if (!res.ok) throw new Error(`Reading file failed: HTTP ${res.status}`);
         const result = await res.json();
         setFilePath(result.path);
@@ -1028,7 +996,7 @@ export function useCodingAgentController({
         const result = await window.electronAPI.searchDeveloperCode(searchQuery, path);
         setSearchResults(result.results);
       } else {
-        const res = await fetch('http://localhost:3001/api/coding/search-code?query=' + encodeURIComponent(searchQuery) + '&scope=' + encodeURIComponent(path || '.'));
+        const res = await codingFetch('http://localhost:3001/api/coding/search-code?query=' + encodeURIComponent(searchQuery) + '&scope=' + encodeURIComponent(path || '.'));
         if (!res.ok) throw new Error(`Searching code failed: HTTP ${res.status}`);
         const result = await res.json();
         setSearchResults(result.results);

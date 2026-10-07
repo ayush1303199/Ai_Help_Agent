@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
@@ -18,12 +19,14 @@ const electronCommand = process.platform === 'win32'
   ? path.join(root, 'node_modules', '.bin', 'electron.cmd')
   : path.join(root, 'node_modules', '.bin', 'electron');
 const children = [];
+const codingAuthToken = randomBytes(32).toString('base64url');
+const codingAuthEnvironment = { AI_CODING_AUTH_TOKEN: codingAuthToken };
 let shuttingDown = false;
 
-function start(command, args) {
+function start(command, args, environment = {}) {
   const child = process.platform === 'win32' && /\.cmd$/i.test(command)
-    ? spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', [command, ...args].join(' ')], { cwd: root, stdio: 'inherit', windowsHide: true })
-    : spawn(command, args, { cwd: root, stdio: 'inherit', windowsHide: true });
+    ? spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', [command, ...args].join(' ')], { cwd: root, stdio: 'inherit', windowsHide: true, env: { ...process.env, ...environment } })
+    : spawn(command, args, { cwd: root, stdio: 'inherit', windowsHide: true, env: { ...process.env, ...environment } });
   children.push(child);
   child.once('exit', (code, signal) => {
     if (!shuttingDown && code !== 0) {
@@ -134,8 +137,12 @@ try {
   const codingWebsocketAlreadyRunning = await portOpen(codingWebsocketService.port);
   const frontendAlreadyRunning = await portOpen(devServer.port);
 
+  if (backendAlreadyRunning || websocketAlreadyRunning || codingWebsocketAlreadyRunning) {
+    throw new Error('A backend service is already running without this launch authentication context. Stop it and start the app with npm run dev.');
+  }
+
   if (!backendAlreadyRunning || !websocketAlreadyRunning || !codingWebsocketAlreadyRunning) {
-    start(npmCommand, ['run', 'server:dev']);
+    start(npmCommand, ['run', 'server:dev'], codingAuthEnvironment);
   } else {
     console.log(`[DEV] Reusing the existing backend on ports ${httpService.port}, ${websocketService.port}, and ${codingWebsocketService.port}.`);
   }
@@ -152,7 +159,7 @@ try {
     waitForTcp(websocketService.port),
     waitForTcp(codingWebsocketService.port),
   ]);
-  const electron = start(electronCommand, ['electron/main.cjs']);
+  const electron = start(electronCommand, ['electron/main.cjs'], codingAuthEnvironment);
   await new Promise((resolve) => electron.once('exit', (code) => resolve(code || 0)));
   await shutdown(0);
 } catch (error) {

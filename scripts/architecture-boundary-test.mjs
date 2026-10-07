@@ -205,6 +205,11 @@ assert.doesNotMatch(
 assert.match(codingPageSource, /useCodingAgentController\(/, 'The Coding Agent page must own its controller lifecycle.');
 assert.doesNotMatch(codingPageSource, /AgentProviderSelect|useAgentProviderSelection\(/, 'Coding must use the globally active provider, not keep a per-agent selection.');
 assert.doesNotMatch(codingControllerSource, /providerId:\s*string\s*\|\s*null/, 'Coding requests must not capture a stale per-agent provider instance.');
+assert.doesNotMatch(
+  codingControllerSource,
+  /inspectDeveloperDatabase/,
+  'Database questions must use the owned Coding transport and task-state pipeline, not a renderer-side fast path.',
+);
 assert.doesNotMatch(codingTransportSource, /scope:\s*turn\.scope,[\s\S]{0,100}providerId/, 'Coding transport must leave provider resolution to the global backend registry.');
 assert.doesNotMatch(appSource, /useCodingAgentController/, 'App composition must not construct the Coding Agent controller.');
 assert.match(codingControllerSource, /new CodingAgentTransport\(\)/, 'Coding Agent must own its transport lifecycle.');

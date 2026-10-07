@@ -1,7 +1,9 @@
 const { app, BrowserWindow, desktopCapturer, session, ipcMain, dialog, globalShortcut, screen } = require('electron');
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const net = require('node:net');
 const path = require('node:path');
+const { fileURLToPath } = require('node:url');
 const fs = require('node:fs/promises');
 const developerFiles = require('./developerFiles.cjs');
 const developerAgent = require('./developerAgent.cjs');
@@ -23,6 +25,8 @@ ignoreBrokenOutputPipe(process.stdout);
 ignoreBrokenOutputPipe(process.stderr);
 
 const isDev = !app.isPackaged;
+const codingAuthToken = process.env.AI_CODING_AUTH_TOKEN || crypto.randomBytes(32).toString('base64url');
+process.env.AI_CODING_AUTH_TOKEN = codingAuthToken;
 developerFiles.configureAuditDirectory(path.join(app.getPath('userData'), 'developer-audit'));
 let backendProcess = null;
 let isQuitting = false;
@@ -136,13 +140,15 @@ async function startPackagedBackend() {
     isPortOpen(services.websocket.port),
     isPortOpen(services.codingWebsocket.port),
   ]);
-  if (httpReady && websocketReady && codingWebsocketReady) return;
+  if (httpReady || websocketReady || codingWebsocketReady) {
+    throw new Error('A backend is already listening without this application launch token. Restart the desktop app and its backend together.');
+  }
   const backendExecutable = process.platform === 'win32'
     ? path.join(process.resourcesPath, 'backend', 'ai-help-agent-backend.exe')
     : path.join(process.resourcesPath, 'backend', 'ai-help-agent-backend');
   backendProcess = spawn(backendExecutable, [], {
     cwd: path.dirname(backendExecutable),
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    env: { ...process.env, AI_CODING_AUTH_TOKEN: codingAuthToken, PYTHONUNBUFFERED: '1' },
     stdio: 'ignore',
     windowsHide: true,
   });
@@ -564,6 +570,27 @@ function assertTrustedMainRendererSender(event) {
   }
 }
 
+function assertTrustedCodingRendererSender(event) {
+  assertTrustedMainRendererSender(event);
+  const senderUrl = event.senderFrame?.url || event.sender.getURL();
+  if (isDev) {
+    if (new URL(senderUrl).origin !== new URL(devServerUrl).origin) {
+      throw new Error('Unauthorized Coding Agent IPC origin.');
+    }
+    return;
+  }
+  const expectedFile = path.resolve(__dirname, '..', 'dist', 'index.html');
+  let actualFile = '';
+  try {
+    if (new URL(senderUrl).protocol === 'file:') actualFile = path.resolve(fileURLToPath(senderUrl));
+  } catch {
+    actualFile = '';
+  }
+  if (actualFile !== expectedFile) {
+    throw new Error('Unauthorized Coding Agent IPC origin.');
+  }
+}
+
 function createWindow() {
   const window = new BrowserWindow({
     width: 1280,
@@ -909,6 +936,10 @@ app.whenReady().then(async () => {
     developerAgent.getSession(event.sender.id);
     return developerFiles.getProjectState(event.sender.id);
   });
+  ipcMain.handle('developer:backend-auth-token', (event) => {
+    assertTrustedCodingRendererSender(event);
+    return codingAuthToken;
+  });
   ipcMain.handle('developer:project-attach', async (event, payload) => {
     developerAgent.getSession(event.sender.id);
     const result = await developerFiles.attachProject(payload?.projectRoot, event.sender.id);
@@ -1127,7 +1158,17 @@ app.whenReady().then(async () => {
     const isDbTool = ['execute_sql', 'run_query', 'db_query', 'database.query', 'sql_query', 'query_database', 'executeQuery', 'check_db', 'inspect_database', 'show_tables', 'list_tables'].includes(rawToolName)
       || Boolean(args.sql || (typeof args.query === 'string' && /\b(?:SELECT|SHOW|EXPLAIN|PRAGMA|FROM|WHERE)\b/i.test(args.query)));
     if (isDbTool) {
-      const rawSql = String(args.sql || args.query || args.command || 'SELECT 1').trim();
+      const rawSql = String(args.sql || args.query || args.command || '').trim();
+      if (!rawSql) {
+        return {
+          ok: false,
+          tool: rawToolName || 'execute_sql',
+          error: {
+            code: 'SQL_REQUIRED',
+            message: 'A SQL statement is required; no query was executed.',
+          },
+        };
+      }
       const isDestructive = /\b(?:DROP|TRUNCATE|DELETE|ALTER|GRANT|REVOKE)\b/i.test(rawSql);
       if (isDestructive) {
         return {

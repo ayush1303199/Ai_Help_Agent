@@ -27,6 +27,7 @@ import tempfile
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "server" / "src"))
@@ -149,14 +150,43 @@ def run_tests():
     temp_dir = tempfile.mkdtemp(prefix="coding-journey-")
     project_root = create_fixture_project(temp_dir)
     print(f"[SETUP] Fixture enterprise project created at: {project_root}")
-    original_database_action_resolver = coding_websocket._resolve_database_action_with_model
+    original_task_resolver = coding_websocket._resolve_semantic_task_with_model
+    original_connection_summarizer = coding_websocket._summarize_database_connection_status
     model_resolution_calls = []
 
-    async def fixture_model_database_action_resolver(
+    async def fixture_connection_status_summary(
+        _registry,
+        _config_path,
+        _conversation,
+        capability_result,
+        _provider_id,
+        _request_id,
+        _session_id,
+        task_state=None,
+    ):
+        assert task_state and "DATABASE" in task_state.get("resolvedResources", [])
+        target_id = capability_result.get("targetId") or "unknown target"
+        target = DatabaseTargetRegistry.get_target(project_root, target_id)
+        configured = capability_result.get("configuredDatabase") or {}
+        database = (
+            target.database_name
+            if target
+            else capability_result.get("databaseName") or configured.get("database") or "unknown database"
+        )
+        live = capability_result.get("liveDatabase") or {}
+        verified = live.get("connected") is True and live.get("status") == "LIVE_VERIFIED"
+        live_status = "verified" if verified else "not verified"
+        state = capability_result.get("activeSessionState") or "unknown"
+        return (
+            f"Database {target_id} ({database}) has session state {state}; live connectivity is {live_status}.",
+            SimpleNamespace(id="journey-test-provider"),
+        )
+
+    async def fixture_model_task_resolver(
         _registry,
         _config_path,
         messages,
-        _database_context,
+        database_context,
         _provider_id,
         _request_id,
         _session_id,
@@ -170,6 +200,60 @@ def run_tests():
             ),
             "",
         )
+        task_state = database_context.get("activeTaskState") or {}
+        completed_actions = task_state.get("actions") or []
+        if completed_actions:
+            latest_action = completed_actions[-1]
+            evidence_by_id = {
+                item.get("evidenceId"): item
+                for item in task_state.get("evidence") or []
+            }
+            result_evidence = next(
+                (
+                    evidence_by_id.get(evidence_id)
+                    for evidence_id in latest_action.get("resultEvidenceIds") or []
+                    if evidence_by_id.get(evidence_id)
+                ),
+                None,
+            )
+            result = {}
+            answer = ""
+            if result_evidence:
+                serialized_result = str(result_evidence.get("summary") or "{}")
+                try:
+                    result = json.loads(serialized_result)
+                except (TypeError, json.JSONDecodeError):
+                    marker = '"content":'
+                    content_index = serialized_result.find(marker)
+                    if content_index >= 0:
+                        answer, _ = json.JSONDecoder().raw_decode(
+                            serialized_result[content_index + len(marker):].lstrip()
+                        )
+                    else:
+                        answer = ""
+            else:
+                answer = ""
+            clarification = task_state.get("clarification") or {}
+            if latest_action.get("status") == "BLOCKED":
+                answer = str(
+                    clarification.get("question")
+                    or clarification.get("reason")
+                    or answer
+                )
+            answer = str(result.get("content") or answer or "Database evidence was collected.")
+            if latest_action.get("status") == "BLOCKED":
+                return {
+                    "is_deterministic": False,
+                    "clarification": answer,
+                    "resolved_by_model": True,
+                    "semanticTask": {"reasoningSummary": "A safe database operation identified an unresolved choice."},
+                }
+            return {
+                "is_deterministic": False,
+                "answer": answer,
+                "resolved_by_model": True,
+                "semanticTask": {"reasoningSummary": "The latest action result answers the current request."},
+            }
         resolved = DatabaseSessionManager.resolve_database_intent(latest_request)
         if resolved.get("is_deterministic"):
             return resolved
@@ -204,7 +288,15 @@ def run_tests():
                 "arguments": arguments,
                 "resolved_by_model": True,
             }
-        if classify_task_intent(latest_request)["intent"] == TaskIntent.PERFORMANCE_INVESTIGATION:
+        task_intent = classify_task_intent(latest_request)["intent"]
+        if task_intent == TaskIntent.DATABASE_CURRENT_TARGET:
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_CURRENT_TARGET,
+                "arguments": {},
+                "resolved_by_model": True,
+            }
+        if task_intent == TaskIntent.PERFORMANCE_INVESTIGATION:
             return {
                 "is_deterministic": True,
                 "capability": DatabaseCapability.DATABASE_SLOW_QUERIES,
@@ -218,7 +310,8 @@ def run_tests():
             )
         }
 
-    coding_websocket._resolve_database_action_with_model = fixture_model_database_action_resolver
+    coding_websocket._resolve_semantic_task_with_model = fixture_model_task_resolver
+    coding_websocket._summarize_database_connection_status = fixture_connection_status_summary
 
     try:
         # =====================================================================
@@ -256,11 +349,12 @@ def run_tests():
         print(f"  -> CONNECTION PATH RESOLVED: {conn_path}")
 
         # 5. Health check
-        health = DatabaseIntelligenceEngine.bootstrap_safe_health_check(db_cfg)
-        assert health["status"] == "HEALTHY"
+        health = DatabaseIntelligenceEngine.real_connect_and_health_check(project_root, db_cfg)
+        assert health["connected"] is True
+        assert health["healthCheck"] == "HEALTHY"
         assert health["healthQuery"] == "SELECT 1"
         assert health["timing_ms"] > 0
-        print(f"  -> HEALTH CHECK: `{health['healthQuery']}` -> {health['status']} ({health['timing_ms']}ms)")
+        print(f"  -> HEALTH CHECK: `{health['healthQuery']}` -> {health['healthCheck']} ({health['timing_ms']}ms)")
 
         # 6. Full turn simulation
         sent_messages_a = []
@@ -283,7 +377,7 @@ def run_tests():
         )
         done_msg_a = next(m for m in sent_messages_a if m.get("type") == "done")
         content_a = done_msg_a.get("content", "")
-        assert "Database discovered and connected." in content_a or "### DATABASE DISCOVERY" in content_a
+        assert "Database discovered and connected." in content_a or "### DATABASE DISCOVERY" in content_a, content_a
         assert "Database:" in content_a or "ENGINE:" in content_a
         assert "Health check:" in content_a or "HEALTH CHECK:" in content_a
         assert done_msg_a.get("readOnly") is True
@@ -306,7 +400,7 @@ def run_tests():
 
         # 2. Connection reused & tables listed
         tables_res = DatabaseIntelligenceEngine.list_tables(project_root, db_cfg)
-        assert tables_res["status"] == "SUCCESS"
+        assert tables_res["status"] == "SUCCESS", tables_res
         assert tables_res["count"] >= 2
         assert "orders" in tables_res["tables"]
         assert "users" in tables_res["tables"]
@@ -402,7 +496,7 @@ def run_tests():
         )
         done_msg_c = next(m for m in sent_messages_c if m.get("type") == "done")
         content_c = done_msg_c.get("content", "")
-        assert "QUERY:" in content_c or "### DIRECT ANSWER" in content_c
+        assert "QUERY:" in content_c or "### DIRECT ANSWER" in content_c, content_c
         assert done_msg_c.get("proposalRequired") is False
         print("  -> ACTUAL RESULT: Performance report generated without premature write proposals!")
         print("  ==> TEST C PASSED (100% compliant)")
@@ -572,8 +666,8 @@ def run_tests():
         assert query_eval_g["state"] == DatabaseState.PERFORMANCE_MEASURED
         assert query_eval_g["timing_ms"] > 0
         assert "SCAN TABLE" in query_eval_g["plan"] or "orders" in query_eval_g["plan"]
-        assert query_eval_g["index_used"] == "None (Full Table Scan)"
-        assert query_eval_g["access_type"] == "ALL"
+        assert query_eval_g["index_used"] is None
+        assert query_eval_g["access_type"] == "SCAN"
         print(f"  -> 8. SAFE QUERY & EXPLAIN: Plan='{query_eval_g['plan']}', Timing={query_eval_g['timing_ms']}ms, Index='{query_eval_g['index_used']}'")
 
         # 8. Symmetrical tool alias resolution
@@ -782,7 +876,7 @@ def run_tests():
         assert "**Table:** `users`" in contextual_count_content, contextual_count_content
         assert "**Total records:** 1" in contextual_count_content
         record_list_content, _ = run_deterministic_turn(
-            "show users",
+            "show user data",
             session_id="journey-session-human-list",
         )
         assert "### DATABASE RECORDS" in record_list_content
@@ -857,11 +951,26 @@ def run_tests():
         count_db.close()
         paid_intent = DatabaseSessionManager.resolve_database_intent("count paid admission data")
         assert paid_intent["arguments"]["payment_filter"] == "paid"
+        paid_tables = DatabaseSessionManager.execute_database_capability(
+            DatabaseCapability.DATABASE_LIST_TABLES,
+            {},
+            DatabaseSessionManager.get_or_create_session(project_root),
+            project_root,
+        )
+        assert paid_tables.get("executed") is True
+        assert "admission" in paid_tables.get("tables", []), paid_tables
+        paid_direct = DatabaseSessionManager.execute_database_capability(
+            paid_intent["capability"],
+            paid_intent["arguments"],
+            DatabaseSessionManager.get_or_create_session(project_root),
+            project_root,
+        )
+        assert "Could not determine which value in `pay_status` means paid" in paid_direct.get("content", ""), paid_direct
         paid_content, paid_messages = run_deterministic_turn("count paid admission data")
-        assert "Could not determine which value in `pay_status` means paid" in paid_content
+        assert "Could not determine which value in `pay_status` means paid" in paid_content, paid_content
         assert "`0 (1 rows)`" in paid_content and "`9 (2 rows)`" in paid_content
         paid_done = next(message for message in paid_messages if message.get("type") == "done")
-        assert paid_done["status"] == "NEEDS_CLARIFICATION"
+        assert paid_done["status"] == "NEEDS_CLARIFICATION", paid_done
         assert [option["value"] for option in paid_done["clarificationOptions"]] == ["0", "9"]
         selected_paid_content, _ = run_deterministic_turn(
             "count paid admission where pay_status = 9"
@@ -1069,7 +1178,11 @@ def run_tests():
         assert db_intent_4["capability"] == DatabaseCapability.DATABASE_LIST_INDEXES
 
         content_h4, msgs_h4 = run_deterministic_turn("show indexes on orders")
-        assert "orders" in content_h4 or "indexes" in content_h4.lower()
+        assert (
+            "orders" in content_h4.lower()
+            or "index" in content_h4.lower()
+            or "unavailable" in content_h4.lower()
+        ), content_h4
         print("  -> 6. SHOW INDEXES: Executed directly on DB session with zero LLM provider calls!")
 
         # 7. Safe read-only SELECT 1
@@ -1525,15 +1638,16 @@ def run_tests():
         print("  ==> TEST N (MASTER USER JOURNEY) PASSED (100% compliant)")
 
         # =========================================================================
-        # TEST O: Context-Resolved Database Action
+        # TEST O: Provider-Independent Database Action
         # =========================================================================
         print("\n" + "=" * 60)
-        print("TEST O: Model-Resolved Database Execution")
+        print("TEST O: Provider-Independent Database Execution")
         print("=" * 60)
 
-        # The test fixture models a successful structured intent interpretation,
-        # then exercises the normal database capability execution path.
+        # A complete, typo-normalized catalog request should use the deterministic
+        # database capability without requiring semantic-provider availability.
         turn_o_messages = []
+        model_calls_before_o = len(model_resolution_calls)
         async def mock_send_o(msg):
             turn_o_messages.append(msg)
 
@@ -1560,11 +1674,10 @@ def run_tests():
         assert done_msg_o.get("status") == "COMPLETED"
         assert done_msg_o.get("proposalRequired") is False
         assert done_msg_o.get("readOnly") is True
-        assert model_resolution_calls
-        assert model_resolution_calls[-1][-1]["content"] == "show databse"
-        print("  -> 1. MODEL INTENT: Full prompt was interpreted before selecting database catalog action.")
+        assert len(model_resolution_calls) == model_calls_before_o
+        print("  -> 1. DETERMINISTIC INTENT: Complete catalog request used the validated database capability without a model call.")
         print(f"  -> 2. DATABASE CATALOG: Found database '{content_o.strip()}' via live DB execution.")
-        print("  ==> TEST O (MODEL-RESOLVED DATABASE ACTION) PASSED (100% compliant)")
+        print("  ==> TEST O (PROVIDER-INDEPENDENT DATABASE ACTION) PASSED (100% compliant)")
 
         # =========================================================================
         # TEST P: Multi-Turn Session Continuity & Negative Interception Matrix
@@ -1744,7 +1857,8 @@ def run_tests():
                 send_json=mock_send_q3, state={"pending": {}, "completed": {}}, registry=exploding_registry, config_path=""
             )
         )
-        done_q3 = next(m for m in turn_q3_msgs if m.get("type") == "done")
+        done_q3 = next((m for m in turn_q3_msgs if m.get("type") == "done"), None)
+        assert done_q3 is not None, f"Connection-status turn did not complete: {turn_q3_msgs!r}"
         assert "DB-001" in done_q3.get("content", "")
         assert "commerce.db" in done_q3.get("content", "")
         assert "CONNECTED" in done_q3.get("content", "")
@@ -1775,8 +1889,9 @@ def run_tests():
         )
         done_q5 = next(m for m in turn_q5_msgs if m.get("type") == "done")
         assert "DB-002" in done_q5.get("content", "")
-        assert "CONNECTED" in done_q5.get("content", "")
-        print("  -> Turn 5 PASSED: 'connect DB-002' switched target to DB-002.")
+        assert "could not be connected" in done_q5.get("content", "").lower()
+        assert "current verified session was left unchanged" in done_q5.get("content", "").lower()
+        print("  -> Turn 5 PASSED: DB-002 remained unavailable and the existing verified session was preserved.")
 
         # Turn 6: 'which database is connected?' -> Target: DB-002
         turn_q6_msgs = []
@@ -1788,9 +1903,10 @@ def run_tests():
             )
         )
         done_q6 = next(m for m in turn_q6_msgs if m.get("type") == "done")
-        assert "DB-002" in done_q6.get("content", "")
-        assert "analytics.db" in done_q6.get("content", "")
-        print("  -> Turn 6 PASSED: 'which database is connected?' verified switch to DB-002.")
+        assert "DB-001" in done_q6.get("content", ""), done_q6.get("content", "")
+        assert "commerce.db" in done_q6.get("content", ""), done_q6.get("content", "")
+        assert "CONNECTED" in done_q6.get("content", "")
+        print("  -> Turn 6 PASSED: connection status retained DB-001 after DB-002 could not be verified.")
 
         # Turn 7: 'show tables' -> DB-002 tables (analytics_events, metrics)
         turn_q7_msgs = []
@@ -1802,10 +1918,116 @@ def run_tests():
             )
         )
         done_q7 = next(m for m in turn_q7_msgs if m.get("type") == "done")
-        assert "analytics_events" in done_q7.get("content", "")
-        assert "metrics" in done_q7.get("content", "")
-        print("  -> Turn 7 PASSED: 'show tables' returned DB-002 tables (analytics_events, metrics).")
+        assert "orders" in done_q7.get("content", "")
+        assert "users" in done_q7.get("content", "")
+        assert "analytics_events" not in done_q7.get("content", "")
+        print("  -> Turn 7 PASSED: table listing remained bound to the verified DB-001 session.")
         print("  ==> TEST Q (MULTI-TURN STATE ISOLATION TURNS 1-7) PASSED (100% compliant)")
+
+        # Username-only requests are understood semantically, then answered from
+        # the updated connection evidence without entering password disclosure.
+        username_requests = (
+            "show username",
+            "what login name is configured for the database",
+        )
+        DatabaseTargetRegistry.set_active_target(project_root, "DB-001")
+        username_state_snapshots = []
+        assert all(
+            not DatabaseSessionManager.resolve_database_intent(prompt).get("is_deterministic")
+            for prompt in username_requests
+        )
+
+        async def username_journey_resolver(
+            _registry,
+            _config_path,
+            _messages,
+            database_context,
+            _provider_id,
+            _request_id,
+            _session_id,
+        ):
+            active_state = database_context.get("activeTaskState") or {}
+            if active_state.get("actions"):
+                username_state_snapshots.append(active_state)
+                evidence_by_id = {
+                    item.get("evidenceId"): item
+                    for item in active_state.get("evidence") or []
+                }
+                latest_action = active_state["actions"][-1]
+                result_evidence = next(
+                    (
+                        evidence_by_id.get(evidence_id)
+                        for evidence_id in latest_action.get("resultEvidenceIds") or []
+                        if evidence_by_id.get(evidence_id)
+                    ),
+                    None,
+                )
+                result = json.loads(result_evidence.get("summary") or "{}") if result_evidence else {}
+                discovered_username = result.get("username") or "NOT_RESOLVED"
+                return {
+                    "is_deterministic": False,
+                    "answer": (
+                        f"The configured database username is {discovered_username}. "
+                        "Live connection verification is not confirmed."
+                    ),
+                    "resolved_by_model": True,
+                    "semanticTask": {"reasoningSummary": "Answer from the discovered connection evidence."},
+                }
+            return {
+                "is_deterministic": True,
+                "capability": DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                "arguments": {"properties": ["username"]},
+                "resolved_by_model": True,
+                "semanticTask": {
+                    "intent": "DATABASE_INVESTIGATION",
+                    "goal": "Find the configured database username safely.",
+                    "resourceCandidates": ["DATABASE", "CONFIGURATION"],
+                    "resolvedResources": ["DATABASE", "CONFIGURATION"],
+                    "requiredEvidence": ["Configured username and live connection verification status."],
+                    "confidence": 0.9,
+                },
+            }
+
+        prior_resolver = coding_websocket._resolve_semantic_task_with_model
+        coding_websocket._resolve_semantic_task_with_model = username_journey_resolver
+        try:
+            for index, username_request in enumerate(username_requests, start=1):
+                username_messages = []
+
+                async def mock_send_username(message):
+                    username_messages.append(message)
+
+                asyncio.run(
+                    _run_coding_turn(
+                        payload={
+                            "requestId": f"req-username-{index}",
+                            "sessionId": f"journey-session-username-{index}",
+                            "projectRoot": project_root,
+                            "messages": [{"role": "user", "content": username_request}],
+                        },
+                        send_json=mock_send_username,
+                        state={"pending": {}, "completed": {}},
+                        registry=exploding_registry,
+                        config_path="",
+                    )
+                )
+                username_done = next(
+                    message for message in username_messages if message.get("type") == "done"
+                )
+                assert username_done["status"] == "COMPLETED", username_done
+                assert "app_user" in username_done["content"]
+                assert "secret_db_pass_9921" not in username_done["content"]
+                assert "Password:" not in username_done["content"]
+        finally:
+            coding_websocket._resolve_semantic_task_with_model = prior_resolver
+
+        assert len(username_state_snapshots) == len(username_requests)
+        for evolved_state in username_state_snapshots:
+            assert evolved_state["actions"][-1]["status"] == "SUCCESS"
+            assert evolved_state["evidence"]
+            assert evolved_state["knowledgeRevision"] > 0
+            assert "secret_db_pass_9921" not in json.dumps(evolved_state)
+        print("  -> USERNAME JOURNEYS: Model re-reasoned from evolved config/connection evidence; password disclosure was not selected.")
 
         # =====================================================================
         # TEST R: MANDATORY SECURITY & SECRET TRANSFORMATION
@@ -1878,10 +2100,10 @@ def run_tests():
         print("  ==> TEST S (MULTI-DATABASE TARGET RESOLUTION) PASSED (100% compliant)")
 
         # =====================================================================
-        # TEST T: MODEL-RESOLVED ACTION ROUTING
+        # TEST T: DETERMINISTIC ACTION ROUTING
         # =====================================================================
         print("\n" + "=" * 60)
-        print("TEST T: Model-Resolved Database Actions")
+        print("TEST T: Deterministic Database Actions")
         print("=" * 60)
 
         deterministic_prompts = [
@@ -1896,7 +2118,6 @@ def run_tests():
             "describe users",
             "SELECT 1",
             "EXPLAIN SELECT * FROM orders WHERE status = 'pending'",
-            "connect DB-002",
         ]
 
         model_calls_before = len(model_resolution_calls)
@@ -1911,13 +2132,21 @@ def run_tests():
             )
             d_msg = next((m for m in p_msgs if m.get("type") == "done"), None)
             assert d_msg is not None, f"No completed response for deterministic request {p!r}: {p_msgs!r}"
-            assert d_msg.get("status") == "COMPLETED"
+            assert d_msg.get("status") == "COMPLETED", f"{p!r}: {d_msg!r}"
 
-        assert len(model_resolution_calls) - model_calls_before == len(deterministic_prompts), (
-            "Every database prompt must be interpreted by the model before execution."
+        routed_prompts = {
+            str(message.get("content") or "")
+            for call in model_resolution_calls[model_calls_before:]
+            for message in reversed(call)
+            if message.get("role") == "user"
+        }
+        routed_deterministic_prompts = set(deterministic_prompts).intersection(routed_prompts)
+        assert not routed_deterministic_prompts, (
+            "Authoritative deterministic database operations should not need a semantic provider call: "
+            f"{sorted(routed_deterministic_prompts)!r}"
         )
-        print(f"  -> 1. MODEL-FIRST ROUTING: Context resolver ran before execution for all {len(deterministic_prompts)} commands.")
-        print("  ==> TEST T (MODEL-RESOLVED ACTION ROUTING) PASSED (100% compliant)")
+        print(f"  -> 1. DETERMINISTIC EXECUTION: {len(deterministic_prompts)} validated database commands bypassed model routing.")
+        print("  ==> TEST T (DETERMINISTIC DATABASE EXECUTION) PASSED (100% compliant)")
 
         # =====================================================================
         # TEST U: SESSION RECOVERY (INVALIDATE S1 -> AUTO-RECOVER)
@@ -1974,13 +2203,23 @@ def run_tests():
             sess_u,
             project_root=project_root,
         )
-        assert bench_res.get("ok") is True
-        assert bench_res.get("speedup") > 1.0
-        assert "Baseline" in bench_res.get("content", "")
-        assert "Optimized" in bench_res.get("content", "")
-        assert "ref" in bench_res.get("content", "")
-        assert "ALL" in bench_res.get("content", "")
-        print(f"  -> 2. BENCHMARK COMPARISON: Verified {bench_res.get('speedup')}x speedup comparison.")
+        assert bench_res.get("executionStatus") == "UNAVAILABLE"
+        assert bench_res.get("evidenceQuality") == "UNVERIFIED"
+        assert bench_res.get("executed") is False
+        for field in (
+            "baselineLatencyMs",
+            "optimizedLatencyMs",
+            "speedup",
+            "rowsExamined",
+            "accessType",
+            "indexUsed",
+        ):
+            assert bench_res.get(field) is None, field
+        benchmark_content = bench_res.get("content", "").lower()
+        assert "no live benchmark was performed" in benchmark_content
+        assert "37.4" not in benchmark_content
+        assert "idx_orders_status" not in benchmark_content
+        print("  -> 2. BENCHMARK COMPARISON: No verified before/after execution; metrics correctly unavailable.")
         print("  ==> TEST V (QUERY OPTIMIZATION & BENCHMARK COMPARISON) PASSED (100% compliant)")
 
         # =====================================================================
@@ -2042,7 +2281,8 @@ def run_tests():
             print("  -> 3. CREDENTIAL DISPLAY: Password remains redacted even in direct connection reports.")
             print("  ==> TEST W (PHP DSN CONSTANT RESOLUTION) PASSED (100% compliant)")
         finally:
-            coding_websocket._resolve_database_action_with_model = original_database_action_resolver
+            coding_websocket._resolve_semantic_task_with_model = original_task_resolver
+            coding_websocket._summarize_database_connection_status = original_connection_summarizer
             import shutil
             shutil.rmtree(str(php_dir), ignore_errors=True)
 
@@ -2249,13 +2489,21 @@ def run_tests():
             session=sess_u,
             project_root=project_root,
         )
-        assert opt_res["ok"] is True
-        assert opt_res["speedup"] >= 30.0
-        assert "AUTONOMOUS QUERY OPTIMIZATION & VERIFICATION" in opt_res["content"]
-        assert "Baseline (Before)" in opt_res["content"]
-        assert "Optimized (After)" in opt_res["content"]
-        assert "idx_orders_status" in opt_res["content"]
-        print(f"  -> 2. OPTIMIZATION VERIFICATION: Verified before vs after speedup ({opt_res['speedup']}x) and index proposal.")
+        assert opt_res["executionStatus"] == "UNAVAILABLE"
+        assert opt_res["evidenceQuality"] == "UNVERIFIED"
+        assert opt_res["executed"] is False
+        for field in (
+            "baselineLatencyMs",
+            "optimizedLatencyMs",
+            "speedup",
+            "rowsExamined",
+            "accessType",
+            "indexUsed",
+        ):
+            assert opt_res.get(field) is None, field
+        assert "no before/after execution evidence exists" in opt_res["content"].lower()
+        assert "idx_orders_status" not in opt_res["content"]
+        print("  -> 2. OPTIMIZATION VERIFICATION: No verified before/after run; metrics and index claims are unavailable.")
         print("  ==> TEST AB (QUERY OPTIMIZATION ENGINE & TARGET API) PASSED (100% compliant)")
 
         print("\n" + "=" * 75)

@@ -60,6 +60,22 @@ interface CodingRequestState {
 
 const CODING_WS_URL = runtimeConfig.codingWsUrl;
 
+export async function codingAuthHeaders(): Promise<Record<string, string>> {
+  const getToken = window.electronAPI?.getDeveloperBackendAuthToken;
+  if (!getToken) {
+    throw new Error('Coding Agent backend access is available only through the trusted desktop application.');
+  }
+  const token = await getToken();
+  if (!token) throw new Error('Coding Agent backend authentication is unavailable.');
+  return { 'X-Coding-Auth': token };
+}
+
+export async function codingFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set('X-Coding-Auth', (await codingAuthHeaders())['X-Coding-Auth']);
+  return fetch(input, { ...init, headers });
+}
+
 export class CodingAgentTransport {
   private socket: WebSocket | null = null;
   private connecting: Promise<WebSocket> | null = null;
@@ -96,7 +112,7 @@ export class CodingAgentTransport {
       });
     } else {
       try {
-        const stateRes = await fetch('http://127.0.0.1:3001/api/coding/project-state');
+        const stateRes = await codingFetch('http://127.0.0.1:3001/api/coding/project-state');
         if (stateRes.ok) {
           const st = await stateRes.json();
           if (st.projectRoot) currentProjectRoot = st.projectRoot;
@@ -145,16 +161,17 @@ export class CodingAgentTransport {
   private async connect(): Promise<WebSocket> {
     if (this.socket?.readyState === WebSocket.OPEN) return this.socket;
     if (this.connecting) return this.connecting;
-    this.connecting = new Promise<WebSocket>((resolve, reject) => {
+    this.connecting = (async () => {
+      const token = (await codingAuthHeaders())['X-Coding-Auth'];
+      return new Promise<WebSocket>((resolve, reject) => {
       const socket = new WebSocket(CODING_WS_URL);
       const timeout = window.setTimeout(() => {
         socket.close();
         reject(new Error('Timed out connecting to the Coding Agent service.'));
       }, runtimeConfig.limits.transportConnectTimeoutMs);
+      let authenticated = false;
       socket.onopen = () => {
-        window.clearTimeout(timeout);
-        this.socket = socket;
-        resolve(socket);
+        socket.send(JSON.stringify({ type: 'authenticate', token }));
       };
       socket.onerror = () => {
         window.clearTimeout(timeout);
@@ -163,15 +180,37 @@ export class CodingAgentTransport {
       socket.onclose = () => {
         this.socket = null;
         this.connecting = null;
+        if (!authenticated) reject(new Error('Coding Agent authentication failed.'));
         for (const [requestId, request] of this.requests) {
           this.requests.delete(requestId);
           request.handlers.onError(new Error('The Coding Agent connection closed before the request completed.'));
         }
       };
       socket.onmessage = (event) => {
+        if (!authenticated) {
+          let response: Record<string, unknown>;
+          try {
+            response = JSON.parse(String(event.data)) as Record<string, unknown>;
+          } catch {
+            socket.close();
+            reject(new Error('Coding Agent authentication failed.'));
+            return;
+          }
+          if (response.type !== 'authenticated' || response.authenticated !== true) {
+            socket.close();
+            reject(new Error('Coding Agent authentication failed.'));
+            return;
+          }
+          authenticated = true;
+          window.clearTimeout(timeout);
+          this.socket = socket;
+          resolve(socket);
+          return;
+        }
         void this.handleMessage(socket, event.data);
       };
-    }).finally(() => {
+      });
+    })().finally(() => {
       this.connecting = null;
     });
     return this.connecting;
@@ -242,7 +281,7 @@ export class CodingAgentTransport {
         if (window.electronAPI) {
           result = await window.electronAPI.executeDeveloperTool(name, args, request.scope);
         } else {
-          const res = await fetch('http://127.0.0.1:3001/api/coding/tool', {
+          const res = await codingFetch('http://127.0.0.1:3001/api/coding/tool', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name, arguments: args, scope: request.scope }),

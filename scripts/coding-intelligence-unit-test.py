@@ -353,10 +353,11 @@ return [
     assert DatabaseIntelligenceEngine.classify_db_error("Database configuration missing or not found") == DbFailureClassification.DB_CONFIG_NOT_FOUND
     assert DatabaseIntelligenceEngine.classify_db_error("SQL syntax error near SELECT") == DbFailureClassification.DB_QUERY_FAILED
 
-    # 4. Safe health check query
+    # 4. Safe health check query: no live execution, so it must remain unverified
     health = DatabaseIntelligenceEngine.bootstrap_safe_health_check(db_info)
     assert health["healthQuery"] == "SELECT 1"
-    assert health["status"] == "HEALTHY"
+    assert health["status"] == "NOT_VERIFIED"
+    assert health["timing_ms"] is None
 
     # 5. Format performance contract report (11 fields, confidence contract)
     # Static code inspection: CODE-LEVEL

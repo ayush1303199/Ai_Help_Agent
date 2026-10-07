@@ -276,6 +276,7 @@ interface Window {
     chooseDeveloperProject: () => Promise<{ canceled: boolean; projectRoot: string | null }>;
     discoverDeveloperProject: (projectName: string) => Promise<{ matches: string[]; projectRoot: string | null }>;
     getDeveloperProjectState: () => Promise<{ status: 'PROJECT_ATTACHED' | 'PROJECT_DETACHED' | 'PROJECT_MISSING' | 'PROJECT_NOT_ATTACHED' | 'PROJECT_STALE' | 'PROJECT_SESSION_RECONNECTING'; projectRoot: string | null; reason?: string | null }>;
+    getDeveloperBackendAuthToken: () => Promise<string>;
     attachDeveloperProject: (projectRoot: string) => Promise<{ status: string; projectRoot: string | null; reason?: string | null }>;
     clearDeveloperProject: () => Promise<void>;
     listDeveloperDirectory: (relativePath?: string) => Promise<Array<{ name: string; type: 'file' | 'directory' }>>;

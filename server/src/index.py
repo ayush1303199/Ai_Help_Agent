@@ -4,11 +4,13 @@ import hashlib
 import json
 import math
 import os
+import secrets
+import hmac
 import threading
 import time
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote_plus, urlparse
 
 from dotenv import load_dotenv
@@ -37,7 +39,7 @@ from backend_config import (
     GENERAL_RETRY_DELAY_SECONDS, MODEL_CATALOG_TIMEOUT_SECONDS, MODEL_REQUEST_TIMEOUT_SECONDS,
     MAX_MODEL_INPUT_CHARS, MAX_MODEL_MESSAGE_CHARS, MAX_MODEL_SYSTEM_CHARS, MAX_PDF_MB,
     MAX_TOKENS, PORT, PROVIDER_RETRY_ATTEMPTS, PROVIDER_RETRY_MAX_SECONDS,
-    CODING_WS_PORT, MEETING_TRANSCRIPTION_PROMPT, STT_TRANSCRIPTION_PROMPT, WS_PORT,
+    CODING_WS_PORT, MEETING_TRANSCRIPTION_PROMPT, STT_TRANSCRIPTION_PROMPT, SERVICES, WS_PORT,
 )
 from coding_websocket import (
     run_coding_websocket_server,
@@ -73,6 +75,16 @@ from stt_service import SttService
 
 load_dotenv()
 
+CODING_AUTH_TOKEN = os.getenv("AI_CODING_AUTH_TOKEN") or secrets.token_urlsafe(32)
+_renderer_host = str((SERVICES.get("devServer") or {}).get("host") or "127.0.0.1")
+_renderer_port = int((SERVICES.get("devServer") or {}).get("port") or 3000)
+TRUSTED_RENDERER_ORIGINS = {
+    f"http://{_renderer_host}:{_renderer_port}",
+    f"http://localhost:{_renderer_port}",
+    f"http://127.0.0.1:{_renderer_port}",
+    "null",
+}
+
 # Initialize provider registry
 registry = ProviderRegistry(config_path=str(CONFIG_PATH))
 registry.initialize(os.environ, PROVIDER_PRESETS)
@@ -83,11 +95,36 @@ stt_service: SttService
 app = FastAPI(title="AI Assistant Backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=sorted(TRUSTED_RENDERER_ORIGINS),
+    allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "X-Coding-Auth"],
 )
+
+
+@app.middleware("http")
+async def authenticate_coding_requests(request: Request, call_next):
+    if request.url.path == "/api/coding" or request.url.path.startswith("/api/coding/"):
+        origin = request.headers.get("origin")
+        supplied_token = request.headers.get("x-coding-auth", "")
+        client_host = request.client.host if request.client else ""
+        is_loopback = client_host in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
+        trusted_origin = (
+            origin is None
+            or origin in TRUSTED_RENDERER_ORIGINS
+            or is_loopback
+        )
+        is_trusted_preflight = request.method == "OPTIONS" and (origin in TRUSTED_RENDERER_ORIGINS or is_loopback)
+        if not trusted_origin or (
+            not is_trusted_preflight
+            and not hmac.compare_digest(supplied_token, CODING_AUTH_TOKEN)
+            and not is_loopback
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized Coding Agent request."},
+            )
+    return await call_next(request)
 
 
 class ProviderSetupRequest(BaseModel):
@@ -1419,6 +1456,14 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
             query = str(args.get("query") or args.get("name") or "").strip()
             syms = UNIVERSAL_INDEX.search_symbols(query)
             return {"ok": True, "data": SecretProtector.redact_data(syms)}
+        elif canonical == "get_context":
+            return {
+                "ok": False,
+                "error": {
+                    "code": "TOOL_UNAVAILABLE",
+                    "message": "No Coding Agent context bridge is available through this endpoint.",
+                },
+            }
         elif canonical == "find_references":
             query = str(args.get("query") or args.get("symbol") or "").strip()
             refs = UNIVERSAL_CODE_GRAPH.get_symbol_references(query)
@@ -1427,7 +1472,15 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
             entries = list_coding_directory_endpoint(".", scope)
             return {"ok": True, "data": {"directories": [e["name"] for e in entries if e["type"] == "directory"]}}
         elif canonical == "execute_sql":
-            raw_sql = str(args.get("sql") or args.get("query") or args.get("command") or "SELECT 1").strip()
+            raw_sql = str(args.get("sql") or args.get("query") or args.get("command") or "").strip()
+            if not raw_sql:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "SQL_REQUIRED",
+                        "message": "A SQL statement is required; no query was executed.",
+                    },
+                }
             st = get_backend_project_state()
             root_str = st.get("projectRoot") or ""
             if not st.get("attached") or not root_str:
@@ -1464,12 +1517,17 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
                     },
                 }
             return {
-                "ok": True,
+                "ok": False,
                 "data": {
                     "command": cmd,
-                    "exitCode": 0,
-                    "output": "Verification passed",
-                    "status": "PASSED",
+                    "executed": False,
+                    "status": "UNAVAILABLE",
+                    "verificationStatus": "UNVERIFIED",
+                    "message": "No verification command was executed by this endpoint.",
+                },
+                "error": {
+                    "code": "VERIFICATION_UNAVAILABLE",
+                    "message": "No verification command was executed by this endpoint.",
                 },
             }
         else:
@@ -3720,7 +3778,12 @@ async def run_websocket_server():
         finally:
             await close_connection_state(state)
     
-    async with serve(ws_handler, "0.0.0.0", WS_PORT):
+    async with serve(
+        ws_handler,
+        "127.0.0.1",
+        WS_PORT,
+        origins=list(TRUSTED_RENDERER_ORIGINS),
+    ):
         print(f"WebSocket server listening on ws://localhost:{WS_PORT}")
         await asyncio.Future()  # run forever
 
@@ -3728,7 +3791,13 @@ async def run_websocket_server():
 async def run_all_websocket_servers():
     await asyncio.gather(
         run_websocket_server(),
-        run_coding_websocket_server(CODING_WS_PORT, registry, CONFIG_PATH),
+        run_coding_websocket_server(
+            CODING_WS_PORT,
+            registry,
+            CONFIG_PATH,
+            auth_token=CODING_AUTH_TOKEN,
+            trusted_origins=sorted(TRUSTED_RENDERER_ORIGINS),
+        ),
     )
 
 
@@ -3737,7 +3806,7 @@ if __name__ == "__main__":
 
     # Start HTTP server in main thread
     server_thread = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info"),
+        target=lambda: uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info"),
         daemon=True
     )
     server_thread.start()

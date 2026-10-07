@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   chooseDeveloperProject: () => ipcRenderer.invoke('developer:choose-project'),
   discoverDeveloperProject: (projectName) => ipcRenderer.invoke('developer:discover-project', { projectName }),
   getDeveloperProjectState: () => ipcRenderer.invoke('developer:project-state'),
+  getDeveloperBackendAuthToken: () => ipcRenderer.invoke('developer:backend-auth-token'),
   attachDeveloperProject: (projectRoot) => ipcRenderer.invoke('developer:project-attach', { projectRoot }),
   clearDeveloperProject: () => ipcRenderer.invoke('developer:clear-project'),
   listDeveloperDirectory: (relativePath) => ipcRenderer.invoke('developer:list-directory', relativePath),

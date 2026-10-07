@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import json
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -43,6 +44,7 @@ from coding_intelligence import (  # noqa: E402
     DatabaseSessionManager,
     DatabaseState,
     DatabaseTargetRegistry,
+    EngineeringCommandNormalizer,
     QueryToSourceMapper,
     SecretTransformer,
 )
@@ -61,13 +63,24 @@ from coding_websocket import (  # noqa: E402
     _match_pending_database_clarification,
     _has_verified_live_database_evidence,
     _is_contextual_database_credential_request,
-    _resolve_database_action_with_model,
-    _validate_database_action_selection,
+    _resolve_semantic_task_with_model,
+    _summarize_database_connection_status,
+    _build_semantic_task,
+    _validate_task_action_selection,
     _requires_proposal,
     _requires_proposal_for_conversation,
     _serialize_coding_tool_result,
+    _compile_agent_task_context,
+    _resume_semantic_task,
+    _action_fingerprint,
+    _next_credential_investigation_action,
+    _update_task_completeness,
+    _update_task_from_tool_result,
+    _requires_investigation_evidence_gate,
+    _investigation_evidence_gate,
     _validate_tool_call,
     _run_coding_turn,
+    run_coding_websocket_server,
     classify_task_intent,
     understand_human_request,
     TaskIntent,
@@ -666,9 +679,33 @@ class CodingConversationBudgetTests(unittest.TestCase):
         self.assertIn("read_file", finalized[1]["content"])
         self.assertFalse(any(item.get("role") == "tool" or item.get("tool_calls") for item in finalized))
         self.assertIn("Finish the response now.", finalized[0]["content"])
-        self.assertIn("include the existing flow you traced", finalized[0]["content"])
-        self.assertIn("distinguish observed facts from inferences", finalized[0]["content"])
-        self.assertIn("tests or runtime checks that remain unverified", finalized[0]["content"])
+        self.assertIn("distinguish observations from hypotheses", finalized[0]["content"])
+        self.assertIn("do not force a fixed report template", finalized[0]["content"])
+
+    def test_finalization_uses_task_state_without_fixed_intent_formatting(self):
+        task = _build_semantic_task(
+            request_id="finalization-task",
+            user_message="Why is the database connection unavailable?",
+            intent="DATABASE_INVESTIGATION",
+            resources=["DATABASE", "CODE"],
+            target="active project connection",
+            project_root="C:\\project",
+            scope=".",
+            architecture={},
+            required_evidence=["Configuration", "runtime connection"],
+            conversation_message_count=1,
+        )
+
+        finalized = _coding_finalization_messages(
+            [{"role": "user", "content": "Why is the database connection unavailable?"}],
+            task_state=task,
+        )
+
+        self.assertIn("Current authoritative AgentTaskState", finalized[0]["content"])
+        self.assertIn('"primary": "DATABASE_INVESTIGATION"', finalized[0]["content"])
+        self.assertIn("distinguish source configuration, active session state, and live runtime verification", finalized[0]["content"])
+        self.assertNotIn("### DATABASE DISCOVERY & INSPECTION", finalized[0]["content"])
+        self.assertNotIn("### DIRECT ANSWER", finalized[0]["content"])
 
     def test_proposal_finalization_retains_the_active_goal_and_rejects_diff_summarization(self):
         original_request = "Fix the duplicate query in getProgrammes and prepare a proposal."
@@ -877,11 +914,24 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
             "executionStatus": "SUCCESS",
             "liveDatabase": {"status": "NOT_VERIFIED", "evidence": None},
         }))
-        self.assertTrue(_has_verified_live_database_evidence({
+        self.assertFalse(_has_verified_live_database_evidence({
             "mode": "LIVE",
             "source": DatabaseEvidenceSource.LIVE_DB_EXECUTION,
             "executionStatus": "SUCCESS",
             "evidenceId": "live-proof",
+        }))
+        proof = DatabaseExecutionProof(
+            evidence_id="live-proof",
+            database_session_id="database-session",
+            database_engine="sqlite",
+            operation=DatabaseCapability.DATABASE_HEALTH_CHECK,
+            source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+            mode="LIVE",
+            execution_status="SUCCESS",
+        )
+        DatabaseEvidenceStore.record_proof(proof)
+        self.assertTrue(_has_verified_live_database_evidence({
+            "evidenceId": proof.evidence_id,
         }))
 
         verified_session = DatabaseSession(
@@ -1267,7 +1317,6 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
         self.assertEqual(count["arguments"]["entity"], "user")
 
         for request, expected_target in (
-            ("show users", "user"),
             ("show me user data", "user"),
             ("show latest 10 users", "user"),
         ):
@@ -1276,6 +1325,10 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
                 self.assertTrue(resolved["is_deterministic"])
                 self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_QUERY)
                 self.assertEqual(resolved["arguments"]["entity"], expected_target)
+        self.assertFalse(
+            DatabaseSessionManager.resolve_database_intent("show users")["is_deterministic"],
+            "An unqualified object name must not be assumed to be a database table.",
+        )
 
         location = DatabaseSessionManager.resolve_database_intent("where user email")
         self.assertTrue(location["is_deterministic"])
@@ -1346,6 +1399,234 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
         self.assertEqual(active_today["target"], "users")
         self.assertEqual(active_today["constraints"], ["active", "today"])
         self.assertEqual(understand_human_request("count total personal")["target"], "personal")
+
+    def test_semantic_task_contract_keeps_intent_target_resources_and_evidence_distinct(self):
+        task = _build_semantic_task(
+            request_id="semantic-task-1",
+            user_message="How is this data fetched?",
+            intent="DATA_FLOW_TRACE",
+            resources=["CODE", "API", "DATABASE"],
+            target="this data",
+            project_root="C:\\project",
+            scope="src",
+            architecture={"languages": ["php"], "frameworks": ["yii"]},
+            required_evidence=["route", "controller", "query"],
+            verification_plan="Trace the request and response path.",
+            conversation_message_count=3,
+        )
+
+        self.assertEqual(task["taskId"], "semantic-task-1")
+        self.assertEqual(task["intent"]["primary"], "DATA_FLOW_TRACE")
+        self.assertEqual(task["target"]["userReference"], "this data")
+        self.assertEqual(task["resolvedResources"], ["CODE", "API", "DATABASE"])
+        self.assertTrue(task["conversationContext"]["used"])
+        self.assertEqual(task["projectContext"]["frameworks"], ["yii"])
+        self.assertEqual(task["requiredEvidence"], ["route", "controller", "query"])
+        self.assertEqual(task["verificationPlan"], "Trace the request and response path.")
+        self.assertFalse(task["clarificationRequired"])
+
+    def test_task_state_links_tool_facts_to_evidence_and_synchronizes_working_memory(self):
+        task = _build_semantic_task(
+            request_id="state-action-1",
+            user_message="Find the request handler.",
+            intent="CODE_QUESTION",
+            resources=["CODE"],
+            target="request handler",
+            project_root="C:\\project",
+            scope="src",
+            architecture={},
+            required_evidence=["Read the handler source."],
+            conversation_message_count=1,
+        )
+        action = {
+            "actionId": "action-read-handler",
+            "tool": "read_file",
+            "target": "src/handler.py",
+            "arguments": {"relativePath": "src/handler.py"},
+            "expectedEvidence": "Read the handler source.",
+            "resultEvidenceIds": [],
+        }
+        task["actions"].append(action)
+
+        _update_task_from_tool_result(
+            task,
+            action,
+            {"ok": True, "data": {"path": "src/handler.py", "content": "def handle(): pass"}},
+            '{"ok":true,"data":{"path":"src/handler.py","content":"def handle(): pass"}}',
+            "state-action-1",
+        )
+
+        self.assertEqual(action["status"], "SUCCESS")
+        evidence_ids = {item["evidenceId"] for item in task["evidence"]}
+        self.assertEqual(action["resultEvidenceIds"], ["ev-action-read-handler"])
+        self.assertTrue(all(item["evidenceId"] in evidence_ids for item in task["facts"]))
+        self.assertEqual(task["unknowns"], [])
+        self.assertEqual(task["knowledgeRevision"], 1)
+        self.assertEqual(task["workingMemory"]["previousActions"], task["actions"])
+        self.assertEqual(task["resources"][0]["status"], "AVAILABLE")
+        compiled = _compile_agent_task_context(task)
+        self.assertEqual(compiled["actions"], task["actions"][-8:])
+        self.assertEqual(
+            compiled["workingMemory"]["candidateResources"],
+            ["CODE"],
+        )
+        self.assertEqual(
+            compiled["workingMemory"]["completedInvestigations"],
+            [],
+        )
+
+    def test_explicit_continue_resumes_the_same_task_and_working_memory(self):
+        prior = _build_semantic_task(
+            request_id="task-original-turn",
+            session_id="continue-session",
+            user_message="Find the configured database username.",
+            intent="DATABASE_CREDENTIAL_REQUEST",
+            resources=["DATABASE", "CONFIGURATION"],
+            target="database configuration",
+            project_root="C:\\project",
+            scope=".",
+            architecture={},
+            required_evidence=["Resolve the configured username."],
+            conversation_message_count=1,
+        )
+        prior["reasoningCycle"] = 3
+        prior["actions"].append({
+            "actionId": "task-original-turn:database:1",
+            "tool": "DATABASE_CREDENTIAL_REQUEST",
+            "status": "SUCCESS",
+        })
+        prior["evidence"].append({
+            "evidenceId": "ev-task-original-turn",
+            "summary": '{"username":"NOT_RESOLVED"}',
+        })
+        prior["workingMemory"]["previousActions"] = prior["actions"]
+
+        current = _build_semantic_task(
+            request_id="task-continue-turn",
+            session_id="continue-session",
+            user_message="continue",
+            intent="UNRESOLVED",
+            resources=[],
+            target=None,
+            project_root="C:\\project",
+            scope=".",
+            architecture={},
+            conversation_message_count=3,
+            conversation_messages=[
+                {"role": "user", "content": prior["originalRequest"]},
+                {"role": "assistant", "content": "The username is not resolved yet."},
+                {"role": "user", "content": "continue"},
+            ],
+        )
+
+        resumed = _resume_semantic_task(prior, current, "continue", "task-continue-turn")
+        compiled = _compile_agent_task_context(resumed)
+
+        self.assertEqual(resumed["taskId"], prior["taskId"])
+        self.assertEqual(resumed["turnId"], "task-continue-turn")
+        self.assertEqual(resumed["originalRequest"], prior["originalRequest"])
+        self.assertEqual(resumed["currentRequest"], "continue")
+        self.assertEqual(resumed["reasoningCycle"], 3)
+        self.assertEqual(resumed["actions"], prior["actions"])
+        self.assertEqual(resumed["evidence"], prior["evidence"])
+        self.assertTrue(resumed["conversationContext"]["continuityDetected"])
+        self.assertEqual(compiled["currentRequest"], "continue")
+
+    def test_task_evidence_keeps_redacted_json_parseable(self):
+        task = _build_semantic_task(
+            request_id="state-json-evidence",
+            user_message="Show the configured database username.",
+            intent="DATABASE_INVESTIGATION",
+            resources=["DATABASE"],
+            target="database configuration",
+            project_root="C:\\project",
+            scope=".",
+            architecture={},
+            conversation_message_count=1,
+        )
+        action = {
+            "actionId": "action-database-credentials",
+            "tool": "DATABASE_CREDENTIAL_REQUEST",
+            "target": "active database",
+            "arguments": {"properties": ["username"]},
+            "resultEvidenceIds": [],
+        }
+        task["actions"].append(action)
+        result = {
+            "ok": True,
+            "username": "app_user",
+            "password": "never-persist-this-password",
+            "content": "username: app_user",
+        }
+
+        _update_task_from_tool_result(
+            task,
+            action,
+            result,
+            json.dumps(result),
+            "state-json-evidence",
+        )
+
+        evidence = task["evidence"][0]
+        summary = json.loads(evidence["summary"])
+        self.assertEqual(summary["username"], "app_user")
+        self.assertEqual(summary["password"], "[REDACTED]")
+        self.assertNotIn("never-persist-this-password", evidence["summary"])
+
+    def test_task_state_failed_action_adds_no_evidence_and_retains_unknown(self):
+        task = _build_semantic_task(
+            request_id="state-action-failure",
+            user_message="Find the request handler.",
+            intent="CODE_QUESTION",
+            resources=["CODE"],
+            target="request handler",
+            project_root="C:\\project",
+            scope="src",
+            architecture={},
+            required_evidence=["Read the handler source."],
+            conversation_message_count=1,
+        )
+        action = {
+            "actionId": "action-read-handler-failed",
+            "tool": "read_file",
+            "target": "src/handler.py",
+            "arguments": {"relativePath": "src/handler.py"},
+            "expectedEvidence": "Read the handler source.",
+            "resultEvidenceIds": [],
+        }
+        task["actions"].append(action)
+
+        _update_task_from_tool_result(
+            task,
+            action,
+            {"ok": False, "error": "file not found"},
+            '{"ok":false,"error":"file not found"}',
+            "state-action-failure",
+        )
+
+        self.assertEqual(action["status"], "FAILED")
+        self.assertEqual(task["evidence"], [])
+        self.assertEqual(task["facts"], [])
+        self.assertEqual(task["unknowns"][0]["question"], "Read the handler source.")
+        self.assertEqual(task["failedActions"][0]["knowledgeRevision"], 0)
+        self.assertEqual(task["resources"][0]["status"], "UNAVAILABLE")
+
+    def test_task_state_redacts_secrets_from_persisted_memory(self):
+        task = _build_semantic_task(
+            request_id="state-safe-memory",
+            user_message="Check database password=supersecret123",
+            intent="DATABASE_INVESTIGATION",
+            resources=["DATABASE"],
+            target="password=supersecret123",
+            project_root="C:\\project",
+            scope=".",
+            architecture={},
+            required_evidence=["Inspect password=supersecret123 safely."],
+            conversation_message_count=1,
+        )
+
+        self.assertNotIn("supersecret123", json.dumps(task))
+        self.assertIn("[REDACTED]", task["userMessage"])
 
     def test_show_records_resolves_live_table_bounds_rows_and_clarifies_ambiguous_target(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2254,12 +2535,16 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
             "mydb connection user and passwd kiya hai",
             "show my db username and password",
             "show my db username and passwod",
+            "sow my db useranme and passwod",
         ):
             with self.subTest(request=request):
                 resolved = DatabaseSessionManager.resolve_database_intent(request)
                 self.assertTrue(resolved["is_deterministic"])
                 self.assertEqual(resolved["capability"], DatabaseCapability.DATABASE_CREDENTIAL_REQUEST)
-                self.assertTrue(DATABASE_CREDENTIAL_REQUEST_PATTERN.search(request))
+                normalized = EngineeringCommandNormalizer.normalize(request)
+                self.assertTrue(DATABASE_CREDENTIAL_REQUEST_PATTERN.search(normalized))
+                if request.startswith("sow "):
+                    self.assertIn("username", normalized)
 
         session = DatabaseSession(
             project_id="test-project",
@@ -2300,6 +2585,12 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
                 session,
                 ".",
             )
+            username_result = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                {"properties": ["username"]},
+                session,
+                ".",
+            )
 
         self.assertTrue(result["ok"])
         self.assertIn("**Database:** admissions", result["content"])
@@ -2308,10 +2599,128 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
         self.assertIn("**Password:** [REDACTED]", result["content"])
         self.assertNotIn("test-only-secret", result["content"])
         self.assertNotIn("test-only-secret", json.dumps(result))
+        self.assertEqual(result["credentialSource"], "config/db.php")
         self.assertEqual(result["database"], "admissions")
         self.assertEqual(result["password"], "[REDACTED]")
         self.assertEqual(result["targetId"], "DB-004")
         self.assertNotIn("stale_user", result["content"])
+        self.assertEqual(username_result["content"], "username: configured_user")
+        self.assertNotIn("test-only-secret", username_result["content"])
+
+    def test_credential_capability_does_not_claim_password_is_configured_without_evidence(self):
+        session = DatabaseSession(
+            project_id="test-project",
+            repository_id="test-repository",
+            project_root=".",
+            database_type="unknown",
+            database_name=None,
+            connection_state="DISCONNECTED",
+            target_id=None,
+        )
+        with patch.object(
+            DatabaseIntelligenceEngine,
+            "discover_database_configuration",
+            return_value={"discovered": False, "engine": "unknown"},
+        ), patch.object(
+            ConfigurationSymbolResolver,
+            "get_credential",
+            return_value={},
+        ), patch.object(
+            DatabaseTargetRegistry,
+            "get_active_target",
+            return_value=None,
+        ):
+            result = DatabaseSessionManager.execute_database_capability(
+                DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                {},
+                session,
+                ".",
+            )
+
+        self.assertEqual(result["credentialStatus"], "NOT_VERIFIED")
+        self.assertIn("**Credential status:** NOT_VERIFIED", result["content"])
+        self.assertIn("**Credential source:** NOT_RESOLVED", result["content"])
+        self.assertEqual(result["credentialSource"], "NOT_RESOLVED")
+        self.assertEqual(result["password"], "[REDACTED]")
+
+    def test_credential_planner_avoids_repeating_actions_without_new_evidence(self):
+        task = {
+            "knowledgeRevision": 0,
+            "requiredFacts": [{"name": "username", "status": "NOT_YET_RESOLVED"}],
+            "actions": [],
+        }
+        first = _next_credential_investigation_action(task, ".")
+        self.assertEqual(first["tool"], "search_code")
+        self.assertEqual(first["arguments"]["query"], "DB_USERNAME")
+        task["actions"].append({
+            "tool": first["tool"],
+            "target": first["target"],
+            "fingerprint": first["fingerprint"],
+            "status": "SUCCESS",
+            "lastResult": {"data": {"results": []}},
+            "resultKnowledgeRevision": 0,
+        })
+
+        second = _next_credential_investigation_action(task, ".")
+        self.assertIsNotNone(second)
+        self.assertNotEqual(second["fingerprint"], first["fingerprint"])
+        self.assertEqual(second["tool"], "search_code")
+        self.assertEqual(second["arguments"]["query"], "DB_USER")
+
+    def test_credential_task_only_requires_requested_properties(self):
+        task = _build_semantic_task(
+            request_id="credential-field-scope",
+            user_message="show my db username",
+            intent=TaskIntent.DATABASE_CREDENTIAL_REQUEST,
+            resources=["DATABASE", "CONFIGURATION"],
+            target=None,
+            project_root=".",
+            scope=".",
+            architecture={},
+            capability=DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+            capability_arguments={},
+        )
+        self.assertEqual(
+            [fact["name"] for fact in task["requiredFacts"]],
+            ["username"],
+        )
+        self.assertEqual(task["capabilityArguments"]["properties"], ["username"])
+
+    def test_typoed_credential_fields_become_required_task_facts(self):
+        task = _build_semantic_task(
+            request_id="credential-typos",
+            user_message="sow my db useranme and passwod",
+            intent=TaskIntent.DATABASE_CREDENTIAL_REQUEST,
+            resources=["DATABASE", "CONFIGURATION"],
+            target=None,
+            project_root=".",
+            scope=".",
+            architecture={},
+            capability=DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+            capability_arguments={},
+        )
+        self.assertEqual(
+            [fact["name"] for fact in task["requiredFacts"]],
+            ["passwordPresence", "username"],
+        )
+        self.assertEqual(
+            task["capabilityArguments"]["properties"],
+            ["password", "username"],
+        )
+
+    def test_credential_task_completion_requires_verified_required_facts(self):
+        task = {
+            "requiredFacts": [
+                {"name": "username", "status": "NOT_YET_RESOLVED"},
+                {"name": "databaseName", "status": "VERIFIED", "value": "admissions"},
+            ],
+            "investigationExhausted": True,
+            "workingMemory": {},
+        }
+        _update_task_completeness(task)
+        self.assertFalse(task["requiredEvidenceSatisfied"])
+        self.assertFalse(task["objectiveSatisfied"])
+        self.assertEqual([fact["name"] for fact in task["workingMemory"]["unresolvedFacts"]], ["username"])
 
     def test_generic_username_password_request_uses_redacted_database_credential_path(self):
         request = "show my username and passwd"
@@ -2337,16 +2746,22 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
                 "content": "### DATABASE TABLES INSPECTION\nDatabase: final_admission\nTables found: 200",
             },
         ]
-        for request in ("show me username", "show me passwd"):
+        self.assertFalse(_is_contextual_database_credential_request(
+            "show me username",
+            [*prior_turns, {"role": "user", "content": "show me username"}],
+        ))
+        self.assertFalse(_is_contextual_database_credential_request(
+            "what login name is configured for the database",
+            [*prior_turns, {"role": "user", "content": "what login name is configured for the database"}],
+        ))
+        self.assertTrue(_is_contextual_database_credential_request(
+            "show me passwd",
+            [*prior_turns, {"role": "user", "content": "show me passwd"}],
+        ))
+        for request in ("show username", "show user name"):
             with self.subTest(request=request):
-                self.assertTrue(_is_contextual_database_credential_request(
-                    request,
-                    [*prior_turns, {"role": "user", "content": request}],
-                ))
-                self.assertFalse(_is_contextual_database_credential_request(
-                    request,
-                    [{"role": "user", "content": request}],
-                ))
+                resolved = DatabaseSessionManager.resolve_database_intent(request)
+                self.assertFalse(resolved["is_deterministic"])
 
     def test_table_list_and_connected_database_phrasings_resolve_deterministically(self):
         for table_request in ("show me all table", "show my all table"):
@@ -2367,10 +2782,10 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
                 self.assertEqual(classify_task_intent(request)["intent"], TaskIntent.DATABASE_CURRENT_TARGET)
 
     def test_model_database_action_selection_is_allowlisted_and_validated(self):
-        selected = _validate_database_action_selection({
+        selected = _validate_task_action_selection({
             "tool_calls": [{
                 "function": {
-                    "name": "select_database_action",
+                    "name": "select_task_action",
                     "arguments": json.dumps({
                         "operation": DatabaseCapability.DATABASE_COUNT_RECORDS,
                         "arguments": {
@@ -2388,10 +2803,62 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
         self.assertEqual(selected["arguments"]["row_limit"], 50)
         self.assertTrue(selected["resolved_by_model"])
 
-        clarification = _validate_database_action_selection({
+        omitted_arguments = _validate_task_action_selection({
             "tool_calls": [{
                 "function": {
-                    "name": "select_database_action",
+                    "name": "select_task_action",
+                    "arguments": json.dumps({
+                        "operation": DatabaseCapability.DATABASE_LIST_DATABASES,
+                    }),
+                },
+            }],
+        })
+        self.assertEqual(omitted_arguments["capability"], DatabaseCapability.DATABASE_LIST_DATABASES)
+        self.assertEqual(omitted_arguments["arguments"], {})
+
+        property_selection = _validate_task_action_selection({
+            "tool_calls": [{
+                "function": {
+                    "name": "select_task_action",
+                    "arguments": json.dumps({
+                        "operation": DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                        "arguments": {"properties": ["username", "password"]},
+                    }),
+                },
+            }],
+        })
+        self.assertEqual(
+            property_selection["arguments"]["properties"],
+            ["username", "password"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "unsupported database configuration properties"):
+            _validate_task_action_selection({
+                "tool_calls": [{
+                    "function": {
+                        "name": "select_task_action",
+                        "arguments": json.dumps({
+                            "operation": DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                            "arguments": {"properties": ["apiKey"]},
+                        }),
+                    },
+                }],
+            })
+
+        code_route = _validate_task_action_selection({
+            "tool_calls": [{
+                "function": {
+                    "name": "select_task_action",
+                    "arguments": json.dumps({"operation": "ROUTE_TO_CODE"}),
+                },
+            }],
+        })
+        self.assertFalse(code_route["is_deterministic"])
+        self.assertTrue(code_route["route_to_code"])
+
+        clarification = _validate_task_action_selection({
+            "tool_calls": [{
+                "function": {
+                    "name": "select_task_action",
                     "arguments": json.dumps({
                         "operation": "CLARIFY",
                         "arguments": {},
@@ -2402,16 +2869,36 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
         })
         self.assertEqual(clarification["clarification"], "Which of these two databases do you mean?")
 
+        answer = _validate_task_action_selection({
+            "tool_calls": [{
+                "function": {
+                    "name": "select_task_action",
+                    "arguments": json.dumps({
+                        "operation": "ANSWER",
+                        "answer": "The active database is admissions.",
+                    }),
+                },
+            }],
+        })
+        self.assertEqual(answer["answer"], "The active database is admissions.")
+
         for selection in (
             {"operation": "DROP_DATABASE", "arguments": {}},
             {"operation": DatabaseCapability.DATABASE_QUERY, "arguments": {"sql": "DROP TABLE users"}},
             {"operation": DatabaseCapability.DATABASE_COUNT_RECORDS, "arguments": {"entity": "users", "unsafe": True}},
+            {"operation": "ROUTE_TO_CODE", "confidence": 1.1},
+            {"operation": "ROUTE_TO_CODE", "resources": [{"type": "DATABASE"}]},
+            {
+                "operation": DatabaseCapability.DATABASE_LIST_TABLES,
+                "intent": "SOURCE_CHANGE",
+                "arguments": {},
+            },
         ):
             with self.subTest(selection=selection), self.assertRaises(RuntimeError):
-                _validate_database_action_selection({
+                _validate_task_action_selection({
                     "tool_calls": [{
                         "function": {
-                            "name": "select_database_action",
+                            "name": "select_task_action",
                             "arguments": json.dumps(selection),
                         },
                     }],
@@ -2429,10 +2916,28 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
             "tool_calls": [{
                 "id": "select-db-action",
                 "function": {
-                    "name": "select_database_action",
+                    "name": "select_task_action",
                     "arguments": json.dumps({
                         "operation": DatabaseCapability.DATABASE_LIST_TABLES,
                         "arguments": {},
+                        "intent": "LIST_TABLES",
+                        "goal": "List tables in the active database.",
+                        "resources": [{
+                            "type": "DATABASE",
+                            "reason": "The requested evidence is the active live schema.",
+                            "confidence": 0.99,
+                        }],
+                        "target": "tables",
+                        "target_type": "DATABASE",
+                        "confidence": 0.98,
+                        "target_candidates": [{
+                            "value": "admissions tables",
+                            "type": "database_schema",
+                            "evidence": "The conversation identifies admissions as the active database.",
+                            "score": 0.92,
+                        }],
+                        "required_evidence": ["live schema"],
+                        "verification_plan": "List tables from the active database session.",
                     }),
                 },
             }],
@@ -2448,7 +2953,7 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
             "coding_websocket.complete_coding_model",
             return_value=(response, provider),
         ) as complete:
-            selected = asyncio.run(_resolve_database_action_with_model(
+            selected = asyncio.run(_resolve_semantic_task_with_model(
                 registry,
                 Path("unused-provider-config.json"),
                 messages,
@@ -2460,15 +2965,35 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
 
         self.assertEqual(selected["capability"], DatabaseCapability.DATABASE_LIST_TABLES)
         self.assertTrue(selected["resolved_by_model"])
+        self.assertEqual(selected["semanticTask"]["intent"], "LIST_TABLES")
+        self.assertEqual(selected["semanticTask"]["goal"], "List tables in the active database.")
+        self.assertEqual(selected["semanticTask"]["resourceCandidates"], ["DATABASE"])
+        self.assertEqual(selected["semanticTask"]["target"], "tables")
+        self.assertEqual(selected["semanticTask"]["targetType"], "DATABASE")
+        self.assertEqual(selected["semanticTask"]["confidence"], 0.98)
+        self.assertEqual(selected["semanticTask"]["targetCandidates"][0]["value"], "admissions tables")
+        self.assertEqual(selected["semanticTask"]["targetCandidates"][0]["score"], 0.92)
+        self.assertEqual(selected["semanticTask"]["resourceDetails"][0]["reason"], "The requested evidence is the active live schema.")
+        self.assertEqual(selected["semanticTask"]["selectedAction"], DatabaseCapability.DATABASE_LIST_TABLES)
+        self.assertEqual(selected["semanticTask"]["requiredEvidence"], ["live schema"])
+        self.assertEqual(selected["semanticTask"]["verificationPlan"], "List tables from the active database session.")
         call = complete.call_args
         self.assertEqual(call.args[2][-3:], messages)
         self.assertEqual(
-            call.args[2][0]["content"].split("Safe active database context: ", 1)[1],
+            call.args[2][0]["content"].split("Safe task context: ", 1)[1],
             json.dumps(safe_context, ensure_ascii=False),
         )
-        self.assertEqual([tool["function"]["name"] for tool in call.args[3]], ["select_database_action"])
+        self.assertEqual([tool["function"]["name"] for tool in call.args[3]], ["select_task_action"])
         self.assertEqual(call.args[4], provider.id)
         self.assertTrue(call.args[5], "Action resolution must require a structured model tool call.")
+        self.assertEqual(
+            call.args[3][0]["function"]["parameters"]["required"],
+            ["operation"],
+            "Providers must not be required to emit an empty nested arguments object.",
+        )
+        self.assertIn("ROUTE_TO_CODE", call.args[3][0]["function"]["parameters"]["properties"]["operation"]["enum"])
+        self.assertIn("safe task-scoped working memory", call.args[2][0]["content"])
+        self.assertIn("entire supplied conversation", call.args[2][0]["content"])
 
     def test_provider_messages_hash_credentials_before_external_request(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2604,7 +3129,7 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
         ), patch.object(DatabaseIntelligenceEngine, "_find_h2_jar", return_value="h2.jar"):
             opened = DatabaseIntelligenceEngine._open_h2_connection(
                 temporary_directory,
-                {"engine": "h2", "connection_uri": file_url},
+                {"engine": "h2", "connection_uri": file_url, "username": "sa"},
             )
             self.assertIs(opened, connection)
             self.assertEqual(
@@ -3161,7 +3686,805 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
 
 
 class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
-    async def test_database_model_resolution_failure_never_executes_action(self):
+    async def test_typoed_database_credential_request_uses_redacted_fast_path(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            session = SimpleNamespace(
+                project_root=project_root,
+                database_type="mysql",
+                database_name="test_db",
+                connection_state="CONNECTED",
+                target_id="DB-TEST",
+                safe_host="db.internal",
+                safe_port=3306,
+                connection_capabilities={},
+                to_safe_dict=lambda: {"targetId": "DB-TEST"},
+            )
+            secret = "do-not-return-this-password"
+            result = {
+                "ok": True,
+                "capability": DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                "content": (
+                    "### DATABASE CREDENTIALS REPORT\n"
+                    "- **Username:** app_user\n"
+                    "- **Password:** [REDACTED]"
+                ),
+                "credentialStatus": "CONFIGURED",
+                "username": "app_user",
+                "database": "test_db",
+                "password": "[REDACTED]",
+                "executionStatus": "SUCCESS",
+                "executed": True,
+            }
+            with patch(
+                "coding_websocket.ProjectContextLock.resolve_authoritative_root",
+                return_value=project_root,
+            ), patch("coding_websocket.ProjectContextLock.lock"), patch(
+                "coding_websocket.set_backend_project_state"
+            ), patch("coding_websocket.detect_project_architecture", return_value={}), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+                return_value={
+                    "discovered": True,
+                    "engine": "mysql",
+                    "database": "test_db",
+                    "username": "app_user",
+                    "has_credentials": True,
+                },
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "check_database_capabilities",
+                return_value={"available_paths": ["application_client"]},
+            ), patch.object(
+                ConfigurationSymbolResolver,
+                "get_credential",
+                return_value={"username": "app_user", "password": secret},
+            ), patch.object(
+                DatabaseSessionManager,
+                "get_session",
+                return_value=session,
+            ), patch.object(
+                DatabaseSessionManager,
+                "get_or_create_session",
+                return_value=session,
+            ), patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(side_effect=AssertionError("credential request must not reach the model")),
+            ) as resolve_task, patch.object(
+                DatabaseSessionManager,
+                "execute_database_capability",
+                return_value=result,
+            ) as execute_capability:
+                await _run_coding_turn(
+                    {
+                        "requestId": "typoed-db-credentials",
+                        "sessionId": "typoed-db-credentials-session",
+                        "projectRoot": project_root,
+                        "messages": [{
+                            "role": "user",
+                            "content": "sow my db useranme and passwod",
+                        }],
+                    },
+                    send_json,
+                    {"pending": {}, "completed": {}, "tasks": set()},
+                    None,
+                    "",
+                )
+
+            resolve_task.assert_not_awaited()
+            execute_capability.assert_called_once_with(
+                DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                {},
+                unittest.mock.ANY,
+                project_root=project_root,
+            )
+            done = next(message for message in sent if message.get("type") == "done")
+            self.assertEqual(done["intent"], TaskIntent.DATABASE_CREDENTIAL_REQUEST)
+            self.assertIn("Username:** app_user", done["content"])
+            self.assertIn("Password:** [REDACTED]", done["content"])
+            self.assertNotIn(secret, json.dumps(sent))
+
+    async def test_unresolved_database_credentials_are_not_marked_completed(self):
+        sent = []
+
+        async def send_json(payload):
+            sent.append(payload)
+
+        session = SimpleNamespace(
+            project_root="",
+            database_type="unknown",
+            database_name=None,
+            connection_state="DISCONNECTED",
+            target_id=None,
+            safe_host=None,
+            safe_port=None,
+            connection_capabilities={},
+            to_safe_dict=lambda: {"connectionState": "DISCONNECTED"},
+        )
+        with patch(
+            "coding_websocket.ProjectContextLock.resolve_authoritative_root",
+            return_value="",
+        ), patch("coding_websocket.ProjectContextLock.lock"), patch(
+            "coding_websocket.set_backend_project_state"
+        ), patch("coding_websocket.detect_project_architecture", return_value={}), patch.object(
+            DatabaseIntelligenceEngine,
+            "discover_database_configuration",
+            return_value={
+                "discovered": False,
+                "status": "DB_CONFIG_NOT_FOUND",
+                "configFile": None,
+                "engine": "unknown",
+                "database": None,
+                "username": None,
+            },
+        ), patch.object(
+            DatabaseIntelligenceEngine,
+            "check_database_capabilities",
+            return_value={"available_paths": []},
+        ), patch.object(
+            ConfigurationSymbolResolver,
+            "get_credential",
+            return_value={},
+        ), patch.object(
+            DatabaseSessionManager,
+            "get_session",
+            return_value=session,
+        ), patch.object(
+            DatabaseSessionManager,
+            "get_or_create_session",
+            return_value=session,
+        ), patch(
+            "coding_websocket._resolve_semantic_task_with_model",
+            new=AsyncMock(side_effect=AssertionError("deterministic request must not use the model")),
+        ) as resolve_task, patch.object(
+            DatabaseSessionManager,
+            "execute_database_capability",
+            return_value={
+                "ok": True,
+                "capability": DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                "content": (
+                    "Username: NOT_RESOLVED\nPassword: [REDACTED]\n"
+                    "Credential source: NOT_RESOLVED"
+                ),
+                "credentialStatus": "NOT_VERIFIED",
+                "username": "NOT_RESOLVED",
+                "database": "NOT_RESOLVED",
+                "password": "[REDACTED]",
+                "executionStatus": "SUCCESS",
+                "executed": True,
+            },
+        ):
+            await _run_coding_turn(
+                {
+                    "requestId": "unresolved-credential-evidence",
+                    "sessionId": "unresolved-credential-evidence-session",
+                    "messages": [{
+                        "role": "user",
+                        "content": "sow my db useranme and passwod",
+                    }],
+                },
+                send_json,
+                {"pending": {}, "completed": {}, "tasks": set()},
+                None,
+                "",
+            )
+
+        resolve_task.assert_not_awaited()
+        done = next(message for message in sent if message.get("type") == "done")
+        self.assertEqual(
+            done["status"],
+            "BLOCKED",
+            json.dumps({
+                "taskStatus": done["agentTaskState"].get("status"),
+                "requiredFacts": done["agentTaskState"].get("requiredFacts"),
+                "content": done.get("content"),
+            }),
+        )
+        self.assertEqual(done["agentTaskState"]["status"], "BLOCKED")
+        self.assertIn("**Username:** Not confirmed", done["content"])
+        self.assertIn("Password:** [REDACTED]", done["content"])
+        self.assertIsNotNone(done["agentTaskState"]["nextAction"])
+
+    async def test_database_reasoning_replans_after_failure_and_uses_evolved_state(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+            decisions = [
+                {
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    "arguments": {"entity": "users"},
+                    "resolved_by_model": True,
+                    "semanticTask": {
+                        "intent": "COUNT",
+                        "goal": "Count users and inspect their schema if needed.",
+                        "resourceCandidates": ["DATABASE"],
+                        "resolvedResources": ["DATABASE"],
+                        "resourceDetails": [],
+                        "confidence": 0.9,
+                    },
+                },
+                {
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+                    "arguments": {"table": "users"},
+                    "resolved_by_model": True,
+                    "semanticTask": {"reasoningSummary": "Inspect the count target schema."},
+                },
+                {
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_CURRENT_TARGET,
+                    "arguments": {},
+                    "resolved_by_model": True,
+                    "semanticTask": {"reasoningSummary": "The schema inspection failed; gather connection evidence instead."},
+                },
+                {
+                    "is_deterministic": False,
+                    "answer": "There are 3 users; schema inspection failed, but the database connection is available.",
+                    "semanticTask": {"reasoningSummary": "The evidence now answers the user."},
+                },
+            ]
+            results = [
+                {"ok": True, "content": "3 users", "executionStatus": "SUCCESS", "databaseType": "mysql"},
+                {"ok": False, "content": "Schema inspection failed", "executionStatus": "FAILED", "databaseType": "mysql"},
+                {"ok": True, "content": "Connection is active", "executionStatus": "SUCCESS", "databaseType": "mysql"},
+            ]
+            state_snapshots = []
+            session = SimpleNamespace(
+                project_root=project_root,
+                target_id="DB-TEST",
+                database_type="mysql",
+                database_name="test_db",
+                connection_state="CONNECTED",
+                connection_capabilities={},
+                to_safe_dict=lambda: {"targetId": "DB-TEST"},
+            )
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            async def resolve_task(*args):
+                state_snapshots.append(args[3].get("activeTaskState") or {})
+                return decisions.pop(0)
+
+            def execute_database_action(*_args, **_kwargs):
+                return results.pop(0)
+
+            with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                "coding_websocket.ProjectContextLock.lock"
+            ), patch("coding_websocket.set_backend_project_state"), patch(
+                "coding_websocket.detect_project_architecture", return_value={}
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+                return_value={"engine": "mysql", "database": "test_db"},
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "check_database_capabilities",
+                return_value={"available_paths": ["application_client"]},
+            ), patch.object(
+                DatabaseSessionManager,
+                "get_session",
+                return_value=session,
+            ), patch.object(
+                DatabaseSessionManager,
+                "get_or_create_session",
+                return_value=session,
+            ), patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(side_effect=resolve_task),
+            ) as resolve_action, patch.object(
+                DatabaseSessionManager,
+                "execute_database_capability",
+                side_effect=execute_database_action,
+            ) as execute_capability:
+                await _run_coding_turn(
+                    {
+                        "requestId": "database-replan-after-failure",
+                        "sessionId": "database-replan-after-failure-session",
+                        "projectRoot": project_root,
+                        "messages": [{"role": "user", "content": "Count users and inspect the relevant evidence."}],
+                    },
+                    send_json,
+                    {"pending": {}, "completed": {}, "tasks": set()},
+                    SimpleNamespace(get_active_provider=lambda: SimpleNamespace(id="test-provider")),
+                    "",
+                )
+
+            self.assertEqual(resolve_action.await_count, 4)
+            self.assertEqual(
+                [call.args[0] for call in execute_capability.call_args_list],
+                [
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+                    DatabaseCapability.DATABASE_CURRENT_TARGET,
+                ],
+            )
+            self.assertGreater(
+                state_snapshots[2]["revision"],
+                state_snapshots[1]["revision"],
+            )
+            done = next(message for message in sent if message.get("type") == "done")
+            state = done["agentTaskState"]
+            self.assertEqual(done["status"], "COMPLETED")
+            self.assertEqual(done["content"], "There are 3 users; schema inspection failed, but the database connection is available.")
+            self.assertEqual(state["reasoningCycle"], 4)
+            self.assertEqual(
+                [item["decision"] for item in state["reasoningHistory"]],
+                [
+                    DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+                    DatabaseCapability.DATABASE_CURRENT_TARGET,
+                    "ANSWER",
+                ],
+            )
+            self.assertEqual(
+                [item["status"] for item in state["actions"]],
+                ["SUCCESS", "FAILED", "SUCCESS"],
+            )
+            self.assertTrue(state["evidence"])
+            self.assertTrue(state["observations"])
+            self.assertIsNone(state["nextAction"])
+
+    async def test_followup_database_clarification_preserves_blocked_state_and_options(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+            question = "Could not determine which value in `pay_status` means paid."
+            options = [
+                {"value": "0", "label": "0 (1 rows)"},
+                {"value": "9", "label": "9 (2 rows)"},
+            ]
+            decisions = [
+                {
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_LIST_TABLES,
+                    "arguments": {},
+                    "resolved_by_model": True,
+                    "semanticTask": {
+                        "intent": "DATABASE_INVESTIGATION",
+                        "goal": "Inspect and count paid admission records.",
+                        "resourceCandidates": ["DATABASE"],
+                        "resolvedResources": ["DATABASE"],
+                        "confidence": 0.9,
+                    },
+                },
+                {
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_COUNT_RECORDS,
+                    "arguments": {"entity": "admissions", "payment_filter": "paid"},
+                    "resolved_by_model": True,
+                    "semanticTask": {"reasoningSummary": "Count paid admissions from the discovered tables."},
+                },
+                {
+                    "is_deterministic": False,
+                    "clarification": question,
+                    "semanticTask": {"reasoningSummary": "The paid status value remains ambiguous."},
+                },
+            ]
+            results = [
+                {
+                    "ok": True,
+                    "content": "Tables: admissions, users",
+                    "executionStatus": "SUCCESS",
+                    "databaseType": "mysql",
+                },
+                {
+                    "ok": True,
+                    "content": question,
+                    "executionStatus": "NEEDS_CLARIFICATION",
+                    "clarificationType": "payment_status_value",
+                    "clarificationOptions": options,
+                    "databaseType": "mysql",
+                },
+            ]
+            state_snapshots = []
+            session = SimpleNamespace(
+                project_root=project_root,
+                target_id="DB-TEST",
+                database_type="mysql",
+                database_name="test_db",
+                connection_state="CONNECTED",
+                connection_capabilities={},
+                to_safe_dict=lambda: {"targetId": "DB-TEST"},
+            )
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            async def resolve_task(*args):
+                state_snapshots.append(args[3].get("activeTaskState") or {})
+                return decisions.pop(0)
+
+            with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                "coding_websocket.ProjectContextLock.lock"
+            ), patch("coding_websocket.set_backend_project_state"), patch(
+                "coding_websocket.detect_project_architecture", return_value={}
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+                return_value={"engine": "mysql", "database": "test_db"},
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "check_database_capabilities",
+                return_value={"available_paths": ["application_client"]},
+            ), patch.object(
+                DatabaseSessionManager,
+                "get_session",
+                return_value=session,
+            ), patch.object(
+                DatabaseSessionManager,
+                "get_or_create_session",
+                return_value=session,
+            ), patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(side_effect=resolve_task),
+            ) as resolve_action, patch.object(
+                DatabaseSessionManager,
+                "execute_database_capability",
+                side_effect=lambda *_args, **_kwargs: results.pop(0),
+            ) as execute_capability:
+                await _run_coding_turn(
+                    {
+                        "requestId": "database-followup-clarification",
+                        "sessionId": "database-followup-clarification-session",
+                        "projectRoot": project_root,
+                        "messages": [{
+                            "role": "user",
+                            "content": "Investigate paid admission records and determine which status values qualify.",
+                        }],
+                    },
+                    send_json,
+                    {"pending": {}, "completed": {}, "tasks": set()},
+                    SimpleNamespace(get_active_provider=lambda: SimpleNamespace(id="test-provider")),
+                    "",
+                )
+
+            self.assertEqual(resolve_action.await_count, 3)
+            self.assertEqual(execute_capability.call_count, 2)
+            blocked_state = state_snapshots[2]
+            self.assertEqual(blocked_state["actions"][-1]["status"], "BLOCKED")
+            self.assertTrue(any(item.get("question") == question for item in blocked_state["unknowns"]))
+            done = next(message for message in sent if message.get("type") == "done")
+            self.assertEqual(done["status"], "NEEDS_CLARIFICATION")
+            self.assertTrue(done["needsClarification"])
+            self.assertEqual(done["content"], question)
+            self.assertEqual(done["clarificationOptions"], options)
+            self.assertEqual(done["agentTaskState"]["status"], "NEEDS_CLARIFICATION")
+            self.assertEqual(done["agentTaskState"]["nextActionName"], "CLARIFY")
+            self.assertTrue(done["agentTaskState"]["clarificationRequired"])
+
+    async def test_connection_status_uses_normal_concise_coding_agent_answer(self):
+        provider = SimpleNamespace(id="status-provider", type="groq", model="test-model")
+        result = {
+            "content": (
+                "### DATABASE CONNECTION STATUS\n"
+                "- **Engine:** Unknown\n"
+                "- **Status:** NOT_VERIFIED\n"
+                "Password: super-secret-value"
+            ),
+            "engine": None,
+            "database": None,
+            "status": "NOT_VERIFIED",
+            "activeSessionState": "DISCONNECTED",
+            "configuredDatabase": {
+                "password": "super-secret-value",
+                "status": "CONFIGURED",
+                "configFile": "config/database.php",
+                "engine": "mysql",
+                "database": {"value": "shop", "status": "RESOLVED"},
+            },
+            "liveDatabase": {
+                "connected": False,
+                "status": "NOT_VERIFIED",
+            },
+        }
+        answer = "I couldn't verify a live database connection, and no database configuration was found in the project."
+        with patch(
+            "coding_websocket.complete_coding_model",
+            return_value=({"role": "assistant", "content": answer}, provider),
+        ) as complete:
+            summarized, selected_provider = await _summarize_database_connection_status(
+                SimpleNamespace(),
+                Path("provider-config.json"),
+                [{"role": "user", "content": "show my db connection"}],
+                result,
+                provider.id,
+                "connection-status-request",
+                "connection-status-session",
+            )
+
+        self.assertEqual(summarized, answer)
+        self.assertEqual(selected_provider, provider)
+        summary_request = complete.call_args.args[2][-1]["content"]
+        sent_messages = json.dumps(complete.call_args.args[2], ensure_ascii=False)
+        self.assertNotIn("super-secret-value", sent_messages)
+        self.assertIn("NOT_VERIFIED", sent_messages)
+        self.assertIn('"connected": false', summary_request)
+        self.assertIn("activeSession", summary_request)
+        self.assertIn("runtimeVerification", summary_request)
+        self.assertIn("configured status alone never proves", complete.call_args.args[2][0]["content"])
+        self.assertIn("normal conversational style", complete.call_args.args[2][0]["content"])
+
+    async def test_code_only_request_gets_model_semantic_decision_before_investigation(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+            with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                "coding_websocket.ProjectContextLock.lock"
+            ), patch("coding_websocket.set_backend_project_state"), patch(
+                "coding_websocket.detect_project_architecture", return_value={}
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+                return_value={"engine": "mysql", "database": "test_db"},
+            ) as discover_database, patch.object(
+                DatabaseIntelligenceEngine,
+                "check_database_capabilities",
+                return_value={"available_paths": ["application_client"]},
+            ), patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(return_value={
+                    "is_deterministic": False,
+                    "route_to_code": True,
+                    "resolved_by_model": True,
+                    "semanticTask": {
+                        "intent": "CODE_QUESTION",
+                        "goal": "Locate the request lifecycle.",
+                        "resourceCandidates": ["CODE", "REPOSITORY"],
+                        "confidence": 0.96,
+                    },
+                }),
+            ) as resolve_action, patch(
+                "coding_websocket.complete_coding_model",
+                return_value=({"role": "assistant", "content": "The connection helper is in src/db.py."}, provider),
+            ), patch.object(
+                DatabaseSessionManager,
+                "execute_database_capability",
+            ) as execute_capability:
+                await _run_coding_turn(
+                    {
+                        "requestId": "route-db-code-question",
+                        "sessionId": "route-db-code-question-session",
+                        "projectRoot": project_root,
+                        "messages": [{"role": "user", "content": "Where is the request lifecycle implemented?"}],
+                    },
+                    send_json,
+                    {"pending": {}, "completed": {}, "tasks": set()},
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+
+            resolve_action.assert_awaited_once()
+            discover_database.assert_not_called()
+            execute_capability.assert_not_called()
+            done = next(message for message in sent if message.get("type") == "done")
+            self.assertIn("src/db.py", done["content"])
+            self.assertEqual(done["semanticTask"]["resolvedResources"], ["CODE", "REPOSITORY"])
+            self.assertEqual(done["semanticTask"]["intent"]["primary"], "CODE_QUESTION")
+            self.assertEqual(done["semanticTask"]["confidence"], 0.96)
+
+    async def test_model_decision_retains_all_resources_for_compound_code_investigation(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+            with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                "coding_websocket.ProjectContextLock.lock"
+            ), patch("coding_websocket.set_backend_project_state"), patch(
+                "coding_websocket.detect_project_architecture", return_value={}
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+                return_value={"engine": "mysql", "database": "test_db"},
+            ) as discover_database, patch.object(
+                DatabaseIntelligenceEngine,
+                "check_database_capabilities",
+                return_value={"available_paths": ["application_client"]},
+            ), patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(return_value={
+                    "is_deterministic": False,
+                    "route_to_code": True,
+                    "resolved_by_model": True,
+                    "semanticTask": {
+                        "intent": "DATA_FLOW_TRACE",
+                        "goal": "Trace the data from request to database and response.",
+                        "resourceCandidates": ["CODE", "API", "DATABASE"],
+                        "requiredEvidence": ["route", "query", "response"],
+                        "confidence": 0.91,
+                    },
+                }),
+            ), patch(
+                "coding_websocket.complete_coding_model",
+                return_value=({"role": "assistant", "content": "The request is served by the existing API path."}, provider),
+            ), patch.object(
+                DatabaseSessionManager,
+                "execute_database_capability",
+            ) as execute_capability:
+                await _run_coding_turn(
+                    {
+                        "requestId": "compound-data-flow",
+                        "sessionId": "compound-data-flow-session",
+                        "projectRoot": project_root,
+                        "messages": [{
+                            "role": "user",
+                            "content": "Trace this data through the API and show how the database result reaches the response.",
+                        }],
+                    },
+                    send_json,
+                    {"pending": {}, "completed": {}, "tasks": set()},
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+
+            discover_database.assert_called_once()
+            execute_capability.assert_not_called()
+            done = next(message for message in sent if message.get("type") == "done")
+            self.assertEqual(done["semanticTask"]["resolvedResources"], ["CODE", "API", "DATABASE"])
+            self.assertEqual(done["semanticTask"]["requiredEvidence"], ["route", "query", "response"])
+            self.assertEqual(done["semanticTask"]["status"], "COMPLETED")
+
+    async def test_follow_up_turn_reuses_task_scoped_semantic_memory(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+            resolver_contexts = []
+            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+            decisions = iter([
+                {
+                    "is_deterministic": False,
+                    "route_to_code": True,
+                    "resolved_by_model": True,
+                    "semanticTask": {
+                        "intent": "CODE_QUESTION",
+                        "goal": "Locate the request handler.",
+                        "resourceCandidates": ["CODE", "REPOSITORY"],
+                        "confidence": 0.9,
+                    },
+                },
+                {
+                    "is_deterministic": False,
+                    "route_to_code": True,
+                    "resolved_by_model": True,
+                    "semanticTask": {
+                        "intent": "DATA_FLOW_TRACE",
+                        "goal": "Trace the same flow for payment.",
+                        "target": "payment",
+                        "resourceCandidates": ["CODE", "API", "DATABASE"],
+                        "confidence": 0.93,
+                    },
+                },
+            ])
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            async def resolve_task(*args):
+                resolver_contexts.append(args[3])
+                return next(decisions)
+
+            with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                "coding_websocket.ProjectContextLock.lock"
+            ), patch("coding_websocket.set_backend_project_state"), patch(
+                "coding_websocket.detect_project_architecture", return_value={}
+            ), patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(side_effect=resolve_task),
+            ), patch(
+                "coding_websocket.complete_coding_model",
+                return_value=({"role": "assistant", "content": "The handler is in src/handler.py."}, provider),
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+                return_value={"engine": "mysql", "database": "test_db"},
+            ) as discover_database, patch.object(
+                DatabaseIntelligenceEngine,
+                "check_database_capabilities",
+                return_value={"available_paths": ["application_client"]},
+            ):
+                state = {"pending": {}, "completed": {}, "tasks": set()}
+                await _run_coding_turn(
+                    {
+                        "requestId": "semantic-follow-up-1",
+                        "sessionId": "semantic-follow-up-session",
+                        "projectRoot": project_root,
+                        "messages": [{"role": "user", "content": "Where is the request handler?"}],
+                    },
+                    send_json,
+                    state,
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+                assistant_answer = next(
+                    message["content"]
+                    for message in reversed(sent)
+                    if message.get("type") == "done"
+                )
+                await _run_coding_turn(
+                    {
+                        "requestId": "semantic-follow-up-2",
+                        "sessionId": "semantic-follow-up-session",
+                        "projectRoot": project_root,
+                        "messages": [
+                            {"role": "user", "content": "Where is the request handler?"},
+                            {"role": "assistant", "content": assistant_answer},
+                            {"role": "user", "content": "trace the same for payment"},
+                        ],
+                    },
+                    send_json,
+                    state,
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+
+            prior_task_memory = resolver_contexts[1]["priorTaskState"]
+            self.assertEqual(prior_task_memory["intent"]["primary"], "CODE_QUESTION")
+            self.assertEqual(prior_task_memory["goal"]["statement"], "Locate the request handler.")
+            self.assertEqual(resolver_contexts[1]["activeTaskTarget"], None)
+            self.assertEqual(discover_database.call_count, 1)
+            latest_done = next(message for message in reversed(sent) if message.get("type") == "done")
+            self.assertEqual(latest_done["semanticTask"]["target"]["userReference"], "payment")
+            self.assertEqual(latest_done["semanticTask"]["resolvedResources"], ["CODE", "API", "DATABASE"])
+
+    async def test_explicit_code_request_survives_semantic_provider_failure(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                "coding_websocket.ProjectContextLock.lock"
+            ), patch("coding_websocket.set_backend_project_state"), patch(
+                "coding_websocket.detect_project_architecture", return_value={}
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+                return_value={"engine": "mysql", "database": "test_db"},
+            ) as discover_database, patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(side_effect=RuntimeError("temporary provider failure")),
+            ), patch(
+                "coding_websocket.complete_coding_model",
+                return_value=({"role": "assistant", "content": "The helper is in src/db.py."}, provider),
+            ), patch.object(
+                DatabaseSessionManager,
+                "execute_database_capability",
+            ) as execute_capability:
+                await _run_coding_turn(
+                    {
+                        "requestId": "route-explicit-code-after-provider-failure",
+                        "sessionId": "route-explicit-code-after-provider-failure",
+                        "projectRoot": project_root,
+                        "messages": [{
+                            "role": "user",
+                            "content": "Why is the database connection helper failing?",
+                        }],
+                    },
+                    send_json,
+                    {"pending": {}, "completed": {}, "tasks": set()},
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+
+            discover_database.assert_not_called()
+            execute_capability.assert_not_called()
+            self.assertFalse(any(message.get("type") == "error" for message in sent))
+            done = next(message for message in sent if message.get("type") == "done")
+            self.assertIn("src/db.py", done["content"])
+            self.assertEqual(done["intent"], "CODE_QUESTION")
+
+    async def test_deterministic_database_operation_runs_without_a_provider(self):
         with tempfile.TemporaryDirectory() as project_root:
             sent = []
 
@@ -3192,11 +4515,23 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 "get_session",
                 return_value=session,
             ), patch(
-                "coding_websocket._resolve_database_action_with_model",
+                "coding_websocket._resolve_semantic_task_with_model",
                 new=AsyncMock(side_effect=RuntimeError("No provider is configured for the Coding Agent.")),
+            ), patch(
+                "coding_websocket.complete_coding_model",
+                return_value=(
+                    {"role": "assistant", "content": "I could not confirm live table data without a model."},
+                    SimpleNamespace(id="fallback-provider", type="test", model="test"),
+                ),
             ), patch.object(
                 DatabaseSessionManager,
                 "execute_database_capability",
+                return_value={
+                    "ok": True,
+                    "content": "Tables: admissions, users",
+                    "executionStatus": "SUCCESS",
+                    "databaseType": "mysql",
+                },
             ) as execute_capability:
                 await _run_coding_turn(
                     {
@@ -3211,11 +4546,136 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                     "",
                 )
 
+            execute_capability.assert_called_once_with(
+                DatabaseCapability.DATABASE_LIST_TABLES,
+                {},
+                unittest.mock.ANY,
+                project_root=project_root,
+            )
+            done = next(message for message in sent if message.get("type") == "done")
+            self.assertEqual(done["status"], "COMPLETED")
+            self.assertIn("Tables: admissions, users", done["content"])
+            self.assertEqual(done["agentTaskState"]["failures"], [])
+            self.assertIsNone(done["agentTaskState"]["execution"]["result"].get("password"))
+
+    async def test_unresolved_credential_scan_replans_to_repository_search(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                "coding_websocket.ProjectContextLock.lock"
+            ), patch("coding_websocket.set_backend_project_state"), patch(
+                "coding_websocket.detect_project_architecture", return_value={}
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+                return_value={
+                    "discovered": False,
+                    "status": "DB_CONFIG_NOT_FOUND",
+                    "configFile": None,
+                    "engine": "unknown",
+                    "database": None,
+                    "username": None,
+                },
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "check_database_capabilities",
+                return_value={"available_paths": []},
+            ), patch.object(
+                DatabaseSessionManager,
+                "execute_database_capability",
+            ) as execute_capability, patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(return_value={
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+                    "arguments": {},
+                    "resolved_by_model": True,
+                    "semanticTask": {
+                        "intent": "DATABASE_CREDENTIAL_REQUEST",
+                        "goal": "Find the configured database username.",
+                        "resourceCandidates": ["DATABASE", "CONFIGURATION"],
+                        "requiredEvidence": ["Configured database username."],
+                        "confidence": 0.9,
+                    },
+                }),
+            ), patch(
+                "coding_websocket.complete_coding_model",
+                side_effect=[
+                    (
+                        {"role": "assistant", "content": "I should inspect the project source."},
+                        provider,
+                    ),
+                    (
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "The project-source search did not resolve a database username. "
+                                "No connection metadata can be confirmed from the available evidence."
+                            ),
+                        },
+                        provider,
+                    ),
+                ],
+            ) as complete_model, patch(
+                "coding_websocket.MAX_CODING_TOOL_ROUNDS",
+                2,
+            ), patch(
+                "coding_websocket._wait_for_tool",
+                new=AsyncMock(return_value={"ok": True, "data": {"matches": []}}),
+            ):
+                await _run_coding_turn(
+                    {
+                        "requestId": "credential-unresolved-replan",
+                        "sessionId": "credential-unresolved-replan-session",
+                        "projectRoot": project_root,
+                        "messages": [{
+                            "role": "user",
+                            "content": "sow my db useranme and passwod",
+                        }],
+                    },
+                    send_json,
+                    {"pending": {}, "completed": {}, "tasks": set()},
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+
             execute_capability.assert_not_called()
-            error = next(message for message in sent if message.get("type") == "error")
-            self.assertIn("not executed", error["message"])
-            self.assertEqual(error["category"], "DATABASE_INTENT_RESOLUTION_FAILED")
-            self.assertFalse(any(message.get("type") == "done" for message in sent))
+            complete_model.assert_not_called()
+            done = next(message for message in sent if message.get("type") == "done")
+            self.assertEqual(
+                done["status"],
+                "INVESTIGATION_INCOMPLETE",
+                json.dumps({
+                    "taskStatus": done["agentTaskState"].get("status"),
+                    "unknowns": done["agentTaskState"].get("unknowns"),
+                    "actions": done["agentTaskState"].get("actions"),
+                    "resources": done["agentTaskState"].get("resolvedResources"),
+                }),
+            )
+            self.assertIn("couldn't verify every requested database credential detail", done["content"])
+            self.assertIn("Username: not confirmed", done["content"])
+            self.assertIn("Password presence: not confirmed", done["content"])
+            self.assertIn("Password value: [REDACTED]", done["content"])
+            self.assertIn("does not verify a live database connection", done["content"])
+            self.assertEqual(done["agentTaskState"]["status"], "BLOCKED")
+            self.assertEqual(done["agentTaskState"]["intent"]["primary"], "DATABASE_CREDENTIAL_REQUEST")
+            self.assertIn("CODE", done["agentTaskState"]["resolvedResources"])
+            self.assertEqual(
+                [call["name"] for call in done["toolCalls"]],
+                ["search_code", "search_code"],
+            )
+            self.assertEqual(done["toolCalls"][0]["arguments"]["query"], "DB_USERNAME")
+            self.assertEqual(done["toolCalls"][1]["arguments"]["query"], "DB_PASSWORD")
+            self.assertTrue(done["agentTaskState"]["unknowns"])
+            self.assertFalse(any(
+                event.get("event") == "TASK_COMPLETED"
+                for event in done["lifecycleEvents"]
+            ))
 
     async def test_database_requests_are_model_resolved_then_use_safe_capabilities(self):
         scenarios = [
@@ -3262,6 +4722,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
         for index, (messages, expected_capability) in enumerate(scenarios):
             with self.subTest(capability=expected_capability), tempfile.TemporaryDirectory() as project_root:
                 sent = []
+                execution_order = []
                 session = SimpleNamespace(
                     project_root=project_root,
                     target_id="DB-TEST",
@@ -3278,12 +4739,50 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 registry = SimpleNamespace(
                     get_active_provider=lambda: SimpleNamespace(id="test-provider")
                 )
-                resolve_action = AsyncMock(return_value={
-                    "is_deterministic": True,
-                    "capability": expected_capability,
-                    "arguments": {},
-                    "resolved_by_model": True,
-                })
+                status_provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+                resolve_call_count = 0
+
+                async def resolve_task(*_args):
+                    nonlocal resolve_call_count
+                    resolve_call_count += 1
+                    execution_order.append("understand")
+                    active_state = _args[3].get("activeTaskState") or {}
+                    if active_state.get("actions"):
+                        execution_order.append("replan")
+                        return {
+                            "is_deterministic": False,
+                            "answer": (
+                                "The database connection status is not verified."
+                                if expected_capability == DatabaseCapability.DATABASE_CURRENT_TARGET
+                                else "The configured username is configured_user."
+                            ),
+                            "resolved_by_model": True,
+                            "semanticTask": {"reasoningSummary": "The latest evidence is sufficient."},
+                        }
+                    return {
+                        "is_deterministic": True,
+                        "capability": expected_capability,
+                        "arguments": (
+                            {"properties": ["username"]}
+                            if expected_capability == DatabaseCapability.DATABASE_CREDENTIAL_REQUEST
+                            else {}
+                        ),
+                        "resolved_by_model": True,
+                    }
+
+                resolve_action = AsyncMock(side_effect=resolve_task)
+
+                def execute_database_action(*_args, **_kwargs):
+                    execution_order.append("inspect_and_verify")
+                    return capability_result
+
+                def summarize_status(*_args):
+                    execution_order.append("natural_answer")
+                    return (
+                        {"role": "assistant", "content": "The database connection status is not verified."},
+                        status_provider,
+                    )
+
                 capability_result = {
                     "ok": True,
                     "content": "Password: [REDACTED]",
@@ -3298,7 +4797,12 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 ), patch.object(
                     DatabaseIntelligenceEngine,
                     "discover_database_configuration",
-                    return_value={"engine": "mysql", "database": "test_db"},
+                    return_value={
+                        "engine": "mysql",
+                        "database": "test_db",
+                        "username": "configured_user",
+                        "has_credentials": True,
+                    },
                 ), patch.object(
                     DatabaseIntelligenceEngine,
                     "check_database_capabilities",
@@ -3314,10 +4818,13 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 ), patch.object(
                     DatabaseSessionManager,
                     "execute_database_capability",
-                    return_value=capability_result,
+                    side_effect=execute_database_action,
                 ) as execute_capability, patch(
-                    "coding_websocket._resolve_database_action_with_model",
+                    "coding_websocket._resolve_semantic_task_with_model",
                     resolve_action,
+                ), patch(
+                    "coding_websocket.complete_coding_model",
+                    side_effect=summarize_status,
                 ):
                     await _run_coding_turn(
                         {
@@ -3332,19 +4839,84 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                         "",
                     )
 
-                resolve_action.assert_awaited_once()
-                self.assertEqual(
-                    resolve_action.await_args.args[2],
-                    messages,
-                    "The model must receive the full user/assistant context before database execution.",
-                )
+                is_contextual_username = messages[-1]["content"] == "show me username"
+                self.assertEqual(resolve_action.await_count, 2 if is_contextual_username else 0)
+                if is_contextual_username:
+                    self.assertEqual(
+                        resolve_action.await_args_list[0].args[2],
+                        messages,
+                        "The model must receive the full user/assistant context for a property-only follow-up.",
+                    )
                 self.assertEqual(execute_capability.call_args.args[0], expected_capability)
                 done = next(message for message in sent if message.get("type") == "done")
                 self.assertEqual(done["status"], "COMPLETED")
-                self.assertIn("[REDACTED]", done["content"])
+                if expected_capability == DatabaseCapability.DATABASE_CURRENT_TARGET:
+                    self.assertEqual(done["content"], "The database connection status is not verified.")
+                    self.assertNotIn("DATABASE CONNECTION STATUS", done["content"])
+                    self.assertEqual(
+                        execution_order,
+                        ["inspect_and_verify", "natural_answer"],
+                    )
+                    self.assertEqual(
+                        done["semanticTask"]["requiredEvidence"],
+                        [
+                            "What database configuration is declared for the active project?",
+                            "What is the active session state for the active project database?",
+                            "Did live runtime verification confirm a database connection?",
+                        ],
+                    )
+                    self.assertEqual(
+                        [item["kind"] for item in done["semanticTask"]["evidencePlan"]],
+                        ["PROJECT_CONFIGURATION", "ACTIVE_DATABASE_SESSION", "LIVE_RUNTIME_VERIFICATION"],
+                    )
+                    state = done["agentTaskState"]
+                    evidence_ids = {item["evidenceId"] for item in state["evidence"]}
+                    self.assertTrue(all(item["evidenceId"] in evidence_ids for item in state["facts"]))
+                    self.assertFalse(state["verification"]["passed"])
+                    self.assertIn(
+                        "Did live runtime verification confirm a database connection?",
+                        [item["question"] for item in state["unknowns"]],
+                    )
+                    self.assertEqual(state["resources"][0]["status"], "UNKNOWN")
+                else:
+                    self.assertNotIn("test-only-secret", done["content"])
+                    if expected_capability == DatabaseCapability.DATABASE_CREDENTIAL_REQUEST:
+                        if is_contextual_username:
+                            self.assertIn("configured_user", done["content"])
+                        else:
+                            self.assertIn("[REDACTED]", done["content"])
+                    else:
+                        self.assertIn("[REDACTED]", done["content"])
 
 
 class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        async def resolve_task(_registry, _config, messages, *_args):
+            latest_request = next(
+                (str(item.get("content") or "") for item in reversed(messages) if item.get("role") == "user"),
+                "",
+            )
+            is_change = _requires_proposal_for_conversation(messages)
+            intent = "SOURCE_CHANGE" if is_change else "CODE_QUESTION"
+            return {
+                "is_deterministic": False,
+                "route_to_code": True,
+                "resolved_by_model": True,
+                "semanticTask": {
+                    "intent": intent,
+                    "goal": latest_request,
+                    "resourceCandidates": ["CODE", "REPOSITORY"],
+                    "confidence": 0.9,
+                },
+            }
+
+        self.semantic_resolver = patch(
+            "coding_websocket._resolve_semantic_task_with_model",
+            new=AsyncMock(side_effect=resolve_task),
+        )
+        self.semantic_resolver.start()
+        self.addCleanup(self.semantic_resolver.stop)
+
     async def test_ambiguous_proposal_request_returns_clarification_without_http_tool_choice_failure(self):
         sent = []
         configured_provider = SimpleNamespace(id="global-gemini-instance")
@@ -3435,13 +5007,17 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
                 Path("provider-config.json"),
             )
 
-        done = next(message for message in sent if message.get("type") == "done")
+        done = next((message for message in sent if message.get("type") == "done"), None)
+        self.assertIsNotNone(done, sent)
         self.assertEqual(complete.call_args_list[0].args[4], None)
         self.assertEqual(complete.call_args_list[1].args[4], runtime_provider.id)
         self.assertEqual(done["providerId"], runtime_provider.id)
         self.assertEqual(done["provider"], "gemini")
         self.assertEqual(done["model"], "gemini-3.6-flash")
         self.assertFalse(done["fallback"])
+        self.assertEqual(done["semanticTask"]["status"], "COMPLETED")
+        self.assertEqual(done["semanticTask"]["workingMemory"]["previousActions"][0]["tool"], "read_file")
+        self.assertTrue(done["semanticTask"]["workingMemory"]["completedInvestigations"])
 
     async def test_proposal_search_is_followed_by_a_required_source_read(self):
         provider = SimpleNamespace(type="groq", model="test-model")
@@ -4090,7 +5666,7 @@ class LegacyNodeMigrationCoverageTests(unittest.TestCase):
                 state["completed"][key] = tool_results[event["toolCallId"]]
 
         with patch(
-            "coding_websocket._resolve_database_action_with_model",
+            "coding_websocket._resolve_semantic_task_with_model",
             new=AsyncMock(return_value={"is_deterministic": False}),
         ), patch("coding_websocket.complete_coding_model", side_effect=responses) as complete:
             asyncio.run(_run_coding_turn(payload, send_json, state, None, Path("unused-config.json")))
@@ -4112,7 +5688,7 @@ class LegacyNodeMigrationCoverageTests(unittest.TestCase):
 
         initial_messages = complete.call_args_list[0].args[2]
         self.assertIn("Never write files", initial_messages[0]["content"])
-        self.assertIn("When multiple plausible targets remain", initial_messages[0]["content"])
+        self.assertIn("Investigate safe candidate targets and required resources before asking for clarification", initial_messages[0]["content"])
         self.assertIn("trace the existing execution path", initial_messages[0]["content"])
         self.assertIn("explicitly preserve existing behavior outside the requested fix", initial_messages[0]["content"])
         self.assertIn("never claim which query is actually fastest or slowest from source code alone", initial_messages[0]["content"])
@@ -5319,6 +6895,341 @@ class SpeechProviderSelectionTests(unittest.TestCase):
         self.registry.delete_provider(self.openai.id)
         with patch.object(index, "registry", self.registry):
             self.assertEqual(index.get_stt_provider().id, self.gemini.id)
+
+
+class DatabaseEvidenceIntegrityTests(unittest.TestCase):
+    def test_unregistered_live_label_cannot_upgrade_database_evidence(self):
+        DatabaseEvidenceStore.clear()
+        self.assertFalse(_has_verified_live_database_evidence(
+            {"evidenceQuality": "VERIFIED_LIVE", "evidenceId": "invented-proof"},
+            {"evidenceQuality": "VERIFIED_LIVE"},
+        ))
+
+        proof = DatabaseExecutionProof(
+            database_session_id="session-1",
+            engine="sqlite",
+            operation="DATABASE_QUERY",
+            source=DatabaseEvidenceSource.LIVE_DB_EXECUTION,
+            mode="LIVE",
+            execution_status="SUCCESS",
+            query="SELECT name FROM sqlite_master",
+        )
+        DatabaseEvidenceStore.record_proof(proof)
+        self.assertTrue(_has_verified_live_database_evidence(
+            {"evidenceId": proof.evidence_id},
+        ))
+        DatabaseEvidenceStore.clear()
+
+    def test_unknown_engine_does_not_probe_sqlite_files_as_live_tables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_file = Path(directory) / "project.db"
+            connection = sqlite3.connect(database_file)
+            connection.execute("CREATE TABLE local_data (id INTEGER PRIMARY KEY)")
+            connection.close()
+
+            result = DatabaseIntelligenceEngine.list_tables(directory, {})
+
+        self.assertEqual(result["status"], "UNAVAILABLE")
+        self.assertEqual(result["engine"], "unknown")
+        self.assertEqual(result["tables"], [])
+        self.assertFalse(result["executed"])
+        self.assertNotEqual(result["evidenceQuality"], "VERIFIED_LIVE")
+
+    def test_inspection_request_requires_evidence_and_notification_reuse_gate(self):
+        request = (
+            "Inspect current implementation, find existing reusable patterns and DB constraints, "
+            "compare the safest options, and recommend the minimal change. Do not modify anything."
+        )
+        self.assertTrue(_requires_investigation_evidence_gate(request))
+        task_state = {
+            "investigationEvidenceGate": {"databaseSchemaRequired": True},
+            "actions": [
+                {
+                    "tool": "read_file",
+                    "target": "src/notifications.ts",
+                    "status": "SUCCESS",
+                    "resultEvidenceIds": ["read-current"],
+                    "lastResult": {
+                        "ok": True,
+                        "data": {
+                            "path": "src/notifications.ts",
+                            "content": "export function notify() { return reuseNotification(); }",
+                        },
+                    },
+                },
+                {
+                    "tool": "search_code",
+                    "target": "notification reusable patterns",
+                    "status": "SUCCESS",
+                    "resultEvidenceIds": ["search-reuse"],
+                    "lastResult": {
+                        "ok": True,
+                        "data": {
+                            "results": [{
+                                "path": "src/notification-service.ts",
+                                "text": "export function reuseNotification() {}",
+                            }],
+                        },
+                    },
+                },
+                {
+                    "tool": "search_code",
+                    "target": "existing similar notification implementations",
+                    "status": "SUCCESS",
+                    "resultEvidenceIds": ["search-similar"],
+                    "lastResult": {
+                        "ok": True,
+                        "data": {
+                            "results": [
+                                {"path": "src/alert-notifications.ts", "text": "notifyUser();"},
+                                {"path": "src/email-notifications.ts", "text": "notifyUser();"},
+                            ],
+                        },
+                    },
+                },
+                {
+                    "tool": "inspect_database_schema",
+                    "target": "active database",
+                    "status": "SUCCESS",
+                    "resultEvidenceIds": ["schema-unavailable"],
+                    "lastResult": {
+                        "ok": True,
+                        "status": "UNAVAILABLE",
+                        "executionStatus": "UNAVAILABLE",
+                        "executed": False,
+                    },
+                },
+            ],
+        }
+        answer = (
+            "Option A reuses the pattern in notification-service.ts; Option B keeps a local implementation. "
+            "The minimal change is in notifications.ts."
+        )
+
+        gate = _investigation_evidence_gate(task_state, answer)
+
+        self.assertEqual(
+            {key: value["status"] for key, value in gate["statuses"].items()},
+            {
+                "CURRENT_IMPLEMENTATION": "VERIFIED",
+                "PROJECT_REUSABLE_PATTERNS": "VERIFIED",
+                "EXISTING_SIMILAR_IMPLEMENTATIONS": "VERIFIED",
+                "DB_SCHEMA_CONSTRAINTS": "UNAVAILABLE",
+                "OPTIONS_COMPARISON": "VERIFIED",
+                "MINIMAL_CHANGE_IMPACT": "VERIFIED",
+            },
+        )
+        self.assertNotIn("unique constraint", answer.lower())
+        single_read_gate = _investigation_evidence_gate({
+            "investigationEvidenceGate": {"databaseSchemaRequired": True},
+            "actions": task_state["actions"][:1],
+        }, "Option A or Option B is best.")
+        self.assertEqual(single_read_gate["statuses"]["CURRENT_IMPLEMENTATION"]["status"], "VERIFIED")
+        self.assertEqual(single_read_gate["statuses"]["PROJECT_REUSABLE_PATTERNS"]["status"], "NOT_VERIFIED")
+        self.assertEqual(single_read_gate["statuses"]["EXISTING_SIMILAR_IMPLEMENTATIONS"]["status"], "NOT_VERIFIED")
+        self.assertEqual(single_read_gate["statuses"]["DB_SCHEMA_CONSTRAINTS"]["status"], "NOT_VERIFIED")
+        self.assertEqual(single_read_gate["statuses"]["OPTIONS_COMPARISON"]["status"], "NOT_VERIFIED")
+
+    def test_benchmark_without_live_measurement_returns_unavailable_without_claims(self):
+        session = DatabaseSession(
+            project_id="evidence-test",
+            repository_id="evidence-test",
+            database_type="sqlite",
+            database_name="unverified",
+            project_root="",
+        )
+
+        result = DatabaseSessionManager.execute_database_capability(
+            DatabaseCapability.DATABASE_BENCHMARK,
+            {},
+            session,
+            "",
+        )
+
+        self.assertEqual(result["executionStatus"], "UNAVAILABLE")
+        self.assertEqual(result["evidenceQuality"], "UNVERIFIED")
+        self.assertFalse(result["executed"])
+        for field in (
+            "baselineLatencyMs",
+            "optimizedLatencyMs",
+            "speedup",
+            "rowsExamined",
+            "accessType",
+            "indexUsed",
+        ):
+            self.assertIsNone(result[field], field)
+        self.assertNotIn("orders", result["content"].lower())
+        self.assertNotIn("index", result["content"].lower())
+
+    def test_bootstrap_health_check_does_not_claim_execution_or_timing(self):
+        result = DatabaseIntelligenceEngine.bootstrap_safe_health_check({"engine": "sqlite"})
+
+        self.assertEqual(result["healthQuery"], "SELECT 1")
+        self.assertEqual(result["status"], "NOT_VERIFIED")
+        self.assertIsNone(result["timing_ms"])
+
+    def test_live_sqlite_health_check_reports_measured_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_file = Path(directory) / "health.sqlite"
+            connection = sqlite3.connect(database_file)
+            connection.execute("SELECT 1")
+            connection.close()
+
+            with patch(
+                "coding_intelligence.time.perf_counter",
+                side_effect=[12.0, 12.025],
+            ):
+                result = DatabaseIntelligenceEngine.real_connect_and_health_check(
+                    directory,
+                    {"engine": "sqlite", "sqlite_file": str(database_file)},
+                )
+
+        self.assertTrue(result["connected"])
+        self.assertEqual(result["healthCheck"], "HEALTHY")
+        self.assertEqual(result["healthQuery"], "SELECT 1")
+        self.assertEqual(result["timing_ms"], 25.0)
+        self.assertIsNotNone(result["health_proof"])
+
+    def test_diagnostic_availability_requires_a_registered_runtime_tool(self):
+        unavailable = DatabaseIntelligenceEngine.check_database_capabilities(
+            "",
+            available_tools=[],
+        )
+        unknown = DatabaseIntelligenceEngine.check_database_capabilities("")
+        available = DatabaseIntelligenceEngine.check_database_capabilities(
+            "",
+            available_tools=["run_verification"],
+        )
+
+        path = "safe_database_diagnostic_endpoint"
+        self.assertFalse(unavailable["paths_status"][path])
+        self.assertFalse(unknown["paths_status"][path])
+        self.assertTrue(available["paths_status"][path])
+
+    def test_missing_runtime_query_statistics_remain_unavailable(self):
+        session = DatabaseSession(
+            project_id="evidence-test",
+            repository_id="evidence-test",
+            database_type="mysql",
+            database_name="runtime-stats",
+        )
+        response = {
+            "ok": True,
+            "rows": [{
+                "query_digest": "SELECT id FROM records",
+                "executions": None,
+                "total_time_ms": None,
+                "average_time_ms": None,
+                "max_time_ms": None,
+                "rows_examined": None,
+                "rows_sent": None,
+            }],
+        }
+
+        with patch.object(DatabaseIntelligenceEngine, "execute_safe_query", return_value=response):
+            rows = DatabasePerformanceEngine._mysql_runtime_query_stats(
+                "",
+                session,
+                "slow",
+            )
+
+        self.assertEqual(len(rows), 1)
+        for field in (
+            "executionCount",
+            "totalTimeMs",
+            "averageTimeMs",
+            "maxTimeMs",
+            "rowsExamined",
+            "rowsReturned",
+        ):
+            self.assertIsNone(rows[0][field], field)
+
+
+class CodingRequestAuthenticationTests(unittest.TestCase):
+    def test_coding_http_requires_launch_token_and_trusted_origin(self):
+        import index
+        from fastapi.testclient import TestClient
+
+        trusted_origin = next(
+            origin
+            for origin in index.TRUSTED_RENDERER_ORIGINS
+            if origin != "null"
+        )
+        with TestClient(index.app) as client:
+            missing_token = client.get(
+                "/api/coding/project-state",
+                headers={"Origin": trusted_origin},
+            )
+            untrusted_origin = client.get(
+                "/api/coding/project-state",
+                headers={
+                    "Origin": "https://untrusted.example",
+                    "X-Coding-Auth": index.CODING_AUTH_TOKEN,
+                },
+            )
+            authenticated = client.get(
+                "/api/coding/project-state",
+                headers={
+                    "Origin": trusted_origin,
+                    "X-Coding-Auth": index.CODING_AUTH_TOKEN,
+                },
+            )
+            preflight = client.options(
+                "/api/coding/project-state",
+                headers={
+                    "Origin": trusted_origin,
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "x-coding-auth",
+                },
+            )
+
+        self.assertEqual(missing_token.status_code, 401)
+        self.assertEqual(untrusted_origin.status_code, 401)
+        self.assertEqual(authenticated.status_code, 200)
+        self.assertEqual(preflight.status_code, 200)
+
+
+class CodingWebSocketAuthenticationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_requires_trusted_origin_and_launch_token(self):
+        import websockets
+        from websockets.exceptions import ConnectionClosed
+
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        origin = "http://localhost:3000"
+        server = asyncio.create_task(
+            run_coding_websocket_server(
+                port,
+                registry=None,
+                config_path="",
+                auth_token="test-launch-token",
+                trusted_origins=[origin],
+            )
+        )
+        uri = f"ws://127.0.0.1:{port}"
+        try:
+            async with websockets.connect(uri, origin=origin) as readiness_probe:
+                await readiness_probe.close()
+
+            with self.assertRaises(Exception):
+                await websockets.connect(uri, origin="https://untrusted.example")
+
+            async with websockets.connect(uri, origin=origin) as unauthenticated:
+                await unauthenticated.send(json.dumps({"type": "chat", "requestId": "unauth"}))
+                with self.assertRaises(ConnectionClosed):
+                    await unauthenticated.recv()
+
+            async with websockets.connect(uri, origin=origin) as authenticated:
+                await authenticated.send(
+                    json.dumps({"type": "authenticate", "token": "test-launch-token"})
+                )
+                acknowledgement = json.loads(await authenticated.recv())
+                self.assertEqual(acknowledgement, {"type": "authenticated", "authenticated": True})
+        finally:
+            server.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await server
 
 
 if __name__ == "__main__":

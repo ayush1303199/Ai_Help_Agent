@@ -855,19 +855,35 @@ async function hasProjectExecutable(root, relativePath) {
     const target = await resolveWithinRoot(root, relativePath);
     const stat = await fs.stat(target.target);
     return stat.isFile();
-  } catch {
-    return false;
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
+    throw error;
   }
 }
 
 async function findChangedPhpFiles(root) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const child = spawn('git', ['status', '--porcelain', '--', '*.php'], { cwd: root, shell: false, windowsHide: true });
     let output = '';
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      callback(value);
+    };
     child.stdout.on('data', (chunk) => { output = `${output}${chunk}`.slice(0, MAX_OUTPUT_CHARS); });
-    child.on('error', () => resolve([]));
-    child.on('close', () => resolve(output.split(/\r?\n/).map((item) => item.slice(3).trim())
-      .filter((item) => item && /\.php$/i.test(item) && !isSensitivePath(item)).slice(0, 20)));
+    child.on('error', (error) => finish(
+      reject,
+      new Error(`Unable to inspect changed PHP files: ${error.message}`),
+    ));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish(reject, new Error(`Unable to inspect changed PHP files (git exited with ${code}).`));
+        return;
+      }
+      finish(resolve, output.split(/\r?\n/).map((item) => item.slice(3).trim())
+        .filter((item) => item && /\.php$/i.test(item) && !isSensitivePath(item)).slice(0, 20));
+    });
   });
 }
 
@@ -917,10 +933,10 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
       child.on('close', (code) => finish({ exitCode: code }));
     });
     const durationMs = Date.now() - startedAt;
-    if (result.timedOut) return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
+    if (result.timedOut) return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
     if (result.error) {
       const missing = /enoent|not found/i.test(result.error);
-      return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: missing ? `${phpCommand.executable} not found in PATH.` : redactOutput(result.error), durationMs, spawnError: true, reason: missing ? `NOT_AVAILABLE (${phpCommand.executable} not found in PATH)` : undefined, networkPolicy: NETWORK_POLICY };
+      return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: missing ? `${phpCommand.executable} not found in PATH.` : redactOutput(result.error), durationMs, spawnError: true, reason: missing ? `NOT_AVAILABLE (${phpCommand.executable} not found in PATH)` : undefined, networkPolicy: NETWORK_POLICY };
     }
     const ok = result.exitCode === 0;
     await appendAudit(root, 'run_php_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
@@ -931,7 +947,7 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
       && !await hasProjectExecutable(root, phpunitPath)
       ? 'PHPUnit is not installed for this project (vendor/bin/phpunit not found); php-lint fallback used.'
       : null;
-    return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, reason, networkPolicy: NETWORK_POLICY, lintFiles: phpCommand.lintFiles };
+    return { ok, script, exitCode: result.exitCode, executed: Number.isInteger(result.exitCode), stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, reason, networkPolicy: NETWORK_POLICY, lintFiles: phpCommand.lintFiles };
   }
   if (projectType.type !== 'node') {
     const commandSpec = CHECK_COMMANDS[script];
@@ -955,12 +971,12 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
     const durationMs = Date.now() - startedAt;
     if (result.error) {
       const missing = /enoent|not found/i.test(result.error);
-      return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: missing ? `${commandSpec.executable} not found in PATH.` : redactOutput(result.error), reason: missing ? `NOT_AVAILABLE (${commandSpec.executable} not found in PATH)` : null, spawnError: true, durationMs, networkPolicy: NETWORK_POLICY };
+      return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: missing ? `${commandSpec.executable} not found in PATH.` : redactOutput(result.error), reason: missing ? `NOT_AVAILABLE (${commandSpec.executable} not found in PATH)` : null, spawnError: true, durationMs, networkPolicy: NETWORK_POLICY };
     }
-    if (result.timedOut) return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
+    if (result.timedOut) return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
     const ok = result.exitCode === 0;
     await appendAudit(root, 'run_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
-    return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence: ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options), networkPolicy: NETWORK_POLICY };
+    return { ok, script, exitCode: result.exitCode, executed: Number.isInteger(result.exitCode), stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence: ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options), networkPolicy: NETWORK_POLICY };
   }
   let packageJson;
   try {
@@ -1045,22 +1061,22 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
   if (result.timedOut) {
     console.warn(`[DEV][VERIFY] project=${project} script=${script} exitCode=null durationMs=${durationMs} success=false timedOut=true`);
     await appendAudit(root, 'run_command', script, 'failure:timeout');
-    return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
+    return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
   }
   if (result.cancelled) {
     await appendAudit(root, 'run_command', script, 'cancelled');
-    return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: 'Verification command cancelled.', durationMs, cancelled: true, networkPolicy: NETWORK_POLICY };
+    return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: 'Verification command cancelled.', durationMs, cancelled: true, networkPolicy: NETWORK_POLICY };
   }
   if (result.error) {
     console.warn(`[DEV][VERIFY] project=${project} script=${script} exitCode=null durationMs=${durationMs} success=false`);
     await appendAudit(root, 'run_command', script, 'failure:spawn');
-    return { ok: false, script, exitCode: null, stdout: redactOutput(stdout), stderr: redactOutput(result.error), durationMs, spawnError: true, networkPolicy: NETWORK_POLICY };
+    return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: redactOutput(result.error), durationMs, spawnError: true, networkPolicy: NETWORK_POLICY };
   }
   const ok = result.exitCode === 0;
   console.info(`[DEV][VERIFY] project=${project} script=${script} exitCode=${result.exitCode} durationMs=${durationMs} success=${ok}`);
   await appendAudit(root, 'run_command', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
   const runtimeEvidence = ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options);
-  return { ok, script, exitCode: result.exitCode, stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, networkPolicy: NETWORK_POLICY };
+  return { ok, script, exitCode: result.exitCode, executed: Number.isInteger(result.exitCode), stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, networkPolicy: NETWORK_POLICY };
 }
 
 async function getVerificationScripts(ownerWebContentsId, requested = []) {
