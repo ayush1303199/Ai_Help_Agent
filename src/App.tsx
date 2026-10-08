@@ -911,7 +911,7 @@ function App() {
         const adapterType = typeof saved.adapterType === 'string' ? saved.adapterType : '';
         const savedId = typeof saved.id === 'string' ? saved.id : '';
         const apiKey = adapterType ? getProviderSecret(persistedSecrets, savedId, adapterType) : '';
-        if (!adapterType || !apiKey || !getProviderConfig(adapterType)) return [];
+        if (!adapterType || !getProviderConfig(adapterType)) return [];
         return [{
           ...(savedId ? { providerId: savedId, createNew: true } : { createNew: true }),
           label: String(saved.label || adapterType),
@@ -955,7 +955,7 @@ function App() {
           continue;
         }
         const savedProviderId = String(restoredData.provider?.id || '');
-        if (savedProviderId) {
+        if (savedProviderId && provider.apiKey) {
           Object.assign(
             persistedSecrets,
             setProviderSecret(persistedSecrets, savedProviderId, provider.adapterType, provider.apiKey),

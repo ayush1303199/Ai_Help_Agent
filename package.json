@@ -26,6 +26,8 @@
     "test:developer-sync-contract": "node scripts/coding-sync-contract-test.mjs",
     "test:developer-real-world": "node scripts/coding-real-world-e2e-test.mjs",
     "test:coding-markdown": "node scripts/coding-markdown-test.mjs",
+    "test:coding-activity": "node --experimental-strip-types scripts/coding-activity-trace-test.mjs",
+    "test:coding-policy": "python scripts/coding-agent-policy-test.py",
     "test:coding-universal": "python scripts/coding-universal-architecture-test.py",
     "test:coding-journey": "python scripts/coding-live-user-journey-test.py",
     "test:coding-performance": "node scripts/coding-performance-investigation-test.mjs",

@@ -252,6 +252,8 @@ Runtime credentials remain outside source control.
 | `AI_MAX_SYSTEM_CHARS` | `13000` | Maximum system-prompt size. |
 | `AI_GENERAL_CONTEXT_CHARS` | `18000` | General Agent context budget. |
 | `AI_GENERAL_MESSAGE_CHARS` | `2200` | General Agent message budget. |
+| `AI_CODING_CONTEXT_BUDGET_TOKENS` | `6000` | Coding Agent application context ceiling. The complete serialized provider request is preflighted using a conservative UTF-8 byte estimate, a 35% safety margin, and the output reservation; a configured provider input limit or declared model context window can lower it. |
+| `AI_CODING_PROVIDER_INPUT_LIMIT_TOKENS` | `0` (unset) | Optional configured provider input limit, used separately from the model context window. |
 | `AI_PROVIDER_CONFIG_PATH` | `~/.ai-help-agent/provider-config.json` | Override the provider metadata path. |
 | `TRANSCRIPTION_MODEL` | provider default | Override the speech-to-text model. |
 | `TRANSCRIPTION_LANGUAGE` | provider default | Optional transcription language hint. |

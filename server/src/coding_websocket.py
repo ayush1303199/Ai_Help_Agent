@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -23,6 +24,12 @@ from backend_config import (
     CODING_TOOL_RESULT_CHARS,
     CODING_TOOL_ROUNDS,
     CODING_TOOL_WAIT_TIMEOUT_SECONDS,
+)
+PROJECT_ARCHITECTURE_QUESTION_PATTERN = re.compile(
+    r"\b(?:which|what|identify|tell\s+me|show\s+me)\b.{0,60}\b"
+    r"(?:programming\s+)?(?:language|framework|technology\s+stack|tech\s+stack)\b|"
+    r"\b(?:project|repository|repo)\b.{0,40}\b(?:language|framework|tech(?:nology)?\s+stack)\b",
+    re.I,
 )
 from coding_intelligence import (
     UNIVERSAL_SECRET_PROTECTOR,
@@ -59,6 +66,7 @@ from coding_intelligence import (
     PromptInjectionGuard,
     ProviderDataMinimizer,
     ProjectIsolationGuard,
+    CODING_ENGINEERING_POLICY,
 )
 
 logger = logging.getLogger(__name__)
@@ -154,6 +162,14 @@ def _has_verified_live_database_evidence(
 
 def classify_provider_exception(error: Exception) -> Dict[str, Any]:
     msg = str(error).lower()
+    if getattr(error, "failure_classification", None) == "CONTEXT_TOO_LARGE":
+        return {
+            "classification": "PROVIDER_FAILURE",
+            "category": "CONTEXT_TOO_LARGE",
+            "retryable": False,
+            "isCodeDefect": False,
+            "suggestedAction": "REDUCE_REQUEST_CONTEXT",
+        }
     if "session_ownership_lost" in msg or "ownership was lost" in msg or "conversation ownership" in msg:
         return {
             "classification": "PROJECT_LIFECYCLE",
@@ -438,17 +454,6 @@ CODING_TOOLS = [
     },
 ]
 TOOL_NAMES = {tool["function"]["name"] for tool in CODING_TOOLS}
-TOOL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
-    "search_code": {"available": True, "operations": ["search", "query", "pattern"]},
-    "read_file": {"available": True, "operations": ["read", "open", "fetch"]},
-    "list_directory": {"available": True, "operations": ["list", "browse", "dir"]},
-    "search_symbols": {"available": True, "operations": ["symbol", "search"]},
-    "find_references": {"available": True, "operations": ["references", "find"]},
-    "get_repository_map": {"available": True, "operations": ["map", "structure"]},
-    "get_context": {"available": True, "operations": ["context", "assemble"]},
-    "run_verification": {"available": True, "operations": ["verify", "test", "check"]},
-    "execute_sql": {"available": True, "operations": ["sql", "query", "explain", "select", "show"]},
-}
 TOOL_ALIASES: Dict[str, str] = {
     "open_file": "read_file",
     "repo_browser.read_file": "read_file",
@@ -482,29 +487,20 @@ TOOL_ALIASES: Dict[str, str] = {
     "run_command": "run_verification",
     "verify": "run_verification",
 }
+TOOL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
+    name: {"available": True}
+    for name in TOOL_NAMES
+    if name not in TOOL_ALIASES or TOOL_ALIASES[name] == name
+}
 
 
 def resolve_tool_capability(name: str) -> Optional[str]:
-    """Resolve a raw tool name or alias to an available canonical capability."""
+    """Resolve only registered tool names and explicit aliases."""
     norm = (name or "").strip()
     if norm in TOOL_CAPABILITIES and TOOL_CAPABILITIES[norm].get("available"):
         return norm
-    if norm in TOOL_ALIASES:
-        target = TOOL_ALIASES[norm]
-        if target in TOOL_CAPABILITIES and TOOL_CAPABILITIES[target].get("available"):
-            return target
-    low = norm.lower()
-    if any(k in low for k in ("search", "find", "grep")):
-        return "search_code"
-    if any(k in low for k in ("read", "open", "file")):
-        return "read_file"
-    if any(k in low for k in ("list", "dir", "tree", "browse")):
-        return "list_directory"
-    if any(k in low for k in ("sql", "query", "db", "database", "table")):
-        return "execute_sql"
-    if any(k in low for k in ("command", "terminal", "exec", "run", "verify")):
-        return "run_verification"
-    return None
+    target = TOOL_ALIASES.get(norm)
+    return target if target in TOOL_CAPABILITIES and TOOL_CAPABILITIES[target].get("available") else None
 MAX_CODING_TOOL_ROUNDS = CODING_TOOL_ROUNDS
 MAX_AGENT_REASONING_CYCLES = 7
 MAX_CODING_CONVERSATION_CHARS = CODING_CONVERSATION_CHARS
@@ -513,16 +509,12 @@ MAX_CODING_FINAL_EVIDENCE_CHARS = CODING_FINAL_EVIDENCE_CHARS
 MAX_COMPLETED_CODING_TOOL_RESULTS = 100
 MAX_CONCURRENT_CODING_TASKS = 16
 CODING_ENGINEERING_WORKFLOW = (
-    "Follow this engineering workflow in order. First identify the requested outcome and project scope. "
-    "Then trace the existing execution path from the relevant entry point through callers/callees and the "
-    "data or state they pass; search references when needed instead of inspecting one matching method in "
-    "isolation. Read the implementation together with directly related tests, configuration, and nearby "
-    "contracts. Compare observed behavior with requested behavior, check plausible alternative causes, and "
-    "state only conclusions supported by inspected evidence. Before proposing a change, determine the minimal "
-    "affected-file task list and explicitly preserve existing behavior outside the requested fix. For analysis "
-    "or debugging answers, report the flow you traced, evidence-based findings, the remaining task/checklist, "
-    "and tests or runtime checks that were not actually run. Never claim a search, reference trace, test, or "
-    "runtime check that the tools did not perform. Keep the investigation bounded to relevant code."
+    "Use the current AgentTaskState to select the next evidence-producing action for this specific request. "
+    "Do not apply a fixed investigation checklist or inspect unrelated resource categories. Trace callers, "
+    "callees, tests, configuration, database state, and reusable patterns only when they are relevant to the "
+    "goal or required evidence. Prefer existing project evidence and capabilities, and report only conclusions "
+    "supported by inspected evidence. Never claim a search, reference trace, test, or runtime check that the "
+    "tools did not perform. Keep investigation bounded to the attached project and current task."
 )
 UNIFIED_DIFF_EXAMPLE = (
     "--- a/path/to/file\n"
@@ -534,21 +526,25 @@ UNIFIED_DIFF_EXAMPLE = (
 )
 
 
-def _coding_task_steps(proposal_required: bool) -> List[str]:
-    steps = [
-        "Identify the requested outcome and project scope",
-        "Trace the existing flow through relevant callers, callees, and data/state",
-        "Read the implementation plus directly related tests, configuration, and contracts",
-        "Compare current behavior with the request and verify the cause against evidence",
-        "List the minimal affected-file changes and existing behavior to preserve",
-    ]
-    if proposal_required:
-        steps.append("Prepare a validated diff from inspected source for explicit approval")
+def _coding_task_steps(intent: str, proposal_required: bool) -> List[str]:
+    if intent in (TaskIntent.DATABASE_INVESTIGATION, TaskIntent.DATABASE_CURRENT_TARGET):
+        steps = ["Resolve only the database evidence required by this request"]
+    elif intent == TaskIntent.PERFORMANCE_INVESTIGATION:
+        steps = ["Locate the relevant query and distinguish source evidence from live measurements"]
+    elif proposal_required:
+        steps = [
+            "Identify the project location and existing implementation pattern relevant to the requested change",
+            "Read the target source before preparing a proposal",
+        ]
     else:
-        steps.append("Report findings, the task checklist, and any unverified checks")
+        steps = ["Gather the minimum project evidence needed to answer this request"]
+    if proposal_required:
+        steps.append("Prepare a validated proposal only after the relevant source has been inspected")
+    else:
+        steps.append("Answer from recorded evidence and identify only relevant unverified checks")
     return steps
 WRITE_PATTERN = re.compile(
-    r"\b(fix|implement|add|create|change|modify|update|refactor|optimi[sz]e|improve|remove|rewrite|"
+    r"\b(fix|implement|add|create|change|modify|update|write|refactor|optimi[sz]e|improve|remove|rewrite|"
     r"resolve|patch|migrate|convert|introduce)\b|"
     r"(?:\b(?:jodo|sudhar|sudharo|badlo|banao|hatao)\b)|"
     r"(?:\b(?:fix|change|update|add|modify|refactor)\s+karo\b)",
@@ -687,6 +683,10 @@ EXPLICIT_CODE_RESOURCE_PATTERN = re.compile(
 
 def _has_explicit_code_resource_cue(request: str) -> bool:
     return bool(EXPLICIT_CODE_RESOURCE_PATTERN.search(str(request or "")))
+
+
+def _is_project_architecture_question(request: str) -> bool:
+    return bool(PROJECT_ARCHITECTURE_QUESTION_PATTERN.search(str(request or "")))
 
 
 def _is_contextual_database_credential_request(request: str, messages: List[Dict[str, Any]]) -> bool:
@@ -1262,7 +1262,7 @@ def generate_task_plan(intent_info: Dict[str, Any], request: str, scope: str = "
         required_evidence = "Project source implementation and related contracts."
         verification_strategy = "Evidence audit and behavior preservation."
 
-    steps = _coding_task_steps(proposal_required)
+    steps = _coding_task_steps(intent, proposal_required)
 
     return {
         "intent": intent,
@@ -1284,6 +1284,7 @@ def detect_project_architecture(project_root: str, scope: str = ".") -> Dict[str
     arch: Dict[str, Any] = {
         "languages": [],
         "frameworks": [],
+        "directories": [],
         "sourceDirectories": [],
         "testDirectories": [],
         "configFiles": [],
@@ -1299,11 +1300,6 @@ def detect_project_architecture(project_root: str, scope: str = ".") -> Dict[str
     if not os.path.isdir(effective_root):
         return arch
 
-    try:
-        top_entries = os.listdir(effective_root)
-    except Exception:
-        return arch
-
     manifest_checks = [
         ("package.json", "TypeScript/JavaScript"),
         ("composer.json", "PHP"),
@@ -1316,54 +1312,85 @@ def detect_project_architecture(project_root: str, scope: str = ".") -> Dict[str
         ("Cargo.toml", "Rust"),
         ("Gemfile", "Ruby"),
     ]
-    for m_file, lang in manifest_checks:
-        if m_file in top_entries:
-            if lang not in arch["languages"]:
-                arch["languages"].append(lang)
-            arch["configFiles"].append(m_file)
+    ignored_directories = {
+        ".git", "node_modules", "vendor", "dist", "build", "target",
+        ".venv", "venv", "__pycache__", ".next", ".nuxt",
+    }
+    discovered_files = []
+    try:
+        for current, directories, filenames in os.walk(effective_root):
+            directories[:] = [
+                name for name in directories
+                if name.casefold() not in ignored_directories
+            ]
+            relative_directory = os.path.relpath(current, effective_root)
+            if relative_directory != ".":
+                relative_directory = relative_directory.replace("\\", "/")
+                arch["directories"].append(relative_directory)
+                directory_name = os.path.basename(current).casefold()
+                if directory_name in ("src", "app", "controllers", "models", "views", "routes", "lib", "services", "handlers", "server", "client"):
+                    arch["sourceDirectories"].append(relative_directory)
+                elif directory_name in ("test", "tests", "spec", "__tests__", "testing"):
+                    arch["testDirectories"].append(relative_directory)
+                elif directory_name in ("config", "etc", "conf"):
+                    arch["configFiles"].append(relative_directory)
+            for filename in filenames:
+                file_path = os.path.join(current, filename)
+                relative_file = os.path.relpath(file_path, effective_root).replace("\\", "/")
+                discovered_files.append((filename, file_path, relative_file))
+    except OSError:
+        return arch
 
-    if "package.json" in top_entries:
+    languages_by_manifest = dict(manifest_checks)
+    for filename, file_path, relative_file in discovered_files:
+        language = languages_by_manifest.get(filename)
+        if language and language not in arch["languages"]:
+            arch["languages"].append(language)
+            arch["configFiles"].append(relative_file)
+
+        low = filename.casefold()
+        if low.startswith((".env", "tsconfig", "vite.config", "webpack", "babel", "dockerfile", "makefile")):
+            arch["configFiles"].append(relative_file)
+        elif low in ("index.ts", "index.js", "main.ts", "main.js", "main.py", "app.py", "server.js", "index.php"):
+            arch["entryPoints"].append(relative_file)
+
         try:
-            with open(os.path.join(effective_root, "package.json"), "r", encoding="utf-8", errors="ignore") as f:
-                pj = json.load(f)
-                deps = {**pj.get("dependencies", {}), **pj.get("devDependencies", {})}
-                if "react" in deps: arch["frameworks"].append("React")
-                if "vue" in deps: arch["frameworks"].append("Vue")
-                if "next" in deps: arch["frameworks"].append("Next.js")
-                if "electron" in deps: arch["frameworks"].append("Electron")
-                if "express" in deps: arch["frameworks"].append("Express")
-                if "vite" in deps: arch["frameworks"].append("Vite")
-                if "nestjs" in str(deps): arch["frameworks"].append("NestJS")
-        except Exception:
-            pass
+            if filename == "package.json":
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as manifest:
+                    package = json.load(manifest)
+                deps = {
+                    **(package.get("dependencies") or {}),
+                    **(package.get("devDependencies") or {}),
+                }
+                for dependency, framework in (
+                    ("react", "React"), ("vue", "Vue"), ("next", "Next.js"),
+                    ("electron", "Electron"), ("express", "Express"), ("vite", "Vite"),
+                    ("@nestjs/core", "NestJS"),
+                ):
+                    if dependency in deps and framework not in arch["frameworks"]:
+                        arch["frameworks"].append(framework)
+            elif filename == "composer.json":
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as manifest:
+                    composer = json.load(manifest)
+                dependencies = {
+                    **(composer.get("require") or {}),
+                    **(composer.get("require-dev") or {}),
+                }
+                for dependency, framework in (
+                    ("yiisoft/yii2", "Yii2"),
+                    ("laravel/framework", "Laravel"),
+                    ("symfony/framework-bundle", "Symfony"),
+                ):
+                    if dependency in dependencies and framework not in arch["frameworks"]:
+                        arch["frameworks"].append(framework)
+        except (OSError, ValueError, TypeError):
+            continue
 
-    if "composer.json" in top_entries:
-        try:
-            with open(os.path.join(effective_root, "composer.json"), "r", encoding="utf-8", errors="ignore") as f:
-                cj = json.load(f)
-                reqs = {**cj.get("require", {}), **cj.get("require-dev", {})}
-                if "yiisoft/yii2" in reqs: arch["frameworks"].append("Yii2")
-                if "laravel/framework" in reqs: arch["frameworks"].append("Laravel")
-                if "symfony/framework-bundle" in reqs: arch["frameworks"].append("Symfony")
-        except Exception:
-            pass
-
-    for entry in top_entries:
-        entry_path = os.path.join(effective_root, entry)
-        if os.path.isdir(entry_path):
-            low = entry.lower()
-            if low in ("src", "app", "controllers", "models", "views", "routes", "lib", "services", "handlers", "server", "client"):
-                arch["sourceDirectories"].append(entry)
-            elif low in ("test", "tests", "spec", "__tests__", "testing"):
-                arch["testDirectories"].append(entry)
-            elif low in ("config", "etc", "conf"):
-                arch["configFiles"].append(entry)
-        else:
-            low = entry.lower()
-            if low.startswith((".env", "tsconfig", "vite.config", "webpack", "babel", "dockerfile", "makefile")):
-                arch["configFiles"].append(entry)
-            elif low in ("index.ts", "index.js", "main.ts", "main.js", "main.py", "app.py", "server.js", "index.php"):
-                arch["entryPoints"].append(entry)
+    arch["directories"] = sorted(set(arch["directories"]))
+    arch["sourceDirectories"] = sorted(set(arch["sourceDirectories"]))
+    arch["testDirectories"] = sorted(set(arch["testDirectories"]))
+    arch["configFiles"] = sorted(set(arch["configFiles"]))
+    arch["entryPoints"] = sorted(set(arch["entryPoints"]))
 
     return arch
 
@@ -1925,6 +1952,38 @@ _active_backend_project: Dict[str, Any] = {
     "status": "PROJECT_NOT_ATTACHED",
     "updatedAt": 0,
 }
+_active_coding_request_contexts: Dict[str, Dict[str, Any]] = {}
+_active_coding_request_contexts_lock = threading.RLock()
+
+
+def register_coding_request_context(request_id: str, session_id: str, project_root: str) -> Dict[str, Any]:
+    if not request_id or not project_root:
+        raise ValueError("A valid request ID and active project root are required.")
+    root = str(Path(project_root).resolve())
+    identity = ProjectContextLock.identify_project_root(root)
+    context = {
+        "requestId": request_id,
+        "sessionId": session_id,
+        "projectRoot": root,
+        "projectId": identity.get("projectId"),
+        "repositoryId": identity.get("repositoryId"),
+    }
+    with _active_coding_request_contexts_lock:
+        if request_id in _active_coding_request_contexts:
+            raise ValueError("A Coding Agent request with this ID is already active.")
+        _active_coding_request_contexts[request_id] = context
+    return {key: value for key, value in context.items() if key != "projectRoot"}
+
+
+def get_coding_request_context(request_id: str) -> Optional[Dict[str, Any]]:
+    with _active_coding_request_contexts_lock:
+        context = _active_coding_request_contexts.get(str(request_id or ""))
+        return dict(context) if context else None
+
+
+def clear_coding_request_context(request_id: str) -> None:
+    with _active_coding_request_contexts_lock:
+        _active_coding_request_contexts.pop(str(request_id or ""), None)
 
 
 def get_backend_project_state() -> Dict[str, Any]:
@@ -1952,7 +2011,6 @@ def set_backend_project_state(project_root: Any) -> Dict[str, Any]:
             _active_backend_project["projectRoot"] = project_root
             _active_backend_project["status"] = "PROJECT_ATTACHED"
             try:
-                ProjectContextLock.lock(project_root)
                 UNIVERSAL_EVENT_STREAM.emit("PROJECT_DISCOVERED", {"projectRoot": project_root})
             except Exception:
                 pass
@@ -2173,6 +2231,28 @@ TASK_ACTION_SELECTION_TOOL = {
                 },
                 "sub_intents": {"type": "array", "items": {"type": "string"}},
                 "required_evidence": {"type": "array", "items": {"type": "string"}},
+                "required_evidence_details": {
+                    "type": "array",
+                    "description": (
+                        "Optional structured source requirements. Include only resources that are genuinely "
+                        "needed; use LIVE_DATABASE_SCHEMA only when live schema proof is required."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "required": ["requirement", "resource"],
+                        "properties": {
+                            "requirement": {"type": "string"},
+                            "resource": {"type": "string", "enum": [
+                                "CODE", "FILE", "DATABASE", "RUNTIME", "BROWSER", "API",
+                                "LOGS", "CONFIGURATION", "PROJECT", "REPOSITORY",
+                            ]},
+                            "evidenceType": {"type": "string", "enum": [
+                                "LIVE_DATABASE_SCHEMA", "LIVE_DATABASE_QUERY", "VERIFICATION_RESULT",
+                            ]},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
                 "verification_plan": {"type": "string"},
                 "ambiguity": {"type": "string"},
                 "continuity_detected": {"type": "boolean"},
@@ -2253,7 +2333,7 @@ def _validate_task_action_selection(message: Dict[str, Any]) -> Dict[str, Any]:
     allowed_selection_properties = {
         "operation", "intent", "goal", "resources", "target", "target_type",
         "confidence", "resolved_target", "target_candidates", "sub_intents",
-        "required_evidence", "verification_plan", "ambiguity", "arguments",
+        "required_evidence", "required_evidence_details", "verification_plan", "ambiguity", "arguments",
         "clarification", "continuity_detected", "reasoning_summary", "hypotheses",
         "answer",
     }
@@ -2318,6 +2398,7 @@ def _validate_task_action_selection(message: Dict[str, Any]) -> Dict[str, Any]:
     target_candidates = selection.get("target_candidates", [])
     sub_intents = selection.get("sub_intents", [])
     required_evidence = selection.get("required_evidence", [])
+    evidence_details = selection.get("required_evidence_details", [])
     if (
         not isinstance(target_candidates, list)
         or any(
@@ -2334,6 +2415,25 @@ def _validate_task_action_selection(message: Dict[str, Any]) -> Dict[str, Any]:
         or any(not isinstance(intent, str) for intent in sub_intents)
         or not isinstance(required_evidence, list)
         or any(not isinstance(item, str) for item in required_evidence)
+        or not isinstance(evidence_details, list)
+        or any(
+            not isinstance(item, dict)
+            or set(item) - {"requirement", "resource", "evidenceType"}
+            or not isinstance(item.get("requirement"), str)
+            or not isinstance(item.get("resource"), str)
+            or item.get("resource") not in allowed_resources
+            or (
+                item.get("evidenceType") is not None
+                and (
+                    not isinstance(item.get("evidenceType"), str)
+                    or item.get("evidenceType") not in {
+                    "LIVE_DATABASE_SCHEMA", "LIVE_DATABASE_QUERY", "VERIFICATION_RESULT",
+                    }
+                )
+            )
+            or item["requirement"].strip() not in required_evidence
+            for item in evidence_details
+        )
     ):
         raise RuntimeError("The AI model returned invalid semantic evidence requirements; no database operation was run.")
     verification_plan = selection.get("verification_plan", "")
@@ -2380,6 +2480,14 @@ def _validate_task_action_selection(message: Dict[str, Any]) -> Dict[str, Any]:
         "resourceCandidates": list(dict.fromkeys(resources)),
         "resolvedResources": list(dict.fromkeys(resources)),
         "requiredEvidence": [item.strip() for item in required_evidence if item.strip()][:12],
+        "requiredEvidenceDetails": [
+            {
+                "requirement": item["requirement"].strip()[:500],
+                "resource": item["resource"],
+                **({"evidenceType": item["evidenceType"]} if item.get("evidenceType") else {}),
+            }
+            for item in evidence_details[:12]
+        ],
         "ambiguity": ambiguity.strip()[:500] or None,
         "verificationPlan": verification_plan.strip()[:1000] or None,
         "confidence": float(confidence),
@@ -2533,6 +2641,7 @@ def _build_semantic_task(
     capability: Optional[str] = None,
     capability_arguments: Optional[Dict[str, Any]] = None,
     required_evidence: Optional[List[str]] = None,
+    required_evidence_details: Optional[List[Dict[str, Any]]] = None,
     verification_plan: Optional[str] = None,
     ambiguity: Optional[str] = None,
     clarification_required: bool = False,
@@ -2606,8 +2715,11 @@ def _build_semantic_task(
         "taskId": request_id,
         "sessionId": session_id,
         "turnId": request_id,
-        "projectId": os.path.basename(os.path.normpath(project_root)) if project_root else None,
-        "repositoryId": os.path.basename(os.path.normpath(project_root)) if project_root else None,
+        **(
+            ProjectContextLock.identify_project_root(project_root)
+            if project_root
+            else {"projectId": None, "repositoryId": None, "repositoryRoot": None, "branch": None}
+        ),
         "userRequest": safe_user_message,
         "originalRequest": safe_user_message,
         "conversationContext": {
@@ -2710,6 +2822,17 @@ def _build_semantic_task(
             SecretProtector.redact_text(str(item))
             for item in (required_evidence or [])
         ],
+        "evidenceRequirementDefinitions": [],
+        "requiredEvidenceDetails": [
+            {
+                "requirement": SecretProtector.redact_text(str(item.get("requirement") or ""))[:500],
+                "resource": item.get("resource"),
+                **({"evidenceType": item["evidenceType"]} if item.get("evidenceType") else {}),
+            }
+            for item in (required_evidence_details or [])
+            if isinstance(item, dict)
+        ],
+        "evidenceRequirements": [],
         "requiredFacts": [],
         "objectiveSatisfied": False,
         "requiredEvidenceSatisfied": False,
@@ -2813,8 +2936,232 @@ def _build_semantic_task(
             "passwordValue": "NEVER_EXPOSE",
             "passwordPresence": "VERIFY_WITHOUT_STORING_VALUE",
         }
+    state["evidenceRequirementDefinitions"] = list(state["requiredEvidence"])
+    _sync_task_evidence_requirements(state)
     _update_task_completeness(state)
     return state
+
+
+def _sync_task_evidence_requirements(task_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Keep task-specific requirement status attached to the existing AgentTaskState."""
+    details = {
+        str(item.get("requirement", "")).strip(): item
+        for item in task_state.get("requiredEvidenceDetails", [])
+        if isinstance(item, dict) and str(item.get("requirement", "")).strip()
+    }
+    existing = {
+        str(item.get("requirement", "")).strip(): item
+        for item in task_state.get("evidenceRequirements", [])
+        if isinstance(item, dict) and str(item.get("requirement", "")).strip()
+    }
+    requirements: List[Dict[str, Any]] = []
+    raw_requirements = task_state.get(
+        "evidenceRequirementDefinitions",
+        task_state.get("requiredEvidence", []),
+    )
+    for raw_requirement in raw_requirements:
+        if not isinstance(raw_requirement, str) or not raw_requirement.strip():
+            continue
+        requirement = SecretProtector.redact_text(raw_requirement.strip())[:500]
+        prior = existing.get(requirement)
+        requirement_id = hashlib.sha256(
+            f"{task_state.get('taskId', '')}\0{requirement}".encode("utf-8")
+        ).hexdigest()[:24]
+        record = {
+            "id": requirement_id,
+            "requirement": requirement,
+            "status": prior.get("status", "PENDING") if prior else "PENDING",
+            "evidenceIds": list(prior.get("evidenceIds") or []) if prior else [],
+            "provenance": list(prior.get("provenance") or []) if prior else [],
+            "knowledgeRevision": (
+                prior.get("knowledgeRevision", task_state.get("knowledgeRevision", 0))
+                if prior
+                else task_state.get("knowledgeRevision", 0)
+            ),
+        }
+        metadata = details.get(requirement)
+        if metadata:
+            record["resource"] = metadata.get("resource")
+            if metadata.get("evidenceType"):
+                record["evidenceType"] = metadata["evidenceType"]
+        requirements.append(record)
+    task_state["evidenceRequirements"] = requirements
+    return requirements
+
+
+def _refresh_task_evidence_requirements(task_state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Match requirements only to verified evidence linked by the executing action."""
+    requirements = _sync_task_evidence_requirements(task_state)
+    evidence_by_id = {
+        str(item.get("evidenceId")): item
+        for item in task_state.get("evidence", [])
+        if isinstance(item, dict) and item.get("evidenceId")
+    }
+    actions = [
+        action for action in task_state.get("actions", [])
+        if isinstance(action, dict)
+    ]
+    for requirement in requirements:
+        prior_status = requirement.get("status")
+        support_ids = set(requirement.get("evidenceIds") or [])
+        supporting_evidence: List[Dict[str, Any]] = []
+        explicitly_contradicted = False
+        explicitly_unavailable = False
+        for action in actions:
+            expected = action.get("expectedEvidence")
+            expected_values = (
+                [expected] if isinstance(expected, str)
+                else expected if isinstance(expected, list)
+                else []
+            )
+            if not any(
+                isinstance(value, str)
+                and value.strip().casefold() == requirement["requirement"].casefold()
+                for value in expected_values
+            ):
+                continue
+            linked_ids = [
+                evidence_id for evidence_id in action.get("resultEvidenceIds", [])
+                if isinstance(evidence_id, str)
+            ] if isinstance(action.get("resultEvidenceIds"), list) else []
+            result = _task_action_result(action)
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            for evidence_id in linked_ids:
+                evidence = evidence_by_id.get(evidence_id)
+                if (
+                    evidence
+                    and evidence.get("verified") is True
+                    and evidence.get("provenance")
+                    and (
+                        not requirement.get("resource")
+                        or evidence.get("type") == requirement["resource"]
+                    )
+                    and (
+                        requirement.get("evidenceType") != "LIVE_DATABASE_SCHEMA"
+                        or _has_live_schema_proof(result, data)
+                    )
+                    and (
+                        requirement.get("evidenceType") != "LIVE_DATABASE_QUERY"
+                        or _has_live_query_proof(result, data)
+                    )
+                    and (
+                        requirement.get("evidenceType") != "VERIFICATION_RESULT"
+                        or (
+                            action.get("tool") in {"run_verification", "terminal.run_command"}
+                            and data.get("executed") is True
+                            and isinstance(data.get("exitCode"), int)
+                            and not isinstance(data.get("exitCode"), bool)
+                        )
+                    )
+                ):
+                    support_ids.add(evidence_id)
+                    supporting_evidence.append(evidence)
+            if action.get("status") in {"SUCCESS", "REUSED"}:
+                for evidence in supporting_evidence:
+                    contradicted_ids = evidence.get("contradictsEvidenceIds")
+                    if (
+                        isinstance(contradicted_ids, list)
+                        and any(item in support_ids for item in contradicted_ids)
+                    ):
+                        explicitly_contradicted = True
+            result_status = str(
+                data.get("executionStatus")
+                or data.get("status")
+                or result.get("executionStatus")
+                or result.get("status")
+                or ""
+            ).upper()
+            if (
+                not support_ids
+                and action.get("status") in {"FAILED", "UNAVAILABLE"}
+                and result_status in {
+                    "UNAVAILABLE", "NOT_CONFIGURED", "UNSUPPORTED_OPERATION",
+                    "CAPABILITY_UNAVAILABLE",
+                }
+            ):
+                explicitly_unavailable = True
+        if explicitly_contradicted:
+            requirement["status"] = "CONTRADICTED"
+        elif support_ids:
+            requirement["status"] = "VERIFIED"
+            requirement["evidenceIds"] = sorted(support_ids)
+            requirement["provenance"] = list(dict.fromkeys(
+                str(item["provenance"])
+                for item in supporting_evidence
+                if item.get("provenance")
+            ))
+            requirement["knowledgeRevision"] = task_state.get("knowledgeRevision", 0)
+        elif explicitly_unavailable:
+            requirement["status"] = "UNAVAILABLE"
+        elif prior_status == "VERIFIED":
+            requirement["status"] = "VERIFIED"
+        elif prior_status == "CONTRADICTED":
+            requirement["status"] = "CONTRADICTED"
+        elif prior_status != "UNAVAILABLE":
+            requirement["status"] = "PENDING"
+    return requirements
+
+
+def _has_live_schema_proof(result: Dict[str, Any], data: Dict[str, Any]) -> bool:
+    proof_id = (
+        data.get("schema_evidence_id")
+        or data.get("schemaEvidenceId")
+        or data.get("evidenceId")
+        or result.get("schema_evidence_id")
+        or result.get("schemaEvidenceId")
+        or result.get("evidenceId")
+    )
+    proof = DatabaseEvidenceStore.get_proof(str(proof_id)) if proof_id else None
+    return bool(
+        proof
+        and proof.is_live_provenance()
+        and any(
+            key in data
+            for key in ("schema_details", "schemaDetails", "constraints", "indexes", "primary_keys", "primaryKeys")
+        )
+    )
+
+
+def _has_live_query_proof(result: Dict[str, Any], data: Dict[str, Any]) -> bool:
+    proof_id = (
+        data.get("evidenceId")
+        or result.get("evidenceId")
+        or data.get("proofEvidenceId")
+        or result.get("proofEvidenceId")
+    )
+    proof = DatabaseEvidenceStore.get_proof(str(proof_id)) if proof_id else None
+    return bool(proof and proof.is_live_provenance())
+
+
+def _task_evidence_sufficiency(task_state: Dict[str, Any]) -> Dict[str, Any]:
+    requirements = _refresh_task_evidence_requirements(task_state)
+    statuses = {
+        item["id"]: {
+            "requirement": item["requirement"],
+            "status": item["status"],
+            "evidenceIds": list(item.get("evidenceIds") or []),
+            "provenance": list(item.get("provenance") or []),
+            "knowledgeRevision": item.get("knowledgeRevision", 0),
+        }
+        for item in requirements
+    }
+    return {
+        "required": bool(requirements),
+        "sufficient": bool(requirements) and all(
+            item["status"] == "VERIFIED" for item in requirements
+        ),
+        "unresolved": [
+            item["requirement"]
+            for item in requirements
+            if item["status"] in {"PENDING", "CONTRADICTED"}
+        ],
+        "unavailable": [
+            item["requirement"]
+            for item in requirements
+            if item["status"] == "UNAVAILABLE"
+        ],
+        "requirements": statuses,
+    }
 
 
 def _update_task_completeness(task_state: Dict[str, Any]) -> None:
@@ -2822,9 +3169,16 @@ def _update_task_completeness(task_state: Dict[str, Any]) -> None:
     if not isinstance(required_facts, list):
         required_facts = []
     resolved_statuses = {"VERIFIED", "PROVEN_BLOCKER"}
-    required_evidence_satisfied = bool(required_facts) and all(
+    required_facts_satisfied = bool(required_facts) and all(
         isinstance(fact, dict) and fact.get("status") == "VERIFIED"
         for fact in required_facts
+    )
+    evidence_sufficiency = _task_evidence_sufficiency(task_state)
+    has_evidence_requirements = bool(task_state.get("evidenceRequirements"))
+    required_evidence_satisfied = (
+        (required_facts_satisfied if required_facts else True)
+        and (evidence_sufficiency["sufficient"] if has_evidence_requirements else True)
+        and bool(required_facts or has_evidence_requirements)
     )
     blocker_established = bool(task_state.get("investigationExhausted")) and all(
         isinstance(fact, dict)
@@ -2832,7 +3186,10 @@ def _update_task_completeness(task_state: Dict[str, Any]) -> None:
         for fact in required_facts
     )
     task_state["requiredEvidenceSatisfied"] = required_evidence_satisfied
-    task_state["objectiveSatisfied"] = required_evidence_satisfied or blocker_established
+    task_state["objectiveSatisfied"] = required_evidence_satisfied or (
+        blocker_established and not has_evidence_requirements
+    )
+    task_state["evidenceSufficiency"] = evidence_sufficiency
     working_memory = task_state.setdefault("workingMemory", {})
     facts_by_name = {
         str(item.get("name")): item
@@ -3049,11 +3406,14 @@ def _compile_agent_task_context(task_state: Dict[str, Any]) -> Dict[str, Any]:
         "objectiveSatisfied": task_state.get("objectiveSatisfied", False),
         "requiredEvidenceSatisfied": task_state.get("requiredEvidenceSatisfied", False),
         "requiredFacts": task_state.get("requiredFacts", []),
+        "evidenceRequirements": task_state.get("evidenceRequirements", []),
+        "evidenceSufficiency": task_state.get("evidenceSufficiency"),
         "investigationEvidenceGate": task_state.get("investigationEvidenceGate"),
         "intent": task_state.get("intent"),
         "target": task_state.get("target"),
         "context": task_state.get("context"),
         "resources": task_state.get("resources", []),
+        "resourceDecision": task_state.get("resourceDecision"),
         "facts": task_state.get("facts", [])[-12:],
         "unknowns": task_state.get("unknowns", [])[:12],
         "hypotheses": task_state.get("hypotheses", [])[-8:],
@@ -3103,6 +3463,28 @@ def _resume_semantic_task(
     return resumed
 
 
+def _messages_for_active_coding_task(
+    messages: List[Dict[str, Any]],
+    continuing: bool,
+) -> List[Dict[str, Any]]:
+    """Keep task history only when the current request continues the prior turn."""
+    user_indices = [
+        index for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    if not user_indices:
+        return []
+    current_index = user_indices[-1]
+    if not continuing:
+        return [messages[current_index]]
+    previous_index = user_indices[-2] if len(user_indices) > 1 else current_index
+    return [
+        message
+        for message in messages[previous_index:]
+        if isinstance(message, dict) and message.get("role") in {"user", "assistant"}
+    ]
+
+
 def _persist_agent_task_state(
     session: Dict[str, Any],
     task_state: Dict[str, Any],
@@ -3131,6 +3513,16 @@ def _task_resource_for_tool(name: str) -> str:
     if "run_verification" in lowered or "terminal" in lowered:
         return "RUNTIME"
     return "CODE"
+
+
+def _has_repository_map_evidence(task_state: Dict[str, Any]) -> bool:
+    return any(
+        isinstance(action, dict)
+        and action.get("tool") == "get_repository_map"
+        and action.get("status") in {"SUCCESS", "REUSED"}
+        and action.get("resultEvidenceIds")
+        for action in task_state.get("actions", [])
+    )
 
 
 def _update_task_resource_state(task_state: Dict[str, Any], resource_type: str, status: str) -> None:
@@ -3177,6 +3569,27 @@ def _update_task_from_tool_result(
             ensure_ascii=False,
             default=str,
         )
+        if action.get("tool") == "get_repository_map":
+            data = result.get("data") if isinstance(result, dict) else None
+            if isinstance(data, dict):
+                map_summary = {}
+                for key in (
+                    "languages", "frameworks", "sourceDirectories",
+                    "testDirectories", "entryPoints", "configFiles",
+                    "importantFiles",
+                ):
+                    value = data.get(key)
+                    if isinstance(value, list):
+                        map_summary[key] = [
+                            SecretProtector.redact_text(str(item))[:200]
+                            for item in value[:30]
+                        ]
+                if map_summary:
+                    safe_summary = json.dumps(
+                        {"data": map_summary},
+                        ensure_ascii=False,
+                        default=str,
+                    )
         if len(safe_summary) > 800:
             parsed_object = parsed_result if isinstance(parsed_result, dict) else {}
             result_content = parsed_object.get("content")
@@ -3193,6 +3606,13 @@ def _update_task_from_tool_result(
                     "rowCount",
                     "query",
                     "path",
+                    "languages",
+                    "frameworks",
+                    "sourceDirectories",
+                    "testDirectories",
+                    "entryPoints",
+                    "configFiles",
+                    "importantFiles",
                 )
                 if key in parsed_object
             }
@@ -3239,7 +3659,12 @@ def _update_task_from_tool_result(
         if isinstance(data, dict):
             informative_result = any(
                 bool(data.get(key))
-                for key in ("results", "symbols", "references", "content", "path", "directories", "schema_details", "schemaDetails")
+                for key in (
+                    "results", "symbols", "references", "content", "path",
+                    "directories", "languages", "frameworks", "entryPoints",
+                    "sourceDirectories", "configFiles", "schema_details",
+                    "schemaDetails",
+                )
             )
             if any(key in data and isinstance(data.get(key), str) for key in ("content",)):
                 informative_result = bool(data["content"].strip())
@@ -3257,6 +3682,7 @@ def _update_task_from_tool_result(
             for value in non_placeholder_values
         )
     if succeeded and informative_result:
+        result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
         evidence = {
             "evidenceId": evidence_id,
             "taskId": task_state.get("taskId"),
@@ -3278,6 +3704,19 @@ def _update_task_from_tool_result(
             "verified": True,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        contradictory_ids = result_data.get("contradictsEvidenceIds")
+        known_evidence_ids = {
+            str(item.get("evidenceId"))
+            for item in task_state.get("evidence", [])
+            if isinstance(item, dict) and item.get("evidenceId")
+        }
+        if isinstance(contradictory_ids, list):
+            validated_contradictions = list(dict.fromkeys(
+                item for item in contradictory_ids
+                if isinstance(item, str) and item in known_evidence_ids
+            ))[:20]
+            if validated_contradictions:
+                evidence["contradictsEvidenceIds"] = validated_contradictions
         task_state.setdefault("evidence", []).append(evidence)
         task_state["knowledgeRevision"] = int(task_state.get("knowledgeRevision", 0)) + 1
         task_state.setdefault("facts", []).append({
@@ -3321,10 +3760,21 @@ def _update_task_from_tool_result(
             else "Tool returned no structured success"
         )
         failure_classification = (
-            str(result.get("failureClassification") or result.get("classification") or "TOOL_FAILURE")
+            str(
+                result.get("failureClassification")
+                or result.get("classification")
+                or (
+                    result.get("executionStatus")
+                    if str(result.get("executionStatus") or "").upper()
+                    in {"DB_ENGINE_UNKNOWN", "DB_CONFIG_AMBIGUOUS", "UNSUPPORTED_ENGINE"}
+                    else "TOOL_FAILURE"
+                )
+            )
             if isinstance(result, dict)
             else "TOOL_FAILURE"
         )
+        if isinstance(result, dict):
+            action["failureClassification"] = failure_classification
         recoverable = (
             bool(result.get("recoverable"))
             if isinstance(result, dict) and "recoverable" in result
@@ -3530,6 +3980,7 @@ async def _resolve_semantic_task_with_model(
     session_id: str,
 ) -> Dict[str, Any]:
     system = (
+        f"{CODING_ENGINEERING_POLICY} "
         "You are the Coding Agent's task-state reasoning cycle. Use the entire supplied conversation and current "
         "safe task-scoped working memory in AgentTaskState to identify what is known, what remains unknown, and "
         "the single next best action. Every call is one bounded reasoning cycle: use current AgentTaskState, "
@@ -3542,7 +3993,10 @@ async def _resolve_semantic_task_with_model(
         "Report whether this request continues the current task; do not carry state across a clearly unrelated request. "
         "Identify the user's "
         "goal, intent, target and candidate targets, resources (including multiple resources when required), "
-        "evidence needed, verification plan, and confidence. Resolve ellipsis and corrections against the active "
+        "task-specific required evidence, and for each requirement identify its resource and any strict "
+        "evidence type (LIVE_DATABASE_SCHEMA, LIVE_DATABASE_QUERY, or VERIFICATION_RESULT). Include "
+        "required_evidence_details only for requirements that need source-specific validation. "
+        "Evidence needs, verification plan, and confidence. Resolve ellipsis and corrections against the active "
         "task, but do not carry context into a clearly new request. Choose ROUTE_TO_CODE for repository/source "
         "investigation, explanation, diagnosis, or proposed changes; identify every required resource so the "
         "existing investigation tools can gather evidence. Choose a database capability only for an operation "
@@ -3632,6 +4086,7 @@ async def _summarize_database_connection_status(
         {
             "role": "system",
             "content": (
+                f"{CODING_ENGINEERING_POLICY} "
                 "Answer this database-connection question in the Coding Agent's normal conversational style. "
                 "Use only the capability evidence below. First distinguish the selected project's configuration "
                 "from the active database session and from live runtime verification. The configured status "
@@ -3711,12 +4166,50 @@ def _compact_coding_conversation(messages: List[Dict[str, Any]]) -> List[Dict[st
          if any(message.get("role") == "user" for message in groups[index])),
         None,
     )
-    selected = set()
+    latest_request = next(
+        (
+            str(message.get("content") or "")
+            for message in reversed(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        "",
+    )
+    relevance_terms = {
+        token for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", latest_request.casefold())
+        if token not in {"the", "and", "for", "with", "from", "that", "this", "how", "what"}
+    }
+    task_state_groups = {
+        index for index, group in enumerate(groups)
+        if any(
+            message.get("role") == "system"
+            and "AgentTaskState" in str(message.get("content") or "")
+            for message in group
+        )
+    }
+    selected = set(task_state_groups)
     selected_chars = sum(_message_size(message) for message in base)
+    selected_chars += sum(
+        _message_size(message)
+        for index in task_state_groups
+        for message in groups[index]
+    )
     if required_user_group is not None:
         selected.add(required_user_group)
         selected_chars += sum(_message_size(message) for message in groups[required_user_group])
-    for index in range(len(groups) - 1, -1, -1):
+    ranked_groups = sorted(
+        range(len(groups)),
+        key=lambda index: (
+            100000 if index in task_state_groups else 0,
+            sum(
+                1
+                for term in relevance_terms
+                if term in json.dumps(groups[index], ensure_ascii=False, default=str).casefold()
+            ) * 100,
+            index,
+        ),
+        reverse=True,
+    )
+    for index in ranked_groups:
         if index in selected:
             continue
         group_chars = sum(_message_size(message) for message in groups[index])
@@ -3793,8 +4286,11 @@ def _coding_finalization_messages(
             + "\n\n".join(reversed(evidence_parts))
         )
     system = (
+        f"{CODING_ENGINEERING_POLICY} "
         "You are the Coding Agent. Use only the user's request and the project evidence provided. "
-        "Do not claim any files were changed or commands were run. "
+        "This is FINALIZATION, after investigation. Do not call or request tools; return a plain-text answer "
+        "using the supplied evidence, or state what could not be verified. Do not claim any files were changed "
+        "or commands were run. "
     )
     if proposal_required:
         system += (
@@ -4089,42 +4585,10 @@ def _investigation_evidence_gate(
             "evidenceIds": [],
         },
     }
-    prerequisite_statuses = (
-        statuses["CURRENT_IMPLEMENTATION"]["status"],
-        statuses["PROJECT_REUSABLE_PATTERNS"]["status"],
-        statuses["EXISTING_SIMILAR_IMPLEMENTATIONS"]["status"],
-    )
-    answer_lower = str(answer or "").casefold()
-    options = {
-        match.casefold()
-        for match in re.findall(r"\b(?:option|approach|alternative)\s*(?:[a-c]|\d+)\b", answer_lower)
-    }
-    cited_paths = {
-        Path(path).name.casefold() for path in file_paths
-        if Path(path).name.casefold() in answer_lower
-    }
-    if all(status == "VERIFIED" for status in prerequisite_statuses) and len(options) >= 2:
-        statuses["OPTIONS_COMPARISON"] = {
-            "status": "VERIFIED",
-            "evidenceIds": list(dict.fromkeys(
-                evidence_id
-                for category in (
-                    "CURRENT_IMPLEMENTATION",
-                    "PROJECT_REUSABLE_PATTERNS",
-                    "EXISTING_SIMILAR_IMPLEMENTATIONS",
-                )
-                for evidence_id in statuses[category]["evidenceIds"]
-            )),
-        }
-    if (
-        all(status == "VERIFIED" for status in prerequisite_statuses)
-        and cited_paths
-        and re.search(r"\b(minimal|smallest|least invasive)\b", answer_lower)
-    ):
-        statuses["MINIMAL_CHANGE_IMPACT"] = {
-            "status": "VERIFIED",
-            "evidenceIds": current_evidence,
-        }
+    # Comparison and recommendation are reasoning outputs, not execution evidence.
+    # They are tracked only when task understanding makes them explicit evidence requirements.
+    statuses["OPTIONS_COMPARISON"] = {"status": "NOT_APPLICABLE", "evidenceIds": []}
+    statuses["MINIMAL_CHANGE_IMPACT"] = {"status": "NOT_APPLICABLE", "evidenceIds": []}
     return {
         "required": True,
         "statuses": statuses,
@@ -4160,14 +4624,12 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[Optional[str], Dict[str, 
         arguments = {}
 
     canonical_name = resolve_tool_capability(raw_name)
-    if not canonical_name:
-        fallback_name, fallback_args = CapabilityIntelligenceEngine.resolve_and_fallback(raw_name, arguments)
-        if fallback_name:
-            canonical_name = fallback_name
-            arguments = fallback_args
     if not canonical_name or canonical_name not in TOOL_CAPABILITIES or not TOOL_CAPABILITIES[canonical_name].get("available"):
         available_tools = ", ".join(sorted(TOOL_CAPABILITIES.keys()))
-        raise ValueError(f"Tool '{raw_name}' is not supported in this runtime. Available capabilities: {available_tools}.")
+        raise ValueError(
+            f"UNKNOWN_MODEL_TOOL: '{raw_name}' is not supported in this runtime. "
+            f"Choose exactly one available capability: {available_tools}."
+        )
 
     normalized_args: Dict[str, Any] = {}
     if canonical_name == "read_file":
@@ -4206,6 +4668,274 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[Optional[str], Dict[str, 
 
 async def _send(send_json, payload: Dict[str, Any]) -> None:
     await send_json(payload)
+
+
+def _activity_type_for_tool(tool: str) -> str:
+    exact_types = {
+        "search_code": "SEARCHING",
+        "repo_browser.search_code": "SEARCHING",
+        "find_code": "SEARCHING",
+        "search_files": "SEARCHING",
+        "read_file": "READING_FILE",
+        "repo_browser.read_file": "READING_FILE",
+        "repo_browser.open_file": "READING_FILE",
+        "open_file": "READING_FILE",
+        "list_directory": "DISCOVERING_REPOSITORY",
+        "repo_browser.list_directory": "DISCOVERING_REPOSITORY",
+        "get_repository_map": "DISCOVERING_REPOSITORY",
+        "search_symbols": "INSPECTING_SYMBOL",
+        "repo_browser.search_symbols": "INSPECTING_SYMBOL",
+        "find_symbols": "INSPECTING_SYMBOL",
+        "find_references": "TRACING_CALLER",
+        "repo_browser.find_references": "TRACING_CALLER",
+        "run_verification": "VERIFYING",
+        "terminal.run_command": "VERIFYING",
+        "execute_sql": "INSPECTING_DATABASE",
+        "discover_database_configuration": "INSPECTING_DATABASE",
+        "DATABASE_CONNECT": "INSPECTING_DATABASE",
+        "DATABASE_CONNECT_TARGET": "INSPECTING_DATABASE",
+        "DATABASE_RECONNECT": "INSPECTING_DATABASE",
+        "DATABASE_DISCONNECT": "INSPECTING_DATABASE",
+        "DATABASE_HEALTH_CHECK": "INSPECTING_DATABASE",
+        "DATABASE_CURRENT_TARGET": "INSPECTING_DATABASE",
+        "DATABASE_CREDENTIAL_REQUEST": "INSPECTING_DATABASE",
+        "DATABASE_LIST_DATABASES": "INSPECTING_DATABASE",
+        "DATABASE_LIST_SCHEMAS": "INSPECTING_DATABASE",
+        "DATABASE_LIST_TABLES": "INSPECTING_DATABASE",
+        "DATABASE_LIST_COLUMNS": "INSPECTING_DATABASE",
+        "DATABASE_DESCRIBE_TABLE": "INSPECTING_DATABASE",
+        "DATABASE_COUNT_RECORDS": "INSPECTING_DATABASE",
+        "DATABASE_LIST_INDEXES": "INSPECTING_DATABASE",
+        "DATABASE_LIST_VIEWS": "INSPECTING_DATABASE",
+        "DATABASE_LIST_CONSTRAINTS": "INSPECTING_DATABASE",
+        "DATABASE_QUERY": "INSPECTING_DATABASE",
+        "DATABASE_EXPLAIN": "INSPECTING_DATABASE",
+        "DATABASE_ANALYZE": "INSPECTING_DATABASE",
+        "DATABASE_QUERY_TIMING": "INSPECTING_DATABASE",
+        "DATABASE_SLOW_QUERIES": "INSPECTING_DATABASE",
+        "DATABASE_TOP_QUERIES": "INSPECTING_DATABASE",
+        "DATABASE_QUERY_STATISTICS": "INSPECTING_DATABASE",
+        "DATABASE_LOCKS": "INSPECTING_DATABASE",
+        "DATABASE_CONNECTIONS": "INSPECTING_DATABASE",
+        "DATABASE_SOURCE_TRACE": "INSPECTING_DATABASE",
+        "DATABASE_BENCHMARK": "INSPECTING_DATABASE",
+        "DATABASE_OPTIMIZATION": "INSPECTING_DATABASE",
+    }
+    return exact_types.get(tool, "TOOL")
+
+
+def _activity_status_for_result(tool: str, result: Any) -> str:
+    if not isinstance(result, dict):
+        return "UNVERIFIED"
+    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    if tool in ("run_verification", "terminal.run_command"):
+        exit_code = data.get("exitCode")
+        if data.get("executed") is not True or not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            return "UNVERIFIED"
+        return "COMPLETED" if result.get("ok") is True and exit_code == 0 else "FAILED"
+    execution_status = str(
+        data.get("executionStatus") or data.get("verificationStatus") or data.get("status") or ""
+    ).upper()
+    if execution_status in {
+        "UNAVAILABLE",
+        "NOT_VERIFIED",
+        "NOT_CONFIGURED",
+        "UNVERIFIED",
+        "NEEDS_CLARIFICATION",
+    }:
+        return "UNVERIFIED"
+    return "COMPLETED" if result.get("ok") is True else "FAILED"
+
+
+def _redact_activity_text(value: Any, max_length: int) -> str:
+    text = re.sub(
+        r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@",
+        r"\1[REDACTED]@",
+        str(value or ""),
+    )
+    text = SecretProtector.redact_text(text)
+    return text[:max_length]
+
+
+def _activity_target_for_tool(tool: str, arguments: Dict[str, Any]) -> str:
+    if tool == "execute_sql":
+        return "read-only SQL operation"
+    target = (
+        arguments.get("relativePath")
+        or arguments.get("path")
+        or arguments.get("query")
+        or arguments.get("sql")
+        or arguments.get("command")
+        or arguments.get("script")
+        or arguments.get("symbol")
+        or tool
+    )
+    return _redact_activity_text(target, 300)
+
+
+def _activity_event_payload(
+    action: Dict[str, Any],
+    request_id: str,
+    session_id: str,
+    status: str,
+    result: Any = None,
+    error: Any = None,
+) -> Dict[str, Any]:
+    tool = str(action.get("tool") or "unknown")
+    safe_action = {
+        "tool": _redact_activity_text(tool, 120),
+        "target": _redact_activity_text(action.get("target"), 300),
+    }
+
+    payload: Dict[str, Any] = {
+        "type": "activity_event",
+        "event": "activity_event",
+        "activityId": str(action.get("actionId") or ""),
+        "executionId": request_id,
+        "taskId": str(action.get("taskId") or request_id),
+        "sessionId": session_id,
+        "action": safe_action,
+        "activityType": _activity_type_for_tool(tool),
+        "status": status,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    safe_result: Dict[str, Any] = {}
+    if isinstance(result, dict):
+        data = result.get("data") if isinstance(result.get("data"), dict) else result
+        if tool in ("run_verification", "terminal.run_command"):
+            executed = data.get("executed") is True
+            exit_code = data.get("exitCode")
+            if executed and isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                safe_result["exitCode"] = exit_code
+            command = data.get("command") or data.get("script") or action.get("target")
+            if isinstance(command, str) and command:
+                safe_result["command"] = _redact_activity_text(command, 300)
+            safe_result["executionStatus"] = (
+                str(data.get("verificationStatus") or data.get("status") or ("PASSED" if result.get("ok") is True and exit_code == 0 else "FAILED"))
+                if executed and isinstance(exit_code, int) and not isinstance(exit_code, bool)
+                else "UNVERIFIED"
+            )
+        elif tool.startswith("DATABASE_") or tool in (
+            "execute_sql",
+            "discover_database_configuration",
+        ):
+            for key in ("rowCount", "databaseType", "executionStatus", "status"):
+                value = data.get(key)
+                if key == "databaseType" and not value and tool == "discover_database_configuration":
+                    value = data.get("engine")
+                if key == "rowCount" and isinstance(value, int) and not isinstance(value, bool):
+                    safe_result["rowCount"] = value
+                elif key != "rowCount" and isinstance(value, str) and value:
+                    safe_result["databaseType" if key == "databaseType" else "executionStatus"] = _redact_activity_text(value, 80)
+            config_file = data.get("configFile")
+            if tool == "discover_database_configuration" and isinstance(config_file, str) and config_file:
+                safe_result["paths"] = [_redact_activity_text(config_file, 300)]
+        collection = None
+        collection_key = None
+        if isinstance(data, dict):
+            for key in (
+                "results", "symbols", "references", "entries", "directories",
+                "tables", "constraints", "indexes", "rows",
+            ):
+                if isinstance(data.get(key), list):
+                    collection = data[key]
+                    collection_key = key
+                    break
+        elif isinstance(data, list):
+            collection = data
+        if collection_key == "rows":
+            safe_result["rowCount"] = len(collection)
+        if collection is not None:
+            safe_result["count"] = len(collection)
+            if collection_key != "rows":
+                paths = []
+                seen_paths = set()
+                for item in collection:
+                    if not isinstance(item, dict):
+                        continue
+                    path = item.get("path") or item.get("name")
+                    if not isinstance(path, str) or not path:
+                        continue
+                    safe_path = _redact_activity_text(path, 300)
+                    if safe_path not in seen_paths:
+                        seen_paths.add(safe_path)
+                        paths.append(safe_path)
+                    if len(paths) == 40:
+                        break
+                if paths:
+                    safe_result["paths"] = paths
+        if tool in ("read_file", "repo_browser.read_file", "repo_browser.open_file", "open_file"):
+            content = data.get("content") if isinstance(data, dict) else None
+            if isinstance(content, str):
+                safe_result["lineCount"] = len(content.splitlines())
+            path = data.get("path") if isinstance(data, dict) else None
+            if isinstance(path, str) and path:
+                safe_result["paths"] = [_redact_activity_text(path, 300)]
+        evidence_ids = action.get("resultEvidenceIds")
+        if isinstance(evidence_ids, list):
+            safe_result["evidenceIds"] = [str(item)[:160] for item in evidence_ids[:20] if isinstance(item, str)]
+    if safe_result:
+        payload["result"] = safe_result
+
+    error_source = error
+    if error_source is None and status in {"FAILED", "UNVERIFIED"} and isinstance(result, dict):
+        error_source = result
+    if isinstance(error_source, dict):
+        raw_error = error_source.get("error") if isinstance(error_source.get("error"), dict) else error_source
+        error_code = raw_error.get("code")
+        error_message = raw_error.get("message") or error_source.get("message")
+        if error_message is None and isinstance(error_source.get("content"), str):
+            error_message = error_source["content"]
+        if error_code or error_message:
+            payload["error"] = {
+                **({"code": _redact_activity_text(error_code, 100)} if error_code else {}),
+                **({"message": _redact_activity_text(error_message, 500)} if error_message else {}),
+            }
+    elif isinstance(error_source, str) and error_source:
+        payload["error"] = {"message": _redact_activity_text(error_source, 500)}
+    return payload
+
+
+async def _publish_activity_event(
+    send_json,
+    action: Dict[str, Any],
+    request_id: str,
+    session_id: str,
+    status: str,
+    result: Any = None,
+    error: Any = None,
+) -> None:
+    try:
+        await _send(
+            send_json,
+            _activity_event_payload(action, request_id, session_id, status, result, error),
+        )
+    except Exception as observer_error:
+        logger.warning(
+            "Could not publish Coding activity event (request_id=%s action_id=%s): %s",
+            request_id,
+            action.get("actionId"),
+            SecretProtector.redact_text(str(observer_error))[:300],
+        )
+
+
+async def _dispatch_coding_tool(
+    send_json,
+    action: Dict[str, Any],
+    request_id: str,
+    session_id: str,
+    tool_call_id: str,
+    name: str,
+    arguments: Dict[str, Any],
+) -> None:
+    await _publish_activity_event(send_json, action, request_id, session_id, "STARTED")
+    await _send(send_json, {
+        "type": "tool_call",
+        "requestId": request_id,
+        "toolCallId": tool_call_id,
+        "name": name,
+        "arguments": arguments,
+    })
 
 
 async def _wait_for_tool(state: Dict[str, Any], request_id: str, tool_call_id: str) -> Any:
@@ -4337,6 +5067,16 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
 
 async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, Any], registry: Any, config_path: Any) -> None:
     request_id = str(payload.get("requestId") or "")
+    context_preexisted = get_coding_request_context(request_id) is not None
+    try:
+        await _run_coding_turn_impl(payload, send_json, state, registry, config_path)
+    finally:
+        if not context_preexisted:
+            clear_coding_request_context(request_id)
+
+
+async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[str, Any], registry: Any, config_path: Any) -> None:
+    request_id = str(payload.get("requestId") or "")
     selected_provider_id = None
     configured_provider_id = None
     supplied = [
@@ -4352,33 +5092,50 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
     proposal_required = _requires_proposal_for_conversation(supplied)
     session_id = str(payload.get("conversationId") or payload.get("sessionId") or payload.get("requestId") or "default-coding-session")
     scope = str(payload.get("scope") or ".")[:CODING_MAX_PATH_CHARS]
+    backend_project_state = get_backend_project_state()
+    active_db_sess = DatabaseSessionManager.get_session(project_root="", session_id=session_id)
     project_root = ProjectContextLock.resolve_authoritative_root(
         session_id=session_id,
-        backend_root=(get_backend_project_state() or {}).get("projectRoot") if isinstance(get_backend_project_state(), dict) else None,
+        session_root=getattr(active_db_sess, "project_root", None) if active_db_sess else None,
+        backend_root=backend_project_state.get("projectRoot") if isinstance(backend_project_state, dict) else None,
         explicit_root=payload.get("projectRoot"),
     )
-    if not project_root:
-        project_root = payload.get("projectRoot")
-    if not project_root:
-        backend_st = get_backend_project_state()
-        if isinstance(backend_st, dict):
-            project_root = backend_st.get("projectRoot")
-    if not project_root:
-        active_db_sess = DatabaseSessionManager.get_session(project_root="", session_id=session_id)
-        if active_db_sess and getattr(active_db_sess, "project_root", None):
-            project_root = active_db_sess.project_root
 
-    # Check if user message explicitly provides an existing directory path on disk
-    path_cand_m = re.search(r"([a-zA-Z]:[/\\][a-zA-Z0-9_\-./\\]+|/[a-zA-Z0-9_\-./\\]+)", raw_request)
-    if path_cand_m:
-        cand_p = path_cand_m.group(1).rstrip(".,;\"'")
-        if os.path.isdir(cand_p):
-            project_root = os.path.normpath(cand_p)
-
-    if project_root and isinstance(project_root, str):
-        await asyncio.to_thread(set_backend_project_state, project_root)
-        await asyncio.to_thread(UNIVERSAL_INDEX.scan_and_update, project_root, max_files=150)
-        ProjectContextLock.lock(project_root, session_id=session_id, scope=scope)
+    if not project_root:
+        await _send(send_json, {
+            "type": "error",
+            "requestId": request_id,
+            "code": "PROJECT_CONTEXT_UNAVAILABLE",
+            "classification": "PROJECT_CONTEXT_UNAVAILABLE",
+            "message": "Unable to access the active project repository.",
+        })
+        return
+    project_root = str(Path(project_root).resolve())
+    try:
+        context_identity = await asyncio.to_thread(
+            register_coding_request_context,
+            request_id,
+            session_id,
+            project_root,
+        )
+    except ValueError as context_error:
+        await _send(send_json, {
+            "type": "error",
+            "requestId": request_id,
+            "code": "PROJECT_CONTEXT_UNAVAILABLE",
+            "classification": "PROJECT_CONTEXT_UNAVAILABLE",
+            "message": SecretProtector.redact_text(str(context_error))[:300],
+        })
+        return
+    logger.info(
+        "Coding project context resolved request_id=%s session_id=%s project_id=%s repository_id=%s",
+        request_id,
+        session_id,
+        context_identity.get("projectId"),
+        context_identity.get("repositoryId"),
+    )
+    await asyncio.to_thread(UNIVERSAL_INDEX.scan_and_update, project_root, max_files=150)
+    ProjectContextLock.lock(project_root, session_id=session_id, task_id=request_id, scope=scope)
     session = CODING_TASK_STORE.get_or_create(session_id, project_root=project_root or "", scope=scope)
     previous_messages = [
         message for message in supplied[:-1]
@@ -4623,7 +5380,14 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     "invalid database action", "did not select exactly one",
                     "unsupported database action", "invalid task action",
                 ))
-                else "PROVIDER_UNAVAILABLE"
+                else (
+                    "TASK_UNDERSTANDING_INVALID"
+                    if any(marker in error_text_lower for marker in (
+                        "ai model returned", "ai model did not select",
+                        "invalid task intent", "invalid task resources",
+                    ))
+                    else "PROVIDER_UNAVAILABLE"
+                )
             )
             task_state.setdefault("failures", []).append({
                 "action": "semantic_task_resolution",
@@ -4642,11 +5406,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                 "recoverable": True,
             })
             if project_root or _has_explicit_code_resource_cue(request):
-                fallback_resources = (
-                    ["CODE", "REPOSITORY"]
-                    if _has_explicit_code_resource_cue(request)
-                    else ["DATABASE", "CONFIGURATION", "PROJECT"]
-                )
+                fallback_resources = ["CODE", "REPOSITORY"]
                 db_det = {
                     "is_deterministic": False,
                     "route_to_code": True,
@@ -4668,12 +5428,11 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                             }
                             for resource in fallback_resources
                         ],
-                        "requiredEvidence": [
-                            "Inspect safe project and database configuration evidence relevant to the request."
-                        ],
+                        "requiredEvidence": [],
                         "reasoningSummary": (
-                            "Semantic resolution was unavailable; continue bounded, read-only discovery "
-                            "with project-scoped evidence."
+                            "Semantic resolution was unavailable; use the attached project for bounded, "
+                            "read-only source discovery. Do not inspect database resources unless the "
+                            "request independently establishes a database requirement."
                         ),
                         "confidence": 0.5,
                         "selectedAction": "ROUTE_TO_CODE",
@@ -4742,6 +5501,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                 scope=scope,
                 architecture=arch,
                 required_evidence=model_semantics.get("requiredEvidence"),
+                required_evidence_details=model_semantics.get("requiredEvidenceDetails"),
                 verification_plan=model_semantics.get("verificationPlan"),
                 ambiguity=model_semantics.get("ambiguity"),
                 clarification_required=True,
@@ -4889,14 +5649,21 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             project_root=str(project_root or ""),
         )
 
-    selected_resources = list((selected_semantics or {}).get("resourceCandidates") or [])
-    if not selected_resources:
+    candidate_resources = list((selected_semantics or {}).get("resourceCandidates") or [])
+    if not candidate_resources:
         if database_routed_to_code:
-            selected_resources = ["CODE", "REPOSITORY"]
+            candidate_resources = ["CODE", "REPOSITORY"]
         elif db_det.get("is_deterministic"):
-            selected_resources = ["DATABASE"]
+            candidate_resources = ["DATABASE"]
         else:
-            selected_resources = ["PROJECT", "REPOSITORY", "CODE"]
+            candidate_resources = ["PROJECT", "REPOSITORY", "CODE"]
+    selected_resources = (
+        [resource for resource in candidate_resources if resource != "DATABASE"]
+        if database_routed_to_code
+        else candidate_resources
+    )
+    if database_routed_to_code and not selected_resources:
+        selected_resources = ["CODE", "REPOSITORY"]
     semantic_task = _build_semantic_task(
         request_id=request_id,
         session_id=session_id,
@@ -4924,6 +5691,34 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         conversation_message_count=len(supplied),
         conversation_messages=supplied,
     )
+    semantic_task["resourceCandidates"] = list(dict.fromkeys(candidate_resources))
+    semantic_task["workingMemory"]["candidateResources"] = semantic_task["resourceCandidates"]
+    if database_routed_to_code:
+        deferred_resources = (
+            ["database"] if "DATABASE" in candidate_resources else []
+        )
+        semantic_task["resourceDecision"] = {
+            "selectedResource": "repository",
+            "reason": (
+                "The validated next action is repository investigation; database evidence is deferred "
+                "until repository evidence shows it is required."
+            ),
+            "requiredEvidence": list(semantic_task.get("requiredEvidence") or []),
+            "deferredResources": deferred_resources,
+            "confidence": float(
+                (selected_semantics or {}).get("confidence", semantic_task.get("confidence", 0.5))
+            ),
+        }
+    elif db_det.get("is_deterministic"):
+        semantic_task["resourceDecision"] = {
+            "selectedResource": "database",
+            "reason": "The validated next action is a database capability required by the current request.",
+            "requiredEvidence": list(semantic_task.get("requiredEvidence") or []),
+            "deferredResources": [],
+            "confidence": float(
+                (selected_semantics or {}).get("confidence", semantic_task.get("confidence", 0.5))
+            ),
+        }
     explicit_continuation = bool(
         intent_info.get("is_continuation") and prior_semantic_task
     )
@@ -5120,6 +5915,48 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             "expectedEvidence": None,
             "confidence": semantic_task.get("confidence", 0.5),
         }
+    task_conversation_messages = _messages_for_active_coding_task(
+        supplied,
+        bool(semantic_task.get("conversationContext", {}).get("continuityDetected")),
+    )
+    require_repository_map = bool(
+        project_root
+        and _is_project_architecture_question(raw_request)
+        and not _has_repository_map_evidence(semantic_task)
+    )
+    if require_repository_map:
+        map_requirement = "Inspect the attached project's repository map and architecture evidence."
+        semantic_task.setdefault("evidenceRequirementDefinitions", [])
+        if map_requirement not in semantic_task["evidenceRequirementDefinitions"]:
+            semantic_task["evidenceRequirementDefinitions"].insert(0, map_requirement)
+        semantic_task.setdefault("requiredEvidence", [])
+        if map_requirement not in semantic_task["requiredEvidence"]:
+            semantic_task["requiredEvidence"].insert(0, map_requirement)
+        semantic_task.setdefault("unknowns", [])
+        if not any(
+            isinstance(item, dict) and item.get("question") == map_requirement
+            for item in semantic_task["unknowns"]
+        ):
+            semantic_task["unknowns"].insert(0, {
+                "id": f"repository-map-{request_id}",
+                "question": map_requirement,
+                "reason": "The attached repository structure has not yet been verified through its registered capability.",
+                "importance": "HIGH",
+                "blocking": True,
+                "status": "UNRESOLVED",
+                "evidenceIds": [],
+            })
+        _sync_task_evidence_requirements(semantic_task)
+        semantic_task["nextAction"] = {
+            "tool": "get_repository_map",
+            "arguments": {},
+            "reason": "Ground the task in the attached project's actual structure before answering or proposing a change.",
+            "expectedEvidence": map_requirement,
+            "confidence": 1.0,
+        }
+        semantic_task["nextActionName"] = "get_repository_map"
+    semantic_task["conversationContext"]["recentMessages"] = task_conversation_messages[-4:]
+    semantic_task["conversationContext"]["messageCount"] = len(task_conversation_messages)
     semantic_task["nextActionName"] = semantic_task["nextAction"]["tool"]
     if selected_semantics:
         semantic_task["workingMemory"]["activeTarget"] = (
@@ -5145,15 +5982,46 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         "source": semantic_task.get("sourceOfDecision"),
     })
     _persist_agent_task_state(session, semantic_task, session_id, "TASK_STATE_UPDATED")
-    selected_uses_database = (
-        db_det.get("is_deterministic")
-        or "DATABASE" in semantic_task["resolvedResources"]
-    )
+    selected_uses_database = bool(db_det.get("is_deterministic"))
     if selected_uses_database:
-        db_config = await asyncio.to_thread(
-            DatabaseIntelligenceEngine.discover_database_configuration,
-            project_root or "",
-            arch=arch,
+        configuration_action = {
+            "actionId": f"{semantic_task.get('taskId')}:{semantic_task.get('turnId')}:database-configuration",
+            "taskId": semantic_task.get("taskId"),
+            "tool": "discover_database_configuration",
+            "target": "active project database configuration",
+            "reason": "Inspect supported project configuration sources for database metadata.",
+            "expectedEvidence": ["database engine and safe configuration source"],
+        }
+        await _publish_activity_event(
+            send_json,
+            configuration_action,
+            request_id,
+            session_id,
+            "STARTED",
+        )
+        try:
+            db_config = await asyncio.to_thread(
+                DatabaseIntelligenceEngine.discover_database_configuration,
+                project_root or "",
+                arch=arch,
+            )
+        except Exception as discovery_error:
+            await _publish_activity_event(
+                send_json,
+                configuration_action,
+                request_id,
+                session_id,
+                "UNVERIFIED",
+                error=discovery_error,
+            )
+            raise
+        await _publish_activity_event(
+            send_json,
+            configuration_action,
+            request_id,
+            session_id,
+            "COMPLETED",
+            result={"ok": True, "data": db_config},
         )
         db_caps = await asyncio.to_thread(
             DatabaseIntelligenceEngine.check_database_capabilities,
@@ -5360,6 +6228,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         )
         db_action = {
             "actionId": db_action_id,
+            "taskId": semantic_task.get("taskId"),
             "tool": db_det["capability"],
             "arguments": SecretProtector.redact_data(db_det.get("arguments") or {}),
             "target": str(
@@ -5402,12 +6271,9 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         })
         _persist_agent_task_state(session, semantic_task, session_id)
         if db_det.get("capability") == DatabaseCapability.DATABASE_CURRENT_TARGET:
-            await _send(send_json, {
-                "type": "activity",
-                "requestId": request_id,
-                "phase": "verifying",
-                "message": "Checking this project's database configuration and active session, then verifying live connectivity.",
-            })
+            db_action["reason"] = (
+                "Inspect the active database target and report only the connection evidence returned by its capability."
+            )
         effective_root = project_root or ""
         sess_obj = await asyncio.to_thread(
             DatabaseSessionManager.get_or_create_session,
@@ -5417,13 +6283,27 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         )
         if not effective_root and getattr(sess_obj, "project_root", ""):
             effective_root = sess_obj.project_root
-        cap_res = await asyncio.to_thread(
-            DatabaseSessionManager.execute_database_capability,
-            db_det["capability"],
-            db_det.get("arguments", {}),
-            sess_obj,
-            project_root=effective_root,
+        await _publish_activity_event(
+            send_json, db_action, request_id, session_id, "STARTED"
         )
+        try:
+            cap_res = await asyncio.to_thread(
+                DatabaseSessionManager.execute_database_capability,
+                db_det["capability"],
+                db_det.get("arguments", {}),
+                sess_obj,
+                project_root=effective_root,
+            )
+        except Exception as capability_error:
+            await _publish_activity_event(
+                send_json,
+                db_action,
+                request_id,
+                session_id,
+                "UNVERIFIED",
+                error=capability_error,
+            )
+            raise
         content = cap_res.get("content", "")
         db_result_json = json.dumps(SecretProtector.redact_data(cap_res), ensure_ascii=False, default=str)
         if cap_res.get("executionStatus") == "NEEDS_CLARIFICATION":
@@ -5467,6 +6347,14 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                 db_result_json,
                 session_id,
             )
+        await _publish_activity_event(
+            send_json,
+            db_action,
+            request_id,
+            session_id,
+            _activity_status_for_result(db_det["capability"], cap_res),
+            result=cap_res,
+        )
         if db_action["status"] == "FAILED":
             db_action["failureKnowledgeRevision"] = semantic_task.get("knowledgeRevision", 0)
         semantic_task["execution"].update({
@@ -5880,18 +6768,103 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                 default=str,
             )
             if action_signature in seen_database_actions:
-                content = (
-                    "The next proposed database action was already performed. I stopped rather than retrying it "
-                    "without new evidence."
+                prior_action = next(
+                    (
+                        action for action in reversed(semantic_task.get("actions", []))
+                        if action.get("tool") == selected_action["capability"]
+                        and json.dumps(
+                            action.get("arguments") or {},
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            default=str,
+                        ) == json.dumps(
+                            selected_action["arguments"],
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    ),
+                    None,
                 )
-                semantic_task["unknowns"].append({
-                    "id": f"repeated-action-{reasoning_cycle}",
-                    "question": "What new evidence or target should be used for the next database action?",
-                    "reason": "The model proposed an action already present in the task action history.",
-                    "status": "UNRESOLVED",
-                    "evidenceIds": [],
-                })
-                break
+                prior_failure = (
+                    prior_action.get("failureClassification")
+                    or (prior_action.get("lastResult") or {}).get("executionStatus")
+                    if isinstance(prior_action, dict)
+                    else None
+                )
+                prior_failure_revision = (
+                    prior_action.get("failureKnowledgeRevision")
+                    if isinstance(prior_action, dict)
+                    else None
+                )
+                if (
+                    prior_action
+                    and prior_action.get("status") == "FAILED"
+                    and prior_failure_revision is not None
+                    and int(semantic_task.get("knowledgeRevision", 0)) > int(prior_failure_revision)
+                ):
+                    seen_database_actions.discard(action_signature)
+                elif prior_failure in {
+                    "DB_ENGINE_UNKNOWN",
+                    "DB_CONFIG_AMBIGUOUS",
+                    "UNSUPPORTED_ENGINE",
+                }:
+                    recovery_action = {
+                        "capability": DatabaseCapability.DATABASE_CURRENT_TARGET,
+                        "arguments": {
+                            "user_request": (
+                                "Resolve the active project's database configuration and verify its current target."
+                            ),
+                        },
+                    }
+                    recovery_signature = json.dumps(
+                        recovery_action,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    if recovery_signature not in seen_database_actions:
+                        selected_action = recovery_action
+                        action_signature = recovery_signature
+                        next_decision = {
+                            **next_decision,
+                            "capability": recovery_action["capability"],
+                            "arguments": recovery_action["arguments"],
+                            "semanticTask": {
+                                "reasoningSummary": (
+                                    "Resolve the missing database configuration/engine prerequisite before retrying."
+                                ),
+                                "requiredEvidence": [
+                                    "resolved project database configuration",
+                                    "verified active database target",
+                                ],
+                            },
+                        }
+                        if semantic_task.get("reasoningHistory"):
+                            semantic_task["reasoningHistory"][-1].update({
+                                "decision": recovery_action["capability"],
+                                "source": "database_recovery",
+                            })
+                    else:
+                        content = (
+                            "The project database configuration remains unresolved after an explicit target "
+                            "resolution attempt. No table operation was repeated or treated as evidence."
+                        )
+                        final_reasoning_status = "BLOCKED"
+                        break
+                else:
+                    content = (
+                        "The next proposed database action was already performed. I stopped rather than retrying it "
+                        "without new evidence."
+                    )
+                    semantic_task["unknowns"].append({
+                        "id": f"repeated-action-{reasoning_cycle}",
+                        "question": "What new evidence or target should be used for the next database action?",
+                        "reason": "The model proposed an action already present in the task action history.",
+                        "status": "UNRESOLVED",
+                        "evidenceIds": [],
+                    })
+                    break
             seen_database_actions.add(action_signature)
             followup_action_id = (
                 f"{semantic_task.get('taskId')}:{semantic_task.get('turnId')}:"
@@ -5899,6 +6872,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             )
             followup_action = {
                 "actionId": followup_action_id,
+                "taskId": semantic_task.get("taskId"),
                 "tool": next_decision["capability"],
                 "arguments": SecretProtector.redact_data(selected_action["arguments"]),
                 "target": str(
@@ -5928,13 +6902,31 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             semantic_task["nextActionName"] = followup_action["tool"]
             semantic_task["status"] = "EXECUTION"
             _persist_agent_task_state(session, semantic_task, session_id, "ACTION_PLANNED")
-            followup_result = await asyncio.to_thread(
-                DatabaseSessionManager.execute_database_capability,
-                followup_action["tool"],
-                selected_action["arguments"],
-                sess_obj,
-                project_root=effective_root,
+            await _publish_activity_event(
+                send_json,
+                followup_action,
+                request_id,
+                session_id,
+                "STARTED",
             )
+            try:
+                followup_result = await asyncio.to_thread(
+                    DatabaseSessionManager.execute_database_capability,
+                    followup_action["tool"],
+                    selected_action["arguments"],
+                    sess_obj,
+                    project_root=effective_root,
+                )
+            except Exception as capability_error:
+                await _publish_activity_event(
+                    send_json,
+                    followup_action,
+                    request_id,
+                    session_id,
+                    "UNVERIFIED",
+                    error=capability_error,
+                )
+                raise
             if followup_result.get("executionStatus") == "NEEDS_CLARIFICATION":
                 clarification_question = SecretProtector.redact_text(
                     str(followup_result.get("content") or "A database target needs clarification.")
@@ -6008,6 +7000,14 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     ),
                     session_id,
                 )
+            await _publish_activity_event(
+                send_json,
+                followup_action,
+                request_id,
+                session_id,
+                _activity_status_for_result(followup_action["tool"], followup_result),
+                result=followup_result,
+            )
             followup_action["failureKnowledgeRevision"] = (
                 semantic_task.get("knowledgeRevision", 0)
                 if followup_action.get("status") == "FAILED"
@@ -6173,6 +7173,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         "plan": plan,
     })
     system = (
+        f"{CODING_ENGINEERING_POLICY} "
         "You are the Coding Agent for the currently selected project. Inspect it only through the supplied "
         "read-only tools. Never write files, run commands, access credentials, or claim changes were applied. "
         "Use the project root and optional scope supplied in the task context. Discover the narrowest relevant "
@@ -6343,7 +7344,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
         {"role": "system", "content": system},
         {"role": "system", "content": context},
         task_state_context_message,
-        *supplied,
+        *task_conversation_messages,
     ]
     tool_calls = []
     tool_result_cache: Dict[str, str] = {}
@@ -6359,6 +7360,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                         "revision": semantic_task.get("revision", 0),
                     })
                 semantic_task["status"] = "REASONING"
+            _update_task_completeness(semantic_task)
             semantic_task["timestamps"]["lastReasonedAt"] = time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ",
                 time.gmtime(),
@@ -6381,6 +7383,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
             )
             if investigation_gate is not None:
                 semantic_task["investigationEvidenceGate"] = investigation_gate
+            evidence_sufficiency = _task_evidence_sufficiency(semantic_task)
             gate_tool_categories = (
                 "CURRENT_IMPLEMENTATION",
                 "PROJECT_REUSABLE_PATTERNS",
@@ -6388,14 +7391,21 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                 "DB_SCHEMA_CONSTRAINTS",
             )
             gate_requires_more_evidence = bool(
-                investigation_gate
-                and any(
-                    investigation_gate["statuses"][category]["status"]
-                    not in {"VERIFIED", "UNAVAILABLE", "NOT_APPLICABLE"}
-                    for category in gate_tool_categories
+                evidence_sufficiency["unresolved"]
+                or (
+                    investigation_gate
+                    and any(
+                        investigation_gate["statuses"][category]["status"]
+                        not in {"VERIFIED", "UNAVAILABLE", "NOT_APPLICABLE"}
+                        for category in gate_tool_categories
+                    )
                 )
             )
             inspection_tools = CODING_TOOLS
+            if evidence_sufficiency["sufficient"] and (
+                not proposal_required or has_read_evidence
+            ):
+                inspection_tools = []
             if proposal_required and round_number > 0 and not has_read_evidence:
                 inspection_tools = [
                     tool for tool in CODING_TOOLS
@@ -6405,12 +7415,6 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                 (proposal_required and round_number > 0 and not has_read_evidence)
                 or gate_requires_more_evidence
             )
-            await _send(send_json, {
-                "type": "activity",
-                "requestId": request_id,
-                "phase": "reading" if round_number == 0 else "context",
-                "message": "Inspecting relevant project evidence." if round_number == 0 else "Checking the next relevant evidence.",
-            })
             credential_fallback_active = (
                 credential_config_scan_routed
                 and semantic_task.get("intent", {}).get("primary")
@@ -6463,6 +7467,19 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                             "safe project evidence inspected so far."
                         ),
                     }
+            elif round_number == 0 and require_repository_map:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": f"repository-map-{request_id}",
+                        "type": "function",
+                        "function": {
+                            "name": "get_repository_map",
+                            "arguments": "{}",
+                        },
+                    }],
+                }
             else:
                 message, selected_provider = await asyncio.to_thread(
                     complete_coding_model, registry, config_path,
@@ -6526,6 +7543,35 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                             session, semantic_task, session_id, "INVESTIGATION_EXHAUSTED"
                         )
             if not calls:
+                if evidence_sufficiency["unresolved"]:
+                    if round_number < MAX_CODING_TOOL_ROUNDS - 1:
+                        conversation.append({
+                            "role": "system",
+                            "content": (
+                                "The task-specific evidence gate is incomplete. Select an available action "
+                                "that directly targets these unresolved requirements using the supplied task "
+                                "state; do not treat planned actions or activity events as evidence: "
+                                + json.dumps(evidence_sufficiency["unresolved"], ensure_ascii=False)
+                            ),
+                        })
+                        continue
+                    final_message = {
+                        "role": "assistant",
+                        "content": (
+                            "Investigation incomplete. Required evidence remains unresolved: "
+                            + "; ".join(evidence_sufficiency["unresolved"])
+                        ),
+                    }
+                    break
+                if evidence_sufficiency["unavailable"]:
+                    final_message = {
+                        "role": "assistant",
+                        "content": (
+                            "Investigation incomplete because required evidence was unavailable: "
+                            + "; ".join(evidence_sufficiency["unavailable"])
+                        ),
+                    }
+                    break
                 if investigation_gate_required:
                     current_gate = _investigation_evidence_gate(
                         semantic_task,
@@ -6624,7 +7670,15 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                         "role": "tool",
                         "tool_call_id": tool_call_id,
                         "name": raw_fn_name,
-                        "content": json.dumps({"ok": False, "error": str(tool_err)}),
+                        "content": json.dumps({
+                            "ok": False,
+                            "code": "UNKNOWN_MODEL_TOOL",
+                            "error": str(tool_err),
+                            "recoveryInstruction": (
+                                "Do not ask the user to choose a tool. Select an exact capability from the "
+                                "available list in the error and retry through the normal reasoning cycle."
+                            ),
+                        }),
                     })
                     continue
 
@@ -6667,13 +7721,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     if current_expected
                     else f"Gather evidence required by the active goal: {semantic_task['goal']['statement']}"
                 )
-                action_target = str(
-                    arguments.get("relativePath")
-                    or arguments.get("path")
-                    or arguments.get("query")
-                    or arguments.get("symbol")
-                    or name
-                )[:300]
+                action_target = _activity_target_for_tool(name, arguments)
                 action_fingerprint = _action_fingerprint(
                     name, arguments, action_target, project_root
                 )
@@ -6702,6 +7750,7 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                 ]
                 action = {
                     "actionId": action_id,
+                    "taskId": semantic_task.get("taskId"),
                     "tool": name,
                     "arguments": safe_arguments,
                     "target": action_target,
@@ -6744,6 +7793,14 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                             "Choose a different investigation step or ask for clarification."
                         ),
                     }
+                    await _publish_activity_event(
+                        send_json,
+                        action,
+                        request_id,
+                        session_id,
+                        "SKIPPED",
+                        error=repeated_result["error"],
+                    )
                     conversation.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
@@ -6784,6 +7841,14 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     action["reusedFromActionId"] = (
                         prior_result_action.get("actionId") if prior_result_action else None
                     )
+                    await _publish_activity_event(
+                        send_json,
+                        action,
+                        request_id,
+                        session_id,
+                        "SKIPPED",
+                        result={"ok": True, "data": {"evidenceIds": action["resultEvidenceIds"]}},
+                    )
                     semantic_task["status"] = "REASONING"
                     semantic_task["timestamps"]["lastActionAt"] = time.strftime(
                         "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
@@ -6799,15 +7864,8 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     consecutive_no_progress += 1
                     continue
 
-                await _send(send_json, {
-                    "type": "tool_call",
-                    "requestId": request_id,
-                    "toolCallId": tool_call_id,
-                    "name": name,
-                    "arguments": arguments,
-                })
-                action["status"] = "RUNNING"
                 is_verification_action = name in ("run_verification", "terminal.run_command")
+                action["status"] = "RUNNING"
                 semantic_task["status"] = "VERIFICATION" if is_verification_action else "EXECUTION"
                 if is_verification_action:
                     semantic_task["verification"]["required"] = True
@@ -6821,6 +7879,15 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                         "tool": name,
                     })
                 _persist_agent_task_state(session, semantic_task, session_id, "TASK_STATE_UPDATED")
+                await _dispatch_coding_tool(
+                    send_json,
+                    action,
+                    request_id,
+                    session_id,
+                    tool_call_id,
+                    name,
+                    arguments,
+                )
                 try:
                     result = await _wait_for_tool(state, request_id, tool_call_id)
                 except Exception as tool_error:
@@ -6834,6 +7901,14 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     )
                     action["signature"] = action_signature
                     action["failureKnowledgeRevision"] = semantic_task.get("knowledgeRevision", 0)
+                    await _publish_activity_event(
+                        send_json,
+                        action,
+                        request_id,
+                        session_id,
+                        "UNVERIFIED",
+                        error=tool_error,
+                    )
                     _persist_agent_task_state(session, semantic_task, session_id, "ACTION_EXECUTED")
                     raise
                 serialized = _serialize_coding_tool_result(result)
@@ -6845,6 +7920,15 @@ async def _run_coding_turn(payload: Dict[str, Any], send_json, state: Dict[str, 
                     result,
                     serialized,
                     session_id,
+                )
+                activity_status = _activity_status_for_result(name, result)
+                await _publish_activity_event(
+                    send_json,
+                    action,
+                    request_id,
+                    session_id,
+                    activity_status,
+                    result=result,
                 )
                 action["signature"] = action_signature
                 if action["status"] == "FAILED":
@@ -7485,6 +8569,14 @@ async def run_coding_websocket_server(
         async def send_json(payload: Dict[str, Any]) -> None:
             await websocket.send(json.dumps(payload, ensure_ascii=False))
 
+        origin = websocket.request_headers.get("Origin")
+        remote_host = websocket.remote_address[0] if websocket.remote_address else ""
+        browser_development_access = (
+            os.getenv("AI_CODING_BROWSER_ACCESS") == "1"
+            and origin in permitted_origins
+            and remote_host in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+        )
+
         try:
             async for message in websocket:
                 if not state["authenticated"]:
@@ -7499,9 +8591,10 @@ async def run_coding_websocket_server(
                         and auth_message.get("type") == "authenticate"
                         else ""
                     )
-                    if not isinstance(supplied_token, str) or not hmac.compare_digest(
+                    token_is_valid = isinstance(supplied_token, str) and hmac.compare_digest(
                         supplied_token, auth_token
-                    ):
+                    )
+                    if not token_is_valid and not browser_development_access:
                         await websocket.close(code=1008, reason="Authentication required.")
                         return
                     state["authenticated"] = True

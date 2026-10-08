@@ -63,6 +63,38 @@ def classify_provider_error(
     """Classify provider failures with an extensible, provider-neutral rule table."""
     safe_message = redact_provider_error(raw_error, sensitive_values)
     normalized = safe_message.lower()
+    if status_code in (401, 403):
+        category = "INVALID_OR_MISSING_KEY"
+        reason = "The provider rejected authentication. Check the saved API key and provider permissions."
+    elif status_code == 429:
+        category = "QUOTA_EXCEEDED"
+        reason = "The provider reports quota or rate limits. Check usage, account billing or plan, and the quota reset window."
+    elif status_code is not None and 500 <= status_code <= 599:
+        category = "PROVIDER_SERVICE_UNAVAILABLE"
+        reason = "The provider returned a server error. Check provider health and retry later."
+    elif "timeout" in normalized or "timed out" in normalized:
+        category = "PROVIDER_TIMEOUT"
+        reason = "The provider request timed out. Check network/provider health and retry later."
+    elif any(marker in normalized for marker in (
+        "getaddrinfo failed",
+        "name or service not known",
+        "name resolution",
+        "dns",
+        "connection refused",
+        "network is unreachable",
+    )):
+        category = "PROVIDER_NETWORK_ERROR"
+        reason = "The provider could not be reached. Check the network and provider endpoint."
+    else:
+        category = None
+        reason = None
+    if category is not None:
+        return {
+            "category": category,
+            "reason": reason,
+            "statusCode": status_code,
+            "rawMessage": safe_message,
+        }
     for pattern in PROVIDER_ERROR_PATTERNS:
         status_matches = status_code in pattern["status_codes"]
         keyword_matches = any(keyword in normalized for keyword in pattern["keywords"])
@@ -73,20 +105,6 @@ def classify_provider_error(
                 "statusCode": status_code,
                 "rawMessage": safe_message,
             }
-    if status_code is not None and status_code >= 500:
-        return {
-            "category": "PROVIDER_SERVICE_UNAVAILABLE",
-            "reason": "The provider returned a server error. Check provider health and retry later.",
-            "statusCode": status_code,
-            "rawMessage": safe_message,
-        }
-    if "timeout" in normalized or "timed out" in normalized:
-        return {
-            "category": "PROVIDER_SERVICE_UNAVAILABLE",
-            "reason": "The provider request timed out. Check network/provider health and retry later.",
-            "statusCode": status_code,
-            "rawMessage": safe_message,
-        }
     return {
         "category": "UNKNOWN",
         "reason": safe_message or "The provider returned an error with no additional message.",

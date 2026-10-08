@@ -33,6 +33,12 @@ def load_provider_registry() -> Dict[str, Dict[str, Any]]:
         for model in provider["models"]:
             if not isinstance(model, dict) or not isinstance(model.get("id"), str) or not model["id"].strip():
                 raise RuntimeError(f"Provider registry entry '{provider_id}' contains an invalid model ID.")
+            if "contextWindowTokens" in model and (
+                isinstance(model["contextWindowTokens"], bool)
+                or not isinstance(model["contextWindowTokens"], int)
+                or model["contextWindowTokens"] < 1
+            ):
+                raise RuntimeError(f"Provider registry entry '{provider_id}' has an invalid context-window limit.")
             model_ids.append(model["id"])
             model_capabilities = model.get("capabilities", {})
             if not isinstance(model_capabilities, dict) or any(
@@ -174,12 +180,26 @@ def provider_model_for_capability(provider_id: str, capability: str) -> Optional
     provider = PROVIDER_REGISTRY.get(provider_id)
     if not provider or capability not in {"chat", "toolCalling", "streaming", "vision", "structuredOutput", "stt"}:
         return None
+
     for model in provider.get("models", []):
         if model.get("capabilities", {}).get(capability) == "SUPPORTED":
             return str(model.get("id") or "")
     if provider.get("capabilities", {}).get(capability) == "SUPPORTED":
         return str(provider.get("defaultModel") or "") or None
     return None
+
+
+def provider_model_context_window_tokens(provider_id: str, model_id: str) -> Optional[int]:
+    """Return a model context limit only when the shared registry declares one."""
+    provider = PROVIDER_REGISTRY.get(provider_id)
+    if not provider:
+        return None
+    model = next(
+        (candidate for candidate in provider.get("models", []) if candidate.get("id") == model_id),
+        None,
+    )
+    limit = model.get("contextWindowTokens") if isinstance(model, dict) else None
+    return limit if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 else None
 
 
 def provider_model_is_valid(provider_id: str, model_id: str, endpoint: str = "") -> bool:

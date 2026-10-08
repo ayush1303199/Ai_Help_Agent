@@ -43,8 +43,11 @@ from backend_config import (
 )
 from coding_websocket import (
     run_coding_websocket_server,
+    get_coding_request_context,
     get_backend_project_state,
     set_backend_project_state,
+    resolve_tool_capability,
+    detect_project_architecture,
 )
 from coding_intelligence import (
     UNIVERSAL_SECRET_PROTECTOR,
@@ -60,6 +63,8 @@ from coding_intelligence import (
     DatabaseCapability,
     DatabaseIntelligenceEngine,
     DatabaseSessionManager,
+    ProjectContextLock,
+    ProjectIndexMismatchError,
 )
 from provider_service import (
     get_active_provider_with_api_key as resolve_active_provider,
@@ -109,16 +114,18 @@ async def authenticate_coding_requests(request: Request, call_next):
         supplied_token = request.headers.get("x-coding-auth", "")
         client_host = request.client.host if request.client else ""
         is_loopback = client_host in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
-        trusted_origin = (
-            origin is None
-            or origin in TRUSTED_RENDERER_ORIGINS
-            or is_loopback
+        trusted_origin = origin is None or origin in TRUSTED_RENDERER_ORIGINS
+        is_loopback_browser = (
+            os.getenv("AI_CODING_BROWSER_ACCESS") == "1"
+            and is_loopback
+            and origin in TRUSTED_RENDERER_ORIGINS
         )
-        is_trusted_preflight = request.method == "OPTIONS" and (origin in TRUSTED_RENDERER_ORIGINS or is_loopback)
+        is_trusted_preflight = request.method == "OPTIONS" and origin in TRUSTED_RENDERER_ORIGINS
         if not trusted_origin or (
             not is_trusted_preflight
             and not hmac.compare_digest(supplied_token, CODING_AUTH_TOKEN)
             and not is_loopback
+            and not is_loopback_browser
         ):
             return JSONResponse(
                 status_code=401,
@@ -378,16 +385,24 @@ def provider_status_for_error(error: Exception) -> ProviderStatus:
     error_msg = str(error)
     lower_message = error_msg.lower()
     status_code = getattr(error, "status_code", None) or getattr(error, "status", None)
-    if status_code in (401, 403) or "401" in error_msg or "unauthorized" in lower_message:
+    if status_code in (401, 403):
         return ProviderStatus.AUTH_FAILED
-    if status_code == 413 or "413" in error_msg or "request too large" in lower_message or "too many tokens" in lower_message:
+    if status_code == 413:
         return ProviderStatus.REQUEST_TOO_LARGE
-    if status_code == 429 or "429" in error_msg or any(
+    if status_code == 429:
+        return ProviderStatus.RATE_LIMITED
+    if status_code in (500, 501, 502, 503, 504, 505, 507):
+        return ProviderStatus.CAPACITY_ERROR
+    if "401" in error_msg or "unauthorized" in lower_message or "forbidden" in lower_message:
+        return ProviderStatus.AUTH_FAILED
+    if "413" in error_msg or "request too large" in lower_message or "too many tokens" in lower_message:
+        return ProviderStatus.REQUEST_TOO_LARGE
+    if any(
         phrase in lower_message
         for phrase in ("rate limit", "rate_limit", "too many requests", "quota", "resource exhausted")
     ):
         return ProviderStatus.RATE_LIMITED
-    if status_code in (500, 502, 503, 504) or "capacity" in lower_message or "503" in error_msg:
+    if "capacity" in lower_message or "503" in error_msg:
         return ProviderStatus.CAPACITY_ERROR
     if "model" in lower_message:
         return ProviderStatus.MODEL_UNAVAILABLE
@@ -1115,12 +1130,94 @@ DISALLOWED_PROJECT_NAMES: Set[str] = {
 }
 
 
+def _select_unambiguous_project_candidate(
+    scored_matches: List[tuple[int, float, str]],
+) -> Optional[str]:
+    if not scored_matches:
+        return None
+    ordered = sorted(scored_matches, key=lambda item: item[0], reverse=True)
+    best_score = ordered[0][0]
+    if best_score < 100 or sum(score == best_score for score, _, _ in ordered) != 1:
+        return None
+    return ordered[0][2]
+
+
+def _find_projects_by_signatures(
+    roots: List[Path],
+    signatures: List[str],
+    excluded_dirs: Set[str],
+    max_directories: int = 4000,
+    max_depth: int = 5,
+    timeout_seconds: float = 2.0,
+) -> List[tuple[int, float, str]]:
+    expected = {signature.casefold() for signature in signatures}
+    if not expected:
+        return []
+
+    minimum_matches = min(2, len(expected))
+    deadline = time.monotonic() + timeout_seconds
+    queue = [(root, 0) for root in roots if root and root.is_dir()]
+    queue_index = 0
+    visited: Set[str] = set()
+    matches: Dict[str, tuple[int, float, str]] = {}
+    visited_directories = 0
+
+    while queue_index < len(queue) and visited_directories < max_directories and time.monotonic() < deadline:
+        directory, depth = queue[queue_index]
+        queue_index += 1
+        try:
+            canonical = str(directory.resolve())
+            if canonical in visited:
+                continue
+            visited.add(canonical)
+            entries = list(directory.iterdir())
+        except (OSError, RuntimeError):
+            continue
+
+        visited_directories += 1
+        entry_names = {entry.name.casefold() for entry in entries}
+        matching_signatures = len(expected & entry_names)
+        if depth > 0 and matching_signatures >= minimum_matches:
+            try:
+                modified_at = directory.stat().st_mtime
+            except OSError:
+                modified_at = 0.0
+            matches[canonical] = (100 + matching_signatures * 15, modified_at, canonical)
+
+        if depth >= max_depth:
+            continue
+        for entry in entries:
+            if (
+                not entry.is_dir()
+                or entry.is_symlink()
+                or entry.name.startswith(".")
+                or entry.name.casefold() in excluded_dirs
+            ):
+                continue
+            if len(queue) < max_directories:
+                queue.append((entry, depth + 1))
+            else:
+                break
+
+    return list(matches.values())
+
+
 @app.post("/api/coding/project-discover")
 def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     import tempfile
     name = str(payload.get("name") or "").strip()
     path_hint = str(payload.get("path") or "").strip()
-    signatures = [str(s).strip().lower() for s in (payload.get("signatures") or []) if str(s).strip()]
+    raw_signatures = payload.get("signatures") or []
+    signatures = [
+        signature.strip().lower()
+        for signature in raw_signatures[:20]
+        if isinstance(signature, str)
+        and 0 < len(signature.strip()) <= 255
+        and Path(signature.strip()).name == signature.strip()
+        and not signature.strip().startswith(".")
+        and signature.strip().lower() not in CODING_IGNORED_NAMES
+        and not _is_coding_sensitive(signature.strip())
+    ] if isinstance(raw_signatures, list) else []
     # 0. Skip discovery if an active project is already attached and no explicit valid path was given
     current_state = get_backend_project_state()
     if current_state.get("attached") and current_state.get("projectRoot"):
@@ -1142,7 +1239,7 @@ def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
             return {"matches": [canonical], "projectRoot": canonical, "status": "PROJECT_ATTACHED"}
 
     target_name = name.lower()
-    if target_name in DISALLOWED_PROJECT_NAMES:
+    if target_name in DISALLOWED_PROJECT_NAMES and not signatures:
         return {"matches": [], "projectRoot": None, "status": "DISALLOWED_NAME"}
     scored_matches: List[tuple[int, float, str]] = []
     seen_paths = set()
@@ -1188,6 +1285,25 @@ def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
         "node_modules", "vendor", "dist", "build", ".git", "venv", ".venv",
         "__pycache__", "appdata", "windows", "program files", "system volume information",
     }
+    configured_roots = os.getenv("AI_HELP_AGENT_CODING_PROJECT_ROOTS", "")
+    for configured_root in configured_roots.split(os.pathsep):
+        configured_root = configured_root.strip()
+        if not configured_root:
+            continue
+        candidate_root = Path(configured_root).expanduser()
+        if (
+            not candidate_root.is_absolute()
+            or candidate_root.resolve() == Path(candidate_root.anchor).resolve()
+            or any(part.casefold() in EXCLUDED_DIRS for part in candidate_root.parts)
+            or _is_coding_sensitive(str(candidate_root))
+            or not candidate_root.is_dir()
+        ):
+            raise HTTPException(status_code=400, detail="Invalid Coding project discovery root.")
+        search_roots.append(candidate_root)
+
+    active_root = current_state.get("projectRoot")
+    if current_state.get("attached") and active_root:
+        search_roots.append(Path(active_root).parent)
 
     for root in search_roots:
         if not root or not root.is_dir():
@@ -1248,13 +1364,17 @@ def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             continue
 
+    if signatures:
+        for score, _, candidate in _find_projects_by_signatures(
+            search_roots,
+            signatures,
+            EXCLUDED_DIRS,
+        ):
+            add_match(score, candidate)
+
     scored_matches.sort(key=lambda x: (x[0], x[1]), reverse=True)
     matches = [m[2] for m in scored_matches]
-
-    project_root = matches[0] if len(matches) == 1 else None
-    if len(matches) > 1 and scored_matches[0][0] >= 100:
-        if scored_matches[0][0] > scored_matches[1][0] or scored_matches[0][1] > scored_matches[1][1]:
-            project_root = scored_matches[0][2]
+    project_root = _select_unambiguous_project_candidate(scored_matches)
 
     if project_root:
         set_backend_project_state(project_root)
@@ -1264,11 +1384,42 @@ def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.get("/api/coding/directory")
 def list_coding_directory_endpoint(path: str = ".", scope: str = ".") -> List[Dict[str, str]]:
-    st = get_backend_project_state()
-    root_str = st.get("projectRoot")
-    if not root_str or not st.get("attached"):
-        raise HTTPException(status_code=400, detail="No project attached (PROJECT_NOT_ATTACHED).")
-    root = Path(root_str)
+    return _list_coding_directory(path, scope)
+
+
+def _resolve_coding_project_root(project_root: Optional[str] = None) -> Path:
+    if project_root is None:
+        state = get_backend_project_state()
+        project_root = state.get("projectRoot") if state.get("attached") else None
+    if not project_root:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PROJECT_CONTEXT_UNAVAILABLE",
+                "message": "Unable to access the active project repository.",
+            },
+        )
+    try:
+        root = Path(project_root).resolve(strict=True)
+    except (OSError, RuntimeError):
+        root = None
+    if root is None or not root.is_dir():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PROJECT_CONTEXT_UNAVAILABLE",
+                "message": "Unable to access the active project repository.",
+            },
+        )
+    return root
+
+
+def _list_coding_directory(
+    path: str = ".",
+    scope: str = ".",
+    project_root: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    root = _resolve_coding_project_root(project_root)
     clean = path.replace("\\", "/").strip().lstrip("./")
     target = (root / clean).resolve() if clean else root
     if (not _is_inside_project_root(root, target) or not target.is_dir()) and scope and scope != ".":
@@ -1290,16 +1441,20 @@ def list_coding_directory_endpoint(path: str = ".", scope: str = ".") -> List[Di
 
 @app.get("/api/coding/list-directory")
 def list_coding_directory_get_endpoint(path: str = ".", scope: str = ".") -> List[Dict[str, str]]:
-    return list_coding_directory_endpoint(path, scope)
+    return _list_coding_directory(path, scope)
 
 
 @app.get("/api/coding/read-file")
 def read_coding_file_endpoint(path: str, scope: str = ".") -> Dict[str, str]:
-    st = get_backend_project_state()
-    root_str = st.get("projectRoot")
-    if not root_str or not st.get("attached"):
-        raise HTTPException(status_code=400, detail="No project attached (PROJECT_NOT_ATTACHED).")
-    root = Path(root_str).resolve()
+    return _read_coding_file(path, scope)
+
+
+def _read_coding_file(
+    path: str,
+    scope: str = ".",
+    project_root: Optional[str] = None,
+) -> Dict[str, str]:
+    root = _resolve_coding_project_root(project_root)
     clean = path.replace("\\", "/").strip().lstrip("./")
     if not clean:
         raise HTTPException(status_code=400, detail="Invalid file path.")
@@ -1348,73 +1503,156 @@ def read_coding_file_endpoint(path: str, scope: str = ".") -> Dict[str, str]:
 
 @app.get("/api/coding/search-code")
 def search_coding_code_endpoint(query: str, scope: str = ".") -> Dict[str, Any]:
-    st = get_backend_project_state()
-    root_str = st.get("projectRoot")
-    if not root_str or not st.get("attached"):
-        raise HTTPException(status_code=400, detail="No project attached (PROJECT_NOT_ATTACHED).")
-    root = Path(root_str)
-    norm_query = query.strip().lower()
+    return _search_coding_code(query, scope)
+
+
+CODING_SEARCH_MAX_FILES = 2000
+CODING_SEARCH_MAX_CANDIDATES = 10000
+CODING_SEARCH_LOW_PRIORITY_DIRS = {
+    "assets", "asset", "static", "public", "vendor", "third_party", "generated",
+}
+CODING_SEARCH_LOW_PRIORITY_FILES = {
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    "composer.lock", "cargo.lock", "poetry.lock",
+}
+CODING_SEARCH_SOURCE_EXTENSIONS = {
+    ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx",
+    ".kt", ".mjs", ".php", ".py", ".rb", ".rs", ".sql", ".ts", ".tsx",
+}
+
+
+def _search_path_priority(relative_path: str) -> int:
+    parts = [part.casefold() for part in Path(relative_path).parts]
+    name = parts[-1] if parts else ""
+    score = 0
+    if any(part in CODING_SEARCH_LOW_PRIORITY_DIRS for part in parts[:-1]):
+        score += 40
+    if name in CODING_SEARCH_LOW_PRIORITY_FILES or name.endswith((".min.js", ".min.css", ".map")):
+        score += 60
+    extension = Path(name).suffix.casefold()
+    if extension not in CODING_SEARCH_SOURCE_EXTENSIONS and name not in CODING_SEARCH_LOW_PRIORITY_FILES:
+        score += 15
+    if any("test" in part or "spec" in part for part in parts):
+        score += 3
+    return score
+
+
+def _normalized_search_text(value: str) -> str:
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    return " ".join(re.findall(r"[a-z0-9_]+", separated.casefold()))
+
+
+def _search_coding_code(
+    query: str,
+    scope: str = ".",
+    project_root: Optional[str] = None,
+) -> Dict[str, Any]:
+    root = _resolve_coding_project_root(project_root)
+    norm_query = " ".join(query.strip().casefold().split())
     if not norm_query:
         raise HTTPException(status_code=400, detail="Search query is required.")
-    
     scope_dir = (root / scope).resolve()
     if not _is_inside_project_root(root, scope_dir) or not scope_dir.is_dir():
-        scope_dir = root
-    
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_PROJECT_SCOPE", "message": "Search scope is outside the active project or unavailable."},
+        )
+
+    query_terms = list(dict.fromkeys(re.findall(r"[a-z0-9_]+", norm_query)))
+    if not query_terms:
+        query_terms = [norm_query]
+    query_normalized = _normalized_search_text(query)
+
+    candidates: List[Tuple[int, str, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(str(scope_dir), followlinks=False):
+        dirnames[:] = sorted(
+            (
+                name for name in dirnames
+                if name.casefold() not in CODING_IGNORED_NAMES
+                and not _is_coding_sensitive(name)
+            ),
+            key=lambda name: (name.casefold() in CODING_SEARCH_LOW_PRIORITY_DIRS, name.casefold()),
+        )
+        for filename in sorted(filenames, key=str.casefold):
+            if filename.casefold() in CODING_IGNORED_NAMES or _is_coding_sensitive(filename):
+                continue
+            file_path = Path(dirpath) / filename
+            if not _is_inside_project_root(root, file_path) or not file_path.is_file():
+                continue
+            relative_path = str(file_path.relative_to(root)).replace("\\", "/")
+            candidates.append((_search_path_priority(relative_path), relative_path, file_path))
+            if len(candidates) >= CODING_SEARCH_MAX_CANDIDATES:
+                break
+        if len(candidates) >= CODING_SEARCH_MAX_CANDIDATES:
+            break
+    candidates.sort(key=lambda item: (item[0], item[1].casefold()))
+
     max_results = 40
-    max_files = 100
-    results: List[Dict[str, Any]] = []
+    results: List[Tuple[int, Dict[str, Any]]] = []
+    files_visited = 0
+    for path_priority, relative_path, file_path in candidates[:CODING_SEARCH_MAX_FILES]:
+        files_visited += 1
+        try:
+            if file_path.stat().st_size > CODING_MAX_FILE_BYTES:
+                continue
+            filename_normalized = _normalized_search_text(file_path.name)
+            filename_terms = [term for term in query_terms if term in filename_normalized]
+            if filename_terms:
+                score = (
+                    100 if query_normalized and query_normalized in filename_normalized else 0
+                ) + 35 * len(filename_terms) + 20 * (len(filename_terms) == len(query_terms))
+                results.append((score - path_priority, {
+                    "path": relative_path,
+                    "line": 0,
+                    "text": file_path.name,
+                    "matchType": "filename",
+                }))
+            matched_terms: Set[str] = set()
+            matched_lines: List[Tuple[int, int, str]] = []
+            with file_path.open("r", encoding="utf-8", errors="ignore") as source:
+                for line_number, line in enumerate(source, start=1):
+                    folded_line = line.casefold()
+                    normalized_line = _normalized_search_text(line)
+                    terms = {term for term in query_terms if term in normalized_line}
+                    if not terms:
+                        continue
+                    matched_terms.update(terms)
+                    score = (
+                        100 if norm_query in folded_line or query_normalized in normalized_line else 0
+                    ) + 35 * len(terms) + 20 * (len(terms) == len(query_terms))
+                    matched_lines.append((score - path_priority, line_number, line.strip()[:240]))
+            for score, line_number, text in sorted(matched_lines, key=lambda item: (-item[0], item[1]))[:3]:
+                results.append((score, {
+                    "path": relative_path,
+                    "line": line_number,
+                    "text": text,
+                    "matchType": "content",
+                }))
+        except (OSError, UnicodeError):
+            continue
 
-    def _search_in_dir(target_dir: Path, current_results: List[Dict[str, Any]], visited: int) -> int:
-        for dirpath, dirnames, filenames in os.walk(str(target_dir)):
-            dirnames[:] = [d for d in dirnames if d.lower() not in CODING_IGNORED_NAMES and not _is_coding_sensitive(d)]
-            for fn in filenames:
-                if len(current_results) >= max_results or visited >= max_files:
-                    return visited
-                if fn.lower() in CODING_IGNORED_NAMES or _is_coding_sensitive(fn):
-                    continue
-                file_path = Path(dirpath) / fn
-                rel = str(file_path.relative_to(root)).replace("\\", "/")
-                if norm_query in fn.lower():
-                    if not any(r["path"] == rel and r.get("matchType") == "filename" for r in current_results):
-                        current_results.append({"path": rel, "line": 0, "text": fn, "matchType": "filename"})
-                visited += 1
-                try:
-                    if file_path.stat().st_size <= CODING_MAX_FILE_BYTES:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            for idx, line in enumerate(f, start=1):
-                                if norm_query in line.lower():
-                                    current_results.append({
-                                        "path": rel,
-                                        "line": idx,
-                                        "text": line.strip()[:240],
-                                        "matchType": "content",
-                                    })
-                                    if len(current_results) >= max_results:
-                                        break
-                except Exception:
-                    continue
-        return visited
-
-    files_visited = _search_in_dir(scope_dir, results, 0)
-    if len(results) == 0 and scope_dir != root:
-        files_visited = _search_in_dir(root, results, files_visited)
+    results.sort(key=lambda item: (-item[0], item[1]["path"].casefold(), item[1]["line"]))
+    identity = ProjectContextLock.identify_project_root(str(root))
+    truncated = len(candidates) > CODING_SEARCH_MAX_FILES or len(candidates) >= CODING_SEARCH_MAX_CANDIDATES
+    final_results = [item for _, item in results[:max_results]]
 
     return {
         "query": query,
         "scope": scope,
-        "results": results[:max_results],
+        "status": "SEARCH_RESULTS" if final_results else "SEARCH_NO_MATCH",
+        "projectId": identity.get("projectId"),
+        "repositoryId": identity.get("repositoryId"),
+        "searchRoot": scope,
+        "results": final_results,
         "filesVisited": files_visited,
+        "truncated": truncated,
     }
 
 
 @app.get("/api/coding/search-symbols")
 def search_coding_symbols_endpoint(query: str, limit: int = 15) -> Dict[str, Any]:
-    st = get_backend_project_state()
-    root_str = st.get("projectRoot")
-    if not root_str or not st.get("attached"):
-        raise HTTPException(status_code=400, detail="No project attached (PROJECT_NOT_ATTACHED).")
-    syms = UNIVERSAL_INDEX.search_symbols(query, limit=limit)
+    root = _resolve_coding_project_root()
+    syms = UNIVERSAL_INDEX.search_symbols(query, limit=limit, project_root=str(root))
     return {"query": query, "symbols": SecretProtector.redact_data(syms)}
 
 
@@ -1423,38 +1661,44 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     tool_name = str(payload.get("name") or "").strip()
     args = payload.get("arguments") or {}
     scope = str(payload.get("scope") or ".").strip()
+    request_id = str(payload.get("requestId") or "")
+    request_context = get_coding_request_context(request_id) if request_id else None
+    if request_id and not request_context:
+        return {
+            "ok": False,
+            "error": {
+                "code": "PROJECT_CONTEXT_UNAVAILABLE",
+                "message": "Unable to access the active project repository.",
+            },
+        }
+    project_root = request_context.get("projectRoot") if request_context else None
     try:
-        canonical = tool_name
-        if tool_name in ("repo_browser.search_code", "search", "find_code", "find_files", "search_files"):
-            canonical = "search_code"
-        elif tool_name in ("repo_browser.read_file", "repo_browser.open_file", "open_file"):
-            canonical = "read_file"
-        elif tool_name in ("repo_browser.list_directory", "list_files", "ls"):
-            canonical = "list_directory"
-        elif tool_name in ("repo_browser.search_symbols", "find_symbols"):
-            canonical = "search_symbols"
-        elif tool_name in ("repo_browser.find_references", "references"):
-            canonical = "find_references"
-        elif tool_name in ("execute_sql", "run_query", "db_query", "database.query", "sql_query", "query_database", "executeQuery", "check_db", "inspect_database", "show_tables", "list_tables", "db.query", "sql"):
-            canonical = "execute_sql"
-        elif tool_name in ("run_verification", "terminal.run_command", "run_command", "verify"):
-            canonical = "run_verification"
+        canonical = resolve_tool_capability(tool_name)
+        if not canonical:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "TOOL_UNAVAILABLE",
+                    "message": f"Unsupported browser tool: {tool_name}",
+                },
+            }
 
         if canonical == "read_file":
             rel_path = str(args.get("relativePath") or args.get("path") or args.get("file") or "").strip()
-            data = read_coding_file_endpoint(rel_path, scope)
+            data = _read_coding_file(rel_path, scope, project_root)
             return {"ok": True, "data": SecretProtector.redact_data(data)}
         elif canonical == "list_directory":
             rel_path = str(args.get("relativePath") or args.get("path") or args.get("dir") or scope or ".").strip()
-            entries = list_coding_directory_endpoint(rel_path, scope)
+            entries = _list_coding_directory(rel_path, scope, project_root)
             return {"ok": True, "data": SecretProtector.redact_data(entries)}
         elif canonical == "search_code":
             query = str(args.get("query") or args.get("pattern") or args.get("q") or args.get("term") or "").strip()
-            res = search_coding_code_endpoint(query=query, scope=scope)
+            res = _search_coding_code(query=query, scope=scope, project_root=project_root)
             return {"ok": True, "data": SecretProtector.redact_data(res)}
         elif canonical == "search_symbols":
             query = str(args.get("query") or args.get("name") or "").strip()
-            syms = UNIVERSAL_INDEX.search_symbols(query)
+            root = _resolve_coding_project_root(project_root)
+            syms = UNIVERSAL_INDEX.search_symbols(query, project_root=str(root))
             return {"ok": True, "data": SecretProtector.redact_data(syms)}
         elif canonical == "get_context":
             return {
@@ -1466,11 +1710,25 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
             }
         elif canonical == "find_references":
             query = str(args.get("query") or args.get("symbol") or "").strip()
-            refs = UNIVERSAL_CODE_GRAPH.get_symbol_references(query)
+            root = _resolve_coding_project_root(project_root)
+            refs = UNIVERSAL_CODE_GRAPH.get_symbol_references(query, project_root=str(root))
             return {"ok": True, "data": SecretProtector.redact_data(refs)}
         elif canonical == "get_repository_map":
-            entries = list_coding_directory_endpoint(".", scope)
-            return {"ok": True, "data": {"directories": [e["name"] for e in entries if e["type"] == "directory"]}}
+            entries = _list_coding_directory(".", scope, project_root)
+            root = _resolve_coding_project_root(project_root)
+            architecture = detect_project_architecture(str(root), scope=scope)
+            return {
+                "ok": True,
+                "data": {
+                    "directories": [e["name"] for e in entries if e["type"] == "directory"],
+                    "languages": architecture.get("languages", []),
+                    "frameworks": architecture.get("frameworks", []),
+                    "sourceDirectories": architecture.get("sourceDirectories", []),
+                    "testDirectories": architecture.get("testDirectories", []),
+                    "entryPoints": architecture.get("entryPoints", []),
+                    "configFiles": architecture.get("configFiles", []),
+                },
+            }
         elif canonical == "execute_sql":
             raw_sql = str(args.get("sql") or args.get("query") or args.get("command") or "").strip()
             if not raw_sql:
@@ -1481,16 +1739,7 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "message": "A SQL statement is required; no query was executed.",
                     },
                 }
-            st = get_backend_project_state()
-            root_str = st.get("projectRoot") or ""
-            if not st.get("attached") or not root_str:
-                return {
-                    "ok": False,
-                    "error": {
-                        "code": "PROJECT_NOT_ATTACHED",
-                        "message": "Attach a project before querying its database.",
-                    },
-                }
+            root_str = str(_resolve_coding_project_root(project_root))
             db_config = DatabaseIntelligenceEngine.discover_database_configuration(root_str)
             db_session = DatabaseSessionManager.get_or_create_session(
                 root_str,
@@ -1533,7 +1782,18 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             return {"ok": False, "error": {"code": "TOOL_UNAVAILABLE", "message": f"Unsupported browser tool: {tool_name}"}}
     except HTTPException as he:
-        return {"ok": False, "error": {"code": "CODING_TOOL_FAILED", "message": he.detail}}
+        detail = he.detail
+        if isinstance(detail, dict) and detail.get("code"):
+            return {"ok": False, "error": detail}
+        return {"ok": False, "error": {"code": "CODING_TOOL_FAILED", "message": detail}}
+    except ProjectIndexMismatchError as error:
+        return {
+            "ok": False,
+            "error": {
+                "code": error.code,
+                "message": "The active project index is stale or belongs to another project; no indexed results were returned.",
+            },
+        }
     except Exception as ex:
         return {"ok": False, "error": {"code": "CODING_TOOL_FAILED", "message": str(ex)}}
 

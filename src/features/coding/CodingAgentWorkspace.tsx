@@ -1,6 +1,82 @@
 import { useEffect, useRef, useState } from 'react';
+import { runtimeConfig } from '../../config/runtimeConfig';
 import type { CodingConversationState, CodingPreference } from './codingSessionStore';
 import type { CodingActivity } from './codingTransport';
+
+function codingActivityLabel(item: CodingActivity): string {
+  if (!('event' in item)) return item.phase;
+  switch (item.activityType) {
+    case 'SEARCHING': return 'Searching code';
+    case 'READING_FILE': return 'Reading file';
+    case 'DISCOVERING_REPOSITORY': return 'Discovering repository';
+    case 'INSPECTING_SYMBOL': return 'Inspecting symbol';
+    case 'TRACING_CALLER': return 'Tracing references';
+    case 'VERIFYING': return 'Running verification';
+    case 'INSPECTING_DATABASE':
+      if (item.action.tool === 'discover_database_configuration') return 'Discovering database configuration';
+      if (item.action.tool === 'DATABASE_CONNECT' || item.action.tool === 'DATABASE_CONNECT_TARGET') return 'Connecting to database';
+      if (item.action.tool === 'DATABASE_LIST_TABLES') return 'Listing database tables';
+      if (item.action.tool === 'DATABASE_DESCRIBE_TABLE') return 'Inspecting database schema';
+      if (item.action.tool === 'DATABASE_QUERY' || item.action.tool === 'execute_sql') return 'Executing database query';
+      return 'Inspecting database';
+    default: return item.action.tool;
+  }
+}
+
+function codingActivityStatus(item: Extract<CodingActivity, { event: 'activity_event' }>) {
+  switch (item.status) {
+    case 'STARTED': return { icon: '●', label: 'Running', className: 'text-sky-300' };
+    case 'COMPLETED': return { icon: '✓', label: 'Completed', className: 'text-emerald-300' };
+    case 'FAILED': return { icon: '✕', label: 'Failed', className: 'text-rose-300' };
+    case 'UNVERIFIED': return { icon: '⚠', label: 'Unverified', className: 'text-amber-300' };
+    case 'SKIPPED': return { icon: '⊘', label: 'Skipped', className: 'text-slate-400' };
+    case 'CANCELLED': return { icon: '○', label: 'Cancelled', className: 'text-slate-400' };
+  }
+}
+
+function CodingActivityEntry({ item }: { item: CodingActivity }) {
+  if (!('event' in item)) {
+    return <div className="text-[11px] text-slate-400">
+      <p><span className="mr-2 font-semibold text-sky-300">{item.phase}</span>{item.message}</p>
+      {item.plan && <div className="ml-2 mt-1 border-l border-slate-700 pl-2">
+        <p>{String(item.plan.goal || '')}</p>
+        {Array.isArray(item.plan.steps) && <ol className="mt-1 list-inside list-decimal">
+          {item.plan.steps.map((step, stepIndex) => <li key={stepIndex}>{String(step)}</li>)}
+        </ol>}
+      </div>}
+    </div>;
+  }
+
+  const result = item.result;
+  const details = [
+    result?.count !== undefined ? `${result.count} results` : undefined,
+    result?.rowCount !== undefined ? `${result.rowCount} rows` : undefined,
+    result?.lineCount !== undefined ? `${result.lineCount} lines` : undefined,
+    result?.databaseType,
+    result?.executionStatus,
+    result?.exitCode !== undefined && result.exitCode !== null ? `exit ${result.exitCode}` : undefined,
+  ].filter(Boolean);
+  const status = codingActivityStatus(item);
+  return <div className="text-[11px] text-slate-400">
+    <p>
+      <span className="mr-2 font-semibold text-sky-300">{codingActivityLabel(item)}</span>
+      <span className={`mr-2 font-semibold ${status.className}`} aria-label={status.label}>
+        {status.icon} {status.label}
+      </span>
+      {item.action.target && <span>{item.action.target}</span>}
+    </p>
+    {item.action.reason && <p className="ml-2 mt-1 text-slate-500">{item.action.reason}</p>}
+    {details.length > 0 && <p className="ml-2 mt-1 text-slate-300">{details.join(' · ')}</p>}
+    {result?.paths && result.paths.length > 0 && <ul className="ml-2 mt-1 list-inside list-disc">
+      {result.paths.map((path) => <li key={path}>{path}</li>)}
+    </ul>}
+    {item.action.expectedEvidence && item.action.expectedEvidence.length > 0 && (
+      <p className="ml-2 mt-1 text-slate-500">Evidence sought: {item.action.expectedEvidence.join(', ')}</p>
+    )}
+    {item.error?.message && <p className="ml-2 mt-1 text-rose-300">{item.error.message}</p>}
+    {item.terminalizedLocally && <p className="ml-2 mt-1 text-amber-300">No terminal result was received.</p>}
+  </div>;
+}
 
 interface CodingMessage {
   role: 'user' | 'assistant';
@@ -270,6 +346,12 @@ export function CodingAgentWorkspace({
   onToggleCodingPreference,
   onResetCodingPreferences,
 }: CodingAgentWorkspaceProps) {
+  const isTrustedDesktop = Boolean(window.electronAPI);
+  const canSelectProject = isTrustedDesktop || (
+    window.location.protocol === 'http:'
+    && ['localhost', '127.0.0.1'].includes(window.location.hostname)
+    && window.location.port === String(runtimeConfig.services.devServer.port)
+  );
   const proposalNeedsDecision = Boolean(proposal && ['awaiting_approval', 'approved', 'applying', 'verifying'].includes(proposal.state || ''));
   const [showAllMessages, setShowAllMessages] = useState(false);
   const [copyError, setCopyError] = useState('');
@@ -299,6 +381,11 @@ export function CodingAgentWorkspace({
     <>
       {errorMessage && <p role="alert" className="mb-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{errorMessage}</p>}
       {statusMessage && <p role="status" className="mb-3 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-200">{statusMessage}</p>}
+      {!canSelectProject && (
+        <p role="status" className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          Project selection and Coding Agent access require the trusted desktop app. Open it to select a folder; browser folder picks cannot be attached.
+        </p>
+      )}
       <header className="mb-4 flex items-center justify-between gap-3 border-b border-slate-700 pb-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -318,7 +405,7 @@ export function CodingAgentWorkspace({
             )}
           </div>
           <p className="mt-1 truncate text-xs text-slate-400">
-            {projectRoot || (projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : projectStatus === 'ATTACHING_PROJECT' ? 'Attaching project…' : 'Mention the project folder in chat for automatic discovery, or select it under Advanced.')}
+            {projectRoot || (!canSelectProject ? 'Open the trusted desktop app to select a project.' : projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : projectStatus === 'ATTACHING_PROJECT' ? 'Attaching project…' : 'Mention the project folder in chat for automatic discovery, or select it under Advanced.')}
           </p>
           {projectRoot && <p className="mt-1 text-[11px] text-sky-300">Scope: {path || '.'}</p>}
         </div>
@@ -333,7 +420,7 @@ export function CodingAgentWorkspace({
                 <p className="truncate text-xs text-slate-300">{projectRoot || 'No project selected'}</p>
               </div>
               <div className="flex shrink-0 gap-2">
-                <button onClick={onSelectProject} disabled={busy || streaming} className="rounded-md border border-sky-500/50 px-2 py-1.5 text-[11px] text-sky-300 disabled:opacity-40">Select folder</button>
+                <button onClick={onSelectProject} disabled={!canSelectProject || busy || streaming} className="rounded-md border border-sky-500/50 px-2 py-1.5 text-[11px] text-sky-300 disabled:opacity-40">Select folder</button>
                 {projectRoot && <button onClick={onClearProject} disabled={busy || streaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Clear</button>}
               </div>
             </div>
@@ -459,7 +546,10 @@ export function CodingAgentWorkspace({
           </div>
           {message.content ? <CodingMarkdown content={message.content} /> : message.streaming && <p className="text-sm leading-relaxed text-slate-300">I’m understanding the request and inspecting the relevant files…</p>}
           {message.role === 'assistant' && messageIndex === messages.length - 1 && activity.length > 0 && <div className="mt-3 space-y-2 rounded-md border border-slate-700 bg-slate-900/70 p-2">
-            {activity.slice(-8).map((item, activityIndex) => <div key={`${item.phase}-${activityIndex}`} className="text-[11px] text-slate-400"><p><span className="mr-2 font-semibold text-sky-300">{item.phase}</span>{item.message}</p>{item.plan && <div className="ml-2 mt-1 border-l border-slate-700 pl-2"><p>{String(item.plan.goal || '')}</p>{Array.isArray(item.plan.steps) && <ol className="mt-1 list-inside list-decimal">{item.plan.steps.map((step, stepIndex) => <li key={stepIndex}>{String(step)}</li>)}</ol>}</div>}</div>)}
+            {activity.map((item) => <CodingActivityEntry
+              key={'event' in item ? `${item.executionId}:${item.activityId}` : item.id}
+              item={item}
+            />)}
           </div>}
         </article>;
         })}

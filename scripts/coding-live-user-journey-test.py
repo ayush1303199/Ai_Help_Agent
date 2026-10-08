@@ -994,6 +994,12 @@ def run_tests():
         with tempfile.TemporaryDirectory(prefix="coding-risky-table-journey-") as risky_project_root:
             risky_data_dir = Path(risky_project_root) / "data"
             risky_data_dir.mkdir()
+            risky_config_dir = Path(risky_project_root) / "config"
+            risky_config_dir.mkdir()
+            (risky_config_dir / "runtime-database.php").write_text(
+                "<?php return ['dsn' => 'sqlite:' . __DIR__ . '/../data/commerce.db'];\n",
+                encoding="utf-8",
+            )
             risky_db = sqlite3.connect(risky_data_dir / "commerce.db")
             risky_db.execute("CREATE TABLE adm_user (id INTEGER PRIMARY KEY)")
             risky_db.executemany("INSERT INTO adm_user DEFAULT VALUES", [(), ()])
@@ -1049,6 +1055,12 @@ def run_tests():
             )
             schema_data_dir = Path(schema_project_root) / "data"
             schema_data_dir.mkdir()
+            schema_config_dir = Path(schema_project_root) / "configuration"
+            schema_config_dir.mkdir()
+            (schema_config_dir / "runtime-database.php").write_text(
+                "<?php return ['dsn' => 'sqlite:' . __DIR__ . '/../data/schema.sqlite'];\n",
+                encoding="utf-8",
+            )
             schema_db = sqlite3.connect(schema_data_dir / "schema.sqlite")
             schema_db.execute(
                 "CREATE TABLE app_user (id INTEGER PRIMARY KEY, email TEXT NOT NULL)"
@@ -1512,17 +1524,18 @@ def run_tests():
         assert locked_ctx["projectId"] == "proj-commerce"
         print(f"  -> 1. PROJECT CONTEXT LOCK: Context locked to {project_root}")
 
-        # An explicitly attached active project must supersede a stale conversation lock.
+        # A trusted explicit selection for this request must supersede a stale
+        # process-global/backend root.
         attached_root = tempfile.gettempdir()
         resolved_attached_root = ProjectContextLock.resolve_authoritative_root(
             session_id="test-session-l",
             backend_root=attached_root,
             explicit_root=project_root,
         )
-        assert resolved_attached_root == attached_root, (
-            f"Active project attachment must override stale session context, got: {resolved_attached_root}"
+        assert resolved_attached_root == project_root, (
+            f"Explicit project selection must override stale backend context, got: {resolved_attached_root}"
         )
-        print("  -> 2. ACTIVE PROJECT ATTACHMENT: Superseded stale conversation project context.")
+        print("  -> 2. TRUSTED PROJECT SELECTION: Superseded stale backend project context.")
 
         # 3. Rejection of stopwords as project names
         for bad_tok in ("faq", "query", "slow", "code-level", "the", "controller"):
@@ -1706,7 +1719,7 @@ def run_tests():
             )
         )
         done_p1 = next(m for m in turn_p1_msgs if m.get("type") == "done")
-        db_sess_turn1 = DatabaseSessionManager.get_session(project_root="", session_id=sess_p_id)
+        db_sess_turn1 = DatabaseSessionManager.get_session(project_root=project_root, session_id=sess_p_id)
         assert db_sess_turn1 is not None and db_sess_turn1.is_connected()
         captured_session_id = db_sess_turn1.session_id
         print(f"  -> 1. TURN 1 CONNECT: Session established (Id={captured_session_id}, Engine={db_sess_turn1.database_type})")
@@ -1729,7 +1742,7 @@ def run_tests():
         )
         done_p2 = next(m for m in turn_p2_msgs if m.get("type") == "done")
         assert "commerce.db" in done_p2.get("content", "")
-        db_sess_turn2 = DatabaseSessionManager.get_session(project_root="", session_id=sess_p_id)
+        db_sess_turn2 = DatabaseSessionManager.get_session(project_root=project_root, session_id=sess_p_id)
         assert db_sess_turn2.session_id == captured_session_id
         print("  -> 2. TURN 2 CONTINUITY: 'show databse' succeeded without projectRoot in payload, session reused.")
 

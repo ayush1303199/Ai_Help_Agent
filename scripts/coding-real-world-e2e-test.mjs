@@ -119,7 +119,7 @@ try {
 
   // File operations must now be rejected
   const rejectedRead = await fetch('http://localhost:3001/api/coding/read-file?path=package.json');
-  assert.equal(rejectedRead.status, 400, 'Detached project must reject file read with HTTP 400');
+  assert.equal(rejectedRead.status, 409, 'Detached project must reject file read with HTTP 409');
   console.log('  -> TEST 6 PASSED: Detach blocks project operations.');
 
   // Re-attach for subsequent tests

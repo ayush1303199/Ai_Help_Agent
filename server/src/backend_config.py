@@ -44,6 +44,21 @@ MODEL_REQUEST_TIMEOUT_SECONDS = float(BACKEND_SETTINGS["modelRequestTimeoutSecon
 MODEL_CATALOG_TIMEOUT_SECONDS = float(BACKEND_SETTINGS["modelCatalogTimeoutSeconds"])
 STT_REQUEST_TIMEOUT_SECONDS = float(BACKEND_SETTINGS["sttRequestTimeoutSeconds"])
 CODING_COMPLETION_TOKENS = int(BACKEND_SETTINGS["codingCompletionTokens"])
+CODING_CONTEXT_BUDGET_TOKENS = int(
+    _setting("AI_CODING_CONTEXT_BUDGET_TOKENS", BACKEND_SETTINGS["codingContextBudgetTokens"])
+)
+CODING_PROVIDER_INPUT_LIMIT_TOKENS = int(
+    _setting("AI_CODING_PROVIDER_INPUT_LIMIT_TOKENS", BACKEND_SETTINGS["codingProviderInputLimitTokens"])
+)
+CODING_CONTEXT_SAFETY_RATIO = float(BACKEND_SETTINGS["codingContextSafetyRatio"])
+CODING_CONTEXT_BYTES_PER_TOKEN = int(BACKEND_SETTINGS["codingContextBytesPerToken"])
+CODING_CONTEXT_RETRY_RATIO = float(BACKEND_SETTINGS["codingContextRetryRatio"])
+if CODING_PROVIDER_INPUT_LIMIT_TOKENS < 0:
+    raise RuntimeError("AI_CODING_PROVIDER_INPUT_LIMIT_TOKENS cannot be negative.")
+if not 0 < CODING_CONTEXT_SAFETY_RATIO <= 0.8:
+    raise RuntimeError("codingContextSafetyRatio must be greater than 0 and at most 0.8.")
+if not 1 <= CODING_CONTEXT_BYTES_PER_TOKEN <= 2:
+    raise RuntimeError("codingContextBytesPerToken must be 1 or 2.")
 CODING_TOOL_ROUNDS = int(BACKEND_SETTINGS["codingToolRounds"])
 CODING_CONVERSATION_CHARS = int(BACKEND_SETTINGS["codingConversationChars"])
 CODING_TOOL_RESULT_CHARS = int(BACKEND_SETTINGS["codingToolResultChars"])

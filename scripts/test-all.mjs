@@ -26,6 +26,8 @@ const scripts = [
   'developer-gates-test.mjs',
   'developer-lifecycle-test.mjs',
   'coding-diff-test.mjs',
+  'coding-activity-trace-test.mjs',
+  'coding-agent-policy-test.py',
   'developer-runtime-state-test.mjs',
   'coding-sync-contract-test.mjs',
   'coding-real-world-e2e-test.mjs',
@@ -82,11 +84,22 @@ if (backendResult.code !== 0) {
   process.exitCode = backendResult.code;
 } else {
   for (const script of scripts) {
+    const isPythonTest = script.endsWith('.py');
     const result = await new Promise((resolve) => {
-      const args = ['coding-diff-test.mjs', 'provider-config-test.mjs', 'meeting-overlay-protocol-test.mjs', 'meeting-audio-quality-test.mjs', 'meeting-capture-lifecycle-test.mjs', 'meeting-transport-test.mjs'].includes(script)
-        ? ['--experimental-strip-types', path.join('scripts', script)]
-        : [path.join('scripts', script)];
-      const child = spawn(process.execPath, args, {
+      const args = isPythonTest
+        ? [path.join('scripts', script)]
+        : [
+            'coding-diff-test.mjs',
+            'coding-activity-trace-test.mjs',
+            'provider-config-test.mjs',
+            'meeting-overlay-protocol-test.mjs',
+            'meeting-audio-quality-test.mjs',
+            'meeting-capture-lifecycle-test.mjs',
+            'meeting-transport-test.mjs',
+          ].includes(script)
+          ? ['--experimental-strip-types', path.join('scripts', script)]
+          : [path.join('scripts', script)];
+      const child = spawn(isPythonTest ? 'python' : process.execPath, args, {
         stdio: 'inherit',
         windowsHide: true,
       });

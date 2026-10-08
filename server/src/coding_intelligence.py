@@ -208,6 +208,7 @@ class IncrementalRepositoryIndex:
 
     def __init__(self, project_root: str = ""):
         self.project_root = project_root
+        self._lock = threading.RLock()
         self._file_hashes: Dict[str, str] = {}
         self._file_mtimes: Dict[str, float] = {}
         self._symbols: Dict[str, List[Dict[str, Any]]] = {} # name_lower -> list of symbol records
@@ -221,6 +222,29 @@ class IncrementalRepositoryIndex:
         return hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
 
     def scan_and_update(self, project_root: Any = None, max_files: int = 500) -> Dict[str, int]:
+        with self._lock:
+            if isinstance(project_root, str) and project_root:
+                normalized_root = os.path.normcase(os.path.realpath(os.path.abspath(project_root)))
+                current_root = (
+                    os.path.normcase(os.path.realpath(os.path.abspath(self.project_root)))
+                    if self.project_root
+                    else ""
+                )
+                if current_root and current_root != normalized_root:
+                    self._clear_index()
+                self.project_root = normalized_root
+            return self._scan_and_update_locked(project_root, max_files)
+
+    def _clear_index(self) -> None:
+        self._file_hashes.clear()
+        self._file_mtimes.clear()
+        self._symbols.clear()
+        self._file_symbols.clear()
+        self._references.clear()
+        self._routes.clear()
+        self._db_references.clear()
+
+    def _scan_and_update_locked(self, project_root: Any = None, max_files: int = 500) -> Dict[str, int]:
         if isinstance(project_root, str):
             self.project_root = project_root
         elif isinstance(project_root, int):
@@ -359,28 +383,47 @@ class IncrementalRepositoryIndex:
 
         self._file_symbols[rel_path] = file_syms
 
-    def search_symbols(self, query: str, limit: int = 15) -> List[Dict[str, Any]]:
-        low_q = query.lower().strip()
-        results: List[Dict[str, Any]] = []
-        # Exact match first
-        if low_q in self._symbols:
-            results.extend(self._symbols[low_q])
+    def search_symbols(
+        self,
+        query: str,
+        limit: int = 15,
+        project_root: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            if project_root:
+                expected_root = os.path.normcase(os.path.realpath(os.path.abspath(project_root)))
+                indexed_root = (
+                    os.path.normcase(os.path.realpath(os.path.abspath(self.project_root)))
+                    if self.project_root
+                    else ""
+                )
+                if indexed_root != expected_root:
+                    raise ProjectIndexMismatchError()
+            low_q = query.lower().strip()
+            results: List[Dict[str, Any]] = []
+            if low_q in self._symbols:
+                results.extend(self._symbols[low_q])
 
-        # Partial match
-        for name_low, syms in self._symbols.items():
-            if name_low != low_q and low_q in name_low:
-                for s in syms:
-                    if s not in results:
-                        results.append(s)
-            if len(results) >= limit:
-                break
-        return results[:limit]
+            for name_low, syms in self._symbols.items():
+                if name_low != low_q and low_q in name_low:
+                    for symbol in syms:
+                        if symbol not in results:
+                            results.append(symbol)
+                if len(results) >= limit:
+                    break
+            return results[:limit]
 
     def get_routes(self) -> List[Dict[str, Any]]:
         return list(self._routes)
 
     def get_db_references(self) -> List[Dict[str, Any]]:
         return list(self._db_references)
+
+
+class ProjectIndexMismatchError(RuntimeError):
+    def __init__(self):
+        super().__init__("The Coding Agent index does not belong to the active project.")
+        self.code = "INDEX_PROJECT_MISMATCH"
 
 
 # =====================================================================
@@ -394,9 +437,14 @@ class LazyCodeGraph:
     def __init__(self, index: IncrementalRepositoryIndex):
         self.index = index
 
-    def expand_symbol_references(self, symbol_name: str, max_refs: int = 10) -> Dict[str, Any]:
+    def expand_symbol_references(
+        self,
+        symbol_name: str,
+        max_refs: int = 10,
+        project_root: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Finds all files and lines referencing the given symbol."""
-        symbol_recs = self.index.search_symbols(symbol_name, limit=5)
+        symbol_recs = self.index.search_symbols(symbol_name, limit=5, project_root=project_root)
         definitions = [{"path": s["path"], "line": s["line"], "kind": s["kind"]} for s in symbol_recs]
         return {
             "symbol": symbol_name,
@@ -407,8 +455,17 @@ class LazyCodeGraph:
             "status": "UNAVAILABLE",
         }
 
-    def get_symbol_references(self, symbol_name: str, max_refs: int = 10) -> Dict[str, Any]:
-        return self.expand_symbol_references(symbol_name, max_refs=max_refs)
+    def get_symbol_references(
+        self,
+        symbol_name: str,
+        max_refs: int = 10,
+        project_root: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self.expand_symbol_references(
+            symbol_name,
+            max_refs=max_refs,
+            project_root=project_root,
+        )
 
     def trace_api_data_flow(self, route_query: str) -> List[Dict[str, Any]]:
         """Traces route -> handler file -> database references."""
@@ -577,6 +634,34 @@ class CodingMemorySystem:
 # =====================================================================
 # 5B. IQ∞ MASTER EXECUTION, CAPABILITY & SECURITY RUNTIME
 # =====================================================================
+CODING_ENGINEERING_POLICY = (
+    "Core Coding Agent engineering policy: before adding implementation, discover the existing "
+    "responsibility owner and reusable code; prefer reuse, then extend, then a local refactor, and "
+    "only then add the smallest justified abstraction. Keep one authoritative Coding Agent owner; "
+    "do not create or delegate core task ownership to a parallel coding, investigation, database, "
+    "retrieval, provider, activity, or verification agent. Reuse existing specialized internal helpers "
+    "as infrastructure, not as competing autonomous owners. Before changing a responsibility, inspect "
+    "its callers, imports, exports, references, tests, registrations, and shared consumers. For every "
+    "implementation task, perform a bounded, task-related obsolete-code assessment, but never remove "
+    "code because it merely looks old: removal requires evidence it is unused, an authoritative "
+    "replacement, direct task relevance, preserved behavior, no unrelated impact, and supporting "
+    "regression checks. If any condition is unproven, keep the code and report that decision. Do not "
+    "expand tasks into unrelated cleanup, rewrite working subsystems, replace discovery with new "
+    "hardcoded assumptions, or weaken safety boundaries. Verify changes with focused regression tests "
+    "and the affected subsystem checks. In final responses, briefly identify REUSED, EXTENDED, NEW, "
+    "REMOVED, or KEPT decisions when relevant; do not provide hidden reasoning."
+)
+CODING_REUSE_PRECEDENCE = ("REUSE", "EXTEND", "LOCAL_REFACTOR", "SMALL_NEW_ABSTRACTION")
+CODING_OBSOLETE_REMOVAL_REQUIREMENTS = (
+    "proven unused",
+    "authoritative replacement exists",
+    "directly related to the task",
+    "behavior preserved",
+    "unrelated functionality unaffected",
+    "relevant regression checks pass",
+)
+
+
 class TaskExecutionContract:
     """
     Section 2: Internal Execution Contract.
@@ -613,6 +698,13 @@ class TaskExecutionContract:
         self.evidence_requirements = evidence_requirements or []
         self.verification_requirements = verification_requirements or []
         self.prose_alone_allowed = prose_alone_allowed
+        self.engineering_policy = {
+            "reusePrecedence": list(CODING_REUSE_PRECEDENCE),
+            "singleCodingAgentOwner": True,
+            "obsoleteCodeRemovalRequires": list(CODING_OBSOLETE_REMOVAL_REQUIREMENTS),
+            "unprovenObsoleteCodeAction": "KEEP",
+            "unrelatedCleanupAllowed": False,
+        }
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -629,6 +721,7 @@ class TaskExecutionContract:
             "evidenceRequirements": self.evidence_requirements,
             "verificationRequirements": self.verification_requirements,
             "proseAloneAllowed": self.prose_alone_allowed,
+            "engineeringPolicy": self.engineering_policy,
         }
 
 
@@ -835,51 +928,82 @@ class EngineeringCommandNormalizer:
 class ProjectContextLock:
     """
     Sections 5 & 6: Authoritative Project State & Project Context Lock.
-    Priority hierarchy:
-      1. Active Coding Project attachment
-      2. Authoritative session/project state
-      3. Backend project state
-      4. Repository state
-      5. Workspace state
-      6. Explicit project path
-      7. Natural-language project reference
-    Once attached, locks context truth so it cannot be overwritten by LLM response or search noise.
+    Context is bound per session. An explicitly attached project root is
+    authoritative for that request; process-global state is only a fallback.
     """
     _locked_contexts: Dict[str, Dict[str, Any]] = {}
-    _global_active_lock: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def identify_project_root(root_path: str) -> Dict[str, Optional[str]]:
+        root = Path(root_path).resolve()
+        root_key = os.path.normcase(str(root)).casefold()
+        project_id = f"project-{hashlib.sha256(root_key.encode('utf-8')).hexdigest()[:16]}"
+        repository_root = None
+        for candidate in (root, *root.parents):
+            if (candidate / ".git").exists():
+                repository_root = candidate
+                break
+        repository_id = None
+        branch = None
+        if repository_root:
+            repository_key = os.path.normcase(str(repository_root)).casefold()
+            repository_id = f"repository-{hashlib.sha256(repository_key.encode('utf-8')).hexdigest()[:16]}"
+            git_marker = repository_root / ".git"
+            git_dir = git_marker
+            if git_marker.is_file():
+                try:
+                    marker = git_marker.read_text(encoding="utf-8", errors="ignore").strip()
+                    if marker.lower().startswith("gitdir:"):
+                        git_dir = (repository_root / marker.split(":", 1)[1].strip()).resolve()
+                except OSError:
+                    git_dir = None
+            try:
+                if git_dir:
+                    head = (git_dir / "HEAD").read_text(encoding="utf-8", errors="ignore").strip()
+                    if head.startswith("ref: refs/heads/"):
+                        branch = head.removeprefix("ref: refs/heads/")
+            except OSError:
+                pass
+        return {
+            "projectId": project_id,
+            "repositoryId": repository_id,
+            "repositoryRoot": str(repository_root) if repository_root else None,
+            "branch": branch,
+        }
 
     @classmethod
     def lock(
         cls,
         root_path: str,
-        session_id: str = "default",
-        workspace_id: str = "ws-default",
-        project_id: str = "proj-default",
-        repository_id: str = "repo-default",
-        branch: str = "main",
-        task_id: str = "task-default",
+        session_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        repository_id: Optional[str] = None,
+        branch: Optional[str] = None,
+        task_id: Optional[str] = None,
         scope: str = ".",
     ) -> Dict[str, Any]:
+        identity = cls.identify_project_root(root_path)
+        root_path = str(Path(root_path).resolve())
         rec = {
             "rootPath": root_path,
             "sessionId": session_id,
             "workspaceId": workspace_id,
-            "projectId": project_id,
-            "repositoryId": repository_id,
-            "branch": branch,
+            "projectId": project_id or identity["projectId"],
+            "repositoryId": repository_id or identity["repositoryId"],
+            "repositoryRoot": identity["repositoryRoot"],
+            "branch": branch or identity["branch"],
             "taskId": task_id,
             "scope": scope,
             "lockedAt": time.time(),
         }
-        cls._locked_contexts[session_id] = rec
-        cls._global_active_lock = rec
+        if session_id:
+            cls._locked_contexts[session_id] = rec
         return rec
 
     @classmethod
     def get_locked_context(cls, session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        if session_id and session_id in cls._locked_contexts:
-            return cls._locked_contexts[session_id]
-        return cls._global_active_lock
+        return cls._locked_contexts.get(session_id) if session_id else None
 
     @classmethod
     def resolve_authoritative_root(
@@ -890,28 +1014,22 @@ class ProjectContextLock:
         explicit_root: Optional[str] = None,
         candidate_term: Optional[str] = None,
     ) -> Optional[str]:
-        # The active Coding project attachment must override stale session context.
-        if backend_root and os.path.isdir(backend_root):
-            return backend_root
+        # Only trusted runtime bindings may select a project. An explicit root
+        # comes from the authenticated project attachment, never message text.
+        if explicit_root and os.path.isdir(explicit_root):
+            return str(Path(explicit_root).resolve())
+        if session_root and os.path.isdir(session_root):
+            return str(Path(session_root).resolve())
 
-        # 2. Session-scoped lock
         locked = cls.get_locked_context(session_id)
         if locked and locked.get("rootPath") and os.path.isdir(locked["rootPath"]):
             return locked["rootPath"]
 
-        # 3. Session root
-        if session_root and os.path.isdir(session_root):
-            return session_root
+        if backend_root and os.path.isdir(backend_root):
+            return str(Path(backend_root).resolve())
 
-        # 4. Explicit project path
-        if explicit_root and os.path.isdir(explicit_root):
-            return explicit_root
-
-        # 5. Natural-language candidate
-        if candidate_term and EngineeringCommandNormalizer.is_valid_project_name(candidate_term):
-            if os.path.isdir(candidate_term):
-                return candidate_term
-
+        # candidate_term is intentionally not authoritative; project names
+        # must pass the explicit discovery and attachment flow first.
         return None
 
 
@@ -1698,40 +1816,44 @@ class DatabaseTargetRegistry:
 
     @classmethod
     def register_target(cls, project_root: str, target: DatabaseTarget) -> None:
-        norm = os.path.normpath(project_root) if project_root else "default"
+        if not project_root:
+            return
+        norm = os.path.normcase(os.path.abspath(project_root))
         if norm not in cls._targets_by_project:
             cls._targets_by_project[norm] = {}
         cls._targets_by_project[norm][target.target_id] = target
 
     @classmethod
     def get_targets(cls, project_root: str = "") -> List[DatabaseTarget]:
-        norm = os.path.normpath(project_root) if project_root else "default"
-        targets = list(cls._targets_by_project.get(norm, {}).values())
-        if not targets and norm != "default":
-            targets = list(cls._targets_by_project.get("default", {}).values())
-        return targets
+        if not project_root:
+            return []
+        norm = os.path.normcase(os.path.abspath(project_root))
+        return list(cls._targets_by_project.get(norm, {}).values())
 
     @classmethod
     def get_target(cls, project_root: str, target_id: Optional[str]) -> Optional[DatabaseTarget]:
         if not target_id:
             return None
-        norm = os.path.normpath(project_root) if project_root else "default"
+        if not project_root:
+            return None
+        norm = os.path.normcase(os.path.abspath(project_root))
         t_map = cls._targets_by_project.get(norm, {})
         if target_id in t_map:
             return t_map[target_id]
-        for p_map in cls._targets_by_project.values():
-            if target_id in p_map:
-                return p_map[target_id]
-            for t in p_map.values():
-                if t.target_id.lower() == target_id.lower() or t.database_name.lower() == target_id.lower():
-                    return t
-        return None
+        return next(
+            (
+                target for target in t_map.values()
+                if target.target_id.casefold() == target_id.casefold()
+                or target.database_name.casefold() == target_id.casefold()
+            ),
+            None,
+        )
 
     @classmethod
     def set_active_target(cls, project_root: str, target_id: str) -> bool:
         target = cls.get_target(project_root, target_id)
         if target:
-            norm = os.path.normpath(project_root) if project_root else "default"
+            norm = os.path.normcase(os.path.abspath(project_root))
             cls._active_target_by_project[norm] = target.target_id
             target.status = "CONNECTED"
             return True
@@ -1739,7 +1861,9 @@ class DatabaseTargetRegistry:
 
     @classmethod
     def get_active_target(cls, project_root: str = "") -> Optional[DatabaseTarget]:
-        norm = os.path.normpath(project_root) if project_root else "default"
+        if not project_root:
+            return None
+        norm = os.path.normcase(os.path.abspath(project_root))
         active_id = cls._active_target_by_project.get(norm)
         if active_id:
             t = cls.get_target(project_root, active_id)
@@ -1762,10 +1886,13 @@ class DatabaseTargetRegistry:
         s_host = target.safe_host if target else getattr(sess, "safe_host", None)
         s_port = target.safe_port if target else getattr(sess, "safe_port", None)
         s_state = getattr(sess, "connection_state", "NOT_CONNECTED") if sess else "NOT_CONNECTED"
-        p_name = Path(project_root).name if project_root else "default"
+        identity = ProjectContextLock.identify_project_root(project_root) if project_root else {
+            "projectId": None,
+            "repositoryId": None,
+        }
         return {
-            "projectId": p_name,
-            "repositoryId": p_name,
+            "projectId": identity["projectId"],
+            "repositoryId": identity["repositoryId"],
             "activeTargetId": t_id,
             "databaseSessionId": getattr(sess, "session_id", ""),
             "engine": engine,
@@ -2818,18 +2945,188 @@ class ConfigurationSymbolResolver:
 
     @staticmethod
     def _looks_like_database_configuration(content: str) -> bool:
-        return bool(
+        has_explicit_connection_setting = bool(
             re.search(
                 r"(?:['\"]?dsn['\"]?\s*(?:=>|=)|"
                 r"(?:DB_(?:HOST|PORT|DATABASE|NAME|USERNAME|USER|CONNECTION)|"
                 r"DATABASE_URL|POSTGRES(?:QL)?_URL|SUPABASE_(?:DB|DATABASE)_URL|"
                 r"MONGO(?:DB)?_(?:URL|URI)|SPRING\.DATASOURCE\.URL)\s*=|"
-                r"['\"]?(?:database|dbname|host|hostname)['\"]?\s*(?:=>|:)\s*['\"]|"
                 r"jdbc:h2:|new\s+\\?PDO\s*\(|new\s+mysqli\s*\()",
                 content,
                 re.I,
             )
         )
+        if has_explicit_connection_setting:
+            return True
+        has_database_field = bool(re.search(
+            r"['\"]?(?:database|dbname)['\"]?\s*(?:=>|:|=)\s*['\"]",
+            content,
+            re.I,
+        ))
+        has_connection_detail = bool(re.search(
+            r"['\"]?(?:host|hostname|username|user|password|driver|port)['\"]?\s*(?:=>|:|=)\s*['\"]",
+            content,
+            re.I,
+        ))
+        return has_database_field and has_connection_detail
+
+    @classmethod
+    def _resolve_static_project_reference(
+        cls,
+        root: Path,
+        source_path: str,
+        expression: str,
+        known_paths: Set[str],
+    ) -> List[str]:
+        """Resolve literal project-local include/import paths without executing project code."""
+        source_dir = Path(source_path).parent
+        value = str(expression or "").strip()
+        value = re.sub(r"\bdirname\s*\(\s*__FILE__\s*\)", str(source_dir), value)
+        value = re.sub(r"\bdirname\s*\(\s*__DIR__\s*\)", str(source_dir.parent), value)
+        value = re.sub(r"\b__DIR__\b", str(source_dir), value)
+        value = re.sub(r"\b__FILE__\b", source_path, value)
+        if re.search(r"\$|%|@[A-Za-z_]|(?:getenv|env)\s*\(", value):
+            return []
+        fragments = re.findall(r"""['"]([^'"]+)['"]""", value)
+        if not fragments:
+            return []
+        resolved_value = "".join(fragments).replace("\\", "/")
+        relative_to_source = bool(re.search(r"\b(?:dirname|__DIR__|__FILE__)\b", expression))
+        if relative_to_source:
+            resolved_value = resolved_value.lstrip("/")
+        candidate_paths = []
+        raw = Path(resolved_value)
+        if raw.is_absolute() and not relative_to_source:
+            try:
+                candidate_paths.append(raw.resolve().relative_to(root.resolve()).as_posix())
+            except (OSError, ValueError):
+                return []
+        else:
+            candidate_paths.extend((
+                (source_dir / raw).as_posix(),
+                raw.as_posix(),
+            ))
+        resolved = []
+        for candidate in candidate_paths:
+            normalized = os.path.normpath(candidate).replace("\\", "/").removeprefix("./")
+            variants = [normalized]
+            if not Path(normalized).suffix:
+                variants.extend(f"{normalized}{extension}" for extension in (
+                    ".php", ".js", ".cjs", ".mjs", ".ts", ".tsx", ".py",
+                ))
+            for variant in variants:
+                if variant in known_paths and variant not in resolved:
+                    resolved.append(variant)
+        return resolved
+
+    @classmethod
+    def _project_configuration_graph(
+        cls,
+        root: Path,
+        file_contents: Dict[str, str],
+    ) -> Tuple[Dict[str, List[str]], List[str]]:
+        known_paths = set(file_contents)
+        graph: Dict[str, List[str]] = {}
+        entrypoints = []
+        entrypoint_names = {
+            "index.php", "yii", "artisan", "manage.py", "wsgi.py", "asgi.py",
+            "server.js", "server.cjs", "index.js", "index.cjs", "main.js",
+            "main.cjs", "app.js",
+        }
+        entrypoint_signature = re.compile(
+            r"\b(?:Yii::create(?:Web|Console)Application|new\s+\\?yii\\(?:web|console)\\Application|"
+            r"NestFactory\.create|createServer\s*\(|\.listen\s*\(|FastAPI\s*\(|Flask\s*\()",
+            re.I,
+        )
+        for relative, content in file_contents.items():
+            targets = []
+            expressions = []
+            expressions.extend(
+                match.group(1)
+                for match in re.finditer(
+                    r"\b(?:require|include)(?:_once)?\s*(?:\(\s*)?([^;]+?)\s*\)?\s*;",
+                    content,
+                    re.I | re.S,
+                )
+            )
+            expressions.extend(
+                match.group(1)
+                for match in re.finditer(
+                    r"(?:\brequire\s*\(\s*|\bfrom\s*|\bimport\s*)['\"]([^'\"]+)['\"]",
+                    content,
+                    re.I,
+                )
+            )
+            for expression in expressions:
+                for target in cls._resolve_static_project_reference(
+                    root, relative, expression, known_paths
+                ):
+                    if target != relative and target not in targets:
+                        targets.append(target)
+            graph[relative] = targets
+
+            name = Path(relative).name.casefold()
+            if name in entrypoint_names and (
+                targets or entrypoint_signature.search(content)
+            ):
+                entrypoints.append(relative)
+        return graph, entrypoints
+
+    @classmethod
+    def _rank_configuration_candidates(
+        cls,
+        root: Path,
+        candidates: List[str],
+        file_contents: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        graph, entrypoints = cls._project_configuration_graph(root, file_contents)
+        distances: Dict[str, List[Tuple[int, str]]] = {candidate: [] for candidate in candidates}
+        for entrypoint in entrypoints:
+            pending = [(entrypoint, 0)]
+            visited = set()
+            while pending:
+                relative, depth = pending.pop(0)
+                if relative in visited:
+                    continue
+                visited.add(relative)
+                if relative in distances:
+                    distances[relative].append((depth, entrypoint))
+                pending.extend((target, depth + 1) for target in graph.get(relative, []))
+        ranked = []
+        for candidate in candidates:
+            evidence = sorted(distances[candidate])
+            ranked.append({
+                "path": candidate,
+                "entrypointReachable": bool(evidence),
+                "distance": evidence[0][0] if evidence else None,
+                "entrypoints": sorted({entrypoint for _, entrypoint in evidence}),
+            })
+        return sorted(
+            ranked,
+            key=lambda item: (
+                not item["entrypointReachable"],
+                item["distance"] if item["distance"] is not None else float("inf"),
+                item["path"].casefold(),
+            ),
+        )
+
+    @classmethod
+    def _configuration_dependency_paths(
+        cls,
+        root: Path,
+        source_path: str,
+        file_contents: Dict[str, str],
+    ) -> List[str]:
+        graph, _ = cls._project_configuration_graph(root, file_contents)
+        pending = [source_path]
+        visited = []
+        while pending:
+            relative = pending.pop(0)
+            if relative in visited:
+                continue
+            visited.append(relative)
+            pending.extend(graph.get(relative, []))
+        return visited
 
     _credential_vault: Dict[str, Dict[str, Any]] = {}
     MAX_CREDENTIAL_PROJECTS = 100
@@ -2886,7 +3183,12 @@ class ConfigurationSymbolResolver:
             cls._credential_vault.pop(os.path.abspath(project_root).lower(), None)
 
     @classmethod
-    def resolve_symbol_in_project(cls, project_root: str, symbol: Any) -> Dict[str, Any]:
+    def resolve_symbol_in_project(
+        cls,
+        project_root: str,
+        symbol: Any,
+        preferred_files: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         if symbol is None:
             return {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
 
@@ -2910,32 +3212,16 @@ class ConfigurationSymbolResolver:
                 "unresolved_message": f"Database configuration references {clean_symbol}, but its authoritative value is not yet resolved."
             }
 
-        candidate_patterns = [
-            "config/_name.php",
-            "config/params.php",
-            "config/db.php",
-            "config/main-local.php",
-            "config/web.php",
-            "config/console.php",
-            "common/config/main-local.php",
-            "_name.php",
-            "params.php",
-            "constants.php",
-            "bootstrap.php",
-            ".env",
-            ".env.local",
-            "config/*.php",
-            "*.php",
-        ]
-
-        scanned_files = []
-        for pat in candidate_patterns:
-            try:
-                for p in root.glob(pat):
-                    if p.is_file() and p not in scanned_files and not any(x in str(p).lower() for x in ("vendor", "node_modules", ".git")):
-                        scanned_files.append(p)
-            except Exception:
-                continue
+        scanned_files = list(cls._iter_project_text_files(root))
+        if preferred_files:
+            preferred = []
+            for relative in preferred_files:
+                candidate = root / relative
+                if candidate.is_file() and candidate not in preferred:
+                    preferred.append(candidate)
+            scanned_files = preferred + [
+                candidate for candidate in scanned_files if candidate not in preferred
+            ]
 
         # Follow require / require_once / include / include_once chains across files
         included_files = []
@@ -3077,7 +3363,20 @@ class ConfigurationSymbolResolver:
         if not root:
             return {"discovered": False, "status": "NOT_FOUND", "message": "Project directory not found on disk."}
 
+        file_contents: Dict[str, str] = {}
+        candidate_paths = []
+        for candidate in cls._iter_project_text_files(root):
+            try:
+                relative = str(candidate.relative_to(root)).replace("\\", "/")
+                file_content = candidate.read_text(encoding="utf-8", errors="ignore")
+            except (OSError, ValueError):
+                continue
+            file_contents[relative] = file_content
+            if cls._looks_like_database_configuration(file_content):
+                candidate_paths.append(relative)
+
         target_file = None
+        selection_evidence = None
         if specific_file:
             cand = root / specific_file
             if cand.is_file():
@@ -3085,8 +3384,19 @@ class ConfigurationSymbolResolver:
             else:
                 matches = list(root.glob(f"**/{Path(specific_file).name}"))
                 matches = [m for m in matches if not any(x in str(m).lower() for x in ("vendor", "node_modules", ".git"))]
-                if matches:
+                if len(matches) == 1:
                     target_file = matches[0]
+                elif len(matches) > 1:
+                    return {
+                        "discovered": False,
+                        "status": "AMBIGUOUS",
+                        "configFile": str(specific_file).replace("\\", "/"),
+                        "candidates": [
+                            str(match.relative_to(root)).replace("\\", "/")
+                            for match in matches
+                        ],
+                        "message": f"Multiple project files match the requested name {Path(specific_file).name}; no file was selected.",
+                    }
                 if not target_file:
                     return {
                         "discovered": False,
@@ -3096,44 +3406,57 @@ class ConfigurationSymbolResolver:
                     }
 
         if not target_file:
-            search_patterns = [
-                "config/db.php", "config/database.php", "config/main-local.php",
-                "config.php", "config/web.php", ".env", "settings.py",
-                "application.properties", "application.yml", "application.yaml",
-                "src/main/resources/application.properties",
-                "src/main/resources/application.yml",
-                "src/main/resources/application.yaml",
-            ]
-            for pat in search_patterns:
-                cand = root / pat
-                if cand.is_file():
-                    try:
-                        candidate_content = cand.read_text(encoding="utf-8", errors="ignore")
-                    except OSError:
-                        continue
-                    if cls._looks_like_database_configuration(candidate_content):
-                        target_file = cand
-                        break
-
-        if not target_file:
-            for p in list(root.glob("config/*.php")) + list(root.glob("*.php")):
-                if not any(x in str(p).lower() for x in ("vendor", "node_modules", ".git")):
-                    try:
-                        c = p.read_text(encoding="utf-8", errors="ignore")
-                        if cls._looks_like_database_configuration(c):
-                            target_file = p
-                            break
-                    except Exception:
-                        pass
+            if len(candidate_paths) == 1:
+                target_file = root / candidate_paths[0]
+                selection_evidence = "Only one database configuration candidate was found."
+            elif len(candidate_paths) > 1:
+                ranked_candidates = cls._rank_configuration_candidates(
+                    root,
+                    candidate_paths,
+                    file_contents,
+                )
+                reachable = [
+                    candidate for candidate in ranked_candidates
+                    if candidate["entrypointReachable"]
+                ]
+                if reachable and (
+                    len(reachable) == 1
+                    or reachable[0]["distance"] < reachable[1]["distance"]
+                ):
+                    selected = reachable[0]
+                    target_file = root / selected["path"]
+                    selection_evidence = (
+                        "Selected through static project entrypoint references: "
+                        + ", ".join(selected["entrypoints"])
+                    )
+                else:
+                    return {
+                        "discovered": False,
+                        "status": "AMBIGUOUS",
+                        "candidates": [candidate["path"] for candidate in ranked_candidates],
+                        "candidateEvidence": ranked_candidates,
+                        "message": (
+                            "Multiple database configuration candidates remain materially viable; "
+                            "no file was selected."
+                        ),
+                    }
 
         if not target_file:
             return {"discovered": False, "status": "NOT_FOUND", "message": "No database configuration file found."}
 
         rel_path = str(target_file.relative_to(root)).replace("\\", "/")
         try:
-            content = target_file.read_text(encoding="utf-8", errors="ignore")
+            content = file_contents.get(rel_path)
+            if content is None:
+                content = target_file.read_text(encoding="utf-8", errors="ignore")
+                file_contents[rel_path] = content
         except Exception as e:
             return {"discovered": False, "status": "ERROR", "message": str(e), "configFile": rel_path}
+        dependency_paths = cls._configuration_dependency_paths(root, rel_path, file_contents)
+        preferred_files = dependency_paths + [
+            path for path in file_contents if Path(path).name.startswith(".env")
+        ]
+        selected_content = content
 
         url_assignment = re.search(
             r"^\s*(?:DATABASE_URL|POSTGRES_URL|POSTGRESQL_URL|SUPABASE_DB_URL|SUPABASE_DATABASE_URL|MONGO_URL|MONGODB_URI|MONGODB_URL|SPRING\.DATASOURCE\.URL)\s*[:=]\s*['\"]?([^'\"\r\n#]+)",
@@ -3171,6 +3494,8 @@ class ConfigurationSymbolResolver:
                 return {
                     "discovered": True,
                     "configFile": rel_path,
+                    "selectionEvidence": selection_evidence,
+                    "configurationDependencies": dependency_paths[1:],
                     "activeComponent": "Database Connection",
                     "componentClass": "Native / Generic Connection",
                     "engine": parsed_url["engine"],
@@ -3195,7 +3520,7 @@ class ConfigurationSymbolResolver:
                     },
                     "hasPassword": password is not None,
                     "status": "RESOLVED" if parsed_url.get("database") else "CONFIGURED",
-                    "fileContent": SecretProtector.redact_text(content),
+                    "fileContent": SecretProtector.redact_text(selected_content),
                     "sqliteFile": None,
                 }
 
@@ -3337,14 +3662,24 @@ class ConfigurationSymbolResolver:
             else:
                 pass_token = re.sub(r"^['\"\s\.]+|['\"\s\.]+$", "", raw_pw)
 
-        res_host = cls.resolve_symbol_in_project(project_root, host_token) if host_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
-        res_db = cls.resolve_symbol_in_project(project_root, db_token) if db_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
+        res_host = cls.resolve_symbol_in_project(
+            project_root, host_token, preferred_files
+        ) if host_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
+        res_db = cls.resolve_symbol_in_project(
+            project_root, db_token, preferred_files
+        ) if db_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
         if engine == "sqlite" and sqlite_file and not res_db.get("value"):
             db_fname = Path(sqlite_file).name
             res_db = {"status": "RESOLVED", "value": db_fname, "symbol": "sqlite_file", "source": "dsn_file"}
-        res_port = cls.resolve_symbol_in_project(project_root, port_token) if port_token else {"status": "NOT_SPECIFIED", "value": None}
-        res_user = cls.resolve_symbol_in_project(project_root, user_token) if user_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
-        res_pass = cls.resolve_symbol_in_project(project_root, pass_token) if pass_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
+        res_port = cls.resolve_symbol_in_project(
+            project_root, port_token, preferred_files
+        ) if port_token else {"status": "NOT_SPECIFIED", "value": None}
+        res_user = cls.resolve_symbol_in_project(
+            project_root, user_token, preferred_files
+        ) if user_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
+        res_pass = cls.resolve_symbol_in_project(
+            project_root, pass_token, preferred_files
+        ) if pass_token else {"status": "NOT_SPECIFIED", "value": None, "symbol": None}
 
         if res_db["status"] == "NOT_RESOLVED" or res_host["status"] == "NOT_RESOLVED":
             overall_status = "NOT_RESOLVED"
@@ -3363,6 +3698,8 @@ class ConfigurationSymbolResolver:
         res_dict = {
             "discovered": True,
             "configFile": rel_path,
+            "selectionEvidence": selection_evidence,
+            "configurationDependencies": dependency_paths[1:],
             "activeComponent": active_comp,
             "componentClass": comp_class,
             "engine": engine or "unknown",
@@ -3372,7 +3709,7 @@ class ConfigurationSymbolResolver:
             "username": res_user,
             "hasPassword": bool(pass_token),
             "status": overall_status,
-            "fileContent": SecretProtector.redact_text(content),
+            "fileContent": SecretProtector.redact_text(selected_content),
             "sqliteFile": sqlite_file,
         }
         if connection_uri or res_pass.get("value") or (res_user and res_user.get("value")):
@@ -3383,6 +3720,33 @@ class ConfigurationSymbolResolver:
                 connection_uri=connection_uri,
             )
         return res_dict
+
+    @staticmethod
+    def _iter_project_text_files(root: Path):
+        ignored_directories = {
+            ".git", "node_modules", "vendor", "dist", "build", "target",
+            ".venv", "venv", "__pycache__", ".next", ".nuxt",
+        }
+        count = 0
+        for current, directories, filenames in os.walk(root):
+            directories[:] = [
+                name for name in directories
+                if name.casefold() not in ignored_directories
+            ]
+            for filename in filenames:
+                candidate = Path(current) / filename
+                try:
+                    if candidate.stat().st_size > 150_000:
+                        continue
+                    with candidate.open("rb") as source:
+                        if b"\0" in source.read(4096):
+                            continue
+                except OSError:
+                    continue
+                yield candidate
+                count += 1
+                if count >= 10_000:
+                    return
 
     @classmethod
     def verify_live_database_identity(cls, project_root: str, cfg: Dict[str, Any], session: Optional[Any] = None) -> Dict[str, Any]:
@@ -4191,9 +4555,20 @@ class DatabaseIntelligenceEngine:
 
         # 1. Authoritative configuration inspection via ConfigurationSymbolResolver
         res_cfg = ConfigurationSymbolResolver.inspect_project_database_configuration(project_root)
+        if res_cfg.get("status") == "AMBIGUOUS":
+            discovered_info["status"] = "DB_CONFIG_AMBIGUOUS"
+            discovered_info["candidates"] = res_cfg.get("candidates", [])
+            discovered_info["evidence"].append(
+                "Multiple database configuration candidates were found; no configuration was selected."
+            )
+            return discovered_info
         if res_cfg.get("discovered"):
             discovered_info["discovered"] = True
             discovered_info["configFile"] = res_cfg.get("configFile")
+            discovered_info["selectionEvidence"] = res_cfg.get("selectionEvidence")
+            discovered_info["configurationDependencies"] = res_cfg.get(
+                "configurationDependencies", []
+            )
             if res_cfg.get("engine") and res_cfg.get("engine") != "unknown":
                 discovered_info["engine"] = res_cfg.get("engine")
             discovered_info["activeComponent"] = res_cfg.get("activeComponent")
@@ -4227,43 +4602,21 @@ class DatabaseIntelligenceEngine:
         # Scan for db config files only if not yet discovered
         found_files = []
         if not discovered_info["discovered"]:
-            config_patterns = [
-                "config/db*.php", "config/database*.php", "config/main-local.php",
-                "config/*.php", "settings.py", "application*.properties",
-                "application*.yml", "schema.prisma", "ormconfig.*",
-                "src/main/resources/application*.properties",
-                "src/main/resources/application*.yml",
-                "src/main/resources/application*.yaml",
-                ".env", ".env.local", ".env.production",
-            ]
-            for pat in config_patterns:
+            for match in ConfigurationSymbolResolver._iter_project_text_files(root):
                 try:
-                    for match in root.glob(pat):
-                        if match.is_file() and match.stat().st_size < 150000:
-                            rel = str(match.relative_to(root)).replace("\\", "/")
-                            if not any(ign in rel.lower() for ign in ("vendor/", "node_modules/", ".git/")):
-                                found_files.append((rel, match))
-                except Exception:
+                    content = match.read_text(encoding="utf-8", errors="ignore")
+                    if ConfigurationSymbolResolver._looks_like_database_configuration(content):
+                        rel = str(match.relative_to(root)).replace("\\", "/")
+                        found_files.append((rel, match))
+                except (OSError, ValueError):
                     continue
-
-            # Check for real SQLite database files directly in project
-            sqlite_files = []
-            for pat in ("data/*.db", "data/*.sqlite", "data/*.sqlite3", "*.sqlite", "*.sqlite3", "*.db", "database/*.sqlite", "database/*.sqlite3", "database/*.db"):
-                for match in root.glob(pat):
-                    if match.is_file():
-                        sqlite_files.append(match)
-            if len(sqlite_files) == 1:
-                sqf = sqlite_files[0]
-                discovered_info["engine"] = "sqlite"
-                discovered_info["database"] = sqf.name
-                discovered_info["sqlite_file"] = str(sqf)
-                discovered_info["discovered"] = True
-                discovered_info["evidence"].append(f"SQLite database file found: {str(sqf.relative_to(root)).replace('\\', '/')}")
-            elif len(sqlite_files) > 1:
-                discovered_info["sqliteResolution"] = "AMBIGUOUS"
+            if len(found_files) > 1:
+                discovered_info["status"] = "DB_CONFIG_AMBIGUOUS"
+                discovered_info["candidates"] = [rel for rel, _ in found_files]
                 discovered_info["evidence"].append(
-                    "Multiple SQLite database files were found; no file was selected."
+                    "Multiple database configuration candidates were found; no configuration was selected."
                 )
+                return discovered_info
 
         for rel_path, file_path in found_files:
             try:
@@ -4393,6 +4746,11 @@ class DatabaseIntelligenceEngine:
 
         if discovered_info["engine"] != "unknown" or discovered_info["database"]:
             discovered_info["discovered"] = True
+        if discovered_info.get("status") != "DB_CONFIG_AMBIGUOUS":
+            if discovered_info["discovered"] and discovered_info["engine"] == "unknown":
+                discovered_info["status"] = "DB_ENGINE_UNKNOWN"
+            elif not discovered_info["discovered"]:
+                discovered_info["status"] = DbFailureClassification.DB_CONFIG_NOT_FOUND
 
         if arch:
             for fw in arch.get("frameworks", []):
@@ -6342,7 +6700,8 @@ class DatabaseSessionManager:
         session: DatabaseSession,
         config: Dict[str, Any],
         project_root: str,
-        project_identity: str,
+        project_identity: Optional[str],
+        repository_identity: Optional[str],
     ) -> bool:
         engine = str(DatabaseIntelligenceEngine._config_value(config, "engine") or "").casefold()
         database = DatabaseIntelligenceEngine._config_value(config, "database")
@@ -6350,7 +6709,7 @@ class DatabaseSessionManager:
         proof = session.health_proof
         if (
             session.project_id != project_identity
-            or session.repository_id != project_identity
+            or session.repository_id != repository_identity
             or not engine
             or engine != session.database_type.casefold()
             or target_id != session.target_id
@@ -6448,7 +6807,11 @@ class DatabaseSessionManager:
     ) -> DatabaseSession:
         norm = os.path.normpath(project_root) if project_root else ""
         cfg = dict(db_config or DatabaseIntelligenceEngine.discover_database_configuration(project_root))
-        project_identity = Path(project_root).name if project_root else "default"
+        identity = ProjectContextLock.identify_project_root(project_root) if project_root else {
+            "projectId": None,
+            "repositoryId": None,
+        }
+        project_identity = identity["projectId"]
         active_target = DatabaseTargetRegistry.get_active_target(project_root) if project_root else None
         if active_target:
             cfg.update({
@@ -6466,7 +6829,13 @@ class DatabaseSessionManager:
             existing
             and existing.is_connected()
             and cls._session_project_is_available(existing)
-            and cls._matches_database_identity(existing, cfg, project_root, project_identity)
+            and cls._matches_database_identity(
+                existing,
+                cfg,
+                project_root,
+                project_identity,
+                identity["repositoryId"],
+            )
         ):
             existing.touch()
             cls._active_session = existing
@@ -6482,6 +6851,7 @@ class DatabaseSessionManager:
                     cfg,
                     project_root,
                     project_identity,
+                    identity["repositoryId"],
                 )
             ):
                 existing_without_root.touch()
@@ -6493,7 +6863,7 @@ class DatabaseSessionManager:
         cfg.update({
             "database_session_id": database_session_id,
             "project_id": project_identity,
-            "repository_id": project_identity,
+            "repository_id": identity["repositoryId"],
             "target_id": cfg.get("target_id"),
         })
         health = DatabaseIntelligenceEngine.real_connect_and_health_check(project_root, cfg)
@@ -6509,8 +6879,8 @@ class DatabaseSessionManager:
         safe_p = cfg.get("port") or health.get("port")
 
         sess = DatabaseSession(
-            project_id=Path(project_root).name if project_root else "default",
-            repository_id=Path(project_root).name if project_root else "default",
+            project_id=project_identity,
+            repository_id=identity["repositoryId"],
             database_type=db_type,
             database_name=db_name,
             connection_handle=health.get("sqlite_file") or health.get("client"),
@@ -7326,6 +7696,36 @@ class DatabaseSessionManager:
                 if health.get("health_proof"):
                     session.health_proof = health["health_proof"]
                     session.binding.bind_proof(health["health_proof"])
+
+        database_read_capabilities = {
+            DatabaseCapability.DATABASE_LIST_DATABASES,
+            DatabaseCapability.DATABASE_LIST_SCHEMAS,
+            DatabaseCapability.DATABASE_LIST_TABLES,
+            DatabaseCapability.DATABASE_DESCRIBE_TABLE,
+            DatabaseCapability.DATABASE_LIST_COLUMNS,
+            DatabaseCapability.DATABASE_LIST_INDEXES,
+            DatabaseCapability.DATABASE_LIST_CONSTRAINTS,
+            DatabaseCapability.DATABASE_LIST_VIEWS,
+            DatabaseCapability.DATABASE_QUERY,
+            DatabaseCapability.DATABASE_EXPLAIN,
+            DatabaseCapability.DATABASE_QUERY_TIMING,
+        }
+        if capability in database_read_capabilities and db_type in ("", "unknown", "unverified"):
+            return {
+                "ok": False,
+                "capability": capability,
+                "error": "DB_ENGINE_UNKNOWN",
+                "failureClassification": "DB_ENGINE_UNKNOWN",
+                "content": (
+                    "Database configuration has not resolved an engine. Resolve the active project "
+                    "configuration and verify a project-bound target before running database operations."
+                ),
+                "executionStatus": "DB_ENGINE_UNKNOWN",
+                "evidenceQuality": "UNVERIFIED",
+                "databaseType": "unknown",
+                "databaseSessionId": session.session_id,
+                "executed": False,
+            }
 
         # 1. DATABASE_LIST_DATABASES
         if capability == DatabaseCapability.DATABASE_LIST_DATABASES:

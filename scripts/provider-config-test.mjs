@@ -223,6 +223,21 @@ assert.match(secretRehydrationFlow, /restoredProvider\?\.hasApiKey === true/, 'h
 assert.match(secretRehydrationFlow, /providers = hydratedData\.providers/, 'the provider UI state must use the backend response after the key is rehydrated');
 assert.doesNotMatch(providerLoadBeforeEmptyRestore, /writePersistedProviderSettings\(/);
 assert.match(emptyProviderRestore, /savedProviderSettings\.providers/);
+assert.match(
+  emptyProviderRestore,
+  /if \(!adapterType \|\| !getProviderConfig\(adapterType\)\) return \[\]/,
+  'saved provider metadata is restored even when its local credential is unavailable',
+);
+assert.doesNotMatch(
+  emptyProviderRestore,
+  /if \(!adapterType \|\| !apiKey \|\| !getProviderConfig\(adapterType\)\) return \[\]/,
+  'a missing credential does not discard the configured provider entry',
+);
+assert.match(
+  emptyProviderRestore,
+  /savedProviderId && provider\.apiKey/,
+  'empty credentials are not written into the local secret store during metadata recovery',
+);
 assert.match(emptyProviderRestore, /if \(restoredProviders\.length > 0\)/);
 const providerFlowStart = appSource.indexOf('const saveConfiguredProvider');
 const providerFlowEnd = appSource.indexOf('const saveAgentPermissions', providerFlowStart);

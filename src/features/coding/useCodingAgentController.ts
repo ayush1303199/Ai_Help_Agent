@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { runtimeConfig } from '../../config/runtimeConfig';
 import { createUnvalidatedSuggestion, parseUnifiedDiff, validateUnifiedFile, type DeveloperDiffFile } from './codingDiff';
-import { codingFetch, CodingAgentTransport, type CodingActivity, type CodingTransportResult } from './codingTransport';
+import {
+  codingFetch,
+  CodingAgentTransport,
+  finalizeCodingActivities,
+  upsertCodingActivity,
+  type CodingActivity,
+  type CodingTransportResult,
+} from './codingTransport';
 import {
   codingPreferenceContext,
   compactCodingConversation,
@@ -191,11 +198,15 @@ export function useCodingAgentController({
   const savedConversation = conversationStates.find((session) => session.id === conversationId);
   const [messages, setMessages] = useState<CodingMessage[]>(() => savedConversation?.messages || []);
   const [activity, setActivity] = useState<CodingActivity[]>([]);
+  const activitySequenceRef = useRef(0);
+  const activeActivityExecutionRef = useRef<string | null>(null);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
-  const [projectRoot, setProjectRoot] = useState<string | null>(() => readStoredProjectRoot() || savedConversation?.projectRoot || null);
+  const [projectRoot, setProjectRoot] = useState<string | null>(() => (
+    window.electronAPI ? readStoredProjectRoot() || savedConversation?.projectRoot || null : null
+  ));
   const [projectLifecycleState, setProjectLifecycleState] = useState<ProjectLifecycleState>(() => {
-    const saved = readStoredProjectRoot() || savedConversation?.projectRoot;
+    const saved = window.electronAPI ? readStoredProjectRoot() || savedConversation?.projectRoot : null;
     return saved ? 'PROJECT_ATTACHED' : 'NO_PROJECT';
   });
   const [projectCandidates, setProjectCandidates] = useState<string[]>([]);
@@ -294,66 +305,76 @@ export function useCodingAgentController({
         }
       } else {
         try {
-          const res = await codingFetch('http://localhost:3001/api/coding/project-state');
+          const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-state`);
           if (!active) return;
-          if (res.ok) {
-            const state = await res.json();
-            if (state.status === 'PROJECT_ATTACHED' && state.projectRoot) {
-              setProjectRoot(state.projectRoot);
-              setProjectLifecycleState('PROJECT_ATTACHED');
-              persistStoredProjectRoot(state.projectRoot);
-              try {
-                const dirRes = await codingFetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
-                if (dirRes.ok && active) setDirectory(await dirRes.json());
-              } catch {
-                // Retain current directory state
-              }
-            } else if (state.status === 'PROJECT_MISSING') {
-              setProjectRoot(null);
-              setProjectLifecycleState('PROJECT_MISSING');
-              persistStoredProjectRoot(null);
-              setDirectory([]);
-              onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
-            } else if (state.status === 'PROJECT_DETACHED') {
-              setProjectRoot(null);
-              setProjectLifecycleState('PROJECT_DETACHED');
-              persistStoredProjectRoot(null);
-              setDirectory([]);
-            } else {
-              const savedRoot = getSavedRoot();
-              if (savedRoot) {
-                try {
-                  const attachRes = await codingFetch('http://localhost:3001/api/coding/project-attach', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ projectRoot: savedRoot }),
-                  });
-                  if (attachRes.ok && active) {
-                    const attached = await attachRes.json();
-                    if (attached.status === 'PROJECT_ATTACHED' && attached.projectRoot) {
-                      setProjectRoot(attached.projectRoot);
-                      setProjectLifecycleState('PROJECT_ATTACHED');
-                      persistStoredProjectRoot(attached.projectRoot);
-                      const dirRes = await codingFetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
-                      if (dirRes.ok && active) setDirectory(await dirRes.json());
-                    } else {
-                      setProjectLifecycleState('NO_PROJECT');
-                    }
-                  } else {
-                    setProjectLifecycleState('NO_PROJECT');
-                  }
-                } catch {
-                  setProjectLifecycleState('NO_PROJECT');
-                }
-              } else {
-                setProjectLifecycleState('NO_PROJECT');
-              }
-            }
-          } else {
-            setProjectLifecycleState('NO_PROJECT');
+          if (!response.ok) {
+            throw new Error(`Project state request failed: HTTP ${response.status}`);
           }
-        } catch {
-          setProjectLifecycleState('NO_PROJECT');
+          const state = await response.json();
+          if (state.status === 'PROJECT_ATTACHED' && state.projectRoot) {
+            setProjectRoot(state.projectRoot);
+            setProjectLifecycleState('PROJECT_ATTACHED');
+            persistStoredProjectRoot(state.projectRoot);
+            const directoryResponse = await codingFetch(
+              `${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`,
+            );
+            if (!directoryResponse.ok) {
+              throw new Error(`Project directory request failed: HTTP ${directoryResponse.status}`);
+            }
+            const listing = await directoryResponse.json();
+            if (active) setDirectory(listing);
+          } else if (state.status === 'PROJECT_DETACHED') {
+            setProjectRoot(null);
+            setProjectLifecycleState('PROJECT_DETACHED');
+            persistStoredProjectRoot(null);
+            setDirectory([]);
+          } else if (state.status === 'PROJECT_MISSING') {
+            setProjectRoot(null);
+            setProjectLifecycleState('PROJECT_MISSING');
+            persistStoredProjectRoot(null);
+            setDirectory([]);
+            onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
+          } else {
+            const savedRoot = getSavedRoot();
+            if (!savedRoot) {
+              setProjectRoot(null);
+              setProjectLifecycleState('NO_PROJECT');
+              setProjectCandidates([]);
+              setDirectory([]);
+              return;
+            }
+            const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ projectRoot: savedRoot }),
+            });
+            if (!active) return;
+            if (!attachResponse.ok) {
+              throw new Error(`Saved project could not be attached: HTTP ${attachResponse.status}`);
+            }
+            const attached = await attachResponse.json();
+            if (!attached.projectRoot) {
+              throw new Error('Saved project attachment did not return a project path.');
+            }
+            setProjectRoot(attached.projectRoot);
+            setProjectLifecycleState('PROJECT_ATTACHED');
+            persistStoredProjectRoot(attached.projectRoot);
+            const directoryResponse = await codingFetch(
+              `${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`,
+            );
+            if (!directoryResponse.ok) {
+              throw new Error(`Project directory request failed: HTTP ${directoryResponse.status}`);
+            }
+            const listing = await directoryResponse.json();
+            if (active) setDirectory(listing);
+          }
+        } catch (error) {
+          if (active) {
+            setProjectRoot(null);
+            setProjectLifecycleState('NO_PROJECT');
+            setDirectory([]);
+            onError(error instanceof Error ? error.message : String(error));
+          }
         }
       }
     };
@@ -413,7 +434,7 @@ export function useCodingAgentController({
             const auth = await window.electronAPI.getDeveloperProjectState();
             if (auth?.projectRoot) currentProjectRoot = auth.projectRoot;
           } else {
-            const res = await codingFetch('http://127.0.0.1:3001/api/coding/project-state');
+            const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-state`);
             if (res.ok) {
               const st = await res.json();
               if (st.projectRoot && st.attached) currentProjectRoot = st.projectRoot;
@@ -460,7 +481,7 @@ export function useCodingAgentController({
             if (window.electronAPI) {
               result = await window.electronAPI.discoverDeveloperProject(candidate);
             } else {
-              const res = await codingFetch('http://127.0.0.1:3001/api/coding/project-discover', {
+              const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-discover`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: candidate }),
@@ -531,21 +552,35 @@ export function useCodingAgentController({
     if (preferencesContext) conversationHistory.unshift({ role: 'assistant', content: `[CODING_STYLE_PREFERENCES]\n${preferencesContext}` });
     setMessages((previous) => [...previous, userMessage, assistantMessage]);
     setInput('');
+    activeActivityExecutionRef.current = requestId;
     setActivity([]);
     setStreaming(true);
     try {
       const transport = transportRef.current;
       if (!transport) throw new Error('Coding Agent transport is unavailable.');
-      await transport.send(requestId, conversationHistory, currentScope, {
+      await transport.send(requestId, conversationHistory, currentScope, currentProjectRoot, {
         onStart: (turnId, root, scope) => {
           turnIdsRef.current.set(requestId, turnId);
+          activeActivityExecutionRef.current = requestId;
           setProjectRoot(root);
           setPath(scope);
-          setActivity([{ phase: 'reading', message: 'Starting the Coding Agent task with the attached project context.' }]);
+          activitySequenceRef.current = 0;
+          setActivity([{
+            id: `start:${requestId}`,
+            executionId: requestId,
+            phase: 'reading',
+            message: 'Starting the Coding Agent task with the attached project context.',
+          }]);
         },
-        onActivity: (entry) => setActivity((previous) => [...previous, entry].slice(-8)),
+        onActivity: (entry) => {
+          if (activeActivityExecutionRef.current !== requestId) return;
+          setActivity((previous) => upsertCodingActivity(previous, entry));
+        },
         onToken: () => undefined,
         onDone: (result: CodingTransportResult) => {
+          if (activeActivityExecutionRef.current === requestId) {
+            setActivity((previous) => finalizeCodingActivities(previous, requestId, 'UNVERIFIED'));
+          }
           void (async () => {
             try {
               const turnId = turnIdsRef.current.get(requestId);
@@ -568,10 +603,12 @@ export function useCodingAgentController({
                 });
               }
               if (result.proposalRequired) {
-                setActivity((previous) => [...previous, {
+                setActivity((previous) => upsertCodingActivity(previous, {
+                  id: `proposal-files:${requestId}:${activitySequenceRef.current++}`,
+                  executionId: requestId,
                   phase: 'files_read',
                   message: result.filesRead.length ? `Read ${result.filesRead.map((file) => file.path).join(', ')}.` : 'No project files were read.',
-                }].slice(-8));
+                }));
                 if (/^\s*NO_CHANGES\s*$/i.test(result.content)) {
                   await transport.markTurn(turnId, 'completed', 'no_changes', result.filesRead.length);
                   setMessages((previous) => previous.map((message) => message.requestId === requestId
@@ -600,7 +637,7 @@ export function useCodingAgentController({
                       content: (await window.electronAPI.readDeveloperFile(file.path)).content,
                     };
                   }
-                  const res = await codingFetch(`http://127.0.0.1:3001/api/coding/read-file?path=${encodeURIComponent(file.path)}`);
+                  const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/read-file?path=${encodeURIComponent(file.path)}`);
                   if (!res.ok) throw new Error(`Could not read file for proposal verification: ${file.path}`);
                   const data = await res.json();
                   return { path: file.path, content: data.content };
@@ -638,10 +675,12 @@ export function useCodingAgentController({
                   : message));
               } else {
                 if (result.filesRead.length) {
-                  setActivity((previous) => [...previous, {
+                  setActivity((previous) => upsertCodingActivity(previous, {
+                    id: `files-read:${requestId}:${activitySequenceRef.current++}`,
+                    executionId: requestId,
                     phase: 'files_read',
                     message: `Read ${result.filesRead.map((file) => file.path).join(', ')}.`,
-                  }].slice(-8));
+                  }));
                 }
                 await transport.markTurn(turnId, 'completed', result.status || 'completed', result.filesRead.length);
                 setMessages((previous) => previous.map((message) => message.requestId === requestId
@@ -662,6 +701,9 @@ export function useCodingAgentController({
           })();
         },
         onError: (error) => {
+          if (activeActivityExecutionRef.current === requestId) {
+            setActivity((previous) => finalizeCodingActivities(previous, requestId, 'UNVERIFIED'));
+          }
           const turnId = turnIdsRef.current.get(requestId);
           if (turnId) void transport.markTurn(turnId, 'failed', 'provider_or_tool_error').catch(() => undefined);
           turnIdsRef.current.delete(requestId);
@@ -729,111 +771,78 @@ export function useCodingAgentController({
 
   const selectProject = async () => {
     if (busy || streaming) return;
-    if (!window.electronAPI) {
+    const desktopApi = window.electronAPI;
+    if (!desktopApi) {
+      const picker = (window as unknown as {
+        showDirectoryPicker?: (options?: unknown) => Promise<{
+          name: string;
+          keys?: () => AsyncIterable<string>;
+        }>;
+      }).showDirectoryPicker;
+      if (typeof picker !== 'function') {
+        onError('This browser does not support folder selection. Use a current Chrome or Edge browser.');
+        return;
+      }
       setBusy(true);
       setProjectLifecycleState('SELECTING_PROJECT');
       try {
-        let selectedPath: string | null = null;
-        let pickerUsed = false;
-        let pickedName = '';
-        const picker = (window as unknown as {
-          showDirectoryPicker?: (opts?: unknown) => Promise<{
-            name: string;
-            keys?: () => AsyncIterable<string>;
-          }>;
-        }).showDirectoryPicker;
-
-        if (typeof picker === 'function') {
-          try {
-            const handle = await picker({ mode: 'read' });
-            if (handle?.name) {
-              pickerUsed = true;
-              pickedName = handle.name;
-              setProjectLifecycleState('ATTACHING_PROJECT');
-              const signatures: string[] = [];
-              try {
-                if (typeof handle.keys === 'function') {
-                  let count = 0;
-                  for await (const key of handle.keys()) {
-                    signatures.push(key);
-                    count++;
-                    if (count >= 20) break;
-                  }
-                }
-              } catch {
-                // Directory handle iteration not supported in this browser
-              }
-              const res = await codingFetch('http://localhost:3001/api/coding/project-discover', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: handle.name, signatures }),
-              });
-              if (res.ok) {
-                const discovery = await res.json();
-                if (discovery.projectRoot) {
-                  selectedPath = discovery.projectRoot;
-                } else if (discovery.matches?.length === 1) {
-                  selectedPath = discovery.matches[0];
-                } else if (discovery.matches?.length > 1) {
-                  setProjectCandidates(discovery.matches);
-                  setProjectLifecycleState('SELECTING_PROJECT');
-                  onStatus(`Found multiple projects matching "${handle.name}". Select one candidate under Advanced.`);
-                  return;
-                }
-              }
-            }
-          } catch (pickerErr) {
-            if ((pickerErr as Error)?.name === 'AbortError') {
-              setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
-              return;
-            }
+        const handle = await picker({ mode: 'read' });
+        const signatures: string[] = [];
+        if (typeof handle.keys === 'function') {
+          let count = 0;
+          for await (const key of handle.keys()) {
+            signatures.push(key);
+            count += 1;
+            if (count >= 20) break;
           }
         }
-        if (!selectedPath) {
-          const stateRes = await codingFetch('http://localhost:3001/api/coding/project-state');
-          if (stateRes.ok) {
-            const state = await stateRes.json();
-            if (state.status === 'PROJECT_ATTACHED' && state.projectRoot) {
-              selectedPath = state.projectRoot;
-            }
-          }
+        const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-discover`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: handle.name, signatures }),
+        });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({ detail: '' }));
+          throw new Error(error.detail || 'Could not match the selected folder to a local project.');
         }
-        if (selectedPath) {
-          setProjectLifecycleState('ATTACHING_PROJECT');
-          const attachRes = await codingFetch('http://localhost:3001/api/coding/project-attach', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ projectRoot: selectedPath }),
-          });
-          if (attachRes.ok) {
-            const attached = await attachRes.json();
-            setProjectRoot(attached.projectRoot);
-            setProjectLifecycleState('PROJECT_ATTACHED');
-            persistStoredProjectRoot(attached.projectRoot);
-            setProjectCandidates([]);
-            setPath('.');
-            setFileContent('');
-            setFilePath('');
-            const dirRes = await codingFetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
-            if (dirRes.ok) setDirectory(await dirRes.json());
-            onStatus(`Connected to project: ${attached.projectRoot}`);
-            return;
-          } else {
-            const err = await attachRes.json().catch(() => ({ detail: '' }));
-            setProjectLifecycleState('ATTACH_FAILED');
-            onError(`Project attachment failed (ATTACH_FAILED): ${err.detail || 'Could not attach path'}`);
-            return;
-          }
-        }
-        if (pickerUsed) {
-          setProjectLifecycleState('ATTACH_FAILED');
-          onError(`Could not locate project directory "${pickedName}" on the local host. Ensure the backend has access to this folder.`);
+        const discovery = await response.json();
+        const matches = Array.isArray(discovery.matches) ? discovery.matches : [];
+        const targetPath = discovery.projectRoot || (matches.length === 1 ? matches[0] : null);
+        if (!targetPath && matches.length > 1) {
+          setProjectCandidates(matches);
+          setProjectLifecycleState('SELECTING_PROJECT');
+          onStatus(`Found multiple projects named "${handle.name}". Select the correct folder under Advanced.`);
           return;
         }
-        setProjectLifecycleState('NO_PROJECT');
-        onError('Select folder using the directory picker or attach a project in the desktop app.');
+        if (!targetPath) {
+          throw new Error(`Could not locate "${handle.name}" under the configured project discovery folders.`);
+        }
+        const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectRoot: targetPath }),
+        });
+        if (!attachResponse.ok) {
+          const error = await attachResponse.json().catch(() => ({ detail: '' }));
+          throw new Error(error.detail || 'Could not attach the selected project.');
+        }
+        const attached = await attachResponse.json();
+        setProjectRoot(attached.projectRoot);
+        setProjectLifecycleState('PROJECT_ATTACHED');
+        persistStoredProjectRoot(attached.projectRoot);
+        setProjectCandidates([]);
+        setPath('.');
+        setFileContent('');
+        setFilePath('');
+        const directoryResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
+        if (directoryResponse.ok) setDirectory(await directoryResponse.json());
+        onStatus(`Connected to project: ${attached.projectRoot}`);
       } catch (error) {
-        setProjectLifecycleState('ATTACH_FAILED');
+        if ((error as Error)?.name === 'AbortError') {
+          setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
+          return;
+        }
+        setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
         onError(error instanceof Error ? error.message : String(error));
       } finally {
         setBusy(false);
@@ -843,7 +852,7 @@ export function useCodingAgentController({
     setBusy(true);
     setProjectLifecycleState('SELECTING_PROJECT');
     try {
-      const result = await window.electronAPI.chooseDeveloperProject();
+      const result = await desktopApi.chooseDeveloperProject();
       if (result.canceled) {
         setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
         return;
@@ -856,7 +865,7 @@ export function useCodingAgentController({
         setPath('.');
         setFileContent('');
         setFilePath('');
-        setDirectory(await window.electronAPI.listDeveloperDirectory('.'));
+        setDirectory(await desktopApi.listDeveloperDirectory('.'));
         onStatus(`Connected to project: ${result.projectRoot}`);
       }
     } catch (error) {
@@ -869,11 +878,12 @@ export function useCodingAgentController({
 
   const attachProjectByPath = async (targetPath: string) => {
     if (!targetPath || busy || streaming) return;
+    const desktopApi = window.electronAPI;
     setBusy(true);
     setProjectLifecycleState('ATTACHING_PROJECT');
     try {
-      if (window.electronAPI) {
-        const attached = await window.electronAPI.attachDeveloperProject(targetPath);
+      if (desktopApi) {
+        const attached = await desktopApi.attachDeveloperProject(targetPath);
         if (attached.status === 'PROJECT_ATTACHED' && attached.projectRoot) {
           setProjectRoot(attached.projectRoot);
           setProjectLifecycleState('PROJECT_ATTACHED');
@@ -882,7 +892,7 @@ export function useCodingAgentController({
           setPath('.');
           setFileContent('');
           setFilePath('');
-          setDirectory(await window.electronAPI.listDeveloperDirectory('.'));
+          setDirectory(await desktopApi.listDeveloperDirectory('.'));
           onStatus(`Connected to project: ${attached.projectRoot}`);
         } else if (attached.status === 'PROJECT_MISSING') {
           setProjectLifecycleState('PROJECT_MISSING');
@@ -892,28 +902,26 @@ export function useCodingAgentController({
           onError(`Project attachment failed (ATTACH_FAILED): ${attached.reason || 'Could not attach'}`);
         }
       } else {
-        const attachRes = await codingFetch('http://localhost:3001/api/coding/project-attach', {
+        const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ projectRoot: targetPath }),
         });
-        if (attachRes.ok) {
-          const attached = await attachRes.json();
-          setProjectRoot(attached.projectRoot);
-          setProjectLifecycleState('PROJECT_ATTACHED');
-          persistStoredProjectRoot(attached.projectRoot);
-          setProjectCandidates([]);
-          setPath('.');
-          setFileContent('');
-          setFilePath('');
-          const dirRes = await codingFetch('http://localhost:3001/api/coding/directory?path=' + encodeURIComponent('.'));
-          if (dirRes.ok) setDirectory(await dirRes.json());
-          onStatus(`Connected to project: ${attached.projectRoot}`);
-        } else {
-          const err = await attachRes.json().catch(() => ({ detail: '' }));
-          setProjectLifecycleState('ATTACH_FAILED');
-          onError(`Project attachment failed (ATTACH_FAILED): ${err.detail || 'Could not attach path'}`);
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({ detail: '' }));
+          throw new Error(error.detail || 'Could not attach the selected project.');
         }
+        const attached = await response.json();
+        setProjectRoot(attached.projectRoot);
+        setProjectLifecycleState('PROJECT_ATTACHED');
+        persistStoredProjectRoot(attached.projectRoot);
+        setProjectCandidates([]);
+        setPath('.');
+        setFileContent('');
+        setFilePath('');
+        const directoryResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
+        if (directoryResponse.ok) setDirectory(await directoryResponse.json());
+        onStatus(`Connected to project: ${attached.projectRoot}`);
       }
     } catch (err) {
       setProjectLifecycleState('ATTACH_FAILED');
@@ -925,13 +933,21 @@ export function useCodingAgentController({
 
   const clearProject = async () => {
     if (busy || streaming) return;
+    const desktopApi = window.electronAPI;
+    if (!desktopApi) {
+      setProjectRoot(null);
+      setProjectLifecycleState('NO_PROJECT');
+      setProjectCandidates([]);
+      setDirectory([]);
+      setPath('.');
+      setFileContent('');
+      setFilePath('');
+      onStatus('Open the trusted desktop app to manage an attached project.');
+      return;
+    }
     setBusy(true);
     try {
-      if (window.electronAPI) {
-        await window.electronAPI.clearDeveloperProject();
-      } else {
-        await codingFetch('http://localhost:3001/api/coding/project-clear', { method: 'POST' });
-      }
+      await desktopApi.clearDeveloperProject();
       setProjectRoot(null);
       setProjectLifecycleState('PROJECT_DETACHED');
       persistStoredProjectRoot(null);
@@ -1092,6 +1108,7 @@ export function useCodingAgentController({
   const clearMessages = () => {
     setMessages([]);
     setInput('');
+    activeActivityExecutionRef.current = null;
     setActivity([]);
     setProjectCandidates([]);
     setConversationStates((previous) => [{
@@ -1112,6 +1129,7 @@ export function useCodingAgentController({
     if (targetId !== conversationId) return;
     setMessages([]);
     setInput('');
+    activeActivityExecutionRef.current = null;
     setActivity([]);
     setProjectCandidates([]);
     setProposal(null);

@@ -1,4 +1,24 @@
 import { runtimeConfig } from '../../config/runtimeConfig.ts';
+import {
+  parseCodingActivityEvent,
+  type CodingActivity,
+  type CodingActivityMessage,
+} from './codingActivity.ts';
+
+export {
+  finalizeCodingActivities,
+  parseCodingActivityEvent,
+  upsertCodingActivity,
+} from './codingActivity.ts';
+export type {
+  CodingActivity,
+  CodingActivityError,
+  CodingActivityEvent,
+  CodingActivityMessage,
+  CodingActivityResult,
+  CodingActivityStatus,
+  CodingActivityType,
+} from './codingActivity';
 
 export function latestCodingUserRequest(messages: Array<{ role: 'user' | 'assistant'; content: string }>) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -35,12 +55,6 @@ export interface CodingTransportResult {
   fallback?: boolean;
 }
 
-export interface CodingActivity {
-  phase: string;
-  message: string;
-  plan?: Record<string, unknown>;
-}
-
 interface CodingHandlers {
   onStart: (turnId: string, projectRoot: string, scope: string) => void;
   onActivity: (activity: CodingActivity) => void;
@@ -50,19 +64,29 @@ interface CodingHandlers {
 }
 
 interface CodingRequestState {
+  requestId: string;
   scope: string;
   handlers: CodingHandlers;
   chunks: string[];
   filesRead: Map<string, string>;
   filesSearched: Set<string>;
   toolCalls: CodingTransportResult['toolCalls'];
+  activityCount: number;
 }
 
 const CODING_WS_URL = runtimeConfig.codingWsUrl;
 
+function isLocalBrowserDevelopment(): boolean {
+  return !window.electronAPI
+    && window.location.protocol === 'http:'
+    && ['localhost', '127.0.0.1'].includes(window.location.hostname)
+    && window.location.port === String(runtimeConfig.services.devServer.port);
+}
+
 export async function codingAuthHeaders(): Promise<Record<string, string>> {
   const getToken = window.electronAPI?.getDeveloperBackendAuthToken;
   if (!getToken) {
+    if (isLocalBrowserDevelopment()) return {};
     throw new Error('Coding Agent backend access is available only through the trusted desktop application.');
   }
   const token = await getToken();
@@ -72,7 +96,8 @@ export async function codingAuthHeaders(): Promise<Record<string, string>> {
 
 export async function codingFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
-  headers.set('X-Coding-Auth', (await codingAuthHeaders())['X-Coding-Auth']);
+  const auth = await codingAuthHeaders();
+  if (auth['X-Coding-Auth']) headers.set('X-Coding-Auth', auth['X-Coding-Auth']);
   return fetch(input, { ...init, headers });
 }
 
@@ -85,6 +110,7 @@ export class CodingAgentTransport {
     requestId: string,
     messages: Array<{ role: 'user' | 'assistant'; content: string }>,
     scope: string,
+    projectRoot: string,
     handlers: CodingHandlers,
     conversationId?: string,
   ): Promise<string> {
@@ -95,7 +121,7 @@ export class CodingAgentTransport {
     let sessionId = conversationId
       ? (conversationId.startsWith('coding-session-') ? conversationId : `coding-session-${conversationId}`)
       : `browser-session-${requestId.slice(0, 8)}`;
-    let currentProjectRoot = '';
+    let currentProjectRoot = projectRoot;
     let currentScope = scope || '.';
 
     if (window.electronAPI) {
@@ -111,25 +137,18 @@ export class CodingAgentTransport {
         phase: 'understanding',
       });
     } else {
-      try {
-        const stateRes = await codingFetch('http://127.0.0.1:3001/api/coding/project-state');
-        if (stateRes.ok) {
-          const st = await stateRes.json();
-          if (st.projectRoot) currentProjectRoot = st.projectRoot;
-        }
-      } catch {
-        // Fallback to unattached if backend query fails
-      }
       handlers.onStart(turnId, currentProjectRoot, currentScope);
     }
 
     this.requests.set(requestId, {
+      requestId,
       scope: currentScope,
       handlers,
       chunks: [],
       filesRead: new Map(),
       filesSearched: new Set(),
       toolCalls: [],
+      activityCount: 0,
     });
     socket.send(JSON.stringify({
       type: 'chat',
@@ -162,7 +181,7 @@ export class CodingAgentTransport {
     if (this.socket?.readyState === WebSocket.OPEN) return this.socket;
     if (this.connecting) return this.connecting;
     this.connecting = (async () => {
-      const token = (await codingAuthHeaders())['X-Coding-Auth'];
+      const token = (await codingAuthHeaders())['X-Coding-Auth'] || '';
       return new Promise<WebSocket>((resolve, reject) => {
       const socket = new WebSocket(CODING_WS_URL);
       const timeout = window.setTimeout(() => {
@@ -223,17 +242,31 @@ export class CodingAgentTransport {
     } catch {
       return;
     }
-    const requestId = String(message.requestId || '');
+    const requestId = String(
+      message.type === 'activity_event'
+        ? message.executionId || message.requestId || ''
+        : message.requestId || '',
+    );
     const request = this.requests.get(requestId);
     if (!request) return;
+    if (message.type === 'activity_event') {
+      const activity = parseCodingActivityEvent(message);
+      if (activity && activity.executionId === requestId) {
+        request.handlers.onActivity(activity);
+      }
+      return;
+    }
     if (message.type === 'activity') {
       const phase = String(message.phase || 'working');
       const detail = typeof message.message === 'string' ? message.message : 'Working on your request.';
-      request.handlers.onActivity({
+      const activity: CodingActivityMessage = {
+        id: `message:${requestId}:${request.activityCount++}`,
+        executionId: requestId,
         phase,
         message: detail,
         plan: message.plan && typeof message.plan === 'object' ? message.plan as Record<string, unknown> : undefined,
-      });
+      };
+      request.handlers.onActivity(activity);
       return;
     }
     if (message.type === 'token') {
@@ -281,10 +314,15 @@ export class CodingAgentTransport {
         if (window.electronAPI) {
           result = await window.electronAPI.executeDeveloperTool(name, args, request.scope);
         } else {
-          const res = await codingFetch('http://127.0.0.1:3001/api/coding/tool', {
+          const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/tool`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, arguments: args, scope: request.scope }),
+            body: JSON.stringify({
+              requestId: request.requestId,
+              name,
+              arguments: args,
+              scope: request.scope,
+            }),
           });
           if (!res.ok) {
             const errBody = await res.json().catch(() => ({}));
