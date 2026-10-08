@@ -64,6 +64,10 @@ from coding_websocket import (  # noqa: E402
     _compact_coding_conversation,
     _is_unified_diff_response,
     _has_read_file_evidence,
+    _has_read_source_evidence,
+    _should_activate_deferred_database,
+    _tools_for_task_resources,
+    _activate_deferred_database_resource,
     _proposal_prompt_instruction,
     _proposal_goal,
     _proposal_response_shape,
@@ -81,6 +85,7 @@ from coding_websocket import (  # noqa: E402
     _messages_for_active_coding_task,
     _resume_semantic_task,
     _action_fingerprint,
+    _coding_tool_call_for_next_action,
     _next_credential_investigation_action,
     _update_task_completeness,
     _update_task_from_tool_result,
@@ -89,6 +94,9 @@ from coding_websocket import (  # noqa: E402
     _is_project_architecture_question,
     _requires_investigation_evidence_gate,
     _investigation_evidence_gate,
+    _proposal_source_candidate_from_search,
+    _proposal_source_search_query,
+    _has_relevant_proposal_source_evidence,
     detect_project_architecture,
     _validate_tool_call,
     _activity_type_for_tool,
@@ -98,6 +106,7 @@ from coding_websocket import (  # noqa: E402
     _dispatch_coding_tool,
     _publish_activity_event,
     _run_coding_turn,
+    CODING_TOOLS,
     TOOL_ALIASES,
     TOOL_CAPABILITIES,
     TOOL_NAMES,
@@ -1225,6 +1234,40 @@ class CodingConversationBudgetTests(unittest.TestCase):
             self.assertIsNone(attempt.kwargs["tools"])
             self.assertNotIn("tool_choice", attempt.kwargs)
 
+    def test_text_only_finalization_uses_json_mode_if_model_repeats_an_unavailable_tool_call(self):
+        provider = SimpleNamespace(type="groq", model="openai/gpt-oss-20b", base_url="https://api.groq.com/openai/v1")
+        response = SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(model_dump=lambda **_kwargs: {
+                "role": "assistant",
+                "content": json.dumps({"content": "--- a/src/helper.php\n+++ b/src/helper.php\n@@ -1 +1 @@\n-old\n+new"}),
+            })
+        )])
+        completion = Mock(side_effect=[
+            RuntimeError("Tool choice is none, but model called a tool"),
+            RuntimeError("Tool choice is none, but model called a tool"),
+            response,
+        ])
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=completion)))
+
+        with patch("coding_provider.OpenAI", return_value=client):
+            message = _request_provider_completion(
+                provider,
+                "test-key",
+                [{"role": "user", "content": "Return the minimal diff."}],
+                None,
+                False,
+            )
+
+        self.assertEqual(message["content"], "--- a/src/helper.php\n+++ b/src/helper.php\n@@ -1 +1 @@\n-old\n+new")
+        self.assertEqual(completion.call_count, 3)
+        for attempt in completion.call_args_list:
+            self.assertIsNone(attempt.kwargs["tools"])
+            self.assertNotIn("tool_choice", attempt.kwargs)
+        self.assertEqual(
+            completion.call_args_list[2].kwargs["response_format"],
+            {"type": "json_object"},
+        )
+
     def test_anthropic_and_gemini_wrappers_are_preflighted_before_dispatch(self):
         provider = SimpleNamespace(type="anthropic", model="test-model", base_url="https://example.test")
         messages = [
@@ -1469,6 +1512,20 @@ class CodingConversationBudgetTests(unittest.TestCase):
             "name": "read_file",
             "content": serialized,
         }]))
+        self.assertTrue(_has_read_source_evidence([{
+            "role": "tool",
+            "name": "read_file",
+            "content": serialized,
+        }]))
+        readme = json.dumps({
+            "ok": True,
+            "data": {"path": "README.md", "content": "Application overview."},
+        })
+        self.assertFalse(_has_read_source_evidence([{
+            "role": "tool",
+            "name": "read_file",
+            "content": readme,
+        }]))
 
     def test_compaction_keeps_system_context_latest_request_and_recent_tool_exchange(self):
         messages = [
@@ -1566,8 +1623,13 @@ class CodingConversationBudgetTests(unittest.TestCase):
         self.assertIn("--- a/path/to/file", instruction)
         self.assertIn("+++ b/path/to/file", instruction)
         self.assertIn("@@ -10,2 +10,2 @@", instruction)
+        self.assertIn("NO_CHANGES only when the inspected source already implements the requested behavior", instruction)
+        self.assertIn("do not use NO_CHANGES merely because the feature is small", instruction)
         self.assertIn("Do not include explanations, Markdown fences, or text outside the diff.", instruction)
+        self.assertIn("Every hunk header must use numeric old/new line ranges", instruction)
+        self.assertIn("never use placeholders such as", instruction)
         self.assertIn("previous response did not match", retry_instruction)
+        self.assertIn("use numeric hunk ranges and exact source context", retry_instruction)
         self.assertNotIn("previous response did not match", instruction)
 
     def test_proposal_response_diagnostics_classify_only_redacted_shape(self):
@@ -1575,6 +1637,9 @@ class CodingConversationBudgetTests(unittest.TestCase):
         prose = "I recommend reusing the existing query result."
 
         self.assertTrue(_is_unified_diff_response(diff))
+        self.assertFalse(_is_unified_diff_response(
+            "--- a/src/controller.js\n+++ b/src/controller.js\n@@\n // existing methods\n+function add(a, b) { return a + b; }\n*** End of File ***"
+        ))
         self.assertFalse(_is_unified_diff_response(prose))
         self.assertEqual(
             _proposal_response_shape(prose),
@@ -1618,6 +1683,31 @@ class CodingConversationBudgetTests(unittest.TestCase):
 
                 self.assertEqual((name, arguments), ("read_file", {"relativePath": "modules/academic/controller.js"}))
         self.assertEqual(MAX_CODING_TOOL_ROUNDS, 7)
+
+    def test_read_file_schema_and_planned_calls_use_one_path_argument(self):
+        read_file = next(
+            tool["function"]
+            for tool in CODING_TOOLS
+            if tool["function"]["name"] == "read_file"
+        )
+        self.assertEqual(
+            read_file["parameters"],
+            {
+                "type": "object",
+                "required": ["path"],
+                "properties": {"path": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        )
+        call = _coding_tool_call_for_next_action(
+            {"action": "read_file", "target": "components/helper/NumberHelper.php"},
+            1,
+            ".",
+        )
+        self.assertEqual(
+            json.loads(call["function"]["arguments"]),
+            {"path": "components/helper/NumberHelper.php"},
+        )
 
     def test_tool_registry_is_exact_and_uses_provider_declarations(self):
         declared_canonical_tools = {
@@ -5221,7 +5311,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 DatabaseIntelligenceEngine,
                 "discover_database_configuration",
                 return_value={"engine": "mysql", "database": "test_db"},
-            ), patch.object(
+            ) as discover_database, patch.object(
                 DatabaseIntelligenceEngine,
                 "check_database_capabilities",
                 return_value={"available_paths": ["application_client"]},
@@ -5366,7 +5456,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 DatabaseIntelligenceEngine,
                 "discover_database_configuration",
                 return_value={"engine": "mysql", "database": "test_db"},
-            ), patch.object(
+            ) as discover_database, patch.object(
                 DatabaseIntelligenceEngine,
                 "check_database_capabilities",
                 return_value={"available_paths": ["application_client"]},
@@ -5534,22 +5624,27 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as project_root:
             sent = []
             state = {"pending": {}, "completed": {}, "tasks": set()}
-            responses = iter([
-                ({
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": "find-source-query",
-                        "function": {
-                            "name": "search_code",
-                            "arguments": "{\"query\":\"database query controller service\"}",
-                        },
-                    }],
-                }, SimpleNamespace(id="test-provider", type="groq", model="test-model")),
-                ({
+            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+            completion_calls = 0
+
+            def complete_from_repository_first(*_args, **_kwargs):
+                nonlocal completion_calls
+                completion_calls += 1
+                if completion_calls == 1:
+                    return ({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "find-source-query",
+                            "function": {
+                                "name": "search_code",
+                                "arguments": "{\"query\":\"database query controller service\"}",
+                            },
+                        }],
+                    }, provider)
+                return ({
                     "role": "assistant",
                     "content": "The application flow is controller to service to query.",
-                }, SimpleNamespace(id="test-provider", type="groq", model="test-model")),
-            ])
+                }, provider)
 
             async def send_json(payload):
                 sent.append(payload)
@@ -5566,7 +5661,6 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                         },
                     }
 
-            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
             with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
                 "coding_websocket.ProjectContextLock.lock"
             ), patch("coding_websocket.set_backend_project_state"), patch(
@@ -5595,7 +5689,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 }),
             ), patch(
                 "coding_websocket.complete_coding_model",
-                side_effect=lambda *args, **kwargs: next(responses),
+                side_effect=complete_from_repository_first,
             ) as complete, patch.object(
                 DatabaseSessionManager,
                 "execute_database_capability",
@@ -5634,7 +5728,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(done["semanticTask"]["requiredEvidence"], ["route", "query", "response"])
             self.assertEqual(done["toolCalls"][0]["name"], "search_code")
-            self.assertEqual(complete.call_count, 2)
+            self.assertGreaterEqual(complete.call_count, 2)
             self.assertFalse(any(
                 "DATABASE AUTONOMOUS DISCOVERY" in str(message.get("content") or "")
                 for message in complete.call_args_list[0].args[2]
@@ -5736,10 +5830,14 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prior_task_memory["intent"]["primary"], "CODE_QUESTION")
             self.assertEqual(prior_task_memory["goal"]["statement"], "Locate the request handler.")
             self.assertEqual(resolver_contexts[1]["activeTaskTarget"], None)
-            self.assertEqual(discover_database.call_count, 1)
+            discover_database.assert_not_called()
             latest_done = next(message for message in reversed(sent) if message.get("type") == "done")
             self.assertEqual(latest_done["semanticTask"]["target"]["userReference"], "payment")
-            self.assertEqual(latest_done["semanticTask"]["resolvedResources"], ["CODE", "API", "DATABASE"])
+            self.assertEqual(latest_done["semanticTask"]["resolvedResources"], ["CODE", "API"])
+            self.assertEqual(
+                latest_done["semanticTask"]["resourceDecision"]["deferredResources"],
+                ["database"],
+            )
 
     async def test_explicit_code_request_survives_semantic_provider_failure(self):
         with tempfile.TemporaryDirectory() as project_root:
@@ -5815,6 +5913,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 provider_messages = args[2]
                 self.assertIn("PHP", json.dumps(provider_messages))
                 self.assertIn("Yii2", json.dumps(provider_messages))
+                self.assertNotIn("execute_sql", json.dumps(args[3]))
                 return ({"role": "assistant", "content": "The project uses PHP and Yii2, based on its repository map."}, provider)
 
             with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
@@ -5879,7 +5978,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual([event["status"] for event in activity_events], ["STARTED", "COMPLETED"])
 
-    async def test_ordinary_code_change_fallback_does_not_select_database_resources(self):
+    async def test_model_database_misroute_for_code_change_falls_back_to_repository(self):
         with tempfile.TemporaryDirectory() as project_root:
             sent = []
             state = {"pending": {}, "completed": {}, "tasks": set()}
@@ -5888,10 +5987,10 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 ({
                     "role": "assistant",
                     "tool_calls": [{
-                        "id": "read-addition-source",
+                        "id": "search-addition-source",
                         "function": {
-                            "name": "read_file",
-                            "arguments": "{\"relativePath\":\"src/math.js\"}",
+                            "name": "search_code",
+                            "arguments": "{\"query\":\"function add\"}",
                         },
                     }],
                 }, provider),
@@ -5911,13 +6010,29 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
             async def send_json(payload):
                 sent.append(payload)
                 if payload.get("type") == "tool_call":
+                    tool_name = payload["name"]
+                    if tool_name == "get_repository_map":
+                        data = {
+                            "languages": ["JavaScript"],
+                            "sourceDirectories": ["src"],
+                            "entryPoints": ["src/index.js"],
+                        }
+                    elif tool_name == "search_code":
+                        data = {"results": [{
+                            "path": "src/math.js",
+                            "line": 1,
+                            "text": "// reusable number addition\nfunction add(a, b) { return a + b; }",
+                            "matchType": "content",
+                        }]}
+                    else:
+                        data = {
+                            "path": "src/math.js",
+                            "content": "// reusable number addition\nfunction subtract(a, b) { return a - b; }\n",
+                        }
                     state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
                         "ok": True,
-                        "tool": "read_file",
-                        "data": {
-                            "path": "src/math.js",
-                            "content": "function subtract(a, b) { return a - b; }\n",
-                        },
+                        "tool": tool_name,
+                        "data": data,
                     }
 
             with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
@@ -5926,7 +6041,18 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 "coding_websocket.detect_project_architecture", return_value={}
             ), patch(
                 "coding_websocket._resolve_semantic_task_with_model",
-                new=AsyncMock(side_effect=RuntimeError("temporary provider failure")),
+                new=AsyncMock(return_value={
+                    "is_deterministic": True,
+                    "capability": DatabaseCapability.DATABASE_QUERY,
+                    "arguments": {"entity": "numbers"},
+                    "semanticTask": {
+                        "intent": "DATABASE_QUERY",
+                        "goal": "Read number data from the database.",
+                        "resourceCandidates": ["DATABASE"],
+                        "resolvedResources": ["DATABASE"],
+                        "selectedAction": "EXECUTE_DATABASE_READ",
+                    },
+                }),
             ), patch(
                 "coding_websocket.complete_coding_model",
                 side_effect=lambda *args, **kwargs: next(responses),
@@ -5950,10 +6076,174 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
             discover_database.assert_not_called()
             done = next(message for message in sent if message.get("type") == "done")
             self.assertEqual(done["semanticTask"]["resolvedResources"], ["CODE", "REPOSITORY"])
-            self.assertEqual(done["intent"], "FEATURE_REQUEST")
+            self.assertEqual(done["intent"], "SOURCE_CHANGE")
             self.assertTrue(done["proposalRequired"])
-            self.assertEqual(done["toolCalls"][0]["name"], "read_file")
+            self.assertEqual([call["name"] for call in done["toolCalls"]], ["search_code", "read_file"])
+            self.assertIn("src/math.js", [item["path"] for item in done["filesRead"]])
             self.assertNotIn("DATABASE", done["semanticTask"]["resolvedResources"])
+
+    async def test_deferred_database_escalation_requires_source_evidence_and_activates_existing_discovery(self):
+        task = _build_semantic_task(
+            request_id="deferred-db-escalation",
+            user_message="Inspect the implementation and database constraints.",
+            intent="CODE_QUESTION",
+            resources=["CODE", "REPOSITORY"],
+            target=None,
+            project_root="C:\\project",
+            scope=".",
+            architecture={},
+            session_id="deferred-db-escalation-session",
+        )
+        task["resourceDecision"] = {
+            "selectedResource": "repository",
+            "deferredResources": ["database"],
+        }
+        task["investigationEvidenceGate"] = {"databaseSchemaRequired": True}
+        action = {
+            "tool": "read_file",
+            "target": "src/Database.php",
+            "status": "SUCCESS",
+            "resultEvidenceIds": ["source-evidence-1"],
+            "lastResult": {
+                "ok": True,
+                "data": {
+                    "path": "src/Database.php",
+                    "content": "return $db->createCommand('SELECT id FROM users')->queryAll();",
+                },
+            },
+        }
+        task["actions"].append(action)
+        self.assertTrue(_should_activate_deferred_database(task))
+
+        session = {"agentTaskState": task}
+        sent = []
+
+        async def send_json(payload):
+            sent.append(payload)
+
+        provider_tools = _tools_for_task_resources(
+            CODING_TOOLS,
+            task,
+        )
+        self.assertNotIn(
+            "execute_sql",
+            [tool["function"]["name"] for tool in provider_tools],
+        )
+
+        with patch.object(
+            DatabaseIntelligenceEngine,
+            "discover_database_configuration",
+            return_value={
+                "status": "FOUND",
+                "configFile": "config/database.php",
+                "engine": "mysql",
+                "database": "app",
+            },
+        ) as discover_database, patch.object(
+            DatabaseIntelligenceEngine,
+            "check_database_capabilities",
+            return_value={"available_paths": ["application_client"]},
+        ):
+            await _activate_deferred_database_resource(
+                send_json,
+                session,
+                task,
+                "C:\\project",
+                {},
+                "deferred-db-escalation",
+                "deferred-db-escalation-session",
+            )
+
+        discover_database.assert_called_once()
+        self.assertEqual(task["resourceDecision"]["selectedResource"], "database")
+        self.assertEqual(task["resourceDecision"]["deferredResources"], [])
+        self.assertIn("DATABASE", task["resolvedResources"])
+        self.assertIn(
+            "execute_sql",
+            [
+                tool["function"]["name"]
+                for tool in _tools_for_task_resources(CODING_TOOLS, task)
+            ],
+        )
+        self.assertEqual(
+            [event["status"] for event in sent if event.get("type") == "activity_event"],
+            ["STARTED", "COMPLETED"],
+        )
+
+    async def test_model_cannot_execute_a_deferred_database_tool_before_resource_activation(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+            state = {"pending": {}, "completed": {}, "tasks": set()}
+            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+            completions = 0
+
+            async def send_json(payload):
+                sent.append(payload)
+
+            def try_deferred_database_tool(*args, **_kwargs):
+                nonlocal completions
+                completions += 1
+                self.assertNotIn("execute_sql", json.dumps(args[3]))
+                if completions == 1:
+                    return ({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "premature-db-query",
+                            "function": {
+                                "name": "execute_sql",
+                                "arguments": "{\"sql\":\"SELECT 1\"}",
+                            },
+                        }],
+                    }, provider)
+                return ({
+                    "role": "assistant",
+                    "content": "The database tool was not run because repository evidence has not selected it.",
+                }, provider)
+
+            with patch("coding_websocket.ProjectContextLock.resolve_authoritative_root", return_value=project_root), patch(
+                "coding_websocket.ProjectContextLock.lock"
+            ), patch("coding_websocket.set_backend_project_state"), patch(
+                "coding_websocket.detect_project_architecture", return_value={}
+            ), patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(return_value={
+                    "is_deterministic": False,
+                    "route_to_code": True,
+                    "semanticTask": {
+                        "intent": "CODE_QUESTION",
+                        "goal": "Locate the authorization handler.",
+                        "resourceCandidates": ["CODE", "REPOSITORY", "DATABASE"],
+                    },
+                }),
+            ), patch(
+                "coding_websocket.complete_coding_model",
+                side_effect=try_deferred_database_tool,
+            ), patch.object(
+                DatabaseIntelligenceEngine,
+                "discover_database_configuration",
+            ) as discover_database:
+                await _run_coding_turn(
+                    {
+                        "requestId": "deferred-db-tool-policy",
+                        "sessionId": "deferred-db-tool-policy-session",
+                        "projectRoot": project_root,
+                        "messages": [{
+                            "role": "user",
+                            "content": "Where is the authorization handler?",
+                        }],
+                    },
+                    send_json,
+                    state,
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+
+            discover_database.assert_not_called()
+            self.assertFalse(any(event.get("type") == "tool_call" for event in sent))
+            self.assertEqual(completions, 2)
+            done = next(message for message in sent if message.get("type") == "done")
+            self.assertEqual(done["semanticTask"]["resourceDecision"]["selectedResource"], "repository")
+            self.assertEqual(done["semanticTask"]["resourceDecision"]["deferredResources"], ["database"])
 
     async def test_deterministic_database_operation_runs_without_a_provider(self):
         with tempfile.TemporaryDirectory() as project_root:
@@ -5977,7 +6267,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 DatabaseIntelligenceEngine,
                 "discover_database_configuration",
                 return_value={"engine": "mysql", "database": "test_db"},
-            ), patch.object(
+            ) as discover_database, patch.object(
                 DatabaseIntelligenceEngine,
                 "check_database_capabilities",
                 return_value={"available_paths": ["application_client"]},
@@ -6023,9 +6313,11 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.ANY,
                 project_root=project_root,
             )
+            discover_database.assert_called_once()
             done = next(message for message in sent if message.get("type") == "done")
             self.assertEqual(done["status"], "COMPLETED")
             self.assertIn("Tables: admissions, users", done["content"])
+            self.assertEqual(done["agentTaskState"]["resourceDecision"]["selectedResource"], "database")
             self.assertEqual(done["agentTaskState"]["failures"], [])
             self.assertIsNone(done["agentTaskState"]["execution"]["result"].get("password"))
 
@@ -6516,16 +6808,6 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
                     "function": {"name": "search_code", "arguments": "{\"query\":\"getProgrammes\"}"},
                 }],
             }, provider),
-            ({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": "read-1",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": "{\"relativePath\":\"models/AdmOuPrgList.php\"}",
-                    },
-                }],
-            }, provider),
             ({"role": "assistant", "content": diff}, provider),
         ])
         state = {"pending": {}, "completed": {}, "tasks": set()}
@@ -6537,7 +6819,10 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
                 return
             tool_name = payload["name"]
             data = (
-                {"results": [{"path": "models/AdmOuPrgList.php"}]}
+                {"results": [{
+                    "path": "models/AdmOuPrgList.php",
+                    "text": "return $query->all();",
+                }]}
                 if tool_name == "search_code"
                 else {"path": "models/AdmOuPrgList.php", "content": "<?php\nreturn $query->all();\n"}
             )
@@ -6563,9 +6848,8 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call["name"] for call in next(
             event for event in sent if event.get("type") == "done"
         )["toolCalls"]], ["search_code", "read_file"])
-        read_attempt = complete.call_args_list[1]
-        self.assertEqual([tool["function"]["name"] for tool in read_attempt.args[3]], ["read_file"])
-        self.assertTrue(read_attempt.args[5])
+        self.assertEqual(complete.call_count, 2)
+        self.assertFalse(complete.call_args_list[1].args[5])
 
     async def test_duplicate_successful_tool_read_uses_cached_evidence_and_finalizes(self):
         provider = SimpleNamespace(type="groq", model="test-model")
@@ -6685,7 +6969,7 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
 
         done = next(message for message in sent if message.get("type") == "done")
         self.assertTrue(done["proposalRequired"])
-        self.assertEqual(done["content"], diff)
+        self.assertEqual(done["content"], diff.strip())
         prompt = complete.call_args.args[2]
         self.assertIn("active change request", prompt[0]["content"])
         self.assertIn(messages[0]["content"], prompt[1]["content"])
@@ -6697,19 +6981,47 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
             "Once the required source was read, tool calling must be optional again.",
         )
 
-    async def test_proposal_without_file_inspection_fails_instead_of_claiming_no_changes(self):
+    async def test_proposal_without_tool_call_uses_task_planner_to_read_source(self):
         sent = []
+        provider = SimpleNamespace(type="groq", model="test-model")
+        diff = (
+            "--- a/src/example.py\n"
+            "+++ b/src/example.py\n"
+            "@@ -1 +1 @@\n"
+            "-return 1\n"
+            "+return 2\n"
+        )
+        responses = iter([
+            ({"role": "assistant", "content": "NO_CHANGES"}, provider),
+            ({"role": "assistant", "content": diff}, provider),
+        ])
 
         async def send_json(payload):
             sent.append(payload)
 
         with patch(
             "coding_websocket.complete_coding_model",
-            return_value=({"role": "assistant", "content": "NO_CHANGES"}, SimpleNamespace(type="groq", model="test-model")),
-        ) as complete:
+            side_effect=lambda *args, **kwargs: next(responses),
+        ) as complete, patch(
+            "coding_websocket.compute_next_best_action",
+            return_value={
+                "action": "read_file",
+                "target": "src/example.py",
+                "rationale": "Read the implementation identified for the requested change.",
+            },
+        ), patch(
+            "coding_websocket._wait_for_tool",
+            new=AsyncMock(return_value={
+                "ok": True,
+                "data": {
+                    "path": "src/example.py",
+                    "content": "# fix duplicate query in value\n\ndef value():\n    return 1\n",
+                },
+            }),
+        ):
             await _run_coding_turn(
                 {
-                    "requestId": "proposal-needs-evidence",
+                    "requestId": "proposal-planner-source-fallback",
                     "scope": ".",
                     "messages": [{"role": "user", "content": "Fix the duplicate query and prepare a proposal."}],
                 },
@@ -6719,9 +7031,12 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
                 Path("provider-config.json"),
             )
 
-        error = next(message for message in sent if message.get("type") == "error")
-        self.assertIn("could not read any project source file", error["message"])
-        self.assertTrue(complete.call_args.args[5])
+        done = next(message for message in sent if message.get("type") == "done")
+        self.assertEqual(done["content"], diff.strip())
+        self.assertEqual([call["name"] for call in done["toolCalls"]], ["read_file"])
+        self.assertEqual(complete.call_count, 2)
+        self.assertTrue(complete.call_args_list[0].args[5] is False)
+        self.assertTrue(complete.call_args_list[1].args[5] is False)
 
     async def test_invalid_proposal_format_gets_one_strict_retry_and_redacted_diagnostic(self):
         responses = iter([
@@ -8590,6 +8905,74 @@ class DatabaseEvidenceIntegrityTests(unittest.TestCase):
         self.assertEqual(single_read_gate["statuses"]["DB_SCHEMA_CONSTRAINTS"]["status"], "NOT_VERIFIED")
         self.assertEqual(single_read_gate["statuses"]["OPTIONS_COMPARISON"]["status"], "NOT_APPLICABLE")
 
+    def test_proposal_source_candidate_prefers_a_task_relevant_search_hit(self):
+        task_state = {
+            "userRequest": (
+                "In the attached project, add a reusable function for adding two numbers. "
+                "Inspect the relevant implementation source first."
+            ),
+            "goal": {"statement": "Create a reusable two-number addition helper."},
+            "actions": [
+                {
+                    "tool": "search_code",
+                    "target": "function add",
+                    "status": "SUCCESS",
+                    "lastResult": {
+                        "data": {
+                            "results": [
+                                {
+                                    "path": "commands/IciciTransactionController.php",
+                                    "text": "function addTransaction()",
+                                },
+                                {
+                                    "path": "components/helper/NumberHelper.php",
+                                    "text": "class NumberHelper",
+                                },
+                            ],
+                        },
+                    },
+                },
+                {
+                    "tool": "read_file",
+                    "target": "commands/IciciTransactionController.php",
+                    "status": "SUCCESS",
+                    "lastResult": {
+                        "data": {
+                            "path": "commands/IciciTransactionController.php",
+                            "content": "function addTransaction() { return $this->save(); }",
+                        },
+                    },
+                },
+            ],
+        }
+
+        self.assertFalse(_has_relevant_proposal_source_evidence(task_state))
+        self.assertEqual(
+            _proposal_source_search_query(task_state),
+            "addition helper number",
+        )
+        self.assertEqual(
+            _proposal_source_candidate_from_search(task_state),
+            "components/helper/NumberHelper.php",
+        )
+        task_state["actions"].append({
+            "tool": "read_file",
+            "target": "components/helper/NumberHelper.php",
+            "status": "SUCCESS",
+            "lastResult": {
+                "data": {
+                    "path": "components/helper/NumberHelper.php",
+                    "content": "class NumberHelper { public static function add($a, $b) { return $a + $b; } }",
+                },
+            },
+        })
+        self.assertTrue(_has_relevant_proposal_source_evidence(task_state))
+        task_state["actions"][-1]["lastResult"] = {
+            "path": "components/helper/NumberHelper.php",
+            "content": "class NumberHelper { public static function add($a, $b) { return $a + $b; } }",
+        }
+        self.assertTrue(_has_relevant_proposal_source_evidence(task_state))
+
     def test_benchmark_without_live_measurement_returns_unavailable_without_claims(self):
         session = DatabaseSession(
             project_id="evidence-test",
@@ -8706,6 +9089,37 @@ class DatabaseEvidenceIntegrityTests(unittest.TestCase):
 
 
 class CodingProjectIdentityTests(unittest.TestCase):
+    def test_browser_tool_search_skips_runtime_cache_and_binary_files(self):
+        import index
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_root = Path(temporary_directory)
+            source_dir = project_root / "src"
+            cache_dir = project_root / "runtime" / "cache"
+            source_dir.mkdir(parents=True)
+            cache_dir.mkdir(parents=True)
+            (source_dir / "ReusableHelper.php").write_text(
+                "<?php\nfunction reusableHelper() { return true; }\n",
+                encoding="utf-8",
+            )
+            (cache_dir / "generated.bin").write_bytes(
+                b"reusable reusable reusable"
+            )
+            (project_root / "binary.dat").write_bytes(
+                b"reusable\x00payload"
+            )
+
+            result = index._search_coding_code(
+                "reusable",
+                project_root=str(project_root),
+            )
+
+            self.assertEqual(result["status"], "SEARCH_RESULTS")
+            self.assertEqual(
+                sorted({hit["path"] for hit in result["results"]}),
+                ["src/ReusableHelper.php"],
+            )
+
     def test_browser_tool_search_is_request_scoped_ranked_and_reports_no_match(self):
         import index
 

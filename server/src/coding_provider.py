@@ -973,6 +973,7 @@ def _request_provider_completion(
     if context_metrics is not None:
         _enforce_provider_payload_budget(request, context_metrics)
     client = OpenAI(api_key=api_key, base_url=provider.base_url or None)
+    json_text_retry = False
     try:
         _record_provider_dispatch(context_metrics)
         response = client.chat.completions.create(**request)
@@ -997,7 +998,28 @@ def _request_provider_completion(
             if context_metrics is not None:
                 _enforce_provider_payload_budget(request, context_metrics)
             _record_provider_dispatch(context_metrics)
-            response = client.chat.completions.create(**request)
+            try:
+                response = client.chat.completions.create(**request)
+            except Exception as retry_error:
+                if not _is_tool_call_rejected_without_tools(retry_error):
+                    raise
+                request["messages"] = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Text-only finalization fallback. Do not call tools. Return one valid JSON object "
+                            'with a single string field named "content", containing the complete answer based '
+                            "only on the supplied evidence."
+                        ),
+                    },
+                    *request["messages"][1:],
+                ]
+                request["response_format"] = {"type": "json_object"}
+                json_text_retry = True
+                if context_metrics is not None:
+                    _enforce_provider_payload_budget(request, context_metrics)
+                _record_provider_dispatch(context_metrics)
+                response = client.chat.completions.create(**request)
         elif tools and require_tool_call and _requires_tool_choice_retry(error):
             request["tool_choice"] = "auto"
             if context_metrics is not None:
@@ -1009,7 +1031,16 @@ def _request_provider_completion(
             raise
     choice = response.choices[0] if response and response.choices else None
     raw = choice.message.model_dump(exclude_none=True) if choice and choice.message else None
-    return _normalize(raw)
+    normalized = _normalize(raw)
+    if json_text_retry:
+        try:
+            payload = json.loads(str(normalized.get("content") or ""))
+        except (AttributeError, TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError("Coding Agent text-only JSON fallback returned invalid JSON.") from error
+        if not isinstance(payload, dict) or not isinstance(payload.get("content"), str):
+            raise RuntimeError("Coding Agent text-only JSON fallback omitted its string content field.")
+        normalized["content"] = payload["content"]
+    return normalized
 
 
 def _text(content: Any) -> str:

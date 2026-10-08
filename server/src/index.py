@@ -1509,8 +1509,9 @@ def search_coding_code_endpoint(query: str, scope: str = ".") -> Dict[str, Any]:
 CODING_SEARCH_MAX_FILES = 2000
 CODING_SEARCH_MAX_CANDIDATES = 10000
 CODING_SEARCH_LOW_PRIORITY_DIRS = {
-    "assets", "asset", "static", "public", "vendor", "third_party", "generated",
+    "assets", "asset", "static", "public", "vendor", "third_party", "generated", "cache", "runtime",
 }
+CODING_SEARCH_IGNORED_DIRS = {"cache", "runtime"}
 CODING_SEARCH_LOW_PRIORITY_FILES = {
     "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
     "composer.lock", "cargo.lock", "poetry.lock",
@@ -1569,12 +1570,17 @@ def _search_coding_code(
             (
                 name for name in dirnames
                 if name.casefold() not in CODING_IGNORED_NAMES
+                and name.casefold() not in CODING_SEARCH_IGNORED_DIRS
                 and not _is_coding_sensitive(name)
             ),
             key=lambda name: (name.casefold() in CODING_SEARCH_LOW_PRIORITY_DIRS, name.casefold()),
         )
         for filename in sorted(filenames, key=str.casefold):
-            if filename.casefold() in CODING_IGNORED_NAMES or _is_coding_sensitive(filename):
+            if (
+                filename.casefold() in CODING_IGNORED_NAMES
+                or Path(filename).suffix.casefold() == ".bin"
+                or _is_coding_sensitive(filename)
+            ):
                 continue
             file_path = Path(dirpath) / filename
             if not _is_inside_project_root(root, file_path) or not file_path.is_file():
@@ -1595,6 +1601,9 @@ def _search_coding_code(
         try:
             if file_path.stat().st_size > CODING_MAX_FILE_BYTES:
                 continue
+            with file_path.open("rb") as source:
+                if b"\0" in source.read(8192):
+                    continue
             filename_normalized = _normalized_search_text(file_path.name)
             filename_terms = [term for term in query_terms if term in filename_normalized]
             if filename_terms:
