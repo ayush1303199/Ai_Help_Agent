@@ -6,10 +6,13 @@ import { spawn } from 'node:child_process';
 import developerAgent from '../electron/developerAgent.cjs';
 import developerFiles from '../electron/developerFiles.cjs';
 
+const authorizeMutation = async () => ({ allowed: true });
+
 console.log('[TEST-MATRIX] Starting 10-point Verification Matrix for Coding Agent Project Attachment & Failure Elimination...');
 
 const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'coding-matrix-test-'));
 const projectPath = path.join(tempDir, 'sample-ecommerce');
+const discoveryMarker = `coding-matrix-${process.pid}-${Date.now()}.marker`;
 
 try {
   await fs.mkdir(projectPath, { recursive: true });
@@ -27,6 +30,7 @@ try {
     path.join(projectPath, 'models', 'Order.php'),
     '<?php\nclass Order {\n  public function getSlowOrders() {\n    // query takes time\n    return $this->db->query("SELECT * FROM orders WHERE status = \'pending\'");\n  }\n}\n',
   );
+  await fs.writeFile(path.join(projectPath, discoveryMarker), 'unique project discovery signature\n');
 
   // =========================================================================
   // TEST 1: Electron Native Picker [UNIT/INTEGRATION]
@@ -52,7 +56,7 @@ try {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       name: 'sample-ecommerce',
-      signatures: ['package.json', 'models'],
+      signatures: ['package.json', 'models', discoveryMarker],
     }),
   });
   assert.equal(discoverRes.ok, true, 'project-discover endpoint must return HTTP 200');
@@ -231,13 +235,14 @@ try {
     { ownerWebContentsId: ownerProposal, sessionId },
     async () => ({ ok: true, status: 'PASS' }),
     projectPath,
+    authorizeMutation,
   );
   assert.equal(applied.state, 'completed');
   const postApplyContent = await fs.readFile(path.join(projectPath, 'src', 'index.ts'), 'utf8');
   assert.equal(postApplyContent, 'console.log("hello store verified");\n');
 
   // Undo proposal
-  await developerAgent.undo(proposal.taskId, { ownerWebContentsId: ownerProposal, sessionId });
+  await developerAgent.undo(proposal.taskId, { ownerWebContentsId: ownerProposal, sessionId }, authorizeMutation, true);
   const postUndoContent = await fs.readFile(path.join(projectPath, 'src', 'index.ts'), 'utf8');
   assert.equal(postUndoContent, 'console.log("hello store");\n');
 

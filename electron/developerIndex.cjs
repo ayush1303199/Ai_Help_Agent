@@ -7,6 +7,18 @@ const SUPPORTED = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.php',
 const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo', '.cache', 'logs', 'tmp', 'temp']);
 const sensitiveNames = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
 const sensitiveDirectories = new Set(['.ssh', '.aws', '.azure', '.config']);
+const SEMANTIC_MODEL_ID = 'jinaai/jina-embeddings-v2-base-code';
+const SEMANTIC_CACHE_VERSION = 1;
+const SEMANTIC_MAX_FILES = 1200;
+const SEMANTIC_MAX_FILE_BYTES = 256 * 1024;
+const SEMANTIC_MAX_CHUNKS = 12000;
+const SEMANTIC_CHUNK_LINES = 40;
+const SEMANTIC_CHUNK_OVERLAP = 10;
+const SEMANTIC_BATCH_SIZE = 16;
+let semanticConfiguration = null;
+let semanticPipelinePromise = null;
+const semanticIndexes = new Map();
+const semanticLocks = new Map();
 function isIgnoredName(name) {
   const normalized = String(name || '').toLowerCase();
   return ignored.has(normalized) || normalized.startsWith('.developer-journal-') || normalized.endsWith('.log');
@@ -243,8 +255,319 @@ async function assertWithinRoot(rootInput, relativePath) {
   if (!inside(root, target)) throw new Error('Path is outside the indexed root.');
   return target;
 }
+
+function configureSemanticSearch(options = {}) {
+  if (!options.cacheDirectory) throw new TypeError('Semantic search cache directory is required.');
+  semanticConfiguration = {
+    cacheDirectory: path.resolve(options.cacheDirectory),
+    modelCacheDirectory: path.resolve(options.modelCacheDirectory || path.join(options.cacheDirectory, 'models')),
+    createPipeline: options.createPipeline || null,
+  };
+  semanticPipelinePromise = null;
+  semanticIndexes.clear();
+  semanticLocks.clear();
+}
+
+async function getSemanticPipeline() {
+  if (!semanticConfiguration) throw new Error('Semantic search has not been configured by the application.');
+  if (!semanticPipelinePromise) {
+    semanticPipelinePromise = (async () => {
+      await fs.mkdir(semanticConfiguration.modelCacheDirectory, { recursive: true });
+      if (semanticConfiguration.createPipeline) {
+        return semanticConfiguration.createPipeline(semanticConfiguration.modelCacheDirectory);
+      }
+      const { env, pipeline } = await import('@huggingface/transformers');
+      env.cacheDir = semanticConfiguration.modelCacheDirectory;
+      env.allowRemoteModels = true;
+      return pipeline('feature-extraction', SEMANTIC_MODEL_ID, { dtype: 'q8' });
+    })().catch((error) => {
+      semanticPipelinePromise = null;
+      throw error;
+    });
+  }
+  return semanticPipelinePromise;
+}
+
+function semanticCachePath(root) {
+  const rootId = digest(root).slice(0, 32);
+  const modelId = digest(SEMANTIC_MODEL_ID).slice(0, 16);
+  return path.join(semanticConfiguration.cacheDirectory, `${rootId}-${modelId}.json`);
+}
+
+async function readSemanticIndex(root) {
+  if (semanticIndexes.has(root)) return semanticIndexes.get(root);
+  const cachePath = semanticCachePath(root);
+  let cached;
+  try {
+    cached = JSON.parse(await fs.readFile(cachePath, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      const empty = { files: {} };
+      semanticIndexes.set(root, empty);
+      return empty;
+    }
+    throw new Error(`Could not read semantic search cache: ${error.message}`);
+  }
+  if (cached.version !== SEMANTIC_CACHE_VERSION || cached.modelId !== SEMANTIC_MODEL_ID || cached.root !== root || !cached.files || typeof cached.files !== 'object') {
+    const empty = { files: {} };
+    semanticIndexes.set(root, empty);
+    return empty;
+  }
+  semanticIndexes.set(root, cached);
+  return cached;
+}
+
+async function writeSemanticIndex(root, semanticIndex) {
+  const cachePath = semanticCachePath(root);
+  await fs.mkdir(path.dirname(cachePath), { recursive: true });
+  const temporaryPath = `${cachePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  const payload = JSON.stringify({
+    version: SEMANTIC_CACHE_VERSION,
+    modelId: SEMANTIC_MODEL_ID,
+    root,
+    files: semanticIndex.files,
+  });
+  try {
+    await fs.writeFile(temporaryPath, payload, { encoding: 'utf8', flag: 'wx' });
+    await fs.rename(temporaryPath, cachePath);
+  } catch (error) {
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    throw new Error(`Could not write semantic search cache: ${error.message}`);
+  }
+}
+
+function validSemanticFileCache(fileCache, expectedHash) {
+  if (!fileCache || fileCache.hash !== expectedHash || !Array.isArray(fileCache.chunks)) return false;
+  return fileCache.chunks.every((chunk) =>
+    Number.isInteger(chunk.startLine) && chunk.startLine > 0
+    && Number.isInteger(chunk.endLine) && chunk.endLine >= chunk.startLine
+    && Number.isInteger(chunk.dimensions) && chunk.dimensions > 0
+    && typeof chunk.vector === 'string'
+    && Buffer.from(chunk.vector, 'base64').length === chunk.dimensions
+  );
+}
+
+function encodeVector(vector) {
+  if (!Array.isArray(vector) || vector.length === 0 || vector.some((value) => !Number.isFinite(value))) {
+    throw new Error('Semantic model returned an invalid embedding vector.');
+  }
+  const bytes = Buffer.alloc(vector.length);
+  for (let index = 0; index < vector.length; index += 1) {
+    bytes[index] = Math.max(-127, Math.min(127, Math.round(vector[index] * 127))) & 0xff;
+  }
+  return { vector: bytes.toString('base64'), dimensions: vector.length };
+}
+
+function decodedVector(encoded) {
+  return Int8Array.from(Buffer.from(encoded, 'base64'));
+}
+
+async function embedTexts(texts) {
+  if (!texts.length) return [];
+  const extractor = await getSemanticPipeline();
+  const embeddings = [];
+  for (let offset = 0; offset < texts.length; offset += SEMANTIC_BATCH_SIZE) {
+    const batch = texts.slice(offset, offset + SEMANTIC_BATCH_SIZE);
+    const output = await extractor(batch, { pooling: 'mean', normalize: true });
+    const vectors = typeof output?.tolist === 'function' ? output.tolist() : output;
+    if (!Array.isArray(vectors) || vectors.length !== batch.length) {
+      throw new Error('Semantic model returned an unexpected embedding batch.');
+    }
+    for (const vector of vectors) {
+      if (!Array.isArray(vector)) throw new Error('Semantic model returned an unexpected embedding vector.');
+      embeddings.push(encodeVector(vector));
+    }
+  }
+  return embeddings;
+}
+
+function splitSemanticChunks(relativePath, content) {
+  const lines = content.split(/\r?\n/);
+  const chunks = [];
+  const stride = SEMANTIC_CHUNK_LINES - SEMANTIC_CHUNK_OVERLAP;
+  for (let start = 0; start < lines.length; start += stride) {
+    const end = Math.min(lines.length, start + SEMANTIC_CHUNK_LINES);
+    const text = lines.slice(start, end).join('\n').trim();
+    if (text) chunks.push({ startLine: start + 1, endLine: end, text: `${relativePath}\n${text}` });
+    if (end === lines.length) break;
+  }
+  return chunks;
+}
+
+function isWithinScope(relativePath, scope) {
+  const rawScope = String(scope || '.').replace(/\\/g, '/');
+  const normalizedScope = rawScope === '.' ? '' : rawScope.replace(/^\.\//, '').replace(/\/+$/g, '');
+  return !normalizedScope || relativePath === normalizedScope || relativePath.startsWith(`${normalizedScope}/`);
+}
+
+async function buildSemanticSearchIndex(index, scope) {
+  const cached = await readSemanticIndex(index.root);
+  const indexedFiles = {};
+  const allFiles = Object.entries(index.files)
+    .filter(([relativePath]) => !isSensitivePath(relativePath) && isWithinScope(relativePath, scope))
+    .sort(([left], [right]) => left.localeCompare(right));
+  const filesToIndex = allFiles.slice(0, SEMANTIC_MAX_FILES);
+  const pendingChunks = [];
+  let cachedFiles = 0;
+  let indexedChunks = 0;
+  let skippedFiles = 0;
+
+  for (const [relativePath, file] of filesToIndex) {
+    const existing = cached.files[relativePath];
+    if (validSemanticFileCache(existing, file.hash)) {
+      indexedFiles[relativePath] = existing;
+      cachedFiles += 1;
+      continue;
+    }
+    if (indexedChunks >= SEMANTIC_MAX_CHUNKS) {
+      skippedFiles += 1;
+      continue;
+    }
+    const absolute = await assertWithinRoot(index.root, relativePath);
+    let content;
+    try {
+      content = await fs.readFile(absolute, 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        skippedFiles += 1;
+        continue;
+      }
+      throw error;
+    }
+    if (Buffer.byteLength(content, 'utf8') > SEMANTIC_MAX_FILE_BYTES || digest(content) !== file.hash) {
+      skippedFiles += 1;
+      continue;
+    }
+    const chunks = splitSemanticChunks(relativePath, content).slice(0, SEMANTIC_MAX_CHUNKS - indexedChunks);
+    for (const chunk of chunks) pendingChunks.push({ relativePath, hash: file.hash, ...chunk });
+    indexedChunks += chunks.length;
+  }
+
+  if (pendingChunks.length) {
+    const vectors = await embedTexts(pendingChunks.map((chunk) => chunk.text));
+    for (let indexInBatch = 0; indexInBatch < pendingChunks.length; indexInBatch += 1) {
+      const chunk = pendingChunks[indexInBatch];
+      if (!indexedFiles[chunk.relativePath]) {
+        indexedFiles[chunk.relativePath] = { hash: chunk.hash, chunks: [] };
+      }
+      indexedFiles[chunk.relativePath].chunks.push({
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        ...vectors[indexInBatch],
+      });
+    }
+  }
+
+  const currentFilePaths = new Set(Object.keys(index.files));
+  for (const [relativePath, fileCache] of Object.entries(cached.files)) {
+    if (!currentFilePaths.has(relativePath) || isSensitivePath(relativePath) || indexedFiles[relativePath]) continue;
+    const current = index.files[relativePath];
+    if (current && validSemanticFileCache(fileCache, current.hash)) indexedFiles[relativePath] = fileCache;
+  }
+
+  const semanticIndex = { version: SEMANTIC_CACHE_VERSION, modelId: SEMANTIC_MODEL_ID, root: index.root, files: indexedFiles };
+  await writeSemanticIndex(index.root, semanticIndex);
+  semanticIndexes.set(index.root, semanticIndex);
+  return {
+    semanticIndex,
+    indexedFiles: Object.keys(indexedFiles).length,
+    cachedFiles,
+    indexedChunks,
+    skippedFiles: skippedFiles + Math.max(0, allFiles.length - filesToIndex.length),
+    truncated: allFiles.length > filesToIndex.length || skippedFiles > 0,
+  };
+}
+
+async function searchSemantic(index, query, options = {}) {
+  if (!index?.root || !index.files || typeof index.files !== 'object') throw new TypeError('A repository index is required for semantic search.');
+  const normalizedQuery = String(query || '').trim();
+  if (!normalizedQuery || normalizedQuery.length > 200) throw new TypeError('Semantic search query is invalid.');
+  if (semanticLocks.has(index.root)) {
+    await semanticLocks.get(index.root);
+    return searchSemantic(index, normalizedQuery, options);
+  }
+  const operation = (async () => {
+    const canonicalRoot = await fs.realpath(index.root);
+    if (canonicalRoot !== index.root) throw new Error('Semantic search repository root changed; rebuild the repository index.');
+    const built = await buildSemanticSearchIndex(index, options.scope || '.');
+    const [queryVector] = await embedTexts([normalizedQuery]);
+    const queryValues = decodedVector(queryVector.vector);
+    const results = [];
+    for (const [relativePath, fileCache] of Object.entries(built.semanticIndex.files)) {
+      if (!isWithinScope(relativePath, options.scope || '.')) continue;
+      for (const chunk of fileCache.chunks) {
+        const values = decodedVector(chunk.vector);
+        if (values.length !== queryValues.length) continue;
+        let score = 0;
+        for (let offset = 0; offset < values.length; offset += 1) score += (values[offset] / 127) * queryValues[offset] / 127;
+        results.push({ path: relativePath, line: chunk.startLine, endLine: chunk.endLine, score, text: '' });
+      }
+    }
+    results.sort((left, right) => right.score - left.score || left.path.localeCompare(right.path) || left.line - right.line);
+    const freshResults = [];
+    const perFile = new Map();
+    for (const result of results) {
+      if (freshResults.length >= 30) break;
+      const count = perFile.get(result.path) || 0;
+      if (count >= 3) continue;
+      const absolute = await assertWithinRoot(index.root, result.path);
+      const content = await fs.readFile(absolute, 'utf8');
+      if (digest(content) !== index.files[result.path]?.hash) continue;
+      const lines = content.split(/\r?\n/);
+      freshResults.push({
+        ...result,
+        text: lines.slice(result.line - 1, result.endLine).join('\n'),
+        matchType: 'semantic',
+      });
+      perFile.set(result.path, count + 1);
+    }
+    return {
+      status: 'ready',
+      model: SEMANTIC_MODEL_ID,
+      indexedFiles: built.indexedFiles,
+      cachedFiles: built.cachedFiles,
+      indexedChunks: built.indexedChunks,
+      skippedFiles: built.skippedFiles,
+      truncated: built.truncated,
+      results: freshResults,
+    };
+  })();
+  semanticLocks.set(index.root, operation);
+  try {
+    return await operation;
+  } finally {
+    semanticLocks.delete(index.root);
+  }
+}
+
+function mergeSearchResults(lexicalResults, semanticResults, limit = 100) {
+  const merged = new Map();
+  const add = (items, source) => {
+    items.forEach((item, rank) => {
+      const key = `${item.path}:${item.line || 0}`;
+      const current = merged.get(key) || { ...item, hybridScore: 0, matchType: source };
+      current.hybridScore += 1 / (60 + rank + 1);
+      if (source === 'semantic') {
+        current.semanticScore = item.score;
+        if (!current.text || current.matchType === 'semantic') current.text = item.text;
+        if (current.matchType === 'lexical') current.matchType = 'hybrid';
+      } else if (current.matchType === 'semantic') {
+        current.matchType = 'hybrid';
+      }
+      if (source === 'lexical' || !Number.isFinite(current.score)) current.score = item.score;
+      merged.set(key, current);
+    });
+  };
+  add(Array.isArray(lexicalResults) ? lexicalResults : [], 'lexical');
+  add(Array.isArray(semanticResults) ? semanticResults : [], 'semantic');
+  return [...merged.values()]
+    .sort((left, right) => right.hybridScore - left.hybridScore || String(left.path).localeCompare(String(right.path)) || (left.line || 0) - (right.line || 0))
+    .slice(0, Math.max(0, limit));
+}
+
 module.exports = {
   SUPPORTED, parseSource, buildIndex, buildRepositoryMap, searchSymbols, definitions, relationships,
   findReferences, inside, assertWithinRoot, isIgnoredName, isSensitivePath,
+  configureSemanticSearch, searchSemantic, mergeSearchResults,
   INDEX_STAGE, runIndexStage,
 };

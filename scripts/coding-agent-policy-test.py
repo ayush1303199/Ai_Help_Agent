@@ -10,6 +10,50 @@ import coding_websocket as websocket  # noqa: E402
 
 
 class CodingAgentPolicyTests(unittest.TestCase):
+    def test_file_mutations_require_approved_scope_and_explicit_delete_confirmation(self):
+        gate = intelligence.PolicyGate
+        self.assertEqual(
+            gate.evaluate_file_mutation("create", ["src/new.ts"], False)[0],
+            "BLOCK",
+        )
+        self.assertEqual(
+            gate.evaluate_file_mutation("modify", ["src/current.ts"], True)[0],
+            "ALLOW",
+        )
+        self.assertEqual(
+            gate.evaluate_file_mutation("rename", ["src/old.ts", "src/new.ts"], True)[0],
+            "ALLOW",
+        )
+        self.assertEqual(
+            gate.evaluate_file_mutation("delete", ["src/current.ts"], True)[0],
+            "BLOCK",
+        )
+        self.assertEqual(
+            gate.evaluate_file_mutation("delete_directory", ["src/unused"], True, True)[0],
+            "ALLOW",
+        )
+        self.assertEqual(
+            gate.evaluate_file_mutation("modify", ["../outside.ts"], True)[0],
+            "BLOCK",
+        )
+        self.assertEqual(
+            gate.evaluate_file_mutation("create", [".env"], True)[0],
+            "BLOCK",
+        )
+        self.assertEqual(
+            gate.evaluate_file_mutation("write_anything", ["src/current.ts"], True)[0],
+            "BLOCK",
+        )
+
+    def test_proposal_shapes_accept_explicit_create_delete_move_and_directory_delete(self):
+        additions = "--- /dev/null\n+++ b/src/new.py\n@@ -0,0 +1,1 @@\n+value\n"
+        deletions = "--- a/src/old.py\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-value\n"
+        moves = "diff --git a/src/old.py b/src/new.py\nrename from src/old.py\nrename to src/new.py\n"
+        directory_delete = "*** Delete Directory: src/unused\n"
+
+        for proposal in (additions, deletions, moves, directory_delete):
+            self.assertTrue(websocket._is_unified_diff_response(proposal), proposal)
+
     def test_reuse_precedes_extension_refactor_and_new_abstraction(self):
         contract = intelligence.ExecutionContractBuilder.build(
             "FEATURE_REQUEST",

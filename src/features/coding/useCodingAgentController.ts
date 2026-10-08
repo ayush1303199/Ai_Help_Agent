@@ -58,20 +58,46 @@ interface CodingProposal {
   id?: string;
   state?: string;
   lifecycleState?: string;
+  repairAttempt?: number;
+  repairAvailable?: boolean;
   files: DeveloperDiffFile[];
   raw: string;
   searchedFiles: string[];
   snapshots: DeveloperSnapshot[];
+  evidence?: Array<{
+    kind: string;
+    operation?: string;
+    paths?: string[];
+    decision?: string;
+    reason?: string;
+    status?: string;
+    checks?: Array<{
+      check?: string | null;
+      ok?: boolean;
+      classification?: string | null;
+      extracted?: { file?: string | null; line?: number | null };
+    }>;
+    at?: string;
+  }>;
   verification?: {
     status?: string;
     classification?: string;
     reason?: string;
-    attempts?: Array<{ check?: string; ok?: boolean; classification?: string; extracted?: { file?: string | null; line?: number | null; message?: string } }>;
+    attempts?: Array<{
+      check?: string;
+      ok?: boolean;
+      classification?: string;
+      stdout?: string;
+      stderr?: string;
+      extracted?: { file?: string | null; line?: number | null; message?: string };
+    }>;
   } | null;
   outcome?: string | null;
   error?: string | null;
   runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null;
 }
+
+const MAX_VERIFICATION_REPAIR_ATTEMPTS = 2;
 
 interface CodingControllerOptions {
   maxContextChars: number;
@@ -420,8 +446,8 @@ export function useCodingAgentController({
     setConversationStates((previous) => upsertCodingConversationState(previous, sessionState));
   }, [appliedPatchLog, conversationId, lastProvider, messages, projectRoot, proposal]);
 
-  const sendMessage = async () => {
-    const question = input.trim();
+  const sendMessage = async (overrideQuestion?: string, repairAttempt = 0) => {
+    const question = (overrideQuestion ?? input).trim();
     if (!question || streaming || busy) return;
     let currentProjectRoot = projectRoot;
     let currentScope = path;
@@ -625,22 +651,26 @@ export function useCodingAgentController({
                   return;
                 }
                 const sources = new Map(result.filesRead.map((file) => [file.path, file.content]));
-                const unexpected = files.filter((file) => !sources.has(file.path));
-                if (unexpected.length) throw new Error(`The proposal references files that were not read: ${unexpected.map((file) => file.path).join(', ')}`);
-                if (files.some((file) => !validateUnifiedFile(file.lines, sources.get(file.path) || ''))) {
+                const readPaths = [...new Set(files
+                  .filter((file) => file.operation !== 'create' && file.operation !== 'delete_directory')
+                  .map((file) => file.sourcePath || file.path))];
+                const unexpected = readPaths.filter((filePath) => !sources.has(filePath));
+                if (unexpected.length) throw new Error(`The proposal references files that were not read: ${unexpected.join(', ')}`);
+                if (files.some((file) => file.operation !== 'delete_directory'
+                  && !validateUnifiedFile(file.lines, sources.get(file.sourcePath || file.path) || ''))) {
                   throw new Error('The proposed diff does not match the inspected file contents.');
                 }
-                const latestFiles = await Promise.all(files.map(async (file) => {
+                const latestFiles = await Promise.all(readPaths.map(async (filePath) => {
                   if (window.electronAPI) {
                     return {
-                      path: file.path,
-                      content: (await window.electronAPI.readDeveloperFile(file.path)).content,
+                      path: filePath,
+                      content: (await window.electronAPI.readDeveloperFile(filePath)).content,
                     };
                   }
-                  const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/read-file?path=${encodeURIComponent(file.path)}`);
-                  if (!res.ok) throw new Error(`Could not read file for proposal verification: ${file.path}`);
+                  const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/read-file?path=${encodeURIComponent(filePath)}`);
+                  if (!res.ok) throw new Error(`Could not read file for proposal verification: ${filePath}`);
                   const data = await res.json();
-                  return { path: file.path, content: data.content };
+                  return { path: filePath, content: data.content };
                 }));
                 const snapshots = await Promise.all(latestFiles.map(async (file) => ({
                   path: file.path,
@@ -661,6 +691,8 @@ export function useCodingAgentController({
                   id: registered.id,
                   state: registered.state,
                   lifecycleState: registered.lifecycleState,
+                  repairAttempt,
+                  repairAvailable: repairAttempt < MAX_VERIFICATION_REPAIR_ATTEMPTS,
                   files,
                   raw: result.content,
                   searchedFiles: result.filesRead.map((file) => file.path),
@@ -1076,7 +1108,17 @@ export function useCodingAgentController({
         verification: result.verification,
         outcome: result.outcome,
         error: result.error,
+        evidence: result.evidence || current.evidence,
       } : current);
+      const verification = result.verification;
+      if (result.state === 'failed' && verification?.status === 'CODE_FAILURE') {
+        setActivity((previous) => upsertCodingActivity(previous, {
+          id: `verification-failure:${proposal.id}`,
+          executionId: proposal.id || 'unknown',
+          phase: 'debugging',
+          message: `Verification failed (${verification.classification || verification.status}); changes were rolled back. Review the diagnostics and request a repair proposal.`,
+        }));
+      }
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1084,12 +1126,40 @@ export function useCodingAgentController({
     }
   };
 
+  const requestVerificationRepair = () => {
+    if (!proposal || proposal.state !== 'failed' || proposal.verification?.status !== 'CODE_FAILURE' || busy || streaming) return;
+    const repairAttempt = (proposal.repairAttempt || 0) + 1;
+    if (repairAttempt > MAX_VERIFICATION_REPAIR_ATTEMPTS) return;
+    const failure = proposal.verification.attempts?.find((attempt) => !attempt.ok);
+    const location = failure?.extracted?.file
+      ? `${failure.extracted.file}${failure.extracted.line ? `:${failure.extracted.line}` : ''}`
+      : 'location unavailable';
+    const output = [failure?.stderr, failure?.stdout]
+      .filter((value): value is string => Boolean(value?.trim()))
+      .join('\n')
+      .slice(0, 4000);
+    const prompt = [
+      `The previous approved patch was rolled back because ${failure?.check || 'verification'} failed.`,
+      `Failure classification: ${failure?.classification || proposal.verification.classification || 'CODE_FAILURE'}.`,
+      `Failure location: ${location}.`,
+      failure?.extracted?.message ? `Failure summary: ${failure.extracted.message}` : '',
+      output ? `Sanitized verification output:\n${output}` : '',
+      'Inspect the current project files and propose the smallest safe correction as a standard unified diff. Use valid numbered hunk headers with accurate line numbers and counts (for example, @@ -2 +2 @@); never use a bare @@ header. Include --- a/path and +++ b/path headers, and do not wrap the diff in a code fence. Do not apply or write any changes. The correction will require a separate explicit approval and will be verified again.',
+    ].filter(Boolean).join('\n\n');
+    setProposal((current) => current ? {
+      ...current,
+      repairAttempt,
+      repairAvailable: repairAttempt < MAX_VERIFICATION_REPAIR_ATTEMPTS,
+    } : current);
+    void sendMessage(prompt, repairAttempt);
+  };
+
   const undoProposal = async () => {
     if (!proposal?.id || !window.electronAPI) return;
     setBusy(true);
     try {
       const result = await window.electronAPI.undoDeveloperProposal(proposal.id);
-      setProposal((current) => current ? { ...current, state: result.state } : current);
+      setProposal((current) => current ? { ...current, state: result.state, evidence: result.evidence || current.evidence } : current);
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1227,6 +1297,7 @@ export function useCodingAgentController({
       onReadFile: (requestedPath?: string) => void readFile(requestedPath), onSearch: () => void searchCode(),
       onApproveProposal: () => void approveProposal(), onRejectProposal: () => void rejectProposal(),
       onApplyProposal: () => void applyProposal(), onUndoProposal: () => void undoProposal(),
+      onRequestRepair: requestVerificationRepair,
       onSendMessage: () => void sendMessage(), onClearMessages: clearMessages,
       conversations: conversationStates, activeConversationId: conversationId,
       onRestoreConversation: restoreHistory, onDeleteConversation: deleteConversation,

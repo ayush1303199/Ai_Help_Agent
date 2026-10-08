@@ -93,6 +93,8 @@ interface SearchResult {
 
 interface DiffFile {
   path: string;
+  sourcePath?: string;
+  operation: 'create' | 'modify' | 'delete' | 'rename' | 'delete_directory';
   lines: string[];
 }
 
@@ -100,14 +102,37 @@ interface Proposal {
   id?: string;
   state?: string;
   lifecycleState?: string;
+  repairAttempt?: number;
+  repairAvailable?: boolean;
   files: DiffFile[];
   raw: string;
   searchedFiles: string[];
   verification?: {
     status?: string;
+    classification?: string;
     reason?: string;
-    attempts?: Array<{ check?: string; ok?: boolean; classification?: string; extracted?: { file?: string | null; line?: number | null } }>;
+    attempts?: Array<{
+      check?: string;
+      ok?: boolean;
+      classification?: string;
+      extracted?: { file?: string | null; line?: number | null; message?: string };
+    }>;
   } | null;
+  evidence?: Array<{
+    kind: string;
+    operation?: string;
+    paths?: string[];
+    decision?: string;
+    reason?: string;
+    status?: string;
+    checks?: Array<{
+      check?: string | null;
+      ok?: boolean;
+      classification?: string | null;
+      extracted?: { file?: string | null; line?: number | null };
+    }>;
+    at?: string;
+  }>;
   error?: string | null;
   runtime?: {
     phase?: string;
@@ -150,6 +175,7 @@ interface CodingAgentWorkspaceProps {
   onRejectProposal: () => void;
   onApplyProposal: () => void;
   onUndoProposal: () => void;
+  onRequestRepair: () => void;
   onSendMessage: () => void;
   onClearMessages: () => void;
   conversations: CodingConversationState[];
@@ -334,6 +360,7 @@ export function CodingAgentWorkspace({
   onRejectProposal,
   onApplyProposal,
   onUndoProposal,
+  onRequestRepair,
   onSendMessage,
   onClearMessages,
   conversations,
@@ -578,9 +605,33 @@ export function CodingAgentWorkspace({
         {proposal.runtime?.metrics && <div className="mt-3 grid grid-cols-2 gap-2 rounded-md border border-slate-700 bg-slate-950 p-2 text-[10px] text-slate-400 sm:grid-cols-4">
           <span>Files read: {proposal.runtime.metrics.filesRead || 0}</span><span>Files changed: {proposal.runtime.metrics.filesChanged || 0}</span><span>Checks: {proposal.runtime.metrics.verificationRuns || 0}</span><span>Confidence: {proposal.runtime.metrics.confidence || 'LOW'}</span>
         </div>}
-        {proposal.files.length > 0 ? <div className="mt-3 space-y-3">{proposal.files.map((file) => <div key={file.path} className="overflow-hidden rounded-md border border-slate-700 bg-slate-950"><p className="border-b border-slate-700 px-2 py-1.5 text-xs font-medium text-slate-200">{file.path}</p><pre className="max-h-80 overflow-auto p-2 text-[11px] leading-relaxed">{file.lines.map((line, lineIndex) => <span key={`${file.path}-${lineIndex}`} className={`block ${line.startsWith('+') && !line.startsWith('+++') ? 'bg-emerald-500/10 text-emerald-200' : line.startsWith('-') && !line.startsWith('---') ? 'bg-rose-500/10 text-rose-200' : 'text-slate-400'}`}>{line || ' '}</span>)}</pre></div>)}</div> : <pre className="mt-3 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] text-slate-300">{proposal.raw || 'No safe changes proposed.'}</pre>}
-        {proposal.verification && <div className={`mt-3 rounded-md border p-2 text-[11px] ${proposal.verification.status === 'PASS' || proposal.verification.status === 'NOT_AVAILABLE' ? 'border-emerald-500/30 text-emerald-200' : 'border-rose-500/30 text-rose-200'}`}><p>Verification: {proposal.verification.status || 'UNKNOWN'}</p>{proposal.verification.reason && <p className="mt-1 text-slate-400">{proposal.verification.reason}</p>}{proposal.verification.attempts?.filter((attempt) => !attempt.ok).map((attempt, attemptIndex) => <p key={`${attempt.check || 'check'}-${attemptIndex}`} className="mt-1 text-rose-200">{attempt.check || 'check'}: {attempt.classification || 'failed'}{attempt.extracted?.file ? ` · ${attempt.extracted.file}${attempt.extracted.line ? `:${attempt.extracted.line}` : ''}` : ''}</p>)}</div>}
+        {proposal.evidence?.some((item) => ['POLICY_GATE', 'VERIFICATION', 'DIAGNOSIS'].includes(item.kind)) && <div className="mt-3 rounded-md border border-slate-700 bg-slate-950 p-2 text-[10px] text-slate-400">
+          {proposal.evidence.some((item) => item.kind === 'POLICY_GATE') && <>
+            <p className="mb-1 font-semibold text-slate-300">Mutation policy evidence</p>
+            {proposal.evidence.filter((item) => item.kind === 'POLICY_GATE').map((item, index) => <p key={`${item.operation || 'mutation'}-${index}`} className={item.decision === 'BLOCK' ? 'text-rose-300' : undefined}>{item.decision || 'ALLOW'} · {item.operation || 'mutation'} · {item.paths?.join(', ') || 'target unavailable'}{item.reason ? ` · ${item.reason}` : ''}</p>)}
+          </>}
+          {proposal.evidence.some((item) => item.kind === 'VERIFICATION') && <>
+            <p className="mb-1 mt-2 font-semibold text-slate-300">Verification evidence</p>
+            {proposal.evidence.filter((item) => item.kind === 'VERIFICATION').map((item, index) => <div key={`verification-${index}`}>
+              <p>{item.status || 'RECORDED'} · {item.checks?.length || 0} check result(s)</p>
+              {item.checks?.map((check, checkIndex) => <p key={`verification-${index}-${checkIndex}`} className={check.ok ? 'text-emerald-300' : 'text-rose-300'}>{check.check || 'check'} · {check.ok ? 'PASS' : check.classification || 'FAILED'}</p>)}
+            </div>)}
+          </>}
+          {proposal.evidence.some((item) => item.kind === 'DIAGNOSIS') && <>
+            <p className="mb-1 mt-2 font-semibold text-slate-300">Failure diagnosis</p>
+            {proposal.evidence.filter((item) => item.kind === 'DIAGNOSIS').map((item, index) => <div key={`diagnosis-${index}`}>
+              <p>{item.status || 'CODE_FAILURE'}</p>
+              {item.checks?.map((check, checkIndex) => <p key={`diagnosis-${index}-${checkIndex}`} className="text-rose-300">{check.check || 'check'} · {check.classification || 'FAILED'}{check.extracted?.file ? ` · ${check.extracted.file}${check.extracted.line ? `:${check.extracted.line}` : ''}` : ''}</p>)}
+            </div>)}
+          </>}
+        </div>}
+        {proposal.files.length > 0 ? <div className="mt-3 space-y-3">{proposal.files.map((file) => <div key={`${file.operation}:${file.sourcePath || ''}:${file.path}`} className="overflow-hidden rounded-md border border-slate-700 bg-slate-950"><p className="border-b border-slate-700 px-2 py-1.5 text-xs font-medium text-slate-200">{file.operation.toUpperCase().replace('_', ' ')} · {file.sourcePath ? `${file.sourcePath} → ${file.path}` : file.path}</p>{file.operation === 'delete_directory' ? <p className="px-2 py-2 text-xs text-rose-200">The directory and its contents will be removed after a separate exact-target confirmation.</p> : <pre className="max-h-80 overflow-auto p-2 text-[11px] leading-relaxed">{file.lines.map((line, lineIndex) => <span key={`${file.path}-${lineIndex}`} className={`block ${line.startsWith('+') && !line.startsWith('+++') ? 'bg-emerald-500/10 text-emerald-200' : line.startsWith('-') && !line.startsWith('---') ? 'bg-rose-500/10 text-rose-200' : 'text-slate-400'}`}>{line || ' '}</span>)}</pre>}</div>)}</div> : <pre className="mt-3 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] text-slate-300">{proposal.raw || 'No safe changes proposed.'}</pre>}
+        {proposal.verification && <div className={`mt-3 rounded-md border p-2 text-[11px] ${proposal.verification.status === 'PASS' || proposal.verification.status === 'NOT_AVAILABLE' ? 'border-emerald-500/30 text-emerald-200' : 'border-rose-500/30 text-rose-200'}`}><p>Verification: {proposal.verification.status || 'UNKNOWN'}</p>{proposal.verification.reason && <p className="mt-1 text-slate-400">{proposal.verification.reason}</p>}{proposal.verification.attempts?.filter((attempt) => !attempt.ok).map((attempt, attemptIndex) => <p key={`${attempt.check || 'check'}-${attemptIndex}`} className="mt-1 text-rose-200">{attempt.check || 'check'}: {attempt.classification || 'failed'}{attempt.extracted?.file ? ` · ${attempt.extracted.file}${attempt.extracted.line ? `:${attempt.extracted.line}` : ''}` : ''}{attempt.extracted?.message ? ` · ${attempt.extracted.message}` : ''}</p>)}</div>}
         {proposal.error && <p className="mt-2 text-[11px] text-rose-300">{proposal.error}</p>}
+        {proposal.state === 'failed' && proposal.verification?.status === 'CODE_FAILURE' && proposal.repairAvailable && <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-2">
+          <p className="text-[11px] text-amber-100">The failed change was rolled back. The agent can inspect the verification diagnostics and prepare a repair for separate approval.</p>
+          <button onClick={onRequestRepair} disabled={busy || streaming} className="shrink-0 rounded-md bg-amber-400 px-2.5 py-1.5 text-[11px] font-medium text-slate-950 disabled:opacity-40">Propose repair</button>
+        </div>}
         </section>
       </article>}
       </div>

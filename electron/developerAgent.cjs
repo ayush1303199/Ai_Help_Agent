@@ -416,12 +416,13 @@ function publicTask(task) {
     id: task.taskId, taskId: task.taskId, sessionId: task.sessionId, state: task.state,
     lifecycleState: STATE_ALIASES[task.state] || task.state.toUpperCase(),
     proposalId: task.proposalId || task.taskId,
-    workspace: task.workspace, files: (task.files || []).map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
+    workspace: task.workspace, files: (task.files || []).map(({ operation, path, sourcePath, hash: fileHash }) => ({ operation, path, sourcePath: sourcePath || null, hash: fileHash })),
     targetFiles: (task.files || []).map(({ path }) => path),
     snapshotHashes: (task.before || []).map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
     approval: task.approval ? { approvedAt: task.approval.approvedAt, actor: task.approval.actor } : null,
-    progress: task.progress, verification: task.verification || null, verificationScript: task.verificationScript || null,
+    progress: task.progress, verification: redact(task.verification) || null, verificationScript: task.verificationScript || null,
     verificationScripts: task.verificationScripts || [],
+    evidence: Array.isArray(task.evidence) ? redact(task.evidence).slice(-50) : [],
     scope: task.scope || '.',
     outcome: task.outcome || null, error: task.error || null,
     runtime: runtimeState(task),
@@ -433,59 +434,188 @@ function inside(root, target) {
   const rel = path.relative(root, target);
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
 }
-async function safePath(root, relative) {
+async function safePath(root, relative, { allowMissing = false, allowDirectory = false } = {}) {
   if (typeof relative !== 'string' || !relative || path.isAbsolute(relative)) throw new Error('Proposal paths must be relative.');
   const clean = relative.replace(/\\/g, '/');
-  if (clean.split('/').includes('..') || clean.startsWith('/')) throw new Error('Proposal path traversal is denied.');
-  if (SENSITIVE_PATH_PATTERN.test(clean)) throw new Error('Sensitive files cannot be changed by the Coding Agent.');
-  const target = path.resolve(root, clean);
-  let entry;
-  try { entry = await fs.lstat(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  if (entry?.isSymbolicLink()) throw new Error('Symlink proposal targets are denied.');
-  const real = await fs.realpath(target).catch((error) => { throw new Error(error.code === 'ENOENT' ? 'Proposal files must already exist.' : error.message); });
-  if (!inside(root, real)) throw new Error('Proposal path is outside the selected project.');
-  const stat = await fs.lstat(real);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Symlink and non-file proposal targets are denied.');
-  return { relative: clean, target: real };
+  if (clean.startsWith('/') || /^[A-Za-z]:/.test(clean) || clean.split('/').some((part) => !part || part === '.' || part === '..' || part.includes(':') || /[. ]$/.test(part))) {
+    throw new Error('Proposal path traversal is denied.');
+  }
+  if (SENSITIVE_PATH_PATTERN.test(clean) || clean.split('/').some((part) => part.toLowerCase() === '.git')) throw new Error('Sensitive files cannot be changed by the Coding Agent.');
+  const projectRoot = await fs.realpath(root);
+  const target = path.resolve(projectRoot, ...clean.split('/'));
+  if (!inside(projectRoot, target)) throw new Error('Proposal path is outside the selected project.');
+  let cursor = projectRoot;
+  let missing = false;
+  for (const segment of clean.split('/')) {
+    cursor = path.join(cursor, segment);
+    if (missing) continue;
+    let stat;
+    try { stat = await fs.lstat(cursor); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      missing = true;
+      continue;
+    }
+    if (stat.isSymbolicLink()) throw new Error('Symlink proposal targets are denied.');
+  }
+  if (missing && !allowMissing) throw new Error('Proposal target does not exist.');
+  if (!missing) {
+    const real = await fs.realpath(target);
+    if (!inside(projectRoot, real)) throw new Error('Proposal path is outside the selected project.');
+    const stat = await fs.lstat(real);
+    if (!stat.isFile() && !(allowDirectory && stat.isDirectory())) throw new Error('Only regular files and explicitly targeted directories are allowed.');
+    return { relative: clean, target: real, exists: true, isDirectory: stat.isDirectory(), parentExists: true };
+  }
+  let existingParent = path.dirname(target);
+  while (true) {
+    try {
+      existingParent = await fs.realpath(existingParent);
+      break;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      const parent = path.dirname(existingParent);
+      if (parent === existingParent) throw error;
+      existingParent = parent;
+    }
+  }
+  if (!inside(projectRoot, existingParent)) throw new Error('Proposal path is outside the selected project.');
+  let parentExists = false;
+  try {
+    const realParent = await fs.realpath(path.dirname(target));
+    parentExists = inside(projectRoot, realParent);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  return { relative: clean, target, exists: false, isDirectory: false, parentExists };
+}
+async function snapshotTarget(root, relative) {
+  const safe = await safePath(root, relative, { allowMissing: true, allowDirectory: true });
+  if (!safe.exists) return { path: safe.relative, exists: false, type: 'missing', hash: hash('MISSING') };
+  if (!safe.isDirectory) {
+    const content = await fs.readFile(safe.target, 'utf8');
+    return { path: safe.relative, exists: true, type: 'file', hash: hash(content), content };
+  }
+  const entries = [];
+  let totalBytes = 0;
+  const visit = async (directory, prefix) => {
+    const children = (await fs.readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+    for (const child of children) {
+      if (child.isSymbolicLink()) throw new Error('Directory mutations containing symlinks are denied.');
+      const relativeChild = prefix ? `${prefix}/${child.name}` : child.name;
+      const childPath = path.join(directory, child.name);
+      if (SENSITIVE_PATH_PATTERN.test(relativeChild) || relativeChild.split('/').some((part) => part.toLowerCase() === '.git')) {
+        throw new Error(`Directory mutation includes a protected path: ${relativeChild}.`);
+      }
+      if (child.isDirectory()) {
+        entries.push({ path: relativeChild, type: 'directory' });
+        await visit(childPath, relativeChild);
+      } else if (child.isFile()) {
+        const content = await fs.readFile(childPath);
+        totalBytes += content.length;
+        if (totalBytes > 50 * 1024 * 1024) throw new Error('Directory mutation exceeds the 50 MiB snapshot safety limit.');
+        entries.push({ path: relativeChild, type: 'file', contentBase64: content.toString('base64'), hash: hash(content) });
+      } else {
+        throw new Error('Unsupported filesystem entry in a directory mutation.');
+      }
+      if (entries.length > 5000) throw new Error('Directory mutation exceeds the 5000-entry safety limit.');
+    }
+  };
+  await visit(safe.target, '');
+  return { path: safe.relative, exists: true, type: 'directory', entries, hash: hash(JSON.stringify(entries)) };
 }
 async function snapshot(root, relative) {
-  const safe = await safePath(root, relative);
-  const content = await fs.readFile(safe.target, 'utf8');
-  return { path: safe.relative, hash: hash(content), content };
+  const state = await snapshotTarget(root, relative);
+  if (!state.exists || state.type !== 'file') throw new Error('A regular file is required for this operation.');
+  return state;
 }
 function parsePatch(raw) {
   if (typeof raw !== 'string' || raw.length > developerSettings.proposalMaxBytes) throw new Error('Proposal is invalid or too large.');
   if (/^\s*NO_CHANGES\s*$/i.test(raw)) return [];
   const lines = raw.replace(/^```(?:diff|patch)?\s*/i, '').replace(/\s*```\s*$/, '').split(/\r?\n/);
-  const files = []; let current;
+  const files = [];
+  let current = null;
+  const startFile = () => {
+    if (current) files.push(current);
+    current = { oldHeader: null, newHeader: null, renameFrom: null, renameTo: null, directoryDelete: null, lines: [] };
+  };
   for (const line of lines) {
-    const header = line.match(/^\+\+\+ b\/(.+)$/);
-    if (header) { current = { path: header[1], lines: [] }; files.push(current); }
-    else if (current && (line.startsWith('@@') || line.startsWith('+') || line.startsWith('-') || line.startsWith(' ') || line === '\\ No newline at end of file')) current.lines.push(line);
+    if (/^diff --git /.test(line)) { if (current) startFile(); else startFile(); continue; }
+    const directoryDelete = line.match(/^\*\*\* Delete Directory: (.+)$/);
+    if (directoryDelete) {
+      startFile();
+      current.directoryDelete = directoryDelete[1].trim();
+      files.push(current);
+      current = null;
+      continue;
+    }
+    const oldHeader = line.match(/^--- (.+?)(?:\t.*)?$/);
+    if (oldHeader) {
+      if (!current || current.oldHeader !== null) startFile();
+      current.oldHeader = oldHeader[1].trim().replace(/^["']|["']$/g, '');
+      continue;
+    }
+    const newHeader = line.match(/^\+\+\+ (.+?)(?:\t.*)?$/);
+    if (newHeader) {
+      if (!current) startFile();
+      current.newHeader = newHeader[1].trim().replace(/^["']|["']$/g, '');
+      continue;
+    }
+    const renameFrom = line.match(/^rename from (.+)$/);
+    if (renameFrom) { if (!current) startFile(); current.renameFrom = renameFrom[1].trim(); continue; }
+    const renameTo = line.match(/^rename to (.+)$/);
+    if (renameTo) { if (!current) startFile(); current.renameTo = renameTo[1].trim(); continue; }
+    if (current && (line.startsWith('@@') || line.startsWith('+') || line.startsWith('-') || line.startsWith(' ') || line === '\\ No newline at end of file')) current.lines.push(line);
   }
-  if (!files.length || files.some((file) => !file.lines.some((line) => line.startsWith('@@')))) throw new Error('Proposal must be a unified diff.');
-  return files;
+  if (current) files.push(current);
+  const decodePath = (value, prefix) => {
+    if (!value || value === '/dev/null') return null;
+    if (value.startsWith(`${prefix}/`)) return value.slice(prefix.length + 1);
+    return value;
+  };
+  const normalized = files.map((file) => {
+    if (file.directoryDelete) {
+      return { operation: 'delete_directory', path: file.directoryDelete.replace(/\\/g, '/'), sourcePath: null, lines: [] };
+    }
+    const sourcePath = file.renameFrom || decodePath(file.oldHeader, 'a');
+    const targetPath = file.renameTo || decodePath(file.newHeader, 'b');
+    let operation;
+    if (file.renameFrom || file.renameTo) operation = 'rename';
+    else if (!sourcePath && targetPath) operation = 'create';
+    else if (sourcePath && !targetPath) operation = 'delete';
+    else if (sourcePath && targetPath && sourcePath !== targetPath) operation = 'rename';
+    else operation = 'modify';
+    const changePath = operation === 'delete' ? sourcePath : targetPath;
+    if (!changePath || (operation === 'rename' && !sourcePath)) throw new Error('Proposal contains an invalid file path header.');
+    if (!file.lines.some((line) => line.startsWith('@@')) && !(operation === 'rename' && file.lines.length === 0)) {
+      throw new Error('Proposal must include a valid unified diff hunk.');
+    }
+    return { operation, path: changePath.replace(/\\/g, '/'), sourcePath: operation === 'rename' ? sourcePath.replace(/\\/g, '/') : null, lines: file.lines };
+  });
+  if (!normalized.length) throw new Error('Proposal must be a unified diff.');
+  return normalized;
 }
 function applyFilePatch(original, lines) {
-  const source = original.split(/\r?\n/); const output = []; let cursor = 0;
+  const source = original ? original.split(/\r?\n/) : []; const output = []; let cursor = 0;
   for (let i = 0; i < lines.length; i += 1) {
-    const header = lines[i].match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,\d+)? @@/);
-    if (!header) continue;
-    const start = Number(header[1]) - 1;
+    const header = lines[i].match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (!header) throw new Error('Invalid patch hunk header.');
+    const oldStart = Number(header[1]);
+    const oldCount = Number(header[2] || 1);
+    const start = oldCount === 0 ? oldStart : oldStart - 1;
     if (start < cursor || start > source.length) throw new Error('Patch context is stale.');
-    output.push(...source.slice(cursor, start)); cursor = start; let consumed = 0;
+    output.push(...source.slice(cursor, start)); cursor = start; let consumed = 0; let produced = 0;
     for (i += 1; i < lines.length && !lines[i].startsWith('@@'); i += 1) {
       const line = lines[i];
       if (line === '\\ No newline at end of file') continue;
-      if (line.startsWith(' ')) { if (source[cursor] !== line.slice(1)) throw new Error('Patch context does not match.'); output.push(source[cursor++]); consumed += 1; }
+      if (line.startsWith(' ')) { if (source[cursor] !== line.slice(1)) throw new Error('Patch context does not match.'); output.push(source[cursor++]); consumed += 1; produced += 1; }
       else if (line.startsWith('-')) { if (source[cursor] !== line.slice(1)) throw new Error('Patch removal does not match.'); cursor += 1; consumed += 1; }
-      else if (line.startsWith('+')) output.push(line.slice(1)); else throw new Error('Invalid patch hunk.');
+      else if (line.startsWith('+')) { output.push(line.slice(1)); produced += 1; } else throw new Error('Invalid patch hunk.');
     }
-    if (Number(header[2] || 1) !== consumed) throw new Error('Patch hunk line count is invalid.');
+    if (oldCount !== consumed || Number(header[4] || 1) !== produced) throw new Error('Patch hunk line count is invalid.');
     i -= 1;
   }
   output.push(...source.slice(cursor));
-  return output.join('\n');
+  const content = output.join('\n');
+  return content.endsWith('\n') || !content ? content : `${content}\n`;
 }
 
 function assessTaskRisk({ files = [], root = '' }) {
@@ -549,7 +679,7 @@ function selfReviewPatch(rawPatch) {
     }
     const additions = file.lines.filter((l) => l.startsWith('+')).length;
     const deletions = file.lines.filter((l) => l.startsWith('-')).length;
-    if (additions === 0 && deletions === 0) {
+    if (additions === 0 && deletions === 0 && file.operation !== 'delete_directory' && file.operation !== 'rename') {
       issues.push(`Empty file hunk for: ${file.path}`);
     }
   }
@@ -665,6 +795,12 @@ async function createProposal({
 }) {
   if (!sessionId || ownerWebContentsId === undefined) throw new Error('Developer session ownership is required.');
   const root = await fs.realpath(inputRoot);
+  const scopePath = scope && scope !== '.' ? scope : '';
+  if (path.isAbsolute(scopePath) || scopePath.replace(/\\/g, '/').split('/').some((segment) => segment === '..')) {
+    throw new Error('Proposal scope must remain inside the selected project.');
+  }
+  const scopeRoot = path.resolve(root, ...scopePath.replace(/\\/g, '/').split('/').filter(Boolean));
+  if (!inside(root, scopeRoot)) throw new Error('Proposal scope must remain inside the selected project.');
   if (conversationTurnId) {
     const turn = conversationTurns.get(conversationTurnId);
     assertConversationOwner(turn, { sessionId, ownerWebContentsId });
@@ -680,15 +816,65 @@ async function createProposal({
   const safeVerificationScripts = [...new Set(requestedScripts.map((script) => commandPolicy(script).script))];
   const files = parsePatch(raw); const unique = new Set(); const before = []; const changes = [];
   for (const file of files) {
-    if (unique.has(file.path)) throw new Error('Proposal contains duplicate files.');
-    unique.add(file.path);
-    const current = await snapshot(root, file.path);
-    const expected = expectedSnapshots.find((item) => item.path.replace(/\\/g, '/') === current.path);
-    if (expected && expected.hash !== current.hash) throw new Error(`Snapshot is stale for ${current.path}.`);
-    const after = applyFilePatch(current.content, file.lines);
-    if (after === current.content) throw new Error(`Proposal has no change for ${current.path}.`);
-    before.push({ path: current.path, hash: current.hash, content: current.content });
-    changes.push({ path: current.path, hash: hash(after), content: after });
+    const mutationPaths = file.sourcePath ? [file.sourcePath, file.path] : [file.path];
+    for (const mutationPath of mutationPaths) {
+      if (unique.has(mutationPath)) throw new Error('Proposal contains duplicate or overlapping files.');
+      unique.add(mutationPath);
+      const scopedTarget = path.resolve(root, ...mutationPath.replace(/\\/g, '/').split('/'));
+      if (!inside(scopeRoot, scopedTarget)) throw new Error(`Proposal target is outside the approved scope: ${mutationPath}.`);
+    }
+    if (file.operation === 'delete_directory' && path.resolve(root, file.path.replace(/\\/g, '/')) === scopeRoot) {
+      throw new Error('Deleting the entire approved proposal scope is not permitted.');
+    }
+    const sourcePath = file.sourcePath || file.path;
+    const sourceState = await snapshotTarget(root, sourcePath);
+    const expected = expectedSnapshots.find((item) => item.path.replace(/\\/g, '/') === sourceState.path);
+    if (expected && expected.hash !== sourceState.hash) throw new Error(`Snapshot is stale for ${sourceState.path}.`);
+    if (file.operation === 'create' && sourceState.exists) throw new Error(`Create target already exists: ${sourcePath}.`);
+    if (file.operation === 'create' && !(await safePath(root, file.path, { allowMissing: true })).parentExists) {
+      throw new Error(`Create target parent does not exist: ${path.dirname(file.path)}.`);
+    }
+    if (file.operation === 'rename') {
+      const destination = await snapshotTarget(root, file.path);
+      if (destination.exists) throw new Error(`Rename target already exists: ${file.path}.`);
+      if (!(await safePath(root, file.path, { allowMissing: true })).parentExists) {
+        throw new Error(`Rename target parent does not exist: ${path.dirname(file.path)}.`);
+      }
+      before.push(sourceState, destination);
+    } else {
+      before.push(sourceState);
+    }
+    let content = null;
+    if (file.operation === 'delete_directory') {
+      const directory = await snapshotTarget(root, file.path);
+      if (!directory.exists || directory.type !== 'directory') throw new Error(`Directory delete target is not a directory: ${file.path}.`);
+    } else if (file.operation === 'delete') {
+      if (!sourceState.exists || sourceState.type !== 'file') throw new Error(`Delete target is not a regular file: ${sourcePath}.`);
+      const after = applyFilePatch(sourceState.content, file.lines);
+      if (after !== '') throw new Error(`File deletion patch does not remove all content from ${sourcePath}.`);
+    } else if (file.operation === 'rename') {
+      if (!sourceState.exists || sourceState.type !== 'file') throw new Error(`Rename source is not a regular file: ${sourcePath}.`);
+      content = file.lines.length ? applyFilePatch(sourceState.content, file.lines) : sourceState.content;
+    } else if (file.operation === 'create') {
+      if (sourceState.exists) throw new Error(`Create target already exists: ${sourcePath}.`);
+      content = applyFilePatch('', file.lines);
+    } else {
+      if (!sourceState.exists || sourceState.type !== 'file') throw new Error(`Modify target is not a regular file: ${sourcePath}.`);
+      content = applyFilePatch(sourceState.content, file.lines);
+      if (content === sourceState.content) throw new Error(`Proposal has no change for ${sourcePath}.`);
+    }
+    if (file.operation !== 'delete' && file.operation !== 'delete_directory') {
+      changes.push({ operation: file.operation, path: file.path, sourcePath: file.sourcePath, hash: hash(content), content });
+    } else {
+      changes.push({ operation: file.operation, path: file.path, sourcePath: file.sourcePath, hash: hash(file.operation === 'delete' ? 'MISSING' : 'MISSING') });
+    }
+  }
+  const after = [];
+  for (const change of changes) {
+    if (change.operation === 'rename') after.push({ path: change.sourcePath, exists: false, type: 'missing', hash: hash('MISSING') });
+    after.push(change.operation === 'delete' || change.operation === 'delete_directory'
+      ? { path: change.path, exists: false, type: 'missing', hash: hash('MISSING') }
+      : { path: change.path, exists: true, type: 'file', hash: change.hash });
   }
   const task = {
     taskId: crypto.randomUUID(), sessionId, ownerWebContentsId, root,
@@ -696,7 +882,7 @@ async function createProposal({
     scope: scope || '.',
     proposalId: crypto.randomUUID(),
     workspace: { root, name: workspace.name || path.basename(root), branch: workspace.branch || null },
-    raw, files: changes, before,
+    raw, files: changes, before, after,
     verificationScript: safeVerificationScripts[0] || null,
     verificationScripts: safeVerificationScripts,
     state: 'proposal_ready', progress: { phase: 'proposal', message: 'Validated proposal.', at: now() },
@@ -791,58 +977,117 @@ function reject(taskId, owner) {
   recordMutation(task, 'proposal_rejected', { proposalId: task.proposalId || taskId });
   return publicTask(task);
 }
-async function writeAndVerify(task, files) {
-  const written = [];
-  const temporary = [];
-  try {
-    for (const file of files) {
-      const safe = await safePath(task.root, file.path);
-      const temp = `${safe.target}.developer-${task.taskId}.tmp`;
-      temporary.push(temp);
-      await fs.writeFile(temp, file.content, 'utf8');
-      await fs.rename(temp, safe.target); written.push(file);
-    }
-    const resulting = await Promise.all(files.map((file) => snapshot(task.root, file.path)));
-    if (resulting.some((item, index) => item.hash !== files[index].hash)) throw new Error('Post-apply verification failed.');
-  } catch (error) {
-    await Promise.all(temporary.map((temp) => fs.rm(temp, { force: true }).catch(() => {})));
-    for (const file of written) {
-      const safe = await safePath(task.root, file.path);
-      const original = task.before.find((item) => item.path === file.path);
-      const rollbackTemp = `${safe.target}.developer-rollback-${task.taskId}.tmp`;
-      try {
-        await fs.writeFile(rollbackTemp, original.content, 'utf8');
-        await fs.rename(rollbackTemp, safe.target);
-      } finally {
-        await fs.rm(rollbackTemp, { force: true }).catch(() => {});
-      }
-    }
-    const restored = await Promise.all(written.map((file) => snapshot(task.root, file.path)));
-    if (restored.some((item, index) => item.hash !== task.before.find((before) => before.path === written[index].path).hash)) {
-      throw new Error(`Apply failed and rollback verification failed: ${error.message}`);
-    }
-    throw error;
+async function authorizeMutation(task, authorize, operation, paths) {
+  if (typeof authorize !== 'function') throw new Error('The authoritative file mutation policy is unavailable.');
+  const targets = [...new Set(paths)];
+  const result = await authorize({
+    taskId: task.taskId,
+    operation,
+    paths: targets,
+    proposalApproved: Boolean(task.approval),
+    deleteConfirmationRequired: operation === 'delete' || operation === 'delete_directory',
+  });
+  if (!result || result.allowed !== true) {
+    task.evidence = [...(task.evidence || []), {
+      kind: 'POLICY_GATE',
+      operation,
+      paths: targets,
+      decision: 'BLOCK',
+      reason: result?.reason || 'Policy Gate unavailable or denied.',
+      at: now(),
+    }].slice(-50);
+    recordMutation(task, 'policy_gate_denied', { operation, paths: targets, reason: result?.reason || 'Policy Gate unavailable or denied.' });
+    throw new Error(result?.reason || 'The authoritative file mutation policy denied or could not authorize this operation.');
   }
+  task.evidence = [...(task.evidence || []), {
+    kind: 'POLICY_GATE',
+    operation,
+    paths: targets,
+    decision: 'ALLOW',
+    at: now(),
+  }].slice(-50);
+  recordMutation(task, 'policy_gate_allowed', { operation, paths: targets });
 }
-async function restoreBeforeSnapshot(task) {
-  const temporary = [];
+async function writeContentAtomically(root, relative, content, taskId) {
+  const safe = await safePath(root, relative, { allowMissing: true });
+  if (!safe.parentExists) throw new Error('Mutation target parent no longer exists.');
+  const temp = `${safe.target}.developer-${taskId}.tmp`;
+  let handle;
   try {
-    for (const file of task.before) {
-      const safe = await safePath(task.root, file.path);
-      const temp = `${safe.target}.developer-recovery-${task.taskId}.tmp`;
-      temporary.push(temp);
-      await fs.writeFile(temp, file.content, 'utf8');
-      await fs.rename(temp, safe.target);
-    }
-    const restored = await Promise.all(task.before.map((item) => snapshot(task.root, item.path)));
-    if (restored.some((item, index) => item.hash !== task.before[index].hash)) {
-      throw new Error('Rollback verification failed.');
-    }
+    handle = await fs.open(temp, 'wx', 0o600);
+    await handle.writeFile(content, typeof content === 'string' ? 'utf8' : undefined);
+    await handle.close();
+    handle = null;
+    await renameWithRetry(temp, safe.target);
   } finally {
-    await Promise.all(temporary.map((temp) => fs.rm(temp, { force: true }).catch(() => {})));
+    if (handle) await handle.close().catch(() => {});
+    await fs.rm(temp, { force: true }).catch(() => {});
   }
 }
-async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
+async function applyChanges(task, authorize) {
+  for (const change of task.files) {
+    const operation = change.operation || 'modify';
+    const paths = change.sourcePath ? [change.sourcePath, change.path] : [change.path];
+    await authorizeMutation(task, authorize, operation, paths);
+  }
+  if (task.cancelRequested) throw Object.assign(new Error('Developer task was cancelled before file mutation.'), { cancelled: true });
+  const current = await Promise.all(task.before.map((item) => snapshotTarget(task.root, item.path)));
+  if (current.some((item, index) => item.hash !== task.before[index].hash)) {
+    throw new Error('Files changed while mutation approval was pending.');
+  }
+  for (const change of task.files) {
+    const sourcePath = change.sourcePath || change.path;
+    if (change.operation === 'delete' || change.operation === 'delete_directory') {
+      const safe = await safePath(task.root, change.path, { allowDirectory: change.operation === 'delete_directory' });
+      await fs.rm(safe.target, { recursive: change.operation === 'delete_directory', force: false });
+    } else if (change.operation === 'rename') {
+      await writeContentAtomically(task.root, change.path, change.content, task.taskId);
+      const source = await safePath(task.root, sourcePath);
+      await fs.rm(source.target);
+    } else {
+      await writeContentAtomically(task.root, change.path, change.content, task.taskId);
+    }
+  }
+  const resulting = await Promise.all(task.after.map((item) => snapshotTarget(task.root, item.path)));
+  if (resulting.some((item, index) => item.hash !== task.after[index].hash)) throw new Error('Post-apply verification failed.');
+}
+async function restoreSnapshot(task, snapshotState) {
+  const safe = await safePath(task.root, snapshotState.path, { allowMissing: true, allowDirectory: true });
+  if (!snapshotState.exists) {
+    if (safe.exists) await fs.rm(safe.target, { recursive: true, force: false });
+    return;
+  }
+  if (snapshotState.type === 'directory') {
+    if (safe.exists) await fs.rm(safe.target, { recursive: true, force: false });
+    await fs.mkdir(safe.target, { recursive: true });
+    for (const entry of snapshotState.entries) {
+      const entryPath = `${snapshotState.path}/${entry.path}`;
+      const child = await safePath(task.root, entryPath, { allowMissing: true });
+      if (entry.type === 'directory') await fs.mkdir(child.target, { recursive: true });
+      else await writeContentAtomically(task.root, entryPath, Buffer.from(entry.contentBase64, 'base64'), task.taskId);
+    }
+  } else {
+    await writeContentAtomically(task.root, snapshotState.path, snapshotState.content, task.taskId);
+  }
+}
+async function restoreBeforeSnapshot(task, authorize) {
+  const toRestore = [];
+  for (const item of task.before) {
+    const current = await snapshotTarget(task.root, item.path);
+    if (current.hash === item.hash) continue;
+    const operation = item.exists ? 'undo' : (current.type === 'directory' ? 'delete_directory' : 'delete');
+    await authorizeMutation(task, authorize, operation, [item.path]);
+    toRestore.push({ item, expectedCurrentHash: current.hash });
+  }
+  const revalidated = await Promise.all(toRestore.map(({ item }) => snapshotTarget(task.root, item.path)));
+  if (revalidated.some((current, index) => current.hash !== toRestore[index].expectedCurrentHash)) {
+    throw new Error('Rollback target changed while recovery approval was pending.');
+  }
+  for (const { item } of toRestore) await restoreSnapshot(task, item);
+  const restored = await Promise.all(task.before.map((item) => snapshotTarget(task.root, item.path)));
+  if (restored.some((item, index) => item.hash !== task.before[index].hash)) throw new Error('Rollback verification failed.');
+}
+async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize = null) {
   const task = getTask(taskId, owner);
   if (task.state !== 'approved') throw new Error('Proposal must be approved exactly once.');
   if (expectedRoot && (await fs.realpath(expectedRoot)) !== task.root) throw new Error('The selected project changed after this proposal was created.');
@@ -860,11 +1105,11 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     task.runtime.history = [...(task.runtime.history || []), { phase: 'APPLYING', at: now(), message: 'Applying validated patch.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'apply', 'Applying validated patch.');
-    const current = await Promise.all(task.before.map((item) => snapshot(task.root, item.path)));
+    const current = await Promise.all(task.before.map((item) => snapshotTarget(task.root, item.path)));
     if (current.some((item, index) => item.hash !== task.before[index].hash)) throw new Error('Files changed after approval.');
     if (task.cancelRequested) { transition(task, 'cancelled'); return publicTask(task); }
     writeStarted = true;
-    await writeAndVerify(task, task.files);
+    await applyChanges(task, authorize);
     patchApplied = true;
     if (task.cancelRequested) throw Object.assign(new Error('Developer task was cancelled before verification.'), { cancelled: true });
     transition(task, 'verifying');
@@ -877,9 +1122,54 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     if (verifyRunner) {
       const result = await verifyRunner();
       task.verification = result;
+      const verificationAttempts = Array.isArray(result?.attempts) ? result.attempts : [];
+      task.evidence = [...(task.evidence || []), {
+        kind: 'VERIFICATION',
+        status: result?.status || (result?.ok ? 'PASS' : 'FAILED'),
+        checks: verificationAttempts.map((attempt) => ({
+          check: attempt.check || attempt.script || null,
+          ok: Boolean(attempt.ok),
+          classification: attempt.classification || null,
+          extracted: attempt.extracted || null,
+        })),
+        at: now(),
+      }].slice(-50);
+      if (!result?.ok && result?.status === 'CODE_FAILURE') {
+        const failedChecks = verificationAttempts.filter((attempt) => !attempt.ok);
+        task.evidence = [...task.evidence, {
+          kind: 'DIAGNOSIS',
+          status: result.classification || result.status,
+          checks: failedChecks.map((attempt) => ({
+            check: attempt.check || attempt.script || null,
+            ok: false,
+            classification: attempt.classification || result.classification || null,
+            extracted: attempt.extracted || null,
+          })),
+          at: now(),
+        }].slice(-50);
+        recordMutation(task, 'verification_diagnosed', {
+          transactionId: task.transactionId,
+          classification: result.classification || result.status,
+          checks: failedChecks.map((attempt) => ({
+            check: attempt.check || attempt.script || null,
+            classification: attempt.classification || result.classification || null,
+            file: attempt.extracted?.file || null,
+            line: attempt.extracted?.line || null,
+          })),
+        });
+      }
+      task.runtime.metrics = {
+        ...(task.runtime.metrics || {}),
+        verificationRuns: Number(task.runtime.metrics?.verificationRuns || 0) + verificationAttempts.length,
+      };
       recordMutation(task, 'verification_recorded', {
         transactionId: task.transactionId, attempt: 1,
         result: result?.status || result?.failure || (result?.ok ? 'pass' : 'failure'),
+        checks: verificationAttempts.map((attempt) => ({
+          check: attempt.check || attempt.script || null,
+          ok: Boolean(attempt.ok),
+          classification: attempt.classification || null,
+        })),
       });
       if (task.cancelRequested || result?.cancelled) {
         throw Object.assign(new Error('Developer task was cancelled during verification.'), { cancelled: true });
@@ -890,7 +1180,7 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     task.runtime = task.runtime || {};
     task.runtime.phase = 'COMPLETED';
     task.runtime.taskState = 'COMPLETED';
-    task.runtime.metrics = { ...(task.runtime.metrics || {}), verificationRuns: Number(task.runtime.metrics?.verificationRuns || 0) + 1, confidence: 'HIGH' };
+    task.runtime.metrics = { ...(task.runtime.metrics || {}), confidence: 'HIGH' };
     task.runtime.history = [...(task.runtime.history || []), { phase: 'COMPLETED', at: now(), message: 'Apply and verification completed.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'complete', 'Apply and verification completed.');
@@ -921,7 +1211,7 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     if (patchApplied || writeStarted || task.state === 'verifying') {
       task.state = 'recovering'; task.updatedAt = now(); progress(task, 'recover', 'Apply failed; verifying rollback state.');
       try {
-        await restoreBeforeSnapshot(task);
+        await restoreBeforeSnapshot(task, authorize);
       } catch (rollbackError) {
         task.error = `Rollback verification failed: ${rollbackError.message}`;
       }
@@ -933,16 +1223,18 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null) {
     throw error;
   } finally { release(); }
 }
-async function undo(taskId, owner) {
+async function undo(taskId, owner, authorize, explicitlyApproved = false) {
   const task = getTask(taskId, owner);
   if (task.state !== 'completed') throw new Error('Only a completed proposal can be undone.');
+  if (!explicitlyApproved) throw new Error('Undo requires a separate explicit user approval.');
+  if (typeof authorize !== 'function') throw new Error('The authoritative file mutation policy is unavailable.');
   const release = await acquireLock();
   task.transactionId = crypto.randomUUID();
   recordMutation(task, 'undo_started', { transactionId: task.transactionId });
   try {
-    const current = await Promise.all(task.files.map((item) => snapshot(task.root, item.path)));
-    if (current.some((item, index) => item.hash !== task.files[index].hash)) throw new Error('Undo refused: files changed after apply.');
-    await writeAndVerify(task, task.before.map((item) => ({ path: item.path, hash: item.hash, content: item.content })));
+    const current = await Promise.all(task.after.map((item) => snapshotTarget(task.root, item.path)));
+    if (current.some((item, index) => item.hash !== task.after[index].hash)) throw new Error('Undo refused: files changed after apply.');
+    await restoreBeforeSnapshot(task, authorize);
     transition(task, 'undone'); progress(task, 'undo', 'Undo completed and verified.'); recordMutation(task, 'undo_completed', { transactionId: task.transactionId }); return publicTask(task);
   } finally { release(); }
 }

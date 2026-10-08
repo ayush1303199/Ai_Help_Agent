@@ -9,6 +9,8 @@ function randomId(prefix = 'proj') {
   return `${prefix}-${crypto.randomBytes(4).toString('hex')}`;
 }
 
+const authorizeMutation = async () => ({ allowed: true });
+
 const CODING_PRODUCTION_FILES = [
   'electron/developerAgent.cjs',
   'electron/developerFiles.cjs',
@@ -350,14 +352,14 @@ async function runAutonomousCodingTests() {
 
     // Explicit approval
     developerAgent.approve(prop.taskId, ownerObj);
-    const applyRes = await developerAgent.apply(prop.taskId, ownerObj, async () => ({ ok: true, status: 'PASS' }), discLifecycle.projectRoot);
+    const applyRes = await developerAgent.apply(prop.taskId, ownerObj, async () => ({ ok: true, status: 'PASS' }), discLifecycle.projectRoot, authorizeMutation);
     assert.equal(applyRes.state, 'completed');
 
     const modified = await developerFiles.readFile(`src/${lifecycleTarget}`, ownerLifecycle);
     assert.ok(modified.content.includes('enabled: true'), 'File must reflect approved diff');
 
     // Clean rollback via undo
-    await developerAgent.undo(prop.taskId, ownerObj);
+    await developerAgent.undo(prop.taskId, ownerObj, authorizeMutation, true);
     const rolledBack = await developerFiles.readFile(`src/${lifecycleTarget}`, ownerLifecycle);
     assert.equal(rolledBack.content, 'module.exports = { enabled: false };\n', 'Undo must restore original content exactly');
     developerFiles.releaseProject(ownerLifecycle);

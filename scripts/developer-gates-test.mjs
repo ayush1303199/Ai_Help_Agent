@@ -25,6 +25,66 @@ try {
   assert.ok(refs.some((item) => item.file === 'main.ts' && item.relationship === 'reference'));
   const second = await index.buildIndex(root, first);
   assert.equal(second.cacheHits, 2);
+  const semanticRoot = path.join(root, 'semantic-project');
+  const semanticCacheDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-semantic-cache-'));
+  await fs.mkdir(path.join(semanticRoot, 'src'), { recursive: true });
+  await fs.writeFile(path.join(semanticRoot, 'src', 'colors.ts'), 'export const palette = "blue";\n// privateCodeToken\n', 'utf8');
+  await fs.writeFile(path.join(semanticRoot, 'src', 'payments.ts'), 'export function chargeCard() { return true; }\n', 'utf8');
+  let embeddedTextCount = 0;
+  const createFakePipeline = async () => async (texts) => {
+    embeddedTextCount += texts.length;
+    const vectors = texts.map((text) => {
+      const vector = [0, 0, 0, 0];
+      if (/\b(?:blue|azure|color|palette)\b/i.test(text)) vector[0] += 1;
+      if (/\b(?:payment|charge|card)\b/i.test(text)) vector[1] += 1;
+      const length = Math.hypot(...vector) || 1;
+      return vector.map((value) => value / length);
+    });
+    return { tolist: () => vectors };
+  };
+  index.configureSemanticSearch({
+    cacheDirectory: semanticCacheDirectory,
+    modelCacheDirectory: path.join(semanticCacheDirectory, 'models'),
+    createPipeline: createFakePipeline,
+  });
+  const semanticSnapshot = await index.buildIndex(semanticRoot);
+  const semanticFirst = await index.searchSemantic(semanticSnapshot, 'azure colors', { scope: 'src' });
+  assert.equal(semanticFirst.status, 'ready');
+  assert.equal(semanticFirst.results[0].path, 'src/colors.ts');
+  assert.equal(semanticFirst.indexedFiles, 2);
+  const storedCacheFile = (await fs.readdir(semanticCacheDirectory)).find((entry) => entry.endsWith('.json'));
+  const storedSemanticCache = await fs.readFile(path.join(semanticCacheDirectory, storedCacheFile), 'utf8');
+  assert.equal(storedSemanticCache.includes('privateCodeToken'), false);
+  index.configureSemanticSearch({
+    cacheDirectory: semanticCacheDirectory,
+    modelCacheDirectory: path.join(semanticCacheDirectory, 'models'),
+    createPipeline: createFakePipeline,
+  });
+  const semanticPersisted = await index.searchSemantic(semanticSnapshot, 'azure colors', { scope: 'src' });
+  assert.equal(semanticPersisted.cachedFiles, 2);
+  assert.equal(semanticPersisted.indexedChunks, 0);
+  await fs.writeFile(path.join(semanticRoot, 'src', 'colors.ts'), 'export const palette = "green";\n', 'utf8');
+  await fs.rm(path.join(semanticRoot, 'src', 'payments.ts'));
+  const semanticChangedSnapshot = await index.buildIndex(semanticRoot, semanticSnapshot);
+  const semanticChanged = await index.searchSemantic(semanticChangedSnapshot, 'azure colors', { scope: 'src' });
+  assert.equal(semanticChanged.indexedFiles, 1);
+  assert.equal(semanticChanged.cachedFiles, 0);
+  assert.ok(semanticChanged.results.every((item) => item.path.startsWith('src/')));
+  const isolatedRoot = path.join(root, 'isolated-project');
+  await fs.mkdir(isolatedRoot, { recursive: true });
+  await fs.writeFile(path.join(isolatedRoot, 'other.ts'), '// payment card charge lookup\nexport function chargeCard() { return true; }\n', 'utf8');
+  const isolatedSnapshot = await index.buildIndex(isolatedRoot);
+  const isolatedSemantic = await index.searchSemantic(isolatedSnapshot, 'payment processing');
+  assert.deepEqual(isolatedSemantic.results.map((item) => item.path), ['other.ts']);
+  await fs.rm(semanticCacheDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  assert.ok(embeddedTextCount >= 5);
+  const combinedResults = index.mergeSearchResults(
+    [{ path: 'src/colors.ts', line: 1, text: 'lexical' }],
+    [{ path: 'src/colors.ts', line: 1, text: 'semantic', score: 0.9 }, { path: 'src/payments.ts', line: 1, text: 'other', score: 0.8 }],
+  );
+  assert.equal(combinedResults[0].matchType, 'hybrid');
+  assert.equal(combinedResults[0].text, 'lexical');
+  assert.equal(combinedResults.length, 2);
   const ranked = context.assembleContext({ query: 'main', results: [{ path: 'z.ts', text: 'main' }, { path: 'a.ts', text: 'other' }], maxTokens: 10 });
   assert.equal(ranked.items[0].path, 'z.ts');
   assert.equal(context.assembleContext({ query: 'main', results: [{ path: 'z.ts', text: 'main' }], maxTokens: 10 }).cached, false);

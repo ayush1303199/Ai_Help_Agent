@@ -6,6 +6,8 @@ import { spawn } from 'node:child_process';
 import developerFiles from '../electron/developerFiles.cjs';
 import developerAgent from '../electron/developerAgent.cjs';
 
+const authorizeMutation = async () => ({ allowed: true });
+
 console.log('[TEST] Starting Coding Agent sync & tool contract verification test...');
 
 const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'coding-sync-contract-'));
@@ -150,12 +152,13 @@ try {
     { ownerWebContentsId: ownerLifecycle, sessionId },
     async () => ({ ok: true, status: 'PASS' }),
     projectPath,
+    authorizeMutation,
   );
   assert.equal(applied.state, 'completed');
   assert.equal(await fs.readFile(path.join(projectPath, 'index.ts'), 'utf8'), 'console.log("verified");\n');
 
   // Undo restores exact snapshot
-  await developerAgent.undo(proposal.taskId, { ownerWebContentsId: ownerLifecycle, sessionId });
+  await developerAgent.undo(proposal.taskId, { ownerWebContentsId: ownerLifecycle, sessionId }, authorizeMutation, true);
   assert.equal(await fs.readFile(path.join(projectPath, 'index.ts'), 'utf8'), 'console.log("hello");\n');
   console.log('[TEST] Case 6 PASSED: Proposal approval gate & rollback strictly preserved.');
 

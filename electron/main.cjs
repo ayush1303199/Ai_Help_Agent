@@ -28,6 +28,10 @@ const isDev = !app.isPackaged;
 const codingAuthToken = process.env.AI_CODING_AUTH_TOKEN || crypto.randomBytes(32).toString('base64url');
 process.env.AI_CODING_AUTH_TOKEN = codingAuthToken;
 developerFiles.configureAuditDirectory(path.join(app.getPath('userData'), 'developer-audit'));
+developerIndex.configureSemanticSearch({
+  cacheDirectory: path.join(app.getPath('userData'), 'developer-semantic-index'),
+  modelCacheDirectory: path.join(app.getPath('userData'), 'developer-semantic-index', 'models'),
+});
 let backendProcess = null;
 let isQuitting = false;
 let mainWindow = null;
@@ -1143,7 +1147,38 @@ app.whenReady().then(async () => {
     }
     if (name === 'search_code') {
       if (!query || query.length > 200) throw new TypeError('Coding Agent search query is invalid.');
-      return { ok: true, tool: name, data: await developerFiles.searchCode(query, event.sender.id, scope) };
+      const lexical = await developerFiles.searchCode(query, event.sender.id, scope);
+      let semantic = { status: 'unavailable', error: 'Semantic search did not run.', results: [] };
+      try {
+        const cached = developerIndexCaches.get(root) || null;
+        const nextIndex = await developerIndex.buildIndex(root, cached && cached.root === root ? cached : null);
+        developerIndexCaches.set(root, nextIndex);
+        semantic = await developerIndex.searchSemantic(nextIndex, query, { scope });
+      } catch (error) {
+        semantic = {
+          status: 'unavailable',
+          error: error instanceof Error ? error.message : String(error),
+          results: [],
+        };
+      }
+      return {
+        ok: true,
+        tool: name,
+        data: {
+          ...lexical,
+          results: developerIndex.mergeSearchResults(lexical.results, semantic.results),
+          semantic: {
+            status: semantic.status,
+            model: semantic.model,
+            indexedFiles: semantic.indexedFiles,
+            cachedFiles: semantic.cachedFiles,
+            indexedChunks: semantic.indexedChunks,
+            skippedFiles: semantic.skippedFiles,
+            truncated: semantic.truncated,
+            error: semantic.error,
+          },
+        },
+      };
     }
     if (name === 'get_context') {
       if (!query || query.length > 200) throw new TypeError('Coding Agent context query is invalid.');
@@ -1333,14 +1368,108 @@ app.whenReady().then(async () => {
         ? { ...result, reason: verificationPlan.reason }
         : result);
     };
+    const authorizeMutation = async (request) => {
+      developerAgent.getTask(id, owner);
+      developerFiles.assertProjectOwner(event.sender.id);
+      if ((await fs.realpath(developerFiles.getProjectRoot(event.sender.id))) !== currentRoot) {
+        throw new Error('The selected project changed before the mutation was authorized.');
+      }
+      let deleteConfirmed = false;
+      if (request.deleteConfirmationRequired) {
+        const targetPaths = request.paths.map((relative) => path.resolve(currentRoot, relative));
+        const confirmation = await dialog.showMessageBox(BrowserWindow.fromWebContents(event.sender), {
+          type: 'warning',
+          title: 'Confirm file deletion',
+          message: 'Confirm deletion of this exact approved target?',
+          detail: targetPaths.join('\n'),
+          buttons: ['Delete target', 'Cancel'],
+          defaultId: 1,
+          cancelId: 1,
+          noLink: true,
+        });
+        if (confirmation.response !== 0) return { allowed: false, reason: 'Deletion was not confirmed.' };
+        deleteConfirmed = true;
+      }
+      const response = await fetch('http://127.0.0.1:3001/api/coding/policy/file-mutation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Coding-Auth': codingAuthToken },
+        body: JSON.stringify({
+          operation: request.operation,
+          paths: request.paths,
+          proposalApproved: request.proposalApproved === true,
+          deleteConfirmed,
+        }),
+      });
+      if (!response.ok) throw new Error(`Policy Gate request failed (${response.status}).`);
+      const decision = await response.json();
+      return {
+        allowed: decision?.decision === 'ALLOW',
+        reason: typeof decision?.reason === 'string' ? decision.reason : 'Policy Gate denied the mutation.',
+      };
+    };
     try {
-      return await developerAgent.apply(id, owner, verify, currentRoot);
+      return await developerAgent.apply(id, owner, verify, currentRoot, authorizeMutation);
     } catch (error) {
       if (error.taskSnapshot) return error.taskSnapshot;
       throw error;
     }
   });
-  ipcMain.handle('developer:proposal-undo', (event, id) => developerAgent.undo(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
+  ipcMain.handle('developer:proposal-undo', async (event, id) => {
+    const owner = { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id };
+    const task = developerAgent.getTask(id, owner);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
+    if (root !== task.root) throw new Error('The selected project changed after this proposal was applied.');
+    const affectedPaths = [...new Set((task.before || []).map((item) => path.resolve(root, item.path)))];
+    const confirmation = await dialog.showMessageBox(BrowserWindow.fromWebContents(event.sender), {
+      type: 'warning',
+      title: 'Confirm proposal undo',
+      message: 'Undo this proposal and restore the previous files?',
+      detail: affectedPaths.join('\n'),
+      buttons: ['Undo and restore', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (confirmation.response !== 0) return developerAgent.getTask(id, owner);
+    const authorizeMutation = async (request) => {
+      developerAgent.getTask(id, owner);
+      developerFiles.assertProjectOwner(event.sender.id);
+      let deleteConfirmed = false;
+      if (request.deleteConfirmationRequired) {
+        const targetPaths = request.paths.map((relative) => path.resolve(root, relative));
+        const deleteApproval = await dialog.showMessageBox(BrowserWindow.fromWebContents(event.sender), {
+          type: 'warning',
+          title: 'Confirm file deletion',
+          message: 'Confirm deletion of this exact target as part of undo?',
+          detail: targetPaths.join('\n'),
+          buttons: ['Delete target', 'Cancel'],
+          defaultId: 1,
+          cancelId: 1,
+          noLink: true,
+        });
+        if (deleteApproval.response !== 0) return { allowed: false, reason: 'Undo deletion was not confirmed.' };
+        deleteConfirmed = true;
+      }
+      const response = await fetch('http://127.0.0.1:3001/api/coding/policy/file-mutation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Coding-Auth': codingAuthToken },
+        body: JSON.stringify({
+          operation: request.operation,
+          paths: request.paths,
+          proposalApproved: true,
+          deleteConfirmed,
+        }),
+      });
+      if (!response.ok) throw new Error(`Policy Gate request failed (${response.status}).`);
+      const decision = await response.json();
+      return {
+        allowed: decision?.decision === 'ALLOW',
+        reason: typeof decision?.reason === 'string' ? decision.reason : 'Policy Gate denied the undo.',
+      };
+    };
+    return developerAgent.undo(id, owner, authorizeMutation, true);
+  });
   ipcMain.handle('developer:proposal-get', (event, id) => developerAgent.getTask(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
   ipcMain.handle('developer:proposal-cancel', (event) => developerAgent.cancelSession(event.sender.id));
   ipcMain.handle('developer:task-pause', (event, taskId) => {

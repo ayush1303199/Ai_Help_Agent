@@ -311,7 +311,7 @@ interface Window {
       error: { code: string; message: string } | null;
     }>;
     advanceDeveloperConversation: (update: { turnId: string; state: 'understanding' | 'completed' | 'failed' | 'cancelled'; phase?: string; fileCount?: number }) => Promise<{ turnId: string; state: string; updatedAt: string }>;
-    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null, scope?: string, conversationTurnId?: string | null) => Promise<{ id: string; state: string; lifecycleState?: string; files: Array<{ path: string; hash: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
+    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null, scope?: string, conversationTurnId?: string | null) => Promise<{ id: string; state: string; lifecycleState?: string; files: Array<{ operation: string; path: string; sourcePath: string | null; hash: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     approveDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     rejectDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     applyDeveloperProposal: (id: string) => Promise<{
@@ -323,12 +323,34 @@ interface Window {
         status?: string;
         classification?: string;
         reason?: string;
-        attempts?: Array<{ check?: string; ok?: boolean; classification?: string; extracted?: { file?: string | null; line?: number | null; message?: string } }>;
+        attempts?: Array<{
+          check?: string;
+          ok?: boolean;
+          classification?: string;
+          stdout?: string;
+          stderr?: string;
+          extracted?: { file?: string | null; line?: number | null; message?: string };
+        }>;
       } | null;
       outcome?: string | null;
       error?: string | null;
+      evidence?: Array<{
+        kind: string;
+        operation?: string;
+        paths?: string[];
+        decision?: string;
+        reason?: string;
+        status?: string;
+        checks?: Array<{
+          check?: string | null;
+          ok?: boolean;
+          classification?: string | null;
+          extracted?: { file?: string | null; line?: number | null };
+        }>;
+        at?: string;
+      }>;
     }>;
-    undoDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
+    undoDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; evidence?: Array<{ kind: string; operation?: string; paths?: string[]; decision?: string; reason?: string; at?: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperSession: () => Promise<{ sessionId: string }>;
     resumeDeveloperSession: (sessionId: string) => Promise<{ sessionId: string }>;

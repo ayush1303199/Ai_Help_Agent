@@ -1092,6 +1092,28 @@ def set_coding_project_state_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]
     return set_backend_project_state(str(project_root) if project_root else None)
 
 
+@app.post("/api/coding/policy/file-mutation")
+def evaluate_coding_file_mutation(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    supplied_token = request.headers.get("x-coding-auth", "")
+    if not hmac.compare_digest(supplied_token, CODING_AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized file mutation policy request.")
+    operation = payload.get("operation")
+    paths = payload.get("paths")
+    if not isinstance(operation, str) or not isinstance(paths, list):
+        raise HTTPException(status_code=400, detail="A mutation operation and target paths are required.")
+    if not isinstance(payload.get("proposalApproved"), bool):
+        raise HTTPException(status_code=400, detail="Proposal approval state must be explicit.")
+    if "deleteConfirmed" in payload and not isinstance(payload["deleteConfirmed"], bool):
+        raise HTTPException(status_code=400, detail="Deletion confirmation state must be explicit.")
+    decision, reason = PolicyGate.evaluate_file_mutation(
+        operation,
+        paths,
+        payload["proposalApproved"],
+        payload.get("deleteConfirmed", False),
+    )
+    return {"decision": decision, "reason": reason}
+
+
 @app.post("/api/coding/project-attach")
 def attach_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     project_root = str(payload.get("projectRoot") or "").strip()

@@ -10886,7 +10886,7 @@ class PolicyGate:
     ]
 
     SENSITIVE_FILES_PATTERN = re.compile(
-        r"(?:^|[\\/\s])(?:\.env(?:\..*)?|\.ssh|\.aws|\.azure|id_rsa(?:\..*)?|[^\\/\s]+\.(?:pem|key|p12|pfx|crt))(?:\b|$)",
+        r"(?:^|[\\/\s])(?:\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.config|id_rsa(?:\..*)?|[^\\/\s]+\.(?:pem|key|p12|pfx|crt|cer|der))(?:\b|$)",
         re.I
     )
 
@@ -11014,11 +11014,39 @@ class PolicyGate:
     @classmethod
     def evaluate_file_write(cls, target_path: str, proposal_approved: bool) -> Tuple[str, str]:
         """Enforces write protection: writes strictly require an approved proposal."""
-        if cls.SENSITIVE_FILES_PATTERN.search(target_path):
-            return "BLOCK", "Writing to sensitive credential or environment files is strictly blocked."
+        return cls.evaluate_file_mutation("modify", [target_path], proposal_approved)
+
+    @classmethod
+    def evaluate_file_mutation(
+        cls,
+        operation: str,
+        target_paths: List[str],
+        proposal_approved: bool,
+        delete_confirmed: bool = False,
+    ) -> Tuple[str, str]:
+        """Authorizes one proposal-scoped filesystem mutation."""
+        allowed_operations = {"create", "modify", "delete", "delete_directory", "rename", "move", "undo"}
+        if operation not in allowed_operations:
+            return "BLOCK", "Unknown file mutation capability is blocked."
+        if not target_paths or any(not isinstance(item, str) or not item.strip() for item in target_paths):
+            return "BLOCK", "A target path is required for every file mutation."
+        for target_path in target_paths:
+            normalized = target_path.replace("\\", "/")
+            segments = normalized.split("/")
+            if (
+                normalized.startswith("/")
+                or re.match(r"^[a-zA-Z]:", normalized)
+                or any(segment in ("", ".", "..") or ":" in segment or segment.endswith((".", " ")) for segment in segments)
+                or normalized.startswith("//")
+            ):
+                return "BLOCK", "Absolute and traversing file mutation paths are blocked."
+            if cls.SENSITIVE_FILES_PATTERN.search(normalized) or any(segment.lower() == ".git" for segment in segments):
+                return "BLOCK", "Mutation of sensitive files or repository metadata is blocked."
         if not proposal_approved:
-            return "BLOCK", "Repository writes require an approved proposal and snapshot validation."
-        return "ALLOW", "Validated write under approved proposal"
+            return "BLOCK", "Repository mutations require an approved proposal and snapshot validation."
+        if operation in {"delete", "delete_directory"} and not delete_confirmed:
+            return "BLOCK", "Deletion requires a separate explicit confirmation."
+        return "ALLOW", "Validated mutation under the approved proposal"
 
 
 # =====================================================================

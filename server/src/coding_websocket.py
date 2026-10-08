@@ -86,7 +86,12 @@ def _proposal_prompt_instruction(retry: bool = False) -> str:
         "Copy context and removed lines exactly from the inspected file; never use placeholders such as "
         "'existing methods', omit hunk ranges, or include an end-of-file marker as a replacement for source "
         "lines. The diff must be parseable and applicable to the inspected source. "
-        "Never copy the example path or lines unless they were actually inspected."
+        "Never copy the example path or lines unless they were actually inspected. "
+        "A new file must use --- /dev/null and +++ b/<repo-relative-path>; a deleted file must use "
+        "--- a/<repo-relative-path> and +++ /dev/null with a hunk that removes its complete contents. "
+        "A move must use Git rename from/to headers and a complete hunk if contents also change. "
+        "For deleting a directory, emit exactly *** Delete Directory: <repo-relative-directory> after "
+        "inspecting its contents; this will still require a separate user confirmation."
     )
     if retry:
         instruction += (
@@ -674,7 +679,21 @@ def _matches_database_investigation(request: str) -> bool:
     if not req:
         return False
     if not DATABASE_CONTEXT_PATTERN.search(req):
-        return False
+        database_intent = DatabaseSessionManager.resolve_database_intent(req)
+        if (
+            database_intent.get("is_deterministic")
+            and database_intent.get("capability") in {
+                DatabaseCapability.DATABASE_COUNT_RECORDS,
+                DatabaseCapability.DATABASE_QUERY,
+            }
+        ):
+            return True
+        understanding = understand_human_request(req)
+        return bool(
+            understanding.get("action") in {"COUNT", "LIST"}
+            and understanding.get("target")
+            and not _has_explicit_code_resource_cue(req)
+        )
     return bool(DATABASE_INVESTIGATION_PATTERN.search(req))
 
 GENERIC_DATABASE_CREDENTIAL_REQUEST_PATTERN = re.compile(
@@ -4499,6 +4518,8 @@ def _proposal_response_shape(content: str) -> Dict[str, Any]:
     lines = stripped.splitlines()
     file_headers = sum(bool(re.match(r"^\+\+\+ (?:[ab]/)?\S", line)) for line in lines)
     hunks = sum(bool(re.match(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", line)) for line in lines)
+    directory_deletes = sum(bool(re.match(r"^\*\*\* Delete Directory: \S", line)) for line in lines)
+    renames = sum(bool(re.match(r"^rename (?:from|to) \S", line)) for line in lines)
     return {
         "chars": len(content),
         "lines": len(lines),
@@ -4508,7 +4529,7 @@ def _proposal_response_shape(content: str) -> Dict[str, Any]:
         "startsWithDiff": stripped.startswith(("diff --git ", "--- ")),
         "startsWithProse": bool(lines and re.match(r"^[^\W\d_]", lines[0], re.UNICODE)),
         "noChanges": bool(re.fullmatch(r"NO_CHANGES", stripped, re.IGNORECASE)),
-        "validDiffShape": file_headers > 0 and hunks > 0,
+        "validDiffShape": (file_headers > 0 and hunks > 0) or directory_deletes > 0 or renames >= 2,
     }
 
 

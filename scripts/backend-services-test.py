@@ -9513,6 +9513,37 @@ class CodingProjectIdentityTests(unittest.TestCase):
 
 
 class CodingRequestAuthenticationTests(unittest.TestCase):
+    def test_file_mutation_policy_route_requires_coding_auth_and_returns_gate_decision(self):
+        import index
+        from fastapi.testclient import TestClient
+
+        payload = {
+            "operation": "create",
+            "paths": ["src/new.py"],
+            "proposalApproved": True,
+        }
+        with TestClient(index.app) as client:
+            unauthorized = client.post("/api/coding/policy/file-mutation", json=payload)
+            allowed = client.post(
+                "/api/coding/policy/file-mutation",
+                json=payload,
+                headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
+            )
+            unconfirmed_delete = client.post(
+                "/api/coding/policy/file-mutation",
+                json={
+                    "operation": "delete",
+                    "paths": ["src/old.py"],
+                    "proposalApproved": True,
+                },
+                headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
+            )
+
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.json()["decision"], "ALLOW")
+        self.assertEqual(unconfirmed_delete.json()["decision"], "BLOCK")
+
     def test_coding_http_requires_launch_token_and_trusted_origin(self):
         import index
         from fastapi.testclient import TestClient

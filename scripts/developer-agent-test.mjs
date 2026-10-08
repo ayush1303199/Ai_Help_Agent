@@ -40,6 +40,11 @@ try {
   });
   assert.equal(proposal.state, 'awaiting_approval');
   const owner = { ownerWebContentsId, sessionId };
+  const authorizedMutations = [];
+  const authorizeTestMutation = async (request) => {
+    authorizedMutations.push(request);
+    return { allowed: true };
+  };
   await assert.rejects(() => agent.apply(proposal.taskId, owner), /approved/);
   assert.throws(() => agent.approve(proposal.taskId, { ownerWebContentsId: 12, sessionId: agent.getSession(12) }), /not owned/);
   const rejectedProposal = await agent.createProposal({
@@ -51,11 +56,131 @@ try {
   assert.equal(agent.getTaskForTest(rejectedProposal.taskId).approval, undefined);
   await assert.rejects(() => agent.apply(rejectedProposal.taskId, owner), /approved/);
   agent.approve(proposal.taskId, owner);
-  await agent.apply(proposal.taskId, owner);
+  await agent.apply(proposal.taskId, owner, undefined, null, authorizeTestMutation);
   assert.equal(await fs.readFile(file, 'utf8'), 'one\nthree\n');
-  await agent.undo(proposal.taskId, owner);
+  await assert.rejects(() => agent.undo(proposal.taskId, owner, authorizeTestMutation), /separate explicit user approval/);
+  await agent.undo(proposal.taskId, owner, authorizeTestMutation, true);
   assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n');
-  await assert.rejects(() => agent.createProposal({ root, ownerWebContentsId, sessionId, raw: '--- a/../escape\n+++ b/../escape\n@@ -1 +1 @@\n-x\n+y\n' }), /traversal|exist/);
+  assert.ok(authorizedMutations.some((request) => request.operation === 'modify'));
+  assert.ok(authorizedMutations.some((request) => request.operation === 'undo'));
+
+  const createdProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+created\n',
+  });
+  assert.equal(createdProposal.files[0].operation, 'create');
+  agent.approve(createdProposal.taskId, owner);
+  await agent.apply(createdProposal.taskId, owner, undefined, null, authorizeTestMutation);
+  assert.equal(await fs.readFile(path.join(root, 'new.txt'), 'utf8'), 'created\n');
+  await agent.undo(createdProposal.taskId, owner, authorizeTestMutation, true);
+  await assert.rejects(() => fs.access(path.join(root, 'new.txt')), { code: 'ENOENT' });
+
+  const deletedProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- a/sample.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n',
+  });
+  assert.equal(deletedProposal.files[0].operation, 'delete');
+  agent.approve(deletedProposal.taskId, owner);
+  await agent.apply(deletedProposal.taskId, owner, undefined, null, authorizeTestMutation);
+  await assert.rejects(() => fs.access(file), { code: 'ENOENT' });
+  await agent.undo(deletedProposal.taskId, owner, authorizeTestMutation, true);
+  assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n');
+
+  const renamedProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: 'diff --git a/sample.txt b/renamed.txt\nsimilarity index 100%\nrename from sample.txt\nrename to renamed.txt\n',
+  });
+  assert.equal(renamedProposal.files[0].operation, 'rename');
+  agent.approve(renamedProposal.taskId, owner);
+  await agent.apply(renamedProposal.taskId, owner, undefined, null, authorizeTestMutation);
+  assert.equal(await fs.readFile(path.join(root, 'renamed.txt'), 'utf8'), 'one\ntwo\n');
+  await agent.undo(renamedProposal.taskId, owner, authorizeTestMutation, true);
+  assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n');
+  await assert.rejects(() => fs.access(path.join(root, 'renamed.txt')), { code: 'ENOENT' });
+
+  await fs.mkdir(path.join(root, 'folder'));
+  await fs.writeFile(path.join(root, 'folder', 'nested.txt'), 'nested\n', 'utf8');
+  const directoryDeleteProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '*** Delete Directory: folder\n',
+  });
+  assert.equal(directoryDeleteProposal.files[0].operation, 'delete_directory');
+  agent.approve(directoryDeleteProposal.taskId, owner);
+  await agent.apply(directoryDeleteProposal.taskId, owner, undefined, null, authorizeTestMutation);
+  await assert.rejects(() => fs.access(path.join(root, 'folder')), { code: 'ENOENT' });
+  await agent.undo(directoryDeleteProposal.taskId, owner, authorizeTestMutation, true);
+  assert.equal(await fs.readFile(path.join(root, 'folder', 'nested.txt'), 'utf8'), 'nested\n');
+
+  const deniedCreate = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- /dev/null\n+++ b/denied.txt\n@@ -0,0 +1,1 @@\n+nope\n',
+  });
+  agent.approve(deniedCreate.taskId, owner);
+  await assert.rejects(
+    () => agent.apply(deniedCreate.taskId, owner, undefined, null, async () => ({ allowed: false, reason: 'policy denial' })),
+    /policy denial/,
+  );
+  await assert.rejects(() => fs.access(path.join(root, 'denied.txt')), { code: 'ENOENT' });
+  const multiCreate = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- /dev/null\n+++ b/first.txt\n@@ -0,0 +1,1 @@\n+first\n'
+      + '--- /dev/null\n+++ b/second.txt\n@@ -0,0 +1,1 @@\n+second\n',
+  });
+  agent.approve(multiCreate.taskId, owner);
+  let policyCallCount = 0;
+  await assert.rejects(() => agent.apply(multiCreate.taskId, owner, undefined, null, async () => {
+    policyCallCount += 1;
+    return policyCallCount === 1 ? { allowed: true } : { allowed: false, reason: 'second target denied' };
+  }), /second target denied/);
+  assert.equal(policyCallCount, 2, 'Each target must reach PolicyGate before any file is written.');
+  await assert.rejects(() => fs.access(path.join(root, 'first.txt')), { code: 'ENOENT' });
+  await assert.rejects(() => fs.access(path.join(root, 'second.txt')), { code: 'ENOENT' });
+
+  await fs.writeFile(path.join(root, 'second.txt'), 'alpha\nbeta\n', 'utf8');
+  const rollbackProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-one\n+ONE\n'
+      + '--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-alpha\n+ALPHA\n',
+  });
+  agent.approve(rollbackProposal.taskId, owner);
+  await assert.rejects(
+    () => agent.apply(rollbackProposal.taskId, owner, async () => ({ ok: false, failure: 'test' }), null, authorizeTestMutation),
+    /Verification failed/,
+  );
+  assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n');
+  assert.equal(await fs.readFile(path.join(root, 'second.txt'), 'utf8'), 'alpha\nbeta\n');
+
+  const mismatchedRoot = path.join(root, 'different-project');
+  await fs.mkdir(mismatchedRoot);
+  const rootMismatchProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-one\n+ONE\n',
+  });
+  agent.approve(rootMismatchProposal.taskId, owner);
+  await assert.rejects(
+    () => agent.apply(rootMismatchProposal.taskId, owner, undefined, mismatchedRoot, authorizeTestMutation),
+    /project changed/,
+  );
+  assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n');
+  const staleProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n-one\n+changed\n two\n',
+  });
+  await fs.writeFile(file, 'external change\n', 'utf8');
+  agent.approve(staleProposal.taskId, owner);
+  await assert.rejects(() => agent.apply(staleProposal.taskId, owner, undefined, null, authorizeTestMutation), /changed after approval/);
+  assert.equal(await fs.readFile(file, 'utf8'), 'external change\n', 'A stale proposal must not overwrite external changes.');
+  await fs.writeFile(file, 'one\ntwo\n', 'utf8');
+  await assert.rejects(() => agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- /dev/null\n+++ b/.env\n@@ -0,0 +1,1 @@\n+blocked\n',
+  }), /Sensitive files/);
+  await assert.rejects(() => agent.createProposal({
+    root, ownerWebContentsId, sessionId, scope: 'subdir',
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-one\n+outside\n',
+  }), /outside the approved scope/);
+
+  await assert.rejects(() => agent.createProposal({ root, ownerWebContentsId, sessionId, raw: '--- a/../escape\n+++ b/../escape\n@@ -1 +1 @@\n-x\n+y\n' }), /traversal|exist|scope/);
   assert.equal(agent.classifyFailure({ timedOut: true }), 'timeout');
   assert.equal(agent.classifyFailure({ exitCode: 1, stderr: 'Access denied' }), 'permission');
   assert.equal(agent.classifyFailure({ exitCode: 1, stderr: 'Syntax error' }), 'compile');
@@ -86,7 +211,7 @@ try {
         raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n' });
     },
     approveFix: (id, owner) => agent.approve(id, owner),
-    applyFix: (id, owner) => agent.apply(id, owner),
+    applyFix: (id, owner) => agent.apply(id, owner, undefined, null, authorizeTestMutation),
     onProgress: (event) => progress.push(event.phase),
   });
   assert.equal(loopResult.status, 'PASS');
@@ -98,7 +223,7 @@ try {
     runCheck: async () => ({ ok: false, script: 'test', exitCode: 1, stderr: 'same failure' }),
     proposeFix: async () => agent.createProposal({ root, sessionId: owner2.sessionId, ownerWebContentsId: owner2.ownerWebContentsId,
       raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n' }),
-    approveFix: (id, owner) => agent.approve(id, owner), applyFix: (id, owner) => agent.apply(id, owner),
+    approveFix: (id, owner) => agent.approve(id, owner), applyFix: (id, owner) => agent.apply(id, owner, undefined, null, authorizeTestMutation),
   });
   assert.equal(noProgress.status, 'NO_PROGRESS');
   await fs.writeFile(file, 'one\ntwo\n', 'utf8');
@@ -116,7 +241,7 @@ try {
       raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n',
     }),
     approveFix: (id, owner) => agent.approve(id, owner),
-    applyFix: (id, owner) => agent.apply(id, owner),
+    applyFix: (id, owner) => agent.apply(id, owner, undefined, null, authorizeTestMutation),
     onProgress: (event) => lifecycleProgress.push(event.phase),
   });
   assert.equal(lifecycleResult.status, 'PASS');
@@ -164,8 +289,8 @@ try {
   const concurrentTask = agent.getTaskForTest(durableTask.taskId);
   agent.approve(durableTask.taskId, owner2);
   const applyResults = await Promise.allSettled([
-    agent.apply(durableTask.taskId, owner2),
-    agent.apply(durableTask.taskId, owner2),
+    agent.apply(durableTask.taskId, owner2, undefined, null, authorizeTestMutation),
+    agent.apply(durableTask.taskId, owner2, undefined, null, authorizeTestMutation),
   ]);
   assert.equal(applyResults.filter((result) => result.status === 'fulfilled').length, 1);
   assert.equal(applyResults.filter((result) => result.status === 'rejected').length, 1);

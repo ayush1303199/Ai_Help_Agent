@@ -9,6 +9,7 @@ const root = await fs.mkdtemp(path.join(process.cwd(), '.developer-lifecycle-'))
 const ownerWebContentsId = 9001;
 const sessionId = agent.getSession(ownerWebContentsId);
 const owner = { ownerWebContentsId, sessionId };
+const authorizeMutation = async () => ({ allowed: true });
 const patch = (file, from, to) => `--- a/${file}
 +++ b/${file}
 @@ -1,2 +1,2 @@
@@ -28,12 +29,12 @@ try {
   assert.equal(proposal.state, 'awaiting_approval');
   await assert.rejects(() => agent.apply(proposal.taskId, owner), /approved/);
   agent.approve(proposal.taskId, owner);
-  const applied = await agent.apply(proposal.taskId, owner, async () => ({ ok: true, status: 'PASS' }), root);
+  const applied = await agent.apply(proposal.taskId, owner, async () => ({ ok: true, status: 'PASS' }), root, authorizeMutation);
   assert.equal(applied.state, 'completed');
   assert.equal(applied.approval.actor, 'renderer-session');
   assert.deepEqual(applied.targetFiles, ['sample.txt']);
   assert.equal((await fs.readFile(file, 'utf8')), 'one\nthree\n');
-  await agent.undo(proposal.taskId, owner);
+  await agent.undo(proposal.taskId, owner, authorizeMutation, true);
   assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n');
 
   const failed = await agent.createProposal({
@@ -41,11 +42,26 @@ try {
     raw: patch('sample.txt', 'one', 'four'),
   });
   agent.approve(failed.taskId, owner);
-  await assert.rejects(() => agent.apply(failed.taskId, owner, async () => agent.normalizeCommandResult({
-    ok: false, script: 'typecheck', exitCode: 1, stderr: 'src/App.tsx:4:2 Type error',
-  }), root), /Verification failed/);
+  const verificationError = await agent.apply(failed.taskId, owner, async () => ({
+    ok: false,
+    status: 'CODE_FAILURE',
+    classification: 'CODE_FAILURE',
+    failure: 'exit',
+    attempts: [{
+      check: 'typecheck',
+      ok: false,
+      classification: 'CODE_FAILURE',
+      stderr: 'src/App.tsx:4:2 Type error api_key=sk-sensitive123456',
+      extracted: { file: 'src/App.tsx', line: 4, message: 'Type error' },
+    }],
+  }), root, authorizeMutation).catch((error) => error);
+  assert.match(verificationError.message, /Verification failed/);
   assert.equal(agent.getTaskForTest(failed.taskId).state, 'failed');
   assert.equal(agent.getTaskForTest(failed.taskId).verification.classification, 'CODE_FAILURE');
+  assert.equal(verificationError.taskSnapshot.evidence.find((item) => item.kind === 'VERIFICATION').checks[0].check, 'typecheck');
+  assert.equal(verificationError.taskSnapshot.evidence.find((item) => item.kind === 'DIAGNOSIS').checks[0].extracted.file, 'src/App.tsx');
+  assert.equal(verificationError.taskSnapshot.runtime.metrics.verificationRuns, 1);
+  assert.doesNotMatch(JSON.stringify(verificationError.taskSnapshot.verification), /sk-sensitive123456/);
   assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n');
 
   const stale = await agent.createProposal({
@@ -54,7 +70,7 @@ try {
   });
   await fs.writeFile(file, 'one\nchanged\n', 'utf8');
   agent.approve(stale.taskId, owner);
-  await assert.rejects(() => agent.apply(stale.taskId, owner, async () => ({ ok: true, status: 'PASS' }), root), /changed after approval/);
+  await assert.rejects(() => agent.apply(stale.taskId, owner, async () => ({ ok: true, status: 'PASS' }), root, authorizeMutation), /changed after approval/);
   assert.equal(await fs.readFile(file, 'utf8'), 'one\nchanged\n');
   await fs.writeFile(file, 'one\ntwo\n', 'utf8');
 

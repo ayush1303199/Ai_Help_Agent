@@ -26,6 +26,32 @@ assert.equal(parsedGitDiff[0].path, 'modules/academic/controller.js');
 assert.equal(validateUnifiedFile(parsedGitDiff[0].lines, original), true);
 assert.equal(isUnifiedDiffResponse(gitDiff), true);
 
+const addedFile = parseUnifiedDiff('--- /dev/null\n+++ b/src/new.ts\n@@ -0,0 +1,1 @@\n+export {};\n');
+assert.equal(addedFile[0].operation, 'create');
+assert.equal(addedFile[0].path, 'src/new.ts');
+assert.equal(validateUnifiedFile(addedFile[0].lines, ''), true);
+
+const removedFile = parseUnifiedDiff('--- a/src/old.ts\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-old\n');
+assert.equal(removedFile[0].operation, 'delete');
+assert.equal(removedFile[0].path, 'src/old.ts');
+assert.equal(validateUnifiedFile(removedFile[0].lines, 'old'), true);
+
+const renamedFiles = parseUnifiedDiff([
+  'diff --git a/src/old.ts b/src/new.ts',
+  'similarity index 100%',
+  'rename from src/old.ts',
+  'rename to src/new.ts',
+  'diff --git a/src/next.ts b/src/final.ts',
+  'similarity index 100%',
+  'rename from src/next.ts',
+  'rename to src/final.ts',
+].join('\n'));
+assert.equal(renamedFiles.length, 2);
+assert.equal(renamedFiles[0].operation, 'rename');
+assert.equal(renamedFiles[0].sourcePath, 'src/old.ts');
+assert.equal(renamedFiles[1].path, 'src/final.ts');
+assert.equal(isUnifiedDiffResponse('*** Delete Directory: src/unused\n'), true);
+
 const plainHeaderDiff = [
   '--- modules/academic/controller.js',
   '+++ modules/academic/controller.js',

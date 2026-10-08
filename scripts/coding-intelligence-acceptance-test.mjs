@@ -20,6 +20,7 @@ async function runCommand(command, args, cwd) {
 
 async function main() {
   console.log('=== IQ1000+ CODING AGENT COMPREHENSIVE ACCEPTANCE TEST SUITE ===');
+  const authorizeMutation = async () => ({ allowed: true });
 
   const testTempDir = await fs.mkdtemp(path.join(process.cwd(), '.coding-iq1000-'));
   const originalRoots = process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS;
@@ -181,6 +182,7 @@ print("PYTHON_INTELLIGENCE_OK")
       { sessionId: turn1.sessionId, ownerWebContentsId: sessionOwnerId },
       async () => ({ ok: true, status: 'PASS' }),
       repoA,
+      authorizeMutation,
     );
     assert.equal(applied.state, 'completed');
 
@@ -188,7 +190,7 @@ print("PYTHON_INTELLIGENCE_OK")
     assert.ok(updatedCode.includes('/* validated fix */'));
 
     // Undo rollback
-    await developerAgent.undo(proposal.taskId, { sessionId: turn1.sessionId, ownerWebContentsId: sessionOwnerId });
+    await developerAgent.undo(proposal.taskId, { sessionId: turn1.sessionId, ownerWebContentsId: sessionOwnerId }, authorizeMutation, true);
     const revertedCode = await fs.readFile(path.join(repoA, 'src', 'UserService.php'), 'utf8');
     assert.equal(revertedCode, '<?php class UserService {}');
     console.log('[PASS] Guarded approval contract and undo rollback verified.');

@@ -394,6 +394,7 @@ assert.equal(calculateTotal(exemptInvoice), 100, 'Tax exempt invoice should not 
   const e2eOwnerWebContentsId = 999;
   const e2eSessionId = agent.getSession(e2eOwnerWebContentsId);
   const e2eOwner = { ownerWebContentsId: e2eOwnerWebContentsId, sessionId: e2eSessionId };
+  const authorizeMutation = async () => ({ allowed: true });
 
   const validDiff = `--- a/calc.js\n+++ b/calc.js\n@@ -1,3 +1,3 @@\n export function add(a, b) {\n-  return a - b;\n+  return a + b;\n }\n`;
   const e2eProposal = await agent.createProposal({
@@ -412,12 +413,12 @@ assert.equal(calculateTotal(exemptInvoice), 100, 'Tax exempt invoice should not 
   assert.equal(approvedTask.state, 'approved');
 
   // Apply proposal to disk
-  await agent.apply(e2eProposal.taskId, e2eOwner);
+  await agent.apply(e2eProposal.taskId, e2eOwner, undefined, null, authorizeMutation);
   const appliedContent = await fs.readFile(calcFile, 'utf8');
   assert.ok(appliedContent.includes('return a + b;'), 'Applied file must reflect updated diff');
 
   // Undo proposal from disk
-  await agent.undo(e2eProposal.taskId, e2eOwner);
+  await agent.undo(e2eProposal.taskId, e2eOwner, authorizeMutation, true);
   const undoneContent = await fs.readFile(calcFile, 'utf8');
   assert.ok(undoneContent.includes('return a - b;'), 'Undone file must restore pristine baseline');
   console.log('[PASS] Full lifecycle E2E proposal -> approval -> atomic apply -> undo verified on disk.');
