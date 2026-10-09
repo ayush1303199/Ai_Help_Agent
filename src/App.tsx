@@ -38,10 +38,19 @@ import {
   isProviderEndpointRequired,
   type ProviderId,
 } from './config/providerRegistry.helpers';
-import { getProviderSecret, removeProviderSecret, setProviderSecret } from './config/providerSecretStore';
+import {
+  deleteProviderSecretStore,
+  ensureProviderSecretStorage,
+  getProviderSecret,
+  persistProviderSecrets,
+  readProviderSecrets,
+  removeProviderSecret,
+  setProviderSecret,
+} from './config/providerSecretStore';
+import { clearAppState, writeAppState } from './config/appStateStorage';
+import { authenticatedBackendFetch } from './config/backendAuth';
 import { ProviderHydrationRequestError, retryProviderHydration } from './config/providerHydration';
 import {
-  readPersistedProviderSecrets,
   readPersistedProviderSettings,
   writePersistedProviderSettings,
 } from './config/providerPersistence';
@@ -457,19 +466,19 @@ function App() {
       enabled: provider.enabled,
       priority: provider.priority,
       status: provider.status || 'unknown',
-    })), readPersistedProviderSecrets());
+    })));
     if (!persisted) setError('Provider settings could not be saved in browser storage.');
   }, [activeProviderId, configuredProviders]);
 
   useEffect(() => {
-    localStorage.setItem('trained-profiles-v1', JSON.stringify(trainedProfiles));
+    writeAppState('trained-profiles-v1', JSON.stringify(trainedProfiles));
   }, [trainedProfiles]);
 
   useEffect(() => {
     if (activeProfileId) {
-      localStorage.setItem('active-profile-id-v1', activeProfileId);
+      writeAppState('active-profile-id-v1', activeProfileId);
     } else {
-      localStorage.removeItem('active-profile-id-v1');
+      clearAppState('active-profile-id-v1');
     }
   }, [activeProfileId]);
 
@@ -758,7 +767,7 @@ function App() {
         variant: 'primary',
         onConfirm: async () => {
           try {
-            const response = await fetch(`${HTTP_URL}/api/agent/open`, {
+            const response = await authenticatedBackendFetch(`${HTTP_URL}/api/agent/open`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ target: 'teams', confirmed: true }),
@@ -787,7 +796,7 @@ function App() {
         variant: 'primary',
         onConfirm: async () => {
           try {
-            const response = await fetch(`${HTTP_URL}/api/agent/open`, {
+            const response = await authenticatedBackendFetch(`${HTTP_URL}/api/agent/open`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               body: JSON.stringify({ target: 'teams', confirmed: true }),
@@ -841,7 +850,7 @@ function App() {
     && (Boolean(providerKey.trim()) || Boolean(editingProvider));
 
   const loadConfiguredProviders = useCallback(async (signal: AbortSignal) => {
-    const response = await fetch(`${HTTP_URL}/api/settings/providers`, { signal });
+    const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers`, { signal });
     if (!response.ok) {
       throw new ProviderHydrationRequestError(
         `Could not load providers (HTTP ${response.status}).`,
@@ -851,7 +860,7 @@ function App() {
     const data = await response.json();
     let providers = Array.isArray(data.providers) ? data.providers : [];
     const savedProviderSettings = readPersistedProviderSettings();
-    const persistedSecrets = readPersistedProviderSecrets();
+    const persistedSecrets = await readProviderSecrets();
     const failedSecretRestores: string[] = [];
 
     // Rehydrate secrets into the backend process after a restart. The server
@@ -863,7 +872,7 @@ function App() {
         ? getProviderSecret(persistedSecrets, String(provider.id || ''), adapterType)
         : '';
       if (!adapterType || !apiKey) continue;
-      const hydrated = await fetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, {
+      const hydrated = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ apiKey }),
@@ -937,7 +946,7 @@ function App() {
         }];
       });
       for (const provider of [...savedProviders, ...legacySavedProviders]) {
-        const restored = await fetch(`${HTTP_URL}/api/settings/providers`, {
+        const restored = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(provider),
@@ -963,7 +972,7 @@ function App() {
           delete persistedSecrets[provider.adapterType];
         }
       }
-      const hydrated = await fetch(`${HTTP_URL}/api/settings/providers`, { signal });
+      const hydrated = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers`, { signal });
       if (!hydrated.ok) {
         throw new ProviderHydrationRequestError(
           `Could not reload providers after credential restoration (HTTP ${hydrated.status}).`,
@@ -994,7 +1003,6 @@ function App() {
             priority: provider.priority,
             status: provider.status,
           })),
-          persistedSecrets,
         );
         if (!persisted && restoredProviders.some((provider: ConfiguredProvider) => provider.hasApiKey)) {
           setError('Provider keys are available for this session but could not be saved for restart recovery.');
@@ -1013,7 +1021,6 @@ function App() {
           priority: provider.priority,
           status: provider.status,
         })),
-        persistedSecrets,
       );
       if (!persisted && providers.some((provider: ConfiguredProvider) => provider.hasApiKey)) {
         setError('Provider keys are available for this session but could not be saved for restart recovery.');
@@ -1076,7 +1083,8 @@ function App() {
     setProviderSaving(true);
     setError('');
     try {
-      const response = await fetch(`${HTTP_URL}/api/settings/providers`, {
+      if (providerKey.trim()) await ensureProviderSecretStorage();
+      const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -1095,7 +1103,7 @@ function App() {
       if (providerKey.trim() && data.provider?.hasApiKey !== true) {
         throw new Error('Provider settings were not saved with the API key. The backend did not confirm the credential.');
       }
-      const secrets = readPersistedProviderSecrets();
+      const secrets = await readProviderSecrets();
       const savedProviderId = String(data.provider?.id || '');
       if (!savedProviderId) throw new Error('Provider was saved but its instance ID was not returned.');
       if (providerKey.trim()) {
@@ -1106,7 +1114,8 @@ function App() {
       const activeProviderType = typeof data.activeProvider === 'string'
         ? providers.find((provider: ConfiguredProvider) => provider.id === data.activeProvider)?.adapterType || null
         : null;
-      const persisted = writePersistedProviderSettings(activeProviderType, providers, secrets);
+      await persistProviderSecrets(secrets);
+      const persisted = writePersistedProviderSettings(activeProviderType, providers);
       setConfiguredProviders(providers);
       setActiveProviderId(typeof data.activeProvider === 'string' ? data.activeProvider : null);
       setSpeechProviderId(typeof data.sttProvider === 'string' ? data.sttProvider : '');
@@ -1145,7 +1154,7 @@ function App() {
 
   const setConfiguredActiveProvider = async (provider: ConfiguredProvider) => {
     try {
-      const response = await fetch(`${HTTP_URL}/api/settings/active-provider`, {
+      const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/active-provider`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ providerId: provider.id }),
@@ -1155,8 +1164,7 @@ function App() {
       const providers = Array.isArray(data.providers) ? data.providers : configuredProviders;
       setConfiguredProviders(providers);
       setActiveProviderId(typeof data.activeProvider === 'string' ? data.activeProvider : null);
-      const secrets = readPersistedProviderSecrets();
-      writePersistedProviderSettings(provider.adapterType, providers, secrets);
+      writePersistedProviderSettings(provider.adapterType, providers);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -1166,7 +1174,7 @@ function App() {
     setProviderSaving(true);
     setError('');
     try {
-      const response = await fetch(`${HTTP_URL}/api/settings/fallback`, {
+      const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/fallback`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ enabled }),
@@ -1185,7 +1193,7 @@ function App() {
     setSelfTestingProviderId(provider.id);
     setError('');
     try {
-      const response = await fetch(`${HTTP_URL}/api/settings/providers/self-test`, {
+      const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers/self-test`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ provider_id: provider.id }),
@@ -1214,18 +1222,17 @@ function App() {
 
   const updateConfiguredProviderState = async (provider: ConfiguredProvider, changes: Partial<ConfiguredProvider>) => {
     try {
-      const response = await fetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, {
+      const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(changes),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(providerResponseError(data, 'Could not update provider.'));
-      const secrets = readPersistedProviderSecrets();
       const providers = Array.isArray(data.providers) ? data.providers : [];
       const activeProviderId = typeof data.activeProvider === 'string' ? data.activeProvider : null;
       const activeProviderType = providers.find((item: ConfiguredProvider) => item.id === activeProviderId)?.adapterType || null;
-      writePersistedProviderSettings(activeProviderType, providers, secrets);
+      writePersistedProviderSettings(activeProviderType, providers);
       setConfiguredProviders(providers);
       setActiveProviderId(activeProviderId);
     } catch (err) {
@@ -1252,24 +1259,27 @@ function App() {
       confirmLabel: 'Remove provider',
       onConfirm: async () => {
         try {
-          const response = await fetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' });
+          const confirmed = await deleteProviderSecretStore(provider.id, provider.label);
+          if (!confirmed) return;
+          const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || 'Could not remove provider.');
-          const secrets = readPersistedProviderSecrets();
+          const secrets = await readProviderSecrets();
           const updatedSecrets = removeProviderSecret(
             secrets,
             provider.id,
             provider.adapterType,
           );
+          await persistProviderSecrets(updatedSecrets);
           const providers = Array.isArray(data.providers) ? data.providers : [];
           const activeProviderId = typeof data.activeProvider === 'string' ? data.activeProvider : null;
           const activeProviderType = providers.find((item: ConfiguredProvider) => item.id === activeProviderId)?.adapterType || null;
-          const persisted = writePersistedProviderSettings(activeProviderType, providers, updatedSecrets);
+          const persisted = writePersistedProviderSettings(activeProviderType, providers);
           setConfiguredProviders(providers);
           setActiveProviderId(activeProviderId);
           setSpeechProviderId(typeof data.sttProvider === 'string' ? data.sttProvider : '');
           setEffectiveSpeechProviderId(typeof data.effectiveSttProvider === 'string' ? data.effectiveSttProvider : '');
-          if (!persisted) setError('Provider was removed, but its saved credential could not be cleared from browser storage.');
+          if (!persisted) setError('Provider was removed, but its metadata could not be saved to browser storage.');
         } catch (err) {
           setError((err as Error).message);
         }
@@ -1279,7 +1289,7 @@ function App() {
 
   const changeSpeechProvider = async (selectedProviderId: string) => {
     try {
-      const response = await fetch(`${HTTP_URL}/api/settings/stt-provider`, {
+      const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/stt-provider`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ providerId: selectedProviderId || null }),
@@ -1305,7 +1315,7 @@ function App() {
     const ids = configuredProviders.map((item) => item.id);
     [ids[index], ids[target]] = [ids[target], ids[index]];
     try {
-      const response = await fetch(`${HTTP_URL}/api/settings/providers/reorder`, {
+      const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers/reorder`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ ids }),
@@ -1324,7 +1334,7 @@ function App() {
     setAgentPermissions(nextPermissions);
     setAgentSaving(true);
     try {
-      const response = await fetch(`${HTTP_URL}/api/settings/agent`, {
+      const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/agent`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(nextPermissions),
@@ -1341,7 +1351,7 @@ function App() {
 
   const loadAgentActivity = useCallback(async () => {
     try {
-      const response = await fetch(`${HTTP_URL}/api/agent/activity`);
+      const response = await authenticatedBackendFetch(`${HTTP_URL}/api/agent/activity`);
       const data = await response.json();
       if (response.ok) setAgentActivity(Array.isArray(data.activity) ? data.activity : []);
     } catch {
@@ -1378,7 +1388,7 @@ function App() {
       onConfirm: async () => {
         setAgentActionTarget(target);
         try {
-          const response = await fetch(`${HTTP_URL}/api/agent/open`, {
+          const response = await authenticatedBackendFetch(`${HTTP_URL}/api/agent/open`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ target, url: agentUrl, confirmed: true }),
@@ -1516,7 +1526,7 @@ function App() {
   });
 
   useEffect(() => {
-    localStorage.setItem('ui-font-scale', String(fontScale));
+    writeAppState('ui-font-scale', String(fontScale));
   }, [fontScale]);
 
   return (

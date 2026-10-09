@@ -21,10 +21,21 @@ import hashlib
 import hmac
 import shlex
 import threading
+import uuid
 from difflib import SequenceMatcher
 from typing import Dict, List, Any, Optional, Set, Tuple
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+try:
+    _FEATURE_OWNERSHIP = json.loads(
+        (Path(__file__).resolve().parent / "coding_feature_ownership.json").read_text(encoding="utf-8")
+    )
+    _PROTECTED_FEATURE_ROOTS = _FEATURE_OWNERSHIP["protectedFeatureRoots"]
+    if not isinstance(_PROTECTED_FEATURE_ROOTS, dict) or not _PROTECTED_FEATURE_ROOTS:
+        raise ValueError("feature ownership map is empty")
+except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+    raise RuntimeError("Coding feature ownership policy is unavailable.") from error
 
 
 # =====================================================================
@@ -1037,6 +1048,8 @@ class CanonicalCapability:
     CODE_SEARCH = "CODE_SEARCH"
     FILE_READ = "FILE_READ"
     DIRECTORY_LIST = "DIRECTORY_LIST"
+    REPOSITORY_MAP = "REPOSITORY_MAP"
+    SOURCE_CONTEXT = "SOURCE_CONTEXT"
     SYMBOL_SEARCH = "SYMBOL_SEARCH"
     REFERENCE_SEARCH = "REFERENCE_SEARCH"
     DATABASE_QUERY = "DATABASE_QUERY"
@@ -1062,6 +1075,8 @@ class CapabilityIntelligenceEngine:
         "open_file": CanonicalCapability.FILE_READ,
         "repo_browser.read_file": CanonicalCapability.FILE_READ,
         "repo_browser.open_file": CanonicalCapability.FILE_READ,
+        "get_repository_map": CanonicalCapability.REPOSITORY_MAP,
+        "get_context": CanonicalCapability.SOURCE_CONTEXT,
         "list_directory": CanonicalCapability.DIRECTORY_LIST,
         "repo_browser.list_directory": CanonicalCapability.DIRECTORY_LIST,
         "list_files": CanonicalCapability.DIRECTORY_LIST,
@@ -1072,12 +1087,28 @@ class CapabilityIntelligenceEngine:
         "find_references": CanonicalCapability.REFERENCE_SEARCH,
         "repo_browser.find_references": CanonicalCapability.REFERENCE_SEARCH,
         "execute_sql": CanonicalCapability.DATABASE_QUERY,
+        "inspect_database_schema": CanonicalCapability.DATABASE_QUERY,
         "run_query": CanonicalCapability.DATABASE_QUERY,
         "db_query": CanonicalCapability.DATABASE_QUERY,
         "database.query": CanonicalCapability.DATABASE_QUERY,
         "query_database": CanonicalCapability.DATABASE_QUERY,
         "run_verification": CanonicalCapability.TERMINAL_EXEC,
         "terminal.run_command": CanonicalCapability.TERMINAL_EXEC,
+    }
+
+    CAPABILITY_METADATA = {
+        CanonicalCapability.CODE_SEARCH: {"resource": "CODE"},
+        CanonicalCapability.FILE_READ: {"resource": "CODE"},
+        CanonicalCapability.DIRECTORY_LIST: {"resource": "REPOSITORY"},
+        CanonicalCapability.REPOSITORY_MAP: {"resource": "REPOSITORY"},
+        CanonicalCapability.SOURCE_CONTEXT: {"resource": "CODE"},
+        CanonicalCapability.SYMBOL_SEARCH: {"resource": "CODE"},
+        CanonicalCapability.REFERENCE_SEARCH: {"resource": "CODE"},
+        CanonicalCapability.DATABASE_QUERY: {"resource": "DATABASE"},
+        CanonicalCapability.DATABASE_EXPLAIN: {"resource": "DATABASE"},
+        CanonicalCapability.DATABASE_LIST_TABLES: {"resource": "DATABASE"},
+        CanonicalCapability.DATABASE_LIST_DATABASES: {"resource": "DATABASE"},
+        CanonicalCapability.TERMINAL_EXEC: {"resource": "RUNTIME"},
     }
 
     CANONICAL_IMPLEMENTATIONS = {
@@ -1680,6 +1711,7 @@ class DbFailureClassification:
 
 
 class DatabaseCapability:
+    RESOURCE = "DATABASE"
     DATABASE_CONNECT = "DATABASE_CONNECT"
     DATABASE_CONNECT_TARGET = "DATABASE_CONNECT_TARGET"
     DATABASE_RECONNECT = "DATABASE_RECONNECT"
@@ -10470,10 +10502,56 @@ class DatabaseSessionManager:
             engine = config_value("engine", session.database_type or "NOT_RESOLVED")
             host = config_value("host", session.safe_host or "NOT_RESOLVED")
             port = config_value("port", session.safe_port or "NOT_RESOLVED")
-            has_password = bool(
-                credentials.get("password")
-                or discovered.get("has_credentials") is True
-                or (discovered.get("_symbol_details") or {}).get("hasPassword") is True
+            symbol_details = discovered.get("_symbol_details")
+            symbol_details = symbol_details if isinstance(symbol_details, dict) else {}
+            password_signals = []
+            password_source = None
+            if isinstance(discovered.get("passwordPresent"), bool):
+                password_signals.append(discovered["passwordPresent"])
+                password_source = "PROJECT_CONFIGURATION"
+            if isinstance(symbol_details.get("hasPassword"), bool):
+                password_signals.append(symbol_details["hasPassword"])
+                password_source = "PROJECT_CONFIGURATION"
+            if isinstance(credentials.get("password"), str) and credentials["password"]:
+                password_signals.append(True)
+                password_source = "CREDENTIAL_STORE"
+            password_present = (
+                password_signals[0]
+                if password_signals and all(value == password_signals[0] for value in password_signals)
+                else None
+            )
+            if len(set(password_signals)) > 1:
+                password_source = None
+            credential_status_configured = bool(
+                discovered.get("has_credentials") is True
+                or password_present is True
+            )
+            username_source = (
+                "PROJECT_CONFIGURATION" if config_value("username") else
+                "CREDENTIAL_STORE" if credentials.get("username") else
+                "ACTIVE_DATABASE_TARGET" if active_target and active_target.username else
+                None
+            )
+            database_source = (
+                "ACTIVE_DATABASE_SESSION" if session.database_name else
+                "PROJECT_CONFIGURATION" if config_value("database") else
+                "ACTIVE_DATABASE_TARGET" if active_target and active_target.database_name else
+                None
+            )
+            engine_source = (
+                "PROJECT_CONFIGURATION" if config_value("engine") else
+                "ACTIVE_DATABASE_SESSION" if session.database_type else
+                None
+            )
+            host_source = (
+                "PROJECT_CONFIGURATION" if config_value("host") else
+                "ACTIVE_DATABASE_SESSION" if session.safe_host else
+                None
+            )
+            port_source = (
+                "PROJECT_CONFIGURATION" if config_value("port") else
+                "ACTIVE_DATABASE_SESSION" if session.safe_port else
+                None
             )
             property_values = {
                 "engine": engine,
@@ -10481,7 +10559,7 @@ class DatabaseSessionManager:
                 "port": port,
                 "database": database_name,
                 "username": username,
-                "credentialStatus": "CONFIGURED" if has_password else "NOT_VERIFIED",
+                "credentialStatus": "CONFIGURED" if credential_status_configured else "NOT_VERIFIED",
                 "password": "[REDACTED]",
             }
             requested_properties = arguments.get("properties")
@@ -10493,7 +10571,7 @@ class DatabaseSessionManager:
             else:
                 content = (
                     f"### DATABASE CREDENTIALS REPORT\n\n"
-                    f"- **Credential status:** {'CONFIGURED' if has_password else 'NOT_VERIFIED'}\n"
+                    f"- **Credential status:** {'CONFIGURED' if credential_status_configured else 'NOT_VERIFIED'}\n"
                     f"- **Target:** {tgt_id or 'NOT_RESOLVED'}\n"
                     f"- **Database:** {database_name}\n"
                     f"- **Username:** {username}\n"
@@ -10504,13 +10582,25 @@ class DatabaseSessionManager:
                 "ok": True,
                 "capability": capability,
                 "content": content,
-                "credentialStatus": "CONFIGURED" if has_password else "NOT_VERIFIED",
+                "credentialStatus": "CONFIGURED" if credential_status_configured else "NOT_VERIFIED",
+                "credentialStatusSource": (
+                    "CREDENTIAL_STATUS_METADATA"
+                    if discovered.get("has_credentials") is True
+                    else password_source
+                ),
+                "passwordPresent": password_present,
+                "passwordPresenceSource": password_source,
                 "targetId": tgt_id,
                 "database": database_name,
+                "databaseNameSource": database_source,
                 "engine": engine,
+                "engineSource": engine_source,
                 "host": host,
+                "hostSource": host_source,
                 "port": port,
+                "portSource": port_source,
                 "username": username,
+                "usernameSource": username_source,
                 "password": "[REDACTED]",
                 "credentialSource": cfg_file,
                 "databaseType": session.database_type,
@@ -11012,9 +11102,65 @@ class PolicyGate:
         return "ALLOW", "Safe read-only or diagnostic SQL operation"
 
     @classmethod
-    def evaluate_file_write(cls, target_path: str, proposal_approved: bool) -> Tuple[str, str]:
+    def evaluate_file_write(
+        cls,
+        target_path: str,
+        proposal_approved: bool,
+        request_binding: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str]:
         """Enforces write protection: writes strictly require an approved proposal."""
-        return cls.evaluate_file_mutation("modify", [target_path], proposal_approved)
+        return cls.evaluate_file_mutation(
+            "modify",
+            [target_path],
+            proposal_approved,
+            request_binding=request_binding,
+        )
+
+    @classmethod
+    def _feature_for_mutation_path(cls, target_path: str) -> str:
+        normalized = target_path.replace("\\", "/").lstrip("./").casefold()
+        matches = []
+        for feature, roots in _PROTECTED_FEATURE_ROOTS.items():
+            for root in roots:
+                prefix = str(root).replace("\\", "/").casefold()
+                if normalized == prefix or normalized.startswith(f"{prefix}/"):
+                    matches.append((len(prefix), feature))
+        return max(matches)[1] if matches else "shared"
+
+    @classmethod
+    def _validate_request_binding(
+        cls,
+        request_binding: Optional[Dict[str, Any]],
+        target_paths: List[str],
+    ) -> Optional[str]:
+        if not isinstance(request_binding, dict):
+            return "A trusted request-bound authorization context is required."
+        task_id = request_binding.get("taskId")
+        turn_id = request_binding.get("turnId")
+        request_hash = request_binding.get("requestHash")
+        root = request_binding.get("root")
+        scope = request_binding.get("scope")
+        features = request_binding.get("authorizedFeatures")
+        if (
+            not isinstance(task_id, str) or not task_id or len(task_id) > 128
+            or not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128
+            or not isinstance(request_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", request_hash)
+            or not isinstance(root, str) or not os.path.isabs(root)
+            or not isinstance(scope, str) or not scope or len(scope) > 512
+            or scope.startswith(("/", "\\")) or re.match(r"^[a-zA-Z]:", scope)
+            or any(part in ("", "..") for part in scope.replace("\\", "/").split("/") if part != ".")
+            or not isinstance(features, list) or not features
+            or any(not isinstance(feature, str) for feature in features)
+        ):
+            return "The request-bound authorization context is malformed."
+        known_features = {*_PROTECTED_FEATURE_ROOTS.keys(), "shared"}
+        if len(set(features)) != len(features) or not set(features).issubset(known_features):
+            return "The request-bound feature scope is invalid."
+        for target_path in target_paths:
+            feature = cls._feature_for_mutation_path(target_path)
+            if feature not in features:
+                return f"Mutation target is outside the authorized {feature} feature scope."
+        return None
 
     @classmethod
     def evaluate_file_mutation(
@@ -11023,6 +11169,7 @@ class PolicyGate:
         target_paths: List[str],
         proposal_approved: bool,
         delete_confirmed: bool = False,
+        request_binding: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str]:
         """Authorizes one proposal-scoped filesystem mutation."""
         allowed_operations = {"create", "modify", "delete", "delete_directory", "rename", "move", "undo"}
@@ -11044,6 +11191,9 @@ class PolicyGate:
                 return "BLOCK", "Mutation of sensitive files or repository metadata is blocked."
         if not proposal_approved:
             return "BLOCK", "Repository mutations require an approved proposal and snapshot validation."
+        binding_error = cls._validate_request_binding(request_binding, target_paths)
+        if binding_error:
+            return "BLOCK", binding_error
         if operation in {"delete", "delete_directory"} and not delete_confirmed:
             return "BLOCK", "Deletion requires a separate explicit confirmation."
         return "ALLOW", "Validated mutation under the approved proposal"

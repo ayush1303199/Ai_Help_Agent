@@ -221,7 +221,7 @@ assert.equal(validTransitions.approved.includes('applying'), true);
 
 // Forbidden transitions (Bypasses)
 assert.equal(validTransitions.reading.includes('applying'), false);
-assert.equal(validTransitions.reading.includes('completed'), false);
+assert.equal(validTransitions.reading.includes('completed'), true); // Read-only tasks may complete without entering the mutation flow.
 assert.equal(validTransitions.awaiting_approval.includes('applying'), false); // Cannot apply without approved!
 console.log('[PASS] State machine transition invariants verified: Valid sequential steps allowed, illegal bypasses strictly forbidden.');
 

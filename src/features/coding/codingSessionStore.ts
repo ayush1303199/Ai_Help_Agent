@@ -1,4 +1,5 @@
 import { runtimeConfig } from '../../config/runtimeConfig.ts';
+import { writeAppState } from '../../config/appStateStorage.ts';
 
 export interface CodingHistoryMessage {
   role: 'user' | 'assistant';
@@ -75,7 +76,7 @@ export function readCodingConversationStates(): CodingConversationState[] {
 
 export function writeCodingConversationStates(states: CodingConversationState[]): boolean {
   try {
-    localStorage.setItem(SESSION_KEY, JSON.stringify(states.slice(0, MAX_SESSIONS)));
+    writeAppState(SESSION_KEY, JSON.stringify(states.slice(0, MAX_SESSIONS)));
     return true;
   } catch {
     return false;
@@ -111,7 +112,7 @@ export function readCodingPreferences(): CodingPreference[] {
 
 export function writeCodingPreferences(preferences: CodingPreference[]): boolean {
   try {
-    localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences.slice(0, MAX_PREFERENCES)));
+    writeAppState(PREFERENCES_KEY, JSON.stringify(preferences.slice(0, MAX_PREFERENCES)));
     return true;
   } catch {
     return false;

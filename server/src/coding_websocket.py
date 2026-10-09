@@ -9,12 +9,18 @@ import logging
 import math
 import os
 import re
+import secrets
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from coding_provider import complete_coding_model
+from coding_provider import (
+    CodingContextTooLargeError,
+    _compact_task_state_message as _compact_provider_task_state_message,
+    _context_terms as _provider_context_terms,
+    complete_coding_model,
+)
 from backend_config import (
     CODING_CONVERSATION_CHARS,
     CODING_FINAL_EVIDENCE_CHARS,
@@ -505,15 +511,54 @@ TOOL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     for name in TOOL_NAMES
     if name not in TOOL_ALIASES or TOOL_ALIASES[name] == name
 }
+_coding_connection_lock = threading.RLock()
+_active_coding_connections: Set[str] = set()
+_mutation_ready_coding_connections: Set[str] = set()
+_MUTATION_CAPABILITY_NAME = "apply_file_mutation"
+
+
+def register_coding_mutation_capability(connection_id: str, proof: str, secret: str) -> bool:
+    if not connection_id or not secret or not isinstance(proof, str):
+        return False
+    expected = hmac.new(secret.encode("utf-8"), connection_id.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(proof, expected):
+        return False
+    with _coding_connection_lock:
+        if connection_id not in _active_coding_connections:
+            return False
+        TOOL_CAPABILITIES[_MUTATION_CAPABILITY_NAME] = {
+            "available": True,
+            "mutation": True,
+            "approval_required": True,
+            "delete_confirmation_required": True,
+        }
+        _mutation_ready_coding_connections.add(connection_id)
+    return True
+
+
+def _set_coding_connection_active(connection_id: str, active: bool) -> None:
+    with _coding_connection_lock:
+        if active:
+            _active_coding_connections.add(connection_id)
+        else:
+            _active_coding_connections.discard(connection_id)
+            _mutation_ready_coding_connections.discard(connection_id)
+            if not _mutation_ready_coding_connections:
+                TOOL_CAPABILITIES.pop(_MUTATION_CAPABILITY_NAME, None)
+
+
+def _coding_connection_has_mutation_capability(connection_id: Optional[str]) -> bool:
+    with _coding_connection_lock:
+        return bool(connection_id and connection_id in _mutation_ready_coding_connections)
 
 
 def resolve_tool_capability(name: str) -> Optional[str]:
     """Resolve only registered tool names and explicit aliases."""
     norm = (name or "").strip()
-    if norm in TOOL_CAPABILITIES and TOOL_CAPABILITIES[norm].get("available"):
+    if norm in TOOL_NAMES and TOOL_CAPABILITIES.get(norm, {}).get("available"):
         return norm
     target = TOOL_ALIASES.get(norm)
-    return target if target in TOOL_CAPABILITIES and TOOL_CAPABILITIES[target].get("available") else None
+    return target if target in TOOL_NAMES and TOOL_CAPABILITIES.get(target, {}).get("available") else None
 MAX_CODING_TOOL_ROUNDS = CODING_TOOL_ROUNDS
 MAX_AGENT_REASONING_CYCLES = 7
 MAX_CODING_CONVERSATION_CHARS = CODING_CONVERSATION_CHARS
@@ -559,8 +604,31 @@ def _coding_task_steps(intent: str, proposal_required: bool) -> List[str]:
 WRITE_PATTERN = re.compile(
     r"\b(fix|implement|add|create|change|modify|update|write|refactor|optimi[sz]e|improve|remove|rewrite|"
     r"resolve|patch|migrate|convert|introduce)\b|"
-    r"(?:\b(?:jodo|sudhar|sudharo|badlo|banao|hatao)\b)|"
+    r"(?:\b(?:jodo|sudhar|sudharo|badlo|banao|banana|banani|bana\s+do|hatao)\b)|"
+    r"(?:\bfile(?:n)?bn(?:a|ana|ani)\b)|"
     r"(?:\b(?:fix|change|update|add|modify|refactor)\s+karo\b)",
+    re.IGNORECASE,
+)
+CAPABILITY_QUESTION_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:"
+    r"(?:can|could|would|will|do)\s+(?:you|the\s+(?:coding\s+)?agent)\s+"
+    r"(?:(?:currently|actually|ever)\s+)?"
+    r"(?:add|create|delete|remove|modify|edit|change|update|write|apply)\s+"
+    r"(?:(?:a|an|the|any|new|this|that)\s+)?"
+    r"(?:file|files|change|changes|project\s+file|project\s+files|code)\b"
+    r"|are\s+(?:you|the\s+(?:coding\s+)?agent)\s+able\s+to\s+"
+    r"(?:add|create|delete|remove|modify|edit|change|update|write|apply)\s+"
+    r"(?:(?:a|an|the|any|new|this|that)\s+)?"
+    r"(?:file|files|change|changes|project\s+file|project\s+files|code)\b"
+    r"|kya\s+tum\s+(?:file|files|project\s+file|project\s+files|code)\s+"
+    r"(?:add|create|delete|remove|modify|edit|change|update|write|apply)\s+"
+    r"kar\s+sakte\s+ho\b"
+    r")",
+    re.IGNORECASE,
+)
+ONLY_YES_NO_PATTERN = re.compile(
+    r"\b(?:only\s+answer\s+(?:yes|no)|answer\s+(?:only\s+)?(?:yes|no)|"
+    r"just\s+(?:yes|no))\b",
     re.IGNORECASE,
 )
 EXPLANATION_PATTERN = re.compile(
@@ -586,7 +654,7 @@ EXPLANATION_FOLLOW_UP_PATTERN = re.compile(
 )
 CLARIFICATION_RESPONSE_PATTERN = re.compile(
     r"\b(?:could you|can you|please)\s+(?:specify|clarify|provide|identify)\b|"
-    r"\bwhich\s+(?:file|issue|change|project|function|method)\b",
+    r"\bwhich\s+(?:file|directory|issue|change|project|function|method)\b",
     re.IGNORECASE,
 )
 DIFF_CONTENT_PATTERN = re.compile(
@@ -601,9 +669,82 @@ CHANGE_FOLLOW_UP_PATTERN = re.compile(
 
 
 def _requires_proposal(request: str) -> bool:
+    if _is_capability_question(request):
+        return False
     if EXPLANATION_PATTERN.search(request) and not EXPLICIT_CHANGE_PATTERN.search(request):
         return False
     return bool(WRITE_PATTERN.search(request))
+
+
+def _is_underspecified_file_creation_request(request: str) -> bool:
+    if not WRITE_PATTERN.search(str(request or "")) or _is_capability_question(request):
+        return False
+    request_text = str(request or "")
+    if not re.search(r"\bfile(?:n)?(?:bn(?:a|ana|ani))?\b", request_text, re.IGNORECASE):
+        return False
+    return not bool(re.search(
+        r"\b[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,12}\b",
+        request_text,
+        re.IGNORECASE,
+    ))
+
+
+def _file_creation_clarification_question(request: str) -> str:
+    if re.search(r"\b(?:ek|hai|kya|tum|sakte|bana|banani|banana|bnani|bnana)\b", request, re.I):
+        return "Kaunsi file banani hai, kahan rakhni hai, aur uska purpose kya hai?"
+    return "What file should I create, where should it go, and what should it do?"
+
+
+def _is_capability_question(request: str) -> bool:
+    if not CAPABILITY_QUESTION_PATTERN.search(str(request or "")):
+        return False
+    return not bool(re.search(
+        r"\b[A-Za-z0-9_-]+\.(?:php|ts|tsx|js|jsx|py|java|go|rb|cs|rs|json|ya?ml|html|css)\b",
+        str(request or ""),
+        re.IGNORECASE,
+    ))
+
+
+def _registered_mutation_capability(connection_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not _coding_connection_has_mutation_capability(connection_id):
+        return None
+    for name in sorted(TOOL_CAPABILITIES):
+        capability = TOOL_CAPABILITIES[name]
+        if (
+            capability.get("available")
+            and capability.get("mutation") is True
+        ):
+            return {"name": name, **capability}
+    return None
+
+
+def _capability_question_answer(request: str, connection_id: Optional[str] = None) -> str:
+    mutation_capability = _registered_mutation_capability(connection_id)
+    if mutation_capability is None:
+        if ONLY_YES_NO_PATTERN.search(request):
+            return "No."
+        return (
+            "No. I can prepare a reviewable diff proposal, but cannot apply project changes "
+            "because no file-mutation capability is registered."
+        )
+
+    approval, approval_reason = PolicyGate.evaluate_file_mutation(
+        "modify",
+        ["capability-check.txt"],
+        proposal_approved=False,
+    )
+    delete_confirmation, delete_reason = PolicyGate.evaluate_file_mutation(
+        "delete",
+        ["capability-check.txt"],
+        proposal_approved=True,
+        delete_confirmed=False,
+    )
+    requirements = []
+    if mutation_capability.get("approval_required") and approval != "ALLOW":
+        requirements.append(approval_reason)
+    if mutation_capability.get("delete_confirmation_required") and delete_confirmation != "ALLOW":
+        requirements.append("Deletion requires a separate explicit confirmation before any delete can proceed.")
+    return "Yes." + (f" {' '.join(requirements)}" if requirements else "")
 
 
 def _proposal_goal(user_requests: List[str]) -> str:
@@ -631,11 +772,9 @@ PERFORMANCE_INVESTIGATION_PATTERN = re.compile(
 )
 
 PERFORMANCE_FIX_PATTERN = re.compile(
-    r"\b(?:fix|patch|optimi[sz]e|sudhar|badlo|repair|correct|update|refactor|change)\s+(?:(?:this|the|that|it)\s+)?(?:slow|duplicate|unindexed|n\+1)?\s*(?:query|queries|bottleneck|performance\s+issue|database\s+query)\b|"
+    r"\b(?:fix|patch|optimi[sz]e|sudhar|badlo|repair|correct|update|refactor|change)\s+(?:(?:this|the|that|it)\s+)?(?:slow|duplicate|unindexed|n\+1)?(?:\s+[a-zA-Z0-9_-]+)?\s*(?:query|queries|bottleneck|performance\s+issue|database\s+query)\b|"
     r"\b(?:query|queries|bottleneck)\s+fix\s*(?:karo|banao|do)?\b|"
-    r"\b(?:fix\s+(?:the\s+)?(?:slow|duplicate|unindexed\s+)?query|fix\s+this\s+query|optimize\s+this\s+query)\b|"
-    r"\b(?:prepare|create|generate|make|build)\s+(?:a\s+)?(?:proposal|diff|patch)\b|"
-    r"\b(?:fix|optimize|refactor)\b.*\b(?:proposal|diff|patch|query)\b",
+    r"\b(?:fix\s+(?:the\s+)?(?:slow|duplicate|unindexed\s+)?query|fix\s+this\s+query|optimize\s+this\s+query)\b",
     re.IGNORECASE,
 )
 
@@ -755,6 +894,8 @@ def _requires_proposal_for_conversation(messages: List[Dict[str, Any]]) -> bool:
     if not user_requests:
         return False
     latest_request = user_requests[-1]
+    if _is_capability_question(latest_request):
+        return False
     if EXPLANATION_FOLLOW_UP_PATTERN.search(latest_request):
         return False
     if PERFORMANCE_FIX_PATTERN.search(latest_request) or re.search(
@@ -811,6 +952,8 @@ class TaskIntent:
     DATABASE_BENCHMARK = "DATABASE_BENCHMARK"
     ARCHITECTURE_INVESTIGATION = "ARCHITECTURE_INVESTIGATION"
     GENERAL_REPOSITORY_TASK = "GENERAL_REPOSITORY_TASK"
+    CAPABILITY_QUESTION = "CAPABILITY_QUESTION"
+    ACTION_REQUEST = "ACTION_REQUEST"
 
     # Backward-compatible aliases
     EXPLANATION = "QUESTION"
@@ -1021,6 +1164,14 @@ def understand_human_request(
         if not target or contextual_count or contextual_latest:
             target = str(resolved_target)
 
+    if _is_capability_question(normalized):
+        action = TaskIntent.CAPABILITY_QUESTION
+        target = None
+        expected_output = "deterministic answer from registered capabilities and policy"
+    elif _requires_proposal(normalized):
+        action = TaskIntent.ACTION_REQUEST
+        expected_output = "approved change proposal"
+
     requires_execution = action in {
         "COUNT", "LIST", "RUNTIME_DATABASE_STATUS", "PERFORMANCE_ANALYSIS"
     }
@@ -1061,8 +1212,12 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
         req, re.I
     ))
 
+    # Capability questions must not be promoted to change proposals by write verbs.
+    if understanding.get("action") == TaskIntent.CAPABILITY_QUESTION:
+        intent = TaskIntent.CAPABILITY_QUESTION
+        proposal_required = False
     # Check for explicit performance fix first if user asks to fix the slow query
-    if PERFORMANCE_FIX_PATTERN.search(req):
+    elif PERFORMANCE_FIX_PATTERN.search(req):
         intent = TaskIntent.PERFORMANCE_FIX
         proposal_required = True
     elif re.search(
@@ -1082,7 +1237,7 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     ):
         intent = TaskIntent.BUG_FIX
         proposal_required = True
-    elif re.search(r"\b(?:code\s+review|review\s+this|review\s+(?:the|this|a)?\s*(?:pull\s+request|pr|code|diff)|review\s+karo|review\s+karke|audit\s+karo|security\s+audit)\b", req, re.I):
+    elif re.search(r"\b(?:code\s+review|review\s+this|review\s+(?:the|this|a)?\s*(?:pull\s+request|pr|code|diff)|review\s+karo|review\s+karke|audit\s+karo|security\s+(?:audit|vulnerability))\b", req, re.I):
         intent = TaskIntent.CODE_REVIEW
         proposal_required = False
     elif re.search(r"\b(?:dependency|dependencies|outdated\s+packages?|package\s+conflict|docker|dockerfile|env\b|config\b|configuration)\b", req, re.I):
@@ -1141,7 +1296,7 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     elif re.search(r"\b(?:refactor|clean\s*up|extract\s+method|reorganize)\b", req, re.I):
         intent = TaskIntent.REFACTOR
         proposal_required = True
-    elif re.search(r"\b(?:500|404|error|exception|bug|issue|kabhi\s+kabhi|fail|crash|wrong|incorrect)\b", req, re.I) and not re.search(r"\b(?:fix|repair|resolve|banao)\b", req, re.I):
+    elif re.search(r"\b(?:500|404|error|exception|bug|issue|kabhi\s+kabhi|fail|crash(?:es|ed|ing)?|wrong|incorrect)\b", req, re.I) and not re.search(r"\b(?:fix|repair|resolve|banao)\b", req, re.I):
         intent = TaskIntent.BUG_INVESTIGATION
         proposal_required = False
     elif re.search(r"\b(?:samjhao|samjha\s+do|kaise\s+kaam\s+karta\s+hai|kya\s+karta\s+hai|explain|describe|what\s+(?:does|do|is|are)|how\s+(?:does|do|is|can\s+i)|why\s+(?:does|do|is)|overview|walkthrough)\b", req, re.I):
@@ -1177,6 +1332,7 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     return {
         "intent": intent,
         "proposal_required": proposal_required,
+        "request": req,
         "is_continuation": is_continuation,
         "target_symbols": candidate_symbols,
         "target_files": candidate_files,
@@ -1516,11 +1672,14 @@ class TaskSessionStore:
             }
         session = self._sessions[key]
         previous_root = str(session.get("projectRoot") or "")
+        normalize_project_root = lambda value: os.path.normcase(
+            os.path.abspath(os.path.normpath(value))
+        )
         if (
             project_root
             and previous_root
-            and os.path.normcase(os.path.normpath(project_root))
-            != os.path.normcase(os.path.normpath(previous_root))
+            and normalize_project_root(project_root)
+            != normalize_project_root(previous_root)
         ):
             for field in (
                 "agentTaskState", "semanticTask", "activeDatabaseTask",
@@ -1551,7 +1710,11 @@ class TaskSessionStore:
             })
         if project_root and not session.get("projectRoot"):
             session["projectRoot"] = project_root
-        elif project_root and previous_root != project_root:
+        elif (
+            project_root
+            and normalize_project_root(previous_root or project_root)
+            != normalize_project_root(project_root)
+        ):
             session["projectRoot"] = project_root
         if scope and scope != ".":
             session["scope"] = scope
@@ -1602,6 +1765,7 @@ class TaskSessionStore:
         session["sourceEvidence"].append({
             "path": path,
             "snippet": SecretProtector.redact_text(snippet[:2000]),
+            "projectRoot": session.get("projectRoot") or "",
             "startLine": start_line,
             "endLine": end_line,
             "symbol": symbol,
@@ -1862,6 +2026,18 @@ def compute_next_best_action(session_data: Dict[str, Any], intent_info: Dict[str
             "rationale": f"Read candidate target file '{unread_candidates[0]}' identified from user goal.",
         }
 
+    if (
+        proposal_required
+        and not target_files
+        and not target_symbols
+        and not _proposal_topic_terms({"userRequest": intent_info.get("request")})
+    ):
+        return {
+            "action": "synthesize_report",
+            "target": "",
+            "rationale": "A concrete change target is needed before selecting relevant project files.",
+        }
+
     searched_queries = {
         str((t.get("arguments") or {}).get("query") or "").lower()
         for t in session_data.get("toolHistory", [])
@@ -2001,11 +2177,15 @@ def _coding_tool_call_for_next_action(
 
 
 _PROPOSAL_GENERIC_TERMS = {
-    "add", "adding", "attached", "change", "compare", "create", "current", "do", "existing",
-    "file", "files", "first", "for", "function", "how", "implementation",
-    "inspect", "make", "minimal", "modify", "not", "only", "options",
-    "pattern", "prepare", "project", "proposal", "recommend", "relevant",
-    "reusable", "safest", "source", "the", "this", "two", "and", "any",
+    "add", "adding", "answer", "attached", "can", "change", "compare", "create",
+    "current", "delete", "do", "existing", "feature", "file", "files", "first", "for",
+    "fix", "bug", "issue", "error", "implement", "build",
+    "function", "how", "implementation", "inspect", "make", "minimal", "modify",
+    "not", "only", "options", "pattern", "prepare", "project", "proposal",
+    "recommend", "relevant", "reusable", "safest", "source", "the", "this",
+    "two", "and", "any", "you", "yes", "something", "anything", "remove",
+    "write", "update", "edit", "apply", "question", "capability", "possible",
+    "support", "currently", "actually", "ever", "new", "changes",
 }
 
 
@@ -2027,14 +2207,286 @@ def _proposal_topic_terms(task_state: Dict[str, Any]) -> set:
 
 
 def _proposal_source_search_query(task_state: Dict[str, Any]) -> str:
-    topic_terms = sorted(_proposal_topic_terms(task_state))
+    if not _proposal_has_concrete_target(task_state):
+        return ""
+    topic_terms = _proposal_topic_terms(task_state)
+    topic_terms.update(Path(target).name for target in _proposal_target_files(task_state))
+    topic_terms = sorted(topic_terms, key=lambda term: (len(term) <= 3, term.casefold()))
     if topic_terms:
         return " ".join(topic_terms[:4])
-    return str(task_state.get("userRequest") or "").strip()[:200]
+    return ""
+
+
+def _proposal_has_concrete_target(task_state: Dict[str, Any]) -> bool:
+    requested_targets = task_state.get("requestedTargets")
+    if isinstance(requested_targets, dict) and any(
+        requested_targets.get(key)
+        for key in ("files", "symbols")
+    ):
+        return True
+    request_text = str(task_state.get("userRequest") or "")
+    intent_info = classify_task_intent(request_text)
+    return bool(intent_info.get("target_files") or intent_info.get("target_symbols"))
+
+
+def _proposal_scope_path(value: Any) -> Optional[str]:
+    path = str(value or "").replace("\\", "/").strip()
+    if path.startswith("/") or re.match(r"^[A-Za-z]:", path):
+        return None
+    path = path.strip("/")
+    if path in {"", "."}:
+        return ""
+    parts = [part for part in path.split("/") if part not in {"", "."}]
+    if any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _proposal_path_is_in_scope(task_state: Dict[str, Any], value: Any) -> Optional[str]:
+    candidate = _proposal_scope_path(value)
+    if candidate is None:
+        return None
+    context = task_state.get("context") if isinstance(task_state.get("context"), dict) else {}
+    project = context.get("project") if isinstance(context.get("project"), dict) else {}
+    scope = _proposal_scope_path(project.get("scope") or task_state.get("scope") or ".")
+    if scope is None or (scope and candidate != scope and not candidate.startswith(scope + "/")):
+        return None
+    parts = {part.casefold() for part in candidate.split("/")[:-1]}
+    if parts.intersection({"vendor", "node_modules", "dist", "build"}):
+        return None
+    if Path(candidate).suffix.casefold() not in _PROPOSAL_SOURCE_EXTENSIONS:
+        return None
+    return candidate
+
+
+def _proposal_target_files(task_state: Dict[str, Any]) -> List[str]:
+    requested_targets = task_state.get("requestedTargets")
+    values = requested_targets.get("files") if isinstance(requested_targets, dict) else None
+    if not isinstance(values, list):
+        values = []
+    if not values:
+        values = classify_task_intent(str(task_state.get("userRequest") or "")).get("target_files", [])
+    return [
+        path
+        for value in values
+        if (path := _proposal_scope_path(value)) is not None and Path(path).suffix
+    ]
+
+
+def _proposal_parent_directory(path: str) -> str:
+    parent = str(Path(path).parent).replace("\\", "/")
+    return "" if parent == "." else parent
+
+
+def _proposal_target_directories(task_state: Dict[str, Any]) -> set:
+    context = task_state.get("context") if isinstance(task_state.get("context"), dict) else {}
+    project = context.get("project") if isinstance(context.get("project"), dict) else {}
+    scope = _proposal_scope_path(project.get("scope") or task_state.get("scope") or ".")
+    if scope is None:
+        return set()
+    directories = set()
+    for target in _proposal_target_files(task_state):
+        target_directory = _proposal_parent_directory(target)
+        if not target_directory:
+            directories.add(scope.casefold())
+        elif not scope or target_directory == scope or target_directory.startswith(scope + "/"):
+            directories.add(target_directory.casefold())
+        else:
+            directories.add(f"{scope}/{target_directory}".strip("/").casefold())
+    return directories
+
+
+def _proposal_source_candidates_from_directory(task_state: Dict[str, Any]) -> List[str]:
+    context = task_state.get("context") if isinstance(task_state.get("context"), dict) else {}
+    project = context.get("project") if isinstance(context.get("project"), dict) else {}
+    scope = _proposal_scope_path(project.get("scope") or task_state.get("scope") or ".")
+    if scope is None:
+        return []
+    candidates = []
+    requested_terms = _proposal_topic_terms({
+        "userRequest": task_state.get("userRequest") or "",
+    })
+    for action in task_state.get("actions", []):
+        if (
+            not isinstance(action, dict)
+            or action.get("tool") not in ("list_directory", "repo_browser.list_directory")
+            or action.get("status") not in {"SUCCESS", "REUSED"}
+        ):
+            continue
+        last_result = _task_action_result(action)
+        data = last_result.get("data") if isinstance(last_result.get("data"), dict) else last_result
+        entries = data.get("entries") or data.get("files") or []
+        if not isinstance(entries, list):
+            continue
+        directory = _proposal_scope_path(
+            action.get("target")
+            or (action.get("arguments") or {}).get("relativePath")
+            or scope
+        )
+        if directory is None or (scope and directory != scope and not directory.startswith(scope + "/")):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("type") != "file":
+                continue
+            name = str(entry.get("name") or "").strip()
+            if not name or Path(name).name != name:
+                continue
+            candidate = _proposal_path_is_in_scope(task_state, f"{directory}/{name}".strip("/"))
+            if candidate is None:
+                continue
+            candidates.append(candidate)
+    candidates = list(dict.fromkeys(candidates))
+    candidates.sort(key=lambda candidate: (
+        -len(requested_terms.intersection(
+            _proposal_topic_terms({"userRequest": candidate})
+        )),
+        candidate.casefold(),
+    ))
+    return candidates
+
+
+def _proposal_directory_listing_completed(task_state: Dict[str, Any]) -> bool:
+    context = task_state.get("context") if isinstance(task_state.get("context"), dict) else {}
+    project = context.get("project") if isinstance(context.get("project"), dict) else {}
+    scope = _proposal_scope_path(project.get("scope") or task_state.get("scope") or ".")
+    if scope is None:
+        return False
+    for action in task_state.get("actions", []):
+        if (
+            not isinstance(action, dict)
+            or action.get("tool") not in ("list_directory", "repo_browser.list_directory")
+            or action.get("status") not in {"SUCCESS", "REUSED"}
+        ):
+            continue
+        directory = _proposal_scope_path(
+            action.get("target")
+            or (action.get("arguments") or {}).get("relativePath")
+            or scope
+        )
+        if directory is not None and (
+            not scope or directory == scope or directory.startswith(scope + "/")
+        ):
+            return True
+    return False
+
+
+def _proposal_next_source_directory(task_state: Dict[str, Any]) -> Optional[str]:
+    context = task_state.get("context") if isinstance(task_state.get("context"), dict) else {}
+    project = context.get("project") if isinstance(context.get("project"), dict) else {}
+    scope = _proposal_scope_path(project.get("scope") or task_state.get("scope") or ".")
+    if scope is None:
+        return None
+
+    listed_directories = set()
+    extra_listing_count = 0
+    for action in task_state.get("actions", []):
+        if not isinstance(action, dict) or action.get("tool") not in (
+            "list_directory", "repo_browser.list_directory"
+        ):
+            continue
+        arguments = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
+        directory = _proposal_scope_path(
+            action.get("target") or arguments.get("relativePath") or arguments.get("path") or scope
+        )
+        if directory is None or (scope and directory != scope and not directory.startswith(scope + "/")):
+            continue
+        listed_directories.add(directory.casefold())
+        if directory.casefold() != scope.casefold():
+            extra_listing_count += 1
+    if extra_listing_count >= 2:
+        return None
+
+    mapped_directories = []
+    for action in task_state.get("actions", []):
+        if not isinstance(action, dict) or action.get("tool") != "get_repository_map":
+            continue
+        result = _task_action_result(action)
+        data = result.get("data") if isinstance(result.get("data"), dict) else result
+        source_directories = data.get("sourceDirectories") if isinstance(data, dict) else None
+        if isinstance(source_directories, list):
+            mapped_directories.extend(source_directories)
+
+    candidates = []
+    for value in mapped_directories:
+        mapped = _proposal_scope_path(value)
+        if mapped is None:
+            continue
+        if scope and mapped and mapped != scope and not mapped.startswith(scope + "/"):
+            mapped = _proposal_scope_path(f"{scope}/{mapped}")
+        elif not mapped:
+            mapped = scope
+        if mapped is None or not mapped:
+            continue
+        parts = [part.casefold() for part in mapped.split("/")]
+        if any(part in {"vendor", "node_modules", "dist", "build"} for part in parts):
+            continue
+        if mapped.casefold() in listed_directories:
+            continue
+        candidates.append(mapped)
+
+    requested_terms = _proposal_topic_terms({
+        "userRequest": task_state.get("userRequest") or "",
+    })
+    candidates = list(dict.fromkeys(candidates))
+    candidates.sort(key=lambda directory: (
+        -len(requested_terms.intersection(
+            _proposal_topic_terms({"userRequest": directory})
+        )),
+        directory.casefold(),
+    ))
+    return candidates[0] if candidates else None
+
+
+def _set_proposal_evidence_limitation(task_state: Dict[str, Any]) -> str:
+    content = (
+        "I couldn't find a readable source file in the attached scope. "
+        "Which directory should I inspect within the attached scope?"
+    )
+    task_state.update({
+        "status": "NEEDS_CLARIFICATION",
+        "assistantContent": content,
+        "selectedAction": "CLARIFY",
+        "nextAction": {
+            "tool": "CLARIFY",
+            "arguments": {},
+            "reason": "No readable source file was found within the attached scope.",
+            "expectedEvidence": None,
+            "confidence": 1.0,
+        },
+        "nextActionName": "CLARIFY",
+    })
+    task_state.setdefault("clarification", {}).update({
+        "required": True,
+        "reason": "No readable source file was found within the attached scope.",
+        "question": content,
+    })
+    return content
+
+
+def _proposal_source_candidate_from_directory(task_state: Dict[str, Any]) -> Optional[str]:
+    attempted_reads = {
+        str(action.get("target") or "").replace("\\", "/").casefold()
+        for action in task_state.get("actions", [])
+        if isinstance(action, dict) and action.get("tool") in {
+            "read_file", "repo_browser.read_file", "repo_browser.open_file", "open_file"
+        }
+    }
+    return next(
+        (
+            candidate
+            for candidate in _proposal_source_candidates_from_directory(task_state)
+            if candidate.casefold() not in attempted_reads
+        ),
+        None,
+    )
 
 
 def _proposal_source_candidate_from_search(task_state: Dict[str, Any]) -> Optional[str]:
+    target_files = _proposal_target_files(task_state)
+    target_dirs = _proposal_target_directories(task_state)
     topic_terms = _proposal_topic_terms(task_state)
+    if not target_files and not topic_terms:
+        return None
     actions = task_state.get("actions", [])
     attempted_reads = {
         str(action.get("target") or "").replace("\\", "/").casefold()
@@ -2057,14 +2509,22 @@ def _proposal_source_candidate_from_search(task_state: Dict[str, Any]) -> Option
         for hit in hits:
             if not isinstance(hit, dict):
                 continue
-            candidate = str(hit.get("path") or "").replace("\\", "/").strip("/")
-            path_parts = {part.casefold() for part in candidate.split("/")[:-1]}
-            if (
-                candidate
-                and Path(candidate).suffix.casefold() in _PROPOSAL_SOURCE_EXTENSIONS
-                and not path_parts.intersection({"vendor", "node_modules", "dist", "build"})
-                and candidate.casefold() not in attempted_reads
-            ):
+            candidate = _proposal_path_is_in_scope(task_state, hit.get("path"))
+            if candidate and candidate.casefold() not in attempted_reads:
+                candidate_basename = Path(candidate).name.casefold()
+                matching_targets = [
+                    target
+                    for target in target_files
+                    if Path(target).name.casefold() == candidate_basename
+                ]
+                if matching_targets:
+                    candidates.append((float("inf"), candidate))
+                    continue
+                if target_files and _proposal_parent_directory(candidate).casefold() in target_dirs:
+                    candidates.append((1, candidate))
+                    continue
+                if target_files:
+                    continue
                 path_terms = _proposal_topic_terms({"userRequest": candidate})
                 content_terms = _proposal_topic_terms({
                     "userRequest": str(hit.get("text") or "")
@@ -2073,7 +2533,7 @@ def _proposal_source_candidate_from_search(task_state: Dict[str, Any]) -> Option
                     3 * len(topic_terms.intersection(path_terms))
                     + len(topic_terms.intersection(content_terms))
                 )
-                if not topic_terms or relevance:
+                if relevance:
                     candidates.append((relevance, candidate))
         if candidates:
             return max(candidates, key=lambda item: item[0])[1]
@@ -2081,6 +2541,33 @@ def _proposal_source_candidate_from_search(task_state: Dict[str, Any]) -> Option
 
 
 def _has_relevant_proposal_source_evidence(task_state: Dict[str, Any]) -> bool:
+    target_files = _proposal_target_files(task_state)
+    if not target_files and not _proposal_has_concrete_target(task_state):
+        if not _has_repository_map_evidence(task_state):
+            return False
+        return _has_scoped_read_source_evidence(task_state)
+    if target_files:
+        target_basenames = {Path(target).name.casefold() for target in target_files}
+        target_dirs = _proposal_target_directories(task_state)
+        for action in task_state.get("actions", []):
+            if not _is_successful_proposal_read(action):
+                continue
+            result = _task_action_result(action)
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            path = _proposal_path_is_in_scope(
+                task_state,
+                data.get("path") or result.get("path") or action.get("target"),
+            )
+            if not path:
+                continue
+            if Path(path).name.casefold() in target_basenames:
+                return True
+            if (
+                _proposal_parent_directory(path).casefold()
+                in target_dirs
+            ):
+                return True
+        return False
     topic_terms = _proposal_topic_terms(task_state)
     if not topic_terms:
         return False
@@ -2095,13 +2582,43 @@ def _has_relevant_proposal_source_evidence(task_state: Dict[str, Any]) -> bool:
             continue
         result = _task_action_result(action)
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        path = str(data.get("path") or result.get("path") or action.get("target") or "")
+        path = _proposal_path_is_in_scope(
+            task_state,
+            data.get("path") or result.get("path") or action.get("target"),
+        )
+        if not path:
+            continue
         content = str(data.get("content") or result.get("content") or result.get("preview") or "")
         if topic_terms.intersection(
             _proposal_topic_terms({"userRequest": path + " " + content})
         ):
             return True
     return False
+
+
+def _is_successful_proposal_read(action: Any) -> bool:
+    return (
+        isinstance(action, dict)
+        and action.get("tool") in {
+            "read_file", "repo_browser.read_file", "repo_browser.open_file", "open_file"
+        }
+        and action.get("status") in {"SUCCESS", "REUSED"}
+    )
+
+
+def _has_scoped_read_source_evidence(task_state: Dict[str, Any]) -> bool:
+    return any(
+        _is_successful_proposal_read(action)
+        and _proposal_path_is_in_scope(
+            task_state,
+            (
+                (_task_action_result(action).get("data") or {}).get("path")
+                if isinstance(_task_action_result(action).get("data"), dict)
+                else _task_action_result(action).get("path")
+            ) or action.get("target"),
+        )
+        for action in task_state.get("actions", [])
+    )
 
 
 def detect_evidence_contradictions(session_data: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -3069,7 +3586,7 @@ def _build_semantic_task(
             "database": "databaseName",
             "username": "username",
             "password": "passwordPresence",
-            "credentialstatus": "passwordPresence",
+            "credentialstatus": "credentialStatus",
         }
         fact_names = list(dict.fromkeys(
             property_to_fact[item]
@@ -3150,14 +3667,10 @@ def _sync_task_evidence_requirements(task_state: Dict[str, Any]) -> List[Dict[st
         record = {
             "id": requirement_id,
             "requirement": requirement,
-            "status": prior.get("status", "PENDING") if prior else "PENDING",
-            "evidenceIds": list(prior.get("evidenceIds") or []) if prior else [],
-            "provenance": list(prior.get("provenance") or []) if prior else [],
-            "knowledgeRevision": (
-                prior.get("knowledgeRevision", task_state.get("knowledgeRevision", 0))
-                if prior
-                else task_state.get("knowledgeRevision", 0)
-            ),
+            "status": "PENDING",
+            "evidenceIds": [],
+            "provenance": [],
+            "knowledgeRevision": task_state.get("knowledgeRevision", 0),
         }
         metadata = details.get(requirement)
         if metadata:
@@ -3169,21 +3682,133 @@ def _sync_task_evidence_requirements(task_state: Dict[str, Any]) -> List[Dict[st
     return requirements
 
 
+def _task_evidence_scope_matches(
+    task_state: Dict[str, Any],
+    evidence: Dict[str, Any],
+) -> bool:
+    project_context = task_state.get("projectContext")
+    project_context = project_context if isinstance(project_context, dict) else {}
+    context = task_state.get("context")
+    context = context if isinstance(context, dict) else {}
+    project = context.get("project")
+    project = project if isinstance(project, dict) else {}
+    expected_root = str(
+        task_state.get("projectRoot")
+        or project_context.get("root")
+        or project.get("root")
+        or ""
+    )
+    evidence_root = str(evidence.get("projectRoot") or "")
+    if not expected_root or not evidence_root:
+        return False
+    normalize_root = lambda value: os.path.normcase(
+        os.path.abspath(os.path.normpath(str(value)))
+    )
+    if normalize_root(expected_root) != normalize_root(evidence_root):
+        return False
+
+    expected_scope = str(
+        task_state.get("scope")
+        or project_context.get("scope")
+        or project.get("scope")
+        or ""
+    )
+    evidence_scope = evidence.get("scope")
+    if expected_scope and (
+        not isinstance(evidence_scope, str)
+        or os.path.normcase(os.path.normpath(evidence_scope))
+        != os.path.normcase(os.path.normpath(expected_scope))
+    ):
+        return False
+
+    for field in ("taskId", "sessionId", "projectId", "repositoryId"):
+        expected = task_state.get(field)
+        actual = evidence.get(field)
+        if expected is not None and actual != expected:
+            return False
+        if expected is None and actual not in (None, ""):
+            return False
+    return True
+
+
+def _task_evidence_supports_requirement(
+    task_state: Dict[str, Any],
+    action: Dict[str, Any],
+    evidence: Dict[str, Any],
+    requirement: Dict[str, Any],
+    result: Dict[str, Any],
+    data: Dict[str, Any],
+) -> bool:
+    evidence_id = evidence.get("evidenceId")
+    linked_ids = action.get("resultEvidenceIds")
+    if (
+        action.get("status") not in {"SUCCESS", "REUSED"}
+        or not isinstance(linked_ids, list)
+        or evidence_id not in linked_ids
+        or evidence.get("verified") is not True
+        or not _task_evidence_scope_matches(task_state, evidence)
+    ):
+        return False
+
+    expected_resource = requirement.get("resource")
+    evidence_resource = evidence.get("resource") or evidence.get("type")
+    if expected_resource and evidence_resource != expected_resource:
+        return False
+    if evidence_resource != _task_resource_for_tool(str(action.get("tool") or "")):
+        return False
+    if evidence.get("source") != action.get("tool"):
+        return False
+    if evidence.get("provenance") not in {
+        "READ_ONLY_TOOL_RESULT",
+        "PROJECT_CONFIGURATION_INSPECTION",
+        "SESSION_OWNED_BY_ACTIVE_PROJECT",
+        "LIVE_DATABASE_VERIFICATION",
+        "ALLOWLISTED_VERIFICATION_TOOL",
+    }:
+        return False
+
+    evidence_type = requirement.get("evidenceType")
+    if evidence_type == "LIVE_DATABASE_SCHEMA":
+        return (
+            evidence_resource == "DATABASE"
+            and _has_live_schema_proof(result, data)
+        )
+    if evidence_type == "LIVE_DATABASE_QUERY":
+        return (
+            evidence_resource == "DATABASE"
+            and _has_live_query_proof(result, data)
+        )
+    if evidence_type == "VERIFICATION_RESULT":
+        exit_code = data.get("exitCode")
+        return (
+            action.get("tool") in {"run_verification", "terminal.run_command"}
+            and evidence_resource == "RUNTIME"
+            and data.get("executed") is True
+            and isinstance(exit_code, int)
+            and not isinstance(exit_code, bool)
+        )
+    return True
+
+
 def _refresh_task_evidence_requirements(task_state: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Match requirements only to verified evidence linked by the executing action."""
     requirements = _sync_task_evidence_requirements(task_state)
-    evidence_by_id = {
-        str(item.get("evidenceId")): item
-        for item in task_state.get("evidence", [])
-        if isinstance(item, dict) and item.get("evidenceId")
-    }
+    evidence_by_id: Dict[str, Dict[str, Any]] = {}
+    duplicate_ids: Set[str] = set()
+    for item in task_state.get("evidence", []):
+        if not isinstance(item, dict) or not item.get("evidenceId"):
+            continue
+        evidence_id = str(item["evidenceId"])
+        if evidence_id in evidence_by_id:
+            duplicate_ids.add(evidence_id)
+        else:
+            evidence_by_id[evidence_id] = item
     actions = [
         action for action in task_state.get("actions", [])
         if isinstance(action, dict)
     ]
     for requirement in requirements:
-        prior_status = requirement.get("status")
-        support_ids = set(requirement.get("evidenceIds") or [])
+        support_ids: Set[str] = set()
         supporting_evidence: List[Dict[str, Any]] = []
         explicitly_contradicted = False
         explicitly_unavailable = False
@@ -3210,40 +3835,13 @@ def _refresh_task_evidence_requirements(task_state: Dict[str, Any]) -> List[Dict
                 evidence = evidence_by_id.get(evidence_id)
                 if (
                     evidence
-                    and evidence.get("verified") is True
-                    and evidence.get("provenance")
-                    and (
-                        not requirement.get("resource")
-                        or evidence.get("type") == requirement["resource"]
-                    )
-                    and (
-                        requirement.get("evidenceType") != "LIVE_DATABASE_SCHEMA"
-                        or _has_live_schema_proof(result, data)
-                    )
-                    and (
-                        requirement.get("evidenceType") != "LIVE_DATABASE_QUERY"
-                        or _has_live_query_proof(result, data)
-                    )
-                    and (
-                        requirement.get("evidenceType") != "VERIFICATION_RESULT"
-                        or (
-                            action.get("tool") in {"run_verification", "terminal.run_command"}
-                            and data.get("executed") is True
-                            and isinstance(data.get("exitCode"), int)
-                            and not isinstance(data.get("exitCode"), bool)
-                        )
+                    and evidence_id not in duplicate_ids
+                    and _task_evidence_supports_requirement(
+                        task_state, action, evidence, requirement, result, data
                     )
                 ):
                     support_ids.add(evidence_id)
                     supporting_evidence.append(evidence)
-            if action.get("status") in {"SUCCESS", "REUSED"}:
-                for evidence in supporting_evidence:
-                    contradicted_ids = evidence.get("contradictsEvidenceIds")
-                    if (
-                        isinstance(contradicted_ids, list)
-                        and any(item in support_ids for item in contradicted_ids)
-                    ):
-                        explicitly_contradicted = True
             result_status = str(
                 data.get("executionStatus")
                 or data.get("status")
@@ -3260,6 +3858,12 @@ def _refresh_task_evidence_requirements(task_state: Dict[str, Any]) -> List[Dict
                 }
             ):
                 explicitly_unavailable = True
+        for evidence in supporting_evidence:
+            contradicted_ids = evidence.get("contradictsEvidenceIds")
+            if isinstance(contradicted_ids, list) and any(
+                item in support_ids for item in contradicted_ids
+            ):
+                explicitly_contradicted = True
         if explicitly_contradicted:
             requirement["status"] = "CONTRADICTED"
         elif support_ids:
@@ -3273,12 +3877,12 @@ def _refresh_task_evidence_requirements(task_state: Dict[str, Any]) -> List[Dict
             requirement["knowledgeRevision"] = task_state.get("knowledgeRevision", 0)
         elif explicitly_unavailable:
             requirement["status"] = "UNAVAILABLE"
-        elif prior_status == "VERIFIED":
-            requirement["status"] = "VERIFIED"
-        elif prior_status == "CONTRADICTED":
-            requirement["status"] = "CONTRADICTED"
-        elif prior_status != "UNAVAILABLE":
+        else:
             requirement["status"] = "PENDING"
+        if not support_ids:
+            requirement["evidenceIds"] = []
+            requirement["provenance"] = []
+        requirement["knowledgeRevision"] = task_state.get("knowledgeRevision", 0)
     return requirements
 
 
@@ -3360,10 +3964,14 @@ def _update_task_completeness(task_state: Dict[str, Any]) -> None:
         and (evidence_sufficiency["sufficient"] if has_evidence_requirements else True)
         and bool(required_facts or has_evidence_requirements)
     )
-    blocker_established = bool(task_state.get("investigationExhausted")) and all(
+    blocker_established = (
+        bool(task_state.get("investigationExhausted"))
+        and bool(required_facts)
+        and all(
         isinstance(fact, dict)
         and fact.get("status") in resolved_statuses
         for fact in required_facts
+        )
     )
     task_state["requiredEvidenceSatisfied"] = required_evidence_satisfied
     task_state["objectiveSatisfied"] = required_evidence_satisfied or (
@@ -3682,17 +4290,118 @@ def _persist_agent_task_state(
     })
 
 
+def _provider_failure_evidence_fallback(
+    request: str,
+    session: Dict[str, Any],
+    project_root: str,
+    provider_classification: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if provider_classification.get("classification") not in {
+        "PROVIDER_FAILURE",
+        "EXTERNAL_RESOURCE_FAILURE",
+    }:
+        return None
+    if not project_root or not isinstance(session, dict):
+        return None
+
+    def normalize_root(value: Any) -> str:
+        return os.path.normcase(os.path.abspath(os.path.normpath(str(value))))
+
+    def normalize_path(value: Any) -> str:
+        return os.path.normcase(str(value).replace("\\", "/").strip("/")).replace("\\", "/")
+
+    current_root = normalize_root(project_root)
+    if normalize_root(session.get("projectRoot") or "") != current_root:
+        return None
+
+    intent = classify_task_intent(request)
+    if intent.get("understanding", {}).get("action") != "EXPLANATION":
+        return None
+    targets = intent.get("target_files") or []
+    if not targets or len(targets) > 4:
+        return None
+
+    evidence_by_target: Dict[str, Dict[str, Any]] = {}
+    evidence_by_path: Dict[str, Dict[str, Any]] = {}
+    paths_by_target: Dict[str, set[str]] = {}
+    for evidence in session.get("sourceEvidence", []):
+        if not isinstance(evidence, dict):
+            continue
+        evidence_root = evidence.get("projectRoot")
+        snippet = str(evidence.get("snippet") or "").strip()
+        path = str(evidence.get("path") or "").replace("\\", "/").strip("/")
+        if not evidence_root or normalize_root(evidence_root) != current_root or not snippet or not path:
+            continue
+        normalized_path = normalize_path(path)
+        target_name = normalized_path.rsplit("/", 1)[-1]
+        paths_by_target.setdefault(target_name, set()).add(normalized_path)
+        evidence_by_target[target_name] = evidence
+        evidence_by_path[normalized_path] = evidence
+
+    selected = []
+    for target in targets:
+        normalized_target = str(target).replace("\\", "/").strip()
+        while normalized_target.startswith("./"):
+            normalized_target = normalized_target[2:]
+        normalized_target = normalize_path(normalized_target)
+        target_name = normalized_target.rsplit("/", 1)[-1]
+        if not target_name:
+            return None
+        if "/" in normalized_target:
+            evidence = evidence_by_path.get(normalized_target)
+        elif len(paths_by_target.get(target_name, set())) == 1:
+            evidence = evidence_by_target.get(target_name)
+        else:
+            evidence = None
+        if not evidence:
+            return None
+        selected.append(evidence)
+
+    sections = []
+    for evidence in selected:
+        path = str(evidence["path"]).replace("\\", "/")
+        display_path = path.replace("`", "\\`")
+        snippet = SecretProtector.redact_text(str(evidence["snippet"])[:2000])
+        sections.append(
+            f"Previously captured source evidence for `{display_path}` "
+            f"(lines {evidence.get('startLine', 1)}-{evidence.get('endLine', 1)}):\n\n"
+            + "\n".join(f"    {line}" for line in snippet.splitlines())
+        )
+    content = (
+        f"The provider request failed ({provider_classification['category']}). "
+        "Based only on source evidence "
+        "previously captured in this project, the relevant code is:\n\n"
+        + "\n\n".join(sections)
+        + "\n\nThis answer is limited to the captured code; no fresh file read or provider "
+        "answer was produced."
+    )
+    return {"content": content, "evidence": selected}
+
+
 def _task_resource_for_tool(name: str) -> str:
-    lowered = name.casefold()
-    if "database" in lowered or lowered in {"execute_sql", "inspect_schema"}:
-        return "DATABASE"
-    if "browser" in lowered:
-        return "BROWSER"
-    if "api" in lowered or "http" in lowered:
-        return "API"
-    if "run_verification" in lowered or "terminal" in lowered:
-        return "RUNTIME"
-    return "CODE"
+    if not isinstance(name, str) or not name.strip():
+        return "UNKNOWN"
+    database_capabilities = {
+        value for key, value in vars(DatabaseCapability).items()
+        if key.startswith("DATABASE_") and isinstance(value, str)
+    }
+    if name in database_capabilities:
+        return DatabaseCapability.RESOURCE
+
+    capability = CapabilityIntelligenceEngine.resolve_capability(name)
+    if not capability:
+        executable_name = resolve_tool_capability(name)
+        if not executable_name:
+            return "UNKNOWN"
+        capability = CapabilityIntelligenceEngine.resolve_capability(executable_name)
+    metadata = CapabilityIntelligenceEngine.CAPABILITY_METADATA.get(capability)
+    resource = metadata.get("resource") if isinstance(metadata, dict) else None
+    if resource not in {
+        "CODE", "FILE", "DATABASE", "RUNTIME", "BROWSER", "API",
+        "LOGS", "CONFIGURATION", "PROJECT", "REPOSITORY",
+    }:
+        return "UNKNOWN"
+    return resource
 
 
 def _has_repository_map_evidence(task_state: Dict[str, Any]) -> bool:
@@ -3706,6 +4415,8 @@ def _has_repository_map_evidence(task_state: Dict[str, Any]) -> bool:
 
 
 def _update_task_resource_state(task_state: Dict[str, Any], resource_type: str, status: str) -> None:
+    if resource_type == "UNKNOWN":
+        return
     resources = task_state.setdefault("resources", [])
     resource = next((item for item in resources if item.get("type") == resource_type), None)
     if resource is None:
@@ -3718,6 +4429,34 @@ def _update_task_resource_state(task_state: Dict[str, Any], resource_type: str, 
         }
         resources.append(resource)
     resource["status"] = status
+
+
+def _task_evidence_scope_fields(
+    task_state: Dict[str, Any],
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    project_context = task_state.get("projectContext")
+    project_context = project_context if isinstance(project_context, dict) else {}
+    context = task_state.get("context")
+    context = context if isinstance(context, dict) else {}
+    project = context.get("project")
+    project = project if isinstance(project, dict) else {}
+    return {
+        "taskId": task_state.get("taskId"),
+        "sessionId": session_id or task_state.get("sessionId"),
+        "projectRoot": (
+            task_state.get("projectRoot")
+            or project_context.get("root")
+            or project.get("root")
+        ),
+        "scope": (
+            task_state.get("scope")
+            or project_context.get("scope")
+            or project.get("scope")
+        ),
+        "projectId": task_state.get("projectId"),
+        "repositoryId": task_state.get("repositoryId"),
+    }
 
 
 def _redacted_json_value(value: Any) -> Any:
@@ -3749,7 +4488,32 @@ def _update_task_from_tool_result(
             ensure_ascii=False,
             default=str,
         )
-        if action.get("tool") == "get_repository_map":
+        if action.get("tool") in ("list_directory", "repo_browser.list_directory"):
+            data = result.get("data") if isinstance(result, dict) else None
+            entries = (
+                data.get("entries") or data.get("files") or []
+                if isinstance(data, dict)
+                else data if isinstance(data, list)
+                else []
+            )
+            if isinstance(entries, list):
+                safe_summary = json.dumps(
+                    {
+                        "data": {
+                            "entries": [
+                                {
+                                    "name": SecretProtector.redact_text(str(item.get("name") or ""))[:200],
+                                    "type": str(item.get("type") or ""),
+                                }
+                                for item in entries[:100]
+                                if isinstance(item, dict)
+                            ]
+                        }
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+        elif action.get("tool") == "get_repository_map":
             data = result.get("data") if isinstance(result, dict) else None
             if isinstance(data, dict):
                 map_summary = {}
@@ -3841,7 +4605,7 @@ def _update_task_from_tool_result(
                 bool(data.get(key))
                 for key in (
                     "results", "symbols", "references", "content", "path",
-                    "directories", "languages", "frameworks", "entryPoints",
+                    "directories", "entries", "files", "languages", "frameworks", "entryPoints",
                     "sourceDirectories", "configFiles", "schema_details",
                     "schemaDetails",
                 )
@@ -3861,14 +4625,15 @@ def _update_task_from_tool_result(
             not in {"UNKNOWN", "UNVERIFIED", "NOT_VERIFIED", "NOT_RESOLVED", "UNAVAILABLE"}
             for value in non_placeholder_values
         )
-    if succeeded and informative_result:
+    resource_type = _task_resource_for_tool(str(action.get("tool") or ""))
+    if succeeded and informative_result and resource_type != "UNKNOWN":
         result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
         evidence = {
             "evidenceId": evidence_id,
-            "taskId": task_state.get("taskId"),
-            "sessionId": session_id,
+            **_task_evidence_scope_fields(task_state, session_id),
             "turnId": task_state.get("turnId"),
-            "type": _task_resource_for_tool(action.get("tool", "")),
+            "type": resource_type,
+            "resource": resource_type,
             "source": action.get("tool"),
             "target": action.get("target"),
             "summary": safe_summary,
@@ -3882,6 +4647,7 @@ def _update_task_from_tool_result(
                 else None
             ),
             "verified": True,
+            "verificationScope": "TOOL_RESULT",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         contradictory_ids = result_data.get("contradictsEvidenceIds")
@@ -3905,6 +4671,7 @@ def _update_task_from_tool_result(
             "evidenceId": evidence_id,
             "confidence": evidence["confidence"],
             "verified": True,
+            "factType": "TOOL_RESULT_OBSERVATION",
         })
         action["resultEvidenceIds"].append(evidence_id)
         action["lastEvidence"] = [evidence_id]
@@ -3925,7 +4692,6 @@ def _update_task_from_tool_result(
                     "question": resolved["question"],
                     "evidenceId": evidence_id,
                 })
-        resource_type = _task_resource_for_tool(action.get("tool", ""))
         _update_task_resource_state(task_state, resource_type, "AVAILABLE")
         CODING_TASK_STORE.emit_lifecycle_event(session_id, "EVIDENCE_ADDED", {
             "taskId": task_state.get("taskId"),
@@ -4011,7 +4777,18 @@ def _update_task_from_tool_result(
             {
                 "username": result.get("username"),
                 "database": result.get("database"),
-                "has_credentials": result.get("credentialStatus") == "CONFIGURED",
+                "engine": result.get("engine"),
+                "host": result.get("host"),
+                "port": result.get("port"),
+                "credentialStatus": result.get("credentialStatus"),
+                "credentialStatusSource": result.get("credentialStatusSource"),
+                "passwordPresent": result.get("passwordPresent"),
+                "passwordPresenceSource": result.get("passwordPresenceSource"),
+                "usernameSource": result.get("usernameSource"),
+                "databaseNameSource": result.get("databaseNameSource"),
+                "engineSource": result.get("engineSource"),
+                "hostSource": result.get("hostSource"),
+                "portSource": result.get("portSource"),
             } if isinstance(result, dict) else {},
         )
     _update_task_completeness(task_state)
@@ -4024,73 +4801,145 @@ def _update_task_credential_facts(
     credentials: Optional[Dict[str, Any]] = None,
     active_session: Any = None,
 ) -> None:
-    """Store only permitted credential metadata and a boolean password-presence fact."""
+    """Store non-secret credential facts without conflating status and password presence."""
     credentials = credentials if isinstance(credentials, dict) else {}
     symbol_details = database_config.get("_symbol_details")
     symbol_details = symbol_details if isinstance(symbol_details, dict) else {}
     session_database = getattr(active_session, "database_name", None)
 
-    def configured_value(name: str, fallback: Any = None) -> Any:
+    def configured_value(name: str) -> Any:
         value = database_config.get(name)
         if isinstance(value, dict):
             value = value.get("value")
-        return value if value not in (None, "") else fallback
+        return value if value not in (None, "") else None
 
-    username = configured_value("username", credentials.get("username"))
-    database_name = configured_value("database", session_database)
-    engine = configured_value("engine", getattr(active_session, "database_type", None))
-    host = configured_value("host", getattr(active_session, "safe_host", None))
-    port = configured_value("port", getattr(active_session, "safe_port", None))
-    password_presence = (
-        True
-        if credentials.get("password") or database_config.get("has_credentials") is True
-        or symbol_details.get("hasPassword") is True
-        else None
-    )
-    values = {
-        "engine": (
-            engine,
-            "PROJECT_CONFIGURATION" if configured_value("engine") else
-            ("ACTIVE_DATABASE_SESSION" if engine else None),
-        ),
-        "host": (
-            host,
-            "PROJECT_CONFIGURATION" if configured_value("host") else
-            ("ACTIVE_DATABASE_SESSION" if host else None),
-        ),
-        "port": (
-            port,
-            "PROJECT_CONFIGURATION" if configured_value("port") else
-            ("ACTIVE_DATABASE_SESSION" if port else None),
-        ),
-        "username": (username, "PROJECT_CONFIGURATION" if username else None),
-        "databaseName": (
-            database_name,
-            "ACTIVE_DATABASE_SESSION" if session_database and database_name == session_database else
-            ("PROJECT_CONFIGURATION" if database_name else None),
-        ),
-        "passwordPresence": (
-            "PRESENT" if password_presence is True else None,
-            "CREDENTIAL_PRESENCE_METADATA" if password_presence is True else None,
-        ),
+    def valid_value(value: Any) -> bool:
+        return not (
+            value is None
+            or isinstance(value, str)
+            and value.strip().upper() in {
+                "", "NOT_RESOLVED", "NOT_VERIFIED", "UNKNOWN", "NONE", "NULL",
+            }
+        )
+
+    session_values = {
+        "engine": getattr(active_session, "database_type", None),
+        "host": getattr(active_session, "safe_host", None),
+        "port": getattr(active_session, "safe_port", None),
+        "username": getattr(active_session, "username", None),
+        "databaseName": session_database,
     }
+    configuration_names = {
+        "databaseName": "database",
+        "engine": "engine",
+        "host": "host",
+        "port": "port",
+        "username": "username",
+    }
+    candidates: Dict[str, List[Tuple[Any, Optional[str]]]] = {}
+    for fact_name, config_name in configuration_names.items():
+        configured = configured_value(config_name)
+        configured_source = database_config.get(f"{fact_name}Source")
+        current_candidates: List[Tuple[Any, Optional[str]]] = []
+        if valid_value(configured):
+            current_candidates.append((
+                configured,
+                str(configured_source or "PROJECT_CONFIGURATION"),
+            ))
+        if fact_name == "username" and valid_value(credentials.get("username")):
+            current_candidates.append((
+                credentials["username"],
+                "CREDENTIAL_STORE",
+            ))
+        session_value = session_values.get(fact_name)
+        if valid_value(session_value):
+            current_candidates.append((
+                session_value,
+                "ACTIVE_DATABASE_SESSION",
+            ))
+        candidates[fact_name] = current_candidates
+
+    credential_status = database_config.get("credentialStatus")
+    if isinstance(credential_status, str):
+        credential_status = credential_status.strip().upper()
+    if credential_status not in {"CONFIGURED", "NOT_CONFIGURED"}:
+        credential_status = None
+
+    password_presence = database_config.get("passwordPresent")
+    password_presence_source = database_config.get("passwordPresenceSource")
+    if not isinstance(password_presence, bool):
+        password_presence = symbol_details.get("hasPassword")
+        if isinstance(password_presence, bool):
+            password_presence_source = "PROJECT_CONFIGURATION"
+    if not isinstance(password_presence, bool):
+        secret_password = credentials.get("password")
+        if isinstance(secret_password, str) and secret_password and secret_password != "[REDACTED]":
+            password_presence = True
+            password_presence_source = "CREDENTIAL_STORE"
+        else:
+            password_presence = None
+
+    values: Dict[str, Tuple[Any, Optional[str], List[Tuple[Any, Optional[str]]]]] = {
+        name: (
+            entries[0][0] if entries else None,
+            entries[0][1] if entries else None,
+            entries,
+        )
+        for name, entries in candidates.items()
+    }
+    values["credentialStatus"] = (
+        credential_status,
+        str(database_config.get("credentialStatusSource") or "CREDENTIAL_STATUS_METADATA")
+        if credential_status
+        else None,
+        [(credential_status, "CREDENTIAL_STATUS_METADATA")]
+        if credential_status
+        else [],
+    )
+    values["passwordPresence"] = (
+        "PRESENT" if password_presence is True else
+        "ABSENT" if password_presence is False else None,
+        str(password_presence_source or "CREDENTIAL_PRESENCE_METADATA")
+        if isinstance(password_presence, bool)
+        else None,
+        [],
+    )
     required = task_state.get("requiredFacts")
     if not isinstance(required, list):
         return
     for fact in required:
         if not isinstance(fact, dict):
             continue
-        value, source = values.get(str(fact.get("name")), (None, None))
-        if value is None or (
-            isinstance(value, str)
-            and value.strip().upper() in {
-                "", "NOT_RESOLVED", "NOT_VERIFIED", "UNKNOWN", "NONE", "NULL"
+        fact_name = str(fact.get("name") or "")
+        value, source, fact_candidates = values.get(fact_name, (None, None, []))
+        if fact_name in configuration_names:
+            normalized_values = {
+                str(candidate).strip().casefold()
+                for candidate, _candidate_source in fact_candidates
+                if valid_value(candidate)
             }
-        ):
+            prior_value = fact.get("value")
+            if fact.get("status") == "VERIFIED" and valid_value(prior_value):
+                normalized_values.add(str(prior_value).strip().casefold())
+            if fact.get("conflictSources"):
+                continue
+            if len(normalized_values) > 1:
+                fact.update({
+                    "status": "UNRESOLVED",
+                    "value": None,
+                    "source": None,
+                    "conflictSources": list(dict.fromkeys(
+                        candidate_source
+                        for _candidate, candidate_source in fact_candidates
+                        if candidate_source
+                    )),
+                })
+                value = None
+        if value is None or not valid_value(value):
             continue
         fact.update({
             "status": "VERIFIED",
-            "value": SecretProtector.redact_text(str(value)),
+            "value": SecretProtector.redact_text(str(value))[:300],
             "source": source,
         })
     prior_unknowns = {
@@ -4113,6 +4962,10 @@ def _update_task_credential_facts(
             "status": "UNRESOLVED",
             "evidenceIds": [],
         })
+        if fact.get("conflictSources"):
+            unknown["reason"] = (
+                "Project configuration and active session evidence disagree; the value remains unresolved."
+            )
         unknown["status"] = (
             "PROVEN_BLOCKER"
             if fact.get("status") == "PROVEN_BLOCKER"
@@ -4138,10 +4991,16 @@ def _format_database_credential_report(result: Dict[str, Any]) -> str:
         if result.get("credentialStatus") == "CONFIGURED"
         else "NOT_VERIFIED"
     )
+    password_presence = (
+        "PRESENT" if result.get("passwordPresent") is True
+        else "ABSENT" if result.get("passwordPresent") is False
+        else "NOT_VERIFIED"
+    )
     return "\n".join([
         "### DATABASE CREDENTIALS REPORT",
         "",
         f"- **Credential status:** {credential_status}",
+        f"- **Password presence:** {password_presence}",
         f"- **Target:** {display(result.get('targetId'), 'Not resolved')}",
         f"- **Database:** {display(result.get('database'), 'Not confirmed')}",
         f"- **Username:** {display(result.get('username'), 'Not confirmed')}",
@@ -4297,7 +5156,7 @@ async def _summarize_database_connection_status(
         complete_coding_model,
         registry,
         config_path,
-        messages,
+        _compact_coding_conversation(messages),
         None,
         provider_id,
         False,
@@ -4312,97 +5171,157 @@ async def _summarize_database_connection_status(
     return answer, provider
 
 
-def _message_size(message: Dict[str, Any]) -> int:
-    return len(json.dumps(message, ensure_ascii=False, default=str))
-
-
 def _compact_coding_conversation(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if len(messages) <= 2:
-        return messages
-    base = messages[:2]
-    remaining = messages[2:]
-    groups = []
-    cursor = 0
-    while cursor < len(remaining):
-        group = [remaining[cursor]]
-        message = remaining[cursor]
-        cursor += 1
-        if message.get("role") == "assistant" and message.get("tool_calls"):
-            call_ids = {
-                str(call.get("id") or "")
-                for call in message.get("tool_calls", [])
-                if isinstance(call, dict)
-            }
-            while cursor < len(remaining) and remaining[cursor].get("role") == "tool":
-                tool_message = remaining[cursor]
-                if str(tool_message.get("tool_call_id") or "") not in call_ids:
-                    break
-                group.append(tool_message)
-                cursor += 1
-        groups.append(group)
-
-    required_user_group = next(
-        (index for index in range(len(groups) - 1, -1, -1)
-         if any(message.get("role") == "user" for message in groups[index])),
-        None,
-    )
+    if not isinstance(messages, list):
+        raise TypeError("Coding conversation must be a list of messages.")
+    original = [dict(message) for message in messages if isinstance(message, dict)]
     latest_request = next(
         (
             str(message.get("content") or "")
-            for message in reversed(messages)
-            if isinstance(message, dict) and message.get("role") == "user"
+            for message in reversed(original)
+            if message.get("role") == "user"
         ),
         "",
     )
-    relevance_terms = {
-        token for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", latest_request.casefold())
-        if token not in {"the", "and", "for", "with", "from", "that", "this", "how", "what"}
-    }
-    task_state_groups = {
-        index for index, group in enumerate(groups)
-        if any(
-            message.get("role") == "system"
-            and "AgentTaskState" in str(message.get("content") or "")
-            for message in group
-        )
-    }
-    selected = set(task_state_groups)
-    selected_chars = sum(_message_size(message) for message in base)
-    selected_chars += sum(
-        _message_size(message)
-        for index in task_state_groups
-        for message in groups[index]
-    )
-    if required_user_group is not None:
-        selected.add(required_user_group)
-        selected_chars += sum(_message_size(message) for message in groups[required_user_group])
-    ranked_groups = sorted(
-        range(len(groups)),
-        key=lambda index: (
-            100000 if index in task_state_groups else 0,
-            sum(
-                1
-                for term in relevance_terms
-                if term in json.dumps(groups[index], ensure_ascii=False, default=str).casefold()
-            ) * 100,
-            index,
-        ),
-        reverse=True,
-    )
-    for index in ranked_groups:
-        if index in selected:
-            continue
-        group_chars = sum(_message_size(message) for message in groups[index])
-        if selected_chars + group_chars > MAX_CODING_CONVERSATION_CHARS:
-            continue
-        selected.add(index)
-        selected_chars += group_chars
-    return base + [
-        message
-        for index, group in enumerate(groups)
-        if index in selected
-        for message in group
+    relevance_terms = _provider_context_terms(original)
+    state_indexes = [
+        index for index, message in enumerate(original)
+        if message.get("role") == "system"
+        and str(message.get("content") or "").startswith((
+            "Current bounded AgentTaskState",
+            "Current authoritative AgentTaskState",
+        ))
     ]
+    latest_state_index = state_indexes[-1] if state_indexes else None
+
+    def serialized_size(value: List[Dict[str, Any]]) -> int:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+
+    def fail_if_mandatory_content_exceeds_limit(
+        value: List[Dict[str, Any]],
+    ) -> None:
+        size = serialized_size(value)
+        if size > MAX_CODING_CONVERSATION_CHARS:
+            raise CodingContextTooLargeError({
+                "serializedConversationChars": size,
+                "maximumConversationChars": MAX_CODING_CONVERSATION_CHARS,
+                "latestRequestChars": len(latest_request),
+            })
+
+    for stage in range(7):
+        candidates = []
+        for index, message in enumerate(original):
+            if index in state_indexes and index != latest_state_index:
+                continue
+            candidate = message
+            if index == latest_state_index:
+                candidate = _compact_provider_task_state_message(
+                    message,
+                    relevance_terms,
+                    stage,
+                )
+            candidates.append(candidate)
+
+        groups: List[Tuple[List[Dict[str, Any]], bool]] = []
+        cursor = 0
+        while cursor < len(candidates):
+            message = candidates[cursor]
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                calls = message.get("tool_calls")
+                call_ids = {
+                    str(call.get("id") or "")
+                    for call in calls
+                    if isinstance(call, dict) and call.get("id")
+                } if isinstance(calls, list) else set()
+                group = [message]
+                result_ids: List[str] = []
+                cursor += 1
+                while cursor < len(candidates) and candidates[cursor].get("role") == "tool":
+                    tool_message = candidates[cursor]
+                    tool_call_id = str(tool_message.get("tool_call_id") or "")
+                    if tool_call_id in call_ids:
+                        group.append(tool_message)
+                        result_ids.append(tool_call_id)
+                    cursor += 1
+                complete = bool(call_ids) and set(result_ids) == call_ids and len(result_ids) == len(call_ids)
+                groups.append((group, complete))
+                continue
+            cursor += 1
+            groups.append(([message], message.get("role") != "tool"))
+
+        required_systems = {
+            index for index, (group, _valid) in enumerate(groups)
+            if any(message.get("role") == "system" for message in group)
+        }
+        required_user_group = next(
+            (
+                index for index in range(len(groups) - 1, -1, -1)
+                if any(message.get("role") == "user" for message in groups[index][0])
+            ),
+            None,
+        )
+        selected = set(required_systems)
+        if required_user_group is not None:
+            selected.add(required_user_group)
+        mandatory = [
+            message
+            for index, (group, _valid) in enumerate(groups)
+            if index in selected
+            for message in group
+        ]
+        if serialized_size(mandatory) > MAX_CODING_CONVERSATION_CHARS:
+            continue
+
+        ranked_groups = sorted(
+            range(len(groups)),
+            key=lambda index: (
+                sum(
+                    1
+                    for term in relevance_terms
+                    if term in json.dumps(groups[index][0], ensure_ascii=False, default=str).casefold()
+                ),
+                index,
+            ),
+            reverse=True,
+        )
+        for index in ranked_groups:
+            if index in selected or not groups[index][1]:
+                continue
+            tentative = selected | {index}
+            compacted = [
+                message
+                for group_index, (group, _valid) in enumerate(groups)
+                if group_index in tentative
+                for message in group
+            ]
+            if serialized_size(compacted) <= MAX_CODING_CONVERSATION_CHARS:
+                selected = tentative
+
+        compacted = [
+            message
+            for index, (group, _valid) in enumerate(groups)
+            if index in selected
+            for message in group
+        ]
+        fail_if_mandatory_content_exceeds_limit(compacted)
+        return compacted
+
+    required = [
+        message for index, message in enumerate(original)
+        if message.get("role") == "system"
+        and (index not in state_indexes or index == latest_state_index)
+    ]
+    if latest_request:
+        required.append(next(
+            message for message in reversed(original)
+            if message.get("role") == "user"
+        ))
+    fail_if_mandatory_content_exceeds_limit(required)
+    raise CodingContextTooLargeError({
+        "serializedConversationChars": serialized_size(required),
+        "maximumConversationChars": MAX_CODING_CONVERSATION_CHARS,
+        "latestRequestChars": len(latest_request),
+    })
 
 
 def _coding_finalization_messages(
@@ -4504,13 +5423,13 @@ def _coding_finalization_messages(
                 "verification. Do not imply one proves another; never expose credentials."
             )
     system += " Finish the response now."
-    return [
+    return _compact_coding_conversation([
         {
             "role": "system",
             "content": system,
         },
         {"role": "user", "content": "\n\n".join(user_context)},
-    ]
+    ])
 
 
 def _proposal_response_shape(content: str) -> Dict[str, Any]:
@@ -4731,10 +5650,16 @@ def _tools_for_task_resources(
 ) -> List[Dict[str, Any]]:
     decision = task_state.get("resourceDecision") or {}
     deferred = decision.get("deferredResources") or []
-    if "database" not in deferred or decision.get("selectedResource") == "database":
-        return tools
-    return [
+    registered = [
         tool for tool in tools
+        if _task_resource_for_tool(
+            str((tool.get("function") or {}).get("name") or "")
+        ) != "UNKNOWN"
+    ]
+    if "database" not in deferred or decision.get("selectedResource") == "database":
+        return registered
+    return [
+        tool for tool in registered
         if _task_resource_for_tool(
             str((tool.get("function") or {}).get("name") or "")
         ) != "DATABASE"
@@ -4890,28 +5815,95 @@ def _investigation_evidence_gate(
     }
 
 
-def _validate_tool_call(call: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any], Optional[str]]:
+def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     """
     Validates and normalizes a model tool call.
-    Returns: (canonical_name, normalized_args, error_message_if_unsupported)
-    Does NOT raise ValueError to prevent crashing the turn.
+    Returns: (canonical_name, normalized_args); invalid calls raise ValueError.
     """
     function = call.get("function") if isinstance(call, dict) else {}
     function = function if isinstance(function, dict) else {}
     raw_name = str(function.get("name") or "").strip()
-    try:
-        raw_args = function.get("arguments") or "{}"
-        if isinstance(raw_args, str):
+    declared_tool = next(
+        (
+            tool for tool in CODING_TOOLS
+            if tool.get("function", {}).get("name") == raw_name
+        ),
+        None,
+    )
+    if declared_tool is None:
+        available_tools = ", ".join(sorted(TOOL_NAMES))
+        raise ValueError(
+            f"UNKNOWN_MODEL_TOOL: '{raw_name}' is not supported in this runtime. "
+            f"Choose exactly one available capability: {available_tools}."
+        )
+    raw_args = function.get("arguments")
+    if isinstance(raw_args, str):
+        try:
             arguments = json.loads(raw_args)
-        elif isinstance(raw_args, dict):
-            arguments = raw_args
-        else:
-            arguments = {}
-    except (TypeError, json.JSONDecodeError):
-        arguments = {}
-
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError("INVALID_TOOL_ARGUMENTS: arguments are not valid JSON.") from error
+    elif isinstance(raw_args, dict):
+        arguments = raw_args
+    else:
+        raise ValueError("INVALID_TOOL_ARGUMENTS: arguments must be a JSON object.")
     if not isinstance(arguments, dict):
-        arguments = {}
+        raise ValueError("INVALID_TOOL_ARGUMENTS: arguments must be a JSON object.")
+
+    def validate_schema(value: Any, schema: Dict[str, Any], location: str) -> None:
+        expected_type = schema.get("type")
+        allowed_types = expected_type if isinstance(expected_type, list) else [expected_type]
+        type_matches = {
+            "object": lambda item: isinstance(item, dict),
+            "array": lambda item: isinstance(item, list),
+            "string": lambda item: isinstance(item, str),
+            "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+            "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+            "boolean": lambda item: isinstance(item, bool),
+            "null": lambda item: item is None,
+        }
+        if expected_type and not any(
+            type_matches.get(type_name, lambda _item: False)(value)
+            for type_name in allowed_types
+        ):
+            raise ValueError(f"INVALID_TOOL_ARGUMENTS: {location} has the wrong type.")
+        if "enum" in schema and value not in schema["enum"]:
+            raise ValueError(f"INVALID_TOOL_ARGUMENTS: {location} is not an allowed value.")
+        if isinstance(value, str):
+            if len(value) < int(schema.get("minLength", 0)):
+                raise ValueError(f"INVALID_TOOL_ARGUMENTS: {location} is too short.")
+            if "maxLength" in schema and len(value) > schema["maxLength"]:
+                raise ValueError(f"INVALID_TOOL_ARGUMENTS: {location} is too long.")
+            if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
+                raise ValueError(f"INVALID_TOOL_ARGUMENTS: {location} has an invalid format.")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if "minimum" in schema and value < schema["minimum"]:
+                raise ValueError(f"INVALID_TOOL_ARGUMENTS: {location} is below its minimum.")
+            if "maximum" in schema and value > schema["maximum"]:
+                raise ValueError(f"INVALID_TOOL_ARGUMENTS: {location} exceeds its maximum.")
+        if isinstance(value, dict):
+            properties = schema.get("properties") or {}
+            for required in schema.get("required", []):
+                if required not in value:
+                    raise ValueError(f"INVALID_TOOL_ARGUMENTS: {location}.{required} is required.")
+            if schema.get("additionalProperties") is False:
+                extras = set(value) - set(properties)
+                if extras:
+                    raise ValueError(
+                        f"INVALID_TOOL_ARGUMENTS: {location} contains unsupported properties: "
+                        + ", ".join(sorted(str(item) for item in extras)[:8])
+                        + "."
+                    )
+            for key, item in value.items():
+                if key in properties:
+                    validate_schema(item, properties[key], f"{location}.{key}")
+        if isinstance(value, list) and isinstance(schema.get("items"), dict):
+            for index, item in enumerate(value):
+                validate_schema(item, schema["items"], f"{location}[{index}]")
+
+    schema = declared_tool.get("function", {}).get("parameters")
+    if not isinstance(schema, dict):
+        raise ValueError("INVALID_TOOL_ARGUMENTS: the selected tool has no valid parameter schema.")
+    validate_schema(arguments, schema, "arguments")
 
     canonical_name = resolve_tool_capability(raw_name)
     if not canonical_name or canonical_name not in TOOL_CAPABILITIES or not TOOL_CAPABILITIES[canonical_name].get("available"):
@@ -5349,6 +6341,7 @@ async def _dispatch_coding_tool(
     send_json,
     action: Dict[str, Any],
     request_id: str,
+    turn_id: str,
     session_id: str,
     tool_call_id: str,
     name: str,
@@ -5358,6 +6351,7 @@ async def _dispatch_coding_tool(
     await _send(send_json, {
         "type": "tool_call",
         "requestId": request_id,
+        "turnId": turn_id,
         "toolCallId": tool_call_id,
         "name": name,
         "arguments": arguments,
@@ -5388,8 +6382,62 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
     if not isinstance(payload, dict):
         await _send(send_json, {"type": "error", "message": "Coding Agent message must be an object."})
         return
+    notification_type = payload.get("type")
+    if notification_type in {"approval_request", "approval_response", "patch_applied", "undo"}:
+        proposal_id = payload.get("proposalId")
+        if not isinstance(proposal_id, str) or not proposal_id or len(proposal_id) > 128:
+            await _send(send_json, {"type": "error", "message": "Mutation notification requires a valid proposal ID."})
+            return
+        notification = {
+            "type": notification_type,
+            "proposalId": proposal_id,
+            "manifestHash": payload.get("manifestHash") if isinstance(payload.get("manifestHash"), str) else None,
+            "receivedAt": time.time(),
+        }
+        state.setdefault("mutation_notifications", []).append(notification)
+        del state["mutation_notifications"][:-20]
+        await _send(send_json, {
+            "type": "notification_ack",
+            "notificationType": notification_type,
+            "proposalId": proposal_id,
+            "authorizationGranted": False,
+        })
+        return
     request_id = str(payload.get("requestId") or "")
+    if payload.get("type") == "cancel":
+        if not request_id or len(request_id) > 128:
+            await _send(send_json, {"type": "error", "message": "A valid request ID is required for cancellation."})
+            return
+        task = state.setdefault("tasks_by_request", {}).get(request_id)
+        if task is None or task.done():
+            await _send(send_json, {
+                "type": "cancelled",
+                "requestId": request_id,
+                "status": "NOT_ACTIVE",
+            })
+            return
+        state.setdefault("cancelled_request_ids", [])
+        if request_id not in state["cancelled_request_ids"]:
+            state["cancelled_request_ids"].append(request_id)
+            del state["cancelled_request_ids"][:-256]
+        task.cancel()
+        for key, future in list(state["pending"].items()):
+            if key.startswith(f"{request_id}:"):
+                if not future.done():
+                    future.cancel()
+                state["pending"].pop(key, None)
+        for key in list(state["completed"]):
+            if key.startswith(f"{request_id}:"):
+                state["completed"].pop(key, None)
+        await _send(send_json, {
+            "type": "cancelled",
+            "requestId": request_id,
+            "status": "CANCELLED",
+        })
+        return
     if payload.get("type") == "tool_result":
+        if request_id in state.get("cancelled_request_ids", []):
+            return
         key = f"{request_id}:{payload.get('toolCallId', '')}"
         future = state["pending"].get(key)
         if future and not future.done():
@@ -5426,6 +6474,19 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
     if payload.get("type") != "chat":
         await _send(send_json, {"type": "error", "requestId": request_id, "message": "Unsupported Coding Agent message type."})
         return
+    if not request_id or len(request_id) > 128:
+        await _send(send_json, {"type": "error", "message": "A valid request ID is required."})
+        return
+    tasks_by_request = state.setdefault("tasks_by_request", {})
+    if request_id in tasks_by_request and not tasks_by_request[request_id].done():
+        await _send(send_json, {
+            "type": "error",
+            "requestId": request_id,
+            "message": "This Coding request ID is already active.",
+        })
+        return
+    if request_id in state.get("cancelled_request_ids", []):
+        state["cancelled_request_ids"].remove(request_id)
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         await _send(send_json, {"type": "error", "requestId": request_id, "message": "No Coding Agent messages provided."})
@@ -5449,9 +6510,12 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
         _run_coding_turn(payload, send_task_event, state, registry, config_path)
     )
     state["tasks"].add(task)
+    tasks_by_request[request_id] = task
 
     def task_finished(completed: asyncio.Task) -> None:
         state["tasks"].discard(completed)
+        if tasks_by_request.get(request_id) is completed:
+            tasks_by_request.pop(request_id, None)
         try:
             error = completed.exception()
         except asyncio.CancelledError:
@@ -5515,9 +6579,82 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         await _send(send_json, {"type": "error", "requestId": request_id, "message": "The Coding Agent request is empty."})
         return
     request = EngineeringCommandNormalizer.normalize(raw_request)
-    proposal_required = _requires_proposal_for_conversation(supplied)
     session_id = str(payload.get("conversationId") or payload.get("sessionId") or payload.get("requestId") or "default-coding-session")
     scope = str(payload.get("scope") or ".")[:CODING_MAX_PATH_CHARS]
+    request_understanding = understand_human_request(request, supplied)
+    underspecified_file_creation = _is_underspecified_file_creation_request(request)
+    capability_question = request_understanding.get("action") == TaskIntent.CAPABILITY_QUESTION
+    proposal_required = (
+        False
+        if capability_question
+        else _requires_proposal_for_conversation(supplied)
+    )
+    if capability_question:
+        content = _capability_question_answer(request, state.get("connection_id"))
+        task_state = _build_semantic_task(
+            request_id=request_id,
+            user_message=raw_request,
+            intent=TaskIntent.CAPABILITY_QUESTION,
+            resources=[],
+            target=None,
+            project_root="",
+            scope=scope,
+            architecture={},
+            required_evidence=[],
+            conversation_message_count=len(supplied),
+            session_id=session_id,
+            conversation_messages=supplied,
+        )
+        task_state.update({
+            "status": "COMPLETED",
+            "assistantContent": content,
+            "understanding": request_understanding,
+            "selectedAction": "ANSWER_CAPABILITY",
+            "nextAction": None,
+            "nextActionName": None,
+            "proposalRequired": False,
+            "objectiveSatisfied": True,
+            "requiredEvidenceSatisfied": True,
+            "sourceOfDecision": "capability_registry",
+        })
+        task_state["intent"]["primary"] = TaskIntent.CAPABILITY_QUESTION
+        task_state["timestamps"]["completedAt"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+        session = CODING_TASK_STORE.get_or_create(
+            session_id,
+            project_root="",
+            scope=scope,
+        )
+        _persist_agent_task_state(
+            session,
+            task_state,
+            session_id,
+            "TASK_COMPLETED",
+        )
+        await _send(send_json, {
+            "type": "token",
+            "requestId": request_id,
+            "content": content,
+        })
+        await _send(send_json, {
+            "type": "done",
+            "requestId": request_id,
+            "content": content,
+            "status": "COMPLETED",
+            "readOnly": True,
+            "writeRequired": False,
+            "proposalRequired": False,
+            "applyRequired": False,
+            "approvalRequired": False,
+            "intent": TaskIntent.CAPABILITY_QUESTION,
+            "toolCalls": [],
+            "filesRead": [],
+            "semanticTask": task_state,
+            "agentTaskState": task_state,
+        })
+        return
+
     backend_project_state = get_backend_project_state()
     active_db_sess = DatabaseSessionManager.get_session(project_root="", session_id=session_id)
     project_root = ProjectContextLock.resolve_authoritative_root(
@@ -5657,6 +6794,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         {"root": project_root, "architecture": arch} if project_root else None
     )
     intent_info = classify_task_intent(request, supplied)
+    intent_info["classified_intent"] = intent_info["intent"]
     request_understanding = understand_human_request(
         request,
         supplied,
@@ -5899,6 +7037,75 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     ),
                 })
                 return
+        if underspecified_file_creation:
+            content = _file_creation_clarification_question(request)
+            task = _build_semantic_task(
+                request_id=request_id,
+                session_id=session_id,
+                user_message=raw_request,
+                intent="SOURCE_CHANGE",
+                resources=["CODE", "REPOSITORY"],
+                target=None,
+                project_root=str(project_root or ""),
+                scope=scope,
+                architecture=arch,
+                required_evidence=[],
+                ambiguity="The requested file name, location, and purpose were not provided.",
+                clarification_required=True,
+                conversation_message_count=len(supplied),
+                conversation_messages=supplied,
+            )
+            task.update({
+                "understanding": request_understanding,
+                "proposalRequired": True,
+                "status": "NEEDS_CLARIFICATION",
+                "assistantContent": content,
+                "selectedAction": "CLARIFY",
+                "sourceOfDecision": "task_understanding",
+                "nextAction": {
+                    "tool": "CLARIFY",
+                    "arguments": {},
+                    "reason": task["ambiguity"],
+                    "expectedEvidence": None,
+                    "confidence": 1.0,
+                },
+                "nextActionName": "CLARIFY",
+            })
+            task["intent"]["primary"] = "SOURCE_CHANGE"
+            task["goal"]["statement"] = raw_request
+            task["clarification"].update({
+                "required": True,
+                "reason": task["ambiguity"],
+                "question": content,
+            })
+            task_state.clear()
+            task_state.update(task)
+            semantic_task = task_state
+            session["agentTaskState"] = semantic_task
+            _persist_agent_task_state(session, semantic_task, session_id, "NEEDS_CLARIFICATION")
+            await _send(send_json, {
+                "type": "token",
+                "requestId": request_id,
+                "content": content,
+            })
+            await _send(send_json, {
+                "type": "done",
+                "requestId": request_id,
+                "content": content,
+                "status": "NEEDS_CLARIFICATION",
+                "readOnly": True,
+                "writeRequired": False,
+                "proposalRequired": True,
+                "applyRequired": False,
+                "approvalRequired": False,
+                "needsClarification": True,
+                "intent": "SOURCE_CHANGE",
+                "toolCalls": [],
+                "filesRead": [],
+                "semanticTask": semantic_task,
+                "agentTaskState": semantic_task,
+            })
+            return
         if db_det.get("clarification") and project_root:
             candidate_task = db_det.get("semanticTask") or {}
             candidate_task["clarificationCandidate"] = SecretProtector.redact_text(
@@ -6156,6 +7363,11 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         conversation_message_count=len(supplied),
         conversation_messages=supplied,
     )
+    semantic_task["requestedTargets"] = {
+        "files": list(intent_info.get("target_files") or []),
+        "symbols": list(intent_info.get("target_symbols") or []),
+    }
+    semantic_task["scope"] = scope
     explicit_continuation = bool(
         intent_info.get("is_continuation") and prior_semantic_task
     )
@@ -6383,9 +7595,21 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         supplied,
         bool(semantic_task.get("conversationContext", {}).get("continuityDetected")),
     )
+    targetless_change_request = bool(
+        proposal_required
+        and not intent_info.get("target_files")
+        and not intent_info.get("target_symbols")
+    )
+    scoped_pattern_discovery = bool(
+        targetless_change_request
+        and intent_info.get("classified_intent") != TaskIntent.PERFORMANCE_FIX
+    )
     require_repository_map = bool(
         project_root
-        and _is_project_architecture_question(raw_request)
+        and (
+            _is_project_architecture_question(raw_request)
+            or scoped_pattern_discovery
+        )
         and not _has_repository_map_evidence(semantic_task)
     )
     if require_repository_map:
@@ -6518,7 +7742,9 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 ),
             )
             credential_facts_unresolved = any(
-                isinstance(fact, dict) and fact.get("status") != "VERIFIED"
+                isinstance(fact, dict)
+                and fact.get("name") != "passwordPresence"
+                and fact.get("status") != "VERIFIED"
                 for fact in semantic_task.get("requiredFacts", [])
             )
         if (
@@ -6974,10 +8200,10 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 evidence_is_resolved = is_verified and status_value not in ("UNKNOWN", "NOT_VERIFIED")
                 evidence_record = {
                     "evidenceId": evidence_id,
-                    "taskId": semantic_task.get("taskId"),
-                    "sessionId": session_id,
+                    **_task_evidence_scope_fields(semantic_task, session_id),
                     "turnId": semantic_task.get("turnId"),
                     "type": evidence_kind,
+                    "resource": "DATABASE",
                     "source": db_det["capability"],
                     "target": target_value,
                     "summary": SecretProtector.redact_text(json.dumps({
@@ -6987,6 +8213,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     "provenance": provenance,
                     "confidence": 0.99 if is_verified else 0.8,
                     "verified": evidence_is_resolved,
+                    "verificationScope": "DATABASE_CAPABILITY_RESULT",
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
                 semantic_task["evidence"].append(evidence_record)
@@ -7088,7 +8315,9 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         credential_facts_unresolved = (
             db_det["capability"] == DatabaseCapability.DATABASE_CREDENTIAL_REQUEST
             and any(
-                isinstance(fact, dict) and fact.get("status") != "VERIFIED"
+                isinstance(fact, dict)
+                and fact.get("name") != "passwordPresence"
+                and fact.get("status") != "VERIFIED"
                 for fact in semantic_task.get("requiredFacts", [])
             )
         )
@@ -7750,6 +8979,19 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             "or repeat it. After gathering sufficient evidence, "
             f"{_proposal_prompt_instruction()}"
         )
+    if targetless_change_request:
+        system += (
+            "\n[TARGETLESS CHANGE DISCOVERY]\n"
+            "The user described a change without naming an existing file or symbol. Do not keyword-search, "
+            "guess a source path, or read files outside the attached scope. "
+            + (
+                "Use the repository map and list the attached scope, then read an existing source file returned "
+                "by that scoped listing as pattern evidence. Keep this pattern evidence separate from "
+                "topic-matched evidence."
+                if scoped_pattern_discovery
+                else "Ask for clarification if the requested change cannot be identified."
+            )
+        )
     context = (
         f"Current optional scope: {scope}\n"
         "AgentTaskState is the authoritative task memory and next-action source. "
@@ -7961,18 +9203,52 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     }],
                 }
             elif proposal_required and not has_relevant_source_evidence:
-                source_candidate = _proposal_source_candidate_from_search(semantic_task)
+                source_candidate = (
+                    _proposal_source_candidate_from_directory(semantic_task)
+                    if scoped_pattern_discovery
+                    else _proposal_source_candidate_from_search(semantic_task)
+                )
+                if source_candidate:
+                    next_source_action = {
+                        "action": "read_file",
+                        "target": source_candidate,
+                        "rationale": (
+                            "Read this source file from the attached scope as pattern evidence before proposing."
+                            if scoped_pattern_discovery
+                            else "Read a source file returned by the completed project search before proposing changes."
+                        ),
+                    }
+                elif scoped_pattern_discovery:
+                    if not _proposal_directory_listing_completed(semantic_task):
+                        next_source_action = {
+                            "action": "list_directory",
+                            "target": scope or ".",
+                            "rationale": "List the attached scope to select an existing source file as pattern evidence.",
+                        }
+                    else:
+                        next_directory = _proposal_next_source_directory(semantic_task)
+                        if next_directory:
+                            next_source_action = {
+                                "action": "list_directory",
+                                "target": next_directory,
+                                "rationale": "List an in-scope source directory from the repository map for pattern evidence.",
+                            }
+                        else:
+                            content = _set_proposal_evidence_limitation(semantic_task)
+                            final_message = {"role": "assistant", "content": content}
+                            _persist_agent_task_state(
+                                session, semantic_task, session_id, "NEEDS_CLARIFICATION"
+                            )
+                            break
+                else:
+                    next_source_action = None
                 auto_call = (
                     _coding_tool_call_for_next_action(
-                        {
-                            "action": "read_file",
-                            "target": source_candidate,
-                            "rationale": "Read a source file returned by the completed project search before proposing changes.",
-                        },
+                        next_source_action,
                         round_number,
                         scope,
                     )
-                    if source_candidate
+                    if next_source_action
                     else None
                 )
                 if auto_call:
@@ -7982,13 +9258,17 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         "tool_calls": [auto_call],
                     }
                     semantic_task["nextAction"] = {
-                        "tool": "read_file",
+                        "tool": auto_call["function"]["name"],
                         "arguments": json.loads(auto_call["function"]["arguments"]),
-                        "reason": "Read a source file returned by the completed project search before proposing changes.",
-                        "expectedEvidence": "Successfully inspected implementation source.",
+                        "reason": next_source_action["rationale"],
+                        "expectedEvidence": (
+                            "A source file listed in the attached scope."
+                            if auto_call["function"]["name"] == "list_directory"
+                            else "Successfully inspected implementation source."
+                        ),
                         "confidence": semantic_task.get("confidence", 0.5),
                     }
-                    semantic_task["nextActionName"] = "read_file"
+                    semantic_task["nextActionName"] = auto_call["function"]["name"]
                     semantic_task["status"] = "REPLANNING"
                     _persist_agent_task_state(
                         session,
@@ -8070,6 +9350,77 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             })
             conversation.append(message)
             calls = message.get("tool_calls") or []
+            if proposal_required and calls:
+                listed_candidates = {
+                    candidate.casefold()
+                    for candidate in _proposal_source_candidates_from_directory(semantic_task)
+                }
+                attached_scope = _proposal_scope_path(scope)
+                accepted_calls = []
+                rejected_calls = []
+                for call in calls:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    function = function if isinstance(function, dict) else {}
+                    tool_name = str((function or {}).get("name") or "")
+                    try:
+                        arguments = json.loads((function or {}).get("arguments") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        arguments = {}
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    rejected = targetless_change_request and tool_name in {
+                        "search_code", "repo_browser.search_code"
+                    }
+                    if tool_name in {
+                        "read_file", "repo_browser.read_file", "repo_browser.open_file", "open_file"
+                    }:
+                        scoped_candidate = _proposal_path_is_in_scope(
+                            semantic_task,
+                            arguments.get("path") or arguments.get("relativePath"),
+                        )
+                        rejected = rejected or scoped_candidate is None or (
+                            targetless_change_request
+                            and scoped_candidate.casefold() not in listed_candidates
+                        )
+                    elif tool_name in {"list_directory", "repo_browser.list_directory"}:
+                        directory = _proposal_scope_path(
+                            arguments.get("relativePath") or arguments.get("path") or attached_scope
+                        )
+                        directory_parts = {
+                            part.casefold() for part in (directory or "").split("/")
+                        }
+                        rejected = rejected or directory is None or (
+                            attached_scope
+                            and directory != attached_scope
+                            and not directory.startswith(attached_scope + "/")
+                        ) or bool(directory_parts.intersection({"vendor", "node_modules", "dist", "build"}))
+                    if rejected:
+                        rejected_calls.append(call)
+                    else:
+                        accepted_calls.append(call)
+                for call in rejected_calls:
+                    conversation.append({
+                        "role": "tool",
+                        "tool_call_id": str(call.get("id") or ""),
+                        "name": str(
+                            (
+                                call.get("function")
+                                if isinstance(call.get("function"), dict)
+                                else {}
+                            ).get("name") or ""
+                        ),
+                        "content": json.dumps({
+                            "ok": False,
+                            "code": "OUT_OF_SCOPE_PATTERN_DISCOVERY",
+                            "error": (
+                                "Targetless pattern discovery may only read a file returned by listing the "
+                                "attached scope; keyword search and other file reads are not allowed."
+                            ),
+                        }),
+                    })
+                calls = accepted_calls
+                if rejected_calls and not calls:
+                    continue
             if (
                 not calls
                 and semantic_task.get("intent", {}).get("primary")
@@ -8122,16 +9473,45 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     project_root=project_root,
                     scope=scope,
                 )
-                source_candidate = _proposal_source_candidate_from_search(semantic_task)
-                next_action = (
-                    {
+                source_candidate = (
+                    _proposal_source_candidate_from_directory(semantic_task)
+                    if scoped_pattern_discovery
+                    else _proposal_source_candidate_from_search(semantic_task)
+                )
+                if source_candidate:
+                    next_action = {
                         "action": "read_file",
                         "target": source_candidate,
-                        "rationale": "Read a source file returned by the completed project search before proposing changes.",
+                        "rationale": (
+                            "Read this source file from the attached scope as pattern evidence before proposing."
+                            if scoped_pattern_discovery
+                            else "Read a source file returned by the completed project search before proposing changes."
+                        ),
                     }
-                    if source_candidate
-                    else compute_next_best_action(session_data, intent_info, arch)
-                )
+                elif scoped_pattern_discovery:
+                    if not _proposal_directory_listing_completed(semantic_task):
+                        next_action = {
+                            "action": "list_directory",
+                            "target": scope or ".",
+                            "rationale": "List the attached scope to select an existing source file as pattern evidence.",
+                        }
+                    else:
+                        next_directory = _proposal_next_source_directory(semantic_task)
+                        if next_directory:
+                            next_action = {
+                                "action": "list_directory",
+                                "target": next_directory,
+                                "rationale": "List an in-scope source directory from the repository map for pattern evidence.",
+                            }
+                        else:
+                            content = _set_proposal_evidence_limitation(semantic_task)
+                            final_message = {"role": "assistant", "content": content}
+                            _persist_agent_task_state(
+                                session, semantic_task, session_id, "NEEDS_CLARIFICATION"
+                            )
+                            break
+                else:
+                    next_action = compute_next_best_action(session_data, intent_info, arch)
                 auto_call = _coding_tool_call_for_next_action(next_action, round_number, scope)
                 if auto_call is None:
                     search_query = _proposal_source_search_query(semantic_task)
@@ -8291,14 +9671,20 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     name, arguments = _validate_tool_call(call)
                 except ValueError as tool_err:
                     raw_fn_name = str(((call.get("function") or {}) if isinstance(call, dict) else {}).get("name") or "unknown")
+                    error_text = str(tool_err)[:500]
+                    error_code = (
+                        "INVALID_TOOL_ARGUMENTS"
+                        if error_text.startswith("INVALID_TOOL_ARGUMENTS:")
+                        else "UNKNOWN_MODEL_TOOL"
+                    )
                     conversation.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
                         "name": raw_fn_name,
                         "content": json.dumps({
                             "ok": False,
-                            "code": "UNKNOWN_MODEL_TOOL",
-                            "error": str(tool_err),
+                            "code": error_code,
+                            "error": error_text,
                             "recoveryInstruction": (
                                 "Do not ask the user to choose a tool. Select an exact capability from the "
                                 "available list in the error and retry through the normal reasoning cycle."
@@ -8532,6 +9918,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     send_json,
                     action,
                     request_id,
+                    str(payload.get("turnId") or request_id),
                     session_id,
                     tool_call_id,
                     name,
@@ -8919,6 +10306,12 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         content = str(final_message.get("content") or "").strip()
         if not content:
             raise RuntimeError("Coding Agent provider returned no final response.")
+        proposal_evidence_clarification = bool(
+            proposal_required
+            and semantic_task.get("status") == "NEEDS_CLARIFICATION"
+            and not _has_relevant_proposal_source_evidence(semantic_task)
+            and _is_clarification_response(content)
+        )
         final_investigation_gate = (
             _investigation_evidence_gate(semantic_task, content)
             if investigation_gate_required
@@ -9006,6 +10399,11 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             isinstance(item, dict)
             and item.get("blocking")
             and item.get("status") == "UNRESOLVED"
+            and not (
+                semantic_task.get("intent", {}).get("primary")
+                == TaskIntent.DATABASE_CREDENTIAL_REQUEST
+                and item.get("id") == "credential-passwordPresence"
+            )
             for item in semantic_task.get("unknowns", [])
         )
         credential_task = (
@@ -9027,11 +10425,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 "port": "Port",
                 "databaseName": "Database",
                 "username": "Username",
-                "passwordPresence": (
-                    "Credential status"
-                    if "credentialstatus" in requested_properties
-                    else "Password presence"
-                ),
+                "credentialStatus": "Credential status",
+                "passwordPresence": "Password presence",
             }
             report_lines = [
                 (
@@ -9050,10 +10445,11 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     continue
                 value = fact.get("value")
                 if fact_name == "passwordPresence":
-                    if label == "Credential status":
-                        value = "CONFIGURED (password value redacted)"
-                    else:
-                        value = "present"
+                    value = (
+                        "present" if value == "PRESENT"
+                        else "not present" if value == "ABSENT"
+                        else "not confirmed"
+                    )
                 source = fact.get("source")
                 source_suffix = f" (source: {source})" if source else ""
                 report_lines.append(f"- {label}: {value}{source_suffix}")
@@ -9089,6 +10485,12 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 "taskId": semantic_task.get("taskId"),
                 "reason": "REQUIRED_CONFIGURATION_EVIDENCE_UNRESOLVED",
             })
+        elif proposal_evidence_clarification:
+            semantic_task["status"] = "NEEDS_CLARIFICATION"
+            CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_NEEDS_CLARIFICATION", {
+                "taskId": semantic_task.get("taskId"),
+                "intent": semantic_task["intent"]["primary"],
+            })
         elif not investigation_gate_blocked:
             CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_COMPLETED", {
                 "taskId": semantic_task.get("taskId"),
@@ -9110,19 +10512,41 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         semantic_task["assistantContent"] = content
         session["agentTaskState"] = semantic_task
         _persist_agent_task_state(session, semantic_task, session_id)
+        # Display metadata only; attempt limits and mutation authorization stay in main-process IPC.
+        attempt_display = None
+        supplied_attempt = payload.get("verificationAttempt")
+        if isinstance(supplied_attempt, dict):
+            attempt_number = supplied_attempt.get("attemptNumber")
+            max_attempts = supplied_attempt.get("maxAttempts")
+            if (
+                type(attempt_number) is int
+                and type(max_attempts) is int
+                and 1 <= attempt_number <= max_attempts <= 100
+            ):
+                attempt_display = {
+                    "attemptNumber": attempt_number,
+                    "maxAttempts": max_attempts,
+                    "label": f"attempt {attempt_number} of {max_attempts}",
+                }
         await _send(send_json, {
             "type": "done",
             "requestId": request_id,
             "content": content,
+            "verificationAttempt": attempt_display,
             "status": (
-                "INVESTIGATION_INCOMPLETE"
-                if credential_task_blocked or investigation_gate_blocked
+                "NEEDS_CLARIFICATION"
+                if proposal_evidence_clarification
                 else (
-                    "INVESTIGATION_COMPLETE"
-                    if (is_perf_inv or is_db_inv or (not proposal_required and _has_read_file_evidence(conversation)))
-                    else ("PROPOSAL_READY" if proposal_required else "COMPLETED")
+                    "INVESTIGATION_INCOMPLETE"
+                    if credential_task_blocked or investigation_gate_blocked
+                    else (
+                        "INVESTIGATION_COMPLETE"
+                        if (is_perf_inv or is_db_inv or (not proposal_required and _has_read_file_evidence(conversation)))
+                        else ("PROPOSAL_READY" if proposal_required else "COMPLETED")
+                    )
                 )
             ),
+            "needsClarification": proposal_evidence_clarification,
             "readOnly": not proposal_required,
             "writeRequired": bool(proposal_required and not is_perf_inv and not is_db_inv),
             "proposalRequired": bool(
@@ -9167,8 +10591,13 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         provider_classification = classify_provider_exception(error)
         session = CODING_TASK_STORE.get_or_create(session_id)
         task_state = session.get("agentTaskState")
+        evidence_fallback = _provider_failure_evidence_fallback(
+            request,
+            session,
+            project_root if "project_root" in locals() else "",
+            provider_classification,
+        )
         if isinstance(task_state, dict):
-            task_state["status"] = "FAILED"
             task_state["nextAction"] = None
             task_state["nextActionName"] = None
             task_state.setdefault("failures", []).append({
@@ -9182,22 +10611,41 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             })
             task_state["failures"] = task_state["failures"][-20:]
-            task_state.setdefault("unknowns", []).append({
-                "id": f"failure-{request_id or session_id}",
-                "question": "The task could not finish; its final result is unavailable.",
-                "reason": provider_classification["category"],
-                "status": "UNRESOLVED",
-                "evidenceIds": [],
-            })
+            if evidence_fallback:
+                task_state["status"] = "COMPLETED"
+                task_state["assistantContent"] = evidence_fallback["content"]
+                task_state["selectedAction"] = "ANSWER_FROM_AVAILABLE_TASK_EVIDENCE"
+                task_state["completionSource"] = "STORED_SOURCE_EVIDENCE"
+                task_state["sourceOfDecision"] = "stored_source_evidence"
+                task_state["objectiveSatisfied"] = True
+                task_state["requiredEvidenceSatisfied"] = True
+            else:
+                task_state["status"] = "FAILED"
+                task_state.setdefault("unknowns", []).append({
+                    "id": f"failure-{request_id or session_id}",
+                    "question": "The task could not finish; its final result is unavailable.",
+                    "reason": provider_classification["category"],
+                    "status": "UNRESOLVED",
+                    "evidenceIds": [],
+                })
             task_state["timestamps"]["updatedAt"] = time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
             )
-            _persist_agent_task_state(session, task_state, session_id)
-        CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_FAILED", {
-            "error": SecretProtector.redact_text(str(error))[:500],
-            "category": provider_classification["category"],
-        })
-        if str(provider_classification["category"]).startswith(("PROVIDER_", "LLM_PROVIDER_")):
+            _persist_agent_task_state(
+                session,
+                task_state,
+                session_id,
+                "TASK_COMPLETED" if evidence_fallback else "TASK_STATE_UPDATED",
+            )
+        if not evidence_fallback:
+            CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_FAILED", {
+                "error": SecretProtector.redact_text(str(error))[:500],
+                "category": provider_classification["category"],
+            })
+        if provider_classification["classification"] in {
+            "PROVIDER_FAILURE",
+            "EXTERNAL_RESOURCE_FAILURE",
+        }:
             CODING_TASK_STORE.emit_lifecycle_event(session_id, "PROVIDER_FAILURE", {
                 "taskId": task_state.get("taskId") if isinstance(task_state, dict) else None,
                 "turnId": task_state.get("turnId") if isinstance(task_state, dict) else None,
@@ -9206,8 +10654,46 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 "recoverable": bool(provider_classification["retryable"]),
             })
         CODING_TASK_STORE.save_checkpoint(session_id, label=f"Failure State: {provider_classification['category']}")
-        session["proposalState"] = "BLOCKED" if not provider_classification["isCodeDefect"] else "FAILED"
+        if not evidence_fallback:
+            session["proposalState"] = "BLOCKED" if not provider_classification["isCodeDefect"] else "FAILED"
         session["lastErrorClassification"] = provider_classification
+        if evidence_fallback:
+            content = evidence_fallback["content"]
+            await _send(send_json, {
+                "type": "done",
+                "requestId": request_id,
+                "content": content,
+                "status": "INVESTIGATION_COMPLETE",
+                "readOnly": True,
+                "writeRequired": False,
+                "proposalRequired": False,
+                "applyRequired": False,
+                "approvalRequired": False,
+                "intent": TaskIntent.QUESTION,
+                "toolCalls": [],
+                "filesRead": [],
+                "sourceEvidence": evidence_fallback["evidence"],
+                "completionSource": "STORED_SOURCE_EVIDENCE",
+                "providerFailure": {
+                    "classification": provider_classification["classification"],
+                    "category": provider_classification["category"],
+                    "successfulModelCall": False,
+                },
+                "agentTaskState": task_state if isinstance(task_state, dict) else None,
+            })
+            try:
+                UNIVERSAL_EVENT_STREAM.emit(
+                    "TASK_COMPLETED",
+                    {
+                        "requestId": request_id,
+                        "session": session_id,
+                        "completionSource": "STORED_SOURCE_EVIDENCE",
+                        "providerFailure": provider_classification["category"],
+                    },
+                )
+            except Exception:
+                pass
+            return
         await _send(send_json, {
             "type": "error",
             "requestId": request_id,
@@ -9249,7 +10735,7 @@ async def run_coding_websocket_server(
     permitted_origins = list(trusted_origins or [])
 
     async def handle(websocket, _path=None):
-        state = {"pending": {}, "completed": {}, "tasks": set(), "authenticated": False}
+        state = {"pending": {}, "completed": {}, "tasks": set(), "authenticated": False, "connection_id": None}
 
         async def send_json(payload: Dict[str, Any]) -> None:
             await websocket.send(json.dumps(payload, ensure_ascii=False))
@@ -9283,12 +10769,20 @@ async def run_coding_websocket_server(
                         await websocket.close(code=1008, reason="Authentication required.")
                         return
                     state["authenticated"] = True
-                    await send_json({"type": "authenticated", "authenticated": True})
+                    state["connection_id"] = secrets.token_urlsafe(24)
+                    _set_coding_connection_active(state["connection_id"], True)
+                    await send_json({
+                        "type": "authenticated",
+                        "authenticated": True,
+                        "connectionId": state["connection_id"],
+                    })
                     continue
                 await handle_coding_payload(message, send_json, state, registry, config_path)
         except ConnectionClosed:
             pass
         finally:
+            if state.get("connection_id"):
+                _set_coding_connection_active(state["connection_id"], False)
             await close_coding_connection(state)
 
     async with serve(

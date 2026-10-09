@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { clearAppState, writeAppState } from '../../config/appStateStorage';
 
 export interface AgentProviderOption {
   id: string;
@@ -29,8 +30,8 @@ export function useAgentProviderSelection(
 
   useEffect(() => {
     try {
-      if (providerId) localStorage.setItem(storageKey(agentId), providerId);
-      else if (providers.length || !savedProviderId) localStorage.removeItem(storageKey(agentId));
+      if (providerId) writeAppState(storageKey(agentId), providerId);
+      else if (providers.length || !savedProviderId) clearAppState(storageKey(agentId));
     } catch {
       onStorageError?.(`The ${agentId} provider preference could not be saved in browser storage.`);
     }

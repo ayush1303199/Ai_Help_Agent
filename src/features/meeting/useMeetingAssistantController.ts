@@ -3,6 +3,7 @@ import { prepareQuestion, prepareTextRequest, type PreparedQuestion } from '../.
 import type { InterviewContextConfig } from '../../ai/interviewContext';
 import type { MeetingAudioMode } from '../../app/appTypes';
 import { runtimeConfig } from '../../config/runtimeConfig';
+import { writeAppState } from '../../config/appStateStorage';
 import {
   readMeetingHistoryRetention,
   type HistorySession,
@@ -203,10 +204,10 @@ export function useMeetingAssistantController({
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('meeting-transcription-language', transcriptionLanguage);
+    writeAppState('meeting-transcription-language', transcriptionLanguage);
   }, [transcriptionLanguage]);
   useEffect(() => {
-    localStorage.setItem('meeting-review-before-send', String(reviewBeforeSend));
+    writeAppState('meeting-review-before-send', String(reviewBeforeSend));
   }, [reviewBeforeSend]);
   useEffect(() => {
     if (transcriptReviewLoad.error && pendingTranscriptReviews === transcriptReviewLoad.reviews) {

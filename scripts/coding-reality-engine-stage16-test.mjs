@@ -18,6 +18,8 @@ import {
 console.log('=== RUNNING STAGE 16 PRODUCTION REALITY ENGINE VERIFICATION ===\n');
 
 const tempBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'stage16-reality-'));
+const checkpointStorageRoot = path.join(tempBaseDir, 'checkpoints');
+taskOrchestrator.setCheckpointStorageRoot(checkpointStorageRoot);
 
 try {
   // -------------------------------------------------------------
@@ -167,10 +169,10 @@ assert.equal(calculateTotal(exemptInvoice), 100, 'Tax exempt invoice should not 
   // 5. Disk Checkpoint Persistence & Process Restart Recovery
   // -------------------------------------------------------------
   console.log('\n--- 5. Testing Disk Checkpoint Persistence & Process-Restart Resume ---');
-  const chkFile = path.join(tempBaseDir, 'checkpoints', `${task1.taskId}.json`);
-  const savedChk = await taskOrchestrator.saveCheckpointToDisk(task1.taskId, chkFile, 'pre_patch');
+  const savedChk = await taskOrchestrator.saveCheckpointToDisk(task1.taskId, 'pre_patch');
   assert.ok(savedChk);
   assert.ok(savedChk.checkpointId);
+  const chkFile = taskOrchestrator.getCheckpointPath(task1.taskId);
 
   // Verify file on disk exists
   const diskData = await fs.readFile(chkFile, 'utf8');
@@ -178,9 +180,14 @@ assert.equal(calculateTotal(exemptInvoice), 100, 'Tax exempt invoice should not 
 
   // Simulate process restart with clean orchestrator instance
   const freshOrchestrator = new TaskOrchestrator();
+  freshOrchestrator.setCheckpointStorageRoot(checkpointStorageRoot);
   assert.equal(freshOrchestrator.getTask(task1.taskId), null);
 
-  const restoredTask = await freshOrchestrator.restoreTaskFromDisk(chkFile);
+  const restoredTask = await freshOrchestrator.restoreTaskFromDisk(
+    task1.taskId,
+    task1.sessionId,
+    task1.workspace,
+  );
   assert.equal(restoredTask.taskId, task1.taskId);
   assert.equal(restoredTask.goal, task1.goal);
   assert.equal(restoredTask.targets.length, 3);
@@ -339,11 +346,20 @@ assert.equal(calculateTotal(exemptInvoice), 100, 'Tax exempt invoice should not 
 
   const mockVerify = async () => ({ ok: true });
 
-  const coordResult = await coord.executeCoordinatedChange(coordTaskId, changes, mockApply, mockVerify);
-  assert.equal(coordResult.ok, false);
-  assert.equal(coordResult.transactionalRollback, true);
+  await assert.rejects(
+    () => coord.executeCoordinatedChange(
+      coordTaskId,
+      changes,
+      mockApply,
+      mockVerify,
+      async () => ({ allowed: true }),
+    ),
+    /callbacks can mutate outside the authorized target set/i,
+  );
+  assert.equal(appliedA, false, 'Callback-based changes must fail before invoking arbitrary code.');
+  assert.equal(await fs.readFile(path.join(repoA, 'serviceA.js'), 'utf8'), 'export const serviceA = () => "v1";\n');
 
-  console.log('[PASS] Multi-repository transactional rollback verified.');
+  console.log('[PASS] Unsafe callback-based multi-repository changes fail closed.');
 
   // -------------------------------------------------------------
   // 12. Honest Browser Verification & Explicit Limitation Reporting
@@ -413,7 +429,13 @@ assert.equal(calculateTotal(exemptInvoice), 100, 'Tax exempt invoice should not 
   assert.equal(approvedTask.state, 'approved');
 
   // Apply proposal to disk
-  await agent.apply(e2eProposal.taskId, e2eOwner, undefined, null, authorizeMutation);
+  await agent.apply(e2eProposal.taskId, e2eOwner, async () => ({
+    ok: true,
+    status: 'PASS',
+    executed: true,
+    exitCode: 0,
+    attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+  }), null, authorizeMutation);
   const appliedContent = await fs.readFile(calcFile, 'utf8');
   assert.ok(appliedContent.includes('return a + b;'), 'Applied file must reflect updated diff');
 
@@ -427,8 +449,10 @@ assert.equal(calculateTotal(exemptInvoice), 100, 'Tax exempt invoice should not 
   // 15. Agent-Level Process-Restart Recovery via Checkpoint
   // -------------------------------------------------------------
   console.log('\n--- 15. Testing Agent-Level Process-Restart Recovery ---');
-  const agentChkFile = path.join(tempBaseDir, 'agent-task-checkpoint.json');
-  await agent.saveTaskCheckpointToDisk(e2eProposal.taskId, agentChkFile, 'applied_and_undone', e2eOwner);
+  const agentCheckpointRoot = path.join(tempBaseDir, 'agent-checkpoints');
+  agent.configureCheckpointStorageRoot(agentCheckpointRoot);
+  await agent.saveTaskCheckpointToDisk(e2eProposal.taskId, 'applied_and_undone', e2eOwner);
+  const agentChkFile = path.join(agentCheckpointRoot, `${e2eProposal.taskId}.json`);
 
   // Verify checkpoint file exists on disk
   const chkContent = await fs.readFile(agentChkFile, 'utf8');
@@ -439,7 +463,7 @@ assert.equal(calculateTotal(exemptInvoice), 100, 'Tax exempt invoice should not 
   assert.throws(() => agent.getTask(e2eProposal.taskId, e2eOwner), /Unknown Developer task/);
 
   // Restore task from disk
-  const restoredViaAgent = await agent.restoreTaskFromDisk(agentChkFile);
+  const restoredViaAgent = await agent.restoreTaskFromDisk(e2eProposal.taskId, e2eOwner, e2eDir);
   assert.equal(restoredViaAgent.taskId, e2eProposal.taskId);
 
   // Resume session & verify agent.getTask succeeds

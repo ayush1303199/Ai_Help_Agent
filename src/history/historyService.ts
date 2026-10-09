@@ -1,4 +1,5 @@
 import { runtimeConfig } from '../config/runtimeConfig';
+import { writeAppState } from '../config/appStateStorage';
 import {
   pruneMeetingRecords,
   readMeetingHistoryRetention,
@@ -169,7 +170,7 @@ export function readHistory(): HistorySession[] {
 
 export function writeHistory(sessions: HistorySession[]): boolean {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(
+    writeAppState(STORAGE_KEY, JSON.stringify(
       pruneHistorySessions(sessions, readMeetingHistoryRetention()).slice(0, MAX_SESSIONS),
     ));
     return true;
@@ -190,7 +191,7 @@ export function readDeveloperConversationStates(): DeveloperConversationState[] 
 
 export function writeDeveloperConversationStates(states: DeveloperConversationState[]): boolean {
   try {
-    localStorage.setItem(DEVELOPER_STATE_STORAGE_KEY, JSON.stringify(states.slice(0, MAX_SESSIONS)));
+    writeAppState(DEVELOPER_STATE_STORAGE_KEY, JSON.stringify(states.slice(0, MAX_SESSIONS)));
     return true;
   } catch {
     return false;
@@ -235,7 +236,7 @@ export function readCodingPreferences(): CodingPreference[] {
 
 export function writeCodingPreferences(preferences: CodingPreference[]): boolean {
   try {
-    localStorage.setItem(CODING_PREFERENCES_STORAGE_KEY, JSON.stringify(preferences.slice(0, MAX_CODING_PREFERENCES)));
+    writeAppState(CODING_PREFERENCES_STORAGE_KEY, JSON.stringify(preferences.slice(0, MAX_CODING_PREFERENCES)));
     return true;
   } catch {
     return false;

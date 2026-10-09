@@ -233,7 +233,13 @@ try {
   const applied = await developerAgent.apply(
     proposal.taskId,
     { ownerWebContentsId: ownerProposal, sessionId },
-    async () => ({ ok: true, status: 'PASS' }),
+    async () => ({
+      ok: true,
+      status: 'PASS',
+      executed: true,
+      exitCode: 0,
+      attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+    }),
     projectPath,
     authorizeMutation,
   );

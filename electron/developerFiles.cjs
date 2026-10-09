@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { developer: developerSettings } = require('../src/config/runtimeSettings.json');
 const { detectProject, PROJECT_MANIFESTS, VERIFICATION_PROFILES } = require('./coding-pipeline/detect/projectDetector.cjs');
+const { requireProjectProcessIsolation } = require('./coding-pipeline/projectProcessIsolation.cjs');
 
 const MAX_FILE_BYTES = developerSettings.maxFileBytes;
 const MAX_SEARCH_RESULTS = developerSettings.maxSearchResults;
@@ -821,6 +822,7 @@ async function runGit(args, ownerWebContentsId) {
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) throw new Error('Invalid git inspection request.');
   const allowed = args[0] === 'status' || (args[0] === 'diff' && args.every((arg) => ['diff', '--stat', '--name-only', '--no-ext-diff'].includes(arg)));
   if (!allowed) throw new Error('Only read-only git status and diff are permitted.');
+  requireProjectProcessIsolation('Project Git inspection');
   const child = spawn('git', args, { cwd: root, shell: false, windowsHide: true });
   let stdout = ''; let stderr = '';
   child.stdout.on('data', (chunk) => { stdout = limitOutput(stdout + chunk.toString()); });
@@ -862,6 +864,7 @@ async function hasProjectExecutable(root, relativePath) {
 }
 
 async function findChangedPhpFiles(root) {
+  requireProjectProcessIsolation('PHP changed-file inspection');
   return new Promise((resolve, reject) => {
     const child = spawn('git', ['status', '--porcelain', '--', '*.php'], { cwd: root, shell: false, windowsHide: true });
     let output = '';
@@ -887,10 +890,87 @@ async function findChangedPhpFiles(root) {
   });
 }
 
+async function assertWorkspaceCopyable(root, current = root) {
+  for (const entry of await fs.readdir(current, { withFileTypes: true })) {
+    if (entry.name === '.git') continue;
+    const target = path.join(current, entry.name);
+    if (entry.isSymbolicLink()) {
+      const resolved = await fs.realpath(target);
+      if (!isInsideRoot(root, resolved)) {
+        throw new Error(`Verification isolation refused an external symlink: ${path.relative(root, target)}.`);
+      }
+      continue;
+    }
+    if (entry.isDirectory()) await assertWorkspaceCopyable(root, target);
+  }
+}
+
+async function assertCopiedSymlinksIsolated(root, current = root) {
+  for (const entry of await fs.readdir(current, { withFileTypes: true })) {
+    if (entry.name === '.git') continue;
+    const target = path.join(current, entry.name);
+    if (entry.isSymbolicLink()) {
+      const resolved = await fs.realpath(target);
+      if (!isInsideRoot(root, resolved)) {
+        throw new Error(`Verification isolation refused a copied symlink escape: ${path.relative(root, target)}.`);
+      }
+      continue;
+    }
+    if (entry.isDirectory()) await assertCopiedSymlinksIsolated(root, target);
+  }
+}
+
+async function createIsolatedWorkspaceCopy(sourceRoot, prefix = 'ai-help-agent-isolated-') {
+  const resolvedSourceRoot = await fs.realpath(sourceRoot);
+  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const workspaceRoot = path.join(temporaryRoot, 'project');
+  try {
+    await assertWorkspaceCopyable(resolvedSourceRoot);
+    await fs.cp(resolvedSourceRoot, workspaceRoot, {
+      recursive: true,
+      filter: (source) => {
+        const relative = path.relative(resolvedSourceRoot, source);
+        const segments = relative.split(path.sep);
+        return !segments.includes('.git') && !isSensitivePath(relative);
+      },
+    });
+    await assertCopiedSymlinksIsolated(workspaceRoot);
+    return {
+      root: workspaceRoot,
+      cleanup: () => fs.rm(temporaryRoot, { recursive: true, force: true }),
+    };
+  } catch (error) {
+    await fs.rm(temporaryRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 async function runVerification(script, ownerWebContentsId, options = {}) {
-  const root = await validateProjectRoot(ownerWebContentsId);
-  if (typeof script !== 'string' || !/^[a-z][a-z0-9:_-]{0,31}$/i.test(script)) throw new Error('Verification script name is invalid.');
+  if (typeof script !== 'string' || !/^[a-z][a-z0-9:_-]{0,31}$/i.test(script)) {
+    throw new Error('Verification script name is invalid.');
+  }
+  const sourceRoot = await validateProjectRoot(ownerWebContentsId);
+  requireProjectProcessIsolation('Project verification');
   const scope = await resolveProjectScope(ownerWebContentsId, options.scope || '.');
+  const isolatedWorkspace = await createIsolatedWorkspaceCopy(sourceRoot, 'ai-help-agent-verification-');
+  try {
+    const verificationRoot = isolatedWorkspace.root;
+    await fs.mkdir(path.join(verificationRoot, '.verification-temp'), { recursive: true });
+    return await runVerificationInWorkspace(
+      script,
+      ownerWebContentsId,
+      { ...options, isolatedTemp: path.join(verificationRoot, '.verification-temp') },
+      sourceRoot,
+      verificationRoot,
+      scope,
+    );
+  } finally {
+    await isolatedWorkspace.cleanup();
+  }
+}
+
+async function runVerificationInWorkspace(script, ownerWebContentsId, options, sourceRoot, root, scope) {
+  if (typeof script !== 'string' || !/^[a-z][a-z0-9:_-]{0,31}$/i.test(script)) throw new Error('Verification script name is invalid.');
   const scopedRoot = scope === '.' ? root : path.join(root, ...scope.split('/'));
   const projectType = await detectProjectType(scopedRoot);
   const rootProjectType = scope === '.' ? projectType : await detectProjectType(root);
@@ -908,15 +988,24 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
         phpCommand = { executable: process.platform === 'win32' ? 'composer.bat' : 'composer', args: ['run-script', 'test'] };
       }
     } else if (script === 'php-lint') {
-      const changedFiles = (await findChangedPhpFiles(root)).filter((file) => scope === '.' || file.replace(/\\/g, '/').startsWith(`${scope}/`));
+      const changedFiles = (await findChangedPhpFiles(sourceRoot))
+        .filter((file) => scope === '.' || file.replace(/\\/g, '/').startsWith(`${scope}/`))
+        .map((file) => path.relative(sourceRoot, path.resolve(sourceRoot, file)));
       if (!changedFiles.length) throw new Error('NOT_AVAILABLE (no changed PHP files available for syntax lint).');
       phpCommand = { executable: 'php', args: changedFiles.map((file) => ['-l', file]).flat(), lintFiles: changedFiles };
     }
     if (!phpCommand) throw new Error('PHP verification is not available for the selected project or requested check.');
   }
   if (phpCommand) {
+    requireProjectProcessIsolation('PHP verification');
     const startedAt = Date.now();
     const safeEnv = safeEnvironment(process.env);
+    if (options.isolatedTemp) {
+      safeEnv.HOME = root;
+      safeEnv.USERPROFILE = root;
+      safeEnv.TEMP = options.isolatedTemp;
+      safeEnv.TMP = options.isolatedTemp;
+    }
     const child = process.platform === 'win32' && /\.(?:bat|cmd)$/i.test(phpCommand.executable)
       ? spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `${phpCommand.executable} ${phpCommand.args.join(' ')}`], { cwd: root, windowsHide: true, env: safeEnv })
       : spawn(phpCommand.executable, phpCommand.args, { cwd: root, shell: false, windowsHide: true, env: safeEnv });
@@ -939,8 +1028,8 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
       return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: missing ? `${phpCommand.executable} not found in PATH.` : redactOutput(result.error), durationMs, spawnError: true, reason: missing ? `NOT_AVAILABLE (${phpCommand.executable} not found in PATH)` : undefined, networkPolicy: NETWORK_POLICY };
     }
     const ok = result.exitCode === 0;
-    await appendAudit(root, 'run_php_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
-    const runtimeEvidence = ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options);
+    await appendAudit(sourceRoot, 'run_php_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
+    const runtimeEvidence = ok ? null : await enrichRuntimeEvidence(sourceRoot, stdout, stderr, options);
     const phpunitPath = process.platform === 'win32' ? 'vendor/bin/phpunit.bat' : 'vendor/bin/phpunit';
     const reason = script === 'php-lint'
       && (projectType.hasPhpUnitConfig || rootProjectType.hasPhpUnitConfig || projectType.composer || rootProjectType.composer)
@@ -954,8 +1043,15 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
     if (!commandSpec || !projectType.profile.checks.includes(script)) {
       throw new Error(`Verification check "${script}" is not available for detected project type "${projectType.type}".`);
     }
+    requireProjectProcessIsolation('Project verification');
     const startedAt = Date.now();
     const safeEnv = safeEnvironment(process.env);
+    if (options.isolatedTemp) {
+      safeEnv.HOME = root;
+      safeEnv.USERPROFILE = root;
+      safeEnv.TEMP = options.isolatedTemp;
+      safeEnv.TMP = options.isolatedTemp;
+    }
     const child = spawn(commandSpec.executable, commandSpec.args, { cwd: root, shell: false, windowsHide: true, env: safeEnv });
     let stdout = ''; let stderr = '';
     const appendBounded = (current, chunk) => current.length >= MAX_OUTPUT_CHARS ? current : (current + chunk.toString()).slice(0, MAX_OUTPUT_CHARS);
@@ -975,8 +1071,8 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
     }
     if (result.timedOut) return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
     const ok = result.exitCode === 0;
-    await appendAudit(root, 'run_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
-    return { ok, script, exitCode: result.exitCode, executed: Number.isInteger(result.exitCode), stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence: ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options), networkPolicy: NETWORK_POLICY };
+    await appendAudit(sourceRoot, 'run_verification', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
+    return { ok, script, exitCode: result.exitCode, executed: Number.isInteger(result.exitCode), stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence: ok ? null : await enrichRuntimeEvidence(sourceRoot, stdout, stderr, options), networkPolicy: NETWORK_POLICY };
   }
   let packageJson;
   try {
@@ -992,12 +1088,14 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
   if (!SAFE_SCRIPT_NAMES.has(script.toLowerCase()) || UNSAFE_SCRIPT_PATTERN.test(command) || !SAFE_COMMAND_PATTERN.test(command)) {
     throw new Error(`Verification script "${script}" is not permitted.`);
   }
+  requireProjectProcessIsolation('Project verification');
 
   async function runGit(args) {
     const root = await validateProjectRoot(ownerWebContentsId);
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) throw new Error('Invalid git inspection request.');
     const allowed = args[0] === 'status' || (args[0] === 'diff' && args.every((arg) => ['diff', '--stat', '--name-only', '--no-ext-diff'].includes(arg)));
     if (!allowed) throw new Error('Only read-only git status and diff are permitted.');
+    requireProjectProcessIsolation('Project Git inspection');
     const child = spawn('git', args, { cwd: root, shell: false, windowsHide: true });
     let stdout = ''; let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
@@ -1015,6 +1113,12 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
   // Windows exposes npm as a .cmd shim. Invoke it through the fixed command
   // interpreter, while the script name remains strictly validated above.
   const safeEnv = safeEnvironment(process.env);
+  if (options.isolatedTemp) {
+    safeEnv.HOME = root;
+    safeEnv.USERPROFILE = root;
+    safeEnv.TEMP = options.isolatedTemp;
+    safeEnv.TMP = options.isolatedTemp;
+  }
   const child = process.platform === 'win32'
     ? spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `${executable} run ${script}`], { cwd: root, windowsHide: true, env: safeEnv })
     : spawn(executable, ['run', script], { cwd: root, shell: false, windowsHide: true, env: safeEnv });
@@ -1057,25 +1161,25 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
     child.on('close', (code) => finish({ exitCode: code }));
   });
   const durationMs = Date.now() - startedAt;
-  const project = path.basename(root);
+  const project = path.basename(sourceRoot);
   if (result.timedOut) {
     console.warn(`[DEV][VERIFY] project=${project} script=${script} exitCode=null durationMs=${durationMs} success=false timedOut=true`);
-    await appendAudit(root, 'run_command', script, 'failure:timeout');
+    await appendAudit(sourceRoot, 'run_command', script, 'failure:timeout');
     return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
   }
   if (result.cancelled) {
-    await appendAudit(root, 'run_command', script, 'cancelled');
+    await appendAudit(sourceRoot, 'run_command', script, 'cancelled');
     return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: 'Verification command cancelled.', durationMs, cancelled: true, networkPolicy: NETWORK_POLICY };
   }
   if (result.error) {
     console.warn(`[DEV][VERIFY] project=${project} script=${script} exitCode=null durationMs=${durationMs} success=false`);
-    await appendAudit(root, 'run_command', script, 'failure:spawn');
+    await appendAudit(sourceRoot, 'run_command', script, 'failure:spawn');
     return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(stdout), stderr: redactOutput(result.error), durationMs, spawnError: true, networkPolicy: NETWORK_POLICY };
   }
   const ok = result.exitCode === 0;
   console.info(`[DEV][VERIFY] project=${project} script=${script} exitCode=${result.exitCode} durationMs=${durationMs} success=${ok}`);
-  await appendAudit(root, 'run_command', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
-  const runtimeEvidence = ok ? null : await enrichRuntimeEvidence(root, stdout, stderr, options);
+  await appendAudit(sourceRoot, 'run_command', script, ok ? 'success' : `failure:exit-${result.exitCode}`);
+  const runtimeEvidence = ok ? null : await enrichRuntimeEvidence(sourceRoot, stdout, stderr, options);
   return { ok, script, exitCode: result.exitCode, executed: Number.isInteger(result.exitCode), stdout: redactOutput(stdout), stderr: redactOutput(stderr), durationMs, runtimeEvidence, networkPolicy: NETWORK_POLICY };
 }
 
@@ -1384,5 +1488,6 @@ module.exports = {
   redactRuntimeValue, parseRuntimeFailure, mapRuntimeSource, classifyProjectSignals,
   PROJECT_MANIFESTS, VERIFICATION_PROFILES,
   detectProjectType, detectDevServerConfiguration,
+  createIsolatedWorkspaceCopy,
   getProjectState, attachProject, setAuthoritativeProject, detachAuthoritativeProject, PROJECT_STATUSES,
 };

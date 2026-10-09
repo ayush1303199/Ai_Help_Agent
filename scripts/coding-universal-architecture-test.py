@@ -54,6 +54,7 @@ def run_suite():
         ("what is the purpose of this service?", TaskIntent.QUESTION, False),
         ("explain how user authentication works", TaskIntent.QUESTION, False),
         ("why is the payment api returning 500 error?", TaskIntent.BUG_INVESTIGATION, False),
+        ("why is auth crashing on verify?", TaskIntent.BUG_INVESTIGATION, False),
         ("fix the null pointer exception in OrderService.ts", TaskIntent.BUG_FIX, True),
         ("which query is take time", TaskIntent.PERFORMANCE_INVESTIGATION, False),
         ("which query is slow?", TaskIntent.PERFORMANCE_INVESTIGATION, False),
@@ -179,7 +180,21 @@ def run_suite():
     async def mock_tool_wait(st, req_id, tool_id):
         return {"ok": True, "data": {"path": "src/auth.ts", "content": "function verify(token) { return token.id; }"}}
 
-    with patch("coding_websocket.complete_coding_model", side_effect=lambda *a, **kw: next(bug_responses)), \
+    with patch(
+        "coding_websocket._resolve_semantic_task_with_model",
+        new=AsyncMock(return_value={
+            "is_deterministic": False,
+            "route_to_code": True,
+            "resolved_by_model": True,
+            "semanticTask": {
+                "intent": "BUG_INVESTIGATION",
+                "goal": "Investigate why auth is crashing on verify.",
+                "resourceCandidates": ["CODE", "REPOSITORY"],
+                "resolvedResources": ["CODE", "REPOSITORY"],
+            },
+        }),
+    ), \
+         patch("coding_websocket.complete_coding_model", side_effect=lambda *a, **kw: next(bug_responses)), \
          patch("coding_websocket._wait_for_tool", side_effect=mock_tool_wait):
         asyncio.run(_run_coding_turn(
             {
@@ -214,7 +229,20 @@ def run_suite():
         sent_fallback.append(evt)
 
     # Simulate provider failure on turn
-    with patch("coding_websocket.complete_coding_model", side_effect=TimeoutError("LLM Provider Timeout")):
+    with patch(
+        "coding_websocket._resolve_semantic_task_with_model",
+        new=AsyncMock(return_value={
+            "is_deterministic": False,
+            "route_to_code": True,
+            "resolved_by_model": True,
+            "semanticTask": {
+                "intent": "CODE_QUESTION",
+                "goal": "Explain logic.ts using available source evidence.",
+                "resourceCandidates": ["CODE", "REPOSITORY"],
+                "resolvedResources": ["CODE", "REPOSITORY"],
+            },
+        }),
+    ), patch("coding_websocket.complete_coding_model", side_effect=TimeoutError("LLM Provider Timeout")):
         # Prepopulate session with local evidence
         sess = CODING_TASK_STORE.get_or_create("session-fb-1", project_root=".")
         CODING_TASK_STORE.record_source_evidence("session-fb-1", path="src/logic.ts", snippet="export function compute() { return 42; }")

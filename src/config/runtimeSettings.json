@@ -121,6 +121,7 @@
     "projectDiscoveryMaxMatches": 20,
     "maxRequestChars": 4000,
     "maxProposalBytes": 2097152,
+    "maxVerificationAttempts": 3,
     "maxStateHistoryEntries": 20,
     "maxSummaryChars": 2000,
     "contextMinTokens": 64,

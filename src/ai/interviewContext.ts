@@ -1,3 +1,5 @@
+import { writeAppState } from '../config/appStateStorage';
+
 export const INTERVIEW_CONTEXT_STORAGE_KEY = 'interview-context-v1';
 
 export const INTERVIEW_DOMAIN_OPTIONS = [
@@ -181,7 +183,7 @@ export function readPersistedInterviewContext(): InterviewContextConfig {
 
 export function writePersistedInterviewContext(config: InterviewContextConfig) {
   try {
-    localStorage.setItem(INTERVIEW_CONTEXT_STORAGE_KEY, JSON.stringify(normalizeInterviewContext(config)));
+    writeAppState(INTERVIEW_CONTEXT_STORAGE_KEY, JSON.stringify(normalizeInterviewContext(config)));
   } catch {
     // Keep the live selection when browser storage is unavailable.
   }

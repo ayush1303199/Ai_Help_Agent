@@ -1,0 +1,40 @@
+{
+  "protectedFeatureRoots": {
+    "coding": [
+      "src/features/coding",
+      "electron/codingAgent.cjs",
+      "electron/developerAgent.cjs",
+      "electron/developerFiles.cjs",
+      "electron/developerIndex.cjs",
+      "electron/coding-pipeline",
+      "server/src/coding_provider.py",
+      "server/src/coding_websocket.py"
+    ],
+    "general": [
+      "src/features/general",
+      "electron/generalAgent.cjs",
+      "electron/generalAgentCapabilities.cjs",
+      "electron/generalAgentElectronBrowser.cjs",
+      "electron/generalAgentExecution.cjs",
+      "electron/generalAgentPlanner.cjs"
+    ],
+    "meeting": [
+      "src/features/meeting",
+      "src/audio",
+      "server/src/stt_service.py"
+    ],
+    "overlay": [
+      "src/features/overlay",
+      "electron/overlay"
+    ],
+    "provider-settings": [
+      "src/features/provider-selection",
+      "src/config/providerPersistence.ts",
+      "src/config/providerSecretStore.ts",
+      "electron/providerSecretVault.cjs"
+    ],
+    "history": [
+      "src/history"
+    ]
+  }
+}

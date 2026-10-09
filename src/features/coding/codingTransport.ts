@@ -53,7 +53,14 @@ export interface CodingTransportResult {
   model?: string | null;
   configuredProviderId?: string | null;
   fallback?: boolean;
+  verificationAttempt?: { attemptNumber: number; maxAttempts: number; label: string } | null;
 }
+
+export type CodingMutationNotification =
+  | 'approval_request'
+  | 'approval_response'
+  | 'patch_applied'
+  | 'undo';
 
 interface CodingHandlers {
   onStart: (turnId: string, projectRoot: string, scope: string) => void;
@@ -65,6 +72,7 @@ interface CodingHandlers {
 
 interface CodingRequestState {
   requestId: string;
+  turnId: string;
   scope: string;
   handlers: CodingHandlers;
   chunks: string[];
@@ -113,6 +121,7 @@ export class CodingAgentTransport {
     projectRoot: string,
     handlers: CodingHandlers,
     conversationId?: string,
+    verificationAttempt?: { attemptNumber: number; maxAttempts: number; label: string; repairToken?: string } | null,
   ): Promise<string> {
     const request = latestCodingUserRequest(messages);
     if (!request.trim()) throw new Error('The current Coding Agent request is missing. Please send it again.');
@@ -125,7 +134,7 @@ export class CodingAgentTransport {
     let currentScope = scope || '.';
 
     if (window.electronAPI) {
-      const turn = await window.electronAPI.beginDeveloperConversation(request, scope);
+      const turn = await window.electronAPI.beginDeveloperConversation(request, scope, verificationAttempt?.repairToken || null);
       turnId = turn.turnId;
       sessionId = turn.sessionId || sessionId;
       currentProjectRoot = turn.projectRoot;
@@ -142,6 +151,7 @@ export class CodingAgentTransport {
 
     this.requests.set(requestId, {
       requestId,
+      turnId,
       scope: currentScope,
       handlers,
       chunks: [],
@@ -159,6 +169,13 @@ export class CodingAgentTransport {
       projectRoot: currentProjectRoot,
       scope: currentScope,
       messages,
+      verificationAttempt: verificationAttempt
+        ? {
+            attemptNumber: verificationAttempt.attemptNumber,
+            maxAttempts: verificationAttempt.maxAttempts,
+            label: verificationAttempt.label,
+          }
+        : undefined,
     }));
     return turnId;
   }
@@ -168,6 +185,22 @@ export class CodingAgentTransport {
       return window.electronAPI.advanceDeveloperConversation({ turnId, state, phase, fileCount });
     }
     return { ok: true, state };
+  }
+
+  notifyMutation(type: CodingMutationNotification, details: {
+    proposalId: string;
+    manifestHash?: string | null;
+    approved?: boolean;
+    verificationStatus?: string | null;
+  }) {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    this.socket.send(JSON.stringify({ type, ...details }));
+  }
+
+  cancel(requestId: string) {
+    if (!requestId || this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(JSON.stringify({ type: 'cancel', requestId }));
+    return true;
   }
 
   close() {
@@ -205,7 +238,7 @@ export class CodingAgentTransport {
           request.handlers.onError(new Error('The Coding Agent connection closed before the request completed.'));
         }
       };
-      socket.onmessage = (event) => {
+      socket.onmessage = async (event) => {
         if (!authenticated) {
           let response: Record<string, unknown>;
           try {
@@ -219,6 +252,13 @@ export class CodingAgentTransport {
             socket.close();
             reject(new Error('Coding Agent authentication failed.'));
             return;
+          }
+          if (window.electronAPI && typeof response.connectionId === 'string') {
+            try {
+              await window.electronAPI.registerDeveloperMutationConnection(response.connectionId);
+            } catch (error) {
+              console.warn('Coding Agent mutation capability handshake was not accepted.', error);
+            }
           }
           authenticated = true;
           window.clearTimeout(timeout);
@@ -281,6 +321,21 @@ export class CodingAgentTransport {
       const rawArgs = message.arguments && typeof message.arguments === 'object'
         ? message.arguments as Record<string, unknown>
         : {};
+      if (message.turnId !== request.turnId) {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({
+            type: 'tool_result',
+            requestId,
+            toolCallId,
+            result: {
+              ok: false,
+              code: 'REQUEST_BINDING_MISMATCH',
+              error: 'The tool call is not bound to the active Coding request.',
+            },
+          }));
+        }
+        return;
+      }
 
       let name = rawName;
       const args = { ...rawArgs };
@@ -312,13 +367,14 @@ export class CodingAgentTransport {
       let result: unknown;
       try {
         if (window.electronAPI) {
-          result = await window.electronAPI.executeDeveloperTool(name, args, request.scope);
+          result = await window.electronAPI.executeDeveloperTool(name, args, request.scope, request.turnId);
         } else {
           const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/tool`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               requestId: request.requestId,
+              turnId: request.turnId,
               name,
               arguments: args,
               scope: request.scope,
@@ -356,6 +412,10 @@ export class CodingAgentTransport {
     }
     if (message.type === 'done') {
       this.requests.delete(requestId);
+      const rawVerificationAttempt = (message as Record<string, unknown>).verificationAttempt;
+      const verificationAttempt = rawVerificationAttempt && typeof rawVerificationAttempt === 'object'
+        ? rawVerificationAttempt as { attemptNumber?: unknown; maxAttempts?: unknown; label?: unknown }
+        : null;
       request.handlers.onDone({
         requestId,
         content: String(message.content || request.chunks.join('')),
@@ -392,6 +452,34 @@ export class CodingAgentTransport {
         model: typeof message.model === 'string' ? message.model : null,
         configuredProviderId: typeof message.configuredProviderId === 'string' ? message.configuredProviderId : null,
         fallback: message.fallback === true,
+        verificationAttempt: verificationAttempt
+          && Number.isSafeInteger(verificationAttempt.attemptNumber)
+          && Number.isSafeInteger(verificationAttempt.maxAttempts)
+          ? {
+              attemptNumber: verificationAttempt.attemptNumber as number,
+              maxAttempts: verificationAttempt.maxAttempts as number,
+              label: typeof verificationAttempt.label === 'string'
+                ? verificationAttempt.label.slice(0, 40)
+                : `attempt ${verificationAttempt.attemptNumber} of ${verificationAttempt.maxAttempts}`,
+            }
+          : null,
+      });
+      return;
+    }
+    if (message.type === 'cancelled') {
+      this.requests.delete(requestId);
+      request.handlers.onDone({
+        requestId,
+        content: 'Request cancelled.',
+        proposalRequired: false,
+        status: 'CANCELLED',
+        readOnly: true,
+        writeRequired: false,
+        applyRequired: false,
+        approvalRequired: false,
+        toolCalls: request.toolCalls,
+        filesRead: [...request.filesRead.entries()].map(([path, content]) => ({ path, content })),
+        filesSearched: [...request.filesSearched],
       });
       return;
     }

@@ -5,7 +5,38 @@
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+
+async function resolveSafeRepositoryFile(repoRoot, file) {
+  const resolvedRoot = await fs.realpath(repoRoot);
+  const fullPath = path.resolve(resolvedRoot, file);
+  const relative = path.relative(resolvedRoot, fullPath);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error('Multi-repository target is outside its repository.');
+  }
+  const parent = await fs.realpath(path.dirname(fullPath));
+  const parentRelative = path.relative(resolvedRoot, parent);
+  if (parentRelative === '..' || parentRelative.startsWith(`..${path.sep}`) || path.isAbsolute(parentRelative)) {
+    throw new Error(`Multi-repository target parent escapes its repository: ${relative}`);
+  }
+  try {
+    const stat = await fs.lstat(fullPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`Multi-repository target is not a regular file: ${relative}`);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  return { resolvedRoot, fullPath, relative };
+}
+
+async function readRepositoryFileOrNull(filePath) {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
 
 class MultiRepoCoordinator {
   constructor() {
@@ -85,35 +116,22 @@ class MultiRepoCoordinator {
 
   async captureBaselineSnapshot(taskId, repoRoot, filesToTrack = []) {
     if (!taskId || !repoRoot) return null;
+    const resolvedRoot = await fs.realpath(repoRoot);
 
-    let preExistingChanges = [];
-    try {
-      const output = await new Promise((resolve) => {
-        const proc = spawn('git', ['status', '--short'], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-        let out = '';
-        proc.stdout.on('data', (d) => { out += d; });
-        proc.on('close', (code) => {
-          if (code === 0) resolve(out.trim());
-          else resolve('');
-        });
-        proc.on('error', () => resolve(''));
-      });
-
-      preExistingChanges = output ? output.split('\n').map((l) => l.trim()).filter(Boolean) : [];
-    } catch {}
+    const preExistingChanges = [];
 
     const fileSnapshots = new Map();
     for (const f of filesToTrack) {
-      const fullPath = path.isAbsolute(f) ? f : path.join(repoRoot, f);
+      const { fullPath } = await resolveSafeRepositoryFile(resolvedRoot, f);
       try {
         const content = await fs.readFile(fullPath, 'utf8');
         fileSnapshots.set(fullPath, content);
-      } catch {
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
         fileSnapshots.set(fullPath, null);
       }
     }
 
-    const resolvedRoot = path.resolve(repoRoot);
     const existingMap = this._baselineSnapshots.get(taskId);
     const existingSnapshot = existingMap?.get(resolvedRoot);
     if (existingSnapshot && existingSnapshot.fileSnapshots) {
@@ -129,8 +147,10 @@ class MultiRepoCoordinator {
       repoRoot: resolvedRoot,
       timestamp: new Date().toISOString(),
       preExistingChanges,
-      hasPreExistingChanges: preExistingChanges.length > 0,
+      preExistingChangesStatus: 'NOT_VERIFIED_NO_OS_SANDBOX',
+      hasPreExistingChanges: null,
       fileSnapshots,
+      postSnapshots: new Map(),
     };
 
     if (!this._baselineSnapshots.has(taskId)) {
@@ -145,7 +165,7 @@ class MultiRepoCoordinator {
     return this._baselineSnapshots.get(taskId)?.get(path.resolve(repoRoot)) || null;
   }
 
-  recordRepoModification(taskId, repoRoot, modifiedFiles = []) {
+  async recordRepoModification(taskId, repoRoot, modifiedFiles = []) {
     if (!this._repoModifications) this._repoModifications = new Map();
     if (!this._repoModifications.has(taskId)) {
       this._repoModifications.set(taskId, new Map());
@@ -153,47 +173,103 @@ class MultiRepoCoordinator {
     const resolvedRoot = path.resolve(repoRoot);
     const existing = this._repoModifications.get(taskId).get(resolvedRoot) || [];
     this._repoModifications.get(taskId).set(resolvedRoot, [...new Set([...existing, ...modifiedFiles])]);
+    const baseline = this.getBaselineSnapshot(taskId, resolvedRoot);
+    if (!baseline) throw new Error('Multi-repository rollback requires a captured baseline.');
+    for (const file of modifiedFiles) {
+      const { fullPath } = await resolveSafeRepositoryFile(resolvedRoot, file);
+      try {
+        baseline.postSnapshots.set(fullPath, await fs.readFile(fullPath, 'utf8'));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        baseline.postSnapshots.set(fullPath, null);
+      }
+    }
   }
 
-  async rollbackMultiRepoChanges(taskId) {
+  async getRollbackPlan(taskId) {
+    if (!this._repoModifications || !this._repoModifications.has(taskId)) return [];
+    const plan = [];
+    for (const [repoRoot, files] of this._repoModifications.get(taskId).entries()) {
+      const baseline = this.getBaselineSnapshot(taskId, repoRoot);
+      if (!baseline) throw new Error('Multi-repository rollback baseline is missing.');
+      const resolvedRoot = await fs.realpath(repoRoot);
+      for (const file of files) {
+        const fullPath = path.resolve(resolvedRoot, file);
+        const relative = path.relative(resolvedRoot, fullPath);
+        if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+          throw new Error('Multi-repository rollback target is outside its repository.');
+        }
+        if (!baseline.fileSnapshots.has(fullPath) || !baseline.postSnapshots.has(fullPath)) {
+          throw new Error(`Multi-repository rollback state is incomplete for ${relative}.`);
+        }
+        if (baseline.fileSnapshots.get(fullPath) === baseline.postSnapshots.get(fullPath)) continue;
+        plan.push({
+          repoRoot: resolvedRoot,
+          path: relative,
+          operation: baseline.fileSnapshots.get(fullPath) === null ? 'delete' : 'undo',
+          deleteConfirmationRequired: baseline.fileSnapshots.get(fullPath) === null,
+        });
+      }
+    }
+    return plan;
+  }
+
+  async rollbackMultiRepoChanges(taskId, authorize) {
     if (!this._repoModifications || !this._repoModifications.has(taskId)) {
       return { ok: true, rolledBackRepos: [] };
     }
-
+    if (typeof authorize !== 'function') {
+      throw new Error('Multi-repository rollback requires the authoritative mutation policy.');
+    }
     const reposMap = this._repoModifications.get(taskId);
     const rolledBackRepos = [];
 
     for (const [repoRoot, files] of reposMap.entries()) {
       const baseline = this.getBaselineSnapshot(taskId, repoRoot);
-      const preExisting = baseline ? baseline.preExistingChanges : [];
-      const snapshots = baseline?.fileSnapshots || new Map();
+      if (!baseline) throw new Error('Multi-repository rollback baseline is missing.');
+      const resolvedRoot = await fs.realpath(repoRoot);
 
       for (const file of files) {
-        const fullPath = path.isAbsolute(file) ? file : path.join(repoRoot, file);
-        const isPreExisting = preExisting.some((p) => p.includes(path.basename(file)));
-        if (!isPreExisting) {
-          let gitCheckoutSuccess = false;
+        const { fullPath, relative } = await resolveSafeRepositoryFile(resolvedRoot, file);
+        if (!baseline.fileSnapshots.has(fullPath) || !baseline.postSnapshots.has(fullPath)) {
+          throw new Error(`Multi-repository rollback state is incomplete for ${relative}.`);
+        }
+        const original = baseline.fileSnapshots.get(fullPath);
+        const expectedCurrent = baseline.postSnapshots.get(fullPath);
+        if (original === expectedCurrent) continue;
+        const readCurrent = async () => {
           try {
-            gitCheckoutSuccess = await new Promise((resolve) => {
-              const proc = spawn('git', ['checkout', '--', file], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
-              proc.on('close', (code) => resolve(code === 0));
-              proc.on('error', () => resolve(false));
-            });
-          } catch {
-            gitCheckoutSuccess = false;
+            const stat = await fs.lstat(fullPath);
+            if (!stat.isFile() || stat.isSymbolicLink()) {
+              throw new Error(`Multi-repository rollback target is not a regular file: ${relative}`);
+            }
+            return await fs.readFile(fullPath, 'utf8');
+          } catch (error) {
+            if (error.code === 'ENOENT') return null;
+            throw error;
           }
-
-          // If git checkout was not successful or repo is not a git repo, fall back to file snapshot restoration
-          if (!gitCheckoutSuccess && snapshots.has(fullPath)) {
-            const originalContent = snapshots.get(fullPath);
-            try {
-              if (originalContent === null) {
-                await fs.unlink(fullPath);
-              } else {
-                await fs.writeFile(fullPath, originalContent, 'utf8');
-              }
-            } catch {}
-          }
+        };
+        if (await readCurrent() !== expectedCurrent) {
+          throw new Error(`Multi-repository rollback refused because the target changed: ${relative}`);
+        }
+        const decision = await authorize({
+          repoRoot: resolvedRoot,
+          operation: original === null ? 'delete' : 'undo',
+          paths: [relative],
+          proposalApproved: true,
+          rollback: true,
+          deleteConfirmationRequired: original === null,
+        });
+        if (!decision || decision.allowed !== true) {
+          throw new Error(decision?.reason || `Policy Gate denied multi-repository rollback for ${relative}.`);
+        }
+        if (await readCurrent() !== expectedCurrent) {
+          throw new Error(`Multi-repository rollback target changed during authorization: ${relative}`);
+        }
+        if (original === null) {
+          await fs.unlink(fullPath);
+        } else {
+          await fs.writeFile(fullPath, original, 'utf8');
         }
       }
       rolledBackRepos.push(repoRoot);
@@ -203,43 +279,10 @@ class MultiRepoCoordinator {
     return { ok: true, rolledBackRepos };
   }
 
-  async executeCoordinatedChange(taskId, repoChanges = [], applyFn, verifyFn) {
-    const applied = [];
-    let failureEncountered = null;
-
-    for (const change of repoChanges) {
-      const { repoRoot, files = [], patch } = change;
-      await this.captureBaselineSnapshot(taskId, repoRoot, files);
-
-      try {
-        const applyRes = await applyFn(repoRoot, patch, files);
-        if (!applyRes || !applyRes.ok) {
-          throw new Error(applyRes?.error || `Apply failed on repo: ${repoRoot}`);
-        }
-        this.recordRepoModification(taskId, repoRoot, files);
-        applied.push(change);
-
-        const verifyRes = await verifyFn(repoRoot);
-        if (!verifyRes || !verifyRes.ok) {
-          throw new Error(verifyRes?.error || `Verification failed on repo: ${repoRoot}`);
-        }
-      } catch (err) {
-        failureEncountered = err.message;
-        break;
-      }
-    }
-
-    if (failureEncountered) {
-      await this.rollbackMultiRepoChanges(taskId);
-      return {
-        ok: false,
-        transactionalRollback: true,
-        error: failureEncountered,
-        rolledBackCount: applied.length,
-      };
-    }
-
-    return { ok: true, appliedCount: applied.length };
+  async executeCoordinatedChange() {
+    throw new Error(
+      'Callback-based coordinated changes are disabled because callbacks can mutate outside the authorized target set.',
+    );
   }
 }
 

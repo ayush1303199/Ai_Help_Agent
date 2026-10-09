@@ -30,6 +30,7 @@ async function runStage18TestSuite() {
   console.log('=== RUNNING STAGE 18 ENGINEERING QUALITY + INDEPENDENT CORRECTNESS VERIFICATION ===\n');
 
   const tempBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'stage18-correctness-'));
+  taskOrchestrator.setCheckpointStorageRoot(path.join(tempBaseDir, 'checkpoints'));
 
   try {
     // -------------------------------------------------------------
@@ -382,28 +383,28 @@ async function runStage18TestSuite() {
     // 10. State Persistence, Reconnect & Process Restart (Sections 65, 69)
     // -------------------------------------------------------------
     console.log('\n--- 10. Testing Atomic Checkpoint & Process-Restart Restoration ---');
-    const checkpointFile = path.join(tempBaseDir, 'stage18_checkpoint.json');
     const persistTaskId = 'task_stage18_persist';
 
     const pTask = taskOrchestrator.createTask({
       taskId: persistTaskId,
       goal: 'Demonstrate persistent engineering quality across restarts',
-      workspaceRoot: tempBaseDir,
+      workspace: tempBaseDir,
       mode: 'PLAN_EXECUTE',
     });
     pTask.findings.push('Identified race condition in query cache');
     pTask.evidence.push('Thread dump trace 0x3b8');
 
     // Save atomic versioned checkpoint
-    const saveRes = await taskOrchestrator.saveCheckpointToDisk(persistTaskId, checkpointFile, 'pre_restart_milestone');
+    const saveRes = await taskOrchestrator.saveCheckpointToDisk(persistTaskId, 'pre_restart_milestone');
     assert.ok(saveRes);
     assert.ok(saveRes.checkpointId);
+    const checkpointFile = taskOrchestrator.getCheckpointPath(persistTaskId);
 
     // Simulate process termination and clean memory restoration
     taskOrchestrator._tasks.delete(persistTaskId);
     assert.equal(taskOrchestrator.getTask(persistTaskId), null);
 
-    const restoreRes = await taskOrchestrator.restoreTaskFromDisk(checkpointFile);
+    const restoreRes = await taskOrchestrator.restoreTaskFromDisk(persistTaskId, pTask.sessionId, pTask.workspace);
     assert.ok(restoreRes);
     assert.equal(restoreRes.taskId, persistTaskId);
     const restoredTask = taskOrchestrator.getTask(persistTaskId);

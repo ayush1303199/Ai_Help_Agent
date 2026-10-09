@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { writeAppState } from '../../config/appStateStorage';
 import { captureScreenForReading } from './screenReadingService';
 
 interface UseScreenReaderOptions {
@@ -62,7 +63,7 @@ export function useScreenReader({
 
   const setEnabledState = useCallback((next: boolean) => {
     try {
-      localStorage.setItem(storageKey, String(next));
+      writeAppState(storageKey, String(next));
       setEnabled(next);
     } catch {
       onError('Screen-reading preference could not be saved because browser storage is unavailable.');

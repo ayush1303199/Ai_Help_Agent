@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { authorizeAppOwnedMutation } = require('./appOwnedPersistence.cjs');
 const { INDEX_STAGE, runIndexStage } = require('./coding-pipeline/index/indexStage.cjs');
 
 const SUPPORTED = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.php', '.java', '.kt', '.go', '.rb', '.cs', '.fs', '.vb', '.rs', '.py']);
@@ -272,6 +273,12 @@ async function getSemanticPipeline() {
   if (!semanticConfiguration) throw new Error('Semantic search has not been configured by the application.');
   if (!semanticPipelinePromise) {
     semanticPipelinePromise = (async () => {
+      await authorizeAppOwnedMutation({
+        root: semanticConfiguration.cacheDirectory,
+        target: semanticConfiguration.modelCacheDirectory,
+        resource: 'cache',
+        operation: 'write',
+      });
       await fs.mkdir(semanticConfiguration.modelCacheDirectory, { recursive: true });
       if (semanticConfiguration.createPipeline) {
         return semanticConfiguration.createPipeline(semanticConfiguration.modelCacheDirectory);
@@ -319,6 +326,12 @@ async function readSemanticIndex(root) {
 
 async function writeSemanticIndex(root, semanticIndex) {
   const cachePath = semanticCachePath(root);
+  await authorizeAppOwnedMutation({
+    root: semanticConfiguration.cacheDirectory,
+    target: path.dirname(cachePath),
+    resource: 'cache',
+    operation: 'write',
+  });
   await fs.mkdir(path.dirname(cachePath), { recursive: true });
   const temporaryPath = `${cachePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   const payload = JSON.stringify({
@@ -328,10 +341,28 @@ async function writeSemanticIndex(root, semanticIndex) {
     files: semanticIndex.files,
   });
   try {
+    await authorizeAppOwnedMutation({
+      root: semanticConfiguration.cacheDirectory,
+      target: temporaryPath,
+      resource: 'cache',
+      operation: 'write',
+    });
     await fs.writeFile(temporaryPath, payload, { encoding: 'utf8', flag: 'wx' });
+    await authorizeAppOwnedMutation({
+      root: semanticConfiguration.cacheDirectory,
+      target: cachePath,
+      resource: 'cache',
+      operation: 'replace',
+    });
     await fs.rename(temporaryPath, cachePath);
   } catch (error) {
-    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    await authorizeAppOwnedMutation({
+      root: semanticConfiguration.cacheDirectory,
+      target: temporaryPath,
+      resource: 'cache',
+      operation: 'remove',
+    });
+    await fs.rm(temporaryPath, { force: true });
     throw new Error(`Could not write semantic search cache: ${error.message}`);
   }
 }

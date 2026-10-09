@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { writeAppState } from '../../config/appStateStorage';
 import {
   DEFAULT_MEETING_HISTORY_RETENTION_DAYS,
   isMeetingHistoryRetentionDue,
@@ -65,19 +66,19 @@ export function useMeetingTranscriptHistory(maxSessions: number, maxTranscripts:
   });
 
   useEffect(() => {
-    localStorage.setItem('meeting-chat-state', JSON.stringify(
+    writeAppState('meeting-chat-state', JSON.stringify(
       pruneMeetingRecords(answeredSegments, historyRetentionDays).slice(0, maxSessions),
     ));
   }, [answeredSegments, historyRetentionDays, maxSessions]);
 
   useEffect(() => {
-    localStorage.setItem('meeting-history-conversation-id', meetingConversationId);
+    writeAppState('meeting-history-conversation-id', meetingConversationId);
   }, [meetingConversationId]);
 
   useEffect(() => {
     const bounded = pruneMeetingRecords(transcripts, historyRetentionDays).slice(0, maxTranscripts);
     if (bounded.length !== transcripts.length) setTranscripts(bounded);
-    localStorage.setItem('meeting-transcripts', JSON.stringify(bounded));
+    writeAppState('meeting-transcripts', JSON.stringify(bounded));
   }, [historyRetentionDays, maxTranscripts, transcripts]);
 
   useEffect(() => {

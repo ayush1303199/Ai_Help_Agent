@@ -19,6 +19,7 @@ import {
 console.log('=== RUNNING STAGE 17 PRODUCTION RUNTIME INTEGRATION ENGINE VERIFICATION ===\n');
 
 const tempBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'stage17-integration-'));
+taskOrchestrator.setCheckpointStorageRoot(path.join(tempBaseDir, 'checkpoints'));
 
 try {
   // -------------------------------------------------------------
@@ -153,9 +154,9 @@ try {
   // 6. Atomic Versioned Checkpointing & Corruption Safety (Section 20-21)
   // -------------------------------------------------------------
   console.log('\n--- 6. Testing Atomic Versioned Checkpointing & Integrity Protection ---');
-  const chkFile = path.join(tempBaseDir, 'checkpoints', `${task.taskId}.json`);
-  const saved = await taskOrchestrator.saveCheckpointToDisk(task.taskId, chkFile, 'idempotency_investigated');
+  const saved = await taskOrchestrator.saveCheckpointToDisk(task.taskId, 'idempotency_investigated');
   assert.ok(saved);
+  const chkFile = taskOrchestrator.getCheckpointPath(task.taskId);
 
   // Verify file on disk has schemaVersion: 1 and checksum
   const diskRaw = await fs.readFile(chkFile, 'utf8');
@@ -164,23 +165,25 @@ try {
   assert.ok(diskJson.checksum);
 
   // Test restoration
-  const restoredTask = await taskOrchestrator.restoreTaskFromDisk(chkFile);
+  const restoredTask = await taskOrchestrator.restoreTaskFromDisk(task.taskId, task.sessionId, task.workspace);
   assert.equal(restoredTask.taskId, task.taskId);
   assert.equal(restoredTask.findings.length, 3);
 
   // Test corrupted checkpoint detection
-  const corruptFile = path.join(tempBaseDir, 'checkpoints', 'corrupt.json');
+  const corruptTaskId = 'corrupt';
+  const corruptFile = taskOrchestrator.getCheckpointPath(corruptTaskId);
   await fs.writeFile(corruptFile, '{"schemaVersion": 1, "checksum": "deadbeef", "task": {"taskId": "t1"}}');
   await assert.rejects(
-    () => taskOrchestrator.restoreTaskFromDisk(corruptFile),
+    () => taskOrchestrator.restoreTaskFromDisk(corruptTaskId, task.sessionId, task.workspace),
     /Corrupted checkpoint: checksum integrity mismatch/
   );
 
   // Test incompatible schema version rejection
-  const futureFile = path.join(tempBaseDir, 'checkpoints', 'future.json');
+  const futureTaskId = 'future';
+  const futureFile = taskOrchestrator.getCheckpointPath(futureTaskId);
   await fs.writeFile(futureFile, '{"schemaVersion": 99, "task": {"taskId": "t2"}}');
   await assert.rejects(
-    () => taskOrchestrator.restoreTaskFromDisk(futureFile),
+    () => taskOrchestrator.restoreTaskFromDisk(futureTaskId, task.sessionId, task.workspace),
     /Incompatible checkpoint schema version/
   );
   console.log('[PASS] Atomic write, versioning, and corruption rejection verified.');
@@ -345,14 +348,20 @@ try {
     return { ok: false, error: 'Type incompatibility in repoB' };
   };
 
-  const rollbackRes = await coord.executeCoordinatedChange(coordTaskId, multiChanges, applyWithFailureInB, async () => ({ ok: true }));
-  assert.equal(rollbackRes.ok, false);
-  assert.equal(rollbackRes.transactionalRollback, true);
+  await assert.rejects(
+    () => coord.executeCoordinatedChange(
+      coordTaskId,
+      multiChanges,
+      applyWithFailureInB,
+      async () => ({ ok: true }),
+      async () => ({ allowed: true }),
+    ),
+    /callbacks can mutate outside the authorized target set/i,
+  );
 
-  // Confirm Repo A was rolled back
-  const rolledBackA = await fs.readFile(path.join(multiA, 'client.js'), 'utf8');
-  assert.equal(rolledBackA, 'export const v = 1;\n', 'Repo A must be rolled back when Repo B fails');
-  console.log('[PASS] Multi-repo coordination with transactional rollback verified.');
+  const unchangedA = await fs.readFile(path.join(multiA, 'client.js'), 'utf8');
+  assert.equal(unchangedA, 'export const v = 1;\n', 'Rejected callbacks must not write to Repo A.');
+  console.log('[PASS] Unsafe callback-based multi-repository changes fail closed.');
 
   // -------------------------------------------------------------
   // 13. Dynamic Server Discovery & Honest Browser Verification (Section 43-45)

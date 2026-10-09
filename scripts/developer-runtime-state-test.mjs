@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 const os = await import('node:os');
 const fs = await import('node:fs/promises');
 const path = await import('node:path');
+const net = await import('node:net');
 const developerFiles = (await import('../electron/developerFiles.cjs')).default;
 const developerContext = (await import('../electron/developerContext.cjs')).default;
+const { DevServerManager } = await import('../electron/coding-pipeline/environment.cjs');
+const { projectProcessIsolationStatus } = await import('../electron/coding-pipeline/projectProcessIsolation.cjs');
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'dev-project-isolation-'));
 const projectA = path.join(tempRoot, 'project-a');
@@ -62,6 +65,40 @@ developerContext.invalidateContextCache(projectB);
 const projectBContextAfterClear = developerContext.assembleContext({ query: 'beta', results: [{ path: 'src/beta.ts', text: 'beta service timeout', matchType: 'content' }], root: projectB, maxTokens: 1200 });
 assert.equal(projectBContextBeforeClear.cached, false);
 assert.equal(projectBContextAfterClear.cached, false);
+
+const portProbe = net.createServer();
+await new Promise((resolve, reject) => {
+  portProbe.once('error', reject);
+  portProbe.listen(0, '127.0.0.1', resolve);
+});
+const devServerPort = portProbe.address().port;
+await new Promise((resolve, reject) => portProbe.close((error) => error ? reject(error) : resolve()));
+const devProject = path.join(tempRoot, 'dev-project');
+await fs.mkdir(devProject, { recursive: true });
+await fs.mkdir(path.join(devProject, '.ssh'), { recursive: true });
+await fs.writeFile(path.join(devProject, '.env'), 'API_TOKEN=fixture-only\n');
+await fs.writeFile(path.join(devProject, '.ssh', 'id_rsa'), 'fixture-only-private-key');
+await fs.writeFile(
+  path.join(devProject, 'package.json'),
+  JSON.stringify({
+    scripts: {
+      dev: `node -e "require('fs').writeFileSync('dev-server-write.txt','isolated');require('http').createServer((_,response)=>response.end('ok')).listen(${devServerPort})" -- --port ${devServerPort}`,
+    },
+  }),
+);
+const copiedWorkspace = await developerFiles.createIsolatedWorkspaceCopy(devProject);
+await assert.rejects(fs.access(path.join(copiedWorkspace.root, '.env')), { code: 'ENOENT' });
+await assert.rejects(fs.access(path.join(copiedWorkspace.root, '.ssh')), { code: 'ENOENT' });
+await assert.ok(await fs.readFile(path.join(copiedWorkspace.root, 'package.json'), 'utf8'));
+await copiedWorkspace.cleanup();
+const devServerManager = new DevServerManager();
+assert.equal(projectProcessIsolationStatus().available, false);
+await assert.rejects(
+  devServerManager.startDevServer('isolated-dev-server-test', devProject),
+  /no verified operating-system sandbox is configured/i,
+);
+assert.equal(devServerManager.getActiveServer('isolated-dev-server-test'), null);
+await assert.rejects(fs.access(path.join(devProject, 'dev-server-write.txt')), { code: 'ENOENT' });
 
 developerFiles.clearProject('owner-a');
 developerFiles.clearProject('owner-b');

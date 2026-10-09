@@ -3,6 +3,7 @@ import {
   readMeetingHistoryRetention,
   type MeetingHistoryRetentionDays,
 } from '../../history/meetingHistoryRetention.ts';
+import { writeAppState } from '../../config/appStateStorage';
 
 export const MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY = 'meeting-transcript-review-queue';
 export const MAX_PENDING_TRANSCRIPT_REVIEWS = 30;
@@ -72,7 +73,7 @@ export function writePendingTranscriptReviews(
   now = Date.now(),
 ): boolean {
   try {
-    localStorage.setItem(
+    writeAppState(
       MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY,
       JSON.stringify(prunePendingTranscriptReviews(
         reviews,

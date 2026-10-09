@@ -352,7 +352,13 @@ async function runAutonomousCodingTests() {
 
     // Explicit approval
     developerAgent.approve(prop.taskId, ownerObj);
-    const applyRes = await developerAgent.apply(prop.taskId, ownerObj, async () => ({ ok: true, status: 'PASS' }), discLifecycle.projectRoot, authorizeMutation);
+    const applyRes = await developerAgent.apply(prop.taskId, ownerObj, async () => ({
+      ok: true,
+      status: 'PASS',
+      executed: true,
+      exitCode: 0,
+      attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+    }), discLifecycle.projectRoot, authorizeMutation);
     assert.equal(applyRes.state, 'completed');
 
     const modified = await developerFiles.readFile(`src/${lifecycleTarget}`, ownerLifecycle);

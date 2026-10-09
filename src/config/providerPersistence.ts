@@ -15,7 +15,8 @@ export interface PersistedProviderSettings {
 }
 
 export const PERSISTED_PROVIDER_STORAGE_KEY = 'ai-help-agent-provider-settings-v1';
-export const PERSISTED_PROVIDER_SECRET_KEY = 'ai-help-agent-provider-secrets-v1';
+
+import { writeAppState } from './appStateStorage';
 
 function browserStorage(): Storage | null {
   try {
@@ -63,24 +64,9 @@ export function readPersistedProviderSettings(storage = browserStorage()): Persi
   }
 }
 
-export function readPersistedProviderSecrets(storage = browserStorage()): Record<string, string> {
-  try {
-    const raw = storage?.getItem(PERSISTED_PROVIDER_SECRET_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    return Object.fromEntries(
-      Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
-    );
-  } catch {
-    return {};
-  }
-}
-
 export function writePersistedProviderSettings(
   selectedProviderType: string | null,
   providers: PersistedProviderMetadata[],
-  secrets: Record<string, string>,
   storage = browserStorage(),
 ): boolean {
   if (!storage) return false;
@@ -95,10 +81,10 @@ export function writePersistedProviderSettings(
     status: provider.status || 'unknown',
   }));
   try {
-    storage.setItem(PERSISTED_PROVIDER_SECRET_KEY, JSON.stringify(secrets));
-    storage.setItem(
+    writeAppState(
       PERSISTED_PROVIDER_STORAGE_KEY,
       JSON.stringify({ selectedProviderType, providers: safeProviders }),
+      storage,
     );
     return true;
   } catch {

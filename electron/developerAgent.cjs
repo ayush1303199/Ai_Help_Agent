@@ -1,7 +1,11 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { authorizeAppOwnedMutation } = require('./appOwnedPersistence.cjs');
 const { developer: developerSettings } = require('../src/config/runtimeSettings.json');
+if (!Number.isSafeInteger(developerSettings.maxVerificationAttempts) || developerSettings.maxVerificationAttempts < 1) {
+  throw new Error('Developer maxVerificationAttempts must be a positive safe integer.');
+}
 const { taskOrchestrator } = require('./coding-pipeline/orchestrator.cjs');
 const { artifactEngine, ARTIFACT_TYPES } = require('./coding-pipeline/artifacts.cjs');
 const { devServerManager } = require('./coding-pipeline/environment.cjs');
@@ -25,6 +29,7 @@ const {
   realityLevelEvaluator,
   businessRevalidationEngine,
 } = require('./coding-pipeline/correctnessEngine.cjs');
+const featureOwnership = require('../server/src/coding_feature_ownership.json');
 
 const STATES = Object.freeze([
   'idle', 'reading', 'understanding', 'proposal_ready', 'awaiting_approval',
@@ -66,12 +71,18 @@ const transitions = {
 };
 const hash = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const SENSITIVE_PATH_PATTERN = /(?:^|[\\/])(?:\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.config|id_rsa(?:\..*)?|[^\\/]+\.(?:pem|key|p12|pfx|crt|cer|der))$/i;
+const SENSITIVE_DIRECTORY_NAMES = new Set(['.ssh', '.aws', '.azure', '.config', '.gnupg', '.kube', '.docker']);
+const SENSITIVE_FILE_NAME_PATTERN = /^(?:\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|\.git-credentials|\.netrc|netrc|\.npmrc|\.pypirc)$/i;
+const MAX_MUTATION_FILE_BYTES = 2 * 1024 * 1024;
+const APPROVAL_TTL_MS = 5 * 60 * 1000;
+const CONVERSATION_AUTHORIZATION_TTL_MS = 30 * 60 * 1000;
 const registry = new Map();
 const sessions = new Map();
 const conversationTurns = new Map();
 let locked = false;
 let journalPath = null;
 let auditPath = null;
+let durabilityRoot = null;
 let journalQueue = Promise.resolve();
 let auditQueue = Promise.resolve();
 let journalError = null;
@@ -129,12 +140,36 @@ function persistJournal(reason = 'mutation') {
   journalQueue = journalQueue.then(async () => {
     const payload = JSON.stringify({ version: 1, updatedAt: now(), reason, lastEventSequence: eventSequence, tasks: [...registry.values()].map(journalTask) }, null, 2);
     const temp = `${targetPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await authorizeAppOwnedMutation({
+      root: durabilityRoot,
+      target: durabilityRoot,
+      resource: 'app-state',
+      operation: 'write',
+    });
+    await fs.mkdir(durabilityRoot, { recursive: true });
     try {
+      await authorizeAppOwnedMutation({
+        root: durabilityRoot,
+        target: temp,
+        resource: 'app-state',
+        operation: 'write',
+      });
       await fs.writeFile(temp, payload, 'utf8');
+      await authorizeAppOwnedMutation({
+        root: durabilityRoot,
+        target: targetPath,
+        resource: 'app-state',
+        operation: 'replace',
+      });
       await renameWithRetry(temp, targetPath);
     } finally {
-      await fs.rm(temp, { force: true }).catch(() => {});
+      await authorizeAppOwnedMutation({
+        root: durabilityRoot,
+        target: temp,
+        resource: 'app-state',
+        operation: 'remove',
+      });
+      await fs.rm(temp, { force: true });
     }
   }).catch((error) => { journalError = error; });
   return journalQueue;
@@ -151,7 +186,13 @@ function auditEvent(type, task, details = {}) {
     attempt: details.attempt || null, details: { ...details, requestId: undefined, proposalId: undefined, transactionId: undefined, taskId: undefined, sessionId: undefined },
   });
   auditQueue = auditQueue.then(async () => {
-    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await authorizeAppOwnedMutation({
+      root: durabilityRoot,
+      target: targetPath,
+      resource: 'audit',
+      operation: 'append',
+    });
+    await fs.mkdir(durabilityRoot, { recursive: true });
     await fs.appendFile(targetPath, `${JSON.stringify(event)}\n`, 'utf8');
   }).catch((error) => { auditError = error; });
   return auditQueue;
@@ -179,7 +220,26 @@ function assertConversationOwner(turn, owner) {
     throw new Error('Coding conversation turn is not owned by this renderer session.');
   }
 }
-function beginConversationTurn({ root, scope = '.', request, sessionId, ownerWebContentsId }) {
+function protectedFeatureForPath(relativePath) {
+  const normalized = String(relativePath || '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+  const roots = featureOwnership.protectedFeatureRoots || {};
+  const matches = Object.entries(roots)
+    .flatMap(([feature, paths]) => paths
+      .filter((prefix) => {
+        const normalizedPrefix = String(prefix).replace(/\\/g, '/').toLowerCase();
+        return normalized === normalizedPrefix || normalized.startsWith(`${normalizedPrefix}/`);
+      })
+      .map((prefix) => ({ feature, length: String(prefix).length })))
+    .sort((a, b) => b.length - a.length);
+  return matches[0]?.feature || 'shared';
+}
+function featuresForChanges(changes) {
+  return [...new Set((changes || []).flatMap((change) => [
+    change.path,
+    change.sourcePath,
+  ]).filter(Boolean).map(protectedFeatureForPath).filter(Boolean))].sort();
+}
+function beginConversationTurn({ root, scope = '.', request, sessionId, ownerWebContentsId, parentAuthorizationContext = null }) {
   if (!sessionId || ownerWebContentsId === undefined) throw new Error('Developer session ownership is required.');
   if (typeof request !== 'string' || !request.trim()) throw new Error('Coding request must be a non-empty string.');
   if (request.length > developerSettings.maxRequestChars) {
@@ -187,8 +247,53 @@ function beginConversationTurn({ root, scope = '.', request, sessionId, ownerWeb
       `Coding request is too long (${request.length} characters; maximum ${developerSettings.maxRequestChars}). Shorten the current request or start a new Coding conversation.`,
     );
   }
+  const canonicalRoot = path.resolve(root);
+  const requestDigest = hash(request);
+  if (parentAuthorizationContext && (
+    parentAuthorizationContext.sessionId !== sessionId
+    || parentAuthorizationContext.ownerWebContentsId !== ownerWebContentsId
+    || !samePath(parentAuthorizationContext.root, canonicalRoot)
+    || !Array.isArray(parentAuthorizationContext.authorizedFeatures)
+  )) {
+    throw new Error('Inherited Coding authorization does not match this project session.');
+  }
+  const turnId = crypto.randomUUID();
+  const expiresAt = parentAuthorizationContext?.expiresAt
+    || new Date(Date.now() + CONVERSATION_AUTHORIZATION_TTL_MS).toISOString();
+  if (!Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.now()) {
+    throw new Error('Inherited Coding request authorization has expired; start a new request.');
+  }
+  const authorizationContext = Object.freeze(parentAuthorizationContext
+    ? {
+        taskId: parentAuthorizationContext.taskId,
+        turnId,
+        expiresAt,
+        requestHash: parentAuthorizationContext.requestHash,
+        requestSummary: parentAuthorizationContext.requestSummary,
+        root: canonicalRoot,
+        scope,
+        sessionId,
+        ownerWebContentsId,
+        authorizedFeatures: Object.freeze([...parentAuthorizationContext.authorizedFeatures]),
+      }
+    : {
+        taskId: turnId,
+        turnId,
+      expiresAt,
+      requestHash: requestDigest,
+        requestSummary: request.slice(0, 512),
+        root: canonicalRoot,
+        scope,
+        sessionId,
+        ownerWebContentsId,
+        authorizedFeatures: Object.freeze(['coding', 'shared']),
+      });
   const turn = {
-    turnId: crypto.randomUUID(), sessionId, ownerWebContentsId, root, scope,
+    turnId, sessionId, ownerWebContentsId, root, scope,
+    requestHash: requestDigest,
+    requestSummary: request.slice(0, 512),
+    expiresAt,
+    authorizationContext,
     state: 'reading', createdAt: now(), updatedAt: now(),
   };
   conversationTurns.set(turn.turnId, turn);
@@ -265,6 +370,25 @@ function getConversationTurn(turnId, owner) {
   assertConversationOwner(turn, owner);
   return { ...turn };
 }
+function validateConversationToolContext(turnId, owner, root, scope) {
+  const turn = conversationTurns.get(turnId);
+  assertConversationOwner(turn, owner);
+  if (turn.state !== 'understanding'
+    || !samePath(turn.root, root)
+    || turn.scope !== scope
+    || turn.authorizationContext?.turnId !== turnId
+    || turn.authorizationContext?.ownerWebContentsId !== owner.ownerWebContentsId
+    || turn.authorizationContext?.sessionId !== owner.sessionId) {
+    throw new Error('Coding tool call is not bound to the active project conversation.');
+  }
+  return {
+    taskId: turn.authorizationContext.taskId,
+    turnId,
+    requestHash: turn.authorizationContext.requestHash,
+    root: turn.authorizationContext.root,
+    scope: turn.authorizationContext.scope,
+  };
+}
 function advanceConversationTurn(turnId, next, owner, details = {}) {
   const turn = conversationTurns.get(turnId);
   assertConversationOwner(turn, owner);
@@ -315,6 +439,10 @@ function getSession(ownerWebContentsId) {
 function configureDurability({ journalFile, auditFile }) {
   journalPath = journalFile || null;
   auditPath = auditFile || null;
+  if (journalPath && auditPath && path.dirname(path.resolve(journalPath)) !== path.dirname(path.resolve(auditPath))) {
+    throw new Error('Developer journal and audit files must share one application-owned storage directory.');
+  }
+  durabilityRoot = journalPath ? path.dirname(path.resolve(journalPath)) : auditPath ? path.dirname(path.resolve(auditPath)) : null;
   return { journalPath, auditPath };
 }
 async function flushDurability() {
@@ -419,7 +547,13 @@ function publicTask(task) {
     workspace: task.workspace, files: (task.files || []).map(({ operation, path, sourcePath, hash: fileHash }) => ({ operation, path, sourcePath: sourcePath || null, hash: fileHash })),
     targetFiles: (task.files || []).map(({ path }) => path),
     snapshotHashes: (task.before || []).map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
-    approval: task.approval ? { approvedAt: task.approval.approvedAt, actor: task.approval.actor } : null,
+    approval: task.approval ? {
+      approvedAt: task.approval.approvedAt,
+      expiresAt: task.approval.expiresAt,
+      manifestHash: task.approval.manifestHash,
+      actor: task.approval.actor,
+    } : null,
+    manifestHash: task.manifestHash || null,
     progress: task.progress, verification: redact(task.verification) || null, verificationScript: task.verificationScript || null,
     verificationScripts: task.verificationScripts || [],
     evidence: Array.isArray(task.evidence) ? redact(task.evidence).slice(-50) : [],
@@ -431,16 +565,34 @@ function publicTask(task) {
   };
 }
 function inside(root, target) {
-  const rel = path.relative(root, target);
+  const compareRoot = process.platform === 'win32' ? root.toLowerCase() : root;
+  const compareTarget = process.platform === 'win32' ? target.toLowerCase() : target;
+  const rel = path.relative(compareRoot, compareTarget);
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+function samePath(first, second) {
+  const resolvedFirst = path.resolve(first);
+  const resolvedSecond = path.resolve(second);
+  return process.platform === 'win32'
+    ? resolvedFirst.toLowerCase() === resolvedSecond.toLowerCase()
+    : resolvedFirst === resolvedSecond;
+}
+function isReservedWindowsName(segment) {
+  return /^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/i.test(segment);
+}
+function isSensitiveMutationPath(relative) {
+  return SENSITIVE_PATH_PATTERN.test(relative) || relative.replace(/\\/g, '/').split('/').some((part) => {
+    const normalized = part.toLowerCase();
+    return normalized === '.git' || SENSITIVE_DIRECTORY_NAMES.has(normalized) || SENSITIVE_FILE_NAME_PATTERN.test(part);
+  });
 }
 async function safePath(root, relative, { allowMissing = false, allowDirectory = false } = {}) {
   if (typeof relative !== 'string' || !relative || path.isAbsolute(relative)) throw new Error('Proposal paths must be relative.');
   const clean = relative.replace(/\\/g, '/');
-  if (clean.startsWith('/') || /^[A-Za-z]:/.test(clean) || clean.split('/').some((part) => !part || part === '.' || part === '..' || part.includes(':') || /[. ]$/.test(part))) {
+  if (clean.startsWith('/') || /^[A-Za-z]:/.test(clean) || clean.split('/').some((part) => !part || part === '.' || part === '..' || part.includes(':') || /[. ]$/.test(part) || isReservedWindowsName(part))) {
     throw new Error('Proposal path traversal is denied.');
   }
-  if (SENSITIVE_PATH_PATTERN.test(clean) || clean.split('/').some((part) => part.toLowerCase() === '.git')) throw new Error('Sensitive files cannot be changed by the Coding Agent.');
+  if (isSensitiveMutationPath(clean)) throw new Error('Sensitive files cannot be changed by the Coding Agent.');
   const projectRoot = await fs.realpath(root);
   const target = path.resolve(projectRoot, ...clean.split('/'));
   if (!inside(projectRoot, target)) throw new Error('Proposal path is outside the selected project.');
@@ -491,8 +643,14 @@ async function snapshotTarget(root, relative) {
   const safe = await safePath(root, relative, { allowMissing: true, allowDirectory: true });
   if (!safe.exists) return { path: safe.relative, exists: false, type: 'missing', hash: hash('MISSING') };
   if (!safe.isDirectory) {
-    const content = await fs.readFile(safe.target, 'utf8');
-    return { path: safe.relative, exists: true, type: 'file', hash: hash(content), content };
+    const stat = await fs.stat(safe.target);
+    if (stat.size > MAX_MUTATION_FILE_BYTES) throw new Error(`Mutation target exceeds the ${MAX_MUTATION_FILE_BYTES / 1024 / 1024} MiB text-file safety limit.`);
+    const bytes = await fs.readFile(safe.target);
+    const content = bytes.toString('utf8');
+    if (bytes.includes(0) || !Buffer.from(content, 'utf8').equals(bytes)) {
+      throw new Error('Binary or invalid UTF-8 files cannot be changed by a text proposal.');
+    }
+    return { path: safe.relative, exists: true, type: 'file', hash: hash(bytes), content };
   }
   const entries = [];
   let totalBytes = 0;
@@ -502,7 +660,10 @@ async function snapshotTarget(root, relative) {
       if (child.isSymbolicLink()) throw new Error('Directory mutations containing symlinks are denied.');
       const relativeChild = prefix ? `${prefix}/${child.name}` : child.name;
       const childPath = path.join(directory, child.name);
-      if (SENSITIVE_PATH_PATTERN.test(relativeChild) || relativeChild.split('/').some((part) => part.toLowerCase() === '.git')) {
+      if (relativeChild.split('/').some((part) => isReservedWindowsName(part))) {
+        throw new Error(`Directory mutation contains a reserved Windows device name: ${relativeChild}.`);
+      }
+      if (isSensitiveMutationPath(relativeChild)) {
         throw new Error(`Directory mutation includes a protected path: ${relativeChild}.`);
       }
       if (child.isDirectory()) {
@@ -594,7 +755,11 @@ function parsePatch(raw) {
   return normalized;
 }
 function applyFilePatch(original, lines) {
-  const source = original ? original.split(/\r?\n/) : []; const output = []; let cursor = 0;
+  const newline = original.includes('\r\n') ? '\r\n' : '\n';
+  const hadTrailingNewline = original.length === 0 || /(?:\r\n|\n)$/.test(original);
+  const source = original ? original.split(/\r?\n/) : [];
+  if (hadTrailingNewline && source.at(-1) === '') source.pop();
+  const output = []; let cursor = 0;
   for (let i = 0; i < lines.length; i += 1) {
     const header = lines[i].match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
     if (!header) throw new Error('Invalid patch hunk header.');
@@ -614,8 +779,47 @@ function applyFilePatch(original, lines) {
     i -= 1;
   }
   output.push(...source.slice(cursor));
-  const content = output.join('\n');
-  return content.endsWith('\n') || !content ? content : `${content}\n`;
+  const content = output.join(newline);
+  const result = hadTrailingNewline && content ? `${content}${newline}` : content;
+  const resultBytes = Buffer.from(result, 'utf8');
+  if (resultBytes.length > MAX_MUTATION_FILE_BYTES) {
+    throw new Error(`Proposed text file exceeds the ${MAX_MUTATION_FILE_BYTES / 1024 / 1024} MiB safety limit.`);
+  }
+  if (resultBytes.includes(0) || resultBytes.toString('utf8') !== result) {
+    throw new Error('Binary or invalid UTF-8 content cannot be written by a text proposal.');
+  }
+  return result;
+}
+
+function proposalManifestHash(task) {
+  return hash(JSON.stringify({
+    proposalId: task.proposalId,
+    root: task.root,
+    scope: task.scope,
+    authorizationContext: task.authorizationContext,
+    requestedFeatures: task.requestedFeatures,
+    authorizedFeatures: task.authorizedFeatures || null,
+    diffHash: typeof task.raw === 'string' ? hash(task.raw) : task.manifestDiffHash,
+    files: task.files.map((file) => ({
+      operation: file.operation,
+      sourcePath: file.sourcePath || null,
+      path: file.path,
+      content: file.content ?? null,
+      hash: file.hash,
+    })),
+    before: task.before.map(({ path: targetPath, exists, type, hash: snapshotHash }) => ({
+      path: targetPath,
+      exists,
+      type,
+      hash: snapshotHash,
+    })),
+    after: task.after.map(({ path: targetPath, exists, type, hash: snapshotHash }) => ({
+      path: targetPath,
+      exists,
+      type,
+      hash: snapshotHash,
+    })),
+  }));
 }
 
 function assessTaskRisk({ files = [], root = '' }) {
@@ -674,7 +878,7 @@ function selfReviewPatch(rawPatch) {
   }
 
   for (const file of parsedFiles) {
-    if (SENSITIVE_PATH_PATTERN.test(file.path)) {
+    if (isSensitiveMutationPath(file.path)) {
       issues.push(`Forbidden file in patch: ${file.path}`);
     }
     const additions = file.lines.filter((l) => l.startsWith('+')).length;
@@ -794,6 +998,7 @@ async function createProposal({
   workspace = {}, verificationScript = null, verificationScripts = [], scope = '.', conversationTurnId = null,
 }) {
   if (!sessionId || ownerWebContentsId === undefined) throw new Error('Developer session ownership is required.');
+  if (!conversationTurnId) throw new Error('A request-bound Coding conversation turn is required to register a proposal.');
   const root = await fs.realpath(inputRoot);
   const scopePath = scope && scope !== '.' ? scope : '';
   if (path.isAbsolute(scopePath) || scopePath.replace(/\\/g, '/').split('/').some((segment) => segment === '..')) {
@@ -801,12 +1006,16 @@ async function createProposal({
   }
   const scopeRoot = path.resolve(root, ...scopePath.replace(/\\/g, '/').split('/').filter(Boolean));
   if (!inside(root, scopeRoot)) throw new Error('Proposal scope must remain inside the selected project.');
-  if (conversationTurnId) {
-    const turn = conversationTurns.get(conversationTurnId);
-    assertConversationOwner(turn, { sessionId, ownerWebContentsId });
-    if (turn.state !== 'understanding' || await fs.realpath(turn.root) !== root || turn.scope !== scope) {
-      throw new Error('Coding conversation is not ready to register a proposal for this project scope.');
-    }
+  const turn = conversationTurns.get(conversationTurnId);
+  assertConversationOwner(turn, { sessionId, ownerWebContentsId });
+  if (turn.state !== 'understanding' || !samePath(await fs.realpath(turn.root), root) || turn.scope !== scope
+    || !Number.isFinite(Date.parse(turn.authorizationContext?.expiresAt || ''))
+    || Date.parse(turn.authorizationContext.expiresAt) <= Date.now()
+    || turn.authorizationContext?.turnId !== turn.turnId
+    || turn.authorizationContext?.sessionId !== sessionId
+    || turn.authorizationContext?.ownerWebContentsId !== ownerWebContentsId
+    || !/^[a-f0-9]{64}$/.test(turn.authorizationContext?.requestHash || '')) {
+    throw new Error('Coding conversation is not ready to register a request-bound proposal for this project scope.');
   }
   if (verificationScript !== null) commandPolicy(verificationScript);
   const requestedScripts = [
@@ -814,12 +1023,19 @@ async function createProposal({
     ...(verificationScript ? [verificationScript] : []),
   ];
   const safeVerificationScripts = [...new Set(requestedScripts.map((script) => commandPolicy(script).script))];
+  const authorizationContext = Object.freeze({
+    ...turn.authorizationContext,
+    root,
+    scope: scope || '.',
+    authorizedFeatures: Object.freeze([...turn.authorizationContext.authorizedFeatures]),
+  });
   const files = parsePatch(raw); const unique = new Set(); const before = []; const changes = [];
   for (const file of files) {
     const mutationPaths = file.sourcePath ? [file.sourcePath, file.path] : [file.path];
     for (const mutationPath of mutationPaths) {
-      if (unique.has(mutationPath)) throw new Error('Proposal contains duplicate or overlapping files.');
-      unique.add(mutationPath);
+      const uniquePath = process.platform === 'win32' ? mutationPath.toLowerCase() : mutationPath;
+      if (unique.has(uniquePath)) throw new Error('Proposal contains duplicate or overlapping files.');
+      unique.add(uniquePath);
       const scopedTarget = path.resolve(root, ...mutationPath.replace(/\\/g, '/').split('/'));
       if (!inside(scopeRoot, scopedTarget)) throw new Error(`Proposal target is outside the approved scope: ${mutationPath}.`);
     }
@@ -828,7 +1044,12 @@ async function createProposal({
     }
     const sourcePath = file.sourcePath || file.path;
     const sourceState = await snapshotTarget(root, sourcePath);
-    const expected = expectedSnapshots.find((item) => item.path.replace(/\\/g, '/') === sourceState.path);
+    const expected = expectedSnapshots.find((item) => {
+      const expectedPath = item.path.replace(/\\/g, '/');
+      return process.platform === 'win32'
+        ? expectedPath.toLowerCase() === sourceState.path.toLowerCase()
+        : expectedPath === sourceState.path;
+    });
     if (expected && expected.hash !== sourceState.hash) throw new Error(`Snapshot is stale for ${sourceState.path}.`);
     if (file.operation === 'create' && sourceState.exists) throw new Error(`Create target already exists: ${sourcePath}.`);
     if (file.operation === 'create' && !(await safePath(root, file.path, { allowMissing: true })).parentExists) {
@@ -869,6 +1090,7 @@ async function createProposal({
       changes.push({ operation: file.operation, path: file.path, sourcePath: file.sourcePath, hash: hash(file.operation === 'delete' ? 'MISSING' : 'MISSING') });
     }
   }
+  const requestedFeatures = featuresForChanges(changes);
   const after = [];
   for (const change of changes) {
     if (change.operation === 'rename') after.push({ path: change.sourcePath, exists: false, type: 'missing', hash: hash('MISSING') });
@@ -879,6 +1101,9 @@ async function createProposal({
   const task = {
     taskId: crypto.randomUUID(), sessionId, ownerWebContentsId, root,
     conversationTurnId,
+    authorizationContext,
+    requestedFeatures,
+    authorizedFeatures: null,
     scope: scope || '.',
     proposalId: crypto.randomUUID(),
     workspace: { root, name: workspace.name || path.basename(root), branch: workspace.branch || null },
@@ -919,6 +1144,8 @@ async function createProposal({
     nextAction: 'AWAIT_USER_APPROVAL',
     createdAt: now(), updatedAt: now(),
   };
+  task.manifestDiffHash = hash(raw);
+  task.manifestHash = proposalManifestHash(task);
   if (conversationTurnId) {
     const turn = conversationTurns.get(conversationTurnId);
     turn.state = 'proposal_ready';
@@ -952,10 +1179,97 @@ async function createProposal({
   transition(task, 'awaiting_approval'); return publicTask(task);
 }
 function getTask(taskId, owner) { const task = registry.get(taskId); if (!task) throw new Error('Unknown Developer task.'); assertOwner(task, owner); return task; }
-function approve(taskId, owner) {
+function assertTaskAuthorization(task) {
+  const context = task.authorizationContext;
+  const turn = conversationTurns.get(task.conversationTurnId);
+  if (!context || !turn
+    || context.taskId !== turn.authorizationContext?.taskId
+    || context.turnId !== task.conversationTurnId
+    || context.requestHash !== turn.authorizationContext?.requestHash
+    || context.expiresAt !== turn.authorizationContext?.expiresAt
+    || !Number.isFinite(Date.parse(context.expiresAt || ''))
+    || Date.parse(context.expiresAt) <= Date.now()
+    || turn.state === 'cancelled'
+    || context.sessionId !== task.sessionId
+    || context.ownerWebContentsId !== task.ownerWebContentsId
+    || !samePath(context.root || '', task.root)
+    || context.scope !== task.scope
+    || !Array.isArray(context.authorizedFeatures)
+    || !/^[a-f0-9]{64}$/.test(context.requestHash || '')) {
+    throw new Error('Request-bound Coding authorization is invalid, stale, or mismatched.');
+  }
+  return context;
+}
+function getTaskMutationContext(taskId, owner) {
+  const task = getTask(taskId, owner);
+  assertTaskAuthorization(task);
+  return {
+    root: task.root,
+    scope: task.scope,
+    affectedPaths: [...new Set((task.before || []).map((item) => item.path))],
+    requestedFeatures: [...(task.requestedFeatures || [])],
+    authorizedFeatures: [...(task.approval?.authorizedFeatures || [])],
+    requestBinding: {
+      taskId: task.authorizationContext.taskId,
+      turnId: task.authorizationContext.turnId,
+      requestHash: task.authorizationContext.requestHash,
+      root: task.authorizationContext.root,
+      scope: task.authorizationContext.scope,
+      authorizedFeatures: [...(task.approval?.authorizedFeatures || [])],
+    },
+  };
+}
+function getProposalAuthorizationContext(taskId, owner) {
+  const task = getTask(taskId, owner);
+  assertTaskAuthorization(task);
+  return {
+    proposalId: task.proposalId,
+    requestSummary: task.authorizationContext.requestSummary,
+    requestedFeatures: [...(task.requestedFeatures || [])],
+    authorizedFeatures: [...task.authorizationContext.authorizedFeatures],
+    changedPaths: [...new Set((task.files || []).flatMap((file) => [file.path, file.sourcePath]).filter(Boolean))],
+  };
+}
+function approve(taskId, owner, featureAuthorization = null) {
   const task = getTask(taskId, owner);
   if (task.state !== 'awaiting_approval') throw new Error('Only a proposal awaiting approval can be approved.');
-  task.approval = { approvedAt: now(), actor: 'renderer-session' };
+  assertTaskAuthorization(task);
+  if (task.manifestHash !== proposalManifestHash(task)) throw new Error('Proposal manifest changed before approval.');
+  const requiredFeatures = featuresForChanges(task.files);
+  const baselineFeatures = task.authorizationContext?.authorizedFeatures;
+  if (!Array.isArray(baselineFeatures)
+    || task.authorizationContext?.taskId !== (conversationTurns.get(task.conversationTurnId)?.authorizationContext?.taskId)
+    || task.authorizationContext?.turnId !== task.conversationTurnId
+    || task.authorizationContext?.sessionId !== task.sessionId
+    || task.authorizationContext?.ownerWebContentsId !== task.ownerWebContentsId
+    || !samePath(task.authorizationContext?.root || '', task.root)
+    || task.authorizationContext?.scope !== task.scope
+    || !/^[a-f0-9]{64}$/.test(task.authorizationContext?.requestHash || '')) {
+    throw new Error('Request-bound authorization is missing or no longer matches this proposal.');
+  }
+  const additionalFeatures = requiredFeatures.filter((feature) => !baselineFeatures.includes(feature));
+  let authorizedFeatures = [...baselineFeatures];
+  if (additionalFeatures.length) {
+    const suppliedFeatures = featureAuthorization?.authorizedFeatures;
+    if (featureAuthorization?.source !== 'main-process-feature-confirmation'
+      || featureAuthorization?.proposalId !== task.proposalId
+      || !Array.isArray(suppliedFeatures)
+      || additionalFeatures.some((feature) => !suppliedFeatures.includes(feature))) {
+      throw new Error(`This proposal crosses the authorized feature scope (${additionalFeatures.join(', ')}); explicit main-process confirmation is required.`);
+    }
+    authorizedFeatures = [...new Set([...authorizedFeatures, ...suppliedFeatures])].sort();
+  }
+  task.authorizedFeatures = authorizedFeatures;
+  task.manifestHash = proposalManifestHash(task);
+  task.approval = {
+    approvedAt: now(),
+    expiresAt: new Date(Date.now() + APPROVAL_TTL_MS).toISOString(),
+    proposalId: task.proposalId,
+    manifestHash: task.manifestHash,
+    consumedAt: null,
+    actor: 'renderer-session',
+    authorizedFeatures: [...authorizedFeatures],
+  };
   task.runtime = task.runtime || {};
   task.runtime.phase = 'AWAITING_APPROVAL';
   task.runtime.taskState = 'AWAITING_APPROVAL';
@@ -977,15 +1291,40 @@ function reject(taskId, owner) {
   recordMutation(task, 'proposal_rejected', { proposalId: task.proposalId || taskId });
   return publicTask(task);
 }
-async function authorizeMutation(task, authorize, operation, paths) {
+async function authorizeMutation(
+  task,
+  authorize,
+  operation,
+  paths,
+  { rollback = false, deleteConfirmationRequired = operation === 'delete' || operation === 'delete_directory' } = {},
+) {
   if (typeof authorize !== 'function') throw new Error('The authoritative file mutation policy is unavailable.');
+  const requestContext = assertTaskAuthorization(task);
+  if (!task.approval || task.approval.manifestHash !== proposalManifestHash(task)) {
+    throw new Error('The approved proposal no longer matches its request-bound authorization manifest.');
+  }
   const targets = [...new Set(paths)];
+  const requiredFeatures = featuresForChanges(targets.map((targetPath) => ({ path: targetPath })));
+  const authorizedFeatures = task.approval.authorizedFeatures;
+  if (!Array.isArray(authorizedFeatures)
+    || requiredFeatures.some((feature) => !authorizedFeatures.includes(feature))) {
+    throw new Error('Mutation target exceeds the explicitly authorized feature scope.');
+  }
   const result = await authorize({
     taskId: task.taskId,
     operation,
     paths: targets,
     proposalApproved: Boolean(task.approval),
-    deleteConfirmationRequired: operation === 'delete' || operation === 'delete_directory',
+    deleteConfirmationRequired,
+    rollback,
+    requestBinding: {
+      taskId: requestContext.taskId,
+      turnId: requestContext.turnId,
+      requestHash: requestContext.requestHash,
+      root: requestContext.root,
+      scope: requestContext.scope,
+      authorizedFeatures: [...authorizedFeatures],
+    },
   });
   if (!result || result.allowed !== true) {
     task.evidence = [...(task.evidence || []), {
@@ -1008,25 +1347,50 @@ async function authorizeMutation(task, authorize, operation, paths) {
   }].slice(-50);
   recordMutation(task, 'policy_gate_allowed', { operation, paths: targets });
 }
-async function writeContentAtomically(root, relative, content, taskId) {
-  const safe = await safePath(root, relative, { allowMissing: true });
+async function writeContentAtomically(
+  task,
+  relative,
+  content,
+  authorize,
+  operation,
+  expectedSnapshot = null,
+  { rollback = false } = {},
+) {
+  if (!task || typeof authorize !== 'function') {
+    throw new Error('The authoritative file mutation policy is unavailable.');
+  }
+  const safe = await safePath(task.root, relative, { allowMissing: true });
   if (!safe.parentExists) throw new Error('Mutation target parent no longer exists.');
-  const temp = `${safe.target}.developer-${taskId}.tmp`;
+  const initialSnapshot = await snapshotTarget(task.root, relative);
+  if (expectedSnapshot && initialSnapshot.hash !== expectedSnapshot.hash) {
+    throw new Error('File changed while mutation approval was pending.');
+  }
+  await authorizeMutation(task, authorize, operation, [relative], { rollback });
+  if ((await snapshotTarget(task.root, relative)).hash !== initialSnapshot.hash) {
+    throw new Error('File changed while mutation approval was pending.');
+  }
+  const temp = `${safe.target}.developer-${task.taskId}.tmp`;
   let handle;
+  let createdTemp = false;
   try {
     handle = await fs.open(temp, 'wx', 0o600);
+    createdTemp = true;
     await handle.writeFile(content, typeof content === 'string' ? 'utf8' : undefined);
     await handle.close();
     handle = null;
+    if ((await snapshotTarget(task.root, relative)).hash !== initialSnapshot.hash) {
+      throw new Error('File changed during mutation; stale diff rejected.');
+    }
     await renameWithRetry(temp, safe.target);
   } finally {
     if (handle) await handle.close().catch(() => {});
-    await fs.rm(temp, { force: true }).catch(() => {});
+    if (createdTemp) await fs.rm(temp, { force: true });
   }
 }
 async function applyChanges(task, authorize) {
   for (const change of task.files) {
     const operation = change.operation || 'modify';
+    if (operation === 'delete' || operation === 'delete_directory') continue;
     const paths = change.sourcePath ? [change.sourcePath, change.path] : [change.path];
     await authorizeMutation(task, authorize, operation, paths);
   }
@@ -1039,59 +1403,148 @@ async function applyChanges(task, authorize) {
     const sourcePath = change.sourcePath || change.path;
     if (change.operation === 'delete' || change.operation === 'delete_directory') {
       const safe = await safePath(task.root, change.path, { allowDirectory: change.operation === 'delete_directory' });
-      await fs.rm(safe.target, { recursive: change.operation === 'delete_directory', force: false });
+      const expectedSnapshot = task.before.find((item) => samePath(item.path, change.path));
+      if (!expectedSnapshot) throw new Error(`Mutation snapshot is missing for ${change.path}.`);
+      await authorizeMutation(task, authorize, change.operation, [change.path]);
+      if ((await snapshotTarget(task.root, change.path)).hash !== expectedSnapshot.hash) {
+        throw new Error('File changed while deletion approval was pending.');
+      }
+      const confirmedTarget = await safePath(task.root, change.path, {
+        allowDirectory: change.operation === 'delete_directory',
+      });
+      await fs.rm(confirmedTarget.target, { recursive: change.operation === 'delete_directory', force: false });
     } else if (change.operation === 'rename') {
-      await writeContentAtomically(task.root, change.path, change.content, task.taskId);
+      const targetSnapshot = task.before.find((item) => samePath(item.path, change.path));
+      if (!targetSnapshot) throw new Error(`Mutation snapshot is missing for ${change.path}.`);
+      await writeContentAtomically(task, change.path, change.content, authorize, 'rename', targetSnapshot);
       const source = await safePath(task.root, sourcePath);
-      await fs.rm(source.target);
+      const sourceSnapshot = task.before.find((item) => samePath(item.path, sourcePath));
+      if (!sourceSnapshot) throw new Error(`Rename source snapshot is missing for ${sourcePath}.`);
+      if ((await snapshotTarget(task.root, sourcePath)).hash !== sourceSnapshot.hash) {
+        throw new Error('File changed during mutation; stale diff rejected.');
+      }
+      await authorizeMutation(task, authorize, 'delete', [sourcePath], {
+        deleteConfirmationRequired: true,
+      });
+      if ((await snapshotTarget(task.root, sourcePath)).hash !== sourceSnapshot.hash) {
+        throw new Error('Rename source changed while deletion approval was pending.');
+      }
+      const confirmedSource = await safePath(task.root, sourcePath);
+      await fs.rm(confirmedSource.target);
     } else {
-      await writeContentAtomically(task.root, change.path, change.content, task.taskId);
+      const expectedSnapshot = task.before.find((item) => samePath(item.path, change.path));
+      if (!expectedSnapshot) throw new Error(`Mutation snapshot is missing for ${change.path}.`);
+      await writeContentAtomically(task, change.path, change.content, authorize, change.operation || 'modify', expectedSnapshot);
     }
   }
   const resulting = await Promise.all(task.after.map((item) => snapshotTarget(task.root, item.path)));
   if (resulting.some((item, index) => item.hash !== task.after[index].hash)) throw new Error('Post-apply verification failed.');
 }
-async function restoreSnapshot(task, snapshotState) {
+async function restoreSnapshot(task, snapshotState, authorize, { rollback = false, expectedCurrentSnapshot } = {}) {
   const safe = await safePath(task.root, snapshotState.path, { allowMissing: true, allowDirectory: true });
+  const current = await snapshotTarget(task.root, snapshotState.path);
+  if (expectedCurrentSnapshot && current.hash !== expectedCurrentSnapshot.hash) {
+    throw new Error('Rollback target changed while recovery approval was pending.');
+  }
   if (!snapshotState.exists) {
-    if (safe.exists) await fs.rm(safe.target, { recursive: true, force: false });
+    if (safe.exists) {
+      const operation = current.type === 'directory' ? 'delete_directory' : 'delete';
+      await authorizeMutation(task, authorize, operation, [snapshotState.path], {
+        rollback,
+        deleteConfirmationRequired: true,
+      });
+      if ((await snapshotTarget(task.root, snapshotState.path)).hash !== current.hash) {
+        throw new Error('Rollback deletion target changed after confirmation.');
+      }
+      const confirmedTarget = await safePath(task.root, snapshotState.path, { allowDirectory: current.type === 'directory' });
+      await fs.rm(confirmedTarget.target, { recursive: current.type === 'directory', force: false });
+    }
     return;
   }
   if (snapshotState.type === 'directory') {
-    if (safe.exists) await fs.rm(safe.target, { recursive: true, force: false });
-    await fs.mkdir(safe.target, { recursive: true });
+    if (safe.exists) {
+      await authorizeMutation(task, authorize, 'delete_directory', [snapshotState.path], {
+        rollback,
+        deleteConfirmationRequired: true,
+      });
+      if ((await snapshotTarget(task.root, snapshotState.path)).hash !== current.hash) {
+        throw new Error('Rollback directory changed after deletion confirmation.');
+      }
+      const confirmedTarget = await safePath(task.root, snapshotState.path, { allowDirectory: true });
+      await fs.rm(confirmedTarget.target, { recursive: true, force: false });
+    }
+    await authorizeMutation(task, authorize, 'undo', [snapshotState.path], { rollback });
+    const creationTarget = await safePath(task.root, snapshotState.path, { allowMissing: true, allowDirectory: true });
+    if (creationTarget.exists) throw new Error('Rollback directory target reappeared after authorization.');
+    await fs.mkdir(creationTarget.target, { recursive: true });
     for (const entry of snapshotState.entries) {
       const entryPath = `${snapshotState.path}/${entry.path}`;
       const child = await safePath(task.root, entryPath, { allowMissing: true });
-      if (entry.type === 'directory') await fs.mkdir(child.target, { recursive: true });
-      else await writeContentAtomically(task.root, entryPath, Buffer.from(entry.contentBase64, 'base64'), task.taskId);
+      if (entry.type === 'directory') {
+        await authorizeMutation(task, authorize, 'undo', [entryPath], { rollback });
+        await fs.mkdir(child.target, { recursive: true });
+      } else {
+        await writeContentAtomically(
+          task,
+          entryPath,
+          Buffer.from(entry.contentBase64, 'base64'),
+          authorize,
+          'undo',
+          null,
+          { rollback },
+        );
+      }
     }
   } else {
-    await writeContentAtomically(task.root, snapshotState.path, snapshotState.content, task.taskId);
+    await writeContentAtomically(
+      task,
+      snapshotState.path,
+      snapshotState.content,
+      authorize,
+      'undo',
+      current,
+      { rollback },
+    );
   }
 }
-async function restoreBeforeSnapshot(task, authorize) {
-  const toRestore = [];
+async function restoreBeforeSnapshot(task, authorize, { rollback = false } = {}) {
   for (const item of task.before) {
     const current = await snapshotTarget(task.root, item.path);
     if (current.hash === item.hash) continue;
-    const operation = item.exists ? 'undo' : (current.type === 'directory' ? 'delete_directory' : 'delete');
-    await authorizeMutation(task, authorize, operation, [item.path]);
-    toRestore.push({ item, expectedCurrentHash: current.hash });
+    await restoreSnapshot(task, item, authorize, {
+      rollback,
+      expectedCurrentSnapshot: current,
+    });
   }
-  const revalidated = await Promise.all(toRestore.map(({ item }) => snapshotTarget(task.root, item.path)));
-  if (revalidated.some((current, index) => current.hash !== toRestore[index].expectedCurrentHash)) {
-    throw new Error('Rollback target changed while recovery approval was pending.');
-  }
-  for (const { item } of toRestore) await restoreSnapshot(task, item);
   const restored = await Promise.all(task.before.map((item) => snapshotTarget(task.root, item.path)));
   if (restored.some((item, index) => item.hash !== task.before[index].hash)) throw new Error('Rollback verification failed.');
 }
-async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize = null) {
+async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize = null, verificationAttempt = 1) {
   const task = getTask(taskId, owner);
+  if (task.approval?.consumedAt) throw new Error('Proposal approval has already been used.');
   if (task.state !== 'approved') throw new Error('Proposal must be approved exactly once.');
-  if (expectedRoot && (await fs.realpath(expectedRoot)) !== task.root) throw new Error('The selected project changed after this proposal was created.');
+  if (!task.approval) throw new Error('Proposal approval is missing.');
+  if (expectedRoot && !samePath(await fs.realpath(expectedRoot), task.root)) throw new Error('The selected project changed after this proposal was created.');
   const release = await acquireLock();
+  if (task.approval?.consumedAt) {
+    release();
+    throw new Error('Proposal approval has already been used.');
+  }
+  task.approval.consumedAt = now();
+  recordMutation(task, 'proposal_approval_consumed', { proposalId: task.proposalId });
+  if (task.approval.proposalId !== task.proposalId) {
+    release();
+    throw new Error('Proposal approval does not match this proposal.');
+  }
+  const approvalExpiry = Date.parse(task.approval.expiresAt);
+  if (!Number.isFinite(approvalExpiry) || approvalExpiry <= Date.now()) {
+    release();
+    throw new Error('Proposal approval has expired.');
+  }
+  if (task.approval.manifestHash !== proposalManifestHash(task)) {
+    release();
+    throw new Error('Proposal manifest changed after approval.');
+  }
   task.transactionId = crypto.randomUUID();
   let patchApplied = false;
   let writeStarted = false;
@@ -1119,9 +1572,18 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
     task.runtime.history = [...(task.runtime.history || []), { phase: 'VERIFYING', at: now(), message: 'Running approved verification.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'verify', 'Running approved verification.');
-    if (verifyRunner) {
-      const result = await verifyRunner();
-      task.verification = result;
+    {
+      const result = verifyRunner
+        ? await verifyRunner()
+        : {
+            ok: false,
+            status: 'UNVERIFIED',
+            executed: false,
+            exitCode: null,
+            reason: 'No verification runner was provided.',
+            attempts: [],
+          };
+      task.verification = redact(result);
       const verificationAttempts = Array.isArray(result?.attempts) ? result.attempts : [];
       task.evidence = [...(task.evidence || []), {
         kind: 'VERIFICATION',
@@ -1163,7 +1625,7 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
         verificationRuns: Number(task.runtime.metrics?.verificationRuns || 0) + verificationAttempts.length,
       };
       recordMutation(task, 'verification_recorded', {
-        transactionId: task.transactionId, attempt: 1,
+        transactionId: task.transactionId, attempt: verificationAttempt,
         result: result?.status || result?.failure || (result?.ok ? 'pass' : 'failure'),
         checks: verificationAttempts.map((attempt) => ({
           check: attempt.check || attempt.script || null,
@@ -1174,7 +1636,22 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
       if (task.cancelRequested || result?.cancelled) {
         throw Object.assign(new Error('Developer task was cancelled during verification.'), { cancelled: true });
       }
-      if (!result?.ok) throw new Error(`Verification failed (${result.failure || 'verification'}).`);
+      if (!(result?.ok === true
+        && result.status === 'PASS'
+        && result.executed === true
+        && result.exitCode === 0
+        && verificationAttempts.length > 0
+        && verificationAttempts.every((attempt) => (
+          attempt.executed === true && Number.isInteger(attempt.exitCode) && attempt.exitCode === 0
+        )))) {
+        const failureState = result?.status === 'CODE_FAILURE' ? 'CODE_FAILURE' : (result?.status || 'UNVERIFIED');
+        task.verification = { ...task.verification, status: failureState, ok: false };
+        throw new Error(
+          failureState === 'UNVERIFIED'
+            ? 'Verification did not produce an executed passing result with exit code 0.'
+            : `Verification failed (${result.failure || 'verification'}).`,
+        );
+      }
     }
     transition(task, 'completed');
     task.runtime = task.runtime || {};
@@ -1211,7 +1688,7 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
     if (patchApplied || writeStarted || task.state === 'verifying') {
       task.state = 'recovering'; task.updatedAt = now(); progress(task, 'recover', 'Apply failed; verifying rollback state.');
       try {
-        await restoreBeforeSnapshot(task, authorize);
+        await restoreBeforeSnapshot(task, authorize, { rollback: true });
       } catch (rollbackError) {
         task.error = `Rollback verification failed: ${rollbackError.message}`;
       }
@@ -1318,7 +1795,13 @@ ${result?.stdout || ''}`;
 }
 function normalizeObservation(result, check = result?.script || '') {
   const normalized = normalizeCommandResult(result);
-  return { ...normalized, check, failure: normalized.failure, extracted: extractFailure(normalized) };
+  return {
+    ...normalized,
+    executed: result?.executed === true,
+    check,
+    failure: normalized.failure,
+    extracted: extractFailure(normalized),
+  };
 }
 function diagnoseObservation(observation, metadata = {}) {
   const environment = new Set(['ENVIRONMENT_FAILURE', 'DEPENDENCY_FAILURE', 'COMMAND_NOT_AVAILABLE', 'TIMEOUT']);
@@ -1337,7 +1820,16 @@ async function runVerificationChecks({ checks, runCheck, isCancelled = () => fal
   if (typeof runCheck !== 'function') throw new Error('Verification runner is required.');
   const selectedChecks = [...new Set(checks || [])].map((check) => commandPolicy(check).script);
   if (!selectedChecks.length) {
-    return { ok: true, status: 'NOT_AVAILABLE', skipped: true, checks: [], attempts: [] };
+    return {
+      ok: false,
+      status: 'UNVERIFIED',
+      executed: false,
+      exitCode: null,
+      skipped: true,
+      checks: [],
+      attempts: [],
+      reason: 'No allow-listed verification script is available.',
+    };
   }
   const attempts = [];
   for (const check of selectedChecks) {
@@ -1345,10 +1837,14 @@ async function runVerificationChecks({ checks, runCheck, isCancelled = () => fal
     onProgress({ phase: 'verify', check });
     const result = normalizeObservation(await runCheck(check), check);
     attempts.push(result);
-    if (!result.ok) {
+    if (!result.ok || !result.executed || !Number.isInteger(result.exitCode) || result.exitCode !== 0) {
       return {
         ok: false,
-        status: result.classification || 'CODE_FAILURE',
+        status: result.executed && Number.isInteger(result.exitCode)
+          ? (result.classification || 'CODE_FAILURE')
+          : 'UNVERIFIED',
+        executed: result.executed,
+        exitCode: result.exitCode,
         failure: result.failure,
         classification: result.classification,
         checks: selectedChecks,
@@ -1357,7 +1853,14 @@ async function runVerificationChecks({ checks, runCheck, isCancelled = () => fal
       };
     }
   }
-  return { ok: true, status: 'PASS', checks: selectedChecks, attempts };
+  return {
+    ok: true,
+    status: 'PASS',
+    executed: attempts.length > 0 && attempts.every((attempt) => attempt.executed === true),
+    exitCode: attempts.at(-1)?.exitCode ?? null,
+    checks: selectedChecks,
+    attempts,
+  };
 }
 function updateLoopTask(taskId, owner, state, phase, message, outcome = null) {
   if (!taskId) return null;
@@ -1505,9 +2008,13 @@ async function verifyTaskBrowser(taskId, options = {}, owner) {
 }
 
 async function manageDevServer(taskId, action, projectRoot, owner) {
-  getTask(taskId, owner);
+  const task = getTask(taskId, owner);
+  const approvedRoot = await fs.realpath(task.root);
+  if (projectRoot && (await fs.realpath(projectRoot)) !== approvedRoot) {
+    throw new Error('Dev server project root does not match the approved task project.');
+  }
   if (action === 'start') {
-    return devServerManager.startDevServer(taskId, projectRoot);
+    return devServerManager.startDevServer(taskId, approvedRoot);
   }
   if (action === 'stop') {
     return devServerManager.stopDevServer(taskId);
@@ -1554,17 +2061,29 @@ function getComplexityLevels() {
   return COMPLEXITY_LEVELS;
 }
 
-async function saveTaskCheckpointToDisk(taskId, filePath, milestone = 'generic', owner) {
-  getTask(taskId, owner);
-  return taskOrchestrator.saveCheckpointToDisk(taskId, filePath, milestone);
+function configureCheckpointStorageRoot(root) {
+  taskOrchestrator.setCheckpointStorageRoot(root);
 }
 
-async function restoreTaskFromDisk(filePath) {
-  const restored = await taskOrchestrator.restoreTaskFromDisk(filePath);
+async function saveTaskCheckpointToDisk(taskId, milestone = 'generic', owner) {
+  getTask(taskId, owner);
+  return taskOrchestrator.saveCheckpointToDisk(taskId, milestone);
+}
+
+async function restoreTaskFromDisk(taskId, owner, expectedRoot) {
+  if (!owner?.sessionId || !Number.isInteger(owner.ownerWebContentsId)) {
+    throw new Error('Developer session ownership is required to restore a checkpoint.');
+  }
+  if (typeof expectedRoot !== 'string' || !expectedRoot) {
+    throw new Error('The selected project root is required to restore a checkpoint.');
+  }
+  const restored = await taskOrchestrator.restoreTaskFromDisk(taskId, owner.sessionId, expectedRoot);
+  restored.ownerWebContentsId = owner.ownerWebContentsId;
   if (restored && restored.taskId && !registry.has(restored.taskId)) {
     registry.set(restored.taskId, {
       taskId: restored.taskId,
-      sessionId: restored.sessionId || 'restored-session',
+      sessionId: owner.sessionId,
+      ownerWebContentsId: owner.ownerWebContentsId,
       state: restored.state || 'idle',
       targets: restored.targets || [],
       files: (restored.targets || []).map((t) => ({ path: t, hash: '' })),
@@ -1575,7 +2094,6 @@ async function restoreTaskFromDisk(filePath) {
       approvalState: restored.approvalState || 'UNAPPROVED',
       plan: restored.plan || [],
       workspace: { root: restored.workspace || '.' },
-      ownerWebContentsId: null,
       createdAt: restored.createdAt || now(),
       updatedAt: restored.updatedAt || now(),
     });
@@ -1593,8 +2111,22 @@ function refuteTaskHypothesis(taskId, text, evidence = {}, owner) {
   return taskOrchestrator.refuteHypothesis(taskId, text, evidence);
 }
 
-async function rollbackMultiRepo(taskId) {
-  return multiRepoCoordinator.rollbackMultiRepoChanges(taskId);
+function getMultiRepoRollbackPlan(taskId, owner) {
+  getTask(taskId, owner);
+  return multiRepoCoordinator.getRollbackPlan(taskId);
+}
+
+async function rollbackMultiRepo(taskId, owner, authorize) {
+  const task = getTask(taskId, owner);
+  if (!task.root) throw new Error('Multi-repository rollback has no approved project root.');
+  if (typeof authorize !== 'function') {
+    throw new Error('Multi-repository rollback requires the authoritative mutation policy.');
+  }
+  const result = await multiRepoCoordinator.rollbackMultiRepoChanges(taskId, authorize);
+  recordMutation(task, 'multi_repo_rollback_completed', {
+    rolledBackRepos: result.rolledBackRepos,
+  });
+  return result;
 }
 
 function getTaskHeartbeat(taskId, owner) {
@@ -1707,8 +2239,8 @@ function resetForTest() {
 }
 
 module.exports = {
-  STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, beginConversationTurn, inspectDatabaseRequest, advanceConversationTurn, recordConversationFindings, getConversationTurn, createProposal, approve, reject, apply, undo,
-  getTask: (id, owner) => publicTask(getTask(id, owner)), getTaskForTest, normalizeCommandResult,
+  STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, beginConversationTurn, inspectDatabaseRequest, advanceConversationTurn, recordConversationFindings, getConversationTurn, validateConversationToolContext, createProposal, approve, reject, apply, undo,
+  getTask: (id, owner) => publicTask(getTask(id, owner)), getTaskForTest, getTaskMutationContext, getProposalAuthorizationContext, normalizeCommandResult,
   classifyFailure, classifyFailureCategory, commandPolicy, selectVerificationChecks, extractFailure, normalizeObservation,
   diagnoseObservation, executeVerificationLoop, runVerificationChecks, runEngineeringLoop, isCancellationRequested,
   configureDurability, loadJournal,
@@ -1717,7 +2249,9 @@ module.exports = {
   saveTaskCheckpoint, restoreTaskCheckpoint, pauseTask, resumeTask, cancelTask,
   steerTask, forkTask, createTaskArtifact, getTaskArtifacts, verifyTaskBrowser, manageDevServer, inspectPatchSecurity,
   listSkills, getSkill, assignTaskSkill, setTaskOperatingMode, listMcpTools, invokeTaskMcpTool, getOperatingModes, getComplexityLevels,
-  saveTaskCheckpointToDisk, restoreTaskFromDisk, validateTaskContextFreshness, refuteTaskHypothesis, rollbackMultiRepo,
+  configureCheckpointStorageRoot, saveTaskCheckpointToDisk, restoreTaskFromDisk,
+  validateTaskContextFreshness, refuteTaskHypothesis,
+  getMultiRepoRollbackPlan, rollbackMultiRepo,
   getTaskHeartbeat, handleClientDisconnect, handleClientReconnect, replayTaskEvents,
   executeParallelWorkers, cancelWorker,
   captureWorktreeBaseline, verifyDirtyWorktreePreserved, calculateAgentDelta,

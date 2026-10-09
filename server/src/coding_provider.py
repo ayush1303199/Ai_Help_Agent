@@ -57,7 +57,7 @@ class CodingContextTooLargeError(RuntimeError):
     def __init__(self, metrics: Dict[str, Any]):
         self.context_metrics = metrics
         super().__init__(
-            "The Coding provider rejected the request because its context remained too large after bounded safe compaction."
+            "The Coding request exceeds the safe context limit after bounded compaction. Shorten the request or reduce the required context and try again."
         )
 
 

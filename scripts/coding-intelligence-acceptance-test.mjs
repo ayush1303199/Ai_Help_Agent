@@ -3,8 +3,16 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import developerFiles from '../electron/developerFiles.cjs';
 import developerAgent from '../electron/developerAgent.cjs';
+
+const FORBIDDEN_COMPONENT_PATHS = [
+  'meeting',
+  'general',
+  'stt',
+  'provider_registry.py',
+];
 
 async function runCommand(command, args, cwd) {
   return new Promise((resolve, reject) => {
@@ -18,13 +26,66 @@ async function runCommand(command, args, cwd) {
   });
 }
 
+function isForbiddenComponentPath(filePath) {
+  const normalized = filePath.toLowerCase();
+  return FORBIDDEN_COMPONENT_PATHS.some((forbidden) => normalized.includes(forbidden));
+}
+
+function changedProtectedPaths(before, after) {
+  return [...new Set([...before.keys(), ...after.keys()])]
+    .filter((filePath) => before.get(filePath) !== after.get(filePath))
+    .sort();
+}
+
+async function captureProtectedComponentSnapshot(root) {
+  const result = await runCommand(
+    'git',
+    ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+    root,
+  );
+  assert.equal(result.code, 0, `Could not enumerate repository files: ${result.stderr}`);
+  const paths = [...new Set(result.stdout.split('\0').filter(Boolean))]
+    .filter(isForbiddenComponentPath);
+  const snapshot = new Map();
+  await Promise.all(paths.map(async (filePath) => {
+    try {
+      const contents = await fs.readFile(path.resolve(root, filePath));
+      snapshot.set(filePath, createHash('sha256').update(contents).digest('hex'));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      snapshot.set(filePath, null);
+    }
+  }));
+  return snapshot;
+}
+
 async function main() {
   console.log('=== IQ1000+ CODING AGENT COMPREHENSIVE ACCEPTANCE TEST SUITE ===');
   const authorizeMutation = async () => ({ allowed: true });
 
+  const dirtyMeetingPath = 'src/features/meeting/meetingTranscriptReviewStore.ts';
+  const dirtyMeetingSnapshot = new Map([[
+    dirtyMeetingPath,
+    createHash('sha256').update('pre-existing dirty worktree content').digest('hex'),
+  ]]);
+  assert.deepEqual(
+    changedProtectedPaths(dirtyMeetingSnapshot, new Map(dirtyMeetingSnapshot)),
+    [],
+    'A pre-existing dirty Meeting file must not be reported as a mutation by this test.',
+  );
+  assert.deepEqual(
+    changedProtectedPaths(
+      dirtyMeetingSnapshot,
+      new Map([[dirtyMeetingPath, createHash('sha256').update('changed during test').digest('hex')]]),
+    ),
+    [dirtyMeetingPath],
+    'A Meeting file changed during this test must still be detected.',
+  );
+
   const testTempDir = await fs.mkdtemp(path.join(process.cwd(), '.coding-iq1000-'));
   const originalRoots = process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS;
   developerAgent.resetForTest();
+  const protectedComponentBaseline = await captureProtectedComponentSnapshot(process.cwd());
 
   try {
     // ------------------------------------------------------------------------
@@ -41,10 +102,17 @@ cases = [
     ("Login API kabhi kabhi 500 de rahi hai, check karo", TaskIntent.BUG_INVESTIGATION, False),
     ("Kaunsa query slow hai check karo", TaskIntent.PERFORMANCE_INVESTIGATION, False),
     ("AdmOuPrgList.php ke getProgrammes() method mein jo duplicate-query issue hai uska fix proposal banao", TaskIntent.PROPOSAL_GENERATION, True),
+    ("fix this bug and prepare a proposal", TaskIntent.BUG_FIX, True),
+    ("fix the slow query and prepare a proposal", TaskIntent.PERFORMANCE_FIX, True),
+    ("optimize this slow query", TaskIntent.PERFORMANCE_FIX, True),
+    ("optimize the slow order query and add index", TaskIntent.PERFORMANCE_FIX, True),
+    ("N+1 query fix karo", TaskIntent.PERFORMANCE_FIX, True),
     ("Fix karo aur relevant tests chalao", TaskIntent.DIRECT_FIX, True),
     ("Yeh method kaise kaam karta hai samjhao", TaskIntent.EXPLANATION, False),
     ("Code review karo aur clean up suggest karo", TaskIntent.CODE_REVIEW, False),
-    ("Security vulnerability check karo", TaskIntent.SECURITY_AUDIT, False),
+    ("Security vulnerability check karo", TaskIntent.CODE_REVIEW, False),
+    ("security audit karo", TaskIntent.CODE_REVIEW, False),
+    ("ye bug check karo", TaskIntent.BUG_INVESTIGATION, False),
     ("Tests fail ho rahe hain check karo", TaskIntent.TEST_FAILURE, False),
 ]
 
@@ -180,7 +248,13 @@ print("PYTHON_INTELLIGENCE_OK")
     const applied = await developerAgent.apply(
       proposal.taskId,
       { sessionId: turn1.sessionId, ownerWebContentsId: sessionOwnerId },
-      async () => ({ ok: true, status: 'PASS' }),
+      async () => ({
+        ok: true,
+        status: 'PASS',
+        executed: true,
+        exitCode: 0,
+        attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+      }),
       repoA,
       authorizeMutation,
     );
@@ -229,18 +303,13 @@ print("PYTHON_INTELLIGENCE_OK")
     console.log('[PASS] Zero hard-coding audit confirmed across all Coding Agent production files.');
 
     // Cross-agent git diff check
-    const gitDiffResult = await runCommand('git', ['status', '--porcelain'], process.cwd());
-    const modifiedLines = gitDiffResult.stdout.split(/\r?\n/).filter(Boolean);
-    const forbiddenPaths = ['meeting', 'general', 'stt', 'provider_registry.py', 'src/features/meeting', 'src/features/general'];
-    for (const line of modifiedLines) {
-      const filePath = line.trim().slice(3);
-      for (const forbidden of forbiddenPaths) {
-        assert.ok(
-          !filePath.toLowerCase().includes(forbidden.toLowerCase()),
-          `Modification leaked to forbidden component: ${filePath}`,
-        );
-      }
-    }
+    const protectedComponentAfter = await captureProtectedComponentSnapshot(process.cwd());
+    const leakedPaths = changedProtectedPaths(protectedComponentBaseline, protectedComponentAfter);
+    assert.deepEqual(
+      leakedPaths,
+      [],
+      `Coding Agent test changed protected feature files: ${leakedPaths.join(', ')}`,
+    );
     console.log('[PASS] Cross-agent boundary audit confirmed: Meeting, General, STT, and Provider Registry completely untouched.');
 
     console.log('\n=== ALL IQ1000+ ACCEPTANCE TESTS PASSED SUCCESSFULLY ===');

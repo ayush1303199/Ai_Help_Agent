@@ -36,9 +36,9 @@ assert.equal(task1.state, 'investigating');
 
 // Illegal transition rejection
 assert.throws(
-  () => taskOrchestrator.transitionState(task1.taskId, 'completed'),
+  () => taskOrchestrator.transitionState(task1.taskId, 'executing'),
   /Illegal state transition/,
-  'Illegal jump from investigating to completed must be rejected'
+  'Mutation execution cannot begin directly from investigation without approval'
 );
 console.log('[PASS] State transitions and illegal transition guards verified.');
 

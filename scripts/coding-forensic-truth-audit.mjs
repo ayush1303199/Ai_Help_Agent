@@ -30,21 +30,23 @@ const forensicResults = {
 console.log('--- 1. Auditing Real OS Process Restart (Two Distinct PIDs) ---');
 const tmpTestDir = path.join(os.tmpdir(), `forensic-restart-${Date.now()}`);
 await fs.mkdir(tmpTestDir, { recursive: true });
-const checkpointFile = path.join(tmpTestDir, 'forensic-task-checkpoint.json');
+const checkpointRoot = path.join(tmpTestDir, 'checkpoints');
+const checkpointFile = path.join(checkpointRoot, 'forensic_proc_task_1.json');
 
 // Script for Process A
 const procAScript = `
 const { taskOrchestrator } = require('${path.resolve('electron/coding-pipeline/orchestrator.cjs').replace(/\\/g, '/')}');
 async function run() {
+  taskOrchestrator.setCheckpointStorageRoot('${checkpointRoot.replace(/\\/g, '/')}');
   const task = taskOrchestrator.createTask({
     taskId: 'forensic_proc_task_1',
     goal: 'Audit multi-process restart',
-    owner: 'forensic-auditor',
+    workspace: '${tmpTestDir.replace(/\\/g, '/')}',
   });
   task.findings.push('Finding recorded by Process A');
   task.hypotheses.push({ id: 'h1', text: 'Hypothesis A', status: 'ACTIVE' });
   task.subtasks.push({ id: 'st1', description: 'Subtask A', status: 'COMPLETED' });
-  await taskOrchestrator.saveCheckpointToDisk('forensic_proc_task_1', '${checkpointFile.replace(/\\/g, '/')}');
+  await taskOrchestrator.saveCheckpointToDisk('forensic_proc_task_1', 'forensic-audit');
   console.log(JSON.stringify({ pid: process.pid, saved: true, taskId: task.taskId }));
   process.exit(0);
 }
@@ -55,7 +57,12 @@ run().catch(e => { console.error(e); process.exit(1); });
 const procBScript = `
 const { taskOrchestrator } = require('${path.resolve('electron/coding-pipeline/orchestrator.cjs').replace(/\\/g, '/')}');
 async function run() {
-  const restored = await taskOrchestrator.restoreTaskFromDisk('${checkpointFile.replace(/\\/g, '/')}');
+  taskOrchestrator.setCheckpointStorageRoot('${checkpointRoot.replace(/\\/g, '/')}');
+  const restored = await taskOrchestrator.restoreTaskFromDisk(
+    'forensic_proc_task_1',
+    'default-session',
+    '${tmpTestDir.replace(/\\/g, '/')}',
+  );
   if (!restored) {
     console.error('Failed to restore');
     process.exit(1);

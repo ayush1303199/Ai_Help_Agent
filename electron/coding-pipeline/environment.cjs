@@ -8,6 +8,8 @@ const path = require('node:path');
 const fs = require('node:fs/promises');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
+const { createIsolatedWorkspaceCopy, safeEnvironment } = require('../developerFiles.cjs');
+const { requireProjectProcessIsolation } = require('./projectProcessIsolation.cjs');
 
 async function detectEnvironmentRuntimes() {
   const runtimes = {
@@ -173,55 +175,69 @@ class DevServerManager {
       return this._activeServers.get(taskId);
     }
 
-    const config = await this.discoverDevServerConfig(projectRoot);
-    if (!config.detected) {
-      throw new Error(`Cannot start dev server: ${config.reason}`);
-    }
+    requireProjectProcessIsolation('Project dev server');
+    const isolatedWorkspace = await createIsolatedWorkspaceCopy(projectRoot, 'ai-help-agent-dev-server-');
+    let config;
+    try {
+      config = await this.discoverDevServerConfig(isolatedWorkspace.root);
+      if (!config.detected) {
+        throw new Error(`Cannot start dev server: ${config.reason}`);
+      }
 
-    // Check if server is already running on the target port
-    const existing = await this.probeHttpPort(config.port);
-    if (existing.active) {
+      const existing = await this.probeHttpPort(config.port);
+      if (existing.active) {
+        await isolatedWorkspace.cleanup();
+        const record = {
+          taskId,
+          port: config.port,
+          reused: true,
+          framework: config.framework,
+          command: config.command,
+          startTime: Date.now(),
+          process: null,
+        };
+        this._activeServers.set(taskId, record);
+        return record;
+      }
+
+      const isWindows = process.platform === 'win32';
+      const shellCmd = isWindows ? 'cmd.exe' : '/bin/sh';
+      const shellArgs = isWindows ? ['/c', config.command] : ['-c', config.command];
+
+      const child = spawn(shellCmd, shellArgs, {
+        cwd: isolatedWorkspace.root,
+        env: safeEnvironment(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+      });
+
       const record = {
         taskId,
         port: config.port,
-        reused: true,
+        reused: false,
         framework: config.framework,
         command: config.command,
         startTime: Date.now(),
-        process: null,
+        process: child,
+        pid: child.pid,
+        workspaceRoot: isolatedWorkspace.root,
+        cleanup: isolatedWorkspace.cleanup,
       };
+
+      child.on('error', (error) => {
+        record.startError = error.message;
+      });
+      child.on('exit', () => {
+        if (this._activeServers.get(taskId) === record) this._activeServers.delete(taskId);
+        record.cleanupPromise = isolatedWorkspace.cleanup();
+      });
+
       this._activeServers.set(taskId, record);
       return record;
+    } catch (error) {
+      await isolatedWorkspace.cleanup();
+      throw error;
     }
-
-    // Spawn server process
-    const isWindows = process.platform === 'win32';
-    const shellCmd = isWindows ? 'cmd.exe' : '/bin/sh';
-    const shellArgs = isWindows ? ['/c', config.command] : ['-c', config.command];
-
-    const child = spawn(shellCmd, shellArgs, {
-      cwd: projectRoot,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: false,
-    });
-
-    const record = {
-      taskId,
-      port: config.port,
-      reused: false,
-      framework: config.framework,
-      command: config.command,
-      startTime: Date.now(),
-      process: child,
-      pid: child.pid,
-    };
-
-    child.on('exit', () => {
-      this._activeServers.delete(taskId);
-    });
-
-    this._activeServers.set(taskId, record);
-    return record;
   }
 
   async stopDevServer(taskId) {
@@ -235,11 +251,26 @@ class DevServerManager {
 
     try {
       if (process.platform === 'win32') {
-        spawn('taskkill', ['/pid', String(record.pid), '/f', '/t'], { stdio: 'ignore' });
+        await new Promise((resolve, reject) => {
+          const killer = spawn('taskkill', ['/pid', String(record.pid), '/f', '/t'], { stdio: 'ignore' });
+          killer.once('error', reject);
+          killer.once('close', (code) => code === 0 ? resolve() : reject(new Error(`taskkill exited with ${code}`)));
+        });
       } else {
-        record.process.kill('SIGTERM');
+        process.kill(-record.pid, 'SIGTERM');
       }
-    } catch {}
+      await new Promise((resolve, reject) => {
+        if (record.process.exitCode !== null || record.process.signalCode !== null) {
+          resolve();
+          return;
+        }
+        record.process.once('exit', resolve);
+        record.process.once('error', reject);
+      });
+      await (record.cleanupPromise || record.cleanup());
+    } catch (error) {
+      throw new Error(`Unable to stop and clean up isolated dev server: ${error.message}`);
+    }
 
     this._activeServers.delete(taskId);
     return { stopped: true, pid: record.pid };

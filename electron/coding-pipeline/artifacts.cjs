@@ -6,6 +6,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { authorizeAppOwnedMutation } = require('../appOwnedPersistence.cjs');
 
 const ARTIFACT_TYPES = Object.freeze({
   IMPLEMENTATION_PLAN: 'implementation-plan',
@@ -65,10 +66,19 @@ class ArtifactEngine {
   }
 
   async persistArtifacts(taskId, outputDir) {
-    const targetDir = outputDir || this._storageDir;
-    if (!targetDir) return [];
+    if (!this._storageDir) throw new Error('Application-owned artifact storage is not configured.');
+    const targetDir = path.resolve(outputDir || this._storageDir);
+    if (targetDir !== this._storageDir) {
+      throw new Error('Artifacts may only be persisted to the configured application-owned storage directory.');
+    }
 
     const artifacts = this.getArtifacts(taskId);
+    await authorizeAppOwnedMutation({
+      root: this._storageDir,
+      target: targetDir,
+      resource: 'artifact',
+      operation: 'write',
+    });
     await fs.mkdir(targetDir, { recursive: true });
 
     const written = [];
@@ -76,6 +86,12 @@ class ArtifactEngine {
       const ext = art.type === ARTIFACT_TYPES.BROWSER_EVIDENCE ? 'json' : art.type === ARTIFACT_TYPES.PATCH_PROPOSAL ? 'diff' : 'md';
       const filename = `${art.type}.${ext}`;
       const filePath = path.join(targetDir, filename);
+      await authorizeAppOwnedMutation({
+        root: this._storageDir,
+        target: filePath,
+        resource: 'artifact',
+        operation: 'write',
+      });
       await fs.writeFile(filePath, art.content, 'utf8');
       written.push({ ...art, path: filePath });
     }

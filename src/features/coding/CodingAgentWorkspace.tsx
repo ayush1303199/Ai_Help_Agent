@@ -104,6 +104,12 @@ interface Proposal {
   lifecycleState?: string;
   repairAttempt?: number;
   repairAvailable?: boolean;
+  attemptNumber?: number;
+  maxAttempts?: number;
+  attemptLabel?: string;
+  reviewFlags?: string[];
+  fileState?: string;
+  chainStatus?: string;
   files: DiffFile[];
   raw: string;
   searchedFiles: string[];
@@ -176,6 +182,8 @@ interface CodingAgentWorkspaceProps {
   onApplyProposal: () => void;
   onUndoProposal: () => void;
   onRequestRepair: () => void;
+  onCancelRepair: () => void;
+  onCancelRequest: () => void;
   onSendMessage: () => void;
   onClearMessages: () => void;
   conversations: CodingConversationState[];
@@ -361,6 +369,8 @@ export function CodingAgentWorkspace({
   onApplyProposal,
   onUndoProposal,
   onRequestRepair,
+  onCancelRepair,
+  onCancelRequest,
   onSendMessage,
   onClearMessages,
   conversations,
@@ -592,9 +602,14 @@ export function CodingAgentWorkspace({
         <div className="flex items-start justify-between gap-3">
           <div>
             <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-200">Proposed diff · {proposal.state === 'cancelled' ? 'rejected' : proposal.lifecycleState || proposal.state || 'pending'}</p>
+            {proposal.attemptLabel && <p className="mt-1 text-[11px] text-amber-100">{proposal.attemptLabel}</p>}
             <p className="mt-1 text-[11px] text-slate-400">Reviewed files: {proposal.searchedFiles.join(', ')}</p>
             {proposal.runtime && <p className="mt-1 text-[10px] text-emerald-300">Pipeline: {proposal.runtime.phase || proposal.runtime.taskState || 'proposal'} · plan v{proposal.runtime.planVersion || 1}</p>}
           </div>
+          {proposal.reviewFlags && proposal.reviewFlags.length > 0 && <div className="mt-3 rounded-md border border-rose-500/40 bg-rose-500/10 p-2 text-[11px] text-rose-100">
+            <p className="font-semibold">Extra review required for sensitive project configuration</p>
+            <p className="mt-1">{proposal.reviewFlags.map((flag) => flag.replace(/-/g, ' ')).join(' · ')}</p>
+          </div>}
           <div className="flex shrink-0 flex-wrap justify-end gap-2">
             {proposal.state === 'awaiting_approval' && <button onClick={onApproveProposal} disabled={busy} className="rounded-md bg-amber-400 px-2.5 py-1.5 text-[11px] font-medium text-slate-950 disabled:opacity-40">Approve</button>}
             {proposal.state === 'approved' && <button onClick={onApplyProposal} disabled={busy} className="rounded-md bg-emerald-400 px-2.5 py-1.5 text-[11px] font-medium text-slate-950 disabled:opacity-40">Apply and verify</button>}
@@ -626,11 +641,14 @@ export function CodingAgentWorkspace({
           </>}
         </div>}
         {proposal.files.length > 0 ? <div className="mt-3 space-y-3">{proposal.files.map((file) => <div key={`${file.operation}:${file.sourcePath || ''}:${file.path}`} className="overflow-hidden rounded-md border border-slate-700 bg-slate-950"><p className="border-b border-slate-700 px-2 py-1.5 text-xs font-medium text-slate-200">{file.operation.toUpperCase().replace('_', ' ')} · {file.sourcePath ? `${file.sourcePath} → ${file.path}` : file.path}</p>{file.operation === 'delete_directory' ? <p className="px-2 py-2 text-xs text-rose-200">The directory and its contents will be removed after a separate exact-target confirmation.</p> : <pre className="max-h-80 overflow-auto p-2 text-[11px] leading-relaxed">{file.lines.map((line, lineIndex) => <span key={`${file.path}-${lineIndex}`} className={`block ${line.startsWith('+') && !line.startsWith('+++') ? 'bg-emerald-500/10 text-emerald-200' : line.startsWith('-') && !line.startsWith('---') ? 'bg-rose-500/10 text-rose-200' : 'text-slate-400'}`}>{line || ' '}</span>)}</pre>}</div>)}</div> : <pre className="mt-3 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] text-slate-300">{proposal.raw || 'No safe changes proposed.'}</pre>}
-        {proposal.verification && <div className={`mt-3 rounded-md border p-2 text-[11px] ${proposal.verification.status === 'PASS' || proposal.verification.status === 'NOT_AVAILABLE' ? 'border-emerald-500/30 text-emerald-200' : 'border-rose-500/30 text-rose-200'}`}><p>Verification: {proposal.verification.status || 'UNKNOWN'}</p>{proposal.verification.reason && <p className="mt-1 text-slate-400">{proposal.verification.reason}</p>}{proposal.verification.attempts?.filter((attempt) => !attempt.ok).map((attempt, attemptIndex) => <p key={`${attempt.check || 'check'}-${attemptIndex}`} className="mt-1 text-rose-200">{attempt.check || 'check'}: {attempt.classification || 'failed'}{attempt.extracted?.file ? ` · ${attempt.extracted.file}${attempt.extracted.line ? `:${attempt.extracted.line}` : ''}` : ''}{attempt.extracted?.message ? ` · ${attempt.extracted.message}` : ''}</p>)}</div>}
+        {proposal.verification && <div className={`mt-3 rounded-md border p-2 text-[11px] ${proposal.verification.status === 'PASS' ? 'border-emerald-500/30 text-emerald-200' : 'border-rose-500/30 text-rose-200'}`}><p>Verification: {proposal.verification.status || 'UNKNOWN'}</p>{proposal.verification.reason && <p className="mt-1 text-slate-400">{proposal.verification.reason}</p>}{proposal.fileState && <p className="mt-1">{proposal.fileState}</p>}{proposal.verification.attempts?.filter((attempt) => !attempt.ok).map((attempt, attemptIndex) => <p key={`${attempt.check || 'check'}-${attemptIndex}`} className="mt-1 text-rose-200">{attempt.check || 'check'}: {attempt.classification || 'failed'}{attempt.extracted?.file ? ` · ${attempt.extracted.file}${attempt.extracted.line ? `:${attempt.extracted.line}` : ''}` : ''}{attempt.extracted?.message ? ` · ${attempt.extracted.message}` : ''}</p>)}</div>}
         {proposal.error && <p className="mt-2 text-[11px] text-rose-300">{proposal.error}</p>}
         {proposal.state === 'failed' && proposal.verification?.status === 'CODE_FAILURE' && proposal.repairAvailable && <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-2">
-          <p className="text-[11px] text-amber-100">The failed change was rolled back. The agent can inspect the verification diagnostics and prepare a repair for separate approval.</p>
-          <button onClick={onRequestRepair} disabled={busy || streaming} className="shrink-0 rounded-md bg-amber-400 px-2.5 py-1.5 text-[11px] font-medium text-slate-950 disabled:opacity-40">Propose repair</button>
+          <p className="text-[11px] text-amber-100">The failed change was rolled back. The agent can inspect the verification diagnostics and prepare a repair for separate approval ({proposal.attemptLabel || 'next attempt'}).</p>
+          <div className="flex shrink-0 gap-2">
+            <button onClick={onRequestRepair} disabled={busy || streaming} className="rounded-md bg-amber-400 px-2.5 py-1.5 text-[11px] font-medium text-slate-950 disabled:opacity-40">Propose repair</button>
+            <button onClick={onCancelRepair} disabled={busy || streaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Cancel chain</button>
+          </div>
         </div>}
         </section>
       </article>}
@@ -638,7 +656,9 @@ export function CodingAgentWorkspace({
 
       <div className="mt-4 flex items-end gap-2 rounded-2xl border border-slate-700 bg-slate-950/80 p-2 shadow-lg">
         <textarea value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSendMessage(); } }} placeholder="Ask about the project or describe a change…" rows={2} className="min-w-0 flex-1 resize-y bg-transparent px-2 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500" />
-        <button onClick={onSendMessage} disabled={!input.trim() || streaming || busy || proposalNeedsDecision} title={proposalNeedsDecision ? 'Approve, apply, or reject the pending proposal first.' : undefined} className="rounded-xl bg-sky-400 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-300 disabled:opacity-40">{streaming || busy ? 'Working…' : 'Send'}</button>
+        {streaming
+          ? <button onClick={onCancelRequest} className="rounded-xl border border-rose-400/50 px-4 py-2.5 text-sm font-semibold text-rose-200 hover:bg-rose-500/10">Stop</button>
+          : <button onClick={onSendMessage} disabled={!input.trim() || busy || proposalNeedsDecision} title={proposalNeedsDecision ? 'Approve, apply, or reject the pending proposal first.' : undefined} className="rounded-xl bg-sky-400 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-300 disabled:opacity-40">{busy ? 'Working…' : 'Send'}</button>}
       </div>
       {messages.length > 0 && <button onClick={onClearMessages} disabled={busy || streaming || proposalNeedsDecision} title={proposalNeedsDecision ? 'Finish the pending proposal before starting a new conversation.' : undefined} className="mt-2 self-start text-xs text-slate-400 hover:text-slate-200 disabled:opacity-40">New Coding conversation</button>}
     </>

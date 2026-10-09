@@ -1,5 +1,7 @@
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import io
 import json
 import socket
@@ -34,6 +36,8 @@ from coding_provider import (  # noqa: E402
 )
 from coding_intelligence import (  # noqa: E402
     DatabaseCapability,
+    CanonicalCapability,
+    CapabilityIntelligenceEngine,
     DATABASE_CREDENTIAL_REQUEST_PATTERN,
     DATABASE_CONNECTION_STATUS_PATTERN,
     DatabaseEvidenceSource,
@@ -80,6 +84,14 @@ from coding_websocket import (  # noqa: E402
     _validate_task_action_selection,
     _requires_proposal,
     _requires_proposal_for_conversation,
+    _is_capability_question,
+    _capability_question_answer,
+    _set_coding_connection_active,
+    register_coding_mutation_capability,
+    handle_coding_payload,
+    _is_underspecified_file_creation_request,
+    _file_creation_clarification_question,
+    compute_next_best_action,
     _serialize_coding_tool_result,
     _compile_agent_task_context,
     _messages_for_active_coding_task,
@@ -89,14 +101,20 @@ from coding_websocket import (  # noqa: E402
     _next_credential_investigation_action,
     _update_task_completeness,
     _update_task_from_tool_result,
+    _update_task_credential_facts,
     _task_evidence_sufficiency,
+    _task_resource_for_tool,
     _has_repository_map_evidence,
     _is_project_architecture_question,
     _requires_investigation_evidence_gate,
     _investigation_evidence_gate,
     _proposal_source_candidate_from_search,
+    _proposal_source_candidate_from_directory,
+    _proposal_source_candidates_from_directory,
+    _proposal_next_source_directory,
     _proposal_source_search_query,
     _has_relevant_proposal_source_evidence,
+    UNIVERSAL_INDEX,
     detect_project_architecture,
     _validate_tool_call,
     _activity_type_for_tool,
@@ -106,6 +124,7 @@ from coding_websocket import (  # noqa: E402
     _dispatch_coding_tool,
     _publish_activity_event,
     _run_coding_turn,
+    CODING_TASK_STORE,
     CODING_TOOLS,
     TOOL_ALIASES,
     TOOL_CAPABILITIES,
@@ -129,6 +148,230 @@ from provider_model_contract import (  # noqa: E402
     provider_model_error,
     provider_model_for_capability,
 )
+
+
+class CodingProviderEvidenceFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def _run_turn(
+        self,
+        project_root,
+        session_id,
+        request,
+        completion_effect,
+        evidence=None,
+        sent=None,
+    ):
+        sent = sent if sent is not None else []
+
+        async def send_json(payload):
+            sent.append(payload)
+
+        if evidence:
+            CODING_TASK_STORE.get_or_create(session_id, project_root=evidence[0])
+            CODING_TASK_STORE.record_source_evidence(
+                session_id,
+                path=evidence[1],
+                snippet=evidence[2],
+                start_line=1,
+                end_line=1,
+            )
+
+        with patch(
+            "coding_websocket.ProjectContextLock.resolve_authoritative_root",
+            return_value=str(project_root),
+        ), patch(
+            "coding_websocket.register_coding_request_context",
+            return_value={"projectId": "fallback-test", "repositoryId": "fallback-test"},
+        ), patch.object(
+            ProjectContextLock,
+            "lock",
+        ), patch.object(
+            UNIVERSAL_INDEX,
+            "scan_and_update",
+        ), patch(
+            "coding_websocket._resolve_semantic_task_with_model",
+            new=AsyncMock(return_value={
+                "is_deterministic": False,
+                "route_to_code": True,
+                "resolved_by_model": True,
+                "semanticTask": {
+                    "intent": "CODE_QUESTION",
+                    "goal": "Explain the selected source using available evidence.",
+                    "resourceCandidates": ["CODE", "REPOSITORY"],
+                    "resolvedResources": ["CODE", "REPOSITORY"],
+                },
+            }),
+        ), patch(
+            "coding_websocket.complete_coding_model",
+            side_effect=completion_effect,
+        ) as complete:
+            await _run_coding_turn(
+                {
+                    "requestId": f"{session_id}-request",
+                    "conversationId": session_id,
+                    "sessionId": session_id,
+                    "scope": ".",
+                    "projectRoot": str(project_root),
+                    "messages": [{"role": "user", "content": request}],
+                },
+                send_json,
+                {"pending": {}, "completed": {}, "tasks": set()},
+                SimpleNamespace(
+                    get_active_provider=lambda: SimpleNamespace(
+                        id="test-provider",
+                        type="test",
+                        model="test-model",
+                    )
+                ),
+                Path("unused-config.json"),
+            )
+        return sent, complete
+
+    async def test_timeout_with_matching_evidence_emits_one_truthful_done(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            session_id = "evidence-fallback-sufficient"
+            events, complete = await self._run_turn(
+                project_root,
+                session_id,
+                "Explain src/logic.ts",
+                TimeoutError("LLM Provider Timeout"),
+                (project_root, "src/logic.ts", "export function compute() { return 42; }"),
+            )
+
+        done_events = [event for event in events if event.get("type") == "done"]
+        self.assertEqual(len(done_events), 1, events)
+        self.assertFalse(any(event.get("type") == "error" for event in events), events)
+        self.assertEqual(done_events[0]["status"], "INVESTIGATION_COMPLETE")
+        self.assertEqual(done_events[0]["completionSource"], "STORED_SOURCE_EVIDENCE")
+        self.assertIn("src/logic.ts", done_events[0]["content"])
+        self.assertIn("return 42", done_events[0]["content"])
+        self.assertFalse(done_events[0]["providerFailure"]["successfulModelCall"])
+        self.assertNotIn("providerId", done_events[0])
+        self.assertEqual(complete.call_count, 1)
+        self.assertEqual(done_events[0]["agentTaskState"]["status"], "COMPLETED")
+        self.assertTrue(
+            any(
+                event.get("event") == "PROVIDER_FAILURE"
+                for event in CODING_TASK_STORE.get_or_create(session_id)["lifecycleEvents"]
+            )
+        )
+
+    async def test_timeout_without_sufficient_evidence_stays_explicit_failure(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            events, complete = await self._run_turn(
+                project_root,
+                "evidence-fallback-insufficient",
+                "Explain src/logic.ts",
+                TimeoutError("LLM Provider Timeout"),
+            )
+
+        self.assertFalse(any(event.get("type") == "done" for event in events), events)
+        error = next(event for event in events if event.get("type") == "error")
+        self.assertEqual(error["category"], "LLM_PROVIDER_TIMEOUT")
+        self.assertEqual(error["agentTaskState"]["status"], "FAILED")
+        self.assertEqual(complete.call_count, 1)
+
+    async def test_non_provider_failure_does_not_use_evidence_fallback(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            events, _ = await self._run_turn(
+                project_root,
+                "evidence-fallback-contract-failure",
+                "Explain src/logic.ts",
+                ValueError("provider_tool_rejected"),
+                (project_root, "src/logic.ts", "return 42;"),
+            )
+
+        self.assertFalse(any(event.get("type") == "done" for event in events), events)
+        error = next(event for event in events if event.get("type") == "error")
+        self.assertEqual(error["category"], "PROVIDER_TOOL_REJECTED")
+
+    async def test_evidence_isolated_by_session_project_and_repository_path(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            repo_a = Path(project_root) / "repo-a"
+            repo_b = Path(project_root) / "repo-b"
+            repo_a.mkdir()
+            repo_b.mkdir()
+            seed_session = "evidence-fallback-isolation-seed"
+            CODING_TASK_STORE.get_or_create(seed_session, project_root=str(repo_a))
+            CODING_TASK_STORE.record_source_evidence(
+                seed_session,
+                "src/logic.ts",
+                "return 'repo-a';",
+            )
+
+            other_session_events, _ = await self._run_turn(
+                repo_a,
+                "evidence-fallback-isolation-other-session",
+                "Explain src/logic.ts",
+                TimeoutError("LLM Provider Timeout"),
+            )
+            different_task_events, _ = await self._run_turn(
+                repo_a,
+                seed_session,
+                "Explain src/unrelated.ts",
+                TimeoutError("LLM Provider Timeout"),
+            )
+            changed_project_events, _ = await self._run_turn(
+                repo_b,
+                seed_session,
+                "Explain src/logic.ts",
+                TimeoutError("LLM Provider Timeout"),
+            )
+            wrong_repository_events, _ = await self._run_turn(
+                repo_a,
+                "evidence-fallback-isolation-wrong-repository",
+                "Explain src/logic.ts",
+                TimeoutError("LLM Provider Timeout"),
+                (repo_a, "other/logic.ts", "return 'unrelated';"),
+            )
+
+        for events in (
+            other_session_events,
+            different_task_events,
+            changed_project_events,
+            wrong_repository_events,
+        ):
+            self.assertFalse(any(event.get("type") == "done" for event in events), events)
+            self.assertTrue(any(event.get("type") == "error" for event in events), events)
+            self.assertEqual(
+                sum(event.get("type") in {"done", "error"} for event in events),
+                1,
+                events,
+            )
+
+    async def test_cancellation_does_not_emit_fallback_terminal_event(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            events = []
+            with self.assertRaises(asyncio.CancelledError):
+                await self._run_turn(
+                    project_root,
+                    "evidence-fallback-cancelled",
+                    "Explain src/logic.ts",
+                    asyncio.CancelledError(),
+                    (project_root, "src/logic.ts", "return 42;"),
+                    sent=events,
+                )
+            self.assertFalse(
+                any(event.get("type") in {"done", "error"} for event in events),
+                events,
+            )
+
+    async def test_normal_provider_success_does_not_use_evidence_fallback(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            events, complete = await self._run_turn(
+                project_root,
+                "evidence-fallback-provider-success",
+                "Explain src/logic.ts",
+                lambda *_args, **_kwargs: (
+                    {"role": "assistant", "content": "Provider explanation."},
+                    SimpleNamespace(id="test-provider", type="test", model="test-model"),
+                ),
+            )
+
+        done = next((event for event in events if event.get("type") == "done"), None)
+        self.assertIsNotNone(done, events)
+        self.assertEqual(done["content"], "Provider explanation.")
+        self.assertNotIn("providerFailure", done)
+        self.assertEqual(complete.call_count, 1)
 
 
 class CodingActivityObserverTests(unittest.IsolatedAsyncioTestCase):
@@ -831,6 +1074,295 @@ class CodingIntentTests(unittest.TestCase):
             "AdmOuPrgList.php ke getProgrammes() method mein duplicate-query issue ka fix proposal/diff banao."
         ))
 
+    def test_capability_questions_are_not_change_requests(self):
+        capability_questions = (
+            "can you add the file in project",
+            "can you delete a file?",
+            "can you modify this file?",
+            "can you write code",
+            "are you able to add files",
+            "kya tum file add kar sakte ho",
+        )
+        for request in capability_questions:
+            with self.subTest(request=request):
+                self.assertTrue(_is_capability_question(request))
+                self.assertEqual(
+                    understand_human_request(request)["action"],
+                    TaskIntent.CAPABILITY_QUESTION,
+                )
+                self.assertEqual(
+                    classify_task_intent(request)["intent"],
+                    TaskIntent.CAPABILITY_QUESTION,
+                )
+                self.assertFalse(_requires_proposal(request))
+                self.assertFalse(_requires_proposal_for_conversation([
+                    {"role": "user", "content": request},
+                ]))
+
+        self.assertFalse(TOOL_CAPABILITIES.get("apply_file_mutation", {}).get("available", False))
+        answer = _capability_question_answer(capability_questions[0])
+        self.assertIn("reviewable diff proposal", answer)
+        self.assertIn("cannot apply project changes", answer)
+        self.assertEqual(
+            _capability_question_answer(capability_questions[0]),
+            _capability_question_answer(capability_questions[0]),
+        )
+        self.assertEqual(
+            _capability_question_answer(
+                "can you add the file in project only answer yes or no"
+            ),
+            "No.",
+        )
+
+    def test_capability_answer_uses_registered_mutation_and_policy_metadata(self):
+        connection_id = "live-authenticated-connection-123456"
+        secret = "private-handshake-secret"
+        proof = hmac.new(secret.encode(), connection_id.encode(), hashlib.sha256).hexdigest()
+        self.assertFalse(_capability_question_answer("Can you modify this file?", connection_id).startswith("Yes."))
+        _set_coding_connection_active(connection_id, True)
+        try:
+            self.assertFalse(register_coding_mutation_capability(connection_id, "invalid-proof", secret))
+            self.assertFalse(TOOL_CAPABILITIES.get("apply_file_mutation", {}).get("available", False))
+            self.assertTrue(register_coding_mutation_capability(connection_id, proof, secret))
+            answer = _capability_question_answer("Can you modify this file?", connection_id)
+            self.assertIn("Yes.", _capability_question_answer("Can you modify this file?", connection_id))
+        finally:
+            _set_coding_connection_active(connection_id, False)
+
+        self.assertTrue(answer.startswith("Yes."))
+        self.assertIn("approved proposal and snapshot validation", answer)
+        self.assertIn("separate explicit confirmation", answer)
+
+    def test_websocket_approval_response_is_notification_only(self):
+        async def run():
+            sent = []
+
+            async def send_json(message):
+                sent.append(message)
+
+            state = {"pending": {}, "completed": {}, "tasks": set()}
+            await handle_coding_payload(json.dumps({
+                "type": "approval_response",
+                "proposalId": "proposal-id",
+                "approved": True,
+                "manifestHash": "a" * 64,
+            }), send_json, state, None, "")
+            self.assertEqual(len(state["mutation_notifications"]), 1)
+            self.assertEqual(state["mutation_notifications"][0]["type"], "approval_response")
+            self.assertEqual(sent[0]["authorizationGranted"], False)
+
+        asyncio.run(run())
+
+    def test_concrete_file_change_remains_a_proposal_request(self):
+        for request in ("add abc.php to the project", "add a.js"):
+            with self.subTest(request=request):
+                self.assertFalse(_is_capability_question(request))
+                self.assertEqual(understand_human_request(request)["action"], TaskIntent.ACTION_REQUEST)
+                self.assertEqual(classify_task_intent(request)["intent"], TaskIntent.FEATURE_REQUEST)
+                self.assertTrue(_requires_proposal(request))
+
+    def test_underspecified_hinglish_file_creation_routes_to_clarification(self):
+        request = "yume ek filenbnani hai"
+        self.assertEqual(understand_human_request(request)["action"], TaskIntent.ACTION_REQUEST)
+        self.assertEqual(classify_task_intent(request)["intent"], TaskIntent.FEATURE_REQUEST)
+        self.assertTrue(_is_underspecified_file_creation_request(request))
+        self.assertEqual(_file_creation_clarification_question(request).count("?"), 1)
+        self.assertFalse(_is_underspecified_file_creation_request("add abc.php in controllers"))
+        self.assertFalse(_is_underspecified_file_creation_request("can you add the file in project"))
+
+    def test_mapped_source_directory_selection_stays_inside_attached_scope(self):
+        task_state = {
+            "userRequest": "write two number adding",
+            "scope": ".",
+            "context": {"project": {"scope": "."}},
+            "actions": [
+                {
+                    "tool": "get_repository_map",
+                    "status": "SUCCESS",
+                    "lastResult": {
+                        "data": {"sourceDirectories": ["vendor/src", "controllers", "models"]},
+                    },
+                },
+                {
+                    "tool": "list_directory",
+                    "target": ".",
+                    "arguments": {"relativePath": "."},
+                    "status": "SUCCESS",
+                    "lastResult": {
+                        "data": {
+                            "entries": [
+                                {"name": "controllers", "type": "directory"},
+                                {"name": "models", "type": "directory"},
+                            ],
+                        },
+                    },
+                },
+            ],
+        }
+        self.assertEqual(_proposal_next_source_directory(task_state), "controllers")
+
+    def test_project_language_question_classification_is_unchanged(self):
+        request = "which language is my project?"
+        self.assertFalse(_is_capability_question(request))
+        self.assertTrue(_is_project_architecture_question(request))
+        self.assertEqual(
+            understand_human_request(request)["action"],
+            "FACT",
+        )
+        self.assertEqual(
+            classify_task_intent(request)["intent"],
+            TaskIntent.GENERAL_REPOSITORY_TASK,
+        )
+
+    def test_generic_change_without_topic_does_not_select_project_files(self):
+        task_state = {
+            "userRequest": "Add a file",
+            "goal": {"statement": "Create a file."},
+            "actions": [{
+                "tool": "search_code",
+                "status": "SUCCESS",
+                "lastResult": {
+                    "data": {
+                        "results": [{
+                            "path": "commands/IciciTransactionController.php",
+                            "text": "transaction update",
+                        }],
+                    },
+                },
+            }],
+        }
+        self.assertEqual(_proposal_source_search_query(task_state), "")
+        self.assertIsNone(_proposal_source_candidate_from_search(task_state))
+        self.assertEqual(
+            compute_next_best_action(
+                {},
+                {"proposal_required": True, "request": "Add a file"},
+            )["action"],
+            "synthesize_report",
+        )
+
+    def test_targetless_number_addition_does_not_add_action_keywords_to_search(self):
+        task_state = {
+            "userRequest": "write two number adding",
+            "goal": {"statement": "Write two number adding."},
+        }
+        self.assertEqual(_proposal_source_search_query(task_state), "")
+        intent = classify_task_intent(task_state["userRequest"])
+        self.assertTrue(intent["proposal_required"])
+        self.assertEqual(intent["target_files"], [])
+        self.assertEqual(intent["target_symbols"], [])
+
+    def test_targetless_proposal_uses_scoped_directory_pattern_evidence(self):
+        task_state = {
+            "userRequest": "write two number adding",
+            "goal": {"statement": "Write two number adding."},
+            "context": {"project": {"scope": "controllers"}},
+            "actions": [
+                {
+                    "tool": "get_repository_map",
+                    "status": "SUCCESS",
+                    "resultEvidenceIds": ["repository-map-evidence"],
+                    "lastResult": {"data": {"sourceDirectories": ["controllers"]}},
+                },
+                {
+                    "tool": "list_directory",
+                    "target": "controllers",
+                    "status": "SUCCESS",
+                    "lastResult": {
+                        "data": {
+                            "entries": [
+                                {"name": "MainController.php", "type": "file"},
+                                {"name": "README.md", "type": "file"},
+                            ],
+                        },
+                    },
+                },
+                {
+                    "tool": "list_directory",
+                    "target": "outside",
+                    "status": "SUCCESS",
+                    "lastResult": {
+                        "data": {
+                            "entries": [{"name": "UnrelatedController.php", "type": "file"}],
+                        },
+                    },
+                },
+            ],
+        }
+
+        self.assertEqual(
+            _proposal_source_candidates_from_directory(task_state),
+            ["controllers/MainController.php"],
+        )
+        self.assertEqual(
+            _proposal_source_candidate_from_directory(task_state),
+            "controllers/MainController.php",
+        )
+        task_state["actions"].append({
+            "tool": "read_file",
+            "target": "outside/UnrelatedController.php",
+            "status": "SUCCESS",
+            "lastResult": {
+                "data": {
+                    "path": "outside/UnrelatedController.php",
+                    "content": "class UnrelatedController {}",
+                },
+            },
+        })
+        self.assertFalse(_has_relevant_proposal_source_evidence(task_state))
+        task_state["actions"].append({
+            "tool": "read_file",
+            "target": "controllers/MainController.php",
+            "status": "SUCCESS",
+            "lastResult": {
+                "data": {
+                    "path": "controllers/MainController.php",
+                    "content": "class MainController { public function index() {} }",
+                },
+            },
+        })
+        self.assertTrue(_has_relevant_proposal_source_evidence(task_state))
+        self.assertEqual(_proposal_source_search_query(task_state), "")
+
+    def test_short_named_new_files_accept_scoped_sibling_pattern_evidence(self):
+        for target in ("abc.php", "a.js"):
+            with self.subTest(target=target):
+                task_state = {
+                    "userRequest": f"add {target}",
+                    "requestedTargets": {"files": [target], "symbols": []},
+                    "context": {"project": {"scope": "controllers"}},
+                    "actions": [{
+                        "tool": "search_code",
+                        "status": "SUCCESS",
+                        "lastResult": {
+                            "data": {
+                                "results": [{
+                                    "path": "controllers/MainController.php",
+                                    "text": "class MainController {}",
+                                }],
+                            },
+                        },
+                    }],
+                }
+
+                self.assertIn(target, _proposal_source_search_query(task_state))
+                self.assertEqual(
+                    _proposal_source_candidate_from_search(task_state),
+                    "controllers/MainController.php",
+                )
+                task_state["actions"].append({
+                    "tool": "read_file",
+                    "target": "controllers/MainController.php",
+                    "status": "SUCCESS",
+                    "lastResult": {
+                        "data": {
+                            "path": "controllers/MainController.php",
+                            "content": "class MainController {}",
+                        },
+                    },
+                })
+                self.assertTrue(_has_relevant_proposal_source_evidence(task_state))
+
     def test_coding_task_plan_is_specific_to_task_intent(self):
         database_steps = _coding_task_steps(TaskIntent.DATABASE_INVESTIGATION, False)
         proposal_steps = _coding_task_steps(TaskIntent.FEATURE_REQUEST, True)
@@ -861,6 +1393,115 @@ class CodingIntentTests(unittest.TestCase):
         ]
 
         self.assertFalse(_requires_proposal_for_conversation(messages))
+
+
+class CodingCapabilityQuestionFastPathTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capability_question_needs_no_project_tools_or_provider(self):
+        questions = (
+            "can you add the file in project",
+            "are you able to add files",
+            "kya tum file add kar sakte ho",
+        )
+        for request_index, request in enumerate(questions):
+            for error_index, provider_error in enumerate(("429 rate limit", "502 provider unavailable")):
+                with self.subTest(request=request, provider_error=provider_error):
+                    sent = []
+
+                    async def send_json(message):
+                        sent.append(message)
+
+                    with patch(
+                        "coding_websocket.complete_coding_model",
+                        side_effect=RuntimeError(provider_error),
+                    ) as complete_model, patch.object(
+                        ProjectContextLock,
+                        "resolve_authoritative_root",
+                        side_effect=AssertionError("capability answers need no project context"),
+                    ), patch.object(
+                        UNIVERSAL_INDEX,
+                        "scan_and_update",
+                        side_effect=AssertionError("capability answers must not scan project files"),
+                    ):
+                        await _run_coding_turn(
+                            {
+                                "requestId": f"capability-{request_index}-{error_index}",
+                                "sessionId": f"capability-session-{request_index}-{error_index}",
+                                "_mutationCapabilityReady": True,
+                                "connectionId": "renderer-supplied-connection",
+                                "messages": [{
+                                    "role": "user",
+                                    "content": request,
+                                }],
+                            },
+                            send_json,
+                            {"pending": {}, "completed": {}, "tasks": set()},
+                            None,
+                            "",
+                        )
+
+                    complete_model.assert_not_called()
+                    done = next(message for message in sent if message.get("type") == "done")
+                    self.assertEqual(done["intent"], TaskIntent.CAPABILITY_QUESTION)
+                    self.assertFalse(done["proposalRequired"])
+                    self.assertEqual(done["toolCalls"], [])
+                    self.assertEqual(done["filesRead"], [])
+                    self.assertIn("reviewable diff proposal", done["content"])
+
+    async def test_mutation_handshake_secret_is_absent_from_logs_and_websocket_payloads(self):
+        import index
+
+        secret = "synthetic-mutation-handshake-secret-never-emit"
+        sent = []
+
+        async def send_json(message):
+            sent.append(message)
+
+        logs = io.StringIO()
+        with patch.dict("os.environ", {"AI_CODING_MUTATION_HANDSHAKE_SECRET": secret}), patch.object(
+            index, "CODING_MUTATION_HANDSHAKE_SECRET", secret
+        ), patch(
+            "coding_websocket.complete_coding_model",
+            side_effect=AssertionError("Capability response must not call a model."),
+        ), contextlib.redirect_stdout(logs), contextlib.redirect_stderr(logs):
+            await _run_coding_turn(
+                {
+                    "requestId": "mutation-secret-hygiene",
+                    "sessionId": "mutation-secret-hygiene-session",
+                    "messages": [{"role": "user", "content": "Can you add a file?"}],
+                },
+                send_json,
+                {"pending": {}, "completed": {}, "tasks": set()},
+                None,
+                "",
+            )
+            activity = _activity_event_payload(
+                {
+                    "actionId": "mutation-secret-hygiene-action",
+                    "tool": "read_file",
+                    "target": "src/example.py",
+                    "reason": "Read source.",
+                },
+                "mutation-secret-hygiene",
+                "mutation-secret-hygiene-session",
+                "COMPLETED",
+                result={"ok": True, "data": {"path": "src/example.py"}},
+            )
+            sent.append(activity)
+            from fastapi.testclient import TestClient
+
+            with TestClient(index.app) as client:
+                response = client.post(
+                    "/api/coding/mutation-handshake",
+                    json={"connectionId": "inactive-secret-hygiene-connection", "proof": "invalid"},
+                    headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
+                )
+
+        done = next(message for message in sent if message.get("type") == "done")
+        self.assertEqual(response.status_code, 403)
+        self.assertNotIn(secret, logs.getvalue())
+        self.assertNotIn(secret, json.dumps(activity))
+        self.assertNotIn(secret, json.dumps(done))
+        self.assertNotIn(secret, response.text)
 
 
 class CodingConversationBudgetTests(unittest.TestCase):
@@ -1541,7 +2182,10 @@ class CodingConversationBudgetTests(unittest.TestCase):
 
         compacted = _compact_coding_conversation(messages)
 
-        self.assertLessEqual(sum(len(str(message)) for message in compacted), MAX_CODING_CONVERSATION_CHARS + 500)
+        self.assertLessEqual(
+            len(json.dumps(compacted, ensure_ascii=False, default=str)),
+            MAX_CODING_CONVERSATION_CHARS,
+        )
         self.assertEqual(compacted[:2], messages[:2])
         self.assertEqual(compacted[2]["content"], "current request")
         self.assertEqual(compacted[-2]["tool_calls"][0]["id"], "call-7")
@@ -2570,6 +3214,7 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
     def test_task_specific_evidence_requirements_are_matched_to_linked_verified_evidence(self):
         task = _build_semantic_task(
             request_id="requirement-state",
+            session_id="requirement-state",
             user_message="How can this be reused?",
             intent="CODE_QUESTION",
             resources=["CODE"],
@@ -2760,6 +3405,7 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
     def test_requirement_conflict_and_live_database_provenance_are_enforced(self):
         task = _build_semantic_task(
             request_id="requirement-conflict-db",
+            session_id="requirement-conflict-db",
             user_message="Inspect live schema.",
             intent="DATABASE_INVESTIGATION",
             resources=["DATABASE"],
@@ -2793,7 +3439,15 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
         task["actions"].append(schema_action)
         task["evidence"].append({
             "evidenceId": "ev-schema-action",
+            "taskId": task["taskId"],
+            "sessionId": task["sessionId"],
+            "projectRoot": task["context"]["project"]["root"],
+            "scope": task["context"]["project"]["scope"],
+            "projectId": task["projectId"],
+            "repositoryId": task["repositoryId"],
             "type": "DATABASE",
+            "resource": "DATABASE",
+            "source": schema_action["tool"],
             "provenance": "READ_ONLY_TOOL_RESULT",
             "verified": True,
         })
@@ -2813,6 +3467,7 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
 
         conflict_task = _build_semantic_task(
             request_id="requirement-conflict",
+            session_id="requirement-conflict",
             user_message="Inspect conflicting source evidence.",
             intent="CODE_QUESTION",
             resources=["CODE"],
@@ -2828,13 +3483,29 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
         conflict_task["evidence"].extend([
             {
                 "evidenceId": "ev-existing",
+                "taskId": conflict_task["taskId"],
+                "sessionId": conflict_task["sessionId"],
+                "projectRoot": conflict_task["context"]["project"]["root"],
+                "scope": conflict_task["context"]["project"]["scope"],
+                "projectId": conflict_task["projectId"],
+                "repositoryId": conflict_task["repositoryId"],
                 "type": "CODE",
+                "resource": "CODE",
+                "source": "read_file",
                 "provenance": "READ_ONLY_TOOL_RESULT",
                 "verified": True,
             },
             {
                 "evidenceId": "ev-conflict",
+                "taskId": conflict_task["taskId"],
+                "sessionId": conflict_task["sessionId"],
+                "projectRoot": conflict_task["context"]["project"]["root"],
+                "scope": conflict_task["context"]["project"]["scope"],
+                "projectId": conflict_task["projectId"],
+                "repositoryId": conflict_task["repositoryId"],
                 "type": "CODE",
+                "resource": "CODE",
+                "source": "read_file",
                 "provenance": "READ_ONLY_TOOL_RESULT",
                 "verified": True,
                 "contradictsEvidenceIds": ["ev-existing"],
@@ -2847,6 +3518,7 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
                 "expectedEvidence": "Inspect the implementation.",
                 "status": "SUCCESS",
                 "resultEvidenceIds": ["ev-existing"],
+                "lastResult": {"ok": True, "data": {"content": "implementation"}},
             },
             {
                 "actionId": "conflicting-source",
@@ -2854,6 +3526,7 @@ class CodingProviderToolChoiceTests(unittest.TestCase):
                 "expectedEvidence": "Inspect the implementation.",
                 "status": "SUCCESS",
                 "resultEvidenceIds": ["ev-conflict"],
+                "lastResult": {"ok": True, "data": {"content": "conflicting implementation"}},
             },
         ])
         self.assertEqual(_task_evidence_sufficiency(conflict_task)["requirements"][
@@ -5997,12 +6670,11 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 ({
                     "role": "assistant",
                     "content": (
-                        "--- a/src/math.js\n"
-                        "+++ b/src/math.js\n"
-                        "@@ -1 +1,3 @@\n"
-                        " function subtract(a, b) { return a - b; }\n"
-                        "+\n"
-                        "+function add(a, b) { return a + b; }\n"
+                        "--- a/controllers/MainController.js\n"
+                        "+++ b/controllers/MainController.js\n"
+                        "@@ -1 +1,2 @@\n"
+                        " class MainController { add(a, b) { return a + b; } }\n"
+                        "+function addNumbers(a, b) { return a + b; }\n"
                     ),
                 }, provider),
             ])
@@ -6014,20 +6686,35 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                     if tool_name == "get_repository_map":
                         data = {
                             "languages": ["JavaScript"],
-                            "sourceDirectories": ["src"],
-                            "entryPoints": ["src/index.js"],
+                            "sourceDirectories": ["controllers"],
+                            "entryPoints": ["controllers/index.js"],
                         }
-                    elif tool_name == "search_code":
-                        data = {"results": [{
-                            "path": "src/math.js",
-                            "line": 1,
-                            "text": "// reusable number addition\nfunction add(a, b) { return a + b; }",
-                            "matchType": "content",
-                        }]}
+                    elif tool_name == "list_directory":
+                        directory = str(
+                            payload.get("arguments", {}).get("relativePath")
+                            or payload.get("arguments", {}).get("path")
+                            or "."
+                        ).strip("./\\")
+                        data = (
+                            [
+                                {"name": "controllers", "type": "directory"},
+                                {"name": "models", "type": "directory"},
+                                {"name": "web", "type": "directory"},
+                            ]
+                            if not directory
+                            else [{"name": "MainController.js", "type": "file"}]
+                            if directory == "controllers"
+                            else []
+                        )
                     else:
+                        path = str(
+                            payload.get("arguments", {}).get("path")
+                            or payload.get("arguments", {}).get("relativePath")
+                            or ""
+                        )
                         data = {
-                            "path": "src/math.js",
-                            "content": "// reusable number addition\nfunction subtract(a, b) { return a - b; }\n",
+                            "path": path,
+                            "content": "class MainController { add(a, b) { return a + b; } }\n",
                         }
                     state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
                         "ok": True,
@@ -6065,6 +6752,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                         "requestId": "ordinary-code-change",
                         "sessionId": "ordinary-code-change-session",
                         "projectRoot": project_root,
+                        "scope": ".",
                         "messages": [{"role": "user", "content": "write two number adding"}],
                     },
                     send_json,
@@ -6078,9 +6766,375 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(done["semanticTask"]["resolvedResources"], ["CODE", "REPOSITORY"])
             self.assertEqual(done["intent"], "SOURCE_CHANGE")
             self.assertTrue(done["proposalRequired"])
-            self.assertEqual([call["name"] for call in done["toolCalls"]], ["search_code", "read_file"])
-            self.assertIn("src/math.js", [item["path"] for item in done["filesRead"]])
+            self.assertEqual(
+                [call["name"] for call in done["toolCalls"]],
+                ["get_repository_map", "list_directory", "list_directory", "read_file"],
+            )
+            self.assertEqual(
+                [item["path"] for item in done["filesRead"]],
+                ["controllers/MainController.js"],
+            )
+            self.assertNotIn("number", " ".join([
+                item["path"] + item["content"] for item in done["filesRead"]
+            ]).casefold())
+            self.assertIn("--- a/controllers/MainController.js", done["content"])
+            self.assertIn("+++ b/controllers/MainController.js", done["content"])
             self.assertNotIn("DATABASE", done["semanticTask"]["resolvedResources"])
+
+    async def test_targetless_discovery_exhaustion_returns_one_clarification(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+            state = {"pending": {}, "completed": {}, "tasks": set()}
+            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+
+            async def send_json(payload):
+                sent.append(payload)
+                if payload.get("type") != "tool_call":
+                    return
+                name = payload["name"]
+                if name == "get_repository_map":
+                    data = {"sourceDirectories": ["controllers", "models", "web"]}
+                elif name == "list_directory":
+                    directory = str(
+                        payload.get("arguments", {}).get("relativePath")
+                        or payload.get("arguments", {}).get("path")
+                        or "."
+                    ).strip("./\\")
+                    data = (
+                        [
+                            {"name": "controllers", "type": "directory"},
+                            {"name": "models", "type": "directory"},
+                            {"name": "web", "type": "directory"},
+                        ]
+                        if not directory
+                        else []
+                    )
+                else:
+                    self.fail(f"Unexpected tool call without source files: {name}")
+                state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
+                    "ok": True,
+                    "tool": name,
+                    "data": data,
+                }
+
+            with patch(
+                "coding_websocket.ProjectContextLock.resolve_authoritative_root",
+                return_value=project_root,
+            ), patch("coding_websocket.ProjectContextLock.lock"), patch(
+                "coding_websocket.set_backend_project_state"
+            ), patch("coding_websocket.detect_project_architecture", return_value={}), patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(return_value={
+                    "is_deterministic": False,
+                    "route_to_code": True,
+                    "semanticTask": {
+                        "intent": "SOURCE_CHANGE",
+                        "goal": "Write two number adding.",
+                        "resourceCandidates": ["CODE", "REPOSITORY"],
+                        "resolvedResources": ["CODE", "REPOSITORY"],
+                    },
+                }),
+            ), patch(
+                "coding_websocket.complete_coding_model",
+                return_value=({"role": "assistant", "content": "Unrelated model answer."}, provider),
+            ) as complete:
+                await _run_coding_turn(
+                    {
+                        "requestId": "targetless-no-source",
+                        "sessionId": "targetless-no-source-session",
+                        "projectRoot": project_root,
+                        "scope": ".",
+                        "messages": [{"role": "user", "content": "write two number adding"}],
+                    },
+                    send_json,
+                    state,
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+
+            done_messages = [message for message in sent if message.get("type") == "done"]
+            self.assertTrue(
+                done_messages,
+                [(message.get("type"), message.get("message"), message.get("content")) for message in sent],
+            )
+            done = done_messages[0]
+            self.assertEqual(
+                done["status"],
+                "NEEDS_CLARIFICATION",
+                (done.get("toolCalls"), done.get("content")),
+            )
+            self.assertIn("readable source file", done["content"])
+            self.assertEqual(done["content"].count("?"), 1)
+            self.assertEqual(
+                [call["name"] for call in done["toolCalls"]],
+                ["get_repository_map", "list_directory", "list_directory", "list_directory"],
+            )
+            self.assertEqual(done["filesRead"], [])
+            self.assertFalse(any(message.get("type") == "error" for message in sent))
+            complete.assert_not_called()
+
+    async def test_file_creation_clarification_answer_continues_to_proposal(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            sent = []
+            state = {"pending": {}, "completed": {}, "tasks": set()}
+            provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+            responses = iter([
+                ({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "clarified-file-search",
+                        "function": {
+                            "name": "search_code",
+                            "arguments": json.dumps({"query": "abc.php"}),
+                        },
+                    }],
+                }, provider),
+                ({
+                    "role": "assistant",
+                    "content": (
+                        "--- a/controllers/abc.php\n"
+                        "+++ b/controllers/abc.php\n"
+                        "@@ -1 +1,2 @@\n"
+                        "<?php\n"
+                        "+// proposal change\n"
+                    ),
+                }, provider),
+            ])
+
+            async def send_json(payload):
+                sent.append(payload)
+                if payload.get("type") != "tool_call":
+                    return
+                if payload["name"] == "search_code":
+                    data = {"results": [{
+                        "path": "controllers/ExistingController.php",
+                        "line": 1,
+                        "text": "class ExistingController {}",
+                    }]}
+                elif payload["name"] == "read_file":
+                    data = {
+                        "path": "controllers/ExistingController.php",
+                        "content": "<?php class ExistingController {}\n",
+                    }
+                else:
+                    self.fail(f"Unexpected tool call: {payload['name']}")
+                state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
+                    "ok": True,
+                    "tool": payload["name"],
+                    "data": data,
+                }
+
+            async def resolve_task(*_args):
+                return {
+                    "is_deterministic": False,
+                    "route_to_code": True,
+                    "semanticTask": {
+                        "intent": "SOURCE_CHANGE",
+                        "goal": "Create a requested project file.",
+                        "resourceCandidates": ["CODE", "REPOSITORY"],
+                        "resolvedResources": ["CODE", "REPOSITORY"],
+                        "confidence": 0.9,
+                    },
+                }
+
+            with patch(
+                "coding_websocket.ProjectContextLock.resolve_authoritative_root",
+                return_value=project_root,
+            ), patch("coding_websocket.ProjectContextLock.lock"), patch(
+                "coding_websocket.set_backend_project_state"
+            ), patch("coding_websocket.detect_project_architecture", return_value={}), patch(
+                "coding_websocket.UNIVERSAL_INDEX.scan_and_update"
+            ), patch(
+                "coding_websocket._resolve_semantic_task_with_model",
+                new=AsyncMock(side_effect=resolve_task),
+            ) as resolve, patch(
+                "coding_websocket.complete_coding_model",
+                side_effect=lambda *args, **kwargs: next(responses),
+            ) as complete:
+                await _run_coding_turn(
+                    {
+                        "requestId": "create-file-clarification-1",
+                        "sessionId": "create-file-clarification-session",
+                        "projectRoot": project_root,
+                        "scope": "controllers",
+                        "messages": [{"role": "user", "content": "yume ek filenbnani hai"}],
+                    },
+                    send_json,
+                    state,
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+                first_done = next(
+                    message
+                    for message in reversed(sent)
+                    if message.get("type") == "done"
+                )
+                question = first_done["content"]
+                self.assertEqual(first_done["intent"], "SOURCE_CHANGE")
+                self.assertEqual(first_done["status"], "NEEDS_CLARIFICATION")
+                self.assertEqual(first_done["content"].count("?"), 1)
+                self.assertEqual(first_done["toolCalls"], [])
+                self.assertEqual(first_done["filesRead"], [])
+                complete.assert_not_called()
+
+                await _run_coding_turn(
+                    {
+                        "requestId": "create-file-clarification-2",
+                        "sessionId": "create-file-clarification-session",
+                        "projectRoot": project_root,
+                        "scope": "controllers",
+                        "messages": [
+                            {"role": "user", "content": "yume ek filenbnani hai"},
+                            {"role": "assistant", "content": question},
+                            {"role": "user", "content": "add abc.php in controllers"},
+                        ],
+                    },
+                    send_json,
+                    state,
+                    SimpleNamespace(get_active_provider=lambda: provider),
+                    "",
+                )
+
+            self.assertEqual(resolve.await_count, 2)
+            done = next(
+                message
+                for message in reversed(sent)
+                if message.get("type") == "done"
+            )
+            self.assertEqual(done["intent"], "SOURCE_CHANGE")
+            self.assertTrue(done["proposalRequired"])
+            self.assertIn("+++ b/controllers/abc.php", done["content"])
+            self.assertEqual(
+                [item["path"] for item in done["filesRead"]],
+                ["controllers/ExistingController.php"],
+            )
+            self.assertNotIn("I can't create", done["content"])
+            self.assertGreater(complete.call_count, 0)
+
+    async def test_new_named_files_reach_proposals_from_scoped_siblings(self):
+        for target, extension_line, scope, sibling_path in (
+            ("abc.php", "<?php", "controllers", "controllers/MainController.php"),
+            ("a.js", "export {};", ".", "MainController.php"),
+        ):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as project_root:
+                sent = []
+                state = {"pending": {}, "completed": {}, "tasks": set()}
+                provider = SimpleNamespace(id="test-provider", type="groq", model="test-model")
+                target_path = f"{scope}/{target}" if scope != "." else target
+                model_responses = []
+                if target == "abc.php":
+                    model_responses.append({
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "out-of-scope-read",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": json.dumps({"path": "outside/Secret.php"}),
+                            },
+                        }],
+                    })
+                model_responses.extend([
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": f"search-{target}",
+                            "function": {
+                                "name": "search_code",
+                                "arguments": json.dumps({"query": target}),
+                            },
+                        }],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"--- a/{target_path}\n"
+                            f"+++ b/{target_path}\n"
+                            "@@ -1 +1,2 @@\n"
+                            f" {extension_line}\n"
+                            "+// proposal change\n"
+                        ),
+                    },
+                ])
+                responses = iter((response, provider) for response in model_responses)
+
+                async def send_json(payload):
+                    sent.append(payload)
+                    if payload.get("type") != "tool_call":
+                        return
+                    if payload["name"] == "search_code":
+                        data = {"results": [{
+                            "path": sibling_path,
+                            "line": 1,
+                            "text": "class MainController {}",
+                        }]}
+                    elif payload["name"] == "read_file":
+                        data = {
+                            "path": sibling_path,
+                            "content": "<?php class MainController {}\n",
+                        }
+                    else:
+                        self.fail(f"Unexpected tool call: {payload['name']}")
+                    state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
+                        "ok": True,
+                        "tool": payload["name"],
+                        "data": data,
+                    }
+
+                with patch(
+                    "coding_websocket.ProjectContextLock.resolve_authoritative_root",
+                    return_value=project_root,
+                ), patch("coding_websocket.ProjectContextLock.lock"), patch(
+                    "coding_websocket.set_backend_project_state"
+                ), patch("coding_websocket.detect_project_architecture", return_value={}), patch(
+                    "coding_websocket._resolve_semantic_task_with_model",
+                    new=AsyncMock(return_value={
+                        "is_deterministic": False,
+                        "route_to_code": True,
+                        "semanticTask": {
+                            "intent": "SOURCE_CHANGE",
+                            "goal": f"Add {target}.",
+                            "resourceCandidates": ["CODE", "REPOSITORY"],
+                            "resolvedResources": ["CODE", "REPOSITORY"],
+                            "confidence": 0.95,
+                        },
+                    }),
+                ), patch(
+                    "coding_websocket.complete_coding_model",
+                    side_effect=lambda *args, **kwargs: next(responses),
+                ):
+                    await _run_coding_turn(
+                        {
+                            "requestId": f"named-target-{target}",
+                            "sessionId": f"named-target-session-{target}",
+                            "projectRoot": project_root,
+                            "scope": scope,
+                            "messages": [{"role": "user", "content": f"add {target} to the project"}],
+                        },
+                        send_json,
+                        state,
+                        SimpleNamespace(get_active_provider=lambda: provider),
+                        "",
+                    )
+
+                done = next(message for message in sent if message.get("type") == "done")
+                self.assertTrue(done["proposalRequired"])
+                self.assertIn(f"+++ b/{target_path}", done["content"])
+                self.assertEqual(
+                    [call["name"] for call in done["toolCalls"]],
+                    ["search_code", "read_file"],
+                )
+                self.assertEqual(
+                    [item["path"] for item in done["filesRead"]],
+                    [sibling_path],
+                )
+                self.assertNotIn(
+                    "outside/Secret.php",
+                    [
+                        payload.get("arguments", {}).get("path")
+                        for payload in sent
+                        if payload.get("type") == "tool_call"
+                    ],
+                )
 
     async def test_deferred_database_escalation_requires_source_evidence_and_activates_existing_discovery(self):
         task = _build_semantic_task(
@@ -6691,6 +7745,7 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ambiguous_proposal_request_returns_clarification_without_http_tool_choice_failure(self):
         sent = []
+        state = {"pending": {}, "completed": {}, "tasks": set()}
         configured_provider = SimpleNamespace(id="global-gemini-instance")
         runtime_provider = SimpleNamespace(
             id="groq-fallback-instance",
@@ -6700,6 +7755,18 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
 
         async def send_json(payload):
             sent.append(payload)
+            if payload.get("type") == "tool_call":
+                state["completed"][f"{payload['requestId']}:{payload['toolCallId']}"] = {
+                    "ok": True,
+                    "tool": "get_repository_map",
+                    "data": {
+                        "languages": [],
+                        "frameworks": [],
+                        "sourceDirectories": [],
+                        "entryPoints": [],
+                        "configFiles": [],
+                    },
+                }
 
         with patch(
             "coding_websocket.complete_coding_model",
@@ -6716,19 +7783,28 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
                     "messages": [{"role": "user", "content": "fix ka proposal/diff banao"}],
                 },
                 send_json,
-                {"pending": {}, "completed": {}, "tasks": set()},
+                state,
                 SimpleNamespace(get_active_provider=lambda: configured_provider),
                 Path("provider-config.json"),
             )
 
         done = next(message for message in sent if message.get("type") == "done")
-        self.assertEqual(done["content"], "Could you specify which file or issue you'd like to address?")
+        self.assertEqual(
+            done["content"],
+            "I couldn't find a readable source file in the attached scope. "
+            "Which directory should I inspect within the attached scope?",
+        )
+        self.assertEqual(done["content"].count("?"), 1)
         self.assertFalse(done["proposalRequired"])
-        self.assertEqual(done["providerId"], runtime_provider.id)
+        tool_calls = [message for message in sent if message.get("type") == "tool_call"]
+        self.assertFalse(any(
+            message.get("name") in {"write_file", "apply_file_mutation"}
+            for message in tool_calls
+        ))
+        self.assertIsNone(done["providerId"])
         self.assertEqual(done["configuredProviderId"], configured_provider.id)
-        self.assertTrue(done["fallback"])
-        self.assertIsNone(complete.call_args.args[4], "Client-supplied provider IDs must not override global selection.")
-        self.assertFalse(complete.call_args.args[5], "The first turn must not force a tool call.")
+        self.assertFalse(done["fallback"])
+        complete.assert_not_called()
 
     async def test_coding_turn_ignores_stale_client_provider_and_pins_actual_runtime_instance(self):
         sent = []
@@ -6960,7 +8036,12 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
         state = {"pending": {}, "completed": {}, "tasks": set()}
         with patch("coding_websocket.complete_coding_model", side_effect=lambda *args, **kwargs: next(responses)) as complete:
             await _run_coding_turn(
-                {"requestId": "proposal-follow-up", "scope": ".", "messages": messages},
+                {
+                    "requestId": "proposal-follow-up",
+                    "scope": ".",
+                    "messages": messages,
+                    "verificationAttempt": {"attemptNumber": 2, "maxAttempts": 3},
+                },
                 send_json,
                 state,
                 object(),
@@ -6970,6 +8051,11 @@ class CodingProposalRetryTests(unittest.IsolatedAsyncioTestCase):
         done = next(message for message in sent if message.get("type") == "done")
         self.assertTrue(done["proposalRequired"])
         self.assertEqual(done["content"], diff.strip())
+        self.assertEqual(done["verificationAttempt"], {
+            "attemptNumber": 2,
+            "maxAttempts": 3,
+            "label": "attempt 2 of 3",
+        })
         prompt = complete.call_args.args[2]
         self.assertIn("active change request", prompt[0]["content"])
         self.assertIn(messages[0]["content"], prompt[1]["content"])
@@ -8749,6 +9835,507 @@ class SpeechProviderSelectionTests(unittest.TestCase):
             self.assertEqual(index.get_stt_provider().id, self.gemini.id)
 
 
+class CodingTaskIntegrityRegressionTests(unittest.TestCase):
+    PROJECT_ROOT = "C:\\task-integrity-project"
+    SESSION_ID = "task-integrity-session"
+
+    def _task(self, requirements=None, details=None, facts=None, request_id="integrity"):
+        task = _build_semantic_task(
+            request_id=request_id,
+            session_id=self.SESSION_ID,
+            user_message="Inspect the requested project evidence.",
+            intent="CODE_QUESTION",
+            resources=["CODE", "REPOSITORY", "DATABASE", "RUNTIME"],
+            target="requested evidence",
+            project_root=self.PROJECT_ROOT,
+            scope="src",
+            architecture={},
+            required_evidence=list(requirements or []),
+            required_evidence_details=list(details or []),
+            conversation_message_count=1,
+        )
+        if facts is not None:
+            task["requiredFacts"] = facts
+        return task
+
+    def _add_read_evidence(self, task, requirement, action_id, path="src/target.py"):
+        action = {
+            "actionId": action_id,
+            "taskId": task["taskId"],
+            "tool": "read_file",
+            "target": path,
+            "expectedEvidence": requirement,
+            "resultEvidenceIds": [],
+        }
+        task["actions"].append(action)
+        result = {
+            "ok": True,
+            "data": {"path": path, "content": "def target(): return True"},
+        }
+        _update_task_from_tool_result(
+            task,
+            action,
+            result,
+            json.dumps(result),
+            self.SESSION_ID,
+        )
+        return action, task["evidence"][-1]
+
+    def test_requirement_refresh_discards_deleted_and_stale_evidence_ids(self):
+        requirement = "Inspect the implementation."
+        task = self._task([requirement], request_id="deleted-evidence")
+        _action, evidence = self._add_read_evidence(task, requirement, "deleted-read")
+        self.assertTrue(_task_evidence_sufficiency(task)["sufficient"])
+
+        task["evidence"].remove(evidence)
+        task["evidenceRequirements"][0].update({
+            "status": "VERIFIED",
+            "evidenceIds": [evidence["evidenceId"]],
+            "provenance": ["READ_ONLY_TOOL_RESULT"],
+        })
+
+        sufficiency = _task_evidence_sufficiency(task)
+        self.assertFalse(sufficiency["sufficient"])
+        self.assertEqual(task["evidenceRequirements"][0]["status"], "PENDING")
+        self.assertEqual(task["evidenceRequirements"][0]["evidenceIds"], [])
+        self.assertEqual(task["evidenceRequirements"][0]["provenance"], [])
+
+    def test_requirement_rejects_wrong_resource_scope_and_provenance(self):
+        requirement = "Inspect the implementation."
+        mutations = {
+            "wrong resource": lambda item, task: item.update({"resource": "DATABASE"}),
+            "wrong project": lambda item, task: item.update({"projectRoot": "C:\\other"}),
+            "wrong task": lambda item, task: item.update({"taskId": "other-task"}),
+            "wrong session": lambda item, task: item.update({"sessionId": "other-session"}),
+            "wrong repository": lambda item, task: item.update({"repositoryId": "other-repository"}),
+            "wrong provenance": lambda item, task: item.update({"provenance": "MODEL_ASSERTION"}),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                task = self._task([requirement], request_id=f"bad-{label.replace(' ', '-')}")
+                _action, evidence = self._add_read_evidence(
+                    task, requirement, f"bad-{label.replace(' ', '-')}-read"
+                )
+                mutate(evidence, task)
+                self.assertFalse(_task_evidence_sufficiency(task)["sufficient"])
+                self.assertEqual(task["evidenceRequirements"][0]["status"], "PENDING")
+
+    def test_failed_action_cannot_support_a_requirement(self):
+        requirement = "Inspect the implementation."
+        task = self._task([requirement], request_id="failed-support")
+        action, _evidence = self._add_read_evidence(task, requirement, "failed-support-read")
+        action["status"] = "FAILED"
+        self.assertFalse(_task_evidence_sufficiency(task)["sufficient"])
+        self.assertEqual(task["evidenceRequirements"][0]["evidenceIds"], [])
+
+    def test_unavailable_action_is_not_suppressed_by_another_requirements_old_ids(self):
+        first = "Inspect the implementation."
+        second = "Inspect the live database."
+        task = self._task(
+            [first, second],
+            request_id="unavailable-after-evidence",
+        )
+        _action, evidence = self._add_read_evidence(task, first, "first-evidence")
+        task["evidenceRequirements"][1]["evidenceIds"] = [evidence["evidenceId"]]
+        task["evidenceRequirements"][1]["status"] = "VERIFIED"
+        unavailable = {
+            "actionId": "second-unavailable",
+            "taskId": task["taskId"],
+            "tool": DatabaseCapability.DATABASE_QUERY,
+            "target": "live database",
+            "expectedEvidence": second,
+            "resultEvidenceIds": [],
+        }
+        task["actions"].append(unavailable)
+        result = {
+            "ok": False,
+            "executionStatus": "UNAVAILABLE",
+            "error": "database capability unavailable",
+        }
+        _update_task_from_tool_result(
+            task,
+            unavailable,
+            result,
+            json.dumps(result),
+            self.SESSION_ID,
+        )
+        _task_evidence_sufficiency(task)
+        self.assertEqual(task["evidenceRequirements"][0]["status"], "VERIFIED")
+        self.assertEqual(task["evidenceRequirements"][1]["status"], "UNAVAILABLE")
+
+    def test_contradictions_are_limited_to_evidence_for_the_same_requirement(self):
+        first = "Inspect the implementation."
+        second = "Inspect the reusable pattern."
+        task = self._task([first, second], request_id="isolated-conflicts")
+        _first_action, first_evidence = self._add_read_evidence(
+            task, first, "conflict-first"
+        )
+        _second_action, second_evidence = self._add_read_evidence(
+            task, second, "conflict-second", "src/pattern.py"
+        )
+        second_evidence["contradictsEvidenceIds"] = [first_evidence["evidenceId"]]
+
+        state = _task_evidence_sufficiency(task)
+        self.assertTrue(state["sufficient"])
+        self.assertEqual(
+            [item["status"] for item in task["evidenceRequirements"]],
+            ["VERIFIED", "VERIFIED"],
+        )
+
+    def test_valid_evidence_survives_knowledge_revision_but_not_record_removal(self):
+        requirement = "Inspect the implementation."
+        task = self._task([requirement], request_id="revision-check")
+        _action, evidence = self._add_read_evidence(task, requirement, "revision-read")
+        task["knowledgeRevision"] += 4
+        state = _task_evidence_sufficiency(task)
+        self.assertTrue(state["sufficient"])
+        self.assertEqual(
+            task["evidenceRequirements"][0]["knowledgeRevision"],
+            task["knowledgeRevision"],
+        )
+        task["evidence"].remove(evidence)
+        self.assertFalse(_task_evidence_sufficiency(task)["sufficient"])
+
+    def test_strict_schema_query_and_verification_proof_types_remain_required(self):
+        task = self._task(
+            ["Verify the live database schema."],
+            [{
+                "requirement": "Verify the live database schema.",
+                "resource": "DATABASE",
+                "evidenceType": "LIVE_DATABASE_SCHEMA",
+            }],
+            request_id="strict-schema-proof",
+        )
+        action = {
+            "actionId": "schema-proof-read",
+            "taskId": task["taskId"],
+            "tool": DatabaseCapability.DATABASE_QUERY,
+            "target": "live schema",
+            "expectedEvidence": "Verify the live database schema.",
+            "status": "SUCCESS",
+            "resultEvidenceIds": ["ev-schema-proof-read"],
+            "lastResult": {
+                "ok": True,
+                "data": {
+                    "schemaDetails": {"tables": ["users"]},
+                    "schemaEvidenceId": "not-live",
+                },
+            },
+        }
+        task["actions"].append(action)
+        task["evidence"].append({
+            **{
+                "evidenceId": "ev-schema-proof-read",
+                "taskId": task["taskId"],
+                "sessionId": self.SESSION_ID,
+                "projectRoot": self.PROJECT_ROOT,
+                "scope": "src",
+                "projectId": task.get("projectId"),
+                "repositoryId": task.get("repositoryId"),
+                "turnId": task["turnId"],
+                "type": "DATABASE",
+                "resource": "DATABASE",
+                "source": DatabaseCapability.DATABASE_QUERY,
+                "provenance": "READ_ONLY_TOOL_RESULT",
+                "verified": True,
+            }
+        })
+        self.assertFalse(_task_evidence_sufficiency(task)["sufficient"])
+
+    def _credential_task(self, properties, request_id="credential-integrity"):
+        return _build_semantic_task(
+            request_id=request_id,
+            session_id=self.SESSION_ID,
+            user_message="Inspect requested database credential metadata.",
+            intent=TaskIntent.DATABASE_CREDENTIAL_REQUEST,
+            resources=["DATABASE", "CONFIGURATION"],
+            target=None,
+            project_root=self.PROJECT_ROOT,
+            scope=".",
+            architecture={},
+            capability=DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
+            capability_arguments={"properties": properties},
+        )
+
+    def test_configured_status_does_not_imply_password_presence(self):
+        task = self._credential_task(["credentialStatus", "password"])
+        self.assertEqual(
+            {fact["name"] for fact in task["requiredFacts"]},
+            {"credentialStatus", "passwordPresence"},
+        )
+        _update_task_credential_facts(
+            task,
+            {"credentialStatus": "CONFIGURED"},
+        )
+        facts = {fact["name"]: fact for fact in task["requiredFacts"]}
+        self.assertEqual(facts["credentialStatus"]["value"], "CONFIGURED")
+        self.assertEqual(facts["credentialStatus"]["status"], "VERIFIED")
+        self.assertEqual(facts["passwordPresence"]["status"], "NOT_YET_RESOLVED")
+
+    def test_explicit_password_presence_is_verified_without_storing_password_value(self):
+        task = self._credential_task(["password"], request_id="password-present")
+        secret = "private-password-test-value"
+        _update_task_credential_facts(
+            task,
+            {"passwordPresent": True},
+            credentials={"password": secret},
+        )
+        fact = task["requiredFacts"][0]
+        self.assertEqual(fact["status"], "VERIFIED")
+        self.assertEqual(fact["value"], "PRESENT")
+        self.assertNotIn(secret, json.dumps(task))
+
+    def test_missing_optional_password_metadata_does_not_prove_absence(self):
+        task = self._credential_task(["password"], request_id="password-unknown")
+        _update_task_credential_facts(task, {})
+        self.assertEqual(task["requiredFacts"][0]["status"], "NOT_YET_RESOLVED")
+        self.assertNotEqual(task["requiredFacts"][0].get("value"), "ABSENT")
+
+    def test_explicit_password_absence_and_distinct_credential_status_are_kept_separate(self):
+        task = self._credential_task(
+            ["password", "credentialStatus"],
+            request_id="password-absent",
+        )
+        _update_task_credential_facts(
+            task,
+            {"credentialStatus": "NOT_CONFIGURED", "passwordPresent": False},
+        )
+        facts = {fact["name"]: fact for fact in task["requiredFacts"]}
+        self.assertEqual(facts["passwordPresence"]["value"], "ABSENT")
+        self.assertEqual(facts["credentialStatus"]["value"], "NOT_CONFIGURED")
+        self.assertNotEqual(facts["passwordPresence"]["value"], facts["credentialStatus"]["value"])
+
+    def test_configuration_session_conflicts_remain_unresolved_with_provenance(self):
+        task = self._credential_task(
+            ["username", "database"],
+            request_id="credential-conflict",
+        )
+        _update_task_credential_facts(
+            task,
+            {"username": "configured_user", "database": "configured_db"},
+            active_session=SimpleNamespace(
+                username="session_user",
+                database_name="session_db",
+            ),
+        )
+        self.assertTrue(all(
+            fact["status"] == "UNRESOLVED" and fact.get("conflictSources")
+            for fact in task["requiredFacts"]
+        ))
+
+    def test_nonconflicting_credential_facts_keep_their_source(self):
+        task = self._credential_task(
+            ["engine", "host", "port", "username", "database"],
+            request_id="credential-sources",
+        )
+        _update_task_credential_facts(
+            task,
+            {
+                "engine": "mysql",
+                "host": "db.internal",
+                "port": 3306,
+                "username": "app_user",
+                "database": "app_db",
+            },
+        )
+        self.assertTrue(all(fact["status"] == "VERIFIED" for fact in task["requiredFacts"]))
+        self.assertTrue(all(
+            fact["source"] == "PROJECT_CONFIGURATION"
+            for fact in task["requiredFacts"]
+        ))
+
+    def test_resource_routing_uses_registered_capability_metadata_and_fails_closed(self):
+        self.assertEqual(_task_resource_for_tool("read_file"), "CODE")
+        self.assertEqual(_task_resource_for_tool("get_repository_map"), "REPOSITORY")
+        self.assertEqual(_task_resource_for_tool("execute_sql"), "DATABASE")
+        self.assertEqual(_task_resource_for_tool("run_verification"), "RUNTIME")
+        self.assertEqual(_task_resource_for_tool("not_registered"), "UNKNOWN")
+        self.assertEqual(_task_resource_for_tool(DatabaseCapability.DATABASE_QUERY), "DATABASE")
+
+        task = {"resourceDecision": {
+            "selectedResource": "repository",
+            "deferredResources": ["database"],
+        }}
+        filtered = _tools_for_task_resources(
+            [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "execute_sql"}},
+                {"type": "function", "function": {"name": "unregistered_tool"}},
+            ],
+            task,
+        )
+        self.assertEqual(
+            [item["function"]["name"] for item in filtered],
+            ["read_file"],
+        )
+        task["resourceDecision"]["selectedResource"] = "database"
+        active = _tools_for_task_resources(
+            [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "execute_sql"}},
+            ],
+            task,
+        )
+        self.assertEqual(
+            [item["function"]["name"] for item in active],
+            ["read_file", "execute_sql"],
+        )
+
+    def test_missing_or_mismatched_capability_resource_metadata_is_unknown(self):
+        canonical = CapabilityIntelligenceEngine.resolve_capability("search_code")
+        metadata = CapabilityIntelligenceEngine.CAPABILITY_METADATA.pop(canonical)
+        try:
+            self.assertEqual(_task_resource_for_tool("search_code"), "UNKNOWN")
+            CapabilityIntelligenceEngine.CAPABILITY_METADATA[canonical] = {"resource": "INVALID"}
+            self.assertEqual(_task_resource_for_tool("search_code"), "UNKNOWN")
+        finally:
+            CapabilityIntelligenceEngine.CAPABILITY_METADATA[canonical] = metadata
+
+    def test_empty_requirements_and_unresolved_facts_cannot_complete_or_block_task(self):
+        empty = {
+            "requiredFacts": [],
+            "evidenceRequirementDefinitions": [],
+            "investigationExhausted": True,
+            "workingMemory": {},
+        }
+        _update_task_completeness(empty)
+        self.assertFalse(empty["objectiveSatisfied"])
+        self.assertFalse(empty["requiredEvidenceSatisfied"])
+
+        unresolved = {
+            "requiredFacts": [{"name": "username", "status": "UNRESOLVED"}],
+            "investigationExhausted": True,
+            "workingMemory": {},
+        }
+        _update_task_completeness(unresolved)
+        self.assertFalse(unresolved["objectiveSatisfied"])
+
+    def test_successful_uninformative_or_unrelated_results_do_not_verify_objectives(self):
+        requirement = "Inspect the implementation."
+        task = self._task([requirement], request_id="uninformative-result")
+        action = {
+            "actionId": "uninformative-read",
+            "taskId": task["taskId"],
+            "tool": "read_file",
+            "target": "src/empty.py",
+            "expectedEvidence": requirement,
+            "resultEvidenceIds": [],
+        }
+        task["actions"].append(action)
+        _update_task_from_tool_result(
+            task,
+            action,
+            {"ok": True, "data": {}},
+            '{"ok":true,"data":{}}',
+            self.SESSION_ID,
+        )
+        self.assertEqual(action["status"], "SUCCESS")
+        self.assertEqual(task["evidence"], [])
+        self.assertFalse(task["objectiveSatisfied"])
+
+        other = self._task([requirement], request_id="unrelated-result")
+        _action, _evidence = self._add_read_evidence(
+            other,
+            "A different requirement.",
+            "unrelated-read",
+        )
+        self.assertFalse(_task_evidence_sufficiency(other)["sufficient"])
+        self.assertFalse(other["objectiveSatisfied"])
+
+    def test_fully_verified_requirement_is_objective_sufficient(self):
+        requirement = "Inspect the implementation."
+        task = self._task([requirement], request_id="fully-verified")
+        self._add_read_evidence(task, requirement, "fully-verified-read")
+        self.assertTrue(_task_evidence_sufficiency(task)["sufficient"])
+        self.assertTrue(task["objectiveSatisfied"])
+        self.assertTrue(task["requiredEvidenceSatisfied"])
+
+    def test_context_compaction_bounds_task_state_and_preserves_latest_request(self):
+        state_message = {
+            "role": "system",
+            "content": "Current bounded AgentTaskState (authoritative):\n" + json.dumps({
+                "taskId": "new-task",
+                "currentRequest": "latest request",
+                "facts": [{"statement": "historical fact " + "x" * 3000} for _ in range(30)],
+                "evidence": [{"summary": "historical evidence " + "y" * 3000} for _ in range(30)],
+            }),
+        }
+        policy_message = {
+            "role": "system",
+            "content": "Required safety instructions. AgentTaskState is authoritative task memory.",
+        }
+        messages = [
+            policy_message,
+            *[
+                {
+                    "role": "system",
+                    "content": "Current bounded AgentTaskState:\n" + json.dumps({
+                        "taskId": f"old-{index}",
+                        "facts": [{"statement": "old " + "z" * 20000}],
+                    }),
+                }
+                for index in range(4)
+            ],
+            state_message,
+            {"role": "user", "content": "Explain the current request exactly."},
+        ]
+        compacted = _compact_coding_conversation(messages)
+        self.assertLessEqual(
+            len(json.dumps(compacted, ensure_ascii=False, default=str)),
+            MAX_CODING_CONVERSATION_CHARS,
+        )
+        self.assertEqual(compacted[-1]["content"], messages[-1]["content"])
+        self.assertIn(policy_message, compacted)
+        self.assertEqual(
+            sum(
+                item.get("role") == "system"
+                and item.get("content", "").startswith("Current bounded AgentTaskState")
+                for item in compacted
+            ),
+            1,
+        )
+
+    def test_context_compaction_preserves_complete_tool_call_result_groups(self):
+        messages = [
+            {"role": "system", "content": "Required instructions."},
+            {"role": "user", "content": "Find the target implementation."},
+            {"role": "assistant", "tool_calls": [
+                {"id": "call-a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "call-b", "function": {"name": "search_code", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call-a", "content": "target implementation"},
+            {"role": "tool", "tool_call_id": "call-b", "content": "target search result"},
+            {"role": "assistant", "content": "old history " + "x" * MAX_CODING_CONVERSATION_CHARS},
+        ]
+        compacted = _compact_coding_conversation(messages)
+        tool_calls = [
+            call["id"]
+            for message in compacted
+            if message.get("role") == "assistant"
+            for call in message.get("tool_calls", [])
+        ]
+        tool_results = [
+            message["tool_call_id"]
+            for message in compacted
+            if message.get("role") == "tool"
+        ]
+        self.assertEqual(tool_calls, ["call-a", "call-b"])
+        self.assertEqual(tool_results, ["call-a", "call-b"])
+        self.assertLessEqual(
+            len(json.dumps(compacted, ensure_ascii=False, default=str)),
+            MAX_CODING_CONVERSATION_CHARS,
+        )
+
+    def test_oversized_latest_user_request_fails_with_actionable_context_error(self):
+        messages = [
+            {"role": "system", "content": "Required instructions."},
+            {"role": "user", "content": "x" * (MAX_CODING_CONVERSATION_CHARS + 1)},
+        ]
+        with self.assertRaises(CodingContextTooLargeError) as raised:
+            _compact_coding_conversation(messages)
+        self.assertIn("Shorten the request", str(raised.exception))
+
+
 class DatabaseEvidenceIntegrityTests(unittest.TestCase):
     def test_unregistered_live_label_cannot_upgrade_database_evidence(self):
         DatabaseEvidenceStore.clear()
@@ -8908,10 +10495,11 @@ class DatabaseEvidenceIntegrityTests(unittest.TestCase):
     def test_proposal_source_candidate_prefers_a_task_relevant_search_hit(self):
         task_state = {
             "userRequest": (
-                "In the attached project, add a reusable function for adding two numbers. "
+                "In the attached project, add a reusable function in NumberHelper.php. "
                 "Inspect the relevant implementation source first."
             ),
             "goal": {"statement": "Create a reusable two-number addition helper."},
+            "requestedTargets": {"files": ["NumberHelper.php"], "symbols": []},
             "actions": [
                 {
                     "tool": "search_code",
@@ -8949,7 +10537,7 @@ class DatabaseEvidenceIntegrityTests(unittest.TestCase):
         self.assertFalse(_has_relevant_proposal_source_evidence(task_state))
         self.assertEqual(
             _proposal_source_search_query(task_state),
-            "addition helper number",
+            "addition helper number NumberHelper.php",
         )
         self.assertEqual(
             _proposal_source_candidate_from_search(task_state),
@@ -9517,32 +11105,106 @@ class CodingRequestAuthenticationTests(unittest.TestCase):
         import index
         from fastapi.testclient import TestClient
 
+        mutation_secret = "test-mutation-secret"
+        request_binding = {
+            "taskId": "task-1",
+            "turnId": "turn-1",
+            "requestHash": "a" * 64,
+            "root": str(Path.cwd().resolve()),
+            "scope": ".",
+            "authorizedFeatures": ["shared"],
+        }
         payload = {
             "operation": "create",
             "paths": ["src/new.py"],
             "proposalApproved": True,
+            "deleteConfirmed": False,
+            "requestBinding": request_binding,
         }
-        with TestClient(index.app) as client:
+        proof = hmac.new(
+            mutation_secret.encode("utf-8"),
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        signed_headers = {
+            "X-Coding-Auth": index.CODING_AUTH_TOKEN,
+            "X-Coding-Mutation-Proof": proof,
+        }
+        with patch.object(index, "CODING_MUTATION_HANDSHAKE_SECRET", mutation_secret), TestClient(index.app) as client:
             unauthorized = client.post("/api/coding/policy/file-mutation", json=payload)
             allowed = client.post(
                 "/api/coding/policy/file-mutation",
                 json=payload,
+                headers=signed_headers,
+            )
+            unsigned = client.post(
+                "/api/coding/policy/file-mutation",
+                json=payload,
                 headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
             )
+            tampered = client.post(
+                "/api/coding/policy/file-mutation",
+                json={**payload, "paths": ["src/features/meeting/transcript.ts"]},
+                headers=signed_headers,
+            )
+            delete_payload = {
+                **payload,
+                "operation": "delete",
+                "paths": ["src/old.py"],
+            }
+            delete_proof = hmac.new(
+                mutation_secret.encode("utf-8"),
+                json.dumps(delete_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
             unconfirmed_delete = client.post(
                 "/api/coding/policy/file-mutation",
-                json={
-                    "operation": "delete",
-                    "paths": ["src/old.py"],
-                    "proposalApproved": True,
+                json=delete_payload,
+                headers={
+                    "X-Coding-Auth": index.CODING_AUTH_TOKEN,
+                    "X-Coding-Mutation-Proof": delete_proof,
                 },
-                headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
             )
 
         self.assertEqual(unauthorized.status_code, 401)
         self.assertEqual(allowed.status_code, 200)
         self.assertEqual(allowed.json()["decision"], "ALLOW")
+        self.assertEqual(unsigned.status_code, 403)
+        self.assertEqual(tampered.status_code, 403)
         self.assertEqual(unconfirmed_delete.json()["decision"], "BLOCK")
+
+    def test_mutation_handshake_requires_main_process_proof_and_active_connection(self):
+        import index
+        from fastapi.testclient import TestClient
+
+        connection_id = "active-coding-connection-123456"
+        secret = "main-process-only-handshake-secret"
+        proof = hmac.new(secret.encode(), connection_id.encode(), hashlib.sha256).hexdigest()
+        _set_coding_connection_active(connection_id, True)
+        try:
+            with patch.object(index, "CODING_MUTATION_HANDSHAKE_SECRET", secret), TestClient(index.app) as client:
+                unauthenticated = client.post("/api/coding/mutation-handshake", json={
+                    "connectionId": connection_id,
+                    "proof": proof,
+                })
+                unauthenticated_proof = client.post(
+                    "/api/coding/mutation-handshake",
+                    json={"connectionId": connection_id, "proof": "wrong"},
+                    headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
+                )
+                self.assertFalse(_capability_question_answer("Can you add a file?", connection_id).startswith("Yes."))
+                authenticated = client.post(
+                    "/api/coding/mutation-handshake",
+                    json={"connectionId": connection_id, "proof": proof},
+                    headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
+                )
+            self.assertEqual(unauthenticated.status_code, 401)
+            self.assertEqual(unauthenticated_proof.status_code, 403)
+            self.assertEqual(authenticated.status_code, 200)
+            self.assertTrue(authenticated.json()["registered"])
+            self.assertTrue(_capability_question_answer("Can you add a file?", connection_id).startswith("Yes."))
+        finally:
+            _set_coding_connection_active(connection_id, False)
 
     def test_coding_http_requires_launch_token_and_trusted_origin(self):
         import index
@@ -9663,17 +11325,66 @@ class CodingWebSocketAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 async with websockets.connect(uri, origin=origin) as browser:
                     await browser.send(json.dumps({"type": "authenticate", "token": ""}))
                     browser_acknowledgement = json.loads(await browser.recv())
-                    self.assertEqual(
-                        browser_acknowledgement,
-                        {"type": "authenticated", "authenticated": True},
-                    )
+                    self.assertEqual(browser_acknowledgement["type"], "authenticated")
+                    self.assertTrue(browser_acknowledgement["authenticated"])
+                    self.assertRegex(browser_acknowledgement["connectionId"], r"^[A-Za-z0-9_-]{24,128}$")
 
             async with websockets.connect(uri, origin=origin) as authenticated:
                 await authenticated.send(
                     json.dumps({"type": "authenticate", "token": "test-launch-token"})
                 )
                 acknowledgement = json.loads(await authenticated.recv())
-                self.assertEqual(acknowledgement, {"type": "authenticated", "authenticated": True})
+                self.assertEqual(acknowledgement["type"], "authenticated")
+                self.assertTrue(acknowledgement["authenticated"])
+                self.assertRegex(acknowledgement["connectionId"], r"^[A-Za-z0-9_-]{24,128}$")
+        finally:
+            server.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await server
+
+    async def test_mutation_capability_is_unregistered_after_websocket_disconnect(self):
+        import websockets
+
+        secret = "disconnect-test-private-secret"
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        origin = "http://localhost:3000"
+        server = asyncio.create_task(
+            run_coding_websocket_server(
+                port,
+                registry=None,
+                config_path="",
+                auth_token="disconnect-test-launch-token",
+                trusted_origins=[origin],
+            )
+        )
+        uri = f"ws://127.0.0.1:{port}"
+        try:
+            async with websockets.connect(uri, origin=origin) as websocket:
+                await websocket.send(json.dumps({
+                    "type": "authenticate",
+                    "token": "disconnect-test-launch-token",
+                }))
+                acknowledgement = json.loads(await websocket.recv())
+                connection_id = acknowledgement["connectionId"]
+                proof = hmac.new(
+                    secret.encode("utf-8"),
+                    connection_id.encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
+                self.assertTrue(register_coding_mutation_capability(connection_id, proof, secret))
+                self.assertTrue(
+                    _capability_question_answer("Can you add a file?", connection_id).startswith("Yes.")
+                )
+            for _ in range(50):
+                if _capability_question_answer("Can you add a file?", connection_id).startswith("No."):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertFalse(TOOL_CAPABILITIES.get("apply_file_mutation", {}).get("available", False))
+            self.assertTrue(
+                _capability_question_answer("Can you add a file?", connection_id).startswith("No.")
+            )
         finally:
             server.cancel()
             with contextlib.suppress(asyncio.CancelledError):

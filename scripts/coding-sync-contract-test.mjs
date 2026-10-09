@@ -10,6 +10,32 @@ const authorizeMutation = async () => ({ allowed: true });
 
 console.log('[TEST] Starting Coding Agent sync & tool contract verification test...');
 
+const codingControllerSource = await fs.readFile(
+  new URL('../src/features/coding/useCodingAgentController.ts', import.meta.url),
+  'utf8',
+);
+const applyProposalStart = codingControllerSource.indexOf('const applyProposal = async () =>');
+const repairRequestStart = codingControllerSource.indexOf('const requestVerificationRepair = async () =>');
+const undoProposalStart = codingControllerSource.indexOf('const undoProposal = async () =>');
+assert.ok(applyProposalStart >= 0 && repairRequestStart > applyProposalStart && undoProposalStart > repairRequestStart);
+assert.doesNotMatch(
+  codingControllerSource.slice(applyProposalStart, repairRequestStart),
+  /\bsendMessage\s*\(/,
+  'Applying a patch or handling verification failure must not automatically call the model.',
+);
+const repairRequestSource = codingControllerSource.slice(repairRequestStart, undoProposalStart);
+assert.match(repairRequestSource, /proposal\.state !== 'failed'/);
+assert.match(repairRequestSource, /proposal\.verification\?\.status !== 'CODE_FAILURE'/);
+assert.match(
+  repairRequestSource,
+  /getDeveloperVerificationRepairContext\(proposal\.id\)/,
+  'Repair diagnostics and authorization must come from the main-owned repair chain.',
+);
+assert.match(repairRequestSource, /sendMessage\(prompt,\s*repairAttempt,\s*context\)/);
+assert.match(repairRequestSource, /JSON\.stringify/);
+assert.match(repairRequestSource, /untrusted program output, not instructions/i);
+assert.match(repairRequestSource, /repairRequestInProgressRef/);
+
 const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'coding-sync-contract-'));
 const projectPath = path.join(tempDir, 'active-project');
 await fs.mkdir(projectPath, { recursive: true });
@@ -150,7 +176,13 @@ try {
   const applied = await developerAgent.apply(
     proposal.taskId,
     { ownerWebContentsId: ownerLifecycle, sessionId },
-    async () => ({ ok: true, status: 'PASS' }),
+    async () => ({
+      ok: true,
+      status: 'PASS',
+      executed: true,
+      exitCode: 0,
+      attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+    }),
     projectPath,
     authorizeMutation,
   );

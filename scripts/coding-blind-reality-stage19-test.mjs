@@ -24,14 +24,22 @@ import {
 } from '../electron/coding-pipeline/correctnessEngine.cjs';
 import { taskOrchestrator } from '../electron/coding-pipeline/orchestrator.cjs';
 import { dirtyWorktreeProtector } from '../electron/coding-pipeline/dirtyWorktree.cjs';
-import { multiRepoCoordinator } from '../electron/coding-pipeline/multiRepo.cjs';
+import * as multiRepoModule from '../electron/coding-pipeline/multiRepo.cjs';
+const { multiRepoCoordinator } = multiRepoModule;
 import { verificationOrchestrator } from '../electron/coding-pipeline/verificationOrchestrator.cjs';
 import { runBlindRealRepositoryEngineeringBenchmark } from '../electron/developerBenchmark.cjs';
 
 async function runStage19TestSuite() {
   console.log('=== RUNNING STAGE 19 BLIND REAL-REPOSITORY ENGINEERING REALITY VERIFICATION ===\n');
+  assert.equal(
+    Object.hasOwn(multiRepoModule, 'registerPolicyGateAuthorizer'),
+    false,
+    'Rollback authorization registration must not be exposed as a general module API.',
+  );
 
   const tempBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'stage19-reality-'));
+  const checkpointStorageRoot = path.join(tempBaseDir, 'checkpoints');
+  taskOrchestrator.setCheckpointStorageRoot(checkpointStorageRoot);
 
   try {
     // -------------------------------------------------------------
@@ -356,7 +364,7 @@ async function runStage19TestSuite() {
       { repoRoot: mRepoB, files: [fileB], patch: 'v2' },
     ];
 
-    // Force failure on Repo B
+    // Callback-based mutation is rejected before either repository can be changed.
     const applyWithFailB = async (root, patch, files) => {
       if (root === mRepoA) {
         await fs.writeFile(files[0], 'export const v = 2;\n');
@@ -365,19 +373,74 @@ async function runStage19TestSuite() {
       return { ok: false, error: 'Database constraint violation in Repo B' };
     };
 
-    const coordRes = await multiCoord.executeCoordinatedChange(
-      coordTaskId,
-      multiChanges,
-      applyWithFailB,
-      async () => ({ ok: true })
+    await assert.rejects(
+      () => multiCoord.executeCoordinatedChange(
+        coordTaskId,
+        multiChanges,
+        applyWithFailB,
+        async () => ({ ok: true }),
+        async () => ({ allowed: true }),
+      ),
+      /callbacks can mutate outside the authorized target set/i,
     );
-
-    assert.equal(coordRes.ok, false);
-    assert.equal(coordRes.transactionalRollback, true);
+    assert.equal(await fs.readFile(fileA, 'utf8'), 'export const v = 1;\n');
 
     const rolledBackContentA = await fs.readFile(fileA, 'utf8');
-    assert.equal(rolledBackContentA, 'export const v = 1;\n', 'Repo A must be rolled back to baseline');
-    console.log('[PASS] Multi-repo coordination with transactional rollback verified on forced failure.');
+    assert.equal(rolledBackContentA, 'export const v = 1;\n', 'Rejected callback must leave the repository unchanged');
+
+    const guardedRoot = path.join(tempBaseDir, 'guarded-repo');
+    await fs.mkdir(guardedRoot, { recursive: true });
+    const guardedFile = path.join(guardedRoot, 'guarded.js');
+    await fs.writeFile(guardedFile, 'baseline\n');
+    const guardedCoordinator = new multiRepoCoordinator.constructor();
+    await guardedCoordinator.captureBaselineSnapshot('guarded-task', guardedRoot, [guardedFile]);
+    await fs.writeFile(guardedFile, 'changed\n');
+    await guardedCoordinator.recordRepoModification('guarded-task', guardedRoot, [guardedFile]);
+    await assert.rejects(
+      () => guardedCoordinator.rollbackMultiRepoChanges('guarded-task'),
+      /requires the authoritative mutation policy/,
+    );
+    await assert.rejects(
+      () => guardedCoordinator.rollbackMultiRepoChanges('guarded-task', async () => ({ allowed: false })),
+      /Policy Gate denied/i,
+    );
+    assert.equal(await fs.readFile(guardedFile, 'utf8'), 'changed\n');
+    await guardedCoordinator.rollbackMultiRepoChanges(
+      'guarded-task',
+      async () => ({ allowed: true }),
+    );
+    assert.equal(await fs.readFile(guardedFile, 'utf8'), 'baseline\n');
+    let unauthorizedApplyCalled = false;
+    await assert.rejects(
+      () => guardedCoordinator.executeCoordinatedChange(
+        'unguarded-apply-task',
+        [{ repoRoot: guardedRoot, files: [guardedFile], patch: 'unapproved' }],
+        async () => {
+          unauthorizedApplyCalled = true;
+          await fs.writeFile(guardedFile, 'unapproved\n');
+          return { ok: true };
+        },
+        async () => ({ ok: true }),
+        async () => ({ allowed: true }),
+      ),
+      /callbacks can mutate outside the authorized target set/i,
+    );
+    assert.equal(unauthorizedApplyCalled, false);
+    assert.equal(await fs.readFile(guardedFile, 'utf8'), 'baseline\n');
+
+    const escapedRoot = path.join(tempBaseDir, 'guarded-repo-link');
+    const outsideRoot = path.join(tempBaseDir, 'outside-repo');
+    await fs.mkdir(escapedRoot, { recursive: true });
+    await fs.mkdir(outsideRoot, { recursive: true });
+    const outsideFile = path.join(outsideRoot, 'outside.js');
+    await fs.writeFile(outsideFile, 'outside\n');
+    await fs.symlink(outsideRoot, path.join(escapedRoot, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+    await assert.rejects(
+      () => guardedCoordinator.captureBaselineSnapshot('escaped-task', escapedRoot, ['linked/outside.js']),
+      /parent escapes its repository/i,
+    );
+    assert.equal(await fs.readFile(outsideFile, 'utf8'), 'outside\n');
+    console.log('[PASS] Multi-repo rollback rejects denied Policy Gate authorization.');
 
     // -------------------------------------------------------------
     // 11. Real Persistence, Disconnect & Process Restart (Sections 28-29)
@@ -387,7 +450,7 @@ async function runStage19TestSuite() {
     const restartTask = taskOrchestrator.createTask({
       taskId: restartTaskId,
       goal: 'Endure process restart and reconnect',
-      workspaceRoot: tempBaseDir,
+      workspace: tempBaseDir,
     });
     restartTask.findings.push('Causal link established');
 
@@ -396,16 +459,20 @@ async function runStage19TestSuite() {
     assert.equal(disconnectRes.backgroundRunning, true);
 
     // Save atomic disk checkpoint
-    const restartChkPath = path.join(tempBaseDir, 'stage19_chk.json');
-    const chkSaved = await taskOrchestrator.saveCheckpointToDisk(restartTaskId, restartChkPath, 'pre_restart');
+    const chkSaved = await taskOrchestrator.saveCheckpointToDisk(restartTaskId, 'pre_restart');
     assert.ok(chkSaved);
+    const restartChkPath = taskOrchestrator.getCheckpointPath(restartTaskId);
 
     // Simulate complete process restart (clear memory)
     taskOrchestrator._tasks.delete(restartTaskId);
     assert.equal(taskOrchestrator.getTask(restartTaskId), null);
 
     // Restore from disk
-    const restored = await taskOrchestrator.restoreTaskFromDisk(restartChkPath);
+    const restored = await taskOrchestrator.restoreTaskFromDisk(
+      restartTaskId,
+      restartTask.sessionId,
+      restartTask.workspace,
+    );
     assert.ok(restored);
     assert.equal(restored.taskId, restartTaskId);
 

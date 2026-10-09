@@ -1,3 +1,5 @@
+import { writeAppState } from '../config/appStateStorage';
+
 export type MeetingHistoryRetentionDays = 7 | 30 | 60 | 90 | 'off' | `date:${string}`;
 export const DEFAULT_MEETING_HISTORY_RETENTION_DAYS: MeetingHistoryRetentionDays = 30;
 export const MEETING_HISTORY_RETENTION_STORAGE_KEY = 'meeting-history-retention-days';
@@ -48,7 +50,7 @@ export function readMeetingHistoryRetention(): MeetingHistoryRetentionDays {
 export function writeMeetingHistoryRetention(days: MeetingHistoryRetentionDays, now = Date.now()) {
   if (typeof days === 'string' && days.startsWith('date:') && !isFutureLocalDate(days.slice(5), now)) return false;
   try {
-    localStorage.setItem(MEETING_HISTORY_RETENTION_STORAGE_KEY, String(days));
+    writeAppState(MEETING_HISTORY_RETENTION_STORAGE_KEY, String(days));
     return true;
   } catch {
     return false;

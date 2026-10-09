@@ -257,6 +257,10 @@ interface Window {
     minimizeOverlay: () => Promise<OverlayRendererState>;
     expandOverlay: () => Promise<OverlayRendererState>;
     closeOverlay: () => Promise<void>;
+    readProviderSecrets: () => Promise<Record<string, string>>;
+    assertProviderSecretStorageAvailable: () => Promise<boolean>;
+    writeProviderSecrets: (secrets: Record<string, string>) => Promise<{ saved: true }>;
+    confirmProviderDeletion: (providerId: string, providerLabel: string) => Promise<boolean>;
     getOverlayPreferences: () => Promise<OverlayRendererState>;
     setOverlayPreferences: (prefs: Partial<{ lowVisibility: boolean; opacity: number; autoHideEnabled: boolean; autoHideDelay: number; alwaysOnTop: boolean; activeTab: 'answer' | 'analysis' | 'summary' | 'action-items' | 'search' | 'history' }>) => Promise<OverlayRendererState>;
     getOverlayBounds: () => Promise<OverlayBounds>;
@@ -277,6 +281,7 @@ interface Window {
     discoverDeveloperProject: (projectName: string) => Promise<{ matches: string[]; projectRoot: string | null }>;
     getDeveloperProjectState: () => Promise<{ status: 'PROJECT_ATTACHED' | 'PROJECT_DETACHED' | 'PROJECT_MISSING' | 'PROJECT_NOT_ATTACHED' | 'PROJECT_STALE' | 'PROJECT_SESSION_RECONNECTING'; projectRoot: string | null; reason?: string | null }>;
     getDeveloperBackendAuthToken: () => Promise<string>;
+    registerDeveloperMutationConnection: (connectionId: string) => Promise<{ registered: boolean }>;
     attachDeveloperProject: (projectRoot: string) => Promise<{ status: string; projectRoot: string | null; reason?: string | null }>;
     clearDeveloperProject: () => Promise<void>;
     listDeveloperDirectory: (relativePath?: string) => Promise<Array<{ name: string; type: 'file' | 'directory' }>>;
@@ -287,10 +292,10 @@ interface Window {
     getDeveloperRepositoryMap: () => Promise<{ root: string; packageManager: string; languages: string[]; frameworks: string[]; entryPoints: string[]; sourceDirectories: string[]; testDirectories: string[]; configFiles: string[]; importantFiles: string[]; structure: Array<{ path: string; type: 'file' | 'directory' }> }>;
     findDeveloperReferences: (query: string) => Promise<Array<{ symbol: string; kind: string; file: string; line: number; relationship: 'definition' | 'reference' }>>;
     assembleDeveloperContext: (payload: { query: string; scope?: string; maxTokens?: number }) => Promise<{ tokenCount: number; budget: number; items: unknown[]; diversity: number; cached: boolean }>;
-    executeDeveloperTool: (name: string, args: Record<string, unknown>, scope?: string) => Promise<{ ok: boolean; tool: string; data?: unknown; error?: string }>;
+    executeDeveloperTool: (name: string, args: Record<string, unknown>, scope?: string, turnId?: string) => Promise<{ ok: boolean; tool: string; data?: unknown; error?: string }>;
     runDeveloperVerification: (script: string) => Promise<{ ok: boolean; script: string; exitCode: number | null; stdout: string; stderr: string; durationMs: number; classification?: string; cancelled?: boolean }>;
     inspectDeveloperGit: (kind: 'status' | 'diff') => Promise<{ args: string[]; stdout: string; stderr: string }>;
-    beginDeveloperConversation: (request: string, scope?: string) => Promise<{ turnId: string; state: string; projectRoot: string; scope: string; sessionId?: string }>;
+    beginDeveloperConversation: (request: string, scope?: string, repairToken?: string | null) => Promise<{ turnId: string; state: string; projectRoot: string; scope: string; sessionId?: string }>;
     inspectDeveloperDatabase: (request: string, contextMessages?: Array<{ role: 'user' | 'assistant'; content: string }>) => Promise<{
       ok: boolean;
       handled: boolean;
@@ -311,7 +316,9 @@ interface Window {
       error: { code: string; message: string } | null;
     }>;
     advanceDeveloperConversation: (update: { turnId: string; state: 'understanding' | 'completed' | 'failed' | 'cancelled'; phase?: string; fileCount?: number }) => Promise<{ turnId: string; state: string; updatedAt: string }>;
-    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null, scope?: string, conversationTurnId?: string | null) => Promise<{ id: string; state: string; lifecycleState?: string; files: Array<{ operation: string; path: string; sourcePath: string | null; hash: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
+    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null, scope?: string, conversationTurnId?: string | null, repairToken?: string | null) => Promise<{ id: string; proposalId?: string; manifestHash?: string | null; state: string; lifecycleState?: string; files: Array<{ operation: string; path: string; sourcePath: string | null; hash: string }>; attemptNumber?: number; maxAttempts?: number; attemptLabel?: string; repairAvailable?: boolean; reviewFlags?: string[]; verificationScripts?: string[]; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
+    getDeveloperVerificationRepairContext: (id: string) => Promise<{ repairToken: string; attemptNumber: number; maxAttempts: number; attemptLabel: string; check: string | null; classification: string; location: string | null; output: string }>;
+    cancelDeveloperVerificationRepairChain: (id: string) => Promise<{ cancelled: boolean }>;
     approveDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     rejectDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     applyDeveloperProposal: (id: string) => Promise<{
@@ -323,9 +330,13 @@ interface Window {
         status?: string;
         classification?: string;
         reason?: string;
+        executed?: boolean;
+        exitCode?: number | null;
         attempts?: Array<{
           check?: string;
           ok?: boolean;
+          executed?: boolean;
+          exitCode?: number | null;
           classification?: string;
           stdout?: string;
           stderr?: string;
@@ -334,6 +345,13 @@ interface Window {
       } | null;
       outcome?: string | null;
       error?: string | null;
+      attemptNumber?: number;
+      maxAttempts?: number;
+      attemptLabel?: string;
+      repairAvailable?: boolean;
+      chainStatus?: string;
+      fileState?: string;
+      reviewFlags?: string[];
       evidence?: Array<{
         kind: string;
         operation?: string;
@@ -363,8 +381,8 @@ interface Window {
     setDeveloperTaskMode?: (taskId: string, mode: string, complexity?: string) => Promise<Record<string, unknown>>;
     listDeveloperMcpTools?: () => Promise<Array<Record<string, unknown>>>;
     invokeDeveloperTaskMcpTool?: (taskId: string, toolName: string, params?: Record<string, unknown>) => Promise<Record<string, unknown>>;
-    saveDeveloperTaskCheckpointDisk?: (taskId: string, filePath: string, milestone?: string) => Promise<Record<string, unknown>>;
-    restoreDeveloperTaskCheckpointDisk?: (filePath: string) => Promise<Record<string, unknown>>;
+    saveDeveloperTaskCheckpointDisk?: (taskId: string, milestone?: string) => Promise<Record<string, unknown>>;
+    restoreDeveloperTaskCheckpointDisk?: (taskId: string) => Promise<Record<string, unknown>>;
     validateDeveloperTaskContextFreshness?: (taskId: string, targetSnapshots: Array<{ path: string; hash: string }>) => Promise<{ fresh: boolean; staleFiles: string[] }>;
     refuteDeveloperTaskHypothesis?: (taskId: string, text: string, evidence?: Record<string, unknown>) => Promise<Record<string, unknown>>;
     rollbackDeveloperMultiRepo?: (taskId: string) => Promise<{ ok: boolean; rolledBackRepos: string[]; errors: string[] }>;

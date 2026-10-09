@@ -18,7 +18,6 @@ import {
   setProviderSecret,
 } from '../src/config/providerSecretStore.ts';
 import {
-  readPersistedProviderSecrets,
   readPersistedProviderSettings,
   writePersistedProviderSettings,
 } from '../src/config/providerPersistence.ts';
@@ -89,14 +88,14 @@ assert.equal(writePersistedProviderSettings('gemini', [{
   baseURL: 'https://generativelanguage.googleapis.com/v1beta',
   enabled: true,
   priority: 1,
-}], migratedSecrets, storageBeforeRestart), true);
+}], storageBeforeRestart), true);
 const storageAfterRestart = new MemoryStorage();
 storageAfterRestart.values = new Map(storageBeforeRestart.values);
 const restoredSettings = readPersistedProviderSettings(storageAfterRestart);
-const restoredSecrets = readPersistedProviderSecrets(storageAfterRestart);
 assert.equal(restoredSettings.providers[0].id, 'gemini-instance-1');
-assert.equal(getProviderSecret(restoredSecrets, restoredSettings.providers[0].id, 'gemini'), 'legacy-key-value');
+assert.equal(getProviderSecret(migratedSecrets, restoredSettings.providers[0].id, 'gemini'), 'legacy-key-value');
 assert.doesNotMatch(storageAfterRestart.getItem('ai-help-agent-provider-settings-v1'), /legacy-key-value/);
+assert.equal(storageAfterRestart.getItem('ai-help-agent-provider-secrets-v1'), null, 'provider credentials are never persisted in renderer storage');
 
 let retryAttempts = 0;
 const recoveredAfterTransientErrors = await retryProviderHydration(async () => {

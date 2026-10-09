@@ -12,6 +12,7 @@
  */
 
 const fs = require('node:fs/promises');
+const { authorizeAppOwnedMutation } = require('../appOwnedPersistence.cjs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { CAPABILITY_REGISTRY, scoreToolSelection } = require('./capabilityRegistry.cjs');
@@ -82,6 +83,24 @@ class TaskOrchestrator {
   constructor() {
     this._tasks = new Map(); // taskId -> taskState
     this._eventLogs = new Map(); // taskId -> Array of event objects
+    this._checkpointStorageRoot = null;
+  }
+
+  setCheckpointStorageRoot(root) {
+    if (typeof root !== 'string' || !path.isAbsolute(root)) {
+      throw new Error('Checkpoint storage root must be an absolute application-owned path.');
+    }
+    this._checkpointStorageRoot = path.resolve(root);
+  }
+
+  getCheckpointPath(taskId) {
+    if (!this._checkpointStorageRoot) {
+      throw new Error('Application-owned checkpoint storage is not configured.');
+    }
+    if (typeof taskId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(taskId)) {
+      throw new Error('Checkpoint task identifier is invalid.');
+    }
+    return path.join(this._checkpointStorageRoot, `${taskId}.json`);
   }
 
   createTask({
@@ -740,9 +759,10 @@ class TaskOrchestrator {
     return result;
   }
 
-  async saveCheckpointToDisk(taskId, filePath, milestone = 'generic') {
+  async saveCheckpointToDisk(taskId, milestone = 'generic') {
     const task = this.getTask(taskId);
     if (!task) return null;
+    const filePath = this.getCheckpointPath(taskId);
     const checkpoint = this.saveCheckpoint(taskId, milestone);
     const serializedTask = {
       taskId: task.taskId,
@@ -757,6 +777,10 @@ class TaskOrchestrator {
       skillPlaybook: task.skillPlaybook,
       skillStepIndex: task.skillStepIndex,
       state: task.state,
+      workspace: task.workspace,
+      repository: task.repository,
+      project: task.project,
+      package: task.package,
       targets: task.targets || [],
       symbols: task.symbols || [],
       findings: task.findings || [],
@@ -793,26 +817,55 @@ class TaskOrchestrator {
       checkpoint,
     }, null, 2);
 
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const checkpointRoot = this._checkpointStorageRoot;
+    await authorizeAppOwnedMutation({
+      root: checkpointRoot,
+      target: checkpointRoot,
+      resource: 'checkpoint',
+      operation: 'write',
+    });
+    await fs.mkdir(checkpointRoot, { recursive: true });
     // Atomic Write (Section 20): Write to temp file, verify integrity, then atomic rename
     const tempFile = `${filePath}.tmp.${Date.now()}.${crypto.randomBytes(3).toString('hex')}`;
     try {
+      await authorizeAppOwnedMutation({
+        root: checkpointRoot,
+        target: tempFile,
+        resource: 'checkpoint',
+        operation: 'write',
+      });
       await fs.writeFile(tempFile, envelope, 'utf8');
       const verifyRead = await fs.readFile(tempFile, 'utf8');
       const verifyChecksum = JSON.parse(verifyRead).checksum;
       if (verifyChecksum !== checksum) {
         throw new Error('Integrity validation failed during checkpoint write.');
       }
+      await authorizeAppOwnedMutation({
+        root: checkpointRoot,
+        target: filePath,
+        resource: 'checkpoint',
+        operation: 'replace',
+      });
       await fs.rename(tempFile, filePath);
     } finally {
-      await fs.rm(tempFile, { force: true }).catch(() => {});
+      await authorizeAppOwnedMutation({
+        root: checkpointRoot,
+        target: tempFile,
+        resource: 'checkpoint',
+        operation: 'remove',
+      });
+      await fs.rm(tempFile, { force: true });
     }
 
     this.recordEvent(taskId, 'CHECKPOINT_PERSISTED_TO_DISK', { filePath, checkpointId: checkpoint.checkpointId, schemaVersion: 1 });
     return checkpoint;
   }
 
-  async restoreTaskFromDisk(filePath) {
+  async restoreTaskFromDisk(taskId, expectedSessionId, expectedWorkspace) {
+    if (!expectedSessionId || typeof expectedWorkspace !== 'string' || !expectedWorkspace) {
+      throw new Error('Checkpoint restore requires the owning session and project root.');
+    }
+    const filePath = this.getCheckpointPath(taskId);
     const raw = await fs.readFile(filePath, 'utf8');
     let parsed;
     try {
@@ -843,6 +896,19 @@ class TaskOrchestrator {
     const restoredTask = parsed.task;
     if (!restoredTask || !restoredTask.taskId) {
       throw new Error('Invalid task checkpoint file: missing taskId');
+    }
+    if (expectedSessionId && restoredTask.sessionId !== expectedSessionId) {
+      throw new Error('Checkpoint belongs to a different Coding Agent session.');
+    }
+    if (typeof restoredTask.workspace !== 'string' || !restoredTask.workspace) {
+      throw new Error('Checkpoint has no project binding and cannot be restored safely.');
+    }
+    const [checkpointRoot, selectedRoot] = await Promise.all([
+      fs.realpath(restoredTask.workspace),
+      fs.realpath(expectedWorkspace),
+    ]);
+    if (checkpointRoot !== selectedRoot) {
+      throw new Error('Checkpoint belongs to a different Coding Agent project.');
     }
 
     this._tasks.set(restoredTask.taskId, restoredTask);

@@ -20,8 +20,10 @@ const electronCommand = process.platform === 'win32'
   : path.join(root, 'node_modules', '.bin', 'electron');
 const children = [];
 const codingAuthToken = randomBytes(32).toString('base64url');
+const codingMutationHandshakeSecret = randomBytes(32).toString('base64url');
 const codingAuthEnvironment = {
   AI_CODING_AUTH_TOKEN: codingAuthToken,
+  AI_CODING_MUTATION_HANDSHAKE_SECRET: codingMutationHandshakeSecret,
   AI_CODING_BROWSER_ACCESS: '1',
 };
 let shuttingDown = false;

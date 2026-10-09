@@ -43,6 +43,7 @@ from backend_config import (
 )
 from coding_websocket import (
     run_coding_websocket_server,
+    register_coding_mutation_capability,
     get_coding_request_context,
     get_backend_project_state,
     set_backend_project_state,
@@ -81,6 +82,7 @@ from stt_service import SttService
 load_dotenv()
 
 CODING_AUTH_TOKEN = os.getenv("AI_CODING_AUTH_TOKEN") or secrets.token_urlsafe(32)
+CODING_MUTATION_HANDSHAKE_SECRET = os.getenv("AI_CODING_MUTATION_HANDSHAKE_SECRET") or ""
 _renderer_host = str((SERVICES.get("devServer") or {}).get("host") or "127.0.0.1")
 _renderer_port = int((SERVICES.get("devServer") or {}).get("port") or 3000)
 TRUSTED_RENDERER_ORIGINS = {
@@ -109,7 +111,20 @@ app.add_middleware(
 
 @app.middleware("http")
 async def authenticate_coding_requests(request: Request, call_next):
-    if request.url.path == "/api/coding" or request.url.path.startswith("/api/coding/"):
+    path = request.url.path
+    is_coding_request = path == "/api/coding" or path.startswith("/api/coding/")
+    is_protected_app_request = (
+        path.startswith("/api/settings/providers")
+        or path in {
+            "/api/settings/provider",
+            "/api/settings/active-provider",
+            "/api/settings/fallback",
+            "/api/settings/stt-provider",
+            "/api/settings/agent",
+        }
+        or path.startswith("/api/agent/")
+    )
+    if is_coding_request or is_protected_app_request:
         origin = request.headers.get("origin")
         supplied_token = request.headers.get("x-coding-auth", "")
         client_host = request.client.host if request.client else ""
@@ -121,15 +136,19 @@ async def authenticate_coding_requests(request: Request, call_next):
             and origin in TRUSTED_RENDERER_ORIGINS
         )
         is_trusted_preflight = request.method == "OPTIONS" and origin in TRUSTED_RENDERER_ORIGINS
-        if not trusted_origin or (
+        valid_token = hmac.compare_digest(supplied_token, CODING_AUTH_TOKEN)
+        unauthorized = not trusted_origin or (
             not is_trusted_preflight
-            and not hmac.compare_digest(supplied_token, CODING_AUTH_TOKEN)
-            and not is_loopback
-            and not is_loopback_browser
-        ):
+            and (
+                not valid_token
+                if is_protected_app_request
+                else not valid_token and not is_loopback_browser and not is_loopback
+            )
+        )
+        if unauthorized:
             return JSONResponse(
                 status_code=401,
-                content={"detail": "Unauthorized Coding Agent request."},
+                content={"detail": "Unauthorized application request."},
             )
     return await call_next(request)
 
@@ -1097,6 +1116,26 @@ def evaluate_coding_file_mutation(payload: Dict[str, Any], request: Request) -> 
     supplied_token = request.headers.get("x-coding-auth", "")
     if not hmac.compare_digest(supplied_token, CODING_AUTH_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized file mutation policy request.")
+    if not CODING_MUTATION_HANDSHAKE_SECRET:
+        raise HTTPException(status_code=503, detail="The trusted mutation authorization key is unavailable.")
+    supplied_proof = request.headers.get("x-coding-mutation-proof", "")
+    try:
+        canonical_payload = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="Mutation policy request is not canonical JSON.") from error
+    expected_proof = hmac.new(
+        CODING_MUTATION_HANDSHAKE_SECRET.encode("utf-8"),
+        canonical_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(supplied_proof, expected_proof):
+        raise HTTPException(status_code=403, detail="Mutation authorization proof is invalid.")
     operation = payload.get("operation")
     paths = payload.get("paths")
     if not isinstance(operation, str) or not isinstance(paths, list):
@@ -1105,13 +1144,35 @@ def evaluate_coding_file_mutation(payload: Dict[str, Any], request: Request) -> 
         raise HTTPException(status_code=400, detail="Proposal approval state must be explicit.")
     if "deleteConfirmed" in payload and not isinstance(payload["deleteConfirmed"], bool):
         raise HTTPException(status_code=400, detail="Deletion confirmation state must be explicit.")
+    request_binding = payload.get("requestBinding")
+    if not isinstance(request_binding, dict):
+        raise HTTPException(status_code=400, detail="A trusted request-bound authorization context is required.")
     decision, reason = PolicyGate.evaluate_file_mutation(
         operation,
         paths,
         payload["proposalApproved"],
         payload.get("deleteConfirmed", False),
+        request_binding,
     )
     return {"decision": decision, "reason": reason}
+
+
+@app.post("/api/coding/mutation-handshake")
+def register_coding_mutation_handshake(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    supplied_token = request.headers.get("x-coding-auth", "")
+    if not hmac.compare_digest(supplied_token, CODING_AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized mutation capability handshake.")
+    connection_id = payload.get("connectionId")
+    proof = payload.get("proof")
+    if not isinstance(connection_id, str) or not isinstance(proof, str):
+        raise HTTPException(status_code=400, detail="A connection ID and authenticated proof are required.")
+    if not CODING_MUTATION_HANDSHAKE_SECRET or not register_coding_mutation_capability(
+        connection_id,
+        proof,
+        CODING_MUTATION_HANDSHAKE_SECRET,
+    ):
+        raise HTTPException(status_code=403, detail="The authenticated mutation path is not available for this connection.")
+    return {"registered": True}
 
 
 @app.post("/api/coding/project-attach")
