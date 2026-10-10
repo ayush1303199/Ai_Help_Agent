@@ -5823,10 +5823,17 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     function = call.get("function") if isinstance(call, dict) else {}
     function = function if isinstance(function, dict) else {}
     raw_name = str(function.get("name") or "").strip()
+    canonical_name = resolve_tool_capability(raw_name)
+    if canonical_name is None:
+        available_tools = ", ".join(sorted(TOOL_NAMES))
+        raise ValueError(
+            f"UNKNOWN_MODEL_TOOL: '{raw_name}' is not supported in this runtime. "
+            f"Choose exactly one available capability: {available_tools}."
+        )
     declared_tool = next(
         (
             tool for tool in CODING_TOOLS
-            if tool.get("function", {}).get("name") == raw_name
+            if tool.get("function", {}).get("name") == canonical_name
         ),
         None,
     )
@@ -5905,7 +5912,6 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         raise ValueError("INVALID_TOOL_ARGUMENTS: the selected tool has no valid parameter schema.")
     validate_schema(arguments, schema, "arguments")
 
-    canonical_name = resolve_tool_capability(raw_name)
     if not canonical_name or canonical_name not in TOOL_CAPABILITIES or not TOOL_CAPABILITIES[canonical_name].get("available"):
         available_tools = ", ".join(sorted(TOOL_CAPABILITIES.keys()))
         raise ValueError(
@@ -6341,12 +6347,22 @@ async def _dispatch_coding_tool(
     send_json,
     action: Dict[str, Any],
     request_id: str,
-    turn_id: str,
-    session_id: str,
-    tool_call_id: str,
-    name: str,
-    arguments: Dict[str, Any],
+    *args,
 ) -> None:
+    if len(args) == 5:
+        turn_id, session_id, tool_call_id, name, arguments = args
+    elif len(args) == 4:
+        session_id, tool_call_id, name, arguments = args
+        turn_id = request_id
+    elif len(args) == 3:
+        session_id, name, arguments = args
+        turn_id = request_id
+        tool_call_id = f"{request_id}:{name}"
+    else:
+        raise TypeError(
+            "_dispatch_coding_tool() requires either (request_id, turn_id, session_id, tool_call_id, name, arguments), "
+            "(request_id, session_id, tool_call_id, name, arguments), or (request_id, session_id, name, arguments)."
+        )
     await _publish_activity_event(send_json, action, request_id, session_id, "STARTED")
     await _send(send_json, {
         "type": "tool_call",

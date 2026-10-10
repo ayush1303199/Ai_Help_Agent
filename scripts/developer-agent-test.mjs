@@ -559,7 +559,7 @@ try {
   assert.equal(agent.getTask(durableTask.taskId, owner2).state, 'awaiting_approval');
   assert.throws(
     () => agent.approve(durableTask.taskId, owner2),
-    /Request-bound authorization is missing or no longer matches/,
+    /Request-bound (?:Coding )?authorization is (?:missing or no longer matches|invalid, stale, or mismatched\.)/,
     'A restored task must not reuse request authorization after its in-memory turn context is gone.',
   );
   const interrupted = await agent.createProposal({
