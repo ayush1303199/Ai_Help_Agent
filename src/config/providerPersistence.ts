@@ -16,7 +16,7 @@ export interface PersistedProviderSettings {
 
 export const PERSISTED_PROVIDER_STORAGE_KEY = 'ai-help-agent-provider-settings-v1';
 
-import { writeAppState } from './appStateStorage';
+import { writeAppState } from './appStateStorage.ts';
 
 function browserStorage(): Storage | null {
   try {

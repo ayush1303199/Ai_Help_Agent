@@ -413,10 +413,19 @@ assert.equal(calculateTotal(exemptInvoice), 100, 'Tax exempt invoice should not 
   const authorizeMutation = async () => ({ allowed: true });
 
   const validDiff = `--- a/calc.js\n+++ b/calc.js\n@@ -1,3 +1,3 @@\n export function add(a, b) {\n-  return a - b;\n+  return a + b;\n }\n`;
+  const turn = agent.beginConversationTurn({
+    root: e2eDir,
+    scope: '.',
+    request: 'Update add function in calc.js',
+    sessionId: e2eSessionId,
+    ownerWebContentsId: e2eOwnerWebContentsId,
+  });
+  agent.advanceConversationTurn(turn.turnId, 'understanding', e2eOwner);
   const e2eProposal = await agent.createProposal({
     root: e2eDir,
     ownerWebContentsId: e2eOwnerWebContentsId,
     sessionId: e2eSessionId,
+    conversationTurnId: turn.turnId,
     raw: validDiff,
   });
 

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { writeAppState } from '../../config/appStateStorage';
+import { writeAppState } from '../../config/appStateStorage.ts';
 import { captureScreenForReading } from './screenReadingService';
 
 interface UseScreenReaderOptions {

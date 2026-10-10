@@ -212,10 +212,19 @@ try {
   await developerFiles.attachProject(projectPath, ownerProposal);
   const sessionId = developerAgent.getSession(ownerProposal);
 
+  const turn = developerAgent.beginConversationTurn({
+    root: projectPath,
+    scope: '.',
+    request: 'Update hello store verified in src/index.ts',
+    sessionId,
+    ownerWebContentsId: ownerProposal,
+  });
+  developerAgent.advanceConversationTurn(turn.turnId, 'understanding', { sessionId, ownerWebContentsId: ownerProposal });
   const proposal = await developerAgent.createProposal({
     root: projectPath,
     sessionId,
     ownerWebContentsId: ownerProposal,
+    conversationTurnId: turn.turnId,
     raw: `--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1,1 +1,1 @@\n-console.log("hello store");\n+console.log("hello store verified");\n`,
   });
   assert.equal(proposal.state, 'awaiting_approval');

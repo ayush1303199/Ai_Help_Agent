@@ -175,10 +175,19 @@ class Order {
      }
 `;
 
+  const proposalTurn = developerAgent.beginConversationTurn({
+    root: projectPath,
+    scope: '.',
+    request: 'fix ka proposal/diff banao',
+    sessionId: proposalSessionId,
+    ownerWebContentsId: ownerProposal,
+  });
+  developerAgent.advanceConversationTurn(proposalTurn.turnId, 'understanding', { sessionId: proposalSessionId, ownerWebContentsId: ownerProposal });
   const proposal = await developerAgent.createProposal({
     root: projectPath,
     sessionId: proposalSessionId,
     ownerWebContentsId: ownerProposal,
+    conversationTurnId: proposalTurn.turnId,
     raw: proposalDiff,
   });
   assert.equal(proposal.state, 'awaiting_approval');

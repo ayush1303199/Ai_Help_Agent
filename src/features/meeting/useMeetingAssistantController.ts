@@ -3,7 +3,7 @@ import { prepareQuestion, prepareTextRequest, type PreparedQuestion } from '../.
 import type { InterviewContextConfig } from '../../ai/interviewContext';
 import type { MeetingAudioMode } from '../../app/appTypes';
 import { runtimeConfig } from '../../config/runtimeConfig';
-import { writeAppState } from '../../config/appStateStorage';
+import { writeAppState } from '../../config/appStateStorage.ts';
 import {
   readMeetingHistoryRetention,
   type HistorySession,
