@@ -486,6 +486,49 @@ class CodingWebSocketTimeoutRegressionTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await websocket._wait_for_tool(state, "request", "tool")
 
+    async def test_request_cancellation_wait_is_bounded_by_runtime_configuration(self):
+        self.assertEqual(websocket.CODING_CANCELLATION_TIMEOUT_SECONDS, 5)
+        cancellation_seen = asyncio.Event()
+        hold_task = asyncio.Event()
+
+        async def cancellation_resistant_task():
+            try:
+                await hold_task.wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await hold_task.wait()
+
+        task = asyncio.create_task(cancellation_resistant_task())
+        await asyncio.sleep(0)
+        events = []
+
+        async def send_json(event):
+            events.append(event)
+
+        state = {
+            "completed": {},
+            "pending": {},
+            "tasks_by_request": {"request": task},
+            "cancelled_request_ids": [],
+        }
+        try:
+            with patch.object(websocket, "CODING_CANCELLATION_TIMEOUT_SECONDS", 0.001):
+                await websocket.handle_coding_payload(
+                    '{"type":"cancel","requestId":"request"}',
+                    send_json,
+                    state,
+                    registry=None,
+                    config_path=None,
+                )
+            self.assertTrue(cancellation_seen.is_set())
+            self.assertEqual(events[0]["status"], "CANCELLED")
+            self.assertTrue(events[0]["cleanupTimedOut"])
+        finally:
+            hold_task.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def test_connection_rejects_chat_when_active_task_limit_is_reached(self):
         state = {
             "pending": {},

@@ -29,6 +29,7 @@ const scripts = [
   'coding-activity-trace-test.mjs',
   'coding-agent-policy-test.py',
   'developer-runtime-state-test.mjs',
+  'coding-acceptance-preflight-test.mjs',
   'coding-sync-contract-test.mjs',
   'coding-repair-runtime-test.mjs',
   'developer-repair-ipc-integration-test.mjs',

@@ -15,6 +15,7 @@ import hashlib
 import uuid
 import re
 import os
+from provider_secret_vault import ProviderSecretVault
 from provider_service import classify_provider_error, redact_provider_error
 from provider_model_contract import (
     PROVIDER_REGISTRY,
@@ -151,6 +152,10 @@ class ProviderRegistry:
         # Secrets are available to the running process only. They are never
         # serialized by ProviderInstance.to_dict() or save_to_file().
         self._runtime_api_keys: Dict[str, str] = {}
+        self._persistent_api_keys: Dict[str, str] = {}
+        self._secret_vault = ProviderSecretVault(
+            self.config_path.with_name("provider-secrets.enc.json")
+        )
         self.active_provider_id: Optional[str] = None
         self.stt_provider_id: Optional[str] = None
         self.fallback_enabled: bool = True
@@ -169,6 +174,7 @@ class ProviderRegistry:
         try:
             # Step 1: Load from persistent storage
             self._load_from_file()
+            self._load_secrets_from_file()
             
             # Step 2: Merge environment variables (env vars override file)
             self._merge_env_providers(env_vars, provider_presets)
@@ -281,6 +287,27 @@ class ProviderRegistry:
                 self.save_to_file()
         except Exception as e:
             print(f"Error loading provider config from {self.config_path}: {e}")
+
+    def _load_secrets_from_file(self) -> None:
+        saved_secrets = self._secret_vault.load()
+        for provider_id, api_key in saved_secrets.items():
+            provider = self.providers.get(provider_id)
+            if not provider:
+                continue
+            self._persistent_api_keys[provider_id] = api_key
+            self._runtime_api_keys[provider_id] = api_key
+            provider.has_api_key = True
+            if provider.status == ProviderStatus.UNCONFIGURED:
+                provider.status = ProviderStatus.CONFIGURED
+
+    def assert_secret_store_available(self) -> None:
+        self._secret_vault.assert_available()
+
+    def supports_persistent_secret_store(self) -> bool:
+        return self._secret_vault.is_supported()
+
+    def save_secrets_to_file(self) -> None:
+        self._secret_vault.save(self._persistent_api_keys)
 
     def _merge_env_providers(self, env_vars: Dict[str, str], provider_presets: Dict[str, Dict[str, str]]) -> None:
         """Merge environment variable providers into registry."""
@@ -422,6 +449,7 @@ class ProviderRegistry:
             existing.has_api_key = bool(api_key) or bool(self._runtime_api_keys.get(existing.id))
             if api_key:
                 self._runtime_api_keys[existing.id] = api_key
+                self._persistent_api_keys[existing.id] = api_key
             existing.label = label or existing.label
             if enabled is not None:
                 existing.enabled = enabled
@@ -454,6 +482,7 @@ class ProviderRegistry:
         self.providers[provider.id] = provider
         if api_key:
             self._runtime_api_keys[provider.id] = api_key
+            self._persistent_api_keys[provider.id] = api_key
         if not self.active_provider_id and provider.enabled:
             self.active_provider_id = provider.id
         self.normalize_priorities()
@@ -543,6 +572,7 @@ class ProviderRegistry:
         
         del self.providers[provider_id]
         self._runtime_api_keys.pop(provider_id, None)
+        self._persistent_api_keys.pop(provider_id, None)
         self.normalize_priorities()
         if self.stt_provider_id == provider_id:
             self.stt_provider_id = None
@@ -565,6 +595,7 @@ class ProviderRegistry:
         if not key:
             return False
         self._runtime_api_keys[provider_id] = key
+        self._persistent_api_keys[provider_id] = key
         provider.has_api_key = True
         if provider.configuration_error:
             provider.status = ProviderStatus.CONFIGURATION_INVALID

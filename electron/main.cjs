@@ -13,6 +13,8 @@ const developerBenchmark = require('./developerBenchmark.cjs');
 const generalAgent = require('./generalAgent.cjs');
 const { ProviderSecretVault } = require('./providerSecretVault.cjs');
 const { authorizeAppOwnedMutation } = require('./appOwnedPersistence.cjs');
+const { projectProcessIsolationStatus } = require('./coding-pipeline/projectProcessIsolation.cjs');
+const { buildCodingAcceptancePreflight } = require('./coding-pipeline/acceptancePreflight.cjs');
 const runtimeSettings = require('../src/config/runtimeSettings.json');
 const { services, electron: electronSettings } = runtimeSettings;
 const devServerUrl = `http://${services.devServer.host}:${services.devServer.port}`;
@@ -69,6 +71,11 @@ if (!Number.isSafeInteger(runtimeSettings.developer.maxVerificationAttempts)
   || runtimeSettings.developer.maxVerificationAttempts < 1) {
   throw new Error('Developer maxVerificationAttempts must be a positive safe integer.');
 }
+if (!Number.isSafeInteger(runtimeSettings.developer.maxAutoRepairAttempts)
+  || runtimeSettings.developer.maxAutoRepairAttempts < 1
+  || runtimeSettings.developer.maxAutoRepairAttempts > 3) {
+  throw new Error('Developer maxAutoRepairAttempts must be an integer from 1 to 3.');
+}
 
 function projectChainKey(root) {
   const resolved = path.resolve(root);
@@ -112,6 +119,10 @@ function createVerificationRepairChain(root, owner, firstTaskId) {
     taskIds: [firstTaskId],
     repairToken: null,
     verificationScripts: null,
+    autoRepairEnabled: false,
+    autoRepairPaths: null,
+    autoRepairAuthorizedFeatures: null,
+    autoRepairBlockedReason: null,
   };
   verificationRepairChainsByRoot.set(rootKey, chain);
   verificationRepairChainsByTask.set(firstTaskId, chain);
@@ -169,7 +180,48 @@ function verificationRepairPresentation(task, chain) {
     repairAvailable: Boolean(chain && chain.status !== 'exhausted' && chain.attemptCount < chain.maxAttempts),
     reviewFlags,
     chainExpiresAt: chain ? new Date(chain.expiresAt).toISOString() : null,
+    autoRepairEnabled: chain?.autoRepairEnabled === true,
+    autoRepairBlockedReason: chain?.autoRepairBlockedReason || null,
   };
+}
+
+function autoRepairEligibility(task) {
+  const files = Array.isArray(task.files) ? task.files : [];
+  if (!files.length || files.some((file) => !['create', 'modify'].includes(file.operation))) {
+    return { allowed: false, reason: 'Auto mode supports only create/modify operations; other operations need fresh approval.' };
+  }
+  const reviewFlags = verificationRepairPresentation(task, null).reviewFlags;
+  if (reviewFlags.length) {
+    return { allowed: false, reason: 'Auto mode is unavailable for test, dependency, or verification configuration changes.' };
+  }
+  return { allowed: true };
+}
+
+function autoRepairProposalScope(task, chain) {
+  if (!chain.autoRepairEnabled
+    || !Array.isArray(chain.autoRepairPaths)
+    || !Array.isArray(chain.autoRepairAuthorizedFeatures)) {
+    return { allowed: false, reason: 'Auto-repair authorization is unavailable; this repair needs approval.' };
+  }
+  const approved = new Map(chain.autoRepairPaths.map((entry) => [entry.path, entry.operation]));
+  const repairFiles = Array.isArray(task.files) ? task.files : [];
+  if (!repairFiles.length || repairFiles.some((file) => {
+    const allowedOperation = approved.get(file.path);
+    return !allowedOperation
+      || allowedOperation !== file.operation
+      || file.sourcePath
+      || !['create', 'modify'].includes(file.operation);
+  })) {
+    return { allowed: false, reason: 'This repair changes files or operations outside the initial approval; fresh approval is required.' };
+  }
+  const authorized = new Set(chain.autoRepairAuthorizedFeatures);
+  if ((task.requestedFeatures || []).some((feature) => !authorized.has(feature))) {
+    return { allowed: false, reason: 'This repair exceeds the initially approved feature scope; fresh approval is required.' };
+  }
+  if (verificationRepairPresentation(task, chain).reviewFlags.length) {
+    return { allowed: false, reason: 'This repair touches sensitive test or verification configuration; fresh approval is required.' };
+  }
+  return { allowed: true };
 }
 
 function redactRepairOutput(value) {
@@ -1173,6 +1225,34 @@ app.whenReady().then(async () => {
     developerAgent.getSession(event.sender.id);
     return developerFiles.getProjectState(event.sender.id);
   });
+  ipcMain.handle('developer:acceptance-preflight', async (event) => {
+    developerAgent.getSession(event.sender.id);
+    const projectState = await developerFiles.getProjectState(event.sender.id);
+    let providerConfigured = false;
+    let providerCheckError = null;
+    try {
+      const response = await fetch(`http://127.0.0.1:${services.http.port}/api/settings/providers`, {
+        headers: { 'X-Coding-Auth': codingAuthToken },
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!response.ok) throw new Error(`provider endpoint returned HTTP ${response.status}`);
+      const data = await response.json();
+      const providers = Array.isArray(data?.providers) ? data.providers : [];
+      const activeProvider = providers.find((provider) => provider.id === data.activeProvider);
+      providerConfigured = activeProvider?.enabled === true
+        && activeProvider?.hasApiKey === true
+        && activeProvider?.assistantCapable === true
+        && activeProvider?.developerToolCalling === true;
+    } catch (error) {
+      providerCheckError = (error instanceof Error ? error.message : String(error)).slice(0, 200);
+    }
+    return buildCodingAcceptancePreflight({
+      providerConfigured,
+      providerCheckError,
+      projectState,
+      isolation: projectProcessIsolationStatus(),
+    });
+  });
   ipcMain.handle('developer:backend-auth-token', (event) => {
     assertTrustedCodingRendererSender(event);
     return codingAuthToken;
@@ -1621,10 +1701,32 @@ app.whenReady().then(async () => {
       chain.verificationConfigHash = preProposalVerificationConfigHash;
     }
     task.verificationScripts = [...chain.verificationScripts];
+    let registeredProposal = proposal;
+    let autoRepairAuthorized = false;
+    if (chain.autoRepairEnabled) {
+      const eligibility = autoRepairProposalScope(task, chain);
+      if (eligibility.allowed) {
+        const taskRecord = developerAgent.getTaskForTest(task.taskId);
+        const baselineFeatures = taskRecord.authorizationContext.authorizedFeatures;
+        const additionalFeatures = task.requestedFeatures.filter((feature) => !baselineFeatures.includes(feature));
+        const featureAuthorization = additionalFeatures.length ? {
+          source: 'main-process-feature-confirmation',
+          proposalId: task.proposalId,
+          authorizedFeatures: chain.autoRepairAuthorizedFeatures,
+        } : null;
+        registeredProposal = developerAgent.approve(task.taskId, owner, featureAuthorization);
+        autoRepairAuthorized = true;
+      } else {
+        chain.autoRepairEnabled = false;
+        chain.autoRepairBlockedReason = eligibility.reason;
+      }
+    }
     return {
-      ...proposal,
+      ...registeredProposal,
       ...verificationRepairPresentation(task, chain),
       verificationScripts: [...chain.verificationScripts],
+      autoRepairAuthorized,
+      autoRepairBlockedReason: chain.autoRepairBlockedReason || null,
     };
   });
   ipcMain.handle('developer:verification-repair-context', async (event, id) => {
@@ -1671,7 +1773,7 @@ app.whenReady().then(async () => {
     }
     return { cancelled: true };
   });
-  ipcMain.handle('developer:proposal-approve', async (event, id) => {
+  ipcMain.handle('developer:proposal-approve', async (event, id, options = {}) => {
     const owner = { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id };
     const task = developerAgent.getProposalAuthorizationContext(id, owner);
     const baselineFeatures = task.authorizedFeatures;
@@ -1703,7 +1805,38 @@ app.whenReady().then(async () => {
         authorizedFeatures: [...new Set([...baselineFeatures, ...additionalFeatures])],
       };
     }
-    return developerAgent.approve(id, owner, featureAuthorization);
+    const approved = developerAgent.approve(id, owner, featureAuthorization);
+    const chain = verificationRepairChainsByTask.get(approved.taskId);
+    if (options?.autoRepair !== true || !chain || chain.taskIds[0] !== approved.taskId) {
+      return {
+        ...approved,
+        autoRepairEnabled: false,
+        autoRepairReason: options?.autoRepair === true
+          ? 'Auto mode is available only for the initial proposal in this verification chain.'
+          : null,
+      };
+    }
+    const taskRecord = developerAgent.getTaskForTest(approved.taskId);
+    const eligibility = autoRepairEligibility(taskRecord);
+    if (!eligibility.allowed) {
+      chain.autoRepairBlockedReason = eligibility.reason;
+      return { ...approved, autoRepairEnabled: false, autoRepairReason: eligibility.reason };
+    }
+    chain.autoRepairEnabled = true;
+    chain.autoRepairBlockedReason = null;
+    chain.maxAttempts = runtimeSettings.developer.maxAutoRepairAttempts + 1;
+    chain.autoRepairPaths = taskRecord.files.map((file) => ({
+      path: file.path,
+      operation: file.operation,
+    }));
+    chain.autoRepairAuthorizedFeatures = [...(taskRecord.approval?.authorizedFeatures || [])];
+    return {
+    ...approved,
+    autoRepairEnabled: true,
+    autoRepairReason: null,
+    maxAttempts: chain.maxAttempts,
+    attemptLabel: `attempt 1 of ${chain.maxAttempts}`,
+    };
   });
   ipcMain.handle('developer:proposal-reject', (event, id) => developerAgent.reject(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
   ipcMain.handle('developer:proposal-apply', async (event, id) => {

@@ -280,6 +280,15 @@ interface Window {
     chooseDeveloperProject: () => Promise<{ canceled: boolean; projectRoot: string | null }>;
     discoverDeveloperProject: (projectName: string) => Promise<{ matches: string[]; projectRoot: string | null }>;
     getDeveloperProjectState: () => Promise<{ status: 'PROJECT_ATTACHED' | 'PROJECT_DETACHED' | 'PROJECT_MISSING' | 'PROJECT_NOT_ATTACHED' | 'PROJECT_STALE' | 'PROJECT_SESSION_RECONNECTING'; projectRoot: string | null; reason?: string | null }>;
+    getDeveloperAcceptancePreflight: () => Promise<{
+      ready: boolean;
+      canRunProjectCommands: boolean;
+      providerConfigured: boolean;
+      projectAttached: boolean;
+      projectStatus: string;
+      sandbox: { available: boolean; verified: boolean; platformRecognized: boolean; platform: string; reason: string | null };
+      blockers: Array<{ code: string; message: string }>;
+    }>;
     getDeveloperBackendAuthToken: () => Promise<string>;
     registerDeveloperMutationConnection: (connectionId: string) => Promise<{ registered: boolean }>;
     attachDeveloperProject: (projectRoot: string) => Promise<{ status: string; projectRoot: string | null; reason?: string | null }>;
@@ -316,10 +325,10 @@ interface Window {
       error: { code: string; message: string } | null;
     }>;
     advanceDeveloperConversation: (update: { turnId: string; state: 'understanding' | 'completed' | 'failed' | 'cancelled'; phase?: string; fileCount?: number }) => Promise<{ turnId: string; state: string; updatedAt: string }>;
-    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null, scope?: string, conversationTurnId?: string | null, repairToken?: string | null) => Promise<{ id: string; proposalId?: string; manifestHash?: string | null; state: string; lifecycleState?: string; files: Array<{ operation: string; path: string; sourcePath: string | null; hash: string }>; attemptNumber?: number; maxAttempts?: number; attemptLabel?: string; repairAvailable?: boolean; reviewFlags?: string[]; verificationScripts?: string[]; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
+    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null, scope?: string, conversationTurnId?: string | null, repairToken?: string | null) => Promise<{ id: string; proposalId?: string; manifestHash?: string | null; state: string; lifecycleState?: string; files: Array<{ operation: string; path: string; sourcePath: string | null; hash: string }>; attemptNumber?: number; maxAttempts?: number; attemptLabel?: string; repairAvailable?: boolean; autoRepairEnabled?: boolean; autoRepairAuthorized?: boolean; autoRepairBlockedReason?: string | null; reviewFlags?: string[]; verificationScripts?: string[]; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperVerificationRepairContext: (id: string) => Promise<{ repairToken: string; attemptNumber: number; maxAttempts: number; attemptLabel: string; check: string | null; classification: string; location: string | null; output: string }>;
     cancelDeveloperVerificationRepairChain: (id: string) => Promise<{ cancelled: boolean }>;
-    approveDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
+    approveDeveloperProposal: (id: string, options?: { autoRepair?: boolean }) => Promise<{ id: string; taskId?: string; state: string; lifecycleState?: string; autoRepairEnabled?: boolean; autoRepairReason?: string | null; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     rejectDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     applyDeveloperProposal: (id: string) => Promise<{
       id: string;

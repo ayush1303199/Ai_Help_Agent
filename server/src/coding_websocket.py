@@ -23,6 +23,7 @@ from coding_provider import (
 )
 from backend_config import (
     CODING_CONVERSATION_CHARS,
+    CODING_CANCELLATION_TIMEOUT_SECONDS,
     CODING_FINAL_EVIDENCE_CHARS,
     CODING_MAX_HISTORY_MESSAGES,
     CODING_MAX_PATH_CHARS,
@@ -5823,7 +5824,6 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     function = call.get("function") if isinstance(call, dict) else {}
     function = function if isinstance(function, dict) else {}
     raw_name = str(function.get("name") or "").strip()
-<<<<<<< HEAD
     canonical_name = resolve_tool_capability(raw_name)
     if canonical_name is None:
         available_tools = ", ".join(sorted(TOOL_NAMES))
@@ -5835,13 +5835,6 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         (
             tool for tool in CODING_TOOLS
             if tool.get("function", {}).get("name") == canonical_name
-=======
-    target_tool_name = TOOL_ALIASES.get(raw_name, raw_name)
-    declared_tool = next(
-        (
-            tool for tool in CODING_TOOLS
-            if tool.get("function", {}).get("name") in {raw_name, target_tool_name}
->>>>>>> c7586eb5501c18baea1053a79eb5743a548c695e
         ),
         None,
     )
@@ -5865,7 +5858,7 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         raise ValueError("INVALID_TOOL_ARGUMENTS: arguments must be a JSON object.")
 
     # Normalize argument aliases (e.g. relativePath -> path for read_file, pattern -> query for search_code)
-    canonical_pre = resolve_tool_capability(raw_name) or target_tool_name
+    canonical_pre = canonical_name
     if canonical_pre == "read_file":
         if "path" not in arguments:
             for alias_key in ("relativePath", "file", "filePath"):
@@ -6378,24 +6371,6 @@ async def _dispatch_coding_tool(
     send_json,
     action: Dict[str, Any],
     request_id: str,
-<<<<<<< HEAD
-    *args,
-) -> None:
-    if len(args) == 5:
-        turn_id, session_id, tool_call_id, name, arguments = args
-    elif len(args) == 4:
-        session_id, tool_call_id, name, arguments = args
-        turn_id = request_id
-    elif len(args) == 3:
-        session_id, name, arguments = args
-        turn_id = request_id
-        tool_call_id = f"{request_id}:{name}"
-    else:
-        raise TypeError(
-            "_dispatch_coding_tool() requires either (request_id, turn_id, session_id, tool_call_id, name, arguments), "
-            "(request_id, session_id, tool_call_id, name, arguments), or (request_id, session_id, name, arguments)."
-        )
-=======
     turn_id: str,
     session_id: str = "",
     tool_call_id: str = "",
@@ -6403,14 +6378,12 @@ async def _dispatch_coding_tool(
     arguments: Optional[Dict[str, Any]] = None,
 ) -> None:
     if arguments is None and isinstance(name, dict):
-        # Called as _dispatch_coding_tool(send, action, request_id, session_id, tool_call_id, name, arguments)
         arguments = name
         name = tool_call_id
         tool_call_id = session_id
         session_id = turn_id
         turn_id = request_id
     arguments = arguments or {}
->>>>>>> c7586eb5501c18baea1053a79eb5743a548c695e
     await _publish_activity_event(send_json, action, request_id, session_id, "STARTED")
     await _send(send_json, {
 
@@ -6494,10 +6467,21 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
         for key in list(state["completed"]):
             if key.startswith(f"{request_id}:"):
                 state["completed"].pop(key, None)
+        _, pending_tasks = await asyncio.wait(
+            {task},
+            timeout=CODING_CANCELLATION_TIMEOUT_SECONDS,
+        )
+        cleanup_timed_out = bool(pending_tasks)
+        if cleanup_timed_out:
+            logger.warning(
+                "Coding task cancellation cleanup exceeded its configured timeout (request_id=%s)",
+                request_id,
+            )
         await _send(send_json, {
             "type": "cancelled",
             "requestId": request_id,
             "status": "CANCELLED",
+            "cleanupTimedOut": cleanup_timed_out,
         })
         return
     if payload.get("type") == "tool_result":
@@ -6567,6 +6551,8 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
 
     async def send_task_event(event: Dict[str, Any]) -> None:
         nonlocal terminal_sent
+        if request_id in state.get("cancelled_request_ids", []):
+            return
         await _send(send_json, event)
         if event.get("requestId") == request_id and event.get("type") in ("done", "error"):
             terminal_sent = True

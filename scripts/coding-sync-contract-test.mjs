@@ -14,7 +14,7 @@ const codingControllerSource = await fs.readFile(
   new URL('../src/features/coding/useCodingAgentController.ts', import.meta.url),
   'utf8',
 );
-const applyProposalStart = codingControllerSource.indexOf('const applyProposal = async () =>');
+const applyProposalStart = codingControllerSource.indexOf('const applyProposal = async (');
 const repairRequestStart = codingControllerSource.indexOf('const requestVerificationRepair = async () =>');
 const undoProposalStart = codingControllerSource.indexOf('const undoProposal = async () =>');
 assert.ok(applyProposalStart >= 0 && repairRequestStart > applyProposalStart && undoProposalStart > repairRequestStart);

@@ -48,7 +48,7 @@ import {
   setProviderSecret,
 } from './config/providerSecretStore';
 import { clearAppState, writeAppState } from './config/appStateStorage.ts';
-import { authenticatedBackendFetch } from './config/backendAuth';
+import { authenticatedBackendFetch, isBrowserDevelopment } from './config/backendAuth';
 import { ProviderHydrationRequestError, retryProviderHydration } from './config/providerHydration';
 import {
   readPersistedProviderSettings,
@@ -240,6 +240,7 @@ const agentPermissionOptions = [
 ] as const;
 
 function App() {
+  const browserDevelopment = isBrowserDevelopment();
   const [chatHistory, setChatHistory] = useState<ChatSession[]>(readHistory);
   const [historyRetention, setHistoryRetention] = useState<MeetingHistoryRetentionDays>(readMeetingHistoryRetention);
   const [activeChatId, setActiveChatId] = useState<string>(() => crypto.randomUUID());
@@ -860,18 +861,21 @@ function App() {
     const data = await response.json();
     let providers = Array.isArray(data.providers) ? data.providers : [];
     const savedProviderSettings = readPersistedProviderSettings();
-    const persistedSecrets = await readProviderSecrets();
+    const backendHasEveryProviderKey = providers.length > 0
+      && providers.every((provider: ConfiguredProvider) => provider.hasApiKey === true);
+    const persistedSecrets = browserDevelopment || backendHasEveryProviderKey
+      ? {}
+      : await readProviderSecrets();
     const failedSecretRestores: string[] = [];
 
-    // Rehydrate secrets into the backend process after a restart. The server
-    // persists provider metadata only; the actual key remains in this client
-    // store and is sent over the local settings request when available.
+    // In desktop mode, rehydrate OS-stored secrets after a backend restart.
+    // Browser preview deliberately has no renderer-side credential store.
     for (const provider of providers) {
       const adapterType = provider.adapterType;
       const apiKey = adapterType
         ? getProviderSecret(persistedSecrets, String(provider.id || ''), adapterType)
         : '';
-      if (!adapterType || !apiKey) continue;
+      if (!adapterType || !apiKey || provider.hasApiKey === true) continue;
       const hydrated = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
@@ -1029,7 +1033,7 @@ function App() {
     if (failedSecretRestores.length > 0) {
       setError(`Could not restore a saved API key for ${failedSecretRestores.join(', ')}. Re-enter the key in provider settings.`);
     }
-  }, []);
+  }, [browserDevelopment]);
 
   const refreshConfiguredProviders = useCallback(() => {
     if (providerHydrationPromiseRef.current) return providerHydrationPromiseRef.current;
@@ -1083,7 +1087,7 @@ function App() {
     setProviderSaving(true);
     setError('');
     try {
-      if (providerKey.trim()) await ensureProviderSecretStorage();
+      if (providerKey.trim() && !browserDevelopment) await ensureProviderSecretStorage();
       const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -1103,7 +1107,7 @@ function App() {
       if (providerKey.trim() && data.provider?.hasApiKey !== true) {
         throw new Error('Provider settings were not saved with the API key. The backend did not confirm the credential.');
       }
-      const secrets = await readProviderSecrets();
+      const secrets = browserDevelopment ? {} : await readProviderSecrets();
       const savedProviderId = String(data.provider?.id || '');
       if (!savedProviderId) throw new Error('Provider was saved but its instance ID was not returned.');
       if (providerKey.trim()) {
@@ -1114,7 +1118,7 @@ function App() {
       const activeProviderType = typeof data.activeProvider === 'string'
         ? providers.find((provider: ConfiguredProvider) => provider.id === data.activeProvider)?.adapterType || null
         : null;
-      await persistProviderSecrets(secrets);
+      if (!browserDevelopment) await persistProviderSecrets(secrets);
       const persisted = writePersistedProviderSettings(activeProviderType, providers);
       setConfiguredProviders(providers);
       setActiveProviderId(typeof data.activeProvider === 'string' ? data.activeProvider : null);
@@ -1122,9 +1126,11 @@ function App() {
       setEffectiveSpeechProviderId(typeof data.effectiveSttProvider === 'string' ? data.effectiveSttProvider : '');
       setFallbackEnabled(typeof data.fallbackEnabled === 'boolean' ? data.fallbackEnabled : fallbackEnabled);
       resetProviderForm();
-      setStatusMessage(persisted
-        ? 'Provider saved.'
-        : 'Provider is available for this session, but its key could not be saved for restart recovery.');
+      setStatusMessage(browserDevelopment
+        ? 'Provider and key saved in the encrypted local vault. Browser and Electron can use it on this Windows account.'
+        : persisted
+          ? 'Provider saved.'
+          : 'Provider is available for this session, but its key could not be saved for restart recovery.');
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -1259,18 +1265,22 @@ function App() {
       confirmLabel: 'Remove provider',
       onConfirm: async () => {
         try {
-          const confirmed = await deleteProviderSecretStore(provider.id, provider.label);
+          const confirmed = browserDevelopment
+            ? window.confirm(`Remove "${provider.label}" from the runtime provider list?`)
+            : await deleteProviderSecretStore(provider.id, provider.label);
           if (!confirmed) return;
           const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || 'Could not remove provider.');
-          const secrets = await readProviderSecrets();
-          const updatedSecrets = removeProviderSecret(
-            secrets,
-            provider.id,
-            provider.adapterType,
-          );
-          await persistProviderSecrets(updatedSecrets);
+          if (!browserDevelopment) {
+            const secrets = await readProviderSecrets();
+            const updatedSecrets = removeProviderSecret(
+              secrets,
+              provider.id,
+              provider.adapterType,
+            );
+            await persistProviderSecrets(updatedSecrets);
+          }
           const providers = Array.isArray(data.providers) ? data.providers : [];
           const activeProviderId = typeof data.activeProvider === 'string' ? data.activeProvider : null;
           const activeProviderType = providers.find((item: ConfiguredProvider) => item.id === activeProviderId)?.adapterType || null;
@@ -2022,7 +2032,9 @@ function App() {
               <input type="checkbox" checked={fallbackEnabled} onChange={(event) => void changeFallbackEnabled(event.target.checked)} disabled={providerSaving} className="h-4 w-4 accent-emerald-500 disabled:opacity-50" />
             </label>
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <p className="min-w-0 flex-1 text-[11px] leading-relaxed text-slate-500">The backend keeps keys in memory only. This desktop client stores a local recovery copy so it can rehydrate the key after a backend restart.</p>
+              <p className="min-w-0 flex-1 text-[11px] leading-relaxed text-slate-500">{browserDevelopment
+                ? 'Development browser preview: provider keys are saved in the Windows-encrypted local vault shared with Electron on this account. Keys are never stored in browser storage.'
+                : 'Provider keys are stored in the Windows-encrypted local vault shared with the browser preview. Browser storage never contains credentials.'}</p>
               {!editingProvider && (providerId || providerKey || providerModel || providerLabel) ? (
                 <button type="button" onClick={cancelProviderEdit} disabled={providerSaving} className="shrink-0 rounded-lg border border-slate-600 px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-800 disabled:opacity-50">Cancel</button>
               ) : null}

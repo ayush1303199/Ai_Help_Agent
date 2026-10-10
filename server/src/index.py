@@ -105,7 +105,7 @@ app.add_middleware(
     allow_origins=sorted(TRUSTED_RENDERER_ORIGINS),
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["Content-Type", "X-Coding-Auth"],
+    allow_headers=["Content-Type", "X-Coding-Auth", "X-Coding-Browser-Access"],
 )
 
 
@@ -135,16 +135,28 @@ async def authenticate_coding_requests(request: Request, call_next):
             and is_loopback
             and origin in TRUSTED_RENDERER_ORIGINS
         )
+        is_provider_browser_access = (
+            is_loopback_browser
+            and origin != "null"
+            and request.headers.get("x-coding-browser-access") == "development"
+        )
         is_trusted_preflight = request.method == "OPTIONS" and origin in TRUSTED_RENDERER_ORIGINS
         valid_token = hmac.compare_digest(supplied_token, CODING_AUTH_TOKEN)
-        unauthorized = not trusted_origin or (
-            not is_trusted_preflight
-            and (
-                not valid_token
-                if is_protected_app_request
-                else not valid_token and not is_loopback_browser and not is_loopback
+        if is_protected_app_request:
+            has_browser_provider_access = (
+                is_provider_browser_access
+                and (path == "/api/settings/providers" or path.startswith("/api/settings/providers/"))
             )
-        )
+            unauthorized = not trusted_origin or (
+                not is_trusted_preflight and not valid_token and not has_browser_provider_access
+            )
+        else:
+            unauthorized = not trusted_origin or (
+                not is_trusted_preflight
+                and not valid_token
+                and not is_loopback_browser
+                and not is_loopback
+            )
         if unauthorized:
             return JSONResponse(
                 status_code=401,
@@ -1105,6 +1117,70 @@ def get_coding_project_state_endpoint() -> Dict[str, Any]:
     return get_backend_project_state()
 
 
+@app.get("/api/coding/acceptance-preflight")
+def get_coding_acceptance_preflight() -> Dict[str, Any]:
+    """Read readiness state without running project commands or changing files."""
+    import sys
+
+    project_state = get_backend_project_state()
+    active_provider = registry.get_active_provider()
+    provider_configured = bool(
+        active_provider
+        and active_provider.enabled
+        and provider_response_data(active_provider).get("hasApiKey") is True
+        and provider_response_data(active_provider).get("assistantCapable") is True
+        and provider_operation_capabilities(active_provider).get("toolCalling") is True
+    )
+    platform = sys.platform
+    platform_recognized = platform in {"win32", "darwin", "linux"}
+    sandbox_reason = (
+        "Project command execution is disabled because the OS sandbox is not verified."
+    )
+    blockers = []
+    if not provider_configured:
+        blockers.append({
+            "code": "runtime_provider_missing",
+            "message": "No enabled active runtime provider with a configured key and Coding Agent capabilities is available. Configure one under Configuration > AI Providers.",
+        })
+    project_attached = (
+        project_state.get("status") == "PROJECT_ATTACHED"
+        and bool(project_state.get("projectRoot"))
+    )
+    if not project_attached:
+        project_missing = project_state.get("status") == "PROJECT_MISSING"
+        blockers.append({
+            "code": "project_missing",
+            "message": (
+                "The selected project folder is missing from disk. Attach an existing project under Developer > Advanced."
+                if project_missing
+                else "No project is attached. Attach an existing project under Developer > Advanced."
+            ),
+        })
+    if not platform_recognized:
+        blockers.append({
+            "code": "sandbox_unsupported_platform",
+            "message": f'OS sandbox verification is unsupported on platform "{platform}".',
+        })
+    else:
+        blockers.append({"code": "sandbox_unverified", "message": sandbox_reason})
+
+    return {
+        "ready": False,
+        "canRunProjectCommands": False,
+        "providerConfigured": provider_configured,
+        "projectAttached": project_attached,
+        "projectStatus": project_state.get("status", "PROJECT_STATUS_UNAVAILABLE"),
+        "sandbox": {
+            "available": False,
+            "verified": False,
+            "platformRecognized": platform_recognized,
+            "platform": platform,
+            "reason": sandbox_reason,
+        },
+        "blockers": blockers,
+    }
+
+
 @app.post("/api/coding/project-state")
 def set_coding_project_state_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     project_root = payload.get("projectRoot")
@@ -1306,7 +1382,7 @@ def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     if current_state.get("attached") and current_state.get("projectRoot"):
         active_root = current_state["projectRoot"]
         active_name = Path(active_root).name.lower()
-        if not (path_hint and Path(path_hint).is_dir()):
+        if not signatures and not (path_hint and Path(path_hint).is_dir()):
             if not name or name.lower() == active_name:
                 return {"matches": [active_root], "projectRoot": active_root, "status": "PROJECT_ATTACHED"}
 
@@ -1909,6 +1985,11 @@ def legacy_provider_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
     if configuration_error:
         raise HTTPException(status_code=400, detail=configuration_error)
 
+    if registry.supports_persistent_secret_store():
+        try:
+            registry.assert_secret_store_available()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
     try:
         provider = registry.add_provider(
             provider_type=provider_type,
@@ -1922,6 +2003,11 @@ def legacy_provider_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
     registry.set_active_provider(provider.id)
     if isinstance(payload.get("fallbackEnabled"), bool):
         registry.fallback_enabled = payload["fallbackEnabled"]
+    if registry.supports_persistent_secret_store():
+        try:
+            registry.save_secrets_to_file()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
     registry.save_to_file()
 
     capability = self_test({"provider_id": provider.id})
@@ -1934,7 +2020,7 @@ def legacy_provider_setup(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.post("/api/settings/providers")
-def add_or_update_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
+def add_or_update_provider(payload: Dict[str, Any], request: Request = None) -> Dict[str, Any]:
     """Add or update a provider."""
     provider_type = str(payload.get("type") or payload.get("adapterType") or "").strip()
     model = str(payload.get("model") or "").strip()
@@ -1959,6 +2045,17 @@ def add_or_update_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
     if configuration_error:
         raise HTTPException(status_code=400, detail=configuration_error)
 
+    browser_preview = bool(request and request.headers.get("x-coding-browser-access") == "development")
+    if browser_preview and not registry.supports_persistent_secret_store():
+        raise HTTPException(
+            status_code=503,
+            detail="Persistent browser provider setup is supported only with the Windows encrypted local vault.",
+        )
+    if api_key and registry.supports_persistent_secret_store():
+        try:
+            registry.assert_secret_store_available()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
     try:
         provider = registry.add_provider(
             provider_type=provider_type,
@@ -1980,6 +2077,11 @@ def add_or_update_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
         if selected and provider_operation_capabilities(selected)["stt"]:
             registry.stt_provider_id = selected.id
 
+    if api_key and registry.supports_persistent_secret_store():
+        try:
+            registry.save_secrets_to_file()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
     registry.save_to_file()
 
     providers = []
@@ -2031,7 +2133,7 @@ def update_stt_provider(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.patch("/api/settings/providers/{provider_id}")
-def update_provider(provider_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def update_provider(provider_id: str, payload: Dict[str, Any], request: Request = None) -> Dict[str, Any]:
     """Update a specific provider."""
     provider = registry.get_provider(provider_id)
     if not provider:
@@ -2076,10 +2178,20 @@ def update_provider(provider_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     if label is not None:
         provider.label = label
 
-    if "apiKey" in payload:
-        api_key = str(payload.get("apiKey") or "").strip()
-        if api_key:
-            registry.set_api_key(provider_id, api_key)
+    api_key = str(payload.get("apiKey") or "").strip() if "apiKey" in payload else ""
+    browser_preview = bool(request and request.headers.get("x-coding-browser-access") == "development")
+    if browser_preview and api_key and not registry.supports_persistent_secret_store():
+        raise HTTPException(
+            status_code=503,
+            detail="Persistent browser provider setup is supported only with the Windows encrypted local vault.",
+        )
+    if api_key and registry.supports_persistent_secret_store():
+        try:
+            registry.assert_secret_store_available()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+    if api_key:
+        registry.set_api_key(provider_id, api_key)
 
     if enabled_value is not None:
         registry.set_provider_enabled(provider_id, enabled_value)
@@ -2093,6 +2205,11 @@ def update_provider(provider_id: str, payload: Dict[str, Any]) -> Dict[str, Any]
     if status_value is not None:
         registry.update_provider_status(provider_id, status_value)
 
+    if api_key and registry.supports_persistent_secret_store():
+        try:
+            registry.save_secrets_to_file()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
     registry.save_to_file()
     providers = []
     for item in registry.get_all_providers():
@@ -2135,11 +2252,27 @@ def set_provider_fallback(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.delete("/api/settings/providers/{provider_id}")
-def delete_provider(provider_id: str) -> Dict[str, Any]:
+def delete_provider(provider_id: str, request: Request = None) -> Dict[str, Any]:
     """Delete a provider."""
+    if registry.supports_persistent_secret_store() and registry.get_api_key(provider_id):
+        try:
+            registry.assert_secret_store_available()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+    browser_preview = bool(request and request.headers.get("x-coding-browser-access") == "development")
+    if browser_preview and not registry.supports_persistent_secret_store():
+        raise HTTPException(
+            status_code=503,
+            detail="Persistent browser provider setup is supported only with the Windows encrypted local vault.",
+        )
     if not registry.delete_provider(provider_id):
         raise HTTPException(status_code=404, detail="Provider not found.")
 
+    if registry.supports_persistent_secret_store():
+        try:
+            registry.save_secrets_to_file()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
     registry.save_to_file()
     providers = []
     for item in registry.get_all_providers():

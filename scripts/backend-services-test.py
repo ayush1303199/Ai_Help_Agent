@@ -140,6 +140,7 @@ from coding_websocket import (  # noqa: E402
 )
 from stt_service import SttService  # noqa: E402
 from provider_registry import ProviderInstance, ProviderRegistry, ProviderStatus  # noqa: E402
+from provider_secret_vault import ProviderSecretVault, ProviderSecretVaultError  # noqa: E402
 from provider_presets import PROVIDER_PRESETS  # noqa: E402
 from provider_model_contract import (  # noqa: E402
     PROVIDER_REGISTRY,
@@ -148,6 +149,152 @@ from provider_model_contract import (  # noqa: E402
     provider_model_error,
     provider_model_for_capability,
 )
+
+
+class ProviderSecretVaultTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI integration test")
+    def test_trusted_browser_provider_save_is_available_after_backend_restart(self):
+        import index
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "provider-config.json"
+            registry = ProviderRegistry(str(config_path))
+            origin = next(value for value in index.TRUSTED_RENDERER_ORIGINS if value != "null")
+            async def post_provider():
+                transport = httpx.ASGITransport(
+                    app=index.app,
+                    client=("127.0.0.1", 43210),
+                )
+                async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                    return await client.post(
+                        "/api/settings/providers",
+                        headers={
+                            "Origin": origin,
+                            "X-Coding-Browser-Access": "development",
+                        },
+                        json={
+                            "adapterType": "groq",
+                            "model": "openai/gpt-oss-20b",
+                            "baseURL": "https://api.groq.com/openai/v1",
+                            "apiKey": "browser-preview-persistence-test-secret",
+                            "createNew": True,
+                        },
+                    )
+
+            with patch.object(index, "registry", registry), patch.dict(
+                "os.environ", {"AI_CODING_BROWSER_ACCESS": "1"}
+            ):
+                response = asyncio.run(post_provider())
+
+            self.assertEqual(response.status_code, 200, response.text)
+            provider_id = response.json()["provider"]["id"]
+            restarted = ProviderRegistry(str(config_path))
+            restarted.initialize({}, {})
+            self.assertEqual(
+                restarted.get_api_key(provider_id),
+                "browser-preview-persistence-test-secret",
+            )
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI integration test")
+    def test_provider_secret_vault_is_encrypted_and_survives_registry_restart(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "provider-config.json"
+            registry = ProviderRegistry(str(config_path))
+            provider = registry.add_provider(
+                "groq",
+                "openai/gpt-oss-20b",
+                "https://api.groq.com/openai/v1",
+                "private-test-secret-not-for-output",
+                provider_id="groq-vault-test",
+                create_new=True,
+            )
+            registry.save_to_file()
+            registry.save_secrets_to_file()
+
+            vault_path = config_path.with_name("provider-secrets.enc.json")
+            serialized = vault_path.read_text(encoding="utf-8")
+            self.assertNotIn("private-test-secret-not-for-output", serialized)
+            self.assertNotIn("private-test-secret-not-for-output", config_path.read_text(encoding="utf-8"))
+
+            restarted = ProviderRegistry(str(config_path))
+            restarted.initialize({}, {})
+            self.assertEqual(restarted.get_api_key(provider.id), "private-test-secret-not-for-output")
+            self.assertTrue(restarted.get_provider(provider.id).has_api_key)
+
+            self.assertTrue(restarted.delete_provider(provider.id))
+            restarted.save_secrets_to_file()
+            self.assertFalse(vault_path.exists())
+
+    def test_provider_secret_vault_fails_closed_without_windows_encryption(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            vault = ProviderSecretVault(Path(temporary_directory) / "provider-secrets.enc.json")
+            with patch("provider_secret_vault.sys.platform", "linux"):
+                with self.assertRaises(ProviderSecretVaultError):
+                    vault.assert_available()
+
+    def test_browser_provider_save_is_rejected_before_mutation_when_vault_is_unsupported(self):
+        import index
+        from fastapi import HTTPException
+        from starlette.requests import Request
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            request = Request({
+                "type": "http",
+                "method": "POST",
+                "path": "/api/settings/providers",
+                "headers": [(b"x-coding-browser-access", b"development")],
+                "client": ("127.0.0.1", 43210),
+                "server": ("127.0.0.1", 3001),
+                "scheme": "http",
+                "query_string": b"",
+            })
+            with patch.object(index, "registry", registry), patch.object(
+                registry, "supports_persistent_secret_store", return_value=False
+            ):
+                with self.assertRaises(HTTPException) as raised:
+                    index.add_or_update_provider({
+                        "adapterType": "groq",
+                        "model": "openai/gpt-oss-20b",
+                        "baseURL": "https://api.groq.com/openai/v1",
+                        "apiKey": "unsupported-platform-test",
+                        "createNew": True,
+                    }, request)
+            self.assertEqual(raised.exception.status_code, 503)
+            self.assertEqual(registry.get_all_providers(), [])
+
+
+class CodingAcceptancePreflightEndpointTests(unittest.TestCase):
+    def test_browser_preflight_reports_live_prerequisites_without_enabling_execution(self):
+        import index
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
+            with patch.object(index, "registry", registry), patch.object(
+                index, "get_backend_project_state",
+                return_value={"status": "PROJECT_NOT_ATTACHED", "projectRoot": None},
+            ):
+                missing = index.get_coding_acceptance_preflight()
+
+            provider = registry.add_provider(
+                "groq",
+                "openai/gpt-oss-20b",
+                "https://api.groq.com/openai/v1",
+                "preflight-private-test-secret",
+            )
+            with patch.object(index, "registry", registry), patch.object(
+                index, "get_backend_project_state",
+                return_value={"status": "PROJECT_ATTACHED", "projectRoot": "C:\\dynamic-project"},
+            ):
+                configured = index.get_coding_acceptance_preflight()
+
+        self.assertIn("project_missing", {item["code"] for item in missing["blockers"]})
+        self.assertFalse(missing["canRunProjectCommands"])
+        self.assertTrue(configured["providerConfigured"])
+        self.assertTrue(configured["projectAttached"])
+        self.assertFalse(configured["canRunProjectCommands"])
+        self.assertFalse(configured["sandbox"]["verified"])
+        self.assertNotIn("preflight-private-test-secret", json.dumps(configured))
 
 
 class CodingProviderEvidenceFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -9061,6 +9208,8 @@ class ProviderSecretLifecycleTests(unittest.TestCase):
         self.assertTrue(result["provider"]["hasApiKey"])
         self.assertFalse(private_test_value in json.dumps(result))
         self.assertFalse(private_test_value in self.config_path.read_text(encoding="utf-8"))
+        encrypted_vault = self.config_path.with_name("provider-secrets.enc.json").read_text(encoding="utf-8")
+        self.assertFalse(private_test_value in encrypted_vault)
 
     def test_existing_provider_edit_post_saves_api_key_immediately_without_persisting_secret(self):
         import index
@@ -9093,6 +9242,8 @@ class ProviderSecretLifecycleTests(unittest.TestCase):
         persisted = self.config_path.read_text(encoding="utf-8")
         self.assertFalse(private_test_value in persisted)
         self.assertTrue(json.loads(persisted)["providers"][0]["hasApiKey"])
+        encrypted_vault = self.config_path.with_name("provider-secrets.enc.json").read_text(encoding="utf-8")
+        self.assertFalse(private_test_value in encrypted_vault)
 
     def test_groq_and_gemini_use_the_same_runtime_secret_resolution_path(self):
         import index
@@ -9109,7 +9260,7 @@ class ProviderSecretLifecycleTests(unittest.TestCase):
             self.assertTrue(index.get_api_key(gemini.id) == "gemini-test-value")
             self.assertTrue(index.provider_response_data(gemini)["hasApiKey"])
 
-    def test_backend_restart_requires_renderer_secret_rehydration(self):
+    def test_backend_restart_restores_key_from_encrypted_local_vault(self):
         import index
 
         original_key = "gemini-restart-test-key"
@@ -9120,20 +9271,18 @@ class ProviderSecretLifecycleTests(unittest.TestCase):
             original_key,
         )
         self.registry.save_to_file()
+        self.registry.save_secrets_to_file()
 
         restarted = ProviderRegistry(str(self.config_path))
         restarted.initialize({}, {})
         loaded = restarted.get_provider(provider.id)
         self.assertTrue(loaded.has_api_key)
-        self.assertEqual(restarted.get_api_key(provider.id), "")
+        self.assertEqual(restarted.get_api_key(provider.id), original_key)
         self.assertNotIn(original_key, self.config_path.read_text(encoding="utf-8"))
-
-        with patch.object(index, "registry", restarted):
-            restored = index.update_provider(provider.id, {"apiKey": original_key})
-            self.assertTrue(index.provider_response_data(loaded)["hasApiKey"])
-
-        self.assertEqual(restored["provider"]["id"], provider.id)
-        self.assertTrue(restored["provider"]["hasApiKey"])
+        self.assertNotIn(
+            original_key,
+            self.config_path.with_name("provider-secrets.enc.json").read_text(encoding="utf-8"),
+        )
 
     def test_retired_model_secret_rehydration_preserves_identity_after_model_migration(self):
         import index
@@ -11031,6 +11180,52 @@ class CodingProjectIdentityTests(unittest.TestCase):
             self.assertEqual(response.json()["status"], "PROJECT_ATTACHED")
             self.assertEqual(response.json()["projectRoot"], str(selected.resolve()))
 
+    def test_browser_selection_signatures_override_attached_same_name_project(self):
+        import index
+        from fastapi.testclient import TestClient
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            app_root = root / "app" / "server"
+            current_directory = root / "cwd"
+            home = root / "home"
+            temporary = root / "tmp"
+            active = home / "Documents" / "first" / "project"
+            selected = home / "Documents" / "second" / "project"
+            for directory in (app_root, current_directory, active, selected, temporary):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            with patch.object(index, "APP_ROOT", app_root), patch.object(
+                Path, "cwd", return_value=current_directory
+            ), patch.object(Path, "home", return_value=home), patch(
+                "tempfile.gettempdir", return_value=str(temporary)
+            ), patch.object(
+                index,
+                "get_backend_project_state",
+                return_value={"attached": True, "projectRoot": str(active)},
+            ), patch.object(
+                index,
+                "_find_projects_by_signatures",
+                return_value=[(145, 1.0, str(selected.resolve()))],
+            ), patch.object(
+                index,
+                "set_backend_project_state",
+                return_value={
+                    "projectRoot": str(selected.resolve()),
+                    "status": "PROJECT_ATTACHED",
+                    "attached": True,
+                },
+            ), patch.dict("os.environ", {"AI_HELP_AGENT_CODING_PROJECT_ROOTS": ""}):
+                with TestClient(index.app) as client:
+                    response = client.post(
+                        "/api/coding/project-discover",
+                        headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
+                        json={"name": "project", "signatures": ["composer.json", "src"]},
+                    )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["projectRoot"], str(selected.resolve()))
+
     def test_database_configuration_uses_discovered_files_and_unknown_without_config(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -11239,7 +11434,7 @@ class CodingRequestAuthenticationTests(unittest.TestCase):
                 headers={
                     "Origin": trusted_origin,
                     "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "x-coding-auth",
+                    "Access-Control-Request-Headers": "x-coding-auth,x-coding-browser-access",
                 },
             )
 
@@ -11247,6 +11442,10 @@ class CodingRequestAuthenticationTests(unittest.TestCase):
         self.assertEqual(untrusted_origin.status_code, 401)
         self.assertEqual(authenticated.status_code, 200)
         self.assertEqual(preflight.status_code, 200)
+        self.assertIn(
+            "x-coding-browser-access",
+            preflight.headers.get("access-control-allow-headers", "").lower(),
+        )
 
     def test_coding_http_allows_only_trusted_loopback_browser_without_token(self):
         import index
@@ -11288,6 +11487,56 @@ class CodingRequestAuthenticationTests(unittest.TestCase):
 
         self.assertEqual(trusted_status, 204)
         self.assertEqual(untrusted_status, 401)
+
+    def test_provider_settings_browser_access_is_development_only_and_origin_bound(self):
+        import index
+        from starlette.requests import Request
+        from starlette.responses import Response
+
+        trusted_origin = next(
+            origin
+            for origin in index.TRUSTED_RENDERER_ORIGINS
+            if origin != "null"
+        )
+
+        async def authenticate(path, origin, marker):
+            headers = [(b"origin", origin.encode("ascii"))]
+            if marker:
+                headers.append((b"x-coding-browser-access", b"development"))
+            request = Request({
+                "type": "http",
+                "method": "GET",
+                "path": path,
+                "headers": headers,
+                "client": ("127.0.0.1", 43210),
+                "server": ("127.0.0.1", 3001),
+                "scheme": "http",
+                "query_string": b"",
+            })
+
+            async def call_next(_request):
+                return Response(status_code=204)
+
+            return (await index.authenticate_coding_requests(request, call_next)).status_code
+
+        async def run_checks():
+            return await asyncio.gather(
+                authenticate("/api/settings/providers", trusted_origin, True),
+                authenticate("/api/settings/providers", trusted_origin, False),
+                authenticate("/api/settings/providers", "https://untrusted.example", True),
+                authenticate("/api/settings/agent", trusted_origin, True),
+            )
+
+        with patch.dict("os.environ", {"AI_CODING_BROWSER_ACCESS": "1"}):
+            allowed, missing_marker, untrusted_origin, other_protected_route = asyncio.run(run_checks())
+        with patch.dict("os.environ", {"AI_CODING_BROWSER_ACCESS": "0"}):
+            disabled = asyncio.run(authenticate("/api/settings/providers", trusted_origin, True))
+
+        self.assertEqual(allowed, 204)
+        self.assertEqual(missing_marker, 401)
+        self.assertEqual(untrusted_origin, 401)
+        self.assertEqual(other_protected_route, 401)
+        self.assertEqual(disabled, 401)
 
 
 class CodingWebSocketAuthenticationTests(unittest.IsolatedAsyncioTestCase):

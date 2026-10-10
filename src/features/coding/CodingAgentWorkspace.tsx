@@ -104,6 +104,9 @@ interface Proposal {
   lifecycleState?: string;
   repairAttempt?: number;
   repairAvailable?: boolean;
+  autoRepairEnabled?: boolean;
+  autoRepairAuthorized?: boolean;
+  autoRepairBlockedReason?: string | null;
   attemptNumber?: number;
   maxAttempts?: number;
   attemptLabel?: string;
@@ -154,6 +157,17 @@ interface CodingAgentWorkspaceProps {
   input: string;
   projectRoot: string | null;
   projectStatus?: string;
+  acceptancePreflight?: {
+    ready: boolean;
+    canRunProjectCommands: boolean;
+    providerConfigured: boolean;
+    projectAttached: boolean;
+    projectStatus: string;
+    sandbox: { available: boolean; verified: boolean; platformRecognized: boolean; platform: string; reason: string | null };
+    blockers: Array<{ code: string; message: string }>;
+  } | null;
+  acceptancePreflightBusy?: boolean;
+  onRefreshAcceptancePreflight?: () => void;
   projectCandidates?: string[];
   directory: Array<{ name: string; type: 'file' | 'directory' }>;
   path: string;
@@ -162,6 +176,7 @@ interface CodingAgentWorkspaceProps {
   searchQuery: string;
   searchResults: SearchResult[];
   proposal: Proposal | null;
+  autoRepairChoice: boolean;
   activity: CodingActivity[];
   busy: boolean;
   streaming: boolean;
@@ -178,6 +193,7 @@ interface CodingAgentWorkspaceProps {
   onReadFile: (path?: string) => void;
   onSearch: () => void;
   onApproveProposal: () => void;
+  onAutoRepairChange: (enabled: boolean) => void;
   onRejectProposal: () => void;
   onApplyProposal: () => void;
   onUndoProposal: () => void;
@@ -342,6 +358,9 @@ export function CodingAgentWorkspace({
   input,
   projectRoot,
   projectStatus,
+  acceptancePreflight,
+  acceptancePreflightBusy = false,
+  onRefreshAcceptancePreflight,
   projectCandidates = [],
   directory,
   path,
@@ -350,6 +369,7 @@ export function CodingAgentWorkspace({
   searchQuery,
   searchResults,
   proposal,
+  autoRepairChoice,
   activity,
   busy,
   streaming,
@@ -360,11 +380,13 @@ export function CodingAgentWorkspace({
   onSearchQueryChange,
   onSelectProject,
   onSelectCandidate,
+  onAttachProjectByPath,
   onClearProject,
   onListDirectory,
   onReadFile,
   onSearch,
   onApproveProposal,
+  onAutoRepairChange,
   onRejectProposal,
   onApplyProposal,
   onUndoProposal,
@@ -389,9 +411,11 @@ export function CodingAgentWorkspace({
     && ['localhost', '127.0.0.1'].includes(window.location.hostname)
     && window.location.port === String(runtimeConfig.services.devServer.port)
   );
+  const isBrowserDevelopment = !isTrustedDesktop && canSelectProject;
   const proposalNeedsDecision = Boolean(proposal && ['awaiting_approval', 'approved', 'applying', 'verifying'].includes(proposal.state || ''));
   const [showAllMessages, setShowAllMessages] = useState(false);
   const [copyError, setCopyError] = useState('');
+  const [projectPathInput, setProjectPathInput] = useState('');
   const lastConversationId = useRef(activeConversationId);
   const olderConversationStates = conversations
     .filter((conversation) => conversation.id !== activeConversationId && conversation.messages.length > 0)
@@ -418,6 +442,35 @@ export function CodingAgentWorkspace({
     <>
       {errorMessage && <p role="alert" className="mb-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{errorMessage}</p>}
       {statusMessage && <p role="status" className="mb-3 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-200">{statusMessage}</p>}
+      <section aria-label="Live acceptance readiness" className="mb-3 rounded-lg border border-slate-700 bg-slate-950/40 px-3 py-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs font-semibold text-slate-200">Live acceptance readiness</p>
+          <button
+            type="button"
+            onClick={onRefreshAcceptancePreflight}
+            disabled={acceptancePreflightBusy || !onRefreshAcceptancePreflight}
+            className="rounded border border-slate-600 px-2 py-1 text-[11px] text-slate-300 hover:border-sky-400 disabled:opacity-50"
+          >
+            {acceptancePreflightBusy ? 'Checking…' : 'Check prerequisites'}
+          </button>
+        </div>
+        {!acceptancePreflight && <p className="mt-1 text-[11px] text-slate-400">Read-only check; it does not run project commands or change files.</p>}
+        {acceptancePreflight && (
+          <>
+            <p role="status" className={`mt-1 text-[11px] ${acceptancePreflight.ready ? 'text-emerald-300' : 'text-amber-200'}`}>
+              {acceptancePreflight.ready ? 'Ready for live acceptance.' : 'Not ready; project commands remain disabled unless the OS sandbox is verified.'}
+            </p>
+            {acceptancePreflight.blockers.length > 0 && (
+              <ul className="mt-1 list-disc space-y-1 pl-5 text-[11px] text-amber-100">
+                {acceptancePreflight.blockers.map((blocker) => <li key={blocker.code}>{blocker.message}</li>)}
+              </ul>
+            )}
+            <p className="mt-1 text-[10px] text-slate-500">
+              Provider: {acceptancePreflight.providerConfigured ? 'ready' : 'missing/unavailable'} · Project: {acceptancePreflight.projectStatus} · Sandbox: {acceptancePreflight.sandbox.verified ? 'verified' : `not verified (${acceptancePreflight.sandbox.platform})`}
+            </p>
+          </>
+        )}
+      </section>
       {!canSelectProject && (
         <p role="status" className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
           Project selection and Coding Agent access require the trusted desktop app. Open it to select a folder; browser folder picks cannot be attached.
@@ -446,10 +499,21 @@ export function CodingAgentWorkspace({
           </p>
           {projectRoot && <p className="mt-1 text-[11px] text-sky-300">Scope: {path || '.'}</p>}
         </div>
-        <details className="relative shrink-0">
-          <summary className="cursor-pointer list-none rounded-md border border-slate-600 px-3 py-2 text-xs text-slate-300 hover:border-sky-400">
-            Advanced
-          </summary>
+        <div className="flex shrink-0 items-center gap-2">
+          {canSelectProject && (
+            <button
+              type="button"
+              onClick={onSelectProject}
+              disabled={busy || streaming}
+              className="rounded-md border border-sky-500/50 px-3 py-2 text-xs text-sky-300 hover:border-sky-400 disabled:opacity-40"
+            >
+              Select project folder
+            </button>
+          )}
+          <details className="relative">
+            <summary className="cursor-pointer list-none rounded-md border border-slate-600 px-3 py-2 text-xs text-slate-300 hover:border-sky-400">
+              Advanced
+            </summary>
           <div className="absolute right-0 z-20 mt-2 max-h-[70vh] w-[min(92vw,34rem)] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl">
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
@@ -457,10 +521,34 @@ export function CodingAgentWorkspace({
                 <p className="truncate text-xs text-slate-300">{projectRoot || 'No project selected'}</p>
               </div>
               <div className="flex shrink-0 gap-2">
-                <button onClick={onSelectProject} disabled={!canSelectProject || busy || streaming} className="rounded-md border border-sky-500/50 px-2 py-1.5 text-[11px] text-sky-300 disabled:opacity-40">Select folder</button>
                 {projectRoot && <button onClick={onClearProject} disabled={busy || streaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Clear</button>}
               </div>
             </div>
+            {isBrowserDevelopment && (
+              <div className="mt-3 flex gap-2">
+                <input
+                  aria-label="Project folder path"
+                  value={projectPathInput}
+                  onChange={(event) => setProjectPathInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && projectPathInput.trim()) {
+                      onAttachProjectByPath?.(projectPathInput.trim());
+                    }
+                  }}
+                  placeholder="Or paste the full project folder path"
+                  className="min-w-0 flex-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-sky-400"
+                />
+                <button
+                  type="button"
+                  aria-label="Attach project path"
+                  onClick={() => onAttachProjectByPath?.(projectPathInput.trim())}
+                  disabled={!projectPathInput.trim() || busy || streaming || !onAttachProjectByPath}
+                  className="rounded-md border border-sky-500/50 px-2 py-1.5 text-[11px] text-sky-300 disabled:opacity-40"
+                >
+                  Attach path
+                </button>
+              </div>
+            )}
             {projectCandidates.length > 0 && (
               <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
                 <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-300">Matching projects found</p>
@@ -501,7 +589,8 @@ export function CodingAgentWorkspace({
               {codingPreferences.length === 0 ? <p className="mt-2 text-xs text-slate-500">No saved preferences.</p> : <div className="mt-2 space-y-1">{codingPreferences.map((preference) => <label key={preference.id} className="flex items-start gap-2 text-xs text-slate-300"><input type="checkbox" checked={preference.enabled} onChange={() => onToggleCodingPreference(preference.id)} className="mt-0.5" /><span><span className="mr-2 text-[10px] uppercase text-sky-300">{preference.category}</span>{preference.text}</span></label>)}</div>}
             </div>
           </div>
-        </details>
+          </details>
+        </div>
       </header>
 
       {olderConversationStates.length > 0 && (
@@ -599,6 +688,18 @@ export function CodingAgentWorkspace({
         <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Coding Agent</p>
         <p className="mb-3 text-sm leading-relaxed text-slate-100">Here is the proposed change for review. Nothing is written until you approve it.</p>
         <section className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+        {proposal.state === 'awaiting_approval' && proposal.attemptNumber === 1 && <label className="mb-3 flex cursor-pointer items-start gap-2 rounded-md border border-sky-500/30 bg-sky-500/5 p-2 text-[11px] text-sky-100">
+          <input
+            type="checkbox"
+            checked={autoRepairChoice}
+            onChange={(event) => onAutoRepairChange(event.target.checked)}
+            disabled={busy}
+            className="mt-0.5 accent-sky-400"
+          />
+          <span><strong>Auto mode:</strong> after approval, apply and verify this change, then automatically prepare and apply up to 3 repairs for the same approved files and operations. Test/build configuration changes and deletions still require manual approval.</span>
+        </label>}
+        {proposal.autoRepairEnabled && <p role="status" className="mb-3 rounded-md border border-sky-500/30 bg-sky-500/5 p-2 text-[11px] text-sky-100">Auto mode enabled for this approved scope · up to 3 repair attempts · no automatic deletions.</p>}
+        {proposal.autoRepairBlockedReason && <p role="status" className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] text-amber-100">{proposal.autoRepairBlockedReason}</p>}
         <div className="flex items-start justify-between gap-3">
           <div>
             <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-200">Proposed diff · {proposal.state === 'cancelled' ? 'rejected' : proposal.lifecycleState || proposal.state || 'pending'}</p>

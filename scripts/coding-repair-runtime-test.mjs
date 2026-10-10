@@ -38,6 +38,7 @@ const conversationRepairTokens = [];
 let applyCalls = 0;
 let conversationCount = 0;
 let initialProjectSync = false;
+let autoModeGranted = false;
 
 class RuntimeWebSocket {
   static OPEN = 1;
@@ -111,20 +112,38 @@ window.electronAPI = {
       id: `proposal-${index + 1}`,
       proposalId: `proposal-ref-${index + 1}`,
       manifestHash: `manifest-${index + 1}`,
-      state: 'awaiting_approval',
-      lifecycleState: 'WAITING_FOR_APPROVAL',
+      state: repairToken && autoModeGranted ? 'approved' : 'awaiting_approval',
+      lifecycleState: repairToken && autoModeGranted ? 'APPROVED' : 'WAITING_FOR_APPROVAL',
       attemptNumber: repairToken ? 2 : 1,
-      maxAttempts: 3,
-      attemptLabel: repairToken ? 'attempt 2 of 3' : 'attempt 1 of 3',
+      maxAttempts: autoModeGranted ? 4 : 3,
+      attemptLabel: repairToken && autoModeGranted
+        ? 'attempt 2 of 4'
+        : repairToken ? 'attempt 2 of 3' : 'attempt 1 of 3',
       repairAvailable: false,
+      autoRepairEnabled: repairToken && autoModeGranted,
+      autoRepairAuthorized: repairToken && autoModeGranted,
       reviewFlags: [],
       files: [],
       runtime: null,
     };
   },
-  approveDeveloperProposal: async (id) => ({ id, state: 'approved' }),
+  approveDeveloperProposal: async (id, options = {}) => {
+    autoModeGranted = options.autoRepair === true;
+    return { id, state: 'approved', autoRepairEnabled: autoModeGranted };
+  },
   applyDeveloperProposal: async (id) => {
     applyCalls += 1;
+    if (applyCalls === 3) {
+      return {
+        id,
+        state: 'completed',
+        verification: { status: 'PASS', executed: true, exitCode: 0 },
+        repairAvailable: false,
+        attemptNumber: 2,
+        maxAttempts: 4,
+        attemptLabel: 'attempt 2 of 4',
+      };
+    }
     return {
       id,
       state: 'failed',
@@ -151,8 +170,8 @@ window.electronAPI = {
   getDeveloperVerificationRepairContext: async () => ({
     repairToken: 'main-issued-one-time-token',
     attemptNumber: 2,
-    maxAttempts: 3,
-    attemptLabel: 'attempt 2 of 3',
+    maxAttempts: autoModeGranted ? 4 : 3,
+    attemptLabel: autoModeGranted ? 'attempt 2 of 4' : 'attempt 2 of 3',
     check: 'test',
     classification: 'CODE_FAILURE',
     location: 'src/index.ts:1',
@@ -232,6 +251,35 @@ try {
   await waitForReact(() => current.workspace.proposal?.state === 'approved', 'The repair proposal was not approved.');
   assert.equal(applyCalls, 1, 'Approval alone must not apply the repair patch.');
   console.log('Coding repair runtime provider-count and approval-gating test passed.');
+
+  await act(async () => {
+    current.workspace.onClearMessages();
+  });
+  await waitForReact(() => current.workspace.proposal === null, 'The completed manual test setup did not reset.');
+  await act(async () => {
+    current.workspace.onInputChange('Make an Auto mode change.');
+  });
+  await act(async () => {
+    current.workspace.onSendMessage();
+  });
+  await waitForReact(() => providerRequests.length === 3 && current.workspace.proposal?.id === 'proposal-3', 'The Auto mode initial proposal was not prepared.');
+  await act(async () => {
+    current.workspace.onAutoRepairChange(true);
+  });
+  await waitForReact(() => current.workspace.autoRepairChoice === true, 'Auto mode could not be selected.');
+  await act(async () => {
+    current.workspace.onApproveProposal();
+  });
+  await waitForReact(
+    () => providerRequests.length === 4 && applyCalls === 3
+      && current.workspace.proposal?.id === 'proposal-4'
+      && current.workspace.proposal?.state === 'completed',
+    `Auto mode did not finish the bounded repair cycle (requests=${providerRequests.length}, applies=${applyCalls}, proposal=${JSON.stringify(current.workspace.proposal)}, status=${current.workspace.statusMessage}).`,
+  );
+  assert.equal(providerRequests.length, 4, 'One automatic repair must use one additional model cycle.');
+  assert.equal(applyCalls, 3, 'Auto mode must apply the initial proposal and one repair without a second approval click.');
+  assert.equal(proposalRegistrations[3].repairToken, 'main-issued-one-time-token');
+  console.log('Coding Auto mode edit-verify-repair runtime test passed.');
 } finally {
   if (root) await act(async () => root.unmount());
   await vite.close();

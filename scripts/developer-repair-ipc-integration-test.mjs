@@ -17,6 +17,7 @@ const dialogRequests = [];
 const policyRequests = [];
 const policyProofs = [];
 let policyDecision = 'ALLOW';
+let providerListFixture = { providers: [], activeProvider: null };
 const electronMock = {
   app: Object.assign(new EventEmitter(), {
     isPackaged: false,
@@ -124,6 +125,10 @@ developerFiles.runVerification = async (script) => {
 
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async (url, options = {}) => {
+  if (String(url).includes('/api/settings/providers')) {
+    assert.match(options.headers?.['X-Coding-Auth'] || '', /\S/, 'Preflight provider lookup must authenticate.');
+    return { ok: true, json: async () => providerListFixture };
+  }
   if (String(url).includes('/api/coding/policy/file-mutation')) {
     policyRequests.push(JSON.parse(options.body || '{}'));
     policyProofs.push(options.headers?.['X-Coding-Mutation-Proof']);
@@ -212,8 +217,31 @@ try {
   const senderFor = () => windows[0].webContents;
   const sender = senderFor(1);
   const ownerId = sender.id;
+  assert.ok(handlers.has('developer:acceptance-preflight'));
+  const unattachedPreflight = await invoke('developer:acceptance-preflight', sender);
+  assert.ok(unattachedPreflight.blockers.some((item) => item.code === 'runtime_provider_missing'));
+  assert.ok(unattachedPreflight.blockers.some((item) => item.code === 'project_missing'));
+  assert.ok(unattachedPreflight.blockers.some((item) => item.code === 'sandbox_unverified'));
+  assert.equal(unattachedPreflight.canRunProjectCommands, false);
   const projectRoot = await createProject(sender);
   projectRootBySender.set(ownerId, projectRoot);
+  const missingProviderPreflight = await invoke('developer:acceptance-preflight', sender);
+  assert.equal(missingProviderPreflight.projectAttached, true);
+  assert.ok(missingProviderPreflight.blockers.some((item) => item.code === 'runtime_provider_missing'));
+  providerListFixture = {
+    activeProvider: 'active-provider',
+    providers: [{
+      id: 'active-provider',
+      enabled: true,
+      hasApiKey: true,
+      assistantCapable: true,
+      developerToolCalling: true,
+    }],
+  };
+  const providerReadyPreflight = await invoke('developer:acceptance-preflight', sender);
+  assert.equal(providerReadyPreflight.providerConfigured, true);
+  assert.ok(providerReadyPreflight.blockers.some((item) => item.code === 'sandbox_unverified'));
+  assert.equal(providerReadyPreflight.canRunProjectCommands, false);
 
   const initial = await createProposal(sender, patch('src/app.js', 'const value = 1;', 'const value = 2;'), {
     attemptNumber: 77,
@@ -255,6 +283,57 @@ try {
   assert.equal(await fs.readFile(path.join(projectRoot, 'src', 'app.js'), 'utf8'), 'const value = 1;\n');
   assert.ok(policyRequests.some((request) => request.operation === 'modify'));
   assert.ok(policyProofs.length > 0 && policyProofs.every((proof) => /^[a-f0-9]{64}$/.test(proof)));
+
+  const autoInitial = await createProposal(
+    sender,
+    patch('src/app.js', 'const value = 1;', 'const value = 2;'),
+  );
+  const autoApproval = await invoke('developer:proposal-approve', sender, autoInitial.id, { autoRepair: true });
+  assert.equal(autoApproval.autoRepairEnabled, true);
+  assert.equal(autoApproval.maxAttempts, 4, 'Auto mode permits one initial attempt plus three repairs.');
+  const autoInitialFailure = await invoke('developer:proposal-apply', sender, autoInitial.id);
+  assert.equal(autoInitialFailure.state, 'failed');
+  assert.equal(autoInitialFailure.repairAvailable, true);
+  assert.equal(
+    await fs.readFile(path.join(projectRoot, 'src', 'app.js'), 'utf8'),
+    'const value = 1;\n',
+    'The failed initial Auto-mode attempt must be rolled back before repair creation.',
+  );
+  const autoRepairContext = await invoke('developer:verification-repair-context', sender, autoInitial.id);
+  const autoRepairProposal = await createProposal(
+    sender,
+    patch('src/app.js', 'const value = 1;', 'const value = 3;'),
+    { repairToken: autoRepairContext.repairToken },
+  );
+  assert.equal(autoRepairProposal.state, 'approved', 'An in-scope repair must be approved by the existing main-process chain.');
+  assert.equal(autoRepairProposal.autoRepairAuthorized, true);
+  assert.ok(developerAgent.getTaskForTest(autoRepairProposal.id).approval);
+  verificationOutcome = 'pass';
+  const autoRepairResult = await invoke('developer:proposal-apply', sender, autoRepairProposal.id);
+  verificationOutcome = 'failure';
+  assert.equal(autoRepairResult.state, 'completed');
+  assert.equal(autoRepairResult.verification.status, 'PASS');
+  assert.ok(policyRequests.some((request) => request.operation === 'modify' && request.paths.includes('src/app.js')));
+
+  const autoExpansionInitial = await createProposal(
+    sender,
+    patch('src/app.js', 'const value = 3;', 'const value = 4;'),
+  );
+  await invoke('developer:proposal-approve', sender, autoExpansionInitial.id, { autoRepair: true });
+  const autoExpansionFailure = await invoke('developer:proposal-apply', sender, autoExpansionInitial.id);
+  assert.equal(autoExpansionFailure.state, 'failed');
+  const autoExpansionContext = await invoke('developer:verification-repair-context', sender, autoExpansionInitial.id);
+  const autoExpandedProposal = await createProposal(
+    sender,
+    patch('tests/sample.test.js', 'test("sample", () => {});', 'test("expanded", () => {});'),
+    { repairToken: autoExpansionContext.repairToken },
+  );
+  assert.equal(autoExpandedProposal.state, 'awaiting_approval');
+  assert.equal(autoExpandedProposal.autoRepairAuthorized, false);
+  assert.equal(autoExpandedProposal.autoRepairEnabled, false);
+  assert.match(autoExpandedProposal.autoRepairBlockedReason, /outside the initial approval|test or verification configuration/i);
+  await invoke('developer:verification-repair-cancel', sender, autoExpandedProposal.id);
+  await fs.writeFile(path.join(projectRoot, 'src', 'app.js'), 'const value = 1;\n');
 
   const meetingDirectory = path.join(projectRoot, 'src', 'features', 'meeting');
   await fs.mkdir(meetingDirectory, { recursive: true });
