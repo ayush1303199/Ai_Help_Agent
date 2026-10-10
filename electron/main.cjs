@@ -13,7 +13,10 @@ const developerBenchmark = require('./developerBenchmark.cjs');
 const generalAgent = require('./generalAgent.cjs');
 const { ProviderSecretVault } = require('./providerSecretVault.cjs');
 const { authorizeAppOwnedMutation } = require('./appOwnedPersistence.cjs');
-const { projectProcessIsolationStatus } = require('./coding-pipeline/projectProcessIsolation.cjs');
+const {
+  projectProcessIsolationStatus,
+  verifyProjectProcessIsolation,
+} = require('./coding-pipeline/projectProcessIsolation.cjs');
 const { buildCodingAcceptancePreflight } = require('./coding-pipeline/acceptancePreflight.cjs');
 const runtimeSettings = require('../src/config/runtimeSettings.json');
 const { services, electron: electronSettings } = runtimeSettings;
@@ -1228,6 +1231,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:acceptance-preflight', async (event) => {
     developerAgent.getSession(event.sender.id);
     const projectState = await developerFiles.getProjectState(event.sender.id);
+    await verifyProjectProcessIsolation();
     let providerConfigured = false;
     let providerCheckError = null;
     try {

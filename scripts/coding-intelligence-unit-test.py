@@ -269,6 +269,19 @@ def test_database_autonomous_execution_contract():
     # 1. Discover database configuration from project files
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
+        source_path = (
+            r"config\database\db.php"
+            if os.name == "nt"
+            else "config/database/db.php"
+        )
+        resolved_reference = ConfigurationSymbolResolver._resolve_static_project_reference(
+            tmp_path,
+            source_path,
+            "require dirname(__FILE__) . '/local.php';",
+            {"config/database/local.php"},
+        )
+        assert resolved_reference == ["config/database/local.php"]
+
         config_dir = tmp_path / "config"
         config_dir.mkdir(parents=True)
         db_file = config_dir / "db.php"
@@ -328,6 +341,32 @@ return [
         assert "- **Status:** NOT_CONFIGURED" in unrelated_report
         assert "INSPECTED CONFIGURATION FILE" not in unrelated_report
         assert "$requirements" not in unrelated_report
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        original_inspector = ConfigurationSymbolResolver.__dict__[
+            "inspect_project_database_configuration"
+        ]
+
+        def fail_configuration_inspection(cls, project_root, specific_file=None):
+            raise RuntimeError("simulated configuration inspection failure")
+
+        ConfigurationSymbolResolver.inspect_project_database_configuration = classmethod(
+            fail_configuration_inspection
+        )
+        try:
+            failed_discovery = DatabaseIntelligenceEngine.discover_database_configuration(
+                tmp_dir
+            )
+        finally:
+            ConfigurationSymbolResolver.inspect_project_database_configuration = (
+                original_inspector
+            )
+
+        assert failed_discovery["discovered"] is False
+        assert failed_discovery["status"] == "DB_CONFIG_INSPECTION_FAILED"
+        assert failed_discovery["failureClassification"] == "DB_CONFIG_INSPECTION_FAILED"
+        assert failed_discovery["inspectionErrorType"] == "RuntimeError"
+        assert "simulated configuration inspection failure" not in str(failed_discovery)
 
     # 2. Check all 8 capability paths
     caps = DatabaseIntelligenceEngine.check_database_capabilities(

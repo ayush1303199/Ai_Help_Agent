@@ -5,7 +5,11 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { developer: developerSettings } = require('../src/config/runtimeSettings.json');
 const { detectProject, PROJECT_MANIFESTS, VERIFICATION_PROFILES } = require('./coding-pipeline/detect/projectDetector.cjs');
-const { requireProjectProcessIsolation } = require('./coding-pipeline/projectProcessIsolation.cjs');
+const {
+  markProjectProcessIsolationUnavailable,
+  requireProjectProcessIsolation,
+} = require('./coding-pipeline/projectProcessIsolation.cjs');
+const { runWindowsSandboxCommand } = require('./coding-pipeline/windowsSandboxRunner.cjs');
 
 const MAX_FILE_BYTES = developerSettings.maxFileBytes;
 const MAX_SEARCH_RESULTS = developerSettings.maxSearchResults;
@@ -46,7 +50,7 @@ const SAFE_COMMAND_PATTERN = /^\s*(?:tsc|eslint|vite|vitest|jest|mocha|ava|biome
 const SAFE_ENV_KEYS = new Set(['PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'ComSpec', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'CI']);
 const CREDENTIAL_ENV_PATTERN = /(?:key|token|secret|pass|credential|auth|private|cookie|session|client[_-]?secret|access[_-]?id)/i;
 const NETWORK_POLICY = Object.freeze({ mode: 'restricted', outbound: 'not-granted-by-verification-layer' });
-const SENSITIVE_NAME_PATTERN = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
+const SENSITIVE_NAME_PATTERN = /^(?:\.env(?:\..*)?|\.npmrc|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
 const SENSITIVE_DIRECTORY_NAMES = new Set(['.ssh', '.aws', '.azure', '.config']);
 const LOW_VALUE_PATH_PATTERN = /(?:^|[\\/])(?:\.idea|assets?|fonts?|vendor|node_modules|dist|build|coverage|tmp|cache)(?:[\\/]|$)|\.(?:ttf|woff2?|eot|map|min\.(?:js|css))$/i;
 const CHECK_COMMANDS = {
@@ -865,6 +869,9 @@ async function hasProjectExecutable(root, relativePath) {
 
 async function findChangedPhpFiles(root) {
   requireProjectProcessIsolation('PHP changed-file inspection');
+  if (process.platform === 'win32') {
+    throw new Error('PHP changed-file inspection is unavailable because Git metadata is not mounted into Windows Sandbox.');
+  }
   return new Promise((resolve, reject) => {
     const child = spawn('git', ['status', '--porcelain', '--', '*.php'], { cwd: root, shell: false, windowsHide: true });
     let output = '';
@@ -974,6 +981,9 @@ async function runVerificationInWorkspace(script, ownerWebContentsId, options, s
   const scopedRoot = scope === '.' ? root : path.join(root, ...scope.split('/'));
   const projectType = await detectProjectType(scopedRoot);
   const rootProjectType = scope === '.' ? projectType : await detectProjectType(root);
+  if (process.platform === 'win32' && projectType.type !== 'node') {
+    throw new Error(`Windows Sandbox verification currently supports npm-based Node projects; "${projectType.type}" project commands were not started.`);
+  }
   let phpCommand = null;
   if (projectType.type === 'php') {
     if (script === 'phpunit' && projectType.hasPhpUnitConfig
@@ -1096,6 +1106,9 @@ async function runVerificationInWorkspace(script, ownerWebContentsId, options, s
     const allowed = args[0] === 'status' || (args[0] === 'diff' && args.every((arg) => ['diff', '--stat', '--name-only', '--no-ext-diff'].includes(arg)));
     if (!allowed) throw new Error('Only read-only git status and diff are permitted.');
     requireProjectProcessIsolation('Project Git inspection');
+    if (process.platform === 'win32') {
+      throw new Error('Project Git inspection was not started because Git metadata is not mounted into the isolated Windows Sandbox workspace.');
+    }
     const child = spawn('git', args, { cwd: root, shell: false, windowsHide: true });
     let stdout = ''; let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
@@ -1119,9 +1132,62 @@ async function runVerificationInWorkspace(script, ownerWebContentsId, options, s
     safeEnv.TEMP = options.isolatedTemp;
     safeEnv.TMP = options.isolatedTemp;
   }
-  const child = process.platform === 'win32'
-    ? spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `${executable} run ${script}`], { cwd: root, windowsHide: true, env: safeEnv })
-    : spawn(executable, ['run', script], { cwd: root, shell: false, windowsHide: true, env: safeEnv });
+  if (process.platform === 'win32') {
+    const startedAt = Date.now();
+    let result;
+    try {
+      result = await runWindowsSandboxCommand({
+        projectRoot: root,
+        workingDirectory: path.relative(root, scopedRoot) || '.',
+        executable,
+        args: ['run', script],
+        environment: safeEnv,
+        timeoutMs: MAX_COMMAND_DURATION_MS,
+        isCancelled: options.isCancelled,
+      });
+    } catch (error) {
+      if (error?.code === 'SANDBOX_TOOLCHAIN_UNAVAILABLE') {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          script,
+          exitCode: null,
+          executed: false,
+          spawnError: true,
+          reason: `NOT_AVAILABLE (${message})`,
+          stdout: '',
+          stderr: message,
+          durationMs: Date.now() - startedAt,
+          networkPolicy: NETWORK_POLICY,
+        };
+      }
+      if (error?.isolationFailure) {
+        markProjectProcessIsolationUnavailable(error instanceof Error ? error.message : String(error));
+      }
+      throw new Error(`Windows Sandbox verification failed closed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const durationMs = result.durationMs || Date.now() - startedAt;
+    const ok = result.exitCode === 0 && !result.timedOut && !result.cancelled;
+    await appendAudit(sourceRoot, 'run_command', script, result.timedOut ? 'failure:timeout' : result.cancelled ? 'cancelled' : ok ? 'success' : `failure:exit-${result.exitCode}`);
+    if (result.timedOut) {
+      return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(result.stdout || ''), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
+    }
+    if (result.cancelled) {
+      return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(result.stdout || ''), stderr: 'Verification command cancelled.', durationMs, cancelled: true, networkPolicy: NETWORK_POLICY };
+    }
+    return {
+      ok,
+      script,
+      exitCode: result.exitCode,
+      executed: Number.isInteger(result.exitCode),
+      stdout: redactOutput(result.stdout || ''),
+      stderr: redactOutput(result.stderr || ''),
+      durationMs,
+      runtimeEvidence: ok ? null : await enrichRuntimeEvidence(sourceRoot, result.stdout || '', result.stderr || '', options),
+      networkPolicy: NETWORK_POLICY,
+    };
+  }
+  const child = spawn(executable, ['run', script], { cwd: root, shell: false, windowsHide: true, env: safeEnv });
   let stdout = '';
   let stderr = '';
   const appendBounded = (current, chunk) => current.length >= MAX_OUTPUT_CHARS

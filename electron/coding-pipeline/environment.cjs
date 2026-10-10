@@ -176,6 +176,9 @@ class DevServerManager {
     }
 
     requireProjectProcessIsolation('Project dev server');
+    if (process.platform === 'win32') {
+      throw new Error('Project dev servers are unavailable in Windows Sandbox because guest networking is disabled and ports are not exposed to the host.');
+    }
     const isolatedWorkspace = await createIsolatedWorkspaceCopy(projectRoot, 'ai-help-agent-dev-server-');
     let config;
     try {

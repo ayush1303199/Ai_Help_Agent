@@ -16,6 +16,7 @@ Provides production-grade runtime intelligence for AI Coding Agent:
 import os
 import re
 import json
+import logging
 import time
 import hashlib
 import hmac
@@ -26,6 +27,8 @@ from difflib import SequenceMatcher
 from typing import Dict, List, Any, Optional, Set, Tuple
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+logger = logging.getLogger(__name__)
 
 try:
     _FEATURE_OWNERSHIP = json.loads(
@@ -1682,6 +1685,7 @@ class DbFailureClassification:
     PROJECT_NOT_AVAILABLE = "PROJECT_NOT_AVAILABLE"
     DB_CONFIG_NOT_FOUND = "DB_CONFIG_NOT_FOUND"
     DB_CONFIG_INVALID = "DB_CONFIG_INVALID"
+    DB_CONFIG_INSPECTION_FAILED = "DB_CONFIG_INSPECTION_FAILED"
     SECRET_UNAVAILABLE = "SECRET_UNAVAILABLE"
     DRIVER_NOT_FOUND = "DRIVER_NOT_FOUND"
     CLIENT_NOT_FOUND = "CLIENT_NOT_FOUND"
@@ -3013,10 +3017,18 @@ class ConfigurationSymbolResolver:
         """Resolve literal project-local include/import paths without executing project code."""
         source_dir = Path(source_path).parent
         value = str(expression or "").strip()
-        value = re.sub(r"\bdirname\s*\(\s*__FILE__\s*\)", str(source_dir), value)
-        value = re.sub(r"\bdirname\s*\(\s*__DIR__\s*\)", str(source_dir.parent), value)
-        value = re.sub(r"\b__DIR__\b", str(source_dir), value)
-        value = re.sub(r"\b__FILE__\b", source_path, value)
+        value = re.sub(
+            r"\bdirname\s*\(\s*__FILE__\s*\)",
+            lambda _match: str(source_dir),
+            value,
+        )
+        value = re.sub(
+            r"\bdirname\s*\(\s*__DIR__\s*\)",
+            lambda _match: str(source_dir.parent),
+            value,
+        )
+        value = re.sub(r"\b__DIR__\b", lambda _match: str(source_dir), value)
+        value = re.sub(r"\b__FILE__\b", lambda _match: source_path, value)
         if re.search(r"\$|%|@[A-Za-z_]|(?:getenv|env)\s*\(", value):
             return []
         fragments = re.findall(r"""['"]([^'"]+)['"]""", value)
@@ -4586,7 +4598,29 @@ class DatabaseIntelligenceEngine:
         }
 
         # 1. Authoritative configuration inspection via ConfigurationSymbolResolver
-        res_cfg = ConfigurationSymbolResolver.inspect_project_database_configuration(project_root)
+        try:
+            res_cfg = ConfigurationSymbolResolver.inspect_project_database_configuration(
+                project_root
+            )
+        except Exception as error:
+            error_type = type(error).__name__
+            logger.error(
+                "Authoritative database configuration inspection failed (error_type=%s).",
+                error_type,
+            )
+            discovered_info.update({
+                "status": DbFailureClassification.DB_CONFIG_INSPECTION_FAILED,
+                "failureClassification": DbFailureClassification.DB_CONFIG_INSPECTION_FAILED,
+                "inspectionErrorType": error_type,
+                "message": (
+                    "Database configuration inspection failed safely; no configuration "
+                    "was selected. Check the backend error log for details."
+                ),
+                "evidence": [
+                    "Authoritative configuration inspection failed; fallback selection was skipped."
+                ],
+            })
+            return discovered_info
         if res_cfg.get("status") == "AMBIGUOUS":
             discovered_info["status"] = "DB_CONFIG_AMBIGUOUS"
             discovered_info["candidates"] = res_cfg.get("candidates", [])

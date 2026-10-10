@@ -7,7 +7,15 @@ const net = await import('node:net');
 const developerFiles = (await import('../electron/developerFiles.cjs')).default;
 const developerContext = (await import('../electron/developerContext.cjs')).default;
 const { DevServerManager } = await import('../electron/coding-pipeline/environment.cjs');
-const { projectProcessIsolationStatus } = await import('../electron/coding-pipeline/projectProcessIsolation.cjs');
+const {
+  projectProcessIsolationStatus,
+  requireProjectProcessIsolation,
+} = await import('../electron/coding-pipeline/projectProcessIsolation.cjs');
+const { assertSandboxProbe } = await import('../electron/coding-pipeline/windowsSandboxRunner.cjs');
+const windowsSandboxRunnerSource = await fs.readFile(
+  new URL('../electron/coding-pipeline/windowsSandboxRunner.cjs', import.meta.url),
+  'utf8',
+);
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'dev-project-isolation-'));
 const projectA = path.join(tempRoot, 'project-a');
@@ -77,6 +85,7 @@ const devProject = path.join(tempRoot, 'dev-project');
 await fs.mkdir(devProject, { recursive: true });
 await fs.mkdir(path.join(devProject, '.ssh'), { recursive: true });
 await fs.writeFile(path.join(devProject, '.env'), 'API_TOKEN=fixture-only\n');
+await fs.writeFile(path.join(devProject, '.npmrc'), '//registry.example/:_authToken=fixture-only\n');
 await fs.writeFile(path.join(devProject, '.ssh', 'id_rsa'), 'fixture-only-private-key');
 await fs.writeFile(
   path.join(devProject, 'package.json'),
@@ -88,11 +97,41 @@ await fs.writeFile(
 );
 const copiedWorkspace = await developerFiles.createIsolatedWorkspaceCopy(devProject);
 await assert.rejects(fs.access(path.join(copiedWorkspace.root, '.env')), { code: 'ENOENT' });
+await assert.rejects(fs.access(path.join(copiedWorkspace.root, '.npmrc')), { code: 'ENOENT' });
 await assert.rejects(fs.access(path.join(copiedWorkspace.root, '.ssh')), { code: 'ENOENT' });
 await assert.ok(await fs.readFile(path.join(copiedWorkspace.root, 'package.json'), 'utf8'));
 await copiedWorkspace.cleanup();
 const devServerManager = new DevServerManager();
 assert.equal(projectProcessIsolationStatus().available, false);
+assert.equal(projectProcessIsolationStatus().verified, false);
+assert.throws(
+  () => requireProjectProcessIsolation('Project test'),
+  /no verified operating-system sandbox is configured/i,
+);
+assert.match(windowsSandboxRunnerSource, /<Networking>Disable<\/Networking>/);
+assert.match(windowsSandboxRunnerSource, /<ReadOnly>true<\/ReadOnly>/);
+assert.match(windowsSandboxRunnerSource, /Windows Sandbox currently permits only validated npm verification scripts/);
+assert.match(windowsSandboxRunnerSource, /CreateProcess|Diagnostics\.Process/);
+const sandboxProbeEvidence = {
+  administrator: false,
+  mediumIntegrity: true,
+  readOnlyInput: true,
+  resultMountWritable: true,
+  hostPathUnavailable: true,
+  externalJunctionUnavailable: true,
+  hostEnvironmentUnavailable: true,
+  ipv4DefaultRoutes: 0,
+  ipv6DefaultRoutes: 0,
+  outboundBlocked: true,
+  guestWorkspaceWritable: true,
+  childProcessCreated: true,
+};
+const successfulSandboxProbe = { exitCode: 0 };
+assert.equal(assertSandboxProbe(sandboxProbeEvidence, successfulSandboxProbe), successfulSandboxProbe);
+assert.throws(
+  () => assertSandboxProbe({ ...sandboxProbeEvidence, administrator: true }, { exitCode: 0 }),
+  /guest process was not a standard user/i,
+);
 await assert.rejects(
   devServerManager.startDevServer('isolated-dev-server-test', devProject),
   /no verified operating-system sandbox is configured/i,
