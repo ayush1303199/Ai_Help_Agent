@@ -1182,8 +1182,10 @@ function getTask(taskId, owner) { const task = registry.get(taskId); if (!task) 
 function assertTaskAuthorization(task) {
   const context = task.authorizationContext;
   const turn = conversationTurns.get(task.conversationTurnId);
-  if (!context || !turn
-    || context.taskId !== turn.authorizationContext?.taskId
+  if (!context || !turn) {
+    throw new Error('Request-bound authorization is missing or no longer matches this turn.');
+  }
+  if (context.taskId !== turn.authorizationContext?.taskId
     || context.turnId !== task.conversationTurnId
     || context.requestHash !== turn.authorizationContext?.requestHash
     || context.expiresAt !== turn.authorizationContext?.expiresAt

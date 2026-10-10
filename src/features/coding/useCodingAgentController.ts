@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { clearAppState, writeAppState } from '../../config/appStateStorage';
+import { clearAppState, writeAppState } from '../../config/appStateStorage.ts';
 import { runtimeConfig } from '../../config/runtimeConfig';
 import { createUnvalidatedSuggestion, parseUnifiedDiff, validateUnifiedFile, type DeveloperDiffFile } from './codingDiff';
 import {
@@ -570,9 +570,12 @@ export function useCodingAgentController({
       setPreferences((previous) => upsertCodingPreference(previous, detectedPreference));
       onStatus('Coding preference saved for future Coding Agent sessions.');
     }
+
+
     const requestId = crypto.randomUUID();
     const userMessage: CodingMessage = { role: 'user', content: question };
     const assistantMessage: CodingMessage = { role: 'assistant', content: '', streaming: true, requestId };
+
     const compactedSession = compactCodingConversation({
       messages: [...messages.filter((message) => !message.streaming), userMessage]
         .map((message) => ({ role: message.role, content: compactMessageContent(message.content, maxMessageChars) })),

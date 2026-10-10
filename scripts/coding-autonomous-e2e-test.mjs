@@ -335,10 +335,19 @@ async function runAutonomousCodingTests() {
 +module.exports = { enabled: true };
 `;
 
+    const turn = developerAgent.beginConversationTurn({
+      root: discLifecycle.projectRoot,
+      scope: '.',
+      request: `Update enabled in src/${lifecycleTarget}`,
+      sessionId: sessionLifecycle,
+      ownerWebContentsId: ownerLifecycle,
+    });
+    developerAgent.advanceConversationTurn(turn.turnId, 'understanding', ownerObj);
     const prop = await developerAgent.createProposal({
       root: discLifecycle.projectRoot,
       ownerWebContentsId: ownerLifecycle,
       sessionId: sessionLifecycle,
+      conversationTurnId: turn.turnId,
       raw: diffContent,
     });
     assert.equal(prop.state, 'awaiting_approval', 'Proposal must begin in awaiting_approval');

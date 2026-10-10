@@ -232,6 +232,7 @@ print("PYTHON_INTELLIGENCE_OK")
       root: repoA,
       ownerWebContentsId: sessionOwnerId,
       sessionId: turn1.sessionId,
+      conversationTurnId: turn1.turnId,
       raw: diff,
     });
     assert.equal(proposal.state, 'awaiting_approval', 'Proposal must start in awaiting_approval');

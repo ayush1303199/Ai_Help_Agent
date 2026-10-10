@@ -157,10 +157,19 @@ try {
 +console.log("verified");
 `;
 
+  const turn = developerAgent.beginConversationTurn({
+    root: projectPath,
+    scope: '.',
+    request: 'Apply verified update to index.ts',
+    sessionId,
+    ownerWebContentsId: ownerLifecycle,
+  });
+  developerAgent.advanceConversationTurn(turn.turnId, 'understanding', { sessionId, ownerWebContentsId: ownerLifecycle });
   const proposal = await developerAgent.createProposal({
     root: projectPath,
     sessionId,
     ownerWebContentsId: ownerLifecycle,
+    conversationTurnId: turn.turnId,
     raw: patchContent,
   });
   assert.equal(proposal.state, 'awaiting_approval');

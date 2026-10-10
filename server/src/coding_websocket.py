@@ -5823,6 +5823,7 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     function = call.get("function") if isinstance(call, dict) else {}
     function = function if isinstance(function, dict) else {}
     raw_name = str(function.get("name") or "").strip()
+<<<<<<< HEAD
     canonical_name = resolve_tool_capability(raw_name)
     if canonical_name is None:
         available_tools = ", ".join(sorted(TOOL_NAMES))
@@ -5834,6 +5835,13 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         (
             tool for tool in CODING_TOOLS
             if tool.get("function", {}).get("name") == canonical_name
+=======
+    target_tool_name = TOOL_ALIASES.get(raw_name, raw_name)
+    declared_tool = next(
+        (
+            tool for tool in CODING_TOOLS
+            if tool.get("function", {}).get("name") in {raw_name, target_tool_name}
+>>>>>>> c7586eb5501c18baea1053a79eb5743a548c695e
         ),
         None,
     )
@@ -5855,6 +5863,29 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         raise ValueError("INVALID_TOOL_ARGUMENTS: arguments must be a JSON object.")
     if not isinstance(arguments, dict):
         raise ValueError("INVALID_TOOL_ARGUMENTS: arguments must be a JSON object.")
+
+    # Normalize argument aliases (e.g. relativePath -> path for read_file, pattern -> query for search_code)
+    canonical_pre = resolve_tool_capability(raw_name) or target_tool_name
+    if canonical_pre == "read_file":
+        if "path" not in arguments:
+            for alias_key in ("relativePath", "file", "filePath"):
+                if alias_key in arguments:
+                    arguments["path"] = arguments.pop(alias_key)
+                    break
+    elif canonical_pre in ("search_code", "search_symbols", "find_references"):
+        if "query" not in arguments:
+            for alias_key in ("pattern", "q", "term", "text", "search"):
+                if alias_key in arguments:
+                    arguments["query"] = arguments.pop(alias_key)
+                    break
+    elif canonical_pre == "list_directory":
+        if "relativePath" not in arguments:
+            for alias_key in ("path", "dir", "directory"):
+                if alias_key in arguments:
+                    arguments["relativePath"] = arguments.pop(alias_key)
+                    break
+
+
 
     def validate_schema(value: Any, schema: Dict[str, Any], location: str) -> None:
         expected_type = schema.get("type")
@@ -6347,6 +6378,7 @@ async def _dispatch_coding_tool(
     send_json,
     action: Dict[str, Any],
     request_id: str,
+<<<<<<< HEAD
     *args,
 ) -> None:
     if len(args) == 5:
@@ -6363,8 +6395,25 @@ async def _dispatch_coding_tool(
             "_dispatch_coding_tool() requires either (request_id, turn_id, session_id, tool_call_id, name, arguments), "
             "(request_id, session_id, tool_call_id, name, arguments), or (request_id, session_id, name, arguments)."
         )
+=======
+    turn_id: str,
+    session_id: str = "",
+    tool_call_id: str = "",
+    name: str = "",
+    arguments: Optional[Dict[str, Any]] = None,
+) -> None:
+    if arguments is None and isinstance(name, dict):
+        # Called as _dispatch_coding_tool(send, action, request_id, session_id, tool_call_id, name, arguments)
+        arguments = name
+        name = tool_call_id
+        tool_call_id = session_id
+        session_id = turn_id
+        turn_id = request_id
+    arguments = arguments or {}
+>>>>>>> c7586eb5501c18baea1053a79eb5743a548c695e
     await _publish_activity_event(send_json, action, request_id, session_id, "STARTED")
     await _send(send_json, {
+
         "type": "tool_call",
         "requestId": request_id,
         "turnId": turn_id,

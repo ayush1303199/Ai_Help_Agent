@@ -1,5 +1,5 @@
 import { runtimeConfig } from '../config/runtimeConfig';
-import { writeAppState } from '../config/appStateStorage';
+import { writeAppState } from '../config/appStateStorage.ts';
 import {
   pruneMeetingRecords,
   readMeetingHistoryRetention,

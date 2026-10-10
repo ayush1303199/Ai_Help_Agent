@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { writeAppState } from '../../config/appStateStorage';
+import { writeAppState } from '../../config/appStateStorage.ts';
 import {
   DEFAULT_MEETING_HISTORY_RETENTION_DAYS,
   isMeetingHistoryRetentionDue,

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { clearAppState, writeAppState } from '../../config/appStateStorage';
+import { clearAppState, writeAppState } from '../../config/appStateStorage.ts';
 
 export interface AgentProviderOption {
   id: string;

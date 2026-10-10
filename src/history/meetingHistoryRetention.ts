@@ -1,4 +1,4 @@
-import { writeAppState } from '../config/appStateStorage';
+import { writeAppState } from '../config/appStateStorage.ts';
 
 export type MeetingHistoryRetentionDays = 7 | 30 | 60 | 90 | 'off' | `date:${string}`;
 export const DEFAULT_MEETING_HISTORY_RETENTION_DAYS: MeetingHistoryRetentionDays = 30;

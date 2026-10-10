@@ -214,10 +214,20 @@ const diffContent = '--- a/target.js\n+++ b/target.js\n@@ -1,2 +1,2 @@\n-functio
 
 await fs.writeFile(targetFile, 'function add(a, b) { return a - b; }\nmodule.exports = { add };\n', 'utf8');
 
+const turn = developerAgent.beginConversationTurn({
+  root: dirtyRepoDir,
+  scope: '.',
+  request: 'Update add function in target.js',
+  sessionId,
+  ownerWebContentsId,
+});
+developerAgent.advanceConversationTurn(turn.turnId, 'understanding', owner);
+
 const proposal = await developerAgent.createProposal({
   root: dirtyRepoDir,
   ownerWebContentsId,
   sessionId,
+  conversationTurnId: turn.turnId,
   raw: diffContent,
 });
 

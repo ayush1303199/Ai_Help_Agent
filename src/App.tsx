@@ -47,7 +47,7 @@ import {
   removeProviderSecret,
   setProviderSecret,
 } from './config/providerSecretStore';
-import { clearAppState, writeAppState } from './config/appStateStorage';
+import { clearAppState, writeAppState } from './config/appStateStorage.ts';
 import { authenticatedBackendFetch } from './config/backendAuth';
 import { ProviderHydrationRequestError, retryProviderHydration } from './config/providerHydration';
 import {

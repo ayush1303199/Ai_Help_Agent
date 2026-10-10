@@ -1,4 +1,4 @@
-import { writeAppState } from '../config/appStateStorage';
+import { writeAppState } from '../config/appStateStorage.ts';
 
 export const INTERVIEW_CONTEXT_STORAGE_KEY = 'interview-context-v1';
 

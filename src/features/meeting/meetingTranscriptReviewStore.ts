@@ -3,7 +3,7 @@ import {
   readMeetingHistoryRetention,
   type MeetingHistoryRetentionDays,
 } from '../../history/meetingHistoryRetention.ts';
-import { writeAppState } from '../../config/appStateStorage';
+import { writeAppState } from '../../config/appStateStorage.ts';
 
 export const MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY = 'meeting-transcript-review-queue';
 export const MAX_PENDING_TRANSCRIPT_REVIEWS = 30;
