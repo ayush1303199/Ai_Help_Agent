@@ -121,6 +121,7 @@ from coding_websocket import (  # noqa: E402
     _activity_status_for_result,
     _activity_target_for_tool,
     _activity_event_payload,
+    _database_activity_observer,
     _dispatch_coding_tool,
     _publish_activity_event,
     _run_coding_turn,
@@ -537,6 +538,9 @@ class CodingActivityObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_activity_type_for_tool("read_file"), "READING_FILE")
         self.assertEqual(_activity_type_for_tool("DATABASE_LIST_TABLES"), "INSPECTING_DATABASE")
         self.assertEqual(_activity_type_for_tool("DATABASE_LIST_CONSTRAINTS"), "INSPECTING_DATABASE")
+        self.assertEqual(_activity_type_for_tool("DATABASE_SESSION"), "INSPECTING_DATABASE")
+        self.assertEqual(_activity_type_for_tool("DATABASE_TARGET_SELECTION"), "INSPECTING_DATABASE")
+        self.assertEqual(_activity_type_for_tool("DATABASE_CONNECTION_ATTEMPT"), "INSPECTING_DATABASE")
         self.assertEqual(_activity_type_for_tool("DATABASE_NOT_A_CAPABILITY"), "TOOL")
         self.assertEqual(_activity_type_for_tool("run_verification"), "VERIFYING")
         self.assertEqual(_activity_type_for_tool("my_search_code_helper"), "TOOL")
@@ -560,12 +564,154 @@ class CodingActivityObserverTests(unittest.IsolatedAsyncioTestCase):
             ),
             "COMPLETED",
         )
+        for field, state, expected in (
+            ("executionStatus", "BLOCKED", "BLOCKED"),
+            ("verificationStatus", "UNCERTAIN", "UNCERTAIN"),
+            ("status", "NOT_ESTABLISHED", "NOT_ESTABLISHED"),
+            ("evidenceState", "UNVERIFIED", "UNVERIFIED"),
+            ("status", "ELIGIBLE_FOR_HUMAN_REVIEW", "BLOCKED"),
+            ("status", "READY", "UNVERIFIED"),
+            ("status", "NOT_STARTED", "UNVERIFIED"),
+        ):
+            data = {"executed": True, "exitCode": 0, field: state}
+            self.assertEqual(
+                _activity_status_for_result(
+                    "run_verification",
+                    {
+                        "ok": True,
+                        "data": data,
+                    },
+                ),
+                expected,
+                f"{state} must not be promoted to verification completion.",
+            )
+        self.assertEqual(
+            _activity_status_for_result(
+                "run_verification",
+                {
+                    "ok": True,
+                    "data": {
+                        "executed": True,
+                        "exitCode": 0,
+                        "verificationStatus": "PASS",
+                    },
+                    "evidenceState": "NOT_ESTABLISHED",
+                },
+            ),
+            "NOT_ESTABLISHED",
+            "A contradictory unresolved evidence state must override a pass claim.",
+        )
+        for invalid_status in ("VERIFIED", "SUCCESS", "not-a-status", "", None, 7):
+            self.assertEqual(
+                _activity_status_for_result(
+                    "run_verification",
+                    {
+                        "ok": True,
+                        "status": invalid_status,
+                        "data": {"executed": True, "exitCode": 0},
+                    },
+                ),
+                "UNVERIFIED",
+                f"Unsupported or malformed status {invalid_status!r} must not establish success.",
+            )
+        self.assertEqual(
+            _activity_status_for_result(
+                "run_verification",
+                {
+                    "ok": True,
+                    "status": "UNRECOGNIZED",
+                    "data": {
+                        "executed": True,
+                        "exitCode": 0,
+                        "verificationStatus": "PASSED",
+                    },
+                },
+            ),
+            "UNVERIFIED",
+            "An unknown outer status must not be hidden by nested success data.",
+        )
+        self.assertEqual(
+            _activity_status_for_result(
+                "run_verification",
+                {
+                    "ok": True,
+                    "data": {
+                        "executed": True,
+                        "exitCode": 0,
+                        "status": "PASS",
+                        "verificationStatus": "FAILED",
+                    },
+                },
+            ),
+            "FAILED",
+            "A conflicting failure status must override a success status.",
+        )
+        self.assertEqual(
+            _activity_status_for_result(
+                "run_verification",
+                {
+                    "ok": True,
+                    "data": {"executed": True, "exitCode": 0},
+                    "evidenceState": "NOT_ESTABLISHED",
+                },
+            ),
+            "NOT_ESTABLISHED",
+            "An unresolved root evidence state must not be discarded.",
+        )
         self.assertEqual(
             _activity_status_for_result(
                 "run_verification",
                 {"ok": False, "data": {"executed": True, "exitCode": 1}},
             ),
             "FAILED",
+        )
+        self.assertEqual(
+            _activity_status_for_result(
+                "run_verification",
+                {"ok": False, "data": {"executed": False, "skipped": True}},
+            ),
+            "SKIPPED",
+        )
+        self.assertEqual(
+            _activity_status_for_result(
+                "DATABASE_CONNECT_TARGET",
+                {"ok": False, "data": {"executionStatus": "NEEDS_CLARIFICATION"}},
+            ),
+            "BLOCKED",
+            "A missing database target must not appear as a failed connection attempt.",
+        )
+        self.assertEqual(
+            _activity_status_for_result(
+                "DATABASE_CONNECT_TARGET",
+                {"ok": False, "data": {"executionStatus": "BLOCKED", "executed": False}},
+            ),
+            "BLOCKED",
+        )
+        self.assertEqual(
+            _activity_status_for_result(
+                "DATABASE_CONNECT_TARGET",
+                {"ok": False, "data": {"executionStatus": "INVALID_REQUEST", "executed": False}},
+            ),
+            "BLOCKED",
+        )
+        self.assertEqual(
+            _activity_status_for_result(
+                "DATABASE_QUERY",
+                {"ok": True, "data": {"executionStatus": "FAILED"}},
+            ),
+            "FAILED",
+        )
+        self.assertEqual(
+            _activity_status_for_result("read_file", {"ok": False, "cancelled": True}),
+            "UNVERIFIED",
+            "A cancellation marker without confirmed termination is not a CANCELLED outcome.",
+        )
+        self.assertEqual(
+            _activity_status_for_result(
+                "read_file",
+                {"ok": False, "cancelled": True, "cancellationConfirmed": True},
+            ),
+            "CANCELLED",
         )
 
     def test_activity_event_only_contains_actual_result_fields_and_redacts_secrets(self):
@@ -601,6 +747,23 @@ class CodingActivityObserverTests(unittest.IsolatedAsyncioTestCase):
         redacted = _activity_event_payload(action, "request-1", "session-1", "STARTED")
         self.assertNotIn("secret-password", json.dumps(redacted))
 
+    def test_successful_verification_event_uses_frontend_status_contract(self):
+        for reported_status in (None, "PASSED"):
+            data = {"executed": True, "exitCode": 0}
+            if reported_status:
+                data["verificationStatus"] = reported_status
+            result = {"ok": True, "data": data}
+            status = _activity_status_for_result("run_verification", result)
+            event = _activity_event_payload(
+                self._action("run_verification"),
+                "request-1",
+                "session-1",
+                status,
+                result=result,
+            )
+            self.assertEqual(event["status"], "COMPLETED")
+            self.assertEqual(event["result"]["executionStatus"], "PASS")
+
     def test_database_configuration_activity_uses_observed_values_only(self):
         event = _activity_event_payload(
             {
@@ -623,6 +786,24 @@ class CodingActivityObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["result"]["paths"], ["config/database.py"])
         self.assertNotIn("database", event["result"])
         self.assertNotIn("count", event["result"])
+        session_event = _activity_event_payload(
+            {
+                **self._action("DATABASE_SESSION"),
+                "target": "active project database session",
+            },
+            "request-1",
+            "session-1",
+            "COMPLETED",
+            result={
+                "ok": True,
+                "data": {
+                    "executionStatus": "CONNECTED",
+                    "databaseType": "sqlite",
+                },
+            },
+        )
+        self.assertEqual(session_event["result"]["executionStatus"], "CONNECTED")
+        self.assertNotIn("database", session_event["result"])
 
     def test_activity_does_not_expose_database_rows_and_deduplicates_actual_paths(self):
         results = [{"path": f"src/file-{index}.py"} for index in range(45)]
@@ -659,12 +840,134 @@ class CodingActivityObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["status"], "UNVERIFIED")
         self.assertEqual(event["result"]["executionStatus"], "UNVERIFIED")
         self.assertNotIn("exitCode", event["result"])
+        blocked = _activity_event_payload(
+            self._action("DATABASE_CONNECT_TARGET"),
+            "request-1",
+            "session-1",
+            "BLOCKED",
+            result={"ok": False, "data": {"executionStatus": "NEEDS_CLARIFICATION"}},
+        )
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertIs(blocked["result"]["executed"], False)
+        self.assertNotIn("database", blocked["result"])
+
+    async def test_database_stage_events_are_correlated_and_keep_observed_order(self):
+        sent = []
+
+        async def send_json(payload):
+            sent.append(payload)
+
+        parent_action = {
+            "actionId": "task-1:database:1",
+            "taskId": "task-1",
+            "proposalId": "proposal-1",
+            "repairAttempt": 2,
+        }
+        record, publish, abandon = _database_activity_observer(
+            send_json, parent_action, "request-1", "session-1"
+        )
+        record("DATABASE_TARGET_SELECTION", "STARTED")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertEqual(len(sent), 1, "Observed database stages should stream before capability completion.")
+        record(
+            "DATABASE_TARGET_SELECTION",
+            "COMPLETED",
+            {"ok": True, "data": {"executionStatus": "SELECTED", "executed": True}},
+        )
+        record("DATABASE_CONNECTION_ATTEMPT", "STARTED")
+        record(
+            "DATABASE_CONNECTION_ATTEMPT",
+            "UNVERIFIED",
+            {
+                "ok": False,
+                "data": {
+                    "executionStatus": "UNAVAILABLE",
+                    "databaseType": "sqlite",
+                    "executed": False,
+                },
+            },
+        )
+        await publish()
+
+        self.assertEqual(
+            [event["action"]["tool"] for event in sent],
+            [
+                "DATABASE_TARGET_SELECTION",
+                "DATABASE_TARGET_SELECTION",
+                "DATABASE_CONNECTION_ATTEMPT",
+                "DATABASE_CONNECTION_ATTEMPT",
+            ],
+        )
+        self.assertEqual(
+            [event["status"] for event in sent],
+            ["STARTED", "COMPLETED", "STARTED", "UNVERIFIED"],
+        )
+        self.assertTrue(all(event["executionId"] == "request-1" for event in sent))
+        self.assertTrue(all(event["taskId"] == "task-1" for event in sent))
+        self.assertTrue(all(event["proposalId"] == "proposal-1" for event in sent))
+        self.assertTrue(all(event["repairAttempt"] == 2 for event in sent))
+        self.assertTrue(all(event["timestamp"] for event in sent))
+        self.assertFalse(sent[-1]["result"]["executed"])
+        self.assertNotIn("content", sent[-1])
+        abandon()
+
+    async def test_request_cancellation_is_unverified_while_an_operation_is_outstanding(self):
+        sent = []
+
+        async def send_json(payload):
+            sent.append(payload)
+
+        async def wait_until_cancelled():
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(wait_until_cancelled())
+        state = {
+            "tasks_by_request": {"request-1": task},
+            "pending": {},
+            "completed": {},
+            "active_activities": {
+                "request-1:database-action": {
+                    "action": self._action("DATABASE_QUERY"),
+                    "session_id": "session-1",
+                },
+            },
+        }
+        await handle_coding_payload(
+            json.dumps({"type": "cancel", "requestId": "request-1"}),
+            send_json,
+            state,
+            None,
+            None,
+        )
+
+        activity_event, cancellation = sent
+        self.assertEqual(activity_event["status"], "UNVERIFIED")
+        self.assertEqual(cancellation["status"], "UNVERIFIED")
+        self.assertFalse(state["active_activities"])
+
+        sent.clear()
+        task = asyncio.create_task(wait_until_cancelled())
+        state = {
+            "tasks_by_request": {"request-2": task},
+            "pending": {},
+            "completed": {},
+            "active_activities": {},
+        }
+        await handle_coding_payload(
+            json.dumps({"type": "cancel", "requestId": "request-2"}),
+            send_json,
+            state,
+            None,
+            None,
+        )
+        self.assertEqual(sent[0]["status"], "CANCELLED")
 
     def test_activity_target_shows_real_command_and_redacts_credentials(self):
         command = "npm test --token=ghp_abcdefghijklmnopqrstuvwx"
         self.assertEqual(
             _activity_target_for_tool("run_verification", {"command": command}),
-            "npm test --[REDACTED]",
+            "verification command",
         )
         target = "postgres://alice:secret-password@db.example.test/app"
         event = _activity_event_payload(
@@ -676,7 +979,18 @@ class CodingActivityObserverTests(unittest.IsolatedAsyncioTestCase):
         payload = json.dumps(event)
         self.assertNotIn("alice", payload)
         self.assertNotIn("secret-password", payload)
-        self.assertEqual(event["action"]["target"], "read-only SQL operation")
+        self.assertEqual(event["action"]["target"], "database operation")
+        failed_command = _activity_event_payload(
+            self._action("run_verification"),
+            "request-1",
+            "session-1",
+            "FAILED",
+            error={"message": "command output contained token=ghp_abcdefghijklmnopqrstuvwx and private text"},
+        )
+        failed_payload = json.dumps(failed_command)
+        self.assertNotIn("ghp_", failed_payload)
+        self.assertNotIn("private text", failed_payload)
+        self.assertEqual(failed_command["error"]["message"], "The operation reported a failure.")
 
     async def test_observer_preserves_order_identity_and_isolates_publish_failures(self):
         sent = []
@@ -5869,6 +6183,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 database_type="mysql",
                 database_name="test_db",
                 connection_state="CONNECTED",
+                is_connected=lambda: True,
                 target_id="DB-TEST",
                 safe_host="db.internal",
                 safe_port=3306,
@@ -5947,12 +6262,16 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             resolve_task.assert_not_awaited()
-            execute_capability.assert_called_once_with(
-                DatabaseCapability.DATABASE_CREDENTIAL_REQUEST,
-                {},
-                unittest.mock.ANY,
-                project_root=project_root,
+            execute_capability.assert_called_once()
+            capability_call = execute_capability.call_args
+            self.assertEqual(
+                capability_call.args[:2],
+                (DatabaseCapability.DATABASE_CREDENTIAL_REQUEST, {}),
             )
+            self.assertIs(capability_call.args[2], session)
+            self.assertEqual(set(capability_call.kwargs), {"project_root", "on_activity"})
+            self.assertEqual(capability_call.kwargs["project_root"], project_root)
+            self.assertTrue(callable(capability_call.kwargs["on_activity"]))
             done = next(message for message in sent if message.get("type") == "done")
             self.assertEqual(done["intent"], TaskIntent.DATABASE_CREDENTIAL_REQUEST)
             self.assertIn("Username:** app_user", done["content"])
@@ -6109,6 +6428,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 database_type="mysql",
                 database_name="test_db",
                 connection_state="CONNECTED",
+                is_connected=lambda: True,
                 connection_capabilities={},
                 to_safe_dict=lambda: {"targetId": "DB-TEST"},
             )
@@ -6257,6 +6577,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 database_type="mysql",
                 database_name="test_db",
                 connection_state="CONNECTED",
+                is_connected=lambda: True,
                 connection_capabilities={},
                 to_safe_dict=lambda: {"targetId": "DB-TEST"},
             )
@@ -7508,12 +7829,15 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                     "",
                 )
 
-            execute_capability.assert_called_once_with(
-                DatabaseCapability.DATABASE_LIST_TABLES,
-                {},
-                unittest.mock.ANY,
-                project_root=project_root,
+            execute_capability.assert_called_once()
+            capability_call = execute_capability.call_args
+            self.assertEqual(
+                capability_call.args[:2],
+                (DatabaseCapability.DATABASE_LIST_TABLES, {}),
             )
+            self.assertEqual(capability_call.kwargs["project_root"], project_root)
+            self.assertEqual(set(capability_call.kwargs), {"project_root", "on_activity"})
+            self.assertTrue(callable(capability_call.kwargs["on_activity"]))
             discover_database.assert_called_once()
             done = next(message for message in sent if message.get("type") == "done")
             self.assertEqual(done["status"], "COMPLETED")
@@ -7693,6 +8017,7 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                     database_type="mysql",
                     database_name="test_db",
                     connection_state="CONNECTED",
+                    is_connected=lambda: True,
                     connection_capabilities={},
                     to_safe_dict=lambda: {"targetId": "DB-TEST"},
                 )

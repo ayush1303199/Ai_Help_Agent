@@ -963,7 +963,7 @@ def health() -> Dict[str, Any]:
         and provider.status in ready_statuses
     )
 
-    return {
+    health_data = {
         "status": provider.status.value if provider else ProviderStatus.UNCONFIGURED.value,
         "provider": provider.type if provider else None,
         "model": provider.model if provider else None,
@@ -980,6 +980,10 @@ def health() -> Dict[str, Any]:
         "wsPort": WS_PORT,
         "codingWsPort": CODING_WS_PORT,
     }
+    test_instance_id = os.getenv("AI_HELP_AGENT_TEST_INSTANCE_ID")
+    if test_instance_id:
+        health_data["testInstanceId"] = test_instance_id
+    return health_data
 
 
 @app.get("/api/settings/providers")
@@ -1133,6 +1137,20 @@ def get_coding_acceptance_preflight() -> Dict[str, Any]:
     )
     platform = sys.platform
     platform_recognized = platform in {"win32", "darwin", "linux"}
+    isolation_capabilities = (
+        "osEnforcedProcessIsolation",
+        "runtimeWorkerIdentityBinding",
+        "effectiveNetworkEndpointRestrictions",
+        "resourceFilesystemBoundaries",
+        "hostObservedProcessWorkerTermination",
+        "hostObservedResourceCleanup",
+        "evidenceFreshnessIntegrityReplayProtection",
+        "secureErasureEvidence",
+    )
+    capability_states = {name: "UNSUPPORTED" for name in isolation_capabilities}
+    if platform == "win32":
+        capability_states = {name: "NOT_ESTABLISHED" for name in isolation_capabilities}
+        capability_states["osEnforcedProcessIsolation"] = "BLOCKED"
     sandbox_reason = (
         "Project command execution is disabled because the OS sandbox is not verified."
     )
@@ -1176,6 +1194,7 @@ def get_coding_acceptance_preflight() -> Dict[str, Any]:
             "platformRecognized": platform_recognized,
             "platform": platform,
             "reason": sandbox_reason,
+            "capabilityStates": capability_states,
         },
         "blockers": blockers,
     }

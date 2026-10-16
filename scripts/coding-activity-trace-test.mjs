@@ -58,6 +58,111 @@ assert.ok(unverified);
 assert.equal(unverified.status, 'UNVERIFIED');
 assert.equal(unverified.result?.exitCode, null);
 
+for (const status of ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED']) {
+  const evidenceState = parseCodingActivityEvent(event({
+    activityType: 'VERIFYING',
+    action: { tool: 'run_verification', target: 'typecheck' },
+    status,
+    result: { executed: false, evidenceState: status },
+  }));
+  assert.ok(evidenceState);
+  assert.equal(evidenceState.status, status);
+  assert.equal(evidenceState.result?.evidenceState, status);
+}
+
+for (const result of [
+  undefined,
+  { executed: false, exitCode: 0 },
+  { executed: true, exitCode: 1 },
+  { executed: true, exitCode: 0, evidenceState: 'NOT_ESTABLISHED' },
+  { executed: true, exitCode: 0, evidenceState: 'UNRECOGNIZED' },
+  { executed: true, exitCode: 0, status: 'BLOCKED' },
+  { executed: true, exitCode: 0, executionStatus: 'BLOCKED' },
+  { executed: true, exitCode: 0, ok: false },
+  { executed: true, exitCode: 0, success: false },
+  { executed: true, exitCode: 0, success: 'true' },
+  { executed: true, exitCode: 0, executionBlocked: true },
+  { executed: true, exitCode: 0, executionBlocked: null },
+  { executed: true, exitCode: 0, cancelled: true },
+  { executed: true, exitCode: 0, timedOut: true },
+  { executed: true, exitCode: 0, error: 'verification failed' },
+  { executed: true, exitCode: 0, failure: 'verification failed' },
+  { exitCode: 0, success: true, verified: true, authorized: true },
+]) {
+  const malformedCompletion = parseCodingActivityEvent(event({
+    activityType: 'VERIFYING',
+    action: { tool: 'run_verification', target: 'typecheck' },
+    status: 'COMPLETED',
+    result,
+  }));
+  assert.ok(malformedCompletion);
+  assert.equal(malformedCompletion.status, 'UNVERIFIED');
+}
+const executedVerificationCompletion = parseCodingActivityEvent(event({
+  activityType: 'VERIFYING',
+  action: { tool: 'run_verification', target: 'typecheck' },
+  status: 'COMPLETED',
+  result: { executed: true, exitCode: 0 },
+}));
+assert.equal(executedVerificationCompletion?.status, 'COMPLETED');
+const backendVerificationCompletion = parseCodingActivityEvent(event({
+  activityType: 'VERIFYING',
+  action: { tool: 'run_verification', target: 'typecheck' },
+  status: 'COMPLETED',
+  result: { executed: true, exitCode: 0, executionStatus: 'PASS' },
+}));
+assert.equal(backendVerificationCompletion?.status, 'COMPLETED');
+
+const progress = parseCodingActivityEvent(event({
+  status: 'PROGRESS',
+  operationSequence: 2,
+}));
+assert.ok(progress);
+assert.equal(progress.status, 'PROGRESS');
+state = upsertCodingActivity([started], progress);
+assert.equal(state[0].status, 'PROGRESS');
+assert.equal(upsertCodingActivity(state, started)[0].status, 'PROGRESS', 'Older updates must not replace newer progress.');
+assert.equal(upsertCodingActivity(state, progress), state, 'Duplicate progress events should be suppressed.');
+const staleProgress = parseCodingActivityEvent(event({
+  status: 'PROGRESS',
+  timestamp: '2026-10-07T11:59:59Z',
+}));
+assert.ok(staleProgress);
+assert.equal(upsertCodingActivity(state, staleProgress)[0].timestamp, progress.timestamp);
+
+const blocked = parseCodingActivityEvent(event({
+  status: 'BLOCKED',
+  terminalizedLocally: true,
+  proposalId: 'proposal-1',
+  repairAttempt: 2,
+  result: { executed: false },
+}));
+assert.ok(blocked);
+assert.equal(blocked.result?.executed, false);
+assert.equal(blocked.proposalId, 'proposal-1');
+assert.equal(blocked.repairAttempt, 2);
+assert.equal(blocked.terminalizedLocally, false, 'Only the local reducer may mark provisional outcomes.');
+const proposal = parseCodingActivityEvent(event({
+  activityId: 'task-1:proposal-created',
+  activityType: 'PROPOSAL',
+  status: 'COMPLETED',
+  result: { executionStatus: 'AWAITING_APPROVAL', executed: false },
+}));
+assert.ok(proposal);
+assert.equal(proposal.activityType, 'PROPOSAL');
+assert.equal(proposal.result?.executed, false, 'Proposal creation must not imply project execution.');
+state = upsertCodingActivity([started], completed);
+assert.equal(upsertCodingActivity(state, failed)[0].status, 'COMPLETED', 'An authoritative terminal outcome is immutable.');
+
+const provisional = finalizeCodingActivities([started], 'request-1', 'UNVERIFIED');
+state = upsertCodingActivity(provisional, completed);
+assert.equal(state[0].status, 'COMPLETED', 'An authoritative result may resolve local provisional UNVERIFIED.');
+assert.equal(state[0].terminalizedLocally, false);
+assert.equal(upsertCodingActivity(provisional, {
+  ...completed,
+  terminalizedLocally: true,
+})[0].status, 'UNVERIFIED', 'A local provisional terminal cannot overwrite itself with another local terminal.');
+
 const unknownType = parseCodingActivityEvent(event({ activityType: 'UNRECOGNIZED' }));
 assert.ok(unknownType);
 assert.equal(unknownType.activityType, 'TOOL', 'Unknown activity types should safely fall back.');
@@ -70,7 +175,7 @@ const secondExecution = parseCodingActivityEvent(event({
 }));
 assert.ok(secondExecution);
 state = upsertCodingActivity([started], secondExecution);
-assert.deepEqual(state.map((item) => item.executionId), ['request-2']);
+assert.deepEqual(state.map((item) => item.executionId), ['request-1', 'request-2']);
 
 state = finalizeCodingActivities([started, completed], 'request-1', 'UNVERIFIED');
 assert.equal(state[0].status, 'UNVERIFIED');
@@ -106,6 +211,65 @@ assert.equal(receivedByRequest.get('request-1')[0].executionId, 'request-1');
 assert.equal(receivedByRequest.get('request-2').length, 1);
 assert.equal(receivedByRequest.get('request-2')[0].executionId, 'request-2');
 transport.close();
+
+const cancellationResults = [];
+const cancellationTransport = new CodingAgentTransport();
+cancellationTransport.requests.set('cancel-unverified', {
+  scope: '.',
+  handlers: {
+    onActivity() {},
+    onDone: result => cancellationResults.push(result.status),
+    onError(error) { throw error; },
+  },
+  chunks: [],
+  filesRead: new Map(),
+  filesSearched: new Set(),
+  toolCalls: [],
+  activityCount: 0,
+});
+cancellationTransport.requests.set('cancel-confirmed', {
+  scope: '.',
+  handlers: {
+    onActivity() {},
+    onDone: result => cancellationResults.push(result.status),
+    onError(error) { throw error; },
+  },
+  chunks: [],
+  filesRead: new Map(),
+  filesSearched: new Set(),
+  toolCalls: [],
+  activityCount: 0,
+});
+cancellationTransport.requests.set('cancel-not-active', {
+  scope: '.',
+  handlers: {
+    onActivity() {},
+    onDone: result => cancellationResults.push(result.status),
+    onError(error) { throw error; },
+  },
+  chunks: [],
+  filesRead: new Map(),
+  filesSearched: new Set(),
+  toolCalls: [],
+  activityCount: 0,
+});
+await cancellationTransport.handleMessage({}, JSON.stringify({
+  type: 'cancelled',
+  requestId: 'cancel-unverified',
+  status: 'UNVERIFIED',
+}));
+await cancellationTransport.handleMessage({}, JSON.stringify({
+  type: 'cancelled',
+  requestId: 'cancel-confirmed',
+  status: 'CANCELLED',
+}));
+await cancellationTransport.handleMessage({}, JSON.stringify({
+  type: 'cancelled',
+  requestId: 'cancel-not-active',
+  status: 'NOT_ACTIVE',
+}));
+assert.deepEqual(cancellationResults, ['CANCELLATION_UNVERIFIED', 'CANCELLED', 'CANCELLATION_UNVERIFIED']);
+cancellationTransport.close();
 
 const outboundMessages = [];
 globalThis.window = { electronAPI: undefined };

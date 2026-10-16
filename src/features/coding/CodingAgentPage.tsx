@@ -22,8 +22,71 @@ interface CodingAcceptancePreflight {
     platformRecognized: boolean;
     platform: string;
     reason: string | null;
+    capabilityStates?: Record<string, 'SUPPORTED' | 'UNSUPPORTED' | 'BLOCKED' | 'UNCERTAIN' | 'NOT_ESTABLISHED'>;
   };
   blockers: Array<{ code: string; message: string }>;
+}
+
+type IsolationCapabilityState = 'SUPPORTED' | 'UNSUPPORTED' | 'BLOCKED' | 'UNCERTAIN' | 'NOT_ESTABLISHED';
+
+const isolationCapabilityNames = [
+  'osEnforcedProcessIsolation',
+  'runtimeWorkerIdentityBinding',
+  'effectiveNetworkEndpointRestrictions',
+  'resourceFilesystemBoundaries',
+  'hostObservedProcessWorkerTermination',
+  'hostObservedResourceCleanup',
+  'evidenceFreshnessIntegrityReplayProtection',
+  'secureErasureEvidence',
+] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isIsolationCapabilityState(value: unknown): value is IsolationCapabilityState {
+  return value === 'SUPPORTED'
+    || value === 'UNSUPPORTED'
+    || value === 'BLOCKED'
+    || value === 'UNCERTAIN'
+    || value === 'NOT_ESTABLISHED';
+}
+
+function normalizeCodingAcceptancePreflight(value: unknown): CodingAcceptancePreflight {
+  const source = isRecord(value) ? value : {};
+  const reportedSandbox = isRecord(source.sandbox) ? source.sandbox : {};
+  const reportedCapabilities = isRecord(reportedSandbox.capabilityStates)
+    ? reportedSandbox.capabilityStates
+    : {};
+  const capabilityStates: Record<string, IsolationCapabilityState> = {};
+  for (const name of isolationCapabilityNames) {
+    const state = reportedCapabilities[name];
+    if (isIsolationCapabilityState(state)) capabilityStates[name] = state;
+  }
+  const blockers = Array.isArray(source.blockers)
+    ? source.blockers.flatMap((blocker) => (
+      isRecord(blocker) && typeof blocker.code === 'string' && typeof blocker.message === 'string'
+        ? [{ code: blocker.code, message: blocker.message }]
+        : []
+    ))
+    : [];
+
+  return {
+    ready: false,
+    canRunProjectCommands: false,
+    providerConfigured: source.providerConfigured === true,
+    projectAttached: source.projectAttached === true,
+    projectStatus: typeof source.projectStatus === 'string' ? source.projectStatus : 'PREFLIGHT_UNVERIFIED',
+    sandbox: {
+      available: false,
+      verified: false,
+      platformRecognized: false,
+      platform: typeof reportedSandbox.platform === 'string' ? reportedSandbox.platform : 'unknown',
+      reason: 'Preflight data is informational; the shared execution gate remains blocked.',
+      capabilityStates: Object.keys(capabilityStates).length ? capabilityStates : undefined,
+    },
+    blockers,
+  };
 }
 
 interface CodingAgentPageProps {
@@ -57,16 +120,16 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
     acceptancePreflightRequest.current = true;
     setAcceptancePreflightBusy(true);
     try {
-      const preflight = window.electronAPI?.getDeveloperAcceptancePreflight
+      const preflight: unknown = window.electronAPI?.getDeveloperAcceptancePreflight
         ? await window.electronAPI.getDeveloperAcceptancePreflight()
         : await (async () => {
           const response = await authenticatedBackendFetch(
             `${runtimeConfig.httpUrl}/api/coding/acceptance-preflight`,
           );
           if (!response.ok) throw new Error(`Readiness endpoint returned HTTP ${response.status}.`);
-          return response.json() as Promise<CodingAcceptancePreflight>;
+          return response.json();
         })();
-      setAcceptancePreflight(preflight);
+      setAcceptancePreflight(normalizeCodingAcceptancePreflight(preflight));
     } catch (error) {
       setAcceptancePreflight({
         ready: false,

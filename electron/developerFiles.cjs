@@ -50,6 +50,7 @@ const SAFE_COMMAND_PATTERN = /^\s*(?:tsc|eslint|vite|vitest|jest|mocha|ava|biome
 const SAFE_ENV_KEYS = new Set(['PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'ComSpec', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'CI']);
 const CREDENTIAL_ENV_PATTERN = /(?:key|token|secret|pass|credential|auth|private|cookie|session|client[_-]?secret|access[_-]?id)/i;
 const NETWORK_POLICY = Object.freeze({ mode: 'restricted', outbound: 'not-granted-by-verification-layer' });
+const WINDOWS_SANDBOX_RESULT_CHANNEL_AUTHENTICATED = false;
 const SENSITIVE_NAME_PATTERN = /^(?:\.env(?:\..*)?|\.npmrc|.*\.(?:pem|key|p12|pfx|crt|cer|der)|id_rsa(?:\..*)?)$/i;
 const SENSITIVE_DIRECTORY_NAMES = new Set(['.ssh', '.aws', '.azure', '.config']);
 const LOW_VALUE_PATH_PATTERN = /(?:^|[\\/])(?:\.idea|assets?|fonts?|vendor|node_modules|dist|build|coverage|tmp|cache)(?:[\\/]|$)|\.(?:ttf|woff2?|eot|map|min\.(?:js|css))$/i;
@@ -573,7 +574,7 @@ async function validateProjectRoot(ownerWebContentsId) {
   }
 }
 
-function appendAudit(root, tool, target, result) {
+function appendAudit(root, tool, target, result, { throwOnFailure = false } = {}) {
   const destination = auditDirectory || path.join(os.homedir(), '.ai-help-agent', 'developer-audit');
   const rootKey = crypto.createHash('sha256').update(path.resolve(root)).digest('hex');
   return fs.appendFile(
@@ -583,6 +584,7 @@ function appendAudit(root, tool, target, result) {
   ).catch(async (error) => {
     if (error.code !== 'ENOENT') {
       console.error(`[DEVELOPER_AUDIT] Failed to append audit event: ${error.message}`);
+      if (throwOnFailure) throw error;
       return;
     }
     try {
@@ -594,6 +596,7 @@ function appendAudit(root, tool, target, result) {
       );
     } catch (writeError) {
       console.error(`[DEVELOPER_AUDIT] Failed to initialize audit storage: ${writeError.message}`);
+      if (throwOnFailure) throw writeError;
     }
   });
 }
@@ -826,6 +829,9 @@ async function runGit(args, ownerWebContentsId) {
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) throw new Error('Invalid git inspection request.');
   const allowed = args[0] === 'status' || (args[0] === 'diff' && args.every((arg) => ['diff', '--stat', '--name-only', '--no-ext-diff'].includes(arg)));
   if (!allowed) throw new Error('Only read-only git status and diff are permitted.');
+  if (process.platform === 'win32') {
+    throw new Error('Windows host-side Git inspection is unavailable pending verified isolation.');
+  }
   requireProjectProcessIsolation('Project Git inspection');
   const child = spawn('git', args, { cwd: root, shell: false, windowsHide: true });
   let stdout = ''; let stderr = '';
@@ -974,6 +980,60 @@ async function runVerification(script, ownerWebContentsId, options = {}) {
   } finally {
     await isolatedWorkspace.cleanup();
   }
+}
+
+function applyWindowsCleanupOutcome(result) {
+  const cleanupOutcome = result.cleanupOutcome;
+  const cleanupFailures = [];
+  const hostLifecycle = result.hostLifecycleObservation;
+  if (!hostLifecycle
+    || hostLifecycle.launcherTerminated !== true
+    || hostLifecycle.sandboxClientsRemaining !== 0
+    || hostLifecycle.stagingDirectoryRemoved !== true
+    || hostLifecycle.cleanupVerified !== true
+    || hostLifecycle.resourceDeleted !== true
+    || hostLifecycle.runId !== result.runId) {
+    cleanupFailures.push('Host-observed Windows Sandbox termination and staging cleanup are incomplete or bound to a different run.');
+  }
+  if (!WINDOWS_SANDBOX_RESULT_CHANNEL_AUTHENTICATED) {
+    cleanupFailures.push('The guest result channel is writable by the guest and is not authenticated by the host.');
+  }
+  if (cleanupOutcome?.accountCleanup === 'failed') {
+    cleanupFailures.push('Guest account cleanup failed.');
+  } else if (cleanupOutcome?.accountCleanup !== 'succeeded') {
+    cleanupFailures.push('Guest account cleanup outcome is unknown or invalid.');
+  }
+  if (cleanupOutcome?.shutdownCommand === 'failed') {
+    cleanupFailures.push('Guest shutdown command failed.');
+  } else if (cleanupOutcome?.shutdownCommand !== 'succeeded') {
+    cleanupFailures.push('Guest shutdown command outcome is unknown or invalid.');
+  }
+  const cleanupError = cleanupFailures.join(' ');
+  return {
+    ...result,
+    cleanupError,
+    ok: result.exitCode === 0 && !result.timedOut && !result.cancelled && !cleanupError,
+    stderr: [result.stderr || '', cleanupError].filter(Boolean).join('\n'),
+  };
+}
+
+async function auditAndPropagateWindowsSandboxFailure(sourceRoot, script, error) {
+  const failureMessage = `Windows Sandbox verification failed closed: ${error instanceof Error ? error.message : String(error)}`;
+  try {
+    await appendAudit(
+      sourceRoot,
+      'run_command',
+      script,
+      error?.isolationFailure ? 'failure:cleanup' : 'failure:execution',
+      { throwOnFailure: true },
+    );
+  } catch (auditError) {
+    throw new AggregateError(
+      [error, auditError],
+      `${failureMessage} The run_command failure audit could not be recorded: ${auditError instanceof Error ? auditError.message : String(auditError)}`,
+    );
+  }
+  throw new Error(failureMessage, { cause: error });
 }
 
 async function runVerificationInWorkspace(script, ownerWebContentsId, options, sourceRoot, root, scope) {
@@ -1164,26 +1224,28 @@ async function runVerificationInWorkspace(script, ownerWebContentsId, options, s
       if (error?.isolationFailure) {
         markProjectProcessIsolationUnavailable(error instanceof Error ? error.message : String(error));
       }
-      throw new Error(`Windows Sandbox verification failed closed: ${error instanceof Error ? error.message : String(error)}`);
+      await auditAndPropagateWindowsSandboxFailure(sourceRoot, script, error);
     }
     const durationMs = result.durationMs || Date.now() - startedAt;
-    const ok = result.exitCode === 0 && !result.timedOut && !result.cancelled;
-    await appendAudit(sourceRoot, 'run_command', script, result.timedOut ? 'failure:timeout' : result.cancelled ? 'cancelled' : ok ? 'success' : `failure:exit-${result.exitCode}`);
+    const verification = applyWindowsCleanupOutcome(result);
+    const { cleanupError, ok, stderr } = verification;
+    await appendAudit(sourceRoot, 'run_command', script, cleanupError ? 'failure:cleanup' : result.timedOut ? 'failure:timeout' : result.cancelled ? 'cancelled' : ok ? 'success' : `failure:exit-${result.exitCode}`);
     if (result.timedOut) {
-      return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(result.stdout || ''), stderr: 'Verification command timed out.', durationMs, timedOut: true, networkPolicy: NETWORK_POLICY };
+      return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(result.stdout || ''), stderr: ['Verification command timed out.', cleanupError].filter(Boolean).join(' '), durationMs, timedOut: true, cleanupOutcome: result.cleanupOutcome, networkPolicy: NETWORK_POLICY };
     }
     if (result.cancelled) {
-      return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(result.stdout || ''), stderr: 'Verification command cancelled.', durationMs, cancelled: true, networkPolicy: NETWORK_POLICY };
+      return { ok: false, script, exitCode: null, executed: false, stdout: redactOutput(result.stdout || ''), stderr: ['Verification command cancelled.', cleanupError].filter(Boolean).join(' '), durationMs, cancelled: true, cleanupOutcome: result.cleanupOutcome, networkPolicy: NETWORK_POLICY };
     }
     return {
       ok,
       script,
-      exitCode: result.exitCode,
-      executed: Number.isInteger(result.exitCode),
-      stdout: redactOutput(result.stdout || ''),
-      stderr: redactOutput(result.stderr || ''),
+      exitCode: verification.exitCode,
+      executed: Number.isInteger(verification.exitCode),
+      stdout: redactOutput(verification.stdout || ''),
+      stderr: redactOutput(stderr),
       durationMs,
-      runtimeEvidence: ok ? null : await enrichRuntimeEvidence(sourceRoot, result.stdout || '', result.stderr || '', options),
+      cleanupOutcome: verification.cleanupOutcome,
+      runtimeEvidence: result.exitCode === 0 ? null : await enrichRuntimeEvidence(sourceRoot, result.stdout || '', result.stderr || '', options),
       networkPolicy: NETWORK_POLICY,
     };
   }
@@ -1547,6 +1609,8 @@ async function detectDevServerConfiguration(projectRoot) {
 
 module.exports = {
   chooseProjectFolder, listDirectory, readFile, searchCode, runVerification, runGit,
+  applyWindowsCleanupOutcome,
+  auditAndPropagateWindowsSandboxFailure,
   getVerificationScripts, resolveWithinRoot, resolveProjectScope, normalizeScopedProjectPath, clearProject, releaseProject,
   assertProjectOwner, getProjectRoot, safeEnvironment, NETWORK_POLICY, isSensitivePath,
   discoverProjectByName, getProjectDiscoveryRoots, configureAuditDirectory, findEnclosingProjectRoot,

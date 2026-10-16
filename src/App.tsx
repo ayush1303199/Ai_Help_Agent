@@ -1265,10 +1265,10 @@ function App() {
       confirmLabel: 'Remove provider',
       onConfirm: async () => {
         try {
-          const confirmed = browserDevelopment
-            ? window.confirm(`Remove "${provider.label}" from the runtime provider list?`)
-            : await deleteProviderSecretStore(provider.id, provider.label);
-          if (!confirmed) return;
+          if (!browserDevelopment) {
+            const confirmed = await deleteProviderSecretStore(provider.id, provider.label);
+            if (!confirmed) return;
+          }
           const response = await authenticatedBackendFetch(`${HTTP_URL}/api/settings/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || 'Could not remove provider.');

@@ -6,6 +6,7 @@ import {
   codingFetch,
   CodingAgentTransport,
   finalizeCodingActivities,
+  parseCodingActivityEvent,
   upsertCodingActivity,
   type CodingActivity,
   type CodingTransportResult,
@@ -58,6 +59,7 @@ interface DeveloperSearchResult {
 interface CodingProposal {
   id?: string;
   proposalId?: string;
+  requestId?: string;
   manifestHash?: string | null;
   state?: string;
   lifecycleState?: string;
@@ -234,7 +236,6 @@ export function useCodingAgentController({
   const savedConversation = conversationStates.find((session) => session.id === conversationId);
   const [messages, setMessages] = useState<CodingMessage[]>(() => savedConversation?.messages || []);
   const [activity, setActivity] = useState<CodingActivity[]>([]);
-  const activitySequenceRef = useRef(0);
   const activeActivityExecutionRef = useRef<string | null>(null);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
@@ -266,6 +267,18 @@ export function useCodingAgentController({
   const applyProposalRef = useRef<(targetProposal?: CodingProposal | null) => Promise<void>>(async () => {});
   const requestVerificationRepairRef = useRef<() => Promise<void>>(async () => {});
   const turnIdsRef = useRef(new Map<string, string>());
+  useEffect(() => {
+    const unsubscribe = window.electronAPI?.onDeveloperActivity?.((rawEvent) => {
+      const activityEvent = parseCodingActivityEvent(rawEvent);
+      if (!activityEvent || !proposal?.id) return;
+      const proposalIds = new Set([proposal.id, proposal.proposalId].filter(Boolean));
+      if (!proposalIds.has(activityEvent.taskId || '')
+        && !proposalIds.has(activityEvent.proposalId || '')) return;
+      setActivity((previous) => upsertCodingActivity(previous, activityEvent));
+    });
+    return () => unsubscribe?.();
+  }, [proposal?.id, proposal?.proposalId]);
+
   const onError = useCallback((message: string) => {
     setErrorMessage(message);
     setStatusMessage('');
@@ -602,7 +615,6 @@ export function useCodingAgentController({
     setMessages((previous) => [...previous, userMessage, assistantMessage]);
     setInput('');
     activeActivityExecutionRef.current = requestId;
-    setActivity([]);
     setStreaming(true);
     try {
       const transport = transportRef.current;
@@ -618,23 +630,19 @@ export function useCodingAgentController({
               ? { ...current, repairAvailable: false, chainStatus: 'reset' }
               : current);
           }
-          activitySequenceRef.current = 0;
-          setActivity([{
+          setActivity((previous) => upsertCodingActivity(previous, {
             id: `start:${requestId}`,
             executionId: requestId,
             phase: 'reading',
             message: 'Starting the Coding Agent task with the attached project context.',
-          }]);
+          }));
         },
         onActivity: (entry) => {
-          if (activeActivityExecutionRef.current !== requestId) return;
           setActivity((previous) => upsertCodingActivity(previous, entry));
         },
         onToken: () => undefined,
         onDone: (result: CodingTransportResult) => {
-          if (activeActivityExecutionRef.current === requestId) {
-            setActivity((previous) => finalizeCodingActivities(previous, requestId, 'UNVERIFIED'));
-          }
+          setActivity((previous) => finalizeCodingActivities(previous, requestId, 'UNVERIFIED'));
           void (async () => {
             try {
               const turnId = turnIdsRef.current.get(requestId);
@@ -643,6 +651,17 @@ export function useCodingAgentController({
                 await transport.markTurn(turnId, 'cancelled', 'request_cancelled');
                 setMessages((previous) => previous.map((message) => message.requestId === requestId
                   ? { ...message, content: 'Request cancelled.', streaming: false }
+                  : message));
+                return;
+              }
+              if (result.status === 'CANCELLATION_UNVERIFIED') {
+                await transport.markTurn(turnId, 'failed', 'cancellation_unverified');
+                setMessages((previous) => previous.map((message) => message.requestId === requestId
+                  ? {
+                      ...message,
+                      content: 'Cancellation was requested, but cleanup was not confirmed. Outstanding operations remain unverified.',
+                      streaming: false,
+                    }
                   : message));
                 return;
               }
@@ -664,12 +683,6 @@ export function useCodingAgentController({
                 });
               }
               if (result.proposalRequired) {
-                setActivity((previous) => upsertCodingActivity(previous, {
-                  id: `proposal-files:${requestId}:${activitySequenceRef.current++}`,
-                  executionId: requestId,
-                  phase: 'files_read',
-                  message: result.filesRead.length ? `Read ${result.filesRead.map((file) => file.path).join(', ')}.` : 'No project files were read.',
-                }));
                 if (/^\s*NO_CHANGES\s*$/i.test(result.content)) {
                   if (repairContext && window.electronAPI && proposal?.id) {
                     await window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id);
@@ -759,9 +772,30 @@ export function useCodingAgentController({
                     manifestHash: registered.manifestHash,
                   });
                 }
+                setActivity((previous) => upsertCodingActivity(previous, {
+                  event: 'activity_event',
+                  activityId: `${registered.id}:proposal-created`,
+                  executionId: requestId,
+                  taskId: registered.id,
+                  proposalId: registered.proposalId || registered.id,
+                  repairAttempt: repairContext?.attemptNumber,
+                  action: { tool: 'proposal_create', target: 'proposal for review' },
+                  activityType: 'PROPOSAL',
+                  status: 'COMPLETED',
+                  result: {
+                    executionStatus: registered.state === 'approved'
+                      ? 'APPROVED'
+                      : registered.state === 'awaiting_approval'
+                        ? 'AWAITING_APPROVAL'
+                        : registered.state.toUpperCase(),
+                    executed: false,
+                  },
+                  timestamp: new Date().toISOString(),
+                }));
                 setProposal({
                   id: registered.id,
                   proposalId: registered.proposalId,
+                  requestId,
                   manifestHash: registered.manifestHash,
                   state: registered.state,
                   lifecycleState: registered.lifecycleState,
@@ -790,14 +824,6 @@ export function useCodingAgentController({
                 if (repairContext && window.electronAPI && proposal?.id) {
                   await window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id);
                 }
-                if (result.filesRead.length) {
-                  setActivity((previous) => upsertCodingActivity(previous, {
-                    id: `files-read:${requestId}:${activitySequenceRef.current++}`,
-                    executionId: requestId,
-                    phase: 'files_read',
-                    message: `Read ${result.filesRead.map((file) => file.path).join(', ')}.`,
-                  }));
-                }
                 await transport.markTurn(turnId, 'completed', result.status || 'completed', result.filesRead.length);
                 setMessages((previous) => previous.map((message) => message.requestId === requestId
                   ? { ...message, content: result.content, streaming: false, performanceEvidence: result.performanceEvidence }
@@ -823,9 +849,7 @@ export function useCodingAgentController({
           if (repairContext && window.electronAPI && proposal?.id) {
             void window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id).catch(() => undefined);
           }
-          if (activeActivityExecutionRef.current === requestId) {
-            setActivity((previous) => finalizeCodingActivities(previous, requestId, 'UNVERIFIED'));
-          }
+          setActivity((previous) => finalizeCodingActivities(previous, requestId, 'UNVERIFIED'));
           const turnId = turnIdsRef.current.get(requestId);
           if (turnId) void transport.markTurn(turnId, 'failed', 'provider_or_tool_error').catch(() => undefined);
           turnIdsRef.current.delete(requestId);
@@ -1193,11 +1217,29 @@ export function useCodingAgentController({
 
   const approveProposal = async () => {
     if (!proposal?.id || !window.electronAPI) return;
+    const proposalId = proposal.id;
+    const executionId = proposal.requestId || proposalId;
     setBusy(true);
     try {
-      const result = await window.electronAPI.approveDeveloperProposal(proposal.id, {
+      const result = await window.electronAPI.approveDeveloperProposal(proposalId, {
         autoRepair: autoRepairChoice,
       });
+      setActivity((previous) => upsertCodingActivity(previous, {
+        event: 'activity_event',
+        activityId: `${proposalId}:approval`,
+        executionId,
+        taskId: proposalId,
+        proposalId: proposal.proposalId || proposalId,
+        repairAttempt: proposal.attemptNumber,
+        action: { tool: 'proposal_approval', target: 'proposal for review' },
+        activityType: 'PROPOSAL',
+        status: 'COMPLETED',
+        result: {
+        executionStatus: result.state === 'approved' ? 'APPROVED' : result.state.toUpperCase(),
+          executed: false,
+        },
+        timestamp: new Date().toISOString(),
+      }));
       transportRef.current?.notifyMutation('approval_response', {
         proposalId: proposal.proposalId || proposal.id,
         manifestHash: proposal.manifestHash,
@@ -1224,9 +1266,24 @@ export function useCodingAgentController({
 
   const rejectProposal = async () => {
     if (!proposal?.id || !window.electronAPI) return;
+    const proposalId = proposal.id;
+    const executionId = proposal.requestId || proposalId;
     setBusy(true);
     try {
-      const result = await window.electronAPI.rejectDeveloperProposal(proposal.id);
+      const result = await window.electronAPI.rejectDeveloperProposal(proposalId);
+      setActivity((previous) => upsertCodingActivity(previous, {
+        event: 'activity_event',
+        activityId: `${proposalId}:rejection`,
+        executionId,
+        taskId: proposalId,
+        proposalId: proposal.proposalId || proposalId,
+        repairAttempt: proposal.attemptNumber,
+        action: { tool: 'proposal_approval', target: 'proposal for review' },
+        activityType: 'PROPOSAL',
+        status: 'COMPLETED',
+        result: { executionStatus: result.state.toUpperCase(), executed: false },
+        timestamp: new Date().toISOString(),
+      }));
       setAutoRepairActive(false);
       setProposal((current) => current ? {
         ...current,
@@ -1288,16 +1345,6 @@ export function useCodingAgentController({
             ? 'Auto mode stopped after reaching its configured repair limit.'
             : 'Auto mode stopped because verification could not authorize another repair.',
         );
-      }
-      if (result.state === 'failed' && verification?.status === 'CODE_FAILURE') {
-        setActivity((previous) => upsertCodingActivity(previous, {
-          id: `verification-failure:${targetProposal.id}`,
-          executionId: targetProposal.id || 'unknown',
-          phase: 'debugging',
-          message: autoRepairActive
-            ? `Verification failed (${verification.classification || verification.status}); the failed change was rolled back. Auto mode is preparing a bounded repair.`
-            : `Verification failed (${verification.classification || verification.status}); changes were rolled back. Review the diagnostics and request a repair proposal.`,
-        }));
       }
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));

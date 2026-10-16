@@ -1,6 +1,6 @@
 /**
- * Structured Task Artifact Engine with Provenance Tracking.
- * Generates and persists verified artifacts for coding workflows.
+ * Structured Task Artifact Engine with content digests and provenance metadata.
+ * Generates and persists coding workflow artifacts.
  */
 
 const fs = require('node:fs/promises');
@@ -45,7 +45,7 @@ class ArtifactEngine {
       content: contentStr,
       hash,
       sourceEvidence: Array.isArray(sourceEvidence) ? sourceEvidence.slice(0, 20) : [],
-      status: 'VERIFIED',
+      status: 'UNVERIFIED',
     };
 
     if (!this._artifacts.has(taskId)) {

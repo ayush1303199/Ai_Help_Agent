@@ -1,36 +1,77 @@
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
+const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
+const { requireProjectProcessIsolation } = require('./projectProcessIsolation.cjs');
+const {
+  createResultEnvelope,
+  normalizeTimeoutMs,
+} = require('./executionEvidenceContract.cjs');
+const {
+  createSandboxResourceLifecycle,
+} = require('./sandboxResourceLifecycle.cjs');
 
 const SANDBOX_STARTUP_TIMEOUT_MS = 120_000;
 const SANDBOX_POLL_INTERVAL_MS = 100;
-const SANDBOX_KILL_GRACE_MS = 10_000;
+const SANDBOX_CLEANUP_TIMEOUT_MS = 180_000;
 const SANDBOX_EXECUTABLE = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'WindowsSandbox.exe');
 const HOST_PROBE_ENVIRONMENT_MARKER = 'AI_HELP_AGENT_SANDBOX_HOST_MARKER';
-let sandboxLeaseActive = false;
+const projectCommandAuthorizations = new WeakSet();
 
 const guestBootstrap = String.raw`$ErrorActionPreference = 'Stop'
 $control = 'C:\ai-help-agent-control'
 $results = 'C:\ai-help-agent-results'
 $progressPath = Join-Path $results 'progress.log'
-Set-Content -LiteralPath $progressPath -Value 'bootstrap-start' -Encoding UTF8
+$cleanupOutcomePath = Join-Path $results 'cleanup.json'
+function Write-ProgressBestEffort([string]$message) {
+  try {
+    Add-Content -LiteralPath $progressPath -Value $message -ErrorAction Stop
+  } catch {}
+}
+function Write-CleanupOutcomeBestEffort([string]$accountStatus, [string]$shutdownStatus, [bool]$complete) {
+  try {
+    [ordered]@{
+      version = 1
+      runId = [string]$config.runId
+      complete = $complete
+      accountCleanup = $accountStatus
+      shutdownCommand = $shutdownStatus
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $cleanupOutcomePath -Encoding UTF8 -ErrorAction Stop
+  } catch {}
+}
+Write-ProgressBestEffort 'bootstrap-start'
 $config = Get-Content -LiteralPath (Join-Path $control 'command.json') -Raw | ConvertFrom-Json
 $user = 'Aha-' + [Guid]::NewGuid().ToString('N').Substring(0, 14)
-$password = 'A7!' + [Guid]::NewGuid().ToString('N') + 'x'
+$passwordBytes = New-Object byte[] 11
+$randomGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try {
+  $randomGenerator.GetBytes($passwordBytes)
+  $password = 'A7!' + [Convert]::ToBase64String($passwordBytes).Replace('+', 'A').Replace('/', 'B').Substring(0, 11)
+}
+finally {
+  $randomGenerator.Dispose()
+}
 $created = $false
 try {
-  $provisionOutput = & "$env:WINDIR\System32\net.exe" user $user $password /add 2>&1
-  $provisionExitCode = $LASTEXITCODE
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $provisionOutput = & "$env:WINDIR\System32\net.exe" user $user $password /add 2>&1
+    $provisionExitCode = $LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
   if ($provisionExitCode -ne 0) { throw "Unable to create the restricted guest account (net user exited with $provisionExitCode): $($provisionOutput | Out-String)" }
-  Add-Content -LiteralPath $progressPath -Value 'guest-account-created'
+  Write-ProgressBestEffort 'guest-account-created'
   $created = $true
   $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
   $credential = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$user", $securePassword)
   $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $control 'invoke.ps1'))
   $process = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Credential $credential -LoadUserProfile -ArgumentList $arguments -PassThru -WindowStyle Hidden
-  Add-Content -LiteralPath $progressPath -Value 'guest-child-started'
+  Write-ProgressBestEffort 'guest-child-started'
   $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(30000, [int]$config.timeoutMs + 30000))
   while (-not $process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
     $process.Refresh()
@@ -54,14 +95,77 @@ try {
   }
 }
 catch {
-  $failure = [ordered]@{ exitCode = $null; stdout = ''; stderr = $_.Exception.Message; timedOut = $false; cancelled = $false }
+  $failure = [ordered]@{ runId = [string]$config.runId; exitCode = $null; stdout = ''; stderr = $_.Exception.Message; timedOut = $false; cancelled = $false; durationMs = 0 }
   $failure | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $results 'result.json') -Encoding UTF8
 }
 finally {
+  $accountCleanupFailure = $null
+  $shutdownFailure = $null
+  $accountCleanupStatus = 'unknown'
+  $shutdownCommandStatus = 'unknown'
+  Write-ProgressBestEffort 'guest-bootstrap-cleanup-start'
   if ($created) {
-    & "$env:WINDIR\System32\net.exe" user $user /delete | Out-Null
+    $accountCleanupStatus = 'failed'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+      $ErrorActionPreference = 'Continue'
+      $accountDeleteExitCode = $null
+      & "$env:WINDIR\System32\net.exe" user $user /delete | Out-Null
+      $accountDeleteExitCode = $LASTEXITCODE
+      if ($accountDeleteExitCode -ne 0) {
+        $accountCleanupFailure = "Guest account cleanup failed (net.exe exited with $accountDeleteExitCode)."
+        $accountCleanupStatus = 'failed'
+      } else {
+        $accountCleanupStatus = 'succeeded'
+      }
+    }
+    catch {
+      $accountCleanupFailure = 'Guest account cleanup failed while invoking net.exe.'
+    }
+    finally {
+      $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($null -ne $accountDeleteExitCode) {
+      Write-ProgressBestEffort "guest-account-delete-exit-$accountDeleteExitCode"
+    }
   }
-  & "$env:WINDIR\System32\shutdown.exe" /s /t 0 /f | Out-Null
+  if ($accountCleanupFailure) {
+    Write-ProgressBestEffort 'guest-account-delete-failed'
+  }
+  Write-CleanupOutcomeBestEffort $accountCleanupStatus $shutdownCommandStatus $false
+  Write-ProgressBestEffort 'guest-shutdown-start'
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $shutdownExitCode = $null
+    & "$env:WINDIR\System32\shutdown.exe" /s /t 0 /f | Out-Null
+    $shutdownExitCode = $LASTEXITCODE
+    if ($shutdownExitCode -ne 0) {
+      $shutdownFailure = "Guest shutdown failed (shutdown.exe exited with $shutdownExitCode)."
+      $shutdownCommandStatus = 'failed'
+    } else {
+      $shutdownCommandStatus = 'succeeded'
+    }
+  }
+  catch {
+    $shutdownFailure = 'Guest shutdown failed while invoking shutdown.exe.'
+    $shutdownCommandStatus = 'failed'
+  }
+  finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+  if ($null -ne $shutdownExitCode) {
+    Write-ProgressBestEffort "guest-shutdown-exit-$shutdownExitCode"
+  }
+  if ($shutdownFailure) {
+    Write-ProgressBestEffort 'guest-shutdown-failed'
+  }
+  Write-CleanupOutcomeBestEffort $accountCleanupStatus $shutdownCommandStatus $true
+  if ($accountCleanupFailure -and $shutdownFailure) {
+    throw "$accountCleanupFailure $shutdownFailure"
+  }
+  if ($accountCleanupFailure) { throw $accountCleanupFailure }
+  if ($shutdownFailure) { throw $shutdownFailure }
 }`;
 
 const guestInvoke = String.raw`$ErrorActionPreference = 'Stop'
@@ -233,6 +337,7 @@ try {
 }
 finally {
   $result = [ordered]@{
+    runId = [string]$config.runId
     exitCode = $exitCode
     stdout = if (Test-Path -LiteralPath $outputPath) { [IO.File]::ReadAllText($outputPath) } else { '' }
     stderr = if (Test-Path -LiteralPath $errorPath) { [IO.File]::ReadAllText($errorPath) } else { '' }
@@ -306,40 +411,144 @@ function buildSandboxConfiguration({ projectRoot, controlRoot, resultsRoot }) {
 </Configuration>`;
 }
 
-async function waitForSandboxResult({ resultPath, cancelPath, process, timeoutMs, isCancelled }) {
-  const startupDeadline = Date.now() + SANDBOX_STARTUP_TIMEOUT_MS + timeoutMs;
-  while (Date.now() < startupDeadline) {
+async function waitForSandboxResult({
+  runId,
+  resultPath,
+  cleanupOutcomePath,
+  cancelPath,
+  process,
+  timeoutMs,
+  isCancelled,
+  startupTimeoutMs = SANDBOX_STARTUP_TIMEOUT_MS,
+  pollIntervalMs = SANDBOX_POLL_INTERVAL_MS,
+  now = Date.now,
+  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  readFile = fs.readFile,
+  writeFile = fs.writeFile,
+}) {
+  if (typeof runId !== 'string' || !runId.trim()) throw new TypeError('Windows Sandbox run identity is required.');
+  const executionTimeoutMs = normalizeTimeoutMs(timeoutMs);
+  const startupDeadline = now() + startupTimeoutMs + executionTimeoutMs;
+  let projectResultReceived = false;
+  let cleanupOutcomeInvalid = false;
+  let cancellationRequested = false;
+  let hostCancelled = false;
+  let hostTerminationAttempt = null;
+  while (now() < startupDeadline) {
     try {
-      const json = await fs.readFile(resultPath, 'utf8');
-      return JSON.parse(json.replace(/^\uFEFF/, ''));
+      const json = await readFile(resultPath, 'utf8');
+      const result = JSON.parse(json.replace(/^\uFEFF/, ''));
+      if (!isValidSandboxGuestResult(result, runId)) {
+        cleanupOutcomeInvalid = true;
+        throw Object.assign(
+          new Error('Windows Sandbox returned malformed or cross-run guest result evidence.'),
+          { code: 'INVALID_GUEST_RESULT' },
+        );
+      }
+      projectResultReceived = true;
+      const cleanupJson = await readFile(cleanupOutcomePath, 'utf8');
+      const cleanupOutcome = parseSandboxCleanupOutcome(cleanupJson, runId);
+      if (!cleanupOutcome) {
+        cleanupOutcomeInvalid = true;
+      } else {
+        return {
+          result: { ...result, timedOut: false, cancelled: hostCancelled },
+          cleanupOutcome,
+          hostWait: { timedOut: false, cancelled: hostCancelled, deadlineObserved: false },
+        };
+      }
     } catch (error) {
-      if (!['ENOENT', 'EBUSY', 'EPERM', 'EACCES'].includes(error.code) && !(error instanceof SyntaxError)) throw error;
+      if (error instanceof SyntaxError) {
+        cleanupOutcomeInvalid = true;
+      } else if (error.code === 'INVALID_GUEST_RESULT') {
+        throw error;
+      } else if (!['ENOENT', 'EBUSY', 'EPERM', 'EACCES'].includes(error.code)) {
+        throw error;
+      }
     }
     if (typeof isCancelled === 'function' && isCancelled()) {
-      await fs.writeFile(cancelPath, 'cancel\n', 'utf8');
+      hostCancelled = true;
+      if (!cancellationRequested) {
+        await writeFile(cancelPath, `${runId}\n`, 'utf8');
+        cancellationRequested = true;
+        hostTerminationAttempt = requestSandboxLauncherTermination(process);
+      }
     }
-    if (process.exitCode !== null && process.exitCode !== undefined) {
-      throw new Error(`Windows Sandbox exited before returning a result (code ${process.exitCode}).`);
+    if ((process.exitCode !== null && process.exitCode !== undefined)
+      || (process.signalCode !== null && process.signalCode !== undefined)) {
+      const termination = process.signalCode
+        ? `signal ${process.signalCode}`
+        : `code ${process.exitCode}`;
+      const missing = projectResultReceived ? 'a complete cleanup outcome' : 'a project result';
+      throw Object.assign(
+        new Error(`Windows Sandbox exited before returning ${missing} (${termination}).`),
+        {
+          code: 'SANDBOX_EXITED_WITHOUT_RESULT',
+          hostWait: {
+            timedOut: false,
+            cancelled: hostCancelled,
+            terminationAttempt: hostTerminationAttempt,
+          },
+        },
+      );
     }
-    await new Promise((resolve) => setTimeout(resolve, SANDBOX_POLL_INTERVAL_MS));
+    await sleep(pollIntervalMs);
   }
-  await fs.writeFile(cancelPath, 'cancel\n', 'utf8').catch(() => {});
-  const progress = await fs.readFile(path.join(path.dirname(resultPath), 'progress.log'), 'utf8').catch(() => '');
-  throw new Error(`Windows Sandbox did not complete before the startup/command deadline.${progress ? ` Guest progress: ${progress.trim().replace(/\r?\n/g, ', ')}` : ''}`);
+  await writeFile(cancelPath, `${runId}\n`, 'utf8').catch(() => {});
+  if (!hostTerminationAttempt) hostTerminationAttempt = requestSandboxLauncherTermination(process);
+  const progress = await readFile(path.join(path.dirname(resultPath), 'progress.log'), 'utf8').catch(() => '');
+  const outcomeState = cleanupOutcomeInvalid ? ' The cleanup outcome was malformed or incomplete.' : '';
+  throw Object.assign(
+    new Error(`Windows Sandbox did not complete with a valid project result and cleanup outcome before the startup/command deadline.${outcomeState}${progress ? ` Guest progress: ${progress.trim().replace(/\r?\n/g, ', ')}` : ''}`),
+    {
+      code: 'SANDBOX_HOST_DEADLINE',
+      timedOut: true,
+      hostWait: {
+        timedOut: true,
+        cancelled: hostCancelled,
+        terminationAttempt: hostTerminationAttempt,
+      },
+    },
+  );
 }
 
-async function stopSandbox(process) {
-  if (!process || process.exitCode !== null) return;
-  await new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      process.kill();
-      resolve();
-    }, SANDBOX_KILL_GRACE_MS);
-    process.once('exit', () => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
+function isValidSandboxGuestResult(value, expectedRunId) {
+  const expectedKeys = ['runId', 'exitCode', 'stdout', 'stderr', 'timedOut', 'cancelled', 'durationMs'];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== expectedKeys.length
+    || !expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key))) return false;
+  return typeof expectedRunId === 'string'
+    && value.runId === expectedRunId
+    && (value.exitCode === null || Number.isInteger(value.exitCode))
+    && typeof value.stdout === 'string'
+    && typeof value.stderr === 'string'
+    && typeof value.timedOut === 'boolean'
+    && typeof value.cancelled === 'boolean'
+    && Number.isFinite(value.durationMs)
+    && value.durationMs >= 0;
+}
+
+function isValidSandboxCleanupOutcome(value, expectedRunId) {
+  const expectedKeys = ['version', 'runId', 'complete', 'accountCleanup', 'shutdownCommand'];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== expectedKeys.length
+    || !expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key))) {
+    return false;
+  }
+  return Number.isInteger(value.version)
+    && value.version === 1
+    && typeof expectedRunId === 'string'
+    && value.runId === expectedRunId
+    && value.complete === true
+    && (value.accountCleanup === 'succeeded' || value.accountCleanup === 'failed')
+    && (value.shutdownCommand === 'succeeded' || value.shutdownCommand === 'failed');
+}
+
+function parseSandboxCleanupOutcome(json, expectedRunId) {
+  const outcome = JSON.parse(json.replace(/^\uFEFF/, ''));
+  return isValidSandboxCleanupOutcome(outcome, expectedRunId) ? outcome : null;
 }
 
 function listSandboxClientPids() {
@@ -356,16 +565,60 @@ function listSandboxClientPids() {
     .filter((pid) => Number.isInteger(pid) && pid > 0);
 }
 
-async function waitForSandboxClientsToClose(baselinePids) {
-  const baseline = new Set(baselinePids);
-  const deadline = Date.now() + SANDBOX_KILL_GRACE_MS;
-  let remaining = [];
-  while (Date.now() < deadline) {
-    remaining = listSandboxClientPids().filter((pid) => !baseline.has(pid));
-    if (!remaining.length) return;
-    await new Promise((resolve) => setTimeout(resolve, 250));
+function hasLauncherTerminated(process) {
+  return !process
+    || (process.exitCode !== null && process.exitCode !== undefined)
+    || (process.signalCode !== null && process.signalCode !== undefined);
+}
+
+function requestSandboxLauncherTermination(process) {
+  if (!process?.pid || hasLauncherTerminated(process)) {
+    return Object.freeze({ requested: false, accepted: false, processId: process?.pid || null });
   }
-  throw new Error(`Windows Sandbox did not close its guest client(s): ${remaining.join(', ')}. No unowned Sandbox processes were terminated.`);
+  let accepted = false;
+  try {
+    accepted = process.kill();
+  } catch {
+    accepted = false;
+  }
+  return Object.freeze({ requested: true, accepted, processId: process.pid });
+}
+
+async function waitForSandboxShutdown(process, baselinePids, temporaryRoot, {
+  listClients = listSandboxClientPids,
+  cleanupTimeoutMs = SANDBOX_CLEANUP_TIMEOUT_MS,
+  now = Date.now,
+  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+} = {}) {
+  const baseline = new Set(baselinePids);
+  const deadline = now() + cleanupTimeoutMs;
+  let remaining = [];
+  let launcherExited = hasLauncherTerminated(process);
+  while (now() < deadline) {
+    remaining = listClients().filter((pid) => !baseline.has(pid));
+    launcherExited = hasLauncherTerminated(process);
+    if (launcherExited && !remaining.length) {
+      return Object.freeze({
+        launcherTerminated: true,
+        launcherPid: process?.pid || null,
+        sandboxClientsRemaining: 0,
+        observedAt: new Date(now()).toISOString(),
+      });
+    }
+    await sleep(250);
+  }
+  remaining = listClients().filter((pid) => !baseline.has(pid));
+  launcherExited = hasLauncherTerminated(process);
+  const launcherState = launcherExited
+    ? 'the Windows Sandbox launcher exited'
+    : `the Windows Sandbox launcher is still running (PID ${process.pid || 'unknown'})`;
+  const clientState = remaining.length
+    ? `guest client(s) are still running: ${remaining.join(', ')}`
+    : 'no guest clients remain';
+  throw new Error(
+    `Windows Sandbox cleanup timed out after ${cleanupTimeoutMs}ms: ${launcherState}; ${clientState}. `
+      + `Isolation is not verified. Temporary probe data was retained at "${temporaryRoot}".`,
+  );
 }
 
 async function removeSandboxTemporaryRoot(temporaryRoot) {
@@ -383,6 +636,23 @@ async function removeSandboxTemporaryRoot(temporaryRoot) {
   throw lastError;
 }
 
+async function verifySandboxTemporaryRootRemoved(temporaryRoot) {
+  try {
+    await fs.access(temporaryRoot);
+    return false;
+  } catch (error) {
+    if (error.code === 'ENOENT') return true;
+    throw error;
+  }
+}
+
+const sandboxResourceLifecycle = createSandboxResourceLifecycle({
+  createTemporaryRoot: () => fs.mkdtemp(path.join(os.tmpdir(), 'ai-help-agent-sandbox-')),
+  waitForShutdown: waitForSandboxShutdown,
+  removeTemporaryRoot: removeSandboxTemporaryRoot,
+  verifyTemporaryRootRemoved: verifySandboxTemporaryRootRemoved,
+});
+
 async function runWindowsSandboxCommand({
   projectRoot,
   workingDirectory = '.',
@@ -393,7 +663,15 @@ async function runWindowsSandboxCommand({
   isCancelled,
   mode = 'command',
   hostProbePath = '',
+  authorization,
 }) {
+  if (mode !== 'command') {
+    throw new Error('Windows Sandbox provider probing is disabled pending separate authorization.');
+  }
+  if (!authorization || !projectCommandAuthorizations.has(authorization)) {
+    throw new Error('Windows Sandbox project command authorization is unavailable.');
+  }
+  requireProjectProcessIsolation('Windows Sandbox project command');
   if (process.platform !== 'win32') {
     throw new Error('Windows Sandbox execution is only available on Windows.');
   }
@@ -401,30 +679,30 @@ async function runWindowsSandboxCommand({
   if (!Array.isArray(args) || args.some((argument) => typeof argument !== 'string')) {
     throw new TypeError('Sandbox command arguments must be strings.');
   }
+  timeoutMs = normalizeTimeoutMs(timeoutMs);
   const relativeWorkingDirectory = String(workingDirectory || '.').replace(/\\/g, '/');
   if (path.posix.isAbsolute(relativeWorkingDirectory)
     || relativeWorkingDirectory.split('/').some((segment) => segment === '..')) {
     throw new Error('Sandbox working directory must stay inside the isolated project.');
   }
-  if (sandboxLeaseActive) throw new Error('Another Coding Agent Windows Sandbox operation is already active.');
-  sandboxLeaseActive = true;
-
-  let temporaryRoot;
-  try {
-    temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ai-help-agent-sandbox-'));
-  } catch (error) {
-    sandboxLeaseActive = false;
-    throw error;
-  }
+  const runId = crypto.randomUUID();
+  const resource = await sandboxResourceLifecycle.createResource({ runId });
+  const temporaryRoot = sandboxResourceLifecycle.getTemporaryRoot(resource);
   const controlRoot = path.join(temporaryRoot, 'control');
   const resultsRoot = path.join(temporaryRoot, 'results');
   const resultPath = path.join(resultsRoot, 'result.json');
+  const cleanupOutcomePath = path.join(resultsRoot, 'cleanup.json');
   const cancelPath = path.join(resultsRoot, 'cancel.request');
   const wsbPath = path.join(temporaryRoot, 'run.wsb');
   let baselineSandboxClients = [];
   let sandboxProcess;
+  let cleanupOutcome;
+  let hostWait;
+  let commandResult;
+  let hostLifecycleObservation;
   try {
     baselineSandboxClients = listSandboxClientPids();
+    sandboxResourceLifecycle.setBaselinePids(resource, baselineSandboxClients);
     if (baselineSandboxClients.length) {
       throw new Error('Close existing Windows Sandbox guests before running Coding Agent verification.');
     }
@@ -440,6 +718,7 @@ async function runWindowsSandboxCommand({
         environment: { CI: typeof environment.CI === 'string' ? environment.CI : '' },
       };
     await fs.writeFile(path.join(controlRoot, 'command.json'), JSON.stringify({
+      runId,
       mode,
       workingDirectory: relativeWorkingDirectory === '.' ? '' : relativeWorkingDirectory,
       timeoutMs: Math.max(1, Math.floor(timeoutMs)),
@@ -465,17 +744,28 @@ async function runWindowsSandboxCommand({
     const sandboxEnvironment = mode === 'probe'
       ? { ...process.env, [HOST_PROBE_ENVIRONMENT_MARKER]: `${Date.now()}-${Math.random()}` }
       : process.env;
+    sandboxResourceLifecycle.markLaunchStarting(resource);
     sandboxProcess = spawn(SANDBOX_EXECUTABLE, [wsbPath], {
       env: sandboxEnvironment,
       stdio: 'ignore',
       windowsHide: true,
     });
+    sandboxProcess.once('spawn', () => {
+      sandboxResourceLifecycle.markLauncherStarted(resource, sandboxProcess);
+    });
+    sandboxProcess.once('error', () => sandboxResourceLifecycle.markLaunchFailed(resource));
     const spawnFailure = new Promise((_, reject) => {
       sandboxProcess.once('error', reject);
     });
-    const result = await Promise.race([
+    const {
+      result,
+      cleanupOutcome: receivedCleanupOutcome,
+      hostWait: receivedHostWait,
+    } = await Promise.race([
       waitForSandboxResult({
+        runId,
         resultPath,
+        cleanupOutcomePath,
         cancelPath,
         process: sandboxProcess,
         timeoutMs,
@@ -483,6 +773,8 @@ async function runWindowsSandboxCommand({
       }),
       spawnFailure,
     ]);
+    cleanupOutcome = receivedCleanupOutcome;
+    hostWait = receivedHostWait;
     if (result.exitCode === null && !result.cancelled && !result.timedOut) {
       throw new Error(result.stderr || 'The restricted Windows Sandbox process returned no exit status.');
     }
@@ -494,58 +786,90 @@ async function runWindowsSandboxCommand({
       } catch {
         throw new Error(`Windows Sandbox returned invalid process-isolation probe evidence: ${(result.stderr || stdout).slice(0, 300)}`);
       }
-      return { ...result, checks };
+      const resultEnvelope = createResultEnvelope({
+        untrustedWorkerClaims: [
+          JSON.stringify({
+            runId: result.runId,
+            exitCode: result.exitCode,
+            timedOut: result.timedOut,
+            cancelled: result.cancelled,
+            durationMs: result.durationMs,
+          }),
+          result.stdout || '',
+          result.stderr || '',
+          cleanupOutcome ? JSON.stringify(cleanupOutcome) : '',
+        ].filter((entry) => typeof entry === 'string' && entry.trim().length > 0),
+        providerObservedState: {
+          launcherExited: sandboxProcess ? (sandboxProcess.exitCode !== null && sandboxProcess.exitCode !== undefined) || (sandboxProcess.signalCode !== null && sandboxProcess.signalCode !== undefined) : null,
+          processId: sandboxProcess ? sandboxProcess.pid : null,
+          sandboxMode: mode,
+          runId,
+        },
+      });
+      commandResult = { ...result, checks, resultEnvelope };
+    } else {
+      const resultEnvelope = createResultEnvelope({
+        untrustedWorkerClaims: [
+          JSON.stringify({
+            runId: result.runId,
+            exitCode: result.exitCode,
+            timedOut: result.timedOut,
+            cancelled: result.cancelled,
+            durationMs: result.durationMs,
+          }),
+          result.stdout || '',
+          result.stderr || '',
+          cleanupOutcome ? JSON.stringify(cleanupOutcome) : '',
+        ].filter((entry) => typeof entry === 'string' && entry.trim().length > 0),
+        providerObservedState: {
+          launcherExited: sandboxProcess ? (sandboxProcess.exitCode !== null && sandboxProcess.exitCode !== undefined) || (sandboxProcess.signalCode !== null && sandboxProcess.signalCode !== undefined) : null,
+          processId: sandboxProcess ? sandboxProcess.pid : null,
+          sandboxMode: mode,
+          runId,
+          hostWait,
+        },
+      });
+      commandResult = {
+        ...result,
+        cleanupOutcome,
+        hostWait,
+        runId,
+        executionResultAuthenticated: false,
+        resultEnvelope,
+      };
     }
-    return result;
   } catch (error) {
-    if (sandboxProcess && error instanceof Error) error.isolationFailure = true;
+    if (sandboxProcess && error instanceof Error) {
+      if (!error.hostWait?.terminationAttempt?.requested) {
+        error.hostTerminationAttempt = requestSandboxLauncherTermination(sandboxProcess);
+      }
+      error.isolationFailure = true;
+    }
     throw error;
   } finally {
     let cleanupError;
     try {
-      await stopSandbox(sandboxProcess);
-      if (sandboxProcess?.pid) await waitForSandboxClientsToClose(baselineSandboxClients);
+      hostLifecycleObservation = await sandboxResourceLifecycle.cleanup(resource);
     } catch (error) {
       cleanupError = error;
     }
-    try {
-      await removeSandboxTemporaryRoot(temporaryRoot);
-    } catch (error) {
-      cleanupError ||= error;
-    }
-    sandboxLeaseActive = false;
     if (cleanupError) {
-      if (cleanupError instanceof Error) cleanupError.isolationFailure = true;
-      throw cleanupError;
+      const outcome = cleanupOutcome
+        ? ` Guest cleanup outcome: accountCleanup=${cleanupOutcome.accountCleanup}, shutdownCommand=${cleanupOutcome.shutdownCommand}.`
+        : '';
+      const error = new Error(`${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}${outcome}`);
+      error.isolationFailure = true;
+      throw error;
     }
   }
-}
-
-async function probeWindowsSandbox(projectRoot) {
-  const markerRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ai-help-agent-sandbox-marker-'));
-  const markerPath = path.join(markerRoot, 'host-marker.txt');
-  const outsideRoot = path.join(markerRoot, 'outside');
-  const junctionPath = path.join(projectRoot, '.sandbox-host-escape');
-  await fs.mkdir(outsideRoot);
-  await fs.writeFile(markerPath, 'host-only-probe-marker', 'utf8');
-  await fs.writeFile(path.join(outsideRoot, 'marker.txt'), 'junction-escape-marker', 'utf8');
-  try {
-    await fs.symlink(outsideRoot, junctionPath, 'junction');
-    const result = await runWindowsSandboxCommand({
-      projectRoot,
-      mode: 'probe',
-      timeoutMs: 30_000,
-      hostProbePath: markerPath,
-    });
-    const checks = result.checks;
-    if (checks?.externalJunctionUnavailable !== true) {
-      throw new Error('Windows Sandbox boundary probe failed: a host junction escaped the read-only project mount.');
+  if (commandResult) {
+    commandResult.hostLifecycleObservation = hostLifecycleObservation;
+    if (commandResult.resultEnvelope) {
+      commandResult.resultEnvelope.providerObservedState.hostLifecycleObservation = hostLifecycleObservation;
     }
-    return checks;
-  } finally {
-    await fs.rm(junctionPath, { recursive: true, force: true }).catch(() => {});
-    await fs.rm(markerRoot, { recursive: true, force: true });
+    return commandResult;
   }
+  throw new Error(`Windows Sandbox run ${runId} produced no command result.`);
 }
 
 function assertSandboxProbe(checks, result) {
@@ -568,7 +892,11 @@ function assertSandboxProbe(checks, result) {
 
 module.exports = {
   assertSandboxProbe,
+  isValidSandboxGuestResult,
   HOST_PROBE_ENVIRONMENT_MARKER,
-  probeWindowsSandbox,
+  parseSandboxCleanupOutcome,
+  requestSandboxLauncherTermination,
   runWindowsSandboxCommand,
+  waitForSandboxResult,
+  waitForSandboxShutdown,
 };

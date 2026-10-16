@@ -1,4 +1,5 @@
 const { projectProcessIsolationStatus } = require('./projectProcessIsolation.cjs');
+const { createCapabilityStateMap } = require('./providerAdapterContract.cjs');
 
 function buildCodingAcceptancePreflight({
   providerConfigured,
@@ -52,6 +53,7 @@ function buildCodingAcceptancePreflight({
       platformRecognized: isolation?.platformRecognized === true,
       platform: isolation?.platform || process.platform,
       reason: isolation?.reason || null,
+      capabilityStates: createCapabilityStateMap(isolation?.capabilityStates || {}),
     },
     blockers,
   };

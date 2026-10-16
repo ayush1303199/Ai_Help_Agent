@@ -468,11 +468,14 @@ export class CodingAgentTransport {
     }
     if (message.type === 'cancelled') {
       this.requests.delete(requestId);
+      const cancellationConfirmed = message.status === 'CANCELLED';
       request.handlers.onDone({
         requestId,
-        content: 'Request cancelled.',
+        content: cancellationConfirmed
+          ? 'Request cancelled.'
+          : 'Cancellation requested, but termination was not confirmed.',
         proposalRequired: false,
-        status: 'CANCELLED',
+        status: cancellationConfirmed ? 'CANCELLED' : 'CANCELLATION_UNVERIFIED',
         readOnly: true,
         writeRequired: false,
         applyRequired: false,

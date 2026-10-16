@@ -59,6 +59,7 @@ from coding_intelligence import (
     DATABASE_CONNECTION_STATUS_PATTERN,
     DatabaseSession,
     DatabaseSessionManager,
+    DatabaseOperationBusyError,
     DatabaseState,
     SelfDebugController,
     FailureClassification,
@@ -75,6 +76,15 @@ from coding_intelligence import (
     ProjectIsolationGuard,
     CODING_ENGINEERING_POLICY,
 )
+
+_MAX_DATABASE_WORKERS = 4
+_database_workers: Dict[str, Dict[str, Any]] = {}
+_database_workers_lock = threading.Lock()
+
+
+class DatabaseWorkerCapacityError(RuntimeError):
+    """Raised when bounded tracking capacity is exhausted before dispatch."""
+
 
 logger = logging.getLogger(__name__)
 
@@ -4064,13 +4074,10 @@ def _next_credential_investigation_action(
         action for action in task_state.get("actions", [])
         if isinstance(action, dict)
     ]
-    current_revision = int(task_state.get("knowledgeRevision", 0))
     attempted = {
         action.get("fingerprint")
         for action in actions
         if action.get("fingerprint")
-        and int(action.get("resultKnowledgeRevision", action.get("knowledgeRevision", current_revision)))
-        == current_revision
     }
     read_files = {
         str(action.get("target") or "").replace("\\", "/").casefold()
@@ -6006,10 +6013,13 @@ def _activity_type_for_tool(tool: str) -> str:
         "discover_database_configuration": "INSPECTING_DATABASE",
         "DATABASE_CONNECT": "INSPECTING_DATABASE",
         "DATABASE_CONNECT_TARGET": "INSPECTING_DATABASE",
+        "DATABASE_TARGET_SELECTION": "INSPECTING_DATABASE",
+        "DATABASE_CONNECTION_ATTEMPT": "INSPECTING_DATABASE",
         "DATABASE_RECONNECT": "INSPECTING_DATABASE",
         "DATABASE_DISCONNECT": "INSPECTING_DATABASE",
         "DATABASE_HEALTH_CHECK": "INSPECTING_DATABASE",
         "DATABASE_CURRENT_TARGET": "INSPECTING_DATABASE",
+        "DATABASE_SESSION": "INSPECTING_DATABASE",
         "DATABASE_CREDENTIAL_REQUEST": "INSPECTING_DATABASE",
         "DATABASE_LIST_DATABASES": "INSPECTING_DATABASE",
         "DATABASE_LIST_SCHEMAS": "INSPECTING_DATABASE",
@@ -6040,22 +6050,95 @@ def _activity_status_for_result(tool: str, result: Any) -> str:
     if not isinstance(result, dict):
         return "UNVERIFIED"
     data = result.get("data") if isinstance(result.get("data"), dict) else result
-    if tool in ("run_verification", "terminal.run_command"):
+    reported_states = set()
+    malformed_status = False
+    for source in (result, data):
+        for field in ("executionStatus", "verificationStatus", "status", "evidenceState"):
+            if field not in source:
+                continue
+            value = source.get(field)
+            if not isinstance(value, str) or not value.strip():
+                malformed_status = True
+                continue
+            reported_states.add(value.strip().upper())
+    is_verification = tool in ("run_verification", "terminal.run_command")
+    if is_verification and malformed_status:
+        return "UNVERIFIED"
+    if is_verification and reported_states.difference({
+        "BLOCKED",
+        "DENIED",
+        "POLICY_DENIED",
+        "POLICY_BLOCKED",
+        "NEEDS_CLARIFICATION",
+        "INVALID_REQUEST",
+        "NOT_AUTHORIZED",
+        "ELIGIBLE_FOR_HUMAN_REVIEW",
+        "UNCERTAIN",
+        "NOT_ESTABLISHED",
+        "SKIPPED",
+        "FAILED",
+        "FAILURE",
+        "ERROR",
+        "CODE_FAILURE",
+        "UNAVAILABLE",
+        "NOT_VERIFIED",
+        "NOT_CONFIGURED",
+        "NOT_STARTED",
+        "READY",
+        "UNVERIFIED",
+        "CANCELLED",
+        "CANCELED",
+        "PASS",
+        "PASSED",
+        "COMPLETED",
+    }):
+        return "UNVERIFIED"
+    if data.get("cancelled") is True or result.get("cancelled") is True:
+        confirmed = data.get("cancellationConfirmed") is True or result.get("cancellationConfirmed") is True
+        return "CANCELLED" if confirmed else "UNVERIFIED"
+    if is_verification and reported_states.intersection({"CANCELLED", "CANCELED"}):
+        confirmed = data.get("cancellationConfirmed") is True or result.get("cancellationConfirmed") is True
+        return "CANCELLED" if confirmed else "UNVERIFIED"
+    error_data = result.get("error") if isinstance(result.get("error"), dict) else {}
+    error_code = str(error_data.get("code") or "").upper()
+    if reported_states.intersection({
+        "BLOCKED",
+        "DENIED",
+        "POLICY_DENIED",
+        "POLICY_BLOCKED",
+        "NEEDS_CLARIFICATION",
+        "INVALID_REQUEST",
+        "NOT_AUTHORIZED",
+        "ELIGIBLE_FOR_HUMAN_REVIEW",
+    }) or error_code in {
+        "BLOCKED",
+        "POLICY_DENIED",
+        "POLICY_BLOCKED",
+        "NOT_AUTHORIZED",
+    }:
+        return "BLOCKED"
+    if "UNCERTAIN" in reported_states:
+        return "UNCERTAIN"
+    if "NOT_ESTABLISHED" in reported_states:
+        return "NOT_ESTABLISHED"
+    if "SKIPPED" in reported_states or data.get("skipped") is True:
+        return "SKIPPED"
+    if reported_states.intersection({"FAILED", "FAILURE", "ERROR", "CODE_FAILURE"}):
+        return "FAILED"
+    if reported_states.intersection({
+        "UNAVAILABLE",
+        "NOT_VERIFIED",
+        "NOT_CONFIGURED",
+        "NOT_STARTED",
+        "READY",
+        "UNVERIFIED",
+    }):
+        return "UNVERIFIED"
+    if is_verification:
         exit_code = data.get("exitCode")
         if data.get("executed") is not True or not isinstance(exit_code, int) or isinstance(exit_code, bool):
             return "UNVERIFIED"
         return "COMPLETED" if result.get("ok") is True and exit_code == 0 else "FAILED"
-    execution_status = str(
-        data.get("executionStatus") or data.get("verificationStatus") or data.get("status") or ""
-    ).upper()
-    if execution_status in {
-        "UNAVAILABLE",
-        "NOT_VERIFIED",
-        "NOT_CONFIGURED",
-        "UNVERIFIED",
-        "NEEDS_CLARIFICATION",
-    }:
-        return "UNVERIFIED"
     return "COMPLETED" if result.get("ok") is True else "FAILED"
 
 
@@ -6070,15 +6153,25 @@ def _redact_activity_text(value: Any, max_length: int) -> str:
 
 
 def _activity_target_for_tool(tool: str, arguments: Dict[str, Any]) -> str:
-    if tool == "execute_sql":
-        return "read-only SQL operation"
+    if tool.startswith("DATABASE_") or tool in (
+        "execute_sql",
+        "discover_database_configuration",
+    ):
+        return "database operation"
+    if tool in ("search_code", "repo_browser.search_code", "find_code", "search_files",
+                "search_symbols", "repo_browser.search_symbols", "find_symbols", "find_references"):
+        target = (
+            arguments.get("relativePath")
+            or arguments.get("path")
+            or arguments.get("query")
+            or arguments.get("symbol")
+        )
+        return _redact_activity_text(target, 300) if isinstance(target, str) and target else "project code"
+    if tool in ("run_verification", "terminal.run_command"):
+        return "verification command"
     target = (
         arguments.get("relativePath")
         or arguments.get("path")
-        or arguments.get("query")
-        or arguments.get("sql")
-        or arguments.get("command")
-        or arguments.get("script")
         or arguments.get("symbol")
         or tool
     )
@@ -6096,7 +6189,7 @@ def _activity_event_payload(
     tool = str(action.get("tool") or "unknown")
     safe_action = {
         "tool": _redact_activity_text(tool, 120),
-        "target": _redact_activity_text(action.get("target"), 300),
+        "target": _activity_target_for_tool(tool, {"relativePath": action.get("target")}),
     }
 
     payload: Dict[str, Any] = {
@@ -6106,27 +6199,40 @@ def _activity_event_payload(
         "executionId": request_id,
         "taskId": str(action.get("taskId") or request_id),
         "sessionId": session_id,
+        **({"proposalId": str(action["proposalId"])} if action.get("proposalId") else {}),
+        **({"repairAttempt": action["repairAttempt"]} if isinstance(action.get("repairAttempt"), int) else {}),
         "action": safe_action,
         "activityType": _activity_type_for_tool(tool),
         "status": status,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "timestamp": (
+            action.get("observedAt")
+            if isinstance(action.get("observedAt"), str)
+            else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        ),
     }
     safe_result: Dict[str, Any] = {}
     if isinstance(result, dict):
         data = result.get("data") if isinstance(result.get("data"), dict) else result
+        if status == "BLOCKED":
+            safe_result["executed"] = False
+        elif isinstance(data.get("executed"), bool):
+            safe_result["executed"] = data["executed"]
         if tool in ("run_verification", "terminal.run_command"):
             executed = data.get("executed") is True
             exit_code = data.get("exitCode")
             if executed and isinstance(exit_code, int) and not isinstance(exit_code, bool):
                 safe_result["exitCode"] = exit_code
-            command = data.get("command") or data.get("script") or action.get("target")
-            if isinstance(command, str) and command:
-                safe_result["command"] = _redact_activity_text(command, 300)
-            safe_result["executionStatus"] = (
-                str(data.get("verificationStatus") or data.get("status") or ("PASSED" if result.get("ok") is True and exit_code == 0 else "FAILED"))
-                if executed and isinstance(exit_code, int) and not isinstance(exit_code, bool)
-                else "UNVERIFIED"
-            )
+            if status == "SKIPPED" or data.get("skipped") is True:
+                safe_result["executionStatus"] = "SKIPPED"
+            else:
+                verification_status = data.get("verificationStatus") or data.get("status")
+                if isinstance(verification_status, str) and verification_status.upper() == "PASSED":
+                    verification_status = "PASS"
+                safe_result["executionStatus"] = (
+                    str(verification_status or ("PASS" if result.get("ok") is True and exit_code == 0 else "FAILED"))
+                    if executed and isinstance(exit_code, int) and not isinstance(exit_code, bool)
+                    else "UNVERIFIED"
+                )
         elif tool.startswith("DATABASE_") or tool in (
             "execute_sql",
             "discover_database_configuration",
@@ -6159,7 +6265,9 @@ def _activity_event_payload(
             safe_result["rowCount"] = len(collection)
         if collection is not None:
             safe_result["count"] = len(collection)
-            if collection_key != "rows":
+            if collection_key != "rows" and not (
+                tool.startswith("DATABASE_") or tool in ("execute_sql", "discover_database_configuration")
+            ):
                 paths = []
                 seen_paths = set()
                 for item in collection:
@@ -6190,21 +6298,33 @@ def _activity_event_payload(
         payload["result"] = safe_result
 
     error_source = error
-    if error_source is None and status in {"FAILED", "UNVERIFIED"} and isinstance(result, dict):
-        error_source = result
+    if error_source is None and status in {"FAILED", "UNVERIFIED", "BLOCKED"} and isinstance(result, dict):
+        error_source = result.get("error") if isinstance(result.get("error"), dict) else None
     if isinstance(error_source, dict):
         raw_error = error_source.get("error") if isinstance(error_source.get("error"), dict) else error_source
         error_code = raw_error.get("code")
-        error_message = raw_error.get("message") or error_source.get("message")
-        if error_message is None and isinstance(error_source.get("content"), str):
-            error_message = error_source["content"]
+        error_message = raw_error.get("message")
         if error_code or error_message:
             payload["error"] = {
                 **({"code": _redact_activity_text(error_code, 100)} if error_code else {}),
-                **({"message": _redact_activity_text(error_message, 500)} if error_message else {}),
+                **({
+                    "message": (
+                        "Execution was prevented by policy or requires clarification."
+                        if status == "BLOCKED"
+                        else "No authoritative result was received."
+                        if status == "UNVERIFIED"
+                        else "The operation reported a failure."
+                    )
+                } if error_message or status in {"FAILED", "UNVERIFIED", "BLOCKED"} else {}),
             }
-    elif isinstance(error_source, str) and error_source:
-        payload["error"] = {"message": _redact_activity_text(error_source, 500)}
+    elif error_source is not None:
+        payload["error"] = {
+            "message": (
+                "No authoritative result was received."
+                if status == "UNVERIFIED"
+                else "The operation reported a failure."
+            )
+        }
     return payload
 
 
@@ -6231,6 +6351,158 @@ async def _publish_activity_event(
         )
 
 
+async def _run_database_worker(
+    function,
+    *args,
+    request_id: str,
+    operation_id: str,
+    on_abandoned=None,
+    **kwargs,
+):
+    worker_id = secrets.token_hex(16)
+    with _database_workers_lock:
+        if len(_database_workers) >= _MAX_DATABASE_WORKERS:
+            raise DatabaseWorkerCapacityError(
+                "Database worker tracking capacity is full; the operation was not started."
+            )
+        worker_record = {
+            "request_id": request_id,
+            "operation_id": operation_id,
+            "task": None,
+            "abandoned": False,
+        }
+        _database_workers[worker_id] = worker_record
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    except BaseException:
+        with _database_workers_lock:
+            _database_workers.pop(worker_id, None)
+        raise
+    worker_record["task"] = worker
+
+    def forget_finished_worker(completed):
+        try:
+            completed.exception()
+        except asyncio.CancelledError:
+            pass
+        except BaseException as worker_error:
+            if worker_record["abandoned"]:
+                logger.warning(
+                    "Abandoned database worker failed (request_id=%s operation_id=%s): %s",
+                    request_id,
+                    operation_id,
+                    SecretProtector.redact_text(str(worker_error))[:300],
+                )
+        finally:
+            with _database_workers_lock:
+                _database_workers.pop(worker_id, None)
+
+    worker.add_done_callback(forget_finished_worker)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        if not worker.done():
+            DatabaseSessionManager.mark_state_unverified()
+        deadline = time.monotonic() + CODING_CANCELLATION_TIMEOUT_SECONDS
+        while not worker.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if worker.done():
+                    break
+                worker_record["abandoned"] = True
+                if callable(on_abandoned):
+                    on_abandoned()
+                logger.warning(
+                    "Database worker remains active after cancellation grace (request_id=%s operation_id=%s)",
+                    request_id,
+                    operation_id,
+                )
+                raise
+            try:
+                await asyncio.wait({worker}, timeout=remaining)
+            except asyncio.CancelledError:
+                continue
+        if not worker.cancelled():
+            try:
+                worker.result()
+            except Exception as worker_error:
+                logger.warning(
+                    "Database worker failed while cancellation was pending (request_id=%s operation_id=%s): %s",
+                    request_id,
+                    operation_id,
+                    SecretProtector.redact_text(str(worker_error))[:300],
+                )
+        raise
+
+
+def _register_active_activity(state, request_id, action, session_id):
+    activity_key = f"{request_id}:{action.get('actionId')}"
+    state.setdefault("active_activities", {})[activity_key] = {
+        "action": action,
+        "session_id": session_id,
+    }
+    return activity_key
+
+
+def _clear_active_activity(state, activity_key):
+    state.setdefault("active_activities", {}).pop(activity_key, None)
+
+
+def _database_activity_observer(send_json, parent_action, request_id, session_id):
+    loop = asyncio.get_running_loop()
+    observed_events = asyncio.Queue()
+    closed = threading.Event()
+
+    def enqueue_if_open(event):
+        if not closed.is_set():
+            observed_events.put_nowait(event)
+
+    async def publish_observed_events():
+        while True:
+            event = await observed_events.get()
+            if event is None:
+                return
+            action, status, result = event
+            await _publish_activity_event(
+                send_json, action, request_id, session_id, status, result
+            )
+
+    publisher = asyncio.create_task(publish_observed_events())
+
+    def record(stage_tool, status, result=None):
+        if closed.is_set():
+            return
+        stage_action = {
+            "actionId": f"{parent_action.get('actionId')}:{stage_tool.lower()}",
+            "taskId": parent_action.get("taskId"),
+            "proposalId": parent_action.get("proposalId"),
+            "repairAttempt": parent_action.get("repairAttempt"),
+            "tool": stage_tool,
+            "target": (
+                "database target"
+                if stage_tool == "DATABASE_TARGET_SELECTION"
+                else "database connection"
+            ),
+            "observedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        loop.call_soon_threadsafe(
+            enqueue_if_open,
+            (stage_action, status, result),
+        )
+
+    async def publish_observed():
+        await asyncio.sleep(0)
+        closed.set()
+        observed_events.put_nowait(None)
+        await publisher
+
+    def abandon_observed():
+        closed.set()
+        publisher.cancel()
+
+    return record, publish_observed, abandon_observed
+
+
 async def _activate_deferred_database_resource(
     send_json,
     session: Dict[str, Any],
@@ -6239,6 +6511,7 @@ async def _activate_deferred_database_resource(
     architecture: Dict[str, Any],
     request_id: str,
     session_id: str,
+    state: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     decision = task_state["resourceDecision"]
     source_evidence_ids = _database_dependency_evidence_ids(task_state)
@@ -6261,6 +6534,11 @@ async def _activate_deferred_database_resource(
         "sourceEvidenceIds": list(dict.fromkeys(source_evidence_ids)),
     })
     _persist_agent_task_state(session, task_state, session_id)
+    active_activity_key = (
+        _register_active_activity(state, request_id, action, session_id)
+        if state is not None
+        else None
+    )
     await _publish_activity_event(send_json, action, request_id, session_id, "STARTED")
     try:
         db_config = await asyncio.to_thread(
@@ -6279,9 +6557,11 @@ async def _activate_deferred_database_resource(
             action,
             request_id,
             session_id,
-            "UNVERIFIED",
+            "FAILED",
             error=discovery_error,
         )
+        if active_activity_key is not None:
+            _clear_active_activity(state, active_activity_key)
         CODING_TASK_STORE.emit_lifecycle_event(session_id, "ACTION_EXECUTED", {
             "taskId": task_state.get("taskId"),
             "actionId": action["actionId"],
@@ -6331,6 +6611,8 @@ async def _activate_deferred_database_resource(
         "COMPLETED",
         result=safe_result,
     )
+    if active_activity_key is not None:
+        _clear_active_activity(state, active_activity_key)
     session["databaseConfig"] = db_config
     session["databaseCapabilities"] = db_capabilities
     task_state["resolvedResources"] = list(dict.fromkeys([
@@ -6477,10 +6759,24 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
                 "Coding task cancellation cleanup exceeded its configured timeout (request_id=%s)",
                 request_id,
             )
+        active_activities = state.setdefault("active_activities", {})
+        unresolved_activity = False
+        for activity_key, activity in list(active_activities.items()):
+            if activity_key.startswith(f"{request_id}:"):
+                unresolved_activity = True
+                await _publish_activity_event(
+                    send_json,
+                    activity["action"],
+                    request_id,
+                    activity["session_id"],
+                    "UNVERIFIED",
+                    error={"code": "CANCELLATION_RESULT_UNAVAILABLE"},
+                )
+                active_activities.pop(activity_key, None)
         await _send(send_json, {
             "type": "cancelled",
             "requestId": request_id,
-            "status": "CANCELLED",
+            "status": "UNVERIFIED" if cleanup_timed_out or unresolved_activity else "CANCELLED",
             "cleanupTimedOut": cleanup_timed_out,
         })
         return
@@ -7731,6 +8027,9 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             "reason": "Inspect supported project configuration sources for database metadata.",
             "expectedEvidence": ["database engine and safe configuration source"],
         }
+        configuration_activity_key = _register_active_activity(
+            state, request_id, configuration_action, session_id
+        )
         await _publish_activity_event(
             send_json,
             configuration_action,
@@ -7750,9 +8049,10 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 configuration_action,
                 request_id,
                 session_id,
-                "UNVERIFIED",
+                "FAILED",
                 error=discovery_error,
             )
+            _clear_active_activity(state, configuration_activity_key)
             raise
         await _publish_activity_event(
             send_json,
@@ -7762,6 +8062,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             "COMPLETED",
             result={"ok": True, "data": db_config},
         )
+        _clear_active_activity(state, configuration_activity_key)
         db_caps = await asyncio.to_thread(
             DatabaseIntelligenceEngine.check_database_capabilities,
             project_root or "",
@@ -8016,35 +8317,121 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 "Inspect the active database target and report only the connection evidence returned by its capability."
             )
         effective_root = project_root or ""
-        sess_obj = await asyncio.to_thread(
-            DatabaseSessionManager.get_or_create_session,
-            effective_root,
-            session_id=session_id,
-            db_config=db_config,
+        session_action = {
+            "actionId": f"{db_action_id}:session",
+            "taskId": semantic_task.get("taskId"),
+            "tool": "DATABASE_SESSION",
+            "target": "active project database session",
+        }
+        session_activity_key = _register_active_activity(
+            state, request_id, session_action, session_id
         )
+        await _publish_activity_event(
+            send_json, session_action, request_id, session_id, "STARTED"
+        )
+        try:
+            sess_obj = await _run_database_worker(
+                DatabaseSessionManager.get_or_create_session,
+                effective_root,
+                session_id=session_id,
+                db_config=db_config,
+                request_id=request_id,
+                operation_id=session_action["actionId"],
+            )
+        except (DatabaseOperationBusyError, DatabaseWorkerCapacityError) as session_error:
+            await _publish_activity_event(
+                send_json,
+                session_action,
+                request_id,
+                session_id,
+                "BLOCKED",
+                result={"ok": False, "data": {"executed": False}},
+                error=session_error,
+            )
+            _clear_active_activity(state, session_activity_key)
+            raise
+        except Exception as session_error:
+            await _publish_activity_event(
+                send_json,
+                session_action,
+                request_id,
+                session_id,
+                "FAILED",
+                error=session_error,
+            )
+            _clear_active_activity(state, session_activity_key)
+            raise
+        session_connected = bool(sess_obj.is_connected())
+        await _publish_activity_event(
+            send_json,
+            session_action,
+            request_id,
+            session_id,
+            "COMPLETED",
+            result={
+                "ok": True,
+                "data": {
+                    "executionStatus": "CONNECTED" if session_connected else "DISCONNECTED",
+                    "databaseType": sess_obj.database_type,
+                },
+            },
+        )
+        _clear_active_activity(state, session_activity_key)
         if not effective_root and getattr(sess_obj, "project_root", ""):
             effective_root = sess_obj.project_root
+        database_activity_key = _register_active_activity(
+            state, request_id, db_action, session_id
+        )
         await _publish_activity_event(
             send_json, db_action, request_id, session_id, "STARTED"
         )
+        (
+            record_database_stage,
+            publish_database_stage_events,
+            abandon_database_stage_events,
+        ) = _database_activity_observer(send_json, db_action, request_id, session_id)
+
         try:
-            cap_res = await asyncio.to_thread(
+            cap_res = await _run_database_worker(
                 DatabaseSessionManager.execute_database_capability,
                 db_det["capability"],
                 db_det.get("arguments", {}),
                 sess_obj,
                 project_root=effective_root,
+                on_activity=record_database_stage,
+                request_id=request_id,
+                operation_id=db_action["actionId"],
+                on_abandoned=abandon_database_stage_events,
             )
-        except Exception as capability_error:
+        except asyncio.CancelledError:
+            abandon_database_stage_events()
+            raise
+        except (DatabaseOperationBusyError, DatabaseWorkerCapacityError) as capability_error:
+            abandon_database_stage_events()
             await _publish_activity_event(
                 send_json,
                 db_action,
                 request_id,
                 session_id,
-                "UNVERIFIED",
+                "BLOCKED",
+                result={"ok": False, "data": {"executed": False}},
                 error=capability_error,
             )
+            _clear_active_activity(state, database_activity_key)
             raise
+        except Exception as capability_error:
+            await publish_database_stage_events()
+            await _publish_activity_event(
+                send_json,
+                db_action,
+                request_id,
+                session_id,
+                "FAILED",
+                error=capability_error,
+            )
+            _clear_active_activity(state, database_activity_key)
+            raise
+        await publish_database_stage_events()
         content = cap_res.get("content", "")
         db_result_json = json.dumps(SecretProtector.redact_data(cap_res), ensure_ascii=False, default=str)
         if cap_res.get("executionStatus") == "NEEDS_CLARIFICATION":
@@ -8096,6 +8483,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             _activity_status_for_result(db_det["capability"], cap_res),
             result=cap_res,
         )
+        _clear_active_activity(state, database_activity_key)
         if db_action["status"] == "FAILED":
             db_action["failureKnowledgeRevision"] = semantic_task.get("knowledgeRevision", 0)
         semantic_task["execution"].update({
@@ -8646,6 +9034,9 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             semantic_task["nextActionName"] = followup_action["tool"]
             semantic_task["status"] = "EXECUTION"
             _persist_agent_task_state(session, semantic_task, session_id, "ACTION_PLANNED")
+            followup_activity_key = _register_active_activity(
+                state, request_id, followup_action, session_id
+            )
             await _publish_activity_event(
                 send_json,
                 followup_action,
@@ -8653,24 +9044,54 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 session_id,
                 "STARTED",
             )
+            (
+                record_database_stage,
+                publish_database_stage_events,
+                abandon_database_stage_events,
+            ) = _database_activity_observer(
+                send_json, followup_action, request_id, session_id
+            )
             try:
-                followup_result = await asyncio.to_thread(
+                followup_result = await _run_database_worker(
                     DatabaseSessionManager.execute_database_capability,
                     followup_action["tool"],
                     selected_action["arguments"],
                     sess_obj,
                     project_root=effective_root,
+                    on_activity=record_database_stage,
+                    request_id=request_id,
+                    operation_id=followup_action["actionId"],
+                    on_abandoned=abandon_database_stage_events,
                 )
-            except Exception as capability_error:
+            except asyncio.CancelledError:
+                abandon_database_stage_events()
+                raise
+            except (DatabaseOperationBusyError, DatabaseWorkerCapacityError) as capability_error:
+                abandon_database_stage_events()
                 await _publish_activity_event(
                     send_json,
                     followup_action,
                     request_id,
                     session_id,
-                    "UNVERIFIED",
+                    "BLOCKED",
+                    result={"ok": False, "data": {"executed": False}},
                     error=capability_error,
                 )
+                _clear_active_activity(state, followup_activity_key)
                 raise
+            except Exception as capability_error:
+                await publish_database_stage_events()
+                await _publish_activity_event(
+                    send_json,
+                    followup_action,
+                    request_id,
+                    session_id,
+                    "FAILED",
+                    error=capability_error,
+                )
+                _clear_active_activity(state, followup_activity_key)
+                raise
+            await publish_database_stage_events()
             if followup_result.get("executionStatus") == "NEEDS_CLARIFICATION":
                 clarification_question = SecretProtector.redact_text(
                     str(followup_result.get("content") or "A database target needs clarification.")
@@ -8752,6 +9173,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 _activity_status_for_result(followup_action["tool"], followup_result),
                 result=followup_result,
             )
+            _clear_active_activity(state, followup_activity_key)
             followup_action["failureKnowledgeRevision"] = (
                 semantic_task.get("knowledgeRevision", 0)
                 if followup_action.get("status") == "FAILED"
@@ -9965,19 +10387,26 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         "tool": name,
                     })
                 _persist_agent_task_state(session, semantic_task, session_id, "TASK_STATE_UPDATED")
-                await _dispatch_coding_tool(
-                    send_json,
-                    action,
-                    request_id,
-                    str(payload.get("turnId") or request_id),
-                    session_id,
-                    tool_call_id,
-                    name,
-                    arguments,
-                )
+                active_activities = state.setdefault("active_activities", {})
+                active_activity_key = f"{request_id}:{tool_call_id}"
+                active_activities[active_activity_key] = {
+                    "action": action,
+                    "session_id": session_id,
+                }
                 try:
+                    await _dispatch_coding_tool(
+                        send_json,
+                        action,
+                        request_id,
+                        str(payload.get("turnId") or request_id),
+                        session_id,
+                        tool_call_id,
+                        name,
+                        arguments,
+                    )
                     result = await _wait_for_tool(state, request_id, tool_call_id)
                 except Exception as tool_error:
+                    active_activities.pop(active_activity_key, None)
                     failed_result = {"ok": False, "error": SecretProtector.redact_text(str(tool_error))[:500]}
                     _update_task_from_tool_result(
                         semantic_task,
@@ -9998,6 +10427,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     )
                     _persist_agent_task_state(session, semantic_task, session_id, "ACTION_EXECUTED")
                     raise
+                active_activities.pop(active_activity_key, None)
                 serialized = _serialize_coding_tool_result(result)
                 target_summary = str(arguments.get("relativePath") or arguments.get("path") or arguments.get("query") or name)[:300]
                 outcome_status = classify_tool_result_status(result)
@@ -10257,6 +10687,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         arch,
                         request_id,
                         session_id,
+                        state=state,
                     )
                     safe_db_context = {
                         "configurationStatus": db_config.get("status") or "UNKNOWN",

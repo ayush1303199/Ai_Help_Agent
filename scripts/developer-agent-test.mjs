@@ -127,6 +127,8 @@ try {
   agent.approve(proposal.taskId, owner);
   assert.match(agent.getTaskForTest(proposal.taskId).approval.manifestHash, /^[a-f0-9]{64}$/);
   assert.ok(Date.parse(agent.getTaskForTest(proposal.taskId).approval.expiresAt) > Date.now());
+  assert.equal(agent.getTaskForTest(proposal.taskId).approval.provenance, 'human-approval-only');
+  assert.equal(agent.getTaskForTest(proposal.taskId).approval.trustClass, 'UNTRUSTED');
   await agent.apply(proposal.taskId, owner, passingVerification, null, authorizeTestMutation);
   assert.equal(await fs.readFile(file, 'utf8'), 'one\nthree\n');
   assert.equal(agent.getTaskForTest(proposal.taskId).verification.status, 'PASS');
@@ -198,6 +200,107 @@ try {
   );
   assert.equal(agent.getTaskForTest(unverifiedProposal.taskId).verification.status, 'UNVERIFIED');
   assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n', 'A missing verifier must roll back rather than claim success.');
+
+  const malformedVerificationProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+malformed-status\n',
+  });
+  agent.approve(malformedVerificationProposal.taskId, owner);
+  const malformedVerification = await agent.apply(
+    malformedVerificationProposal.taskId,
+    owner,
+    async () => ({
+      ok: false,
+      status: 'PASS',
+      executed: false,
+      exitCode: null,
+      attempts: [],
+    }),
+    root,
+    authorizeTestMutation,
+  ).catch((error) => error);
+  assert.equal(malformedVerification.taskSnapshot.verification.status, 'UNVERIFIED');
+  assert.notEqual(malformedVerification.taskSnapshot.verification.ok, true);
+  assert.equal(
+    malformedVerification.taskSnapshot.evidence.find((item) => item.kind === 'VERIFICATION').status,
+    'UNVERIFIED',
+  );
+  assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n', 'A failed PASS-shaped verification result must roll back.');
+
+  const adversarialVerificationResults = [
+    ['PASS without execution', { ok: true, status: 'PASS', exitCode: 0, attempts: [] }],
+    ['null verification result', null],
+    ['unknown verification status', {
+      ok: true, status: 'VERIFIED', executed: true, exitCode: 0,
+      attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+    }],
+    ['PASS with failed attempt', {
+      ok: true, status: 'PASS', executed: true, exitCode: 0,
+      attempts: [{ check: 'test', ok: false, executed: true, exitCode: 1 }],
+    }],
+    ['PASS with mismatched checks', {
+      ok: true, status: 'PASS', executed: true, exitCode: 0, checks: ['lint'],
+      attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+    }],
+    ['PASS with malformed attempt', {
+      ok: true, status: 'PASS', executed: true, exitCode: 0, attempts: [null],
+    }],
+    ['PASS contradicted by success flag', {
+      ok: true, status: 'PASS', success: false, executed: true, exitCode: 0,
+      attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+    }],
+    ['PASS with untrusted evidence state', {
+      ok: true, status: 'PASS', evidenceState: 'VERIFIED', executed: true, exitCode: 0,
+      attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+    }],
+    ['PASS with malformed success flag', {
+      ok: true, status: 'PASS', success: 'true', executed: true, exitCode: 0,
+      attempts: [{ check: 'test', ok: true, executed: true, exitCode: 0 }],
+    }],
+    ['execution blocked with stale unverified status', {
+      ok: false, status: 'UNVERIFIED', executionBlocked: true, evidenceState: 'NOT_ESTABLISHED',
+      executed: false, exitCode: null, attempts: [],
+    }, 'BLOCKED'],
+    ['untrusted verified and authorized flags', {
+      verified: true, authorized: true, success: true,
+    }],
+  ];
+  for (const [label, result, expectedStatus = 'UNVERIFIED'] of adversarialVerificationResults) {
+    const proposal = await agent.createProposal({
+      root, ownerWebContentsId, sessionId,
+      raw: `--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+${label.replaceAll(' ', '-')}\n`,
+    });
+    agent.approve(proposal.taskId, owner);
+    const failedResult = await agent.apply(
+      proposal.taskId,
+      owner,
+      async () => result,
+      root,
+      authorizeTestMutation,
+    ).catch((error) => error);
+    assert.equal(failedResult.taskSnapshot.verification.status, expectedStatus, label);
+    assert.notEqual(failedResult.taskSnapshot.verification.status, 'PASS', label);
+    assert.equal(failedResult.taskSnapshot.verification.authorized, undefined, label);
+    assert.equal(failedResult.taskSnapshot.verification.verified, undefined, label);
+    assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n', `${label} must roll back.`);
+  }
+
+  const throwingVerificationProposal = await agent.createProposal({
+    root, ownerWebContentsId, sessionId,
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+throwing-verifier\n',
+  });
+  agent.approve(throwingVerificationProposal.taskId, owner);
+  const thrownVerification = await agent.apply(
+    throwingVerificationProposal.taskId,
+    owner,
+    async () => { throw new Error('Verification runner failed after an earlier check.'); },
+    root,
+    authorizeTestMutation,
+  ).catch((error) => error);
+  assert.equal(thrownVerification.taskSnapshot.verification.status, 'UNVERIFIED');
+  assert.equal(thrownVerification.taskSnapshot.verification.ok, false);
+  assert.equal(thrownVerification.taskSnapshot.verification.reason, 'Verification runner failed after an earlier check.');
+  assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n', 'A thrown verifier must roll back.');
 
   const createdProposal = await agent.createProposal({
     root, ownerWebContentsId, sessionId,
@@ -470,12 +573,60 @@ try {
   assert.equal(agent.classifyFailure({ cancelled: true }), 'cancelled');
   assert.equal(agent.STATE_ALIASES.awaiting_approval, 'WAITING_FOR_APPROVAL');
   assert.equal(agent.normalizeCommandResult({ ok: false, script: 'lint', exitCode: 1 }).failure, 'exit');
+  assert.equal(agent.normalizeCommandResult({
+    ok: true, status: 'BLOCKED', executed: true, exitCode: 0,
+  }).ok, false, 'A blocked status cannot be normalized as a successful command result.');
+  assert.equal(agent.normalizeCommandResult({
+    ok: true, status: 'PASS', executed: false, exitCode: 0,
+  }).ok, false, 'A PASS without execution cannot be normalized as success.');
+  assert.equal(agent.normalizeCommandResult({
+    ok: 'true', status: 'PASS', executed: true, exitCode: 0,
+  }).ok, false, 'A truthy non-boolean ok value is malformed.');
+  assert.equal(agent.normalizeCommandResult({
+    ok: true, status: 'PASS', executed: true, exitCode: 0, success: 'true',
+  }).ok, false, 'A malformed success flag cannot establish a passing command.');
+  assert.equal(agent.normalizeCommandResult({
+    ok: true, status: 'PASS', executed: true, exitCode: 0, evidenceState: 'VERIFIED',
+  }).ok, false, 'A caller-supplied evidence state cannot establish a passing command.');
+  const staleBlockedStatus = agent.normalizeCommandResult({
+    ok: false, status: 'UNVERIFIED', executionBlocked: true, evidenceState: 'NOT_ESTABLISHED',
+    executed: false, exitCode: null,
+  });
+  assert.equal(staleBlockedStatus.status, 'BLOCKED');
+  assert.equal(staleBlockedStatus.evidenceState, 'NOT_ESTABLISHED');
+  const malformedBlockedError = agent.verificationFailureFromError(
+    Object.assign(new Error('Gate denied execution.'), {
+      executionBlocked: true,
+      executionStatus: 'UNVERIFIED',
+      evidenceState: 'NOT_ESTABLISHED',
+    }),
+    'test',
+  );
+  assert.equal(malformedBlockedError.status, 'BLOCKED');
+  assert.equal(malformedBlockedError.evidenceState, 'NOT_ESTABLISHED');
+  const untrustedEvidenceError = agent.verificationFailureFromError(
+    Object.assign(new Error('Untrusted failure.'), { evidenceState: 'NOT_ESTABLISHED' }),
+    'test',
+  );
+  assert.equal(untrustedEvidenceError.status, 'UNVERIFIED');
+  assert.equal(untrustedEvidenceError.evidenceState, undefined);
   assert.throws(() => agent.commandPolicy('install'), /not permitted/);
   const loop = await agent.executeVerificationLoop({
-    run: async () => ({ ok: false, script: 'test', exitCode: 1 }),
+    run: async () => ({ ok: false, script: 'test', executed: true, exitCode: 1 }),
     diagnose: () => ({ retryable: true, kind: 'transient' }),
   });
   assert.equal(loop.attempts.length, 2);
+  const blockedExecutionLoop = await agent.executeVerificationLoop({
+    run: async () => ({
+      ok: true, status: 'BLOCKED', executionBlocked: true, evidenceState: 'NOT_ESTABLISHED',
+      executed: true, exitCode: 0,
+    }),
+    diagnose: () => ({ retryable: true }),
+  });
+  assert.equal(blockedExecutionLoop.ok, false);
+  assert.equal(blockedExecutionLoop.status, 'BLOCKED');
+  assert.equal(blockedExecutionLoop.evidenceState, 'NOT_ESTABLISHED');
+  assert.equal(blockedExecutionLoop.attempts.length, 1, 'A blocked result must not retry as if it were a code failure.');
   assert.deepEqual(agent.selectVerificationChecks({ scripts: { test: 'vitest', lint: 'eslint .', deploy: 'echo deploy' } }), ['test', 'lint']);
   assert.deepEqual(agent.extractFailure({ stderr: 'src/app.ts:12:4 test should pass' }), {
     file: 'src/app.ts', line: 12, column: 4, test: null, message: 'src/app.ts:12:4 test should pass',
@@ -486,7 +637,9 @@ try {
   let proposalRuns = 0;
   const loopResult = await agent.runEngineeringLoop({
     owner: owner2, checks: ['test'], maxAttempts: 2,
-    runCheck: async () => (++checkRuns === 1 ? { ok: false, script: 'test', exitCode: 1, stderr: 'src/app.ts:2:1 expected true' } : { ok: true, script: 'test', exitCode: 0 }),
+    runCheck: async () => (++checkRuns === 1
+      ? { ok: false, script: 'test', exitCode: 1, executed: true, stderr: 'src/app.ts:2:1 expected true' }
+      : { ok: true, script: 'test', executed: true, exitCode: 0 }),
     proposeFix: async () => {
       proposalRuns += 1;
       return agent.createProposal({ root, sessionId: owner2.sessionId, ownerWebContentsId: owner2.ownerWebContentsId,
@@ -502,7 +655,7 @@ try {
   await fs.writeFile(file, 'one\ntwo\n', 'utf8');
   const noProgress = await agent.runEngineeringLoop({
     owner: owner2, checks: ['test'], maxAttempts: 3,
-    runCheck: async () => ({ ok: false, script: 'test', exitCode: 1, stderr: 'same failure' }),
+    runCheck: async () => ({ ok: false, script: 'test', executed: true, exitCode: 1, stderr: 'same failure' }),
     proposeFix: async () => agent.createProposal({ root, sessionId: owner2.sessionId, ownerWebContentsId: owner2.ownerWebContentsId,
       raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n' }),
     approveFix: (id, owner) => agent.approve(id, owner), applyFix: (id, owner) => agent.apply(id, owner, passingVerification, null, authorizeTestMutation),
@@ -517,7 +670,9 @@ try {
   let lifecycleRuns = 0;
   const lifecycleResult = await agent.runEngineeringLoop({
     taskId: lifecycleTask.taskId, owner: owner2, checks: ['test'], maxAttempts: 2,
-    runCheck: async () => (++lifecycleRuns === 1 ? { ok: false, script: 'test', exitCode: 1, stderr: 'same lifecycle failure' } : { ok: true, script: 'test', exitCode: 0 }),
+    runCheck: async () => (++lifecycleRuns === 1
+      ? { ok: false, script: 'test', exitCode: 1, executed: true, stderr: 'same lifecycle failure' }
+      : { ok: true, script: 'test', executed: true, exitCode: 0 }),
     proposeFix: async () => agent.createProposal({
       root, sessionId: owner2.sessionId, ownerWebContentsId: owner2.ownerWebContentsId,
       raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n',
@@ -536,6 +691,24 @@ try {
     proposeFix: async () => { throw new Error('should not propose'); }, approveFix: async () => {}, applyFix: async () => {},
   });
   assert.equal(environmentFailure.status, 'ENVIRONMENT_FAILURE');
+  let blockedFixProposals = 0;
+  const blockedEngineeringLoop = await agent.runEngineeringLoop({
+    owner: owner2,
+    checks: ['test'],
+    runCheck: async () => ({
+      ok: true, status: 'BLOCKED', executionBlocked: true, evidenceState: 'NOT_ESTABLISHED',
+      executed: true, exitCode: 0,
+    }),
+    proposeFix: async () => {
+      blockedFixProposals += 1;
+      throw new Error('A blocked check must not lead to a repair proposal.');
+    },
+    approveFix: async () => {},
+    applyFix: async () => {},
+  });
+  assert.equal(blockedEngineeringLoop.status, 'BLOCKED');
+  assert.equal(blockedEngineeringLoop.evidenceState, 'NOT_ESTABLISHED');
+  assert.equal(blockedFixProposals, 0);
   const journalRoot = await fs.mkdtemp(path.join(process.cwd(), '.developer-journal-'));
   const journalFile = path.join(journalRoot, 'journal.json');
   const auditFile = path.join(journalRoot, 'audit.jsonl');

@@ -72,9 +72,10 @@ class FakeWebContents extends EventEmitter {
     super();
     this.id = windows.length + 1;
     this.url = 'http://localhost:3000/';
+    this.sentMessages = [];
   }
   getURL() { return this.url; }
-  send() {}
+  send(channel, ...args) { this.sentMessages.push({ channel, args }); }
   setWindowOpenHandler() {}
   loadURL(url) { this.url = url; }
 }
@@ -152,6 +153,11 @@ try {
     assert.ok(handler, `Missing IPC handler ${name}`);
     return handler({ sender, senderFrame: { url: sender.getURL() } }, ...args);
   };
+  const invokeFromFrame = async (name, sender, frameUrl, ...args) => {
+    const handler = handlers.get(name);
+    assert.ok(handler, `Missing IPC handler ${name}`);
+    return handler({ sender, senderFrame: { url: frameUrl } }, ...args);
+  };
   const createProject = async (sender, withScript = true) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-repair-project-'));
     projectRoots.add(root);
@@ -225,6 +231,46 @@ try {
   assert.equal(unattachedPreflight.canRunProjectCommands, false);
   const projectRoot = await createProject(sender);
   projectRootBySender.set(ownerId, projectRoot);
+  const originalGetSession = developerAgent.getSession;
+  const originalRunGit = developerFiles.runGit;
+  let sessionLookups = 0;
+  let gitInspections = 0;
+  developerAgent.getSession = (...args) => {
+    sessionLookups += 1;
+    return originalGetSession(...args);
+  };
+  developerFiles.runGit = (...args) => {
+    gitInspections += 1;
+    return originalRunGit(...args);
+  };
+  try {
+    const untrustedSender = { id: 999999, getURL: () => sender.getURL() };
+    await assert.rejects(
+      invoke('developer:git-inspect', untrustedSender),
+      /This action is only available from the main AI Help Agent window/,
+    );
+    assert.equal(sessionLookups, 0);
+    assert.equal(gitInspections, 0);
+
+    await assert.rejects(
+      invokeFromFrame('developer:git-inspect', sender, 'http://untrusted.invalid/'),
+      /Unauthorized Coding Agent IPC origin/,
+    );
+    assert.equal(sessionLookups, 0);
+    assert.equal(gitInspections, 0);
+
+    await assert.rejects(
+      invoke('developer:git-inspect', sender),
+      process.platform === 'win32'
+        ? /Windows host-side Git inspection is unavailable pending verified isolation\./
+        : /Project Git inspection was not started/,
+    );
+    assert.equal(sessionLookups, 1);
+    assert.equal(gitInspections, 1);
+  } finally {
+    developerAgent.getSession = originalGetSession;
+    developerFiles.runGit = originalRunGit;
+  }
   const missingProviderPreflight = await invoke('developer:acceptance-preflight', sender);
   assert.equal(missingProviderPreflight.projectAttached, true);
   assert.ok(missingProviderPreflight.blockers.some((item) => item.code === 'runtime_provider_missing'));
@@ -294,6 +340,15 @@ try {
   const autoInitialFailure = await invoke('developer:proposal-apply', sender, autoInitial.id);
   assert.equal(autoInitialFailure.state, 'failed');
   assert.equal(autoInitialFailure.repairAvailable, true);
+  const firstAttemptActivity = sender.sentMessages
+    .filter((message) => message.channel === 'developer:activity')
+    .map((message) => message.args[0])
+    .filter((activity) => activity.taskId === autoInitial.id);
+  assert.ok(firstAttemptActivity.some((activity) => activity.action.tool === 'proposal_apply' && activity.status === 'COMPLETED'));
+  assert.ok(firstAttemptActivity.some((activity) => activity.action.tool === 'verification' && activity.status === 'FAILED'));
+  assert.ok(firstAttemptActivity.some((activity) => activity.action.tool === 'rollback' && activity.status === 'COMPLETED'));
+  assert.ok(firstAttemptActivity.some((activity) => activity.action.tool === 'proposal_transaction' && activity.status === 'FAILED'));
+  assert.ok(firstAttemptActivity.every((activity) => activity.proposalId && activity.repairAttempt === 1));
   assert.equal(
     await fs.readFile(path.join(projectRoot, 'src', 'app.js'), 'utf8'),
     'const value = 1;\n',
@@ -313,6 +368,13 @@ try {
   verificationOutcome = 'failure';
   assert.equal(autoRepairResult.state, 'completed');
   assert.equal(autoRepairResult.verification.status, 'PASS');
+  const repairActivity = sender.sentMessages
+    .filter((message) => message.channel === 'developer:activity')
+    .map((message) => message.args[0])
+    .filter((activity) => activity.taskId === autoRepairProposal.id);
+  assert.ok(repairActivity.some((activity) => activity.action.tool === 'verification' && activity.status === 'COMPLETED'));
+  assert.ok(repairActivity.some((activity) => activity.action.tool === 'proposal_transaction' && activity.status === 'COMPLETED'));
+  assert.ok(repairActivity.every((activity) => activity.repairAttempt === 2));
   assert.ok(policyRequests.some((request) => request.operation === 'modify' && request.paths.includes('src/app.js')));
 
   const autoExpansionInitial = await createProposal(

@@ -66,9 +66,34 @@ const actualIsolation = projectProcessIsolationStatus();
 assert.equal(actualIsolation.available, false);
 assert.equal(actualIsolation.verified, false);
 assert.equal(actualIsolation.platform, process.platform);
+assert.equal(
+  buildCodingAcceptancePreflight({
+    providerConfigured: readyProvider,
+    projectState: attachedProject,
+    isolation: projectProcessIsolationStatus('win32'),
+  }).sandbox.capabilityStates.osEnforcedProcessIsolation,
+  'BLOCKED',
+);
+assert.throws(
+  () => buildCodingAcceptancePreflight({
+    providerConfigured: readyProvider,
+    projectState: attachedProject,
+    isolation: {
+      ...unverifiedWindows,
+      capabilityStates: { osEnforcedProcessIsolation: 'VERIFIED' },
+    },
+  }),
+  /Invalid state/,
+);
+const linuxCapabilityStates = buildCodingAcceptancePreflight({
+  providerConfigured: readyProvider,
+  projectState: attachedProject,
+  isolation: projectProcessIsolationStatus('linux'),
+}).sandbox.capabilityStates;
+assert.ok(Object.values(linuxCapabilityStates).every((state) => state === 'UNSUPPORTED'));
 assert.throws(
   () => requireProjectProcessIsolation('Preflight test command'),
-  /was not started.*sandbox/i,
+  /was not started.*(?:sandbox|isolation mechanism)/i,
 );
 
 const codingPage = await fs.readFile(
@@ -87,7 +112,22 @@ const backendSource = await fs.readFile(
   new URL('../server/src/index.py', import.meta.url),
   'utf8',
 );
+const preflightNormalizerStart = codingPage.indexOf('function normalizeCodingAcceptancePreflight(');
+const preflightNormalizerEnd = codingPage.indexOf('interface CodingAgentPageProps', preflightNormalizerStart);
+const preflightNormalizer = codingPage.slice(preflightNormalizerStart, preflightNormalizerEnd);
+assert.ok(preflightNormalizerStart >= 0 && preflightNormalizerEnd > preflightNormalizerStart);
+assert.match(preflightNormalizer, /ready: false/);
+assert.match(preflightNormalizer, /canRunProjectCommands: false/);
+assert.match(preflightNormalizer, /available: false/);
+assert.match(preflightNormalizer, /verified: false/);
+assert.match(preflightNormalizer, /isIsolationCapabilityState/);
+assert.match(preflightNormalizer, /Array\.isArray\(source\.blockers\)/);
+assert.match(codingPage, /setAcceptancePreflight\(normalizeCodingAcceptancePreflight\(preflight\)\)/);
 assert.match(codingPage, /getDeveloperAcceptancePreflight\(\)/);
+assert.match(codingWorkspace, /Project command execution remains blocked by the shared execution gate/);
+assert.match(codingWorkspace, /descriptive, not verification/);
+assert.doesNotMatch(codingWorkspace, /acceptancePreflight\.ready\s*\?/);
+assert.doesNotMatch(codingWorkspace, /acceptancePreflight\.sandbox\.verified\s*\?/);
 assert.match(codingPage, /\/api\/coding\/acceptance-preflight/);
 assert.doesNotMatch(codingPage, /if \(!window\.electronAPI\?\.getDeveloperAcceptancePreflight[^]*return;/);
 assert.match(codingWorkspace, /isBrowserDevelopment/);
@@ -99,5 +139,6 @@ assert.match(codingController, /file\.webkitRelativePath/);
 assert.match(codingController, /\/api\/coding\/project-discover/);
 assert.match(backendSource, /@app\.get\("\/api\/coding\/acceptance-preflight"\)/);
 assert.match(backendSource, /"canRunProjectCommands": False/);
+assert.match(backendSource, /"capabilityStates": capability_states/);
 
 console.log('Coding acceptance preflight missing-prerequisite and fail-closed tests passed.');

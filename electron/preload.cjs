@@ -85,6 +85,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   approveDeveloperProposal: (id, options = {}) => ipcRenderer.invoke('developer:proposal-approve', id, options),
   rejectDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-reject', id),
   applyDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-apply', id),
+  onDeveloperActivity: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, activity) => callback(activity);
+    ipcRenderer.on('developer:activity', listener);
+    return () => ipcRenderer.removeListener('developer:activity', listener);
+  },
   undoDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-undo', id),
   getDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-get', id),
   getDeveloperSession: () => ipcRenderer.invoke('developer:session'),

@@ -46,6 +46,9 @@ function codingMutationProof(payload) {
     .update(JSON.stringify(canonicalMutationJson(payload)))
     .digest('hex');
 }
+function verificationFailureResult(error, script) {
+  return developerAgent.verificationFailureFromError(error, script);
+}
 const providerSecretVault = new ProviderSecretVault({
   storageDirectory: app.getPath('userData'),
   safeStorage,
@@ -1602,7 +1605,20 @@ app.whenReady().then(async () => {
     }
     if (name === 'run_verification' || name === 'terminal.run_command') {
       const script = String(args.command || args.script || args.check || '');
-      return { ok: true, tool: name, data: await developerFiles.runVerification(script, event.sender.id) };
+      try {
+        return { ok: true, tool: name, data: await developerFiles.runVerification(script, event.sender.id) };
+      } catch (error) {
+        const data = verificationFailureResult(error, script);
+        return {
+          ok: false,
+          tool: name,
+          data,
+          error: {
+            code: error?.code || 'VERIFICATION_UNAVAILABLE',
+            message: data.error,
+          },
+        };
+      }
     }
     if (name === 'search_symbols' || name === 'find_references' || name === 'get_repository_map') {
       const cached = developerIndexCaches.get(root) || null;
@@ -1652,7 +1668,9 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:provider-discovery', (_event, providers) => developerBenchmark.discoverProviders(providers));
   ipcMain.handle('developer:run-verification', (event, script) => {
     ownedDeveloperSession(event);
-    return developerFiles.runVerification(script, event.sender.id);
+    return developerFiles.runVerification(script, event.sender.id).catch((error) => (
+      verificationFailureResult(error, script)
+    ));
   });
   ipcMain.handle('developer:session', (event) => {
     event.sender.once('destroyed', () => {
@@ -1668,10 +1686,12 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('developer:session-resume', (event, sessionId) => ({ sessionId: developerAgent.resumeSession(event.sender.id, sessionId) }));
   ipcMain.handle('developer:git-inspect', (event, kind) => {
+    assertTrustedCodingRendererSender(event);
     ownedDeveloperSession(event);
     return developerFiles.runGit(kind === 'diff' ? ['diff', '--no-ext-diff'] : ['status', '--short'], event.sender.id);
   });
   ipcMain.handle('developer:proposal-create', async (event, payload) => {
+    assertTrustedCodingRendererSender(event);
     const owner = ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
     const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
@@ -1778,6 +1798,7 @@ app.whenReady().then(async () => {
     return { cancelled: true };
   });
   ipcMain.handle('developer:proposal-approve', async (event, id, options = {}) => {
+    assertTrustedCodingRendererSender(event);
     const owner = { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id };
     const task = developerAgent.getProposalAuthorizationContext(id, owner);
     const baselineFeatures = task.authorizedFeatures;
@@ -1842,8 +1863,12 @@ app.whenReady().then(async () => {
     attemptLabel: `attempt 1 of ${chain.maxAttempts}`,
     };
   });
-  ipcMain.handle('developer:proposal-reject', (event, id) => developerAgent.reject(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id }));
+  ipcMain.handle('developer:proposal-reject', (event, id) => {
+    assertTrustedCodingRendererSender(event);
+    return developerAgent.reject(id, { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id });
+  });
   ipcMain.handle('developer:proposal-apply', async (event, id) => {
+    assertTrustedCodingRendererSender(event);
     const owner = { sessionId: developerAgent.getSession(event.sender.id), ownerWebContentsId: event.sender.id };
     const task = developerAgent.getTaskForTest(id);
     if (!task) throw new Error('Unknown Developer task.');
@@ -1894,18 +1919,15 @@ app.whenReady().then(async () => {
         checks: verificationPlan.scripts,
         isCancelled: () => developerAgent.isCancellationRequested(id, owner),
         onProgress: (progress) => {
-          if (progress.check) console.log(`[DEV][VERIFY] task=${id} check=${progress.check}`);
+          if (progress.check) publishDeveloperActivity({ phase: 'verification', status: 'PROGRESS' });
         },
         runCheck: (script) => developerFiles.runVerification(script, event.sender.id, {
           scope: task.scope,
           isCancelled: () => developerAgent.isCancellationRequested(id, owner),
         }).catch((error) => ({
-          ok: false,
-          script,
-          exitCode: null,
+          ...verificationFailureResult(error, script),
           stdout: '',
-          stderr: error.message,
-          error: error.message,
+          stderr: error instanceof Error ? error.message : String(error),
         })),
       }).then((result) => verificationPlan.reason && result.status === 'NOT_AVAILABLE'
         ? { ...result, reason: verificationPlan.reason }
@@ -1981,8 +2003,45 @@ app.whenReady().then(async () => {
         reason: typeof decision?.reason === 'string' ? decision.reason : 'Policy Gate denied the mutation.',
       };
     };
+    let activitySequence = 0;
+    const publishDeveloperActivity = ({ phase, status, executed, exitCode, evidenceState }) => {
+      if (event.sender.isDestroyed?.()) return;
+      const activityId = `${task.taskId}:${task.transactionId}:${phase}`;
+      const result = {};
+      if (typeof executed === 'boolean') result.executed = executed;
+      if (Number.isInteger(exitCode)) result.exitCode = exitCode;
+      if (['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(evidenceState)) {
+        result.evidenceState = evidenceState;
+      }
+      event.sender.send('developer:activity', {
+        type: 'activity_event',
+        event: 'activity_event',
+        activityId,
+        executionId: task.transactionId,
+        taskId: task.taskId,
+        proposalId: task.proposalId || id,
+        repairAttempt: attemptNumber,
+        operationSequence: ++activitySequence,
+        action: {
+          tool: phase,
+          target: phase === 'verification' ? 'approved verification' : 'approved proposal',
+        },
+        activityType: phase === 'verification' ? 'VERIFYING' : 'TOOL',
+        status,
+        result: Object.keys(result).length ? result : undefined,
+        timestamp: new Date().toISOString(),
+      });
+    };
     try {
-      const result = await developerAgent.apply(id, owner, verify, currentRoot, authorizeMutation, attemptNumber);
+      const result = await developerAgent.apply(
+        id,
+        owner,
+        verify,
+        currentRoot,
+        authorizeMutation,
+        attemptNumber,
+        publishDeveloperActivity,
+      );
       const verifiedSuccess = result.verification?.status === 'PASS'
         && result.verification.executed === true
         && result.verification.exitCode === 0;

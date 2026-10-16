@@ -1,89 +1,67 @@
-const fs = require('node:fs/promises');
-const os = require('node:os');
-const path = require('node:path');
-const { assertSandboxProbe, probeWindowsSandbox } = require('./windowsSandboxRunner.cjs');
+const {
+  evaluateProviderEligibility,
+  validateExecutionEvidenceManifest,
+} = require('./executionEvidenceContract.cjs');
+const { createCapabilityStateMap } = require('./providerAdapterContract.cjs');
 
 const supportedPlatforms = new Set(['win32', 'darwin', 'linux']);
-const windowsSandboxExecutable = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'WindowsSandbox.exe');
-let currentStatus = makeUnavailableStatus();
-let verificationPromise = null;
-let lastVerificationAttemptAt = 0;
+const windowsDisabledReason = 'Windows project-context process execution is disabled pending an independently reviewed isolation mechanism.';
+const unsupportedPlatformCapabilities = createCapabilityStateMap({
+  osEnforcedProcessIsolation: 'UNSUPPORTED',
+  runtimeWorkerIdentityBinding: 'UNSUPPORTED',
+  effectiveNetworkEndpointRestrictions: 'UNSUPPORTED',
+  resourceFilesystemBoundaries: 'UNSUPPORTED',
+  hostObservedProcessWorkerTermination: 'UNSUPPORTED',
+  hostObservedResourceCleanup: 'UNSUPPORTED',
+  evidenceFreshnessIntegrityReplayProtection: 'UNSUPPORTED',
+  secureErasureEvidence: 'UNSUPPORTED',
+});
 
-function makeUnavailableStatus(reason = 'Project-context process execution is disabled because no verified operating-system sandbox is configured.') {
+function capabilityStatesForPlatform(platform) {
+  if (platform !== 'win32') return unsupportedPlatformCapabilities;
+  return createCapabilityStateMap({
+    osEnforcedProcessIsolation: 'BLOCKED',
+  });
+}
+
+function makeUnavailableStatus(
+  reason = 'Project-context process execution is disabled because no verified operating-system sandbox is configured.',
+  platform = process.platform,
+) {
   return Object.freeze({
     available: false,
     verified: false,
-    platformRecognized: supportedPlatforms.has(process.platform),
+    platformRecognized: supportedPlatforms.has(platform),
     reason,
-    platform: process.platform,
+    platform,
+    capabilityStates: capabilityStatesForPlatform(platform),
   });
 }
+
+let currentStatus = makeUnavailableStatus();
 
 function projectProcessIsolationStatus(platform = process.platform) {
   if (platform !== process.platform) {
     const supportedPlatform = supportedPlatforms.has(platform);
-    return Object.freeze({
-      available: false,
-      verified: false,
-      platformRecognized: supportedPlatform,
-      reason: supportedPlatform
+    return makeUnavailableStatus(
+      supportedPlatform
         ? `Project-context process execution has not been verified on platform "${platform}".`
         : `Project-context process execution is unsupported on platform "${platform}".`,
       platform,
-    });
+    );
+  }
+  if (process.platform === 'win32') {
+    return makeUnavailableStatus(windowsDisabledReason);
   }
   return currentStatus;
 }
 
 async function verifyProjectProcessIsolation() {
-  if (process.platform !== 'win32') {
-    currentStatus = makeUnavailableStatus(
-      `Project-context process execution has no verified sandbox adapter for platform "${process.platform}".`,
-    );
-    return currentStatus;
-  }
-  if (verificationPromise) return verificationPromise;
-  if (lastVerificationAttemptAt && Date.now() - lastVerificationAttemptAt < 60_000) return currentStatus;
-  lastVerificationAttemptAt = Date.now();
-
-  verificationPromise = (async () => {
-    let temporaryRoot;
-    try {
-      temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ai-help-agent-sandbox-check-'));
-      const projectRoot = path.join(temporaryRoot, 'project');
-      await fs.access(windowsSandboxExecutable);
-      await fs.mkdir(projectRoot);
-      const evidence = await probeWindowsSandbox(projectRoot);
-      assertSandboxProbe(evidence.checks, evidence);
-      currentStatus = Object.freeze({
-        available: true,
-        verified: true,
-        platformRecognized: true,
-        reason: null,
-        platform: process.platform,
-        verifiedAt: new Date().toISOString(),
-      });
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      currentStatus = makeUnavailableStatus(`Windows Sandbox isolation is not verified: ${detail.slice(0, 400)}`);
-    } finally {
-      if (temporaryRoot) {
-        try {
-          await fs.rm(temporaryRoot, { recursive: true, force: true });
-        } catch (error) {
-          const detail = error instanceof Error ? error.message : String(error);
-          currentStatus = makeUnavailableStatus(`Windows Sandbox probe cleanup failed: ${detail.slice(0, 400)}`);
-        }
-      }
-    }
-    return currentStatus;
-  })();
-
-  try {
-    return await verificationPromise;
-  } finally {
-    verificationPromise = null;
-  }
+  const reason = process.platform === 'win32'
+    ? windowsDisabledReason
+    : `Project-context process execution has no verified sandbox adapter for platform "${process.platform}".`;
+  currentStatus = makeUnavailableStatus(reason);
+  return currentStatus;
 }
 
 function markProjectProcessIsolationUnavailable(reason) {
@@ -93,17 +71,49 @@ function markProjectProcessIsolationUnavailable(reason) {
   currentStatus = makeUnavailableStatus(`Windows Sandbox isolation is no longer verified: ${detail.slice(0, 400)}`);
 }
 
-function requireProjectProcessIsolation(operation) {
+function evaluateExecutionEvidence(manifest, expectedContext = {}, capabilities = {}) {
+  const evidenceResult = validateExecutionEvidenceManifest(manifest, expectedContext);
+  if (evidenceResult.state !== 'EXECUTION_AUTHORIZED') {
+    return evidenceResult;
+  }
+  return evaluateProviderEligibility(capabilities, evidenceResult);
+}
+
+function executionGateError(operation, status, evidenceState, reason) {
+  const error = new Error(`${operation} was not started. ${reason}`);
+  error.code = 'PROJECT_EXECUTION_BLOCKED';
+  error.executionBlocked = true;
+  error.executionStatus = status;
+  error.evidenceState = evidenceState;
+  return error;
+}
+
+function requireProjectProcessIsolation(operation, evidence = null, expectedContext = null, capabilities = {}) {
   const label = typeof operation === 'string' && operation.trim()
     ? operation.trim()
     : 'Project command';
   const status = projectProcessIsolationStatus();
-  if (!status.available || !status.verified) {
-    throw new Error(`${label} was not started. ${status.reason}`);
+  if (process.platform === 'win32' || !status.available || !status.verified) {
+    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', status.reason);
+  }
+
+  const resolvedContext = expectedContext && typeof expectedContext === 'object' ? expectedContext : {};
+  const resolvedCapabilities = capabilities && typeof capabilities === 'object' ? capabilities : {};
+  if (!evidence) {
+    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', 'Execution evidence manifest is missing.');
+  }
+
+  const evaluation = evaluateExecutionEvidence(evidence, resolvedContext, resolvedCapabilities);
+  if (evaluation.state !== 'EXECUTION_AUTHORIZED') {
+    const state = ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(evaluation.state)
+      ? evaluation.state
+      : 'NOT_ESTABLISHED';
+    throw executionGateError(label, state, state, evaluation.reason);
   }
 }
 
 module.exports = {
+  evaluateExecutionEvidence,
   markProjectProcessIsolationUnavailable,
   projectProcessIsolationStatus,
   requireProjectProcessIsolation,

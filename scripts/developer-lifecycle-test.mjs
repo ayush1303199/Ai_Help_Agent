@@ -46,6 +46,9 @@ try {
   assert.equal(applied.state, 'completed');
   assert.equal(applied.approval.actor, 'renderer-session');
   assert.deepEqual(applied.targetFiles, ['sample.txt']);
+  assert.equal(applied.verification.ok, true);
+  assert.equal(applied.verification.executed, true);
+  assert.equal(applied.verification.exitCode, 0);
   assert.equal((await fs.readFile(file, 'utf8')), 'one\nthree\n');
   await agent.undo(proposal.taskId, owner, authorizeMutation, true);
   assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n');
@@ -125,15 +128,20 @@ try {
   assert.deepEqual(missingPlan.missing, ['test']);
   await assert.rejects(
     () => files.runVerification('typecheck', ownerWebContentsId),
-    /no verified operating-system sandbox is configured/i,
+    (error) => error.code === 'PROJECT_EXECUTION_BLOCKED'
+      && error.executionBlocked === true
+      && error.executionStatus === 'BLOCKED'
+      && error.evidenceState === 'NOT_ESTABLISHED',
   );
   await assert.rejects(
     () => files.runVerification('build', ownerWebContentsId),
-    /no verified operating-system sandbox is configured/i,
+    /Project verification was not started/,
   );
   await assert.rejects(
     () => files.runGit(['status', '--short'], ownerWebContentsId),
-    /no verified operating-system sandbox is configured/i,
+    process.platform === 'win32'
+      ? /Windows host-side Git inspection is unavailable pending verified isolation\./
+      : /Project Git inspection was not started/,
   );
   await assert.rejects(() => fs.access(path.join(root, 'verification-output')), { code: 'ENOENT' });
   files.clearProject(ownerWebContentsId);
@@ -151,6 +159,194 @@ try {
   assert.equal(checks.ok, false);
   assert.equal(checks.status, 'CODE_FAILURE');
   assert.equal(checks.attempts.length, 2);
+
+  for (const status of ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED']) {
+    const unavailable = await agent.runVerificationChecks({
+      checks: ['typecheck'],
+      runCheck: async () => ({
+        ok: false,
+        status,
+        evidenceState: status,
+        executionBlocked: true,
+        executed: false,
+        exitCode: null,
+        reason: 'Execution evidence is not established.',
+        error: 'Verification was not started.',
+      }),
+    });
+    assert.equal(unavailable.status, status);
+    assert.equal(unavailable.evidenceState, status);
+    assert.equal(unavailable.executed, false);
+    assert.equal(unavailable.reason, 'Execution evidence is not established.');
+  }
+  const malformedGateError = await agent.runVerificationChecks({
+    checks: ['typecheck'],
+    runCheck: async () => {
+      throw Object.assign(new Error('Gate denied execution.'), {
+        executionBlocked: true,
+        executionStatus: 'UNVERIFIED',
+        evidenceState: 'NOT_ESTABLISHED',
+      });
+    },
+  });
+  assert.equal(malformedGateError.status, 'BLOCKED');
+  assert.equal(malformedGateError.evidenceState, 'NOT_ESTABLISHED');
+  assert.equal(malformedGateError.executed, false);
+  assert.equal(malformedGateError.attempts.length, 1);
+  const staleBlockedResult = await agent.runVerificationChecks({
+    checks: ['typecheck'],
+    runCheck: async () => ({
+      ok: false,
+      status: 'UNVERIFIED',
+      executionBlocked: true,
+      evidenceState: 'NOT_ESTABLISHED',
+      executed: false,
+      exitCode: null,
+    }),
+  });
+  assert.equal(staleBlockedResult.status, 'BLOCKED');
+  assert.equal(staleBlockedResult.evidenceState, 'NOT_ESTABLISHED');
+
+  const verificationResultMatrix = [
+    { name: 'PASS without execution', result: { ok: true, status: 'PASS', exitCode: 0, attempts: [] } },
+    { name: 'null result', result: null },
+    {
+      name: 'unknown status',
+      result: {
+        ok: true, status: 'VERIFIED', executed: true, exitCode: 0,
+        attempts: [{ check: 'typecheck', ok: true, executed: true, exitCode: 0 }],
+      },
+    },
+    {
+      name: 'contradictory success',
+      result: {
+        ok: true, status: 'PASS', success: false, executed: true, exitCode: 0,
+        attempts: [{ check: 'typecheck', ok: true, executed: true, exitCode: 0 }],
+      },
+    },
+    {
+      name: 'blocked success-shaped result',
+      result: {
+        ok: true, status: 'BLOCKED', executionBlocked: true, evidenceState: 'NOT_ESTABLISHED',
+        executed: true, exitCode: 0,
+      },
+    },
+    {
+      name: 'untrusted flags without valid result',
+      result: { verified: true, authorized: true, success: true },
+    },
+  ];
+  for (const scenario of verificationResultMatrix) {
+    const normalized = await agent.runVerificationChecks({
+      checks: ['typecheck'],
+      runCheck: async () => scenario.result,
+    });
+    assert.notEqual(normalized.status, 'PASS', scenario.name);
+    assert.notEqual(normalized.ok, true, scenario.name);
+  }
+
+  let verificationAttempt = 0;
+  const throwAfterPass = await agent.runVerificationChecks({
+    checks: ['typecheck', 'lint'],
+    runCheck: async (script) => {
+      verificationAttempt += 1;
+      if (verificationAttempt === 1) {
+        return { ok: true, status: 'PASS', script, executed: true, exitCode: 0 };
+      }
+      const error = new Error('Host evidence is unavailable.');
+      error.executionBlocked = true;
+      error.executionStatus = 'BLOCKED';
+      error.evidenceState = 'NOT_ESTABLISHED';
+      throw error;
+    },
+  });
+  assert.equal(throwAfterPass.status, 'BLOCKED');
+  assert.equal(throwAfterPass.evidenceState, 'NOT_ESTABLISHED');
+  assert.equal(throwAfterPass.attempts.length, 2);
+  assert.equal(throwAfterPass.attempts[0].ok, true);
+  assert.equal(throwAfterPass.attempts[1].ok, false);
+
+  const blockedProposal = await createBoundProposal({
+    root, sessionId, ownerWebContentsId,
+    raw: patch('sample.txt', 'one', 'blocked'),
+  });
+  const auditDirectory = path.join(root, 'audit-fixture');
+  agent.configureDurability({
+    journalFile: path.join(auditDirectory, 'journal.json'),
+    auditFile: path.join(auditDirectory, 'audit.jsonl'),
+  });
+  agent.approve(blockedProposal.taskId, owner);
+  const blockedActivity = [];
+  const blockedApplyError = await agent.apply(
+    blockedProposal.taskId,
+    owner,
+    async () => ({
+      ok: false,
+      status: 'UNVERIFIED',
+      executionBlocked: true,
+      evidenceState: 'NOT_ESTABLISHED',
+      executed: false,
+      exitCode: null,
+      reason: 'Host isolation is not established.',
+      attempts: [],
+    }),
+    root,
+    authorizeMutation,
+    1,
+    (activity) => blockedActivity.push(activity),
+  ).catch((error) => error);
+  assert.equal(blockedApplyError.taskSnapshot.verification.status, 'BLOCKED');
+  assert.equal(blockedApplyError.taskSnapshot.verification.evidenceState, 'NOT_ESTABLISHED');
+  assert.equal(blockedApplyError.taskSnapshot.verification.reason, 'Host isolation is not established.');
+  const blockedEvidence = blockedApplyError.taskSnapshot.evidence.find((item) => item.kind === 'VERIFICATION');
+  assert.equal(blockedEvidence.status, 'BLOCKED');
+  assert.equal(blockedEvidence.evidenceState, 'NOT_ESTABLISHED');
+  await agent.flushDurability();
+  const auditEvents = (await fs.readFile(path.join(auditDirectory, 'audit.jsonl'), 'utf8'))
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const verificationAudit = auditEvents.find((event) => event.type === 'verification_recorded');
+  assert.equal(verificationAudit.details.result, 'BLOCKED');
+  assert.equal(verificationAudit.details.evidenceState, 'NOT_ESTABLISHED');
+  assert.ok(blockedActivity.some((activity) => (
+    activity.phase === 'verification'
+    && activity.status === 'BLOCKED'
+    && activity.evidenceState === 'NOT_ESTABLISHED'
+  )));
+  assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n', 'A blocked verification must roll back the applied fixture patch.');
+
+  const malformedAttemptProposal = await createBoundProposal({
+    root, sessionId, ownerWebContentsId,
+    raw: patch('sample.txt', 'one', 'malformed-attempt'),
+  });
+  agent.approve(malformedAttemptProposal.taskId, owner);
+  const malformedAttemptError = await agent.apply(
+    malformedAttemptProposal.taskId,
+    owner,
+    async () => ({
+      ok: true,
+      status: 'PASS',
+      executed: true,
+      exitCode: 0,
+      attempts: [null],
+    }),
+    root,
+    authorizeMutation,
+  ).catch((error) => error);
+  assert.equal(malformedAttemptError.taskSnapshot.verification.status, 'UNVERIFIED');
+  assert.equal(malformedAttemptError.taskSnapshot.evidence.find((item) => item.kind === 'VERIFICATION').status, 'UNVERIFIED');
+  await agent.flushDurability();
+  const malformedAuditEvents = (await fs.readFile(path.join(auditDirectory, 'audit.jsonl'), 'utf8'))
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const malformedVerificationAudit = malformedAuditEvents.find((event) => (
+    event.taskId === malformedAttemptProposal.taskId && event.type === 'verification_recorded'
+  ));
+  assert.equal(malformedVerificationAudit.details.result, 'UNVERIFIED');
+  assert.deepEqual(malformedVerificationAudit.details.checks, [{
+    check: null,
+    ok: false,
+    classification: null,
+  }]);
+  assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n', 'A malformed attempt must not prevent rollback.');
 
   console.log('developer lifecycle tests passed');
 } finally {

@@ -76,6 +76,22 @@ const SENSITIVE_FILE_NAME_PATTERN = /^(?:\.env(?:\..*)?|credentials?(?:\..*)?|se
 const MAX_MUTATION_FILE_BYTES = 2 * 1024 * 1024;
 const APPROVAL_TTL_MS = 5 * 60 * 1000;
 const CONVERSATION_AUTHORIZATION_TTL_MS = 30 * 60 * 1000;
+const VERIFICATION_FAILURE_STATUSES = new Set([
+  'BLOCKED',
+  'UNCERTAIN',
+  'NOT_ESTABLISHED',
+  'UNVERIFIED',
+  'CODE_FAILURE',
+  'COMMAND_NOT_AVAILABLE',
+  'NOT_AVAILABLE',
+  'CANCELLED',
+  'TIMEOUT',
+  'ENVIRONMENT_FAILURE',
+  'DEPENDENCY_FAILURE',
+  'PROVIDER_FAILURE',
+]);
+const NON_PASS_EVIDENCE_STATES = new Set(['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED']);
+const GATE_FAILURE_STATUSES = new Set(['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED']);
 const registry = new Map();
 const sessions = new Map();
 const conversationTurns = new Map();
@@ -102,6 +118,7 @@ function redact(value) {
       return [key, redact(item)];
     }));
   }
+  if (value === null || value === undefined || typeof value === 'boolean' || typeof value === 'number') return value;
   return bounded(value).replace(/(sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]+|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)/gi, '[REDACTED]');
 }
 function journalTask(task) {
@@ -111,7 +128,7 @@ function journalTask(task) {
     ownerWebContentsId: undefined,
     error: bounded(task.error, 1000),
     progress: redact(task.progress),
-    verification: redact(task.verification),
+    verification: sanitizeVerificationSnapshot(task.verification),
     outcome: redact(task.outcome),
     checkpoint: task.checkpoint || null,
     risk: task.risk || null,
@@ -554,7 +571,7 @@ function publicTask(task) {
       actor: task.approval.actor,
     } : null,
     manifestHash: task.manifestHash || null,
-    progress: task.progress, verification: redact(task.verification) || null, verificationScript: task.verificationScript || null,
+    progress: task.progress, verification: sanitizeVerificationSnapshot(task.verification), verificationScript: task.verificationScript || null,
     verificationScripts: task.verificationScripts || [],
     evidence: Array.isArray(task.evidence) ? redact(task.evidence).slice(-50) : [],
     scope: task.scope || '.',
@@ -1263,6 +1280,19 @@ function approve(taskId, owner, featureAuthorization = null) {
   }
   task.authorizedFeatures = authorizedFeatures;
   task.manifestHash = proposalManifestHash(task);
+  const approvalBinding = {
+    runId: task.taskId,
+    providerId: 'human-approval-record',
+    providerConfigRevision: 'approval-default',
+    approvedSnapshotDigest: task.manifestHash || `${task.taskId}-snapshot`,
+    approvedManifestDigest: task.manifestHash || `${task.taskId}-manifest`,
+    verificationPlanDigest: task.verificationPlanHash || task.manifestHash || `${task.taskId}-verification-plan`,
+    workerIdentity: task.sessionId || task.ownerWebContentsId || task.taskId,
+    evidenceTimestamp: now(),
+    evidenceExpiry: new Date(Date.now() + APPROVAL_TTL_MS).toISOString(),
+    provenance: 'human-approval-only',
+    trustClass: 'UNTRUSTED',
+  };
   task.approval = {
     approvedAt: now(),
     expiresAt: new Date(Date.now() + APPROVAL_TTL_MS).toISOString(),
@@ -1271,6 +1301,16 @@ function approve(taskId, owner, featureAuthorization = null) {
     consumedAt: null,
     actor: 'renderer-session',
     authorizedFeatures: [...authorizedFeatures],
+    approvedSnapshotDigest: approvalBinding.approvedSnapshotDigest,
+    approvedManifestDigest: approvalBinding.approvedManifestDigest,
+    verificationPlanDigest: approvalBinding.verificationPlanDigest,
+    providerConfigRevision: approvalBinding.providerConfigRevision,
+    providerId: approvalBinding.providerId,
+    workerIdentity: approvalBinding.workerIdentity,
+    evidenceTimestamp: approvalBinding.evidenceTimestamp,
+    evidenceExpiry: approvalBinding.evidenceExpiry,
+    provenance: approvalBinding.provenance,
+    trustClass: approvalBinding.trustClass,
   };
   task.runtime = task.runtime || {};
   task.runtime.phase = 'AWAITING_APPROVAL';
@@ -1521,7 +1561,7 @@ async function restoreBeforeSnapshot(task, authorize, { rollback = false } = {})
   const restored = await Promise.all(task.before.map((item) => snapshotTarget(task.root, item.path)));
   if (restored.some((item, index) => item.hash !== task.before[index].hash)) throw new Error('Rollback verification failed.');
 }
-async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize = null, verificationAttempt = 1) {
+async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize = null, verificationAttempt = 1, onActivity = () => {}) {
   const task = getTask(taskId, owner);
   if (task.approval?.consumedAt) throw new Error('Proposal approval has already been used.');
   if (task.state !== 'approved') throw new Error('Proposal must be approved exactly once.');
@@ -1550,7 +1590,18 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
   task.transactionId = crypto.randomUUID();
   let patchApplied = false;
   let writeStarted = false;
+  let applyStarted = false;
+  let applyTerminal = false;
+  let verificationTerminal = false;
+  const notifyActivity = (phase, status, details = {}) => {
+    try {
+      onActivity({ phase, status, ...details });
+    } catch {
+      console.warn('Could not publish Developer activity event.');
+    }
+  };
   recordMutation(task, 'transaction_started', { transactionId: task.transactionId });
+  notifyActivity('proposal_transaction', 'STARTED');
   try {
     await multiRepoCoordinator.captureBaselineSnapshot(task.taskId, task.root);
     transition(task, 'applying');
@@ -1560,12 +1611,22 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
     task.runtime.history = [...(task.runtime.history || []), { phase: 'APPLYING', at: now(), message: 'Applying validated patch.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'apply', 'Applying validated patch.');
+    applyStarted = true;
+    notifyActivity('proposal_apply', 'STARTED');
     const current = await Promise.all(task.before.map((item) => snapshotTarget(task.root, item.path)));
     if (current.some((item, index) => item.hash !== task.before[index].hash)) throw new Error('Files changed after approval.');
-    if (task.cancelRequested) { transition(task, 'cancelled'); return publicTask(task); }
+    if (task.cancelRequested) {
+      transition(task, 'cancelled');
+      applyTerminal = true;
+      notifyActivity('proposal_apply', 'CANCELLED', { executed: false });
+      notifyActivity('proposal_transaction', 'CANCELLED', { executed: false });
+      return publicTask(task);
+    }
     writeStarted = true;
     await applyChanges(task, authorize);
     patchApplied = true;
+    applyTerminal = true;
+    notifyActivity('proposal_apply', 'COMPLETED', { executed: true });
     if (task.cancelRequested) throw Object.assign(new Error('Developer task was cancelled before verification.'), { cancelled: true });
     transition(task, 'verifying');
     task.runtime = task.runtime || {};
@@ -1574,10 +1635,13 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
     task.runtime.history = [...(task.runtime.history || []), { phase: 'VERIFYING', at: now(), message: 'Running approved verification.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'verify', 'Running approved verification.');
+    notifyActivity('verification', 'STARTED');
     {
-      const result = verifyRunner
-        ? await verifyRunner()
-        : {
+      let result;
+      try {
+        result = verifyRunner
+          ? await verifyRunner()
+          : {
             ok: false,
             status: 'UNVERIFIED',
             executed: false,
@@ -1585,29 +1649,56 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
             reason: 'No verification runner was provided.',
             attempts: [],
           };
-      task.verification = redact(result);
+      } catch (error) {
+        result = verificationFailureFromError(error);
+      }
       const verificationAttempts = Array.isArray(result?.attempts) ? result.attempts : [];
+      const verificationPassed = isSuccessfulVerificationResult(result, verificationAttempts);
+      const reportedVerificationStatus = normalizeVerificationStatus(result, verificationPassed) || 'UNVERIFIED';
+      task.verification = verificationSnapshot(result, reportedVerificationStatus, verificationAttempts, verificationPassed);
+      const verificationStatus = verificationPassed
+        ? 'COMPLETED'
+        : ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(reportedVerificationStatus)
+          ? reportedVerificationStatus
+          : result?.skipped === true
+          ? 'SKIPPED'
+          : result?.cancelled === true
+            ? 'CANCELLED'
+            : result?.executed === true && Number.isInteger(result.exitCode)
+              ? 'FAILED'
+              : 'UNVERIFIED';
+      verificationTerminal = true;
+      notifyActivity('verification', verificationStatus, {
+        executed: result?.executed === true,
+        exitCode: Number.isInteger(result?.exitCode) ? result.exitCode : null,
+        evidenceState: ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(result?.evidenceState)
+          ? result.evidenceState
+          : undefined,
+      });
       task.evidence = [...(task.evidence || []), {
         kind: 'VERIFICATION',
-        status: result?.status || (result?.ok ? 'PASS' : 'FAILED'),
+        status: reportedVerificationStatus,
+        evidenceState: ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(result?.evidenceState)
+          ? result.evidenceState
+          : null,
         checks: verificationAttempts.map((attempt) => ({
-          check: attempt.check || attempt.script || null,
-          ok: Boolean(attempt.ok),
-          classification: attempt.classification || null,
-          extracted: attempt.extracted || null,
+          check: attempt?.check || attempt?.script || null,
+          ok: isSuccessfulVerificationAttempt(attempt),
+          classification: attempt?.classification || null,
+          extracted: attempt?.extracted || null,
         })),
         at: now(),
       }].slice(-50);
       if (!result?.ok && result?.status === 'CODE_FAILURE') {
-        const failedChecks = verificationAttempts.filter((attempt) => !attempt.ok);
+        const failedChecks = verificationAttempts.filter((attempt) => !isSuccessfulVerificationAttempt(attempt));
         task.evidence = [...task.evidence, {
           kind: 'DIAGNOSIS',
           status: result.classification || result.status,
           checks: failedChecks.map((attempt) => ({
-            check: attempt.check || attempt.script || null,
+            check: attempt?.check || attempt?.script || null,
             ok: false,
-            classification: attempt.classification || result.classification || null,
-            extracted: attempt.extracted || null,
+            classification: attempt?.classification || result.classification || null,
+            extracted: attempt?.extracted || null,
           })),
           at: now(),
         }].slice(-50);
@@ -1615,10 +1706,10 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
           transactionId: task.transactionId,
           classification: result.classification || result.status,
           checks: failedChecks.map((attempt) => ({
-            check: attempt.check || attempt.script || null,
-            classification: attempt.classification || result.classification || null,
-            file: attempt.extracted?.file || null,
-            line: attempt.extracted?.line || null,
+            check: attempt?.check || attempt?.script || null,
+            classification: attempt?.classification || result.classification || null,
+            file: attempt?.extracted?.file || null,
+            line: attempt?.extracted?.line || null,
           })),
         });
       }
@@ -1628,25 +1719,21 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
       };
       recordMutation(task, 'verification_recorded', {
         transactionId: task.transactionId, attempt: verificationAttempt,
-        result: result?.status || result?.failure || (result?.ok ? 'pass' : 'failure'),
+        result: reportedVerificationStatus,
+        evidenceState: ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(result?.evidenceState)
+          ? result.evidenceState
+          : null,
         checks: verificationAttempts.map((attempt) => ({
-          check: attempt.check || attempt.script || null,
-          ok: Boolean(attempt.ok),
-          classification: attempt.classification || null,
+          check: attempt?.check || attempt?.script || null,
+          ok: isSuccessfulVerificationAttempt(attempt),
+          classification: attempt?.classification || null,
         })),
       });
       if (task.cancelRequested || result?.cancelled) {
         throw Object.assign(new Error('Developer task was cancelled during verification.'), { cancelled: true });
       }
-      if (!(result?.ok === true
-        && result.status === 'PASS'
-        && result.executed === true
-        && result.exitCode === 0
-        && verificationAttempts.length > 0
-        && verificationAttempts.every((attempt) => (
-          attempt.executed === true && Number.isInteger(attempt.exitCode) && attempt.exitCode === 0
-        )))) {
-        const failureState = result?.status === 'CODE_FAILURE' ? 'CODE_FAILURE' : (result?.status || 'UNVERIFIED');
+      if (!verificationPassed) {
+        const failureState = reportedVerificationStatus;
         task.verification = { ...task.verification, status: failureState, ok: false };
         throw new Error(
           failureState === 'UNVERIFIED'
@@ -1663,6 +1750,7 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
     task.runtime.history = [...(task.runtime.history || []), { phase: 'COMPLETED', at: now(), message: 'Apply and verification completed.' }].slice(-developerSettings.maxStateHistoryEntries);
     task.runtime.lastUpdated = now();
     progress(task, 'complete', 'Apply and verification completed.');
+    notifyActivity('proposal_transaction', 'COMPLETED', { executed: true });
     try {
       artifactEngine.createArtifact({
         taskId: task.taskId,
@@ -1687,17 +1775,43 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
     return publicTask(task);
   } catch (error) {
     task.error = error.message;
+    if (!applyTerminal && applyStarted) {
+      applyTerminal = true;
+      notifyActivity(
+        'proposal_apply',
+        error.cancelled ? 'CANCELLED' : 'FAILED',
+        patchApplied ? { executed: true } : {},
+      );
+    }
+    if (!verificationTerminal && task.state === 'verifying') {
+      verificationTerminal = true;
+      notifyActivity('verification', error.cancelled ? 'CANCELLED' : 'UNVERIFIED', {
+        executed: false,
+        exitCode: null,
+      });
+    }
     if (patchApplied || writeStarted || task.state === 'verifying') {
       task.state = 'recovering'; task.updatedAt = now(); progress(task, 'recover', 'Apply failed; verifying rollback state.');
+      notifyActivity('rollback', 'STARTED');
       try {
         await restoreBeforeSnapshot(task, authorize, { rollback: true });
+        notifyActivity('rollback', 'COMPLETED', { executed: true });
       } catch (rollbackError) {
         task.error = `Rollback verification failed: ${rollbackError.message}`;
+        notifyActivity('rollback', 'FAILED', { executed: true });
       }
       task.state = error.cancelled ? 'cancelled' : 'failed'; task.updatedAt = now();
     }
     task.updatedAt = now();
     recordMutation(task, 'transaction_failed', { transactionId: task.transactionId, error: error.message });
+    notifyActivity(
+      'proposal_transaction',
+      task.state === 'cancelled'
+        ? 'CANCELLED'
+        : task.state === 'failed'
+          ? 'FAILED'
+          : 'UNVERIFIED',
+      {});
     error.taskSnapshot = publicTask(task);
     throw error;
   } finally { release(); }
@@ -1738,13 +1852,152 @@ function classifyFailureCategory(result) {
   if (/syntax|type error|compile|ts\d{3,4}|failed|failure/i.test(text) || Number.isInteger(result?.exitCode)) return 'CODE_FAILURE';
   return result?.ok ? null : 'ENVIRONMENT_FAILURE';
 }
+function isOptionalBoolean(value) {
+  return value === undefined || value === null || typeof value === 'boolean';
+}
+function normalizeVerificationStatus(result, passed) {
+  if (GATE_FAILURE_STATUSES.has(result?.status)) return result.status;
+  if (result?.executionBlocked === true) return 'BLOCKED';
+  if (GATE_FAILURE_STATUSES.has(result?.evidenceState)) return result.evidenceState;
+  if (VERIFICATION_FAILURE_STATUSES.has(result?.status)) return result.status;
+  if (passed) return 'PASS';
+  if (result?.status !== undefined) return 'UNVERIFIED';
+  if (result?.error || result?.spawnError === true) return undefined;
+  if (result?.executed === true && Number.isInteger(result.exitCode) && result.exitCode !== 0) return undefined;
+  return 'UNVERIFIED';
+}
+function isSuccessfulVerificationAttempt(attempt) {
+  return Boolean(attempt)
+    && typeof attempt === 'object'
+    && !Array.isArray(attempt)
+    && attempt.ok === true
+    && attempt.executed === true
+    && attempt.exitCode === 0
+    && (typeof attempt.check === 'string' && attempt.check.trim()
+      || typeof attempt.script === 'string' && attempt.script.trim())
+    && (attempt.status === undefined || attempt.status === 'PASS')
+    && isOptionalBoolean(attempt.success)
+    && attempt.success !== false
+    && isOptionalBoolean(attempt.executionBlocked)
+    && attempt.executionBlocked !== true
+    && (attempt.evidenceState === undefined || attempt.evidenceState === null)
+    && isOptionalBoolean(attempt.cancelled)
+    && attempt.cancelled !== true
+    && isOptionalBoolean(attempt.timedOut)
+    && attempt.timedOut !== true
+    && !attempt.error
+    && !attempt.failure;
+}
+function isSuccessfulVerificationResult(result, attempts) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
+  if (result.ok !== true
+    || result.status !== 'PASS'
+    || result.executed !== true
+    || result.exitCode !== 0
+    || !isOptionalBoolean(result.success)
+    || result.success === false
+    || !isOptionalBoolean(result.executionBlocked)
+    || result.executionBlocked === true
+    || (result.evidenceState !== undefined && result.evidenceState !== null)
+    || !isOptionalBoolean(result.cancelled)
+    || result.cancelled === true
+    || !isOptionalBoolean(result.timedOut)
+    || result.timedOut === true
+    || result.error
+    || result.failure
+    || !Array.isArray(attempts)
+    || attempts.length === 0
+    || !attempts.every(isSuccessfulVerificationAttempt)) return false;
+  if (result.checks !== undefined) {
+    if (!Array.isArray(result.checks) || result.checks.length !== attempts.length) return false;
+    if (result.checks.some((check, index) => (
+      typeof check !== 'string'
+      || check !== (attempts[index].check || attempts[index].script)
+    ))) return false;
+  }
+  return true;
+}
+function sanitizeVerificationSnapshot(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const attempts = Array.isArray(value.attempts) ? value.attempts.map((attempt) => ({
+    check: typeof attempt?.check === 'string' ? redact(attempt.check) : null,
+    script: typeof attempt?.script === 'string' ? redact(attempt.script) : null,
+    ok: isSuccessfulVerificationAttempt(attempt),
+    executed: attempt?.executed === true,
+    exitCode: Number.isInteger(attempt?.exitCode) ? attempt.exitCode : null,
+    classification: typeof attempt?.classification === 'string' ? redact(attempt.classification) : null,
+    extracted: attempt?.extracted && typeof attempt.extracted === 'object'
+      ? redact(attempt.extracted)
+      : null,
+  })) : [];
+  const checks = Array.isArray(value.checks)
+    ? value.checks.filter((check) => typeof check === 'string').map(redact)
+    : attempts.map((attempt) => attempt.check || attempt.script).filter(Boolean);
+  const evidenceState = NON_PASS_EVIDENCE_STATES.has(value.evidenceState) ? value.evidenceState : null;
+  const passed = value.ok === true
+    && value.status === 'PASS'
+    && value.executed === true
+    && value.exitCode === 0
+    && isSuccessfulVerificationResult(value, value.attempts);
+  const status = normalizeVerificationStatus(value, passed) || 'UNVERIFIED';
+  return {
+    status,
+    ok: passed,
+    executed: value.executed === true,
+    exitCode: Number.isInteger(value.exitCode) ? value.exitCode : null,
+    reason: typeof value.reason === 'string'
+      ? redact(value.reason)
+      : typeof value.error === 'string' ? redact(value.error) : null,
+    failure: typeof value.failure === 'string' ? redact(value.failure) : null,
+    classification: typeof value.classification === 'string' ? redact(value.classification) : null,
+    evidenceState,
+    attempts,
+    checks,
+  };
+}
+function verificationSnapshot(result, status, attempts, passed) {
+  const source = result && typeof result === 'object' && !Array.isArray(result) ? result : {};
+  return sanitizeVerificationSnapshot({
+    ...source,
+    status,
+    ok: passed,
+    attempts,
+    checks: Array.isArray(source.checks) ? source.checks : undefined,
+  });
+}
 function normalizeCommandResult(result) {
-  return { ok: Boolean(result?.ok), script: String(result?.script || ''), exitCode: result?.exitCode ?? null,
+  const hasRecord = Boolean(result) && typeof result === 'object' && !Array.isArray(result);
+  const statusKnown = !hasRecord
+    || typeof result.status !== 'string'
+    || result.status === 'PASS'
+    || VERIFICATION_FAILURE_STATUSES.has(result.status);
+  const ok = hasRecord
+    && result.ok === true
+    && result.executed === true
+    && result.exitCode === 0
+    && statusKnown
+    && (result.status === undefined || result.status === 'PASS')
+    && isOptionalBoolean(result.success)
+    && result.success !== false
+    && isOptionalBoolean(result.executionBlocked)
+    && result.executionBlocked !== true
+    && (result.evidenceState === undefined || result.evidenceState === null)
+    && isOptionalBoolean(result.cancelled)
+    && result.cancelled !== true
+    && isOptionalBoolean(result.timedOut)
+    && result.timedOut !== true
+    && !result.error
+    && !result.failure;
+  return { ok, script: String(result?.script || ''), exitCode: result?.exitCode ?? null,
     stdout: String(result?.stdout || ''), stderr: String(result?.stderr || ''), durationMs: Number(result?.durationMs || 0),
     reason: result?.reason ? String(result.reason).slice(0, 500) : null,
-    failure: result?.ok ? null : classifyFailure(result),
-    classification: result?.ok ? null : classifyFailureCategory(result),
+    failure: ok ? null : classifyFailure({ ...result, ok: false }),
+    classification: ok ? null : classifyFailureCategory({ ...result, ok: false }),
     cancelled: Boolean(result?.cancelled),
+    executed: result?.executed === true,
+    status: normalizeVerificationStatus(result, ok),
+    evidenceState: NON_PASS_EVIDENCE_STATES.has(result?.evidenceState) ? result.evidenceState : undefined,
+    executionBlocked: result?.executionBlocked === true,
     runtimeEvidence: result?.runtimeEvidence || null,
   };
 }
@@ -1761,9 +2014,24 @@ async function executeVerificationLoop({ run, maxAttempts = 2, diagnose = () => 
   const observations = [];
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     onProgress({ phase: 'verify', attempt });
-    const result = normalizeCommandResult(await run(attempt));
+    let rawResult;
+    try {
+      rawResult = await run(attempt);
+    } catch (error) {
+      rawResult = verificationFailureFromError(error);
+    }
+    const result = normalizeCommandResult(rawResult);
     observations.push(result);
-    if (result.ok) return { ok: true, attempts: observations };
+    if (result.ok) return { ok: true, status: 'PASS', executed: true, exitCode: 0, attempts: observations };
+    if (isGateOrUnverifiedResult(result)) {
+      return {
+        ok: false,
+        status: result.status || result.evidenceState || 'UNVERIFIED',
+        evidenceState: result.evidenceState,
+        attempts: observations,
+        reason: result.reason,
+      };
+    }
     const diagnosis = diagnose(result);
     if (attempt < attempts && diagnosis?.retryable) {
       onProgress({ phase: 'recover', attempt, diagnosis });
@@ -1799,11 +2067,35 @@ function normalizeObservation(result, check = result?.script || '') {
   const normalized = normalizeCommandResult(result);
   return {
     ...normalized,
-    executed: result?.executed === true,
     check,
-    failure: normalized.failure,
     extracted: extractFailure(normalized),
   };
+}
+function verificationFailureFromError(error, script = '') {
+  const executionBlocked = error?.executionBlocked === true;
+  const status = executionBlocked
+    ? GATE_FAILURE_STATUSES.has(error?.executionStatus) ? error.executionStatus : 'BLOCKED'
+    : 'UNVERIFIED';
+  const evidenceState = executionBlocked && NON_PASS_EVIDENCE_STATES.has(error?.evidenceState)
+    ? error.evidenceState
+    : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    ok: false,
+    script,
+    status,
+    executionBlocked,
+    evidenceState,
+    executed: false,
+    exitCode: null,
+    error: message,
+    reason: message,
+  };
+}
+function isGateOrUnverifiedResult(result) {
+  return ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED', 'UNVERIFIED'].includes(result?.status)
+    || NON_PASS_EVIDENCE_STATES.has(result?.evidenceState)
+    || result?.executionBlocked === true;
 }
 function diagnoseObservation(observation, metadata = {}) {
   const environment = new Set(['ENVIRONMENT_FAILURE', 'DEPENDENCY_FAILURE', 'COMMAND_NOT_AVAILABLE', 'TIMEOUT']);
@@ -1837,16 +2129,24 @@ async function runVerificationChecks({ checks, runCheck, isCancelled = () => fal
   for (const check of selectedChecks) {
     if (isCancelled()) return { ok: false, status: 'CANCELLED', cancelled: true, checks: selectedChecks, attempts };
     onProgress({ phase: 'verify', check });
-    const result = normalizeObservation(await runCheck(check), check);
+    let rawResult;
+    try {
+      rawResult = await runCheck(check);
+    } catch (error) {
+      rawResult = verificationFailureFromError(error, check);
+    }
+    const result = normalizeObservation(rawResult, check);
     attempts.push(result);
-    if (!result.ok || !result.executed || !Number.isInteger(result.exitCode) || result.exitCode !== 0) {
+    if (!result.ok) {
       return {
         ok: false,
-        status: result.executed && Number.isInteger(result.exitCode)
+        status: result.status || (result.executed && Number.isInteger(result.exitCode)
           ? (result.classification || 'CODE_FAILURE')
-          : 'UNVERIFIED',
+          : 'UNVERIFIED'),
+        evidenceState: result.evidenceState,
         executed: result.executed,
         exitCode: result.exitCode,
+        reason: result.reason || null,
         failure: result.failure,
         classification: result.classification,
         checks: selectedChecks,
@@ -1896,7 +2196,13 @@ async function runEngineeringLoop({
     onProgress({ phase: 'running_checks', attempt, checks: selectedChecks });
     const results = [];
     for (const check of selectedChecks) {
-      const observation = normalizeObservation(await runCheck(check, attempt), check);
+      let rawResult;
+      try {
+        rawResult = await runCheck(check, attempt);
+      } catch (error) {
+        rawResult = verificationFailureFromError(error, check);
+      }
+      const observation = normalizeObservation(rawResult, check);
       results.push(observation); observations.push(observation);
       if (!observation.ok) break;
     }
@@ -1908,6 +2214,15 @@ async function runEngineeringLoop({
     }
     const diagnosis = diagnoseObservation(failure, { taskId, attempt });
     onProgress({ phase: 'observing', attempt, observation: failure });
+    if (isGateOrUnverifiedResult(failure)) {
+      const outcome = {
+        status: failure.status || failure.evidenceState || 'UNVERIFIED',
+        evidenceState: failure.evidenceState,
+        error: failure.reason || 'Verification status is blocked or not established.',
+      };
+      if (task) updateLoopTask(taskId, owner, 'failed', 'verification_unavailable', outcome.error, outcome);
+      return { ...outcome, attempts: observations, diagnosis, fixes };
+    }
     if (diagnosis.environmentFailure) {
       const outcome = { status: 'ENVIRONMENT_FAILURE', error: 'Verification could not run in the current environment.' };
       if (task) updateLoopTask(taskId, owner, 'failed', 'environment_failure', outcome.error, outcome);
@@ -2245,6 +2560,7 @@ module.exports = {
   getTask: (id, owner) => publicTask(getTask(id, owner)), getTaskForTest, getTaskMutationContext, getProposalAuthorizationContext, normalizeCommandResult,
   classifyFailure, classifyFailureCategory, commandPolicy, selectVerificationChecks, extractFailure, normalizeObservation,
   diagnoseObservation, executeVerificationLoop, runVerificationChecks, runEngineeringLoop, isCancellationRequested,
+  verificationFailureFromError,
   configureDurability, loadJournal,
   flushDurability, resumeSession, releaseSession, resetForTest, parsePatch, applyFilePatch,
   assessTaskRisk, selfReviewPatch, classifyVerificationFailure,

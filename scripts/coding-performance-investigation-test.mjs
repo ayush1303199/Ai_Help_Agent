@@ -8,6 +8,11 @@ import developerFiles from '../electron/developerFiles.cjs';
 
 console.log('[PERF-TEST] Starting Regression Test Suite for Performance Investigation & Conversation Ownership...');
 
+assert.ok(process.env.AI_HELP_AGENT_TEST_BACKEND_URL, 'Run this integration test through the isolated test harness.');
+const backendUrl = new URL(process.env.AI_HELP_AGENT_TEST_BACKEND_URL);
+assert.equal(backendUrl.hostname, '127.0.0.1', 'Integration tests require the isolated loopback backend.');
+assert.notEqual(backendUrl.port, '3001', 'Integration tests must not target the live backend port.');
+const backendBaseUrl = backendUrl.origin;
 const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'coding-perf-test-'));
 const projectPath = path.join(tempDir, 'ecommerce-store');
 
@@ -44,7 +49,7 @@ class Order {
   // STEP 1: Project Attachment Contract
   // =========================================================================
   console.log('[STEP 1] Attaching project to backend (/api/coding/project-attach)...');
-  const attachRes = await fetch('http://127.0.0.1:3001/api/coding/project-attach', {
+  const attachRes = await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectRoot: projectPath }),
@@ -110,7 +115,7 @@ class Order {
   // STEP 4: Tool Execution on Real Files
   // =========================================================================
   console.log('[STEP 4] Verifying Real Tool Execution for Query Search & Reading...');
-  const searchToolRes = await fetch('http://127.0.0.1:3001/api/coding/tool', {
+  const searchToolRes = await fetch(`${backendBaseUrl}/api/coding/tool`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -126,7 +131,7 @@ class Order {
   assert.ok(searchToolData.data.results.some((r) => r.path.includes('Order.php')));
 
   // Test alias resolution for repo_browser.search_code with pattern
-  const aliasToolRes = await fetch('http://127.0.0.1:3001/api/coding/tool', {
+  const aliasToolRes = await fetch(`${backendBaseUrl}/api/coding/tool`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -140,7 +145,7 @@ class Order {
   assert.equal(aliasToolData.ok, true);
   assert.ok(aliasToolData.data.results.length > 0);
 
-  const readToolRes = await fetch('http://127.0.0.1:3001/api/coding/tool', {
+  const readToolRes = await fetch(`${backendBaseUrl}/api/coding/tool`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -201,5 +206,5 @@ class Order {
   console.log('  -> STEP 5 PASSED: Proposal created in awaiting_approval state without automatic apply.');
   console.log('[PERF-TEST] ALL 5 PERFORMANCE INVESTIGATION REGRESSION SUITES PASSED (5/5).');
 } finally {
-  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  await fs.rm(tempDir, { recursive: true, force: true });
 }

@@ -23,12 +23,41 @@ import hmac
 import shlex
 import threading
 import uuid
+from functools import wraps
 from difflib import SequenceMatcher
-from typing import Dict, List, Any, Optional, Set, Tuple
+from typing import Callable, Dict, List, Any, Optional, Set, Tuple
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 logger = logging.getLogger(__name__)
+
+
+class DatabaseOperationBusyError(RuntimeError):
+    """Raised when a concurrent operation could race shared database session state."""
+
+
+def _serialize_database_session_operation(method):
+    @wraps(method)
+    def guarded(cls, *args, **kwargs):
+        if cls._state_unverified:
+            raise DatabaseOperationBusyError(
+                "Database session state is unverified; database operations remain disabled."
+            )
+        if not cls._operation_lock.acquire(blocking=False):
+            raise DatabaseOperationBusyError(
+                "A database operation is already active; this operation was not started."
+            )
+        try:
+            if cls._state_unverified:
+                raise DatabaseOperationBusyError(
+                    "Database session state is unverified; database operations remain disabled."
+                )
+            return method(cls, *args, **kwargs)
+        finally:
+            cls._operation_lock.release()
+
+    return guarded
+
 
 try:
     _FEATURE_OWNERSHIP = json.loads(
@@ -6726,8 +6755,14 @@ class DatabaseSessionManager:
     _sessions: Dict[str, DatabaseSession] = {}
     _sessions_by_id: Dict[str, DatabaseSession] = {}
     _active_session: Optional[DatabaseSession] = None
+    _operation_lock = threading.RLock()
+    _state_unverified = False
     MAX_SESSIONS = 100
     schema_knowledge_store = DatabaseSchemaKnowledgeStore()
+
+    @classmethod
+    def mark_state_unverified(cls) -> None:
+        cls._state_unverified = True
 
     @staticmethod
     def _session_project_is_available(session: DatabaseSession) -> bool:
@@ -6820,6 +6855,7 @@ class DatabaseSessionManager:
         )
 
     @classmethod
+    @_serialize_database_session_operation
     def get_session(cls, project_root: str = "", session_id: Optional[str] = None) -> Optional[DatabaseSession]:
         norm = os.path.normpath(project_root) if project_root else ""
         if norm and norm in cls._sessions:
@@ -6840,6 +6876,7 @@ class DatabaseSessionManager:
         return None
 
     @classmethod
+    @_serialize_database_session_operation
     def register_session(cls, project_root: str, session: DatabaseSession) -> DatabaseSession:
         norm = os.path.normpath(project_root) if project_root else ""
         cls._ensure_session_capacity(norm)
@@ -6854,6 +6891,7 @@ class DatabaseSessionManager:
         return session
 
     @classmethod
+    @_serialize_database_session_operation
     def clear_session(cls, project_root: str) -> None:
         norm = os.path.normpath(project_root) if project_root else ""
         if norm in cls._sessions:
@@ -6865,6 +6903,7 @@ class DatabaseSessionManager:
                 cls._active_session = None
 
     @classmethod
+    @_serialize_database_session_operation
     def get_or_create_session(
         cls,
         project_root: str,
@@ -7724,12 +7763,14 @@ class DatabaseSessionManager:
         return sorted(ranked, key=lambda item: (-item["score"], item["table"].casefold()))
 
     @classmethod
+    @_serialize_database_session_operation
     def execute_database_capability(
         cls,
         capability: str,
         arguments: Dict[str, Any],
         session: DatabaseSession,
         project_root: str,
+        on_activity: Optional[Callable[[str, str, Optional[Dict[str, Any]]], None]] = None,
     ) -> Dict[str, Any]:
         """
         Executes a canonical database capability directly against the database connection.
@@ -10717,8 +10758,25 @@ class DatabaseSessionManager:
 
         # 10. DATABASE_CONNECT_TARGET
         if capability == DatabaseCapability.DATABASE_CONNECT_TARGET:
+            def observe_database_stage(tool: str, status: str, result: Optional[Dict[str, Any]] = None) -> None:
+                if callable(on_activity):
+                    try:
+                        on_activity(tool, status, result)
+                    except Exception as activity_error:
+                        logger.warning(
+                            "Could not record database activity stage (%s): %s",
+                            tool,
+                            SecretProtector.redact_text(str(activity_error))[:300],
+                        )
+
+            observe_database_stage("DATABASE_TARGET_SELECTION", "STARTED")
             tgt_id = str(arguments.get("target") or "").strip()
             if not tgt_id:
+                observe_database_stage(
+                    "DATABASE_TARGET_SELECTION",
+                    "BLOCKED",
+                    {"ok": False, "data": {"executionStatus": "BLOCKED", "executed": False}},
+                )
                 return {
                     "ok": False,
                     "capability": capability,
@@ -10733,6 +10791,11 @@ class DatabaseSessionManager:
                         target = t
                         break
             if target:
+                observe_database_stage(
+                    "DATABASE_TARGET_SELECTION",
+                    "COMPLETED",
+                    {"ok": True, "data": {"executionStatus": "SELECTED", "executed": True}},
+                )
                 db_cfg = {
                     "engine": target.engine,
                     "database": target.database_name,
@@ -10746,7 +10809,28 @@ class DatabaseSessionManager:
                     "target_id": target.target_id,
                     **target._protected_credentials,
                 }
+                observe_database_stage("DATABASE_CONNECTION_ATTEMPT", "STARTED")
                 health = DatabaseIntelligenceEngine.real_connect_and_health_check(eff_root, db_cfg)
+                connection_status = "CONNECTED" if health.get("connected") else str(
+                    health.get("status") or "UNVERIFIED"
+                ).upper()
+                observe_database_stage(
+                    "DATABASE_CONNECTION_ATTEMPT",
+                    "COMPLETED" if health.get("connected") else (
+                        "FAILED" if health.get("status") == "FAILED" else "UNVERIFIED"
+                    ),
+                    {
+                        "ok": bool(health.get("connected")),
+                        "data": {
+                            "executionStatus": connection_status,
+                            "databaseType": target.engine,
+                            "executed": (
+                                health.get("connected") is True
+                                or health.get("healthCheck") == "FAILED"
+                            ),
+                        },
+                    },
+                )
                 if not health.get("connected"):
                     return {
                         "ok": False,
@@ -10805,6 +10889,11 @@ class DatabaseSessionManager:
                     "executed": True,
                 }
             else:
+                observe_database_stage(
+                    "DATABASE_TARGET_SELECTION",
+                    "BLOCKED",
+                    {"ok": False, "data": {"executionStatus": "BLOCKED", "executed": False}},
+                )
                 avail = [t.target_id for t in DatabaseTargetRegistry.get_targets(eff_root)]
                 content = f"Target `{tgt_id}` not found. Available targets: {', '.join(avail) if avail else 'None'}."
                 return {
@@ -10814,6 +10903,9 @@ class DatabaseSessionManager:
                     "error": "TARGET_NOT_FOUND",
                     "databaseType": db_type,
                     "databaseSessionId": session.session_id,
+                    "executionStatus": "BLOCKED",
+                    "evidenceQuality": "UNVERIFIED",
+                    "executed": False,
                 }
 
         # 11. DATABASE_SLOW_QUERIES

@@ -4,7 +4,18 @@ import type { CodingConversationState, CodingPreference } from './codingSessionS
 import type { CodingActivity } from './codingTransport';
 
 function codingActivityLabel(item: CodingActivity): string {
-  if (!('event' in item)) return item.phase;
+  if (!('event' in item)) return `Agent narration · ${item.phase}`;
+  if (item.activityType === 'PROPOSAL') {
+    if (item.result?.executionStatus === 'AWAITING_APPROVAL') return 'Proposal created · awaiting approval';
+    if (item.result?.executionStatus === 'APPROVED') return 'Proposal approved · apply not started';
+    if (item.result?.executionStatus === 'REJECTED') return 'Proposal rejected · not applied';
+    return 'Proposal lifecycle';
+  }
+  if (item.activityType === 'TOOL') {
+    if (item.action.tool === 'proposal_transaction') return 'Proposal transaction';
+    if (item.action.tool === 'proposal_apply') return 'Applying approved proposal';
+    if (item.action.tool === 'rollback') return 'Restoring approved snapshot';
+  }
   switch (item.activityType) {
     case 'SEARCHING': return 'Searching code';
     case 'READING_FILE': return 'Reading file';
@@ -14,7 +25,20 @@ function codingActivityLabel(item: CodingActivity): string {
     case 'VERIFYING': return 'Running verification';
     case 'INSPECTING_DATABASE':
       if (item.action.tool === 'discover_database_configuration') return 'Discovering database configuration';
-      if (item.action.tool === 'DATABASE_CONNECT' || item.action.tool === 'DATABASE_CONNECT_TARGET') return 'Connecting to database';
+      if (item.action.tool === 'DATABASE_SESSION') return 'Resolving database session';
+      if (item.action.tool === 'DATABASE_TARGET_SELECTION') return 'Selecting database target';
+      if (item.action.tool === 'DATABASE_CONNECTION_ATTEMPT') {
+        const result = item.result?.executionStatus?.toUpperCase();
+        if (result === 'CONNECTED' || result === 'VERIFIED') return 'Database connection verified';
+        if (result === 'FAILED') return 'Database connection failed';
+        if (result === 'UNAVAILABLE' || result === 'NOT_VERIFIED') return 'Database connection not verified';
+        return 'Attempting database connection';
+      }
+      if (item.result?.executionStatus?.toUpperCase() === 'CONNECTED'
+        || item.result?.executionStatus?.toUpperCase() === 'VERIFIED') return 'Database connection verified';
+      if (item.action.tool === 'DATABASE_CURRENT_TARGET') return 'Inspecting selected database target';
+      if (item.action.tool.startsWith('DATABASE_CONNECT') || item.action.tool === 'DATABASE_RECONNECT') return 'Connecting to database target';
+      if (item.action.tool === 'DATABASE_HEALTH_CHECK') return 'Verifying database connection';
       if (item.action.tool === 'DATABASE_LIST_TABLES') return 'Listing database tables';
       if (item.action.tool === 'DATABASE_DESCRIBE_TABLE') return 'Inspecting database schema';
       if (item.action.tool === 'DATABASE_QUERY' || item.action.tool === 'execute_sql') return 'Executing database query';
@@ -26,18 +50,26 @@ function codingActivityLabel(item: CodingActivity): string {
 function codingActivityStatus(item: Extract<CodingActivity, { event: 'activity_event' }>) {
   switch (item.status) {
     case 'STARTED': return { icon: '●', label: 'Running', className: 'text-sky-300' };
+    case 'PROGRESS': return { icon: '◌', label: 'In progress', className: 'text-sky-300' };
     case 'COMPLETED': return { icon: '✓', label: 'Completed', className: 'text-emerald-300' };
     case 'FAILED': return { icon: '✕', label: 'Failed', className: 'text-rose-300' };
     case 'UNVERIFIED': return { icon: '⚠', label: 'Unverified', className: 'text-amber-300' };
     case 'SKIPPED': return { icon: '⊘', label: 'Skipped', className: 'text-slate-400' };
     case 'CANCELLED': return { icon: '○', label: 'Cancelled', className: 'text-slate-400' };
+    case 'BLOCKED': return { icon: '⊘', label: 'Blocked · not executed', className: 'text-amber-300' };
+    case 'UNCERTAIN': return { icon: '⚠', label: 'Uncertain · not established', className: 'text-amber-300' };
+    case 'NOT_ESTABLISHED': return { icon: '⚠', label: 'Not established', className: 'text-amber-300' };
   }
 }
 
 function CodingActivityEntry({ item }: { item: CodingActivity }) {
   if (!('event' in item)) {
     return <div className="text-[11px] text-slate-400">
-      <p><span className="mr-2 font-semibold text-sky-300">{item.phase}</span>{item.message}</p>
+      <p>
+        <span className="mr-2 font-semibold text-slate-500">{codingActivityLabel(item)}</span>
+        <span>{item.message}</span>
+        <span className="ml-2 text-slate-600">Not evidence of execution</span>
+      </p>
       {item.plan && <div className="ml-2 mt-1 border-l border-slate-700 pl-2">
         <p>{String(item.plan.goal || '')}</p>
         {Array.isArray(item.plan.steps) && <ol className="mt-1 list-inside list-decimal">
@@ -54,7 +86,10 @@ function CodingActivityEntry({ item }: { item: CodingActivity }) {
     result?.lineCount !== undefined ? `${result.lineCount} lines` : undefined,
     result?.databaseType,
     result?.executionStatus,
+    result?.evidenceState ? `evidence ${result.evidenceState}` : undefined,
     result?.exitCode !== undefined && result.exitCode !== null ? `exit ${result.exitCode}` : undefined,
+    result?.executed === false ? 'not executed' : result?.executed === true ? 'executed' : undefined,
+    item.repairAttempt !== undefined ? `repair attempt ${item.repairAttempt}` : undefined,
   ].filter(Boolean);
   const status = codingActivityStatus(item);
   return <div className="text-[11px] text-slate-400">
@@ -163,7 +198,14 @@ interface CodingAgentWorkspaceProps {
     providerConfigured: boolean;
     projectAttached: boolean;
     projectStatus: string;
-    sandbox: { available: boolean; verified: boolean; platformRecognized: boolean; platform: string; reason: string | null };
+    sandbox: {
+      available: boolean;
+      verified: boolean;
+      platformRecognized: boolean;
+      platform: string;
+      reason: string | null;
+      capabilityStates?: Record<string, 'SUPPORTED' | 'UNSUPPORTED' | 'BLOCKED' | 'UNCERTAIN' | 'NOT_ESTABLISHED'>;
+    };
     blockers: Array<{ code: string; message: string }>;
   } | null;
   acceptancePreflightBusy?: boolean;
@@ -457,8 +499,8 @@ export function CodingAgentWorkspace({
         {!acceptancePreflight && <p className="mt-1 text-[11px] text-slate-400">Read-only check; it does not run project commands or change files.</p>}
         {acceptancePreflight && (
           <>
-            <p role="status" className={`mt-1 text-[11px] ${acceptancePreflight.ready ? 'text-emerald-300' : 'text-amber-200'}`}>
-              {acceptancePreflight.ready ? 'Ready for live acceptance.' : 'Not ready; project commands remain disabled unless the OS sandbox is verified.'}
+            <p role="status" className="mt-1 text-[11px] text-amber-200">
+              Project command execution remains blocked by the shared execution gate; this preflight is informational only.
             </p>
             {acceptancePreflight.blockers.length > 0 && (
               <ul className="mt-1 list-disc space-y-1 pl-5 text-[11px] text-amber-100">
@@ -466,8 +508,14 @@ export function CodingAgentWorkspace({
               </ul>
             )}
             <p className="mt-1 text-[10px] text-slate-500">
-              Provider: {acceptancePreflight.providerConfigured ? 'ready' : 'missing/unavailable'} · Project: {acceptancePreflight.projectStatus} · Sandbox: {acceptancePreflight.sandbox.verified ? 'verified' : `not verified (${acceptancePreflight.sandbox.platform})`}
+              Provider: {acceptancePreflight.providerConfigured ? 'configured' : 'missing/unavailable'} · Project: {acceptancePreflight.projectStatus} · Sandbox: blocked by the shared execution gate ({acceptancePreflight.sandbox.platform})
             </p>
+            {acceptancePreflight.sandbox.capabilityStates && (
+              <p className="mt-1 break-words text-[10px] text-slate-500">
+                Reported isolation capabilities (descriptive, not verification): {Object.entries(acceptancePreflight.sandbox.capabilityStates)
+                  .map(([capability, state]) => `${capability}: ${state}`).join(' · ')}
+              </p>
+            )}
           </>
         )}
       </section>

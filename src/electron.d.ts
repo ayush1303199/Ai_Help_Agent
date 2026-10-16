@@ -286,7 +286,14 @@ interface Window {
       providerConfigured: boolean;
       projectAttached: boolean;
       projectStatus: string;
-      sandbox: { available: boolean; verified: boolean; platformRecognized: boolean; platform: string; reason: string | null };
+      sandbox: {
+        available: boolean;
+        verified: boolean;
+        platformRecognized: boolean;
+        platform: string;
+        reason: string | null;
+        capabilityStates?: Record<string, 'SUPPORTED' | 'UNSUPPORTED' | 'BLOCKED' | 'UNCERTAIN' | 'NOT_ESTABLISHED'>;
+      };
       blockers: Array<{ code: string; message: string }>;
     }>;
     getDeveloperBackendAuthToken: () => Promise<string>;
@@ -377,6 +384,7 @@ interface Window {
         at?: string;
       }>;
     }>;
+    onDeveloperActivity?: (callback: (event: import('./features/coding/codingActivity').CodingActivityEvent) => void) => () => void;
     undoDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; evidence?: Array<{ kind: string; operation?: string; paths?: string[]; decision?: string; reason?: string; at?: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperSession: () => Promise<{ sessionId: string }>;

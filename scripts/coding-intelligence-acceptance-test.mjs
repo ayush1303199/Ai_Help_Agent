@@ -318,7 +318,7 @@ print("PYTHON_INTELLIGENCE_OK")
     developerAgent.resetForTest();
     if (originalRoots === undefined) delete process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS;
     else process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS = originalRoots;
-    await fs.rm(testTempDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(testTempDir, { recursive: true, force: true });
   }
 }
 

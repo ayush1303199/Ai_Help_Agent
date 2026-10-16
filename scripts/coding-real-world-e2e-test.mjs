@@ -7,6 +7,11 @@ import developerAgent from '../electron/developerAgent.cjs';
 import developerFiles from '../electron/developerFiles.cjs';
 
 const authorizeMutation = async () => ({ allowed: true });
+assert.ok(process.env.AI_HELP_AGENT_TEST_BACKEND_URL, 'Run this integration test through the isolated test harness.');
+const backendUrl = new URL(process.env.AI_HELP_AGENT_TEST_BACKEND_URL);
+assert.equal(backendUrl.hostname, '127.0.0.1', 'Integration tests require the isolated loopback backend.');
+assert.notEqual(backendUrl.port, '3001', 'Integration tests must not target the live backend port.');
+const backendBaseUrl = backendUrl.origin;
 
 console.log('[TEST-MATRIX] Starting 10-point Verification Matrix for Coding Agent Project Attachment & Failure Elimination...');
 
@@ -51,7 +56,7 @@ try {
   // TEST 2: Browser Directory Picker & Discovery [INTEGRATION/E2E]
   // =========================================================================
   console.log('[TEST 2] Browser Directory Discovery Bridge (/api/coding/project-discover)...');
-  const discoverRes = await fetch('http://localhost:3001/api/coding/project-discover', {
+  const discoverRes = await fetch(`${backendBaseUrl}/api/coding/project-discover`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -69,7 +74,7 @@ try {
   // TEST 3: Project Attachment Contract [INTEGRATION]
   // =========================================================================
   console.log('[TEST 3] Project Attachment Contract (/api/coding/project-attach & developerFiles.attachProject)...');
-  const attachRes = await fetch('http://localhost:3001/api/coding/project-attach', {
+  const attachRes = await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectRoot: projectPath }),
@@ -89,7 +94,7 @@ try {
   // TEST 4: Project State Synchronization [INTEGRATION/BUSINESS]
   // =========================================================================
   console.log('[TEST 4] Project State Synchronization (Electron <-> Backend)...');
-  const backendStateRes = await fetch('http://localhost:3001/api/coding/project-state');
+  const backendStateRes = await fetch(`${backendBaseUrl}/api/coding/project-state`);
   const backendState = await backendStateRes.json();
   assert.equal(backendState.status, 'PROJECT_ATTACHED');
   assert.equal(backendState.attached, true);
@@ -105,7 +110,7 @@ try {
   // =========================================================================
   console.log('[TEST 5] Renderer Reload Persistence & Recovery...');
   // Simulating fresh renderer session requesting state on mount
-  const reloadedSessionStateRes = await fetch('http://localhost:3001/api/coding/project-state');
+  const reloadedSessionStateRes = await fetch(`${backendBaseUrl}/api/coding/project-state`);
   const reloadedSessionState = await reloadedSessionStateRes.json();
   assert.equal(reloadedSessionState.status, 'PROJECT_ATTACHED');
   assert.equal(reloadedSessionState.projectRoot.toLowerCase(), projectPath.toLowerCase());
@@ -115,19 +120,19 @@ try {
   // TEST 6: Project Detach [INTEGRATION/BUSINESS]
   // =========================================================================
   console.log('[TEST 6] Project Detach & Refusal of Project Operations...');
-  const clearRes = await fetch('http://localhost:3001/api/coding/project-clear', { method: 'POST' });
+  const clearRes = await fetch(`${backendBaseUrl}/api/coding/project-clear`, { method: 'POST' });
   assert.equal(clearRes.ok, true);
   const clearedState = await clearRes.json();
   assert.equal(clearedState.status, 'PROJECT_DETACHED');
   assert.equal(clearedState.attached, false);
 
   // File operations must now be rejected
-  const rejectedRead = await fetch('http://localhost:3001/api/coding/read-file?path=package.json');
+  const rejectedRead = await fetch(`${backendBaseUrl}/api/coding/read-file?path=package.json`);
   assert.equal(rejectedRead.status, 409, 'Detached project must reject file read with HTTP 409');
   console.log('  -> TEST 6 PASSED: Detach blocks project operations.');
 
   // Re-attach for subsequent tests
-  await fetch('http://localhost:3001/api/coding/project-attach', {
+  await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectRoot: projectPath }),
@@ -139,20 +144,20 @@ try {
   console.log('[TEST 7] Missing Directory Detection (PROJECT_MISSING)...');
   const missingDirPath = path.join(tempDir, 'deleted-folder');
   await fs.mkdir(missingDirPath, { recursive: true });
-  await fetch('http://localhost:3001/api/coding/project-attach', {
+  await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectRoot: missingDirPath }),
   });
   // Delete the directory from disk
   await fs.rm(missingDirPath, { recursive: true, force: true });
-  const missingStateRes = await fetch('http://localhost:3001/api/coding/project-state');
+  const missingStateRes = await fetch(`${backendBaseUrl}/api/coding/project-state`);
   const missingState = await missingStateRes.json();
   assert.equal(missingState.status, 'PROJECT_MISSING', 'Deleted directory must report PROJECT_MISSING');
   console.log('  -> TEST 7 PASSED: PROJECT_MISSING detected accurately.');
 
   // Re-attach projectPath
-  await fetch('http://localhost:3001/api/coding/project-attach', {
+  await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectRoot: projectPath }),
@@ -162,13 +167,13 @@ try {
   // TEST 8: Unauthorized File Access & Security Scoping [SECURITY/INTEGRATION]
   // =========================================================================
   console.log('[TEST 8] Unauthorized File Access & Security Boundary Check...');
-  const outsidePathRes = await fetch('http://localhost:3001/api/coding/read-file?path=../outside-secret.txt');
+  const outsidePathRes = await fetch(`${backendBaseUrl}/api/coding/read-file?path=../outside-secret.txt`);
   assert.equal(outsidePathRes.status, 400, 'Path traversal must be rejected with HTTP 400');
 
-  const sensitiveRes = await fetch('http://localhost:3001/api/coding/read-file?path=.env');
+  const sensitiveRes = await fetch(`${backendBaseUrl}/api/coding/read-file?path=.env`);
   assert.equal(sensitiveRes.status, 400, 'Sensitive path .env must be rejected with HTTP 400');
 
-  const validFileRes = await fetch('http://localhost:3001/api/coding/read-file?path=src/index.ts');
+  const validFileRes = await fetch(`${backendBaseUrl}/api/coding/read-file?path=src/index.ts`);
   assert.equal(validFileRes.status, 200, 'Authorized project file must be allowed with HTTP 200');
   console.log('  -> TEST 8 PASSED: Security scoping and containment verified.');
 
@@ -176,20 +181,20 @@ try {
   // TEST 9: Coding Agent File Inspection [INTEGRATION/BUSINESS]
   // =========================================================================
   console.log('[TEST 9] Coding Agent File Inspection & Tool Execution...');
-  const dirRes = await fetch('http://localhost:3001/api/coding/directory?path=.');
+  const dirRes = await fetch(`${backendBaseUrl}/api/coding/directory?path=.`);
   assert.equal(dirRes.ok, true);
   const dirEntries = await dirRes.json();
   const entryNames = dirEntries.map((e) => e.name);
   assert.ok(entryNames.includes('package.json'));
   assert.ok(entryNames.includes('models'));
 
-  const searchRes = await fetch('http://localhost:3001/api/coding/search-code?query=query&scope=.');
+  const searchRes = await fetch(`${backendBaseUrl}/api/coding/search-code?query=query&scope=.`);
   assert.equal(searchRes.ok, true);
   const searchResults = await searchRes.json();
   assert.ok(searchResults.results.length > 0);
   assert.ok(searchResults.results.some((r) => r.path.includes('Order.php')));
 
-  const toolExecRes = await fetch('http://localhost:3001/api/coding/tool', {
+  const toolExecRes = await fetch(`${backendBaseUrl}/api/coding/tool`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -264,5 +269,5 @@ try {
   console.log('  -> TEST 10 PASSED: Approval gate, atomic apply, and rollback verified.');
   console.log('[TEST-MATRIX] ALL 10 VERIFICATION TESTS PASSED SUCCESSFULLY (10/10).');
 } finally {
-  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  await fs.rm(tempDir, { recursive: true, force: true });
 }
