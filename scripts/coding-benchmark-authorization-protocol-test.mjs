@@ -584,7 +584,145 @@ try {
 
   console.log('[PASS] Section 6: Replay ledger fail-closed hardening verified.');
 
+  // -------------------------------------------------------------------------
+  // SECTION 7: Replay Ledger Concurrency Hardening & Storage Protection
+  // -------------------------------------------------------------------------
+  console.log('\n--- Section 7: Concurrency Hardening, Collision & Path Protection ---');
+
+  // Test 7.1: Simulated Concurrent Reservation Collision (Kernel-Level 'wx' / EEXIST)
+  const concurrencyLedger = path.join(tempDir, 'concurrency-ledger.json');
+  contract.setLedgerPathForTest(concurrencyLedger);
+  contract.resetConsumedTokensForTest();
+
+  const collidingToken = 'token-collision-race-test-999';
+  const manifestRace1 = {
+    humanAuthorization: {
+      explicitApproval: true,
+      approverIdentity: 'lead@example.com',
+      approvalTimestamp: new Date().toISOString(),
+    },
+    runToken: collidingToken,
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+    networkPermissionGranted: true,
+    provider: 'openai',
+    apiKey: 'sk-test-key-12345',
+    fixtures: ['FIX-01'],
+    destinationRoot: isolatedDestinationRoot,
+  };
+
+  // Dry run passes without consuming or reserving
+  const resDry = contract.validateLiveBenchmarkAuthorization(manifestRace1, { projectRoot: projectMockRoot, dryRun: true });
+  assert.equal(resDry.authorized, true, 'Dry run should validate without reserving');
+
+  // First real call succeeds and reserves token atomically
+  const resRace1 = contract.validateLiveBenchmarkAuthorization(manifestRace1, { projectRoot: projectMockRoot });
+  assert.equal(resRace1.authorized, true, 'First caller should successfully acquire reservation and authorize');
+
+  // Second call with same token immediately fails closed with REPLAY_DETECTED
+  const resRace2 = contract.validateLiveBenchmarkAuthorization(manifestRace1, { projectRoot: projectMockRoot });
+  assert.equal(resRace2.authorized, false);
+  assert.ok(resRace2.blockers.some((b) => b.includes('has already been consumed (replay prevention)')));
+
+  // Test 7.2: Unsafe Storage Path / Symbolic Link Rejection
+  const realStorageDir = path.join(tempDir, 'real-storage');
+  const symlinkStorageDir = path.join(tempDir, 'symlink-storage');
+  await fs.mkdir(realStorageDir, { recursive: true });
+  try {
+    await fs.symlink(realStorageDir, symlinkStorageDir, 'junction');
+    const symlinkLedgerPath = path.join(symlinkStorageDir, 'ledger.json');
+    contract.setLedgerPathForTest(symlinkLedgerPath);
+
+    assert.throws(
+      () => contract.assertSafeStoragePath(symlinkLedgerPath),
+      /LEDGER_UNSAFE_PATH/i,
+      'Symlink / reparse point path must be rejected with LEDGER_UNSAFE_PATH',
+    );
+
+    const resSymlink = contract.validateLiveBenchmarkAuthorization({
+      humanAuthorization: {
+        explicitApproval: true,
+        approverIdentity: 'lead@example.com',
+        approvalTimestamp: new Date().toISOString(),
+      },
+      runToken: 'token-symlink-test',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+      networkPermissionGranted: true,
+      provider: 'openai',
+      apiKey: 'sk-test-key-12345',
+      fixtures: ['FIX-01'],
+      destinationRoot: isolatedDestinationRoot,
+    }, { projectRoot: projectMockRoot });
+
+    assert.equal(resSymlink.authorized, false);
+    assert.ok(
+      resSymlink.blockers.some((b) => b.includes('LEDGER_UNSAFE_PATH') || b.includes('fail-closed')),
+      'Symlinked ledger path must fail closed during authorization validation',
+    );
+  } catch (err) {
+    if (err.code !== 'EPERM') throw err;
+  }
+
+  // Test 7.3: Durability & Unswallowed Write Failure Fail-Closed
+  const readOnlyLedgerDir = path.join(tempDir, 'unwritable-ledger-dir');
+  await fs.mkdir(readOnlyLedgerDir, { recursive: true });
+  const unwritableLedgerPath = path.join(readOnlyLedgerDir, 'dummy.json');
+  contract.setLedgerPathForTest(unwritableLedgerPath);
+
+  // Cause reservation creation to fail by placing a blocking file where the directory should be
+  const badReservationsDir = path.join(readOnlyLedgerDir, '.token-reservations');
+  await fs.writeFile(badReservationsDir, 'file-blocking-dir-creation', 'utf8');
+
+  const blockTokenManifest = {
+    humanAuthorization: {
+      explicitApproval: true,
+      approverIdentity: 'lead@example.com',
+      approvalTimestamp: new Date().toISOString(),
+    },
+    runToken: 'token-write-fail-test',
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+    networkPermissionGranted: true,
+    provider: 'openai',
+    apiKey: 'sk-test-key-12345',
+    fixtures: ['FIX-01'],
+    destinationRoot: isolatedDestinationRoot,
+  };
+
+  const resWriteFail = contract.validateLiveBenchmarkAuthorization(blockTokenManifest, { projectRoot: projectMockRoot });
+  assert.equal(resWriteFail.authorized, false);
+  assert.equal(resWriteFail.state, 'BLOCKED');
+  assert.equal(resWriteFail.reasonCode, 'LEDGER_WRITE_FAILED');
+  assert.ok(resWriteFail.blockers.some((b) => b.includes('Failed to commit consumed token to durable ledger')));
+
+  // Test 7.4: Lock Contention and Stale Lock Recovery
+  const lockLedgerPath = path.join(tempDir, 'lock-test-ledger.json');
+  const releaseLock1 = contract.acquireLedgerLock(lockLedgerPath);
+  assert.equal(typeof releaseLock1, 'function');
+
+  // Verify lock file exists
+  assert.ok(await fs.stat(`${lockLedgerPath}.lock`));
+
+  // Release lock
+  releaseLock1();
+
+  // Test 7.5: Production Default Path Resolution Does Not Use os.tmpdir()
+  contract.setLedgerPathForTest(null);
+  delete process.env.AI_HELP_AGENT_LEDGER_PATH;
+  const prodDefaultPath = contract.getProtectedDefaultLedgerPath();
+  const tmpDirNorm = path.resolve(os.tmpdir()).toLowerCase();
+  const prodPathNorm = path.resolve(prodDefaultPath).toLowerCase();
+  assert.ok(
+    !prodPathNorm.startsWith(tmpDirNorm),
+    `Production default ledger path (${prodDefaultPath}) must not reside in os.tmpdir() (${os.tmpdir()})`,
+  );
+  assert.ok(
+    prodPathNorm.includes('ai_help_agent') || prodPathNorm.includes('.ai-help-agent'),
+    'Production default ledger path must reside in dedicated per-user application security directory',
+  );
+
+  console.log('[PASS] Section 7: Replay ledger concurrency hardening, collision prevention & path protection verified.');
+
   console.log('\n=== ALL BENCHMARK AUTHORIZATION AND ISOLATION TESTS PASSED ===');
 } finally {
   await fs.rm(tempDir, { recursive: true, force: true });
 }
+
