@@ -153,6 +153,10 @@ const RETRY_INTERVAL_MS = 25;
  */
 function acquireLedgerLock(ledgerPath) {
   const lockPath = `${ledgerPath}.lock`;
+  const dir = path.dirname(ledgerPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
   const startTime = Date.now();
 
   while (Date.now() - startTime < LOCK_TIMEOUT_MS) {
