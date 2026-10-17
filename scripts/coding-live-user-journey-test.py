@@ -26,6 +26,7 @@ import sqlite3
 import tempfile
 import asyncio
 import time
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -519,12 +520,28 @@ def run_tests():
         print(f"  -> LIFECYCLE: {' -> '.join(lifecycle_d)}")
 
         # 3. Policy Gate write enforcement: Unapproved write BLOCKED
-        write_eval_unapproved, reason_unapproved = PolicyGate.evaluate_file_write("models/Order.php", proposal_approved=False)
+        request_binding_d = {
+            "taskId": "task-journey-d",
+            "turnId": "turn-journey-d",
+            "requestHash": hashlib.sha256(b"fix it").hexdigest(),
+            "root": str(Path(project_root).resolve()),
+            "scope": ".",
+            "authorizedFeatures": ["shared"],
+        }
+        write_eval_unapproved, reason_unapproved = PolicyGate.evaluate_file_write(
+            "models/Order.php",
+            proposal_approved=False,
+            request_binding=request_binding_d,
+        )
         assert write_eval_unapproved == "BLOCK"
         print(f"  -> WRITE PROTECTION (UNAPPROVED): BLOCK ({reason_unapproved})")
 
         # 4. Policy Gate write enforcement: Approved write ALLOWED
-        write_eval_approved, reason_approved = PolicyGate.evaluate_file_write("models/Order.php", proposal_approved=True)
+        write_eval_approved, reason_approved = PolicyGate.evaluate_file_write(
+            "models/Order.php",
+            proposal_approved=True,
+            request_binding=request_binding_d,
+        )
         assert write_eval_approved == "ALLOW"
         print(f"  -> WRITE PROTECTION (APPROVED): ALLOW ({reason_approved})")
         print("  ==> TEST D PASSED (100% compliant)")
@@ -1305,8 +1322,16 @@ def run_tests():
         print("  -> 3. INVARIANT 3: Architecture, code review, and general repository task classification unchanged.")
 
         # 4. Source-write approval remains unchanged
-        assert PolicyGate.evaluate_file_write("src/file.py", proposal_approved=False)[0] == "BLOCK"
-        assert PolicyGate.evaluate_file_write("src/file.py", proposal_approved=True)[0] == "ALLOW"
+        request_binding_invariant = {
+            "taskId": "task-invariant-4",
+            "turnId": "turn-invariant-4",
+            "requestHash": hashlib.sha256(b"source-write-approval").hexdigest(),
+            "root": str(Path(project_root).resolve()),
+            "scope": ".",
+            "authorizedFeatures": ["shared"],
+        }
+        assert PolicyGate.evaluate_file_write("src/file.py", proposal_approved=False, request_binding=request_binding_invariant)[0] == "BLOCK"
+        assert PolicyGate.evaluate_file_write("src/file.py", proposal_approved=True, request_binding=request_binding_invariant)[0] == "ALLOW"
         print("  -> 4. INVARIANT 4: Source-write approval policy gating strictly preserved.")
 
         # 5. DB read-only investigation does NOT enter source-write approval
