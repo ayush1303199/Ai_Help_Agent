@@ -89,7 +89,7 @@
     "modelCatalogTimeoutSeconds": 15,
     "sttRequestTimeoutSeconds": 60,
     "codingCompletionTokens": 1024,
-    "codingContextBudgetTokens": 6000,
+    "codingContextBudgetTokens": 12000,
     "codingProviderInputLimitTokens": 0,
     "codingContextSafetyRatio": 0.65,
     "codingContextBytesPerToken": 2,

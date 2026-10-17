@@ -2008,6 +2008,8 @@ function sanitizeVerificationSnapshot(value) {
     executed: attempt?.executed === true,
     exitCode: Number.isInteger(attempt?.exitCode) ? attempt.exitCode : null,
     classification: typeof attempt?.classification === 'string' ? redact(attempt.classification) : null,
+    stderr: typeof attempt?.stderr === 'string' ? redact(attempt.stderr) : (attempt?.extracted?.message ? redact(attempt.extracted.message) : null),
+    stdout: typeof attempt?.stdout === 'string' ? redact(attempt.stdout) : null,
     extracted: attempt?.extracted && typeof attempt.extracted === 'object'
       ? redact(attempt.extracted)
       : null,

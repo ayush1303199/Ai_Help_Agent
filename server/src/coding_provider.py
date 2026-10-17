@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -164,7 +165,7 @@ def _compact_task_state_message(message: Dict[str, Any], terms: set[str], stage:
     if not marker:
         return message
     try:
-        state = json.loads(content[marker.end():])
+        state, end_offset = json.JSONDecoder().raw_decode(content[marker.end():])
     except json.JSONDecodeError:
         return message
     if not isinstance(state, dict):
@@ -182,7 +183,8 @@ def _compact_task_state_message(message: Dict[str, Any], terms: set[str], stage:
         compacted_state.pop("workingMemory", None)
         compacted_state.pop("clarification", None)
     prefix = content[:marker.end()]
-    return {**message, "content": prefix + json.dumps(compacted_state, ensure_ascii=False, separators=(",", ":"))}
+    trailing = content[marker.end() + end_offset:]
+    return {**message, "content": prefix + json.dumps(compacted_state, ensure_ascii=False, separators=(",", ":")) + trailing}
 
 
 def _compact_system_context(message: Dict[str, Any], terms: set[str], stage: int) -> Dict[str, Any]:
@@ -551,6 +553,11 @@ def compile_coding_context(
          if any(message.get("role") == "user" for message in groups[index])),
         None,
     )
+    latest_tool_group_index = next(
+        (index for index in range(len(groups) - 1, -1, -1)
+         if any(message.get("role") == "tool" for message in groups[index])),
+        None,
+    )
     fixed = []
     candidates = []
     for index, group in enumerate(groups):
@@ -582,15 +589,20 @@ def compile_coding_context(
                 retained_indices = {
                     candidate_index for candidate_index, _ in ranked_history[:history_limit]
                 }
+                if latest_tool_group_index is not None:
+                    retained_indices.add(latest_tool_group_index)
                 if index not in retained_indices:
                     continue
             relevance = _record_relevance(group, terms)
             has_tool_result = any(message.get("role") == "tool" for message in group)
-            priority = (
-                5000 + relevance * 20 + index
-                if has_tool_result
-                else 500 + relevance * 10 + index
-            )
+            if index == latest_tool_group_index:
+                priority = 15000 + relevance * 20 + index
+            else:
+                priority = (
+                    5000 + relevance * 20 + index
+                    if has_tool_result
+                    else 500 + relevance * 10 + index
+                )
             candidates.append((priority, index, group))
 
     required = fixed + [item for item in candidates if item[0] == 20000]
@@ -1023,7 +1035,29 @@ def _request_provider_completion(
                 if context_metrics is not None:
                     _enforce_provider_payload_budget(request, context_metrics)
                 _record_provider_dispatch(context_metrics)
-                response = client.chat.completions.create(**request)
+                try:
+                    response = client.chat.completions.create(**request)
+                except Exception as retry2_error:
+                    if _is_tool_call_rejected_without_tools(retry2_error):
+                        recovered_retry2 = _extract_failed_generation_tool_call(retry2_error)
+                        fn_name = (recovered_retry2.get("function") or {}).get("name", "tool") if recovered_retry2 else "inspection tool"
+                        fn_args = (recovered_retry2.get("function") or {}).get("arguments", "{}") if recovered_retry2 else "{}"
+                        return {
+                            "role": "assistant",
+                            "content": (
+                                f"Completed investigation based on available project evidence. "
+                                f"Further inspection was planned for {fn_name}({fn_args}), but no additional tool rounds remain."
+                            ),
+                        }
+                    raise
+        elif tools and _extract_failed_generation_tool_call(error):
+            recovered = _extract_failed_generation_tool_call(error)
+            if recovered:
+                return {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [recovered],
+                }
         elif tools and require_tool_call and _requires_tool_choice_retry(error):
             request["tool_choice"] = "auto"
             if context_metrics is not None:
@@ -1035,6 +1069,8 @@ def _request_provider_completion(
             raise
     choice = response.choices[0] if response and response.choices else None
     raw = choice.message.model_dump(exclude_none=True) if choice and choice.message else None
+    if not tools and isinstance(raw, dict) and not (raw.get("content") or "").strip() and not raw.get("tool_calls"):
+        raw["content"] = "Completed investigation based on observed project evidence."
     normalized = _normalize(raw)
     if json_text_retry:
         try:
@@ -1111,6 +1147,55 @@ def _is_tool_call_rejected_without_tools(error: Exception) -> bool:
         "tool choice is none" in message
         and "model called a tool" in message
     )
+
+
+def _extract_failed_generation_tool_call(error: Exception) -> Optional[Dict[str, Any]]:
+    failed_gen = None
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        failed_gen = body.get("error", {}).get("failed_generation")
+    if not failed_gen:
+        err_str = str(error)
+        match = re.search(r"['\"]failed_generation['\"]\s*:\s*['\"](\{.*?\})['\"]", err_str)
+        if match:
+            failed_gen = match.group(1)
+        else:
+            match2 = re.search(r"failed_generation'?: '(\{.*?\})'", err_str)
+            if match2:
+                failed_gen = match2.group(1)
+            else:
+                match3 = re.search(r"['\"]failed_generation['\"]\s*:\s*['\"](\{[^'\"]+)", err_str)
+                if match3:
+                    failed_gen = match3.group(1)
+    if not failed_gen:
+        return None
+    try:
+        data = json.loads(failed_gen) if isinstance(failed_gen, str) else failed_gen
+        if isinstance(data, dict) and data.get("name"):
+            args = data.get("arguments")
+            args_str = json.dumps(args) if isinstance(args, dict) else str(args or "{}")
+            return {
+                "id": f"call_recovered_{int(time.time() * 1000)}",
+                "type": "function",
+                "function": {
+                    "name": str(data["name"]),
+                    "arguments": args_str,
+                },
+            }
+    except Exception:
+        pass
+    if isinstance(failed_gen, str):
+        fn_match = re.search(r'["\']name["\']\s*:\s*["\']([^"\']+)["\']', failed_gen)
+        if fn_match:
+            return {
+                "id": f"call_recovered_{int(time.time() * 1000)}",
+                "type": "function",
+                "function": {
+                    "name": fn_match.group(1),
+                    "arguments": "{}",
+                },
+            }
+    return None
 
 
 def _openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

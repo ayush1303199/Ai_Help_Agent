@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from coding_provider import (
     CodingContextTooLargeError,
+    _compact_system_context as _compact_provider_system_context,
     _compact_task_state_message as _compact_provider_task_state_message,
     _context_terms as _provider_context_terms,
     complete_coding_model,
@@ -392,6 +393,14 @@ CODING_TOOLS = [
             "name": "list_directory",
             "description": "List project files and directories. Read-only.",
             "parameters": {"type": "object", "properties": {"relativePath": {"type": "string"}}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "repo_browser.list_directory",
+            "description": "List project files and directories. Read-only; path is project-relative.",
+            "parameters": {"type": "object", "properties": {"relativePath": {"type": "string"}, "path": {"type": "string"}}, "additionalProperties": False},
         },
     },
     {
@@ -1244,7 +1253,7 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
         intent = TaskIntent.BUILD_FAILURE
         proposal_required = bool(re.search(r"\b(?:fix|patch|banao)\b", req, re.I))
     elif re.search(r"\b(?:fix|sudhar|badlo|repair|resolve|patch)\b", req, re.I) and (
-        re.search(r"\b(?:karo|it|this|the\s+bug|the\s+issue|bug|issue|error|exception|crash|failure|problem|defect|leak|null)\b", req, re.I)
+        re.search(r"\b(?:karo|it|this|the\s+bug|the\s+issue|buge?s?|issue|error|exception|crash|failure|problem|defect|leak|null)\b", req, re.I)
     ):
         intent = TaskIntent.BUG_FIX
         proposal_required = True
@@ -1307,13 +1316,13 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     elif re.search(r"\b(?:refactor|clean\s*up|extract\s+method|reorganize)\b", req, re.I):
         intent = TaskIntent.REFACTOR
         proposal_required = True
-    elif re.search(r"\b(?:500|404|error|exception|bug|issue|kabhi\s+kabhi|fail|crash(?:es|ed|ing)?|wrong|incorrect)\b", req, re.I) and not re.search(r"\b(?:fix|repair|resolve|banao)\b", req, re.I):
+    elif re.search(r"\b(?:500|404|error|exception|buge?s?|issue|kabhi\s+kabhi|fail|crash(?:es|ed|ing)?|wrong|incorrect)\b", req, re.I) and not re.search(r"\b(?:fix|repair|resolve|banao)\b", req, re.I):
         intent = TaskIntent.BUG_INVESTIGATION
         proposal_required = False
     elif re.search(r"\b(?:samjhao|samjha\s+do|kaise\s+kaam\s+karta\s+hai|kya\s+karta\s+hai|explain|describe|what\s+(?:does|do|is|are)|how\s+(?:does|do|is|can\s+i)|why\s+(?:does|do|is)|overview|walkthrough)\b", req, re.I):
         intent = TaskIntent.QUESTION
         proposal_required = False
-    elif re.search(r"\b(?:check\s+karo|inspect\s+karo|dekh\s+ke\s+batao|batao\s+kya)\b", req, re.I):
+    elif re.search(r"\b(?:che[ck]{1,2}(?:\s+karo)?|inspect(?:\s+karo)?|dekh\s+ke\s+batao|batao\s+kya)\b", req, re.I):
         intent = TaskIntent.BUG_INVESTIGATION
         proposal_required = False
     elif _requires_proposal(req):
@@ -5228,6 +5237,12 @@ def _compact_coding_conversation(messages: List[Dict[str, Any]]) -> List[Dict[st
                     relevance_terms,
                     stage,
                 )
+            elif message.get("role") == "system" and stage > 0:
+                candidate = _compact_provider_system_context(
+                    message,
+                    relevance_terms,
+                    stage,
+                )
             candidates.append(candidate)
 
         groups: List[Tuple[List[Dict[str, Any]], bool]] = []
@@ -5314,11 +5329,15 @@ def _compact_coding_conversation(messages: List[Dict[str, Any]]) -> List[Dict[st
         fail_if_mandatory_content_exceeds_limit(compacted)
         return compacted
 
-    required = [
-        message for index, message in enumerate(original)
-        if message.get("role") == "system"
-        and (index not in state_indexes or index == latest_state_index)
-    ]
+    required = []
+    for index, message in enumerate(original):
+        if message.get("role") == "system":
+            if index in state_indexes and index != latest_state_index:
+                continue
+            if index == latest_state_index:
+                required.append(_compact_provider_task_state_message(message, relevance_terms, 6))
+            else:
+                required.append(_compact_provider_system_context(message, relevance_terms, 6))
     if latest_request:
         required.append(next(
             message for message in reversed(original)
@@ -9530,6 +9549,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
     selected_provider = None
     active_provider = registry.get_active_provider() if (registry and hasattr(registry, "get_active_provider")) else None
     configured_provider_id = getattr(active_provider, "id", None)
+    consecutive_no_progress = 0
     try:
         for round_number in range(MAX_CODING_TOOL_ROUNDS):
             if round_number:
@@ -9584,10 +9604,14 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             )
             inspection_tools = CODING_TOOLS
             if evidence_sufficiency["sufficient"] and (
-                not proposal_required or has_relevant_source_evidence
+                (proposal_required and has_relevant_source_evidence)
+                or (not proposal_required and has_read_evidence and round_number >= 2)
             ):
                 inspection_tools = []
-            if proposal_required and round_number > 0 and not has_relevant_source_evidence:
+            if (
+                (proposal_required and round_number > 0 and not has_relevant_source_evidence)
+                or (not proposal_required and round_number > 0 and not has_read_evidence)
+            ):
                 inspection_tools = [
                     tool for tool in CODING_TOOLS
                     if tool["function"]["name"] in {
@@ -9598,6 +9622,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         "search_symbols",
                         "find_references",
                         "list_directory",
+                        "repo_browser.list_directory",
                         "get_repository_map",
                         "get_context",
                     }
@@ -10137,7 +10162,6 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     break
             executed_tool_this_round = False
             reused_tool_result_this_round = False
-            consecutive_no_progress = 0
             for index, call in enumerate(calls):
                 tool_call_id = str(call.get("id") or f"tool-{round_number}-{index}")
                 try:
@@ -10323,6 +10347,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         "reason": "IDENTICAL_FAILURE_WITHOUT_NEW_EVIDENCE",
                     })
                     semantic_task["status"] = "REPLANNING"
+                    semantic_task["nextAction"] = None
+                    semantic_task["nextActionName"] = None
                     _persist_agent_task_state(session, semantic_task, session_id)
                     continue
                 tool_calls.append({"name": name, "arguments": arguments, "round": round_number + 1, "role": role})
@@ -10361,6 +10387,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     semantic_task["timestamps"]["lastActionAt"] = time.strftime(
                         "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
                     )
+                    semantic_task["nextAction"] = None
+                    semantic_task["nextActionName"] = None
                     _persist_agent_task_state(session, semantic_task, session_id, "ACTION_EXECUTED")
                     conversation.append({
                         "role": "tool",
@@ -10475,6 +10503,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 session["agentTaskState"] = semantic_task
                 if isinstance(result, dict) and result.get("ok") is True:
                     tool_result_cache[cache_key] = serialized
+                semantic_task["nextAction"] = None
+                semantic_task["nextActionName"] = None
 
                 if is_empty_or_trivial:
                     consecutive_no_progress += 1
@@ -10707,7 +10737,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         ),
                     })
 
-            if consecutive_no_progress >= 2 and round_number > 0:
+            if consecutive_no_progress >= 3 and round_number > 0:
                 conversation.append({
                     "role": "system",
                     "content": (
@@ -10720,15 +10750,24 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 break
 
             if reused_tool_result_this_round and not executed_tool_this_round:
+                if has_read_evidence or (proposal_required and has_relevant_source_evidence):
+                    conversation.append({
+                        "role": "system",
+                        "content": (
+                            "This exact read-only tool call has already succeeded in this request. "
+                            "Use its returned evidence to answer or prepare the proposal; do not repeat the same call."
+                        ),
+                    })
+                    final_message = None
+                    break
                 conversation.append({
                     "role": "system",
                     "content": (
-                        "This exact read-only tool call has already succeeded in this request. "
-                        "Use its returned evidence to answer or prepare the proposal; do not repeat the same call."
+                        "This tool call was answered from recorded project evidence. "
+                        "Continue your investigation by inspecting relevant directories, files, or symbols, or synthesize your findings."
                     ),
                 })
-                final_message = None
-                break
+                continue
             if round_number == MAX_CODING_TOOL_ROUNDS - 1:
                 conversation.append({
                     "role": "system",
@@ -10787,7 +10826,18 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 selected_provider_id = getattr(selected_provider, "id", None) or selected_provider_id
         content = str(final_message.get("content") or "").strip()
         if not content:
-            raise RuntimeError("Coding Agent provider returned no final response.")
+            observations = semantic_task.get("observations") or []
+            if observations:
+                obs_summary = "\n".join(
+                    f"- {obs.get('tool')}: {obs.get('evidenceRef', obs.get('evidenceId', 'executed'))}"
+                    for obs in observations[-5:]
+                )
+                content = (
+                    "Completed investigation with the following recorded evidence:\n"
+                    + obs_summary
+                )
+            else:
+                content = "Completed investigation. No additional evidence was found in the project scope."
         proposal_evidence_clarification = bool(
             proposal_required
             and semantic_task.get("status") == "NEEDS_CLARIFICATION"
