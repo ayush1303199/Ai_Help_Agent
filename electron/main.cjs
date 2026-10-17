@@ -1503,11 +1503,35 @@ app.whenReady().then(async () => {
     developerAgent.validateConversationToolContext(payload?.turnId, owner, root, scope);
     if (name === 'list_directory') {
       const relativePath = developerFiles.normalizeScopedProjectPath(root, scope, args.relativePath || '.');
-      return { ok: true, tool: name, data: await developerFiles.listDirectory(relativePath, event.sender.id) };
+      try {
+        return { ok: true, tool: name, data: await developerFiles.listDirectory(relativePath, event.sender.id) };
+      } catch (error) {
+        const targetPath = String(args.relativePath || args.path || relativePath);
+        return {
+          ok: false,
+          tool: name,
+          error: {
+            code: 'DIRECTORY_NOT_FOUND',
+            message: `Directory "${targetPath}" was not found in the project. Please inspect existing directories or use search_code.`,
+          },
+        };
+      }
     }
     if (name === 'read_file') {
       const relativePath = developerFiles.normalizeScopedProjectPath(root, scope, args.relativePath);
-      return { ok: true, tool: name, data: await developerFiles.readFile(relativePath, event.sender.id) };
+      try {
+        return { ok: true, tool: name, data: await developerFiles.readFile(relativePath, event.sender.id) };
+      } catch (error) {
+        const targetPath = String(args.relativePath || args.path || relativePath);
+        return {
+          ok: false,
+          tool: name,
+          error: {
+            code: 'FILE_NOT_FOUND',
+            message: `File "${targetPath}" was not found in the project. Please verify the file path using search_code or list_directory.`,
+          },
+        };
+      }
     }
     if (name === 'search_code') {
       if (!query || query.length > 200) throw new TypeError('Coding Agent search query is invalid.');

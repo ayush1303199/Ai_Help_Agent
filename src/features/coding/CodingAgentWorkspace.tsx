@@ -17,12 +17,12 @@ function codingActivityLabel(item: CodingActivity): string {
     if (item.action.tool === 'rollback') return 'Restoring approved snapshot';
   }
   switch (item.activityType) {
-    case 'SEARCHING': return 'Searching code';
-    case 'READING_FILE': return 'Reading file';
-    case 'DISCOVERING_REPOSITORY': return 'Discovering repository';
-    case 'INSPECTING_SYMBOL': return 'Inspecting symbol';
-    case 'TRACING_CALLER': return 'Tracing references';
-    case 'VERIFYING': return 'Running verification';
+    case 'SEARCHING': return 'Searched code';
+    case 'READING_FILE': return 'Analyzed';
+    case 'DISCOVERING_REPOSITORY': return 'Explored directory';
+    case 'INSPECTING_SYMBOL': return 'Inspected symbol';
+    case 'TRACING_CALLER': return 'Traced references';
+    case 'VERIFYING': return 'Ran verification';
     case 'INSPECTING_DATABASE':
       if (item.action.tool === 'discover_database_configuration') return 'Discovering database configuration';
       if (item.action.tool === 'DATABASE_SESSION') return 'Resolving database session';
@@ -93,23 +93,29 @@ function CodingActivityEntry({ item }: { item: CodingActivity }) {
   ].filter(Boolean);
   const status = codingActivityStatus(item);
   return <div className="text-[11px] text-slate-400">
-    <p>
-      <span className="mr-2 font-semibold text-sky-300">{codingActivityLabel(item)}</span>
-      <span className={`mr-2 font-semibold ${status.className}`} aria-label={status.label}>
+    <p className="flex flex-wrap items-center gap-1.5">
+      <span className="font-semibold text-sky-300">{codingActivityLabel(item)}</span>
+      {item.action.target && (
+        <code className="rounded bg-slate-800/80 px-1.5 py-0.5 font-mono text-[11px] text-sky-200">
+          {item.action.target}
+        </code>
+      )}
+      <span className={`font-semibold ${status.className}`} aria-label={status.label}>
         {status.icon} {status.label}
       </span>
-      {item.action.target && <span>{item.action.target}</span>}
     </p>
-    {item.action.reason && <p className="ml-2 mt-1 text-slate-500">{item.action.reason}</p>}
-    {details.length > 0 && <p className="ml-2 mt-1 text-slate-300">{details.join(' · ')}</p>}
-    {result?.paths && result.paths.length > 0 && <ul className="ml-2 mt-1 list-inside list-disc">
+    {item.action.reason && <p className="ml-2 mt-0.5 text-[10px] text-slate-500">{item.action.reason}</p>}
+    {details.length > 0 && <p className="ml-2 mt-0.5 text-[10px] text-slate-400">{details.join(' · ')}</p>}
+    {result?.paths && result.paths.length > 0 && <ul className="ml-2 mt-0.5 list-inside list-disc text-[10px] text-slate-300">
       {result.paths.map((path) => <li key={path}>{path}</li>)}
     </ul>}
     {item.action.expectedEvidence && item.action.expectedEvidence.length > 0 && (
-      <p className="ml-2 mt-1 text-slate-500">Evidence sought: {item.action.expectedEvidence.join(', ')}</p>
+      <p className="ml-2 mt-0.5 text-[10px] text-slate-500">Evidence sought: {item.action.expectedEvidence.join(', ')}</p>
     )}
-    {item.error?.message && <p className="ml-2 mt-1 text-rose-300">{item.error.message}</p>}
-    {item.terminalizedLocally && <p className="ml-2 mt-1 text-amber-300">No terminal result was received.</p>}
+    {item.status !== 'SKIPPED' && item.error?.message && (
+      <p className="ml-2 mt-0.5 text-[10px] text-rose-300">{item.error.message}</p>
+    )}
+    {item.terminalizedLocally && <p className="ml-2 mt-0.5 text-amber-300">No terminal result was received.</p>}
   </div>;
 }
 
@@ -719,8 +725,18 @@ export function CodingAgentWorkspace({
             {message.content && <button type="button" onClick={() => { void copyMessages([message], copyKey); }} className="rounded px-1.5 py-0.5 text-[10px] text-slate-500 hover:text-sky-200" aria-label={`Copy ${message.role} message`}>{copiedItem === copyKey ? 'Copied' : 'Copy Markdown'}</button>}
           </div>
           {message.content ? <CodingMarkdown content={message.content} /> : message.streaming && <p className="text-sm leading-relaxed text-slate-300">I’m understanding the request and inspecting the relevant files…</p>}
-          {message.role === 'assistant' && messageIndex === messages.length - 1 && activity.length > 0 && <div className="mt-3 space-y-2 rounded-md border border-slate-700 bg-slate-900/70 p-2">
-            {activity.map((item) => <CodingActivityEntry
+          {message.role === 'assistant' && messageIndex === messages.length - 1 && activity.length > 0 && <div className="mt-3 space-y-2 rounded-md border border-slate-700 bg-slate-900/70 p-2.5">
+            {activity.filter((item, idx, arr) => {
+              if (idx === 0) return true;
+              const prev = arr[idx - 1];
+              if ('event' in item && 'event' in prev) {
+                if (item.status === 'SKIPPED' && prev.status === 'SKIPPED' &&
+                    item.action.tool === prev.action.tool && item.action.target === prev.action.target) {
+                  return false;
+                }
+              }
+              return true;
+            }).map((item) => <CodingActivityEntry
               key={'event' in item ? `${item.executionId}:${item.activityId}` : item.id}
               item={item}
             />)}

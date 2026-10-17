@@ -6341,6 +6341,8 @@ def _activity_event_payload(
             "message": (
                 "No authoritative result was received."
                 if status == "UNVERIFIED"
+                else "Action skipped (already attempted)."
+                if status == "SKIPPED"
                 else "The operation reported a failure."
             )
         }
@@ -10318,6 +10320,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     "role": role,
                 })
                 if repeated_failure:
+                    consecutive_no_progress += 1
                     action["status"] = "SKIPPED"
                     repeated_result = {
                         "ok": False,
@@ -10507,7 +10510,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 semantic_task["nextAction"] = None
                 semantic_task["nextActionName"] = None
 
-                if is_empty_or_trivial:
+                if is_empty_or_trivial or outcome_status != ToolResultStatus.SUCCESS:
                     consecutive_no_progress += 1
                 else:
                     consecutive_no_progress = 0
@@ -10738,7 +10741,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         ),
                     })
 
-            if consecutive_no_progress >= 3 and round_number > 0:
+            if consecutive_no_progress >= 2 and round_number > 0:
                 conversation.append({
                     "role": "system",
                     "content": (
