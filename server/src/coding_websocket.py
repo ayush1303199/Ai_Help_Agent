@@ -9607,7 +9607,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 (proposal_required and has_relevant_source_evidence)
                 or (not proposal_required and has_read_evidence and round_number >= 2)
             ):
-                inspection_tools = []
+                final_message = None
+                break
             if (
                 (proposal_required and round_number > 0 and not has_relevant_source_evidence)
                 or (not proposal_required and round_number > 0 and not has_read_evidence)

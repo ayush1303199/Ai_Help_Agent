@@ -1144,8 +1144,15 @@ def _get_default_coding_tools() -> List[Dict[str, Any]]:
 def _is_tool_call_rejected_without_tools(error: Exception) -> bool:
     message = str(error).casefold()
     return (
-        "tool choice is none" in message
-        and "model called a tool" in message
+        (
+            "tool choice is none" in message
+            or "tool_choice is none" in message
+            or "tool choice is 'none'" in message
+            or "tool_choice is 'none'" in message
+        )
+        and ("model called a tool" in message or "failed_generation" in message)
+    ) or (
+        "tool_use_failed" in message and ("none" in message or "not provided" in message)
     )
 
 
