@@ -252,11 +252,21 @@ class DevServerManager {
         cleanupPromise: null,
         cleanupError: null,
         exitObserved: false,
+        spawnFailed: false,
+        spawnError: null,
         stopPromise: null,
       };
 
+      child.once('spawn', () => {
+        record.spawned = true;
+      });
       child.on('error', (error) => {
         record.startError = error.message;
+        if (!record.spawned) {
+          record.spawnFailed = true;
+          record.spawnError = error;
+          this._beginWorkspaceCleanup(taskId, record);
+        }
       });
       child.on('exit', () => {
         record.exitObserved = true;
@@ -283,6 +293,19 @@ class DevServerManager {
     if (record.stopPromise) return record.stopPromise;
     record.stopPromise = (async () => {
       try {
+        if (record.spawnFailed) {
+          try {
+            await this._beginWorkspaceCleanup(taskId, record);
+          } catch (cleanupError) {
+            throw new AggregateError(
+              [record.spawnError, cleanupError],
+              `Dev server failed to start and its isolated workspace cleanup also failed: ${cleanupError.message}`,
+            );
+          }
+          throw new Error(`Dev server failed to start: ${record.spawnError.message}`, {
+            cause: record.spawnError,
+          });
+        }
         if (!record.exitObserved
           && record.process.exitCode === null
           && record.process.signalCode === null) {
@@ -308,6 +331,9 @@ class DevServerManager {
         });
         await this._beginWorkspaceCleanup(taskId, record);
       } catch (error) {
+        if (error instanceof AggregateError || (record.spawnFailed && error.cause === record.spawnError)) {
+          throw error;
+        }
         throw new Error(`Unable to stop and clean up isolated dev server: ${error.message}`, { cause: error });
       }
 

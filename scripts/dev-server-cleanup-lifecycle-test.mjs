@@ -97,6 +97,56 @@ assert.deepEqual(await successfulStop, { stopped: true, pid: 8241 });
 assert.equal(successfulCleanupCalls, 1);
 assert.equal(successfulFixture.manager.getActiveServer('successful-task'), null);
 
+const spawnCleanupGate = deferred();
+let spawnFailureCleanupCalls = 0;
+const spawnFailure = new Error('Synthetic process spawn failure.');
+const spawnFailureFixture = createManager(() => {
+  spawnFailureCleanupCalls += 1;
+  return spawnCleanupGate.promise;
+});
+const spawnFailureRecord = await spawnFailureFixture.manager.startDevServer('spawn-failure-task', 'unused-project');
+spawnFailureFixture.child.emit('error', spawnFailure);
+await Promise.resolve();
+assert.equal(spawnFailureCleanupCalls, 1);
+assert.equal(spawnFailureRecord.spawnFailed, true);
+assert.equal(spawnFailureFixture.manager.getActiveServer('spawn-failure-task'), spawnFailureRecord);
+const spawnFailureStop = spawnFailureFixture.manager.stopDevServer('spawn-failure-task');
+assert.equal(spawnFailureCleanupCalls, 1);
+spawnCleanupGate.resolve();
+await assert.rejects(spawnFailureStop, (error) => {
+  assert.match(error.message, /Dev server failed to start/);
+  assert.equal(error.cause, spawnFailure);
+  return true;
+});
+assert.equal(spawnFailureCleanupCalls, 1);
+assert.equal(spawnFailureFixture.manager.getActiveServer('spawn-failure-task'), null);
+
+const spawnAndCleanupGate = deferred();
+let spawnAndCleanupCalls = 0;
+const spawnAndCleanupFailure = new Error('Synthetic failed spawn cleanup.');
+const spawnAndCleanupFixture = createManager(() => {
+  spawnAndCleanupCalls += 1;
+  return spawnAndCleanupGate.promise;
+});
+const spawnAndCleanupRecord = await spawnAndCleanupFixture.manager.startDevServer('spawn-cleanup-failure-task', 'unused-project');
+spawnAndCleanupFixture.child.emit('error', spawnFailure);
+await Promise.resolve();
+const spawnAndCleanupStop1 = spawnAndCleanupFixture.manager.stopDevServer('spawn-cleanup-failure-task');
+const spawnAndCleanupStop2 = spawnAndCleanupFixture.manager.stopDevServer('spawn-cleanup-failure-task');
+assert.equal(spawnAndCleanupCalls, 1);
+assert.equal(spawnAndCleanupFixture.manager.getActiveServer('spawn-cleanup-failure-task'), spawnAndCleanupRecord);
+spawnAndCleanupGate.reject(spawnAndCleanupFailure);
+for (const stop of [spawnAndCleanupStop1, spawnAndCleanupStop2]) {
+  await assert.rejects(stop, (error) => {
+    assert.ok(error instanceof AggregateError);
+    assert.deepEqual(error.errors, [spawnFailure, spawnAndCleanupFailure]);
+    return true;
+  });
+}
+assert.equal(spawnAndCleanupRecord.cleanupError, spawnAndCleanupFailure);
+assert.equal(spawnAndCleanupFixture.manager.getActiveServer('spawn-cleanup-failure-task'), spawnAndCleanupRecord);
+assert.equal(spawnAndCleanupCalls, 1);
+
 const originalKill = process.kill;
 try {
   // Case 3: Active child process stopped explicitly, concurrent calls share stopPromise, cleanup succeeds
