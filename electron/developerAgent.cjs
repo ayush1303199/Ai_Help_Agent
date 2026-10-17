@@ -772,6 +772,9 @@ function parsePatch(raw) {
   return normalized;
 }
 function applyFilePatch(original, lines) {
+  if (!Array.isArray(lines) || !lines.some((line) => line.startsWith('@@'))) {
+    throw new Error('Proposal must include a valid unified diff hunk.');
+  }
   const newline = original.includes('\r\n') ? '\r\n' : '\n';
   const hadTrailingNewline = original.length === 0 || /(?:\r\n|\n)$/.test(original);
   const source = original ? original.split(/\r?\n/) : [];
@@ -782,17 +785,96 @@ function applyFilePatch(original, lines) {
     if (!header) throw new Error('Invalid patch hunk header.');
     const oldStart = Number(header[1]);
     const oldCount = Number(header[2] || 1);
-    const start = oldCount === 0 ? oldStart : oldStart - 1;
-    if (start < cursor || start > source.length) throw new Error('Patch context is stale.');
-    output.push(...source.slice(cursor, start)); cursor = start; let consumed = 0; let produced = 0;
+    let start = oldCount === 0 ? oldStart : oldStart - 1;
+
+    if (start < cursor) {
+      throw new Error('Overlapping patch hunks are not permitted.');
+    }
+
+    const hunkExpected = [];
+    for (let j = i + 1; j < lines.length && !lines[j].startsWith('@@'); j += 1) {
+      const line = lines[j];
+      if (line === '\\ No newline at end of file') continue;
+      if (line.startsWith(' ') || line.startsWith('-')) {
+        hunkExpected.push(line.slice(1));
+      }
+    }
+
+    const matchesAt = (pos, allowTrim = true) => {
+      if (pos < cursor || pos + hunkExpected.length > source.length) return false;
+      for (let k = 0; k < hunkExpected.length; k += 1) {
+        const srcLine = source[pos + k];
+        const expLine = hunkExpected[k];
+        if (srcLine === expLine) continue;
+        if (allowTrim && srcLine !== undefined && srcLine.trimEnd() === expLine.trimEnd()) continue;
+        return false;
+      }
+      return true;
+    };
+
+    if (oldCount > 0 && hunkExpected.length > 0) {
+      const minOffset = Math.max(cursor, start - 3);
+      const maxOffset = Math.min(source.length - hunkExpected.length, start + 3);
+      const exactCandidates = [];
+      const trimmedCandidates = [];
+
+      for (let offset = minOffset; offset <= maxOffset; offset += 1) {
+        if (matchesAt(offset, false)) {
+          exactCandidates.push(offset);
+        } else if (matchesAt(offset, true)) {
+          trimmedCandidates.push(offset);
+        }
+      }
+
+      if (exactCandidates.length === 1) {
+        start = exactCandidates[0];
+      } else if (exactCandidates.length > 1) {
+        throw new Error('Ambiguous patch target: multiple matching locations found.');
+      } else if (trimmedCandidates.length === 1) {
+        start = trimmedCandidates[0];
+      } else if (trimmedCandidates.length > 1) {
+        throw new Error('Ambiguous patch target: multiple matching locations found with whitespace tolerance.');
+      } else {
+        throw new Error('Patch context does not match.');
+      }
+    } else if (oldCount === 0) {
+      if (start > source.length) {
+        throw new Error('Patch insertion target is out of bounds.');
+      }
+    } else if (oldCount > 0 && hunkExpected.length === 0) {
+      throw new Error('Invalid patch hunk: no context or deletion lines in hunk.');
+    }
+
+    output.push(...source.slice(cursor, start));
+    cursor = start;
+    let consumed = 0;
+    let produced = 0;
     for (i += 1; i < lines.length && !lines[i].startsWith('@@'); i += 1) {
       const line = lines[i];
       if (line === '\\ No newline at end of file') continue;
-      if (line.startsWith(' ')) { if (source[cursor] !== line.slice(1)) throw new Error('Patch context does not match.'); output.push(source[cursor++]); consumed += 1; produced += 1; }
-      else if (line.startsWith('-')) { if (source[cursor] !== line.slice(1)) throw new Error('Patch removal does not match.'); cursor += 1; consumed += 1; }
-      else if (line.startsWith('+')) { output.push(line.slice(1)); produced += 1; } else throw new Error('Invalid patch hunk.');
+      if (line.startsWith(' ')) {
+        const expected = line.slice(1);
+        const matches = source[cursor] === expected || (source[cursor] !== undefined && source[cursor].trimEnd() === expected.trimEnd());
+        if (!matches) throw new Error('Patch context does not match.');
+        output.push(source[cursor++]);
+        consumed += 1;
+        produced += 1;
+      } else if (line.startsWith('-')) {
+        const expected = line.slice(1);
+        const matches = source[cursor] === expected || (source[cursor] !== undefined && source[cursor].trimEnd() === expected.trimEnd());
+        if (!matches) throw new Error('Patch removal does not match.');
+        cursor += 1;
+        consumed += 1;
+      } else if (line.startsWith('+')) {
+        output.push(line.slice(1));
+        produced += 1;
+      } else {
+        throw new Error('Invalid patch hunk.');
+      }
     }
-    if (oldCount !== consumed || Number(header[4] || 1) !== produced) throw new Error('Patch hunk line count is invalid.');
+    if (oldCount !== consumed && Math.abs(oldCount - consumed) > 1) {
+      throw new Error('Patch hunk line count is invalid.');
+    }
     i -= 1;
   }
   output.push(...source.slice(cursor));
@@ -2002,9 +2084,12 @@ function normalizeCommandResult(result) {
   };
 }
 function commandPolicy(script) {
-  const allowed = new Set(['lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify', 'phpunit', 'composer-test', 'php-lint',
+  const allowed = new Set([
+    'lint', 'typecheck', 'test', 'build', 'check', 'validate', 'verify', 'phpunit', 'composer-test', 'php-lint',
     'maven-test', 'maven-build', 'gradle-test', 'gradle-build', 'go-test', 'go-vet', 'go-build', 'ruby-test', 'ruby-lint',
-    'dotnet-test', 'dotnet-build', 'cargo-test', 'cargo-clippy', 'cargo-build', 'python-test', 'python-lint']);
+    'dotnet-test', 'dotnet-build', 'cargo-test', 'cargo-clippy', 'cargo-build', 'python-test', 'python-lint',
+    'vitest', 'jest', 'pytest', 'format:check', 'test:unit', 'test:e2e',
+  ]);
   if (typeof script !== 'string' || !allowed.has(script)) throw new Error('Verification command is not permitted.');
   return { script, approvalRequired: true, arbitraryShell: false };
 }
@@ -2050,17 +2135,43 @@ function selectVerificationChecks(packageJson, requested = []) {
   });
 }
 function extractFailure(result) {
-  const text = `${result?.stderr || ''}
-${result?.stdout || ''}`;
-  const location = text.match(/(?:^|\s)([^ \r\n:]+):(\d+)(?::(\d+))?(?:\s|$)/);
-  const test = text.match(/(?:FAIL|failed|failing)\s+(?:test\s+)?["'`]?([^"'`\r\n]+)["'`]?/i);
-  const message = text.split(/\r?\n/).map((line) => line.trim()).find((line) => line && !/^npm (?:error|warn)/i.test(line)) || '';
+  const text = `${result?.stderr || ''}\n${result?.stdout || ''}\n${result?.error || ''}`;
+
+  // Ecosystem-specific pattern matching
+  const tsMatch = text.match(/(?:^|\s)([a-zA-Z0-9_./\\-]+\.(?:ts|tsx|js|jsx)):(\d+)(?::(\d+))?\s*(?:-\s*error\s*(TS\d+)?:?\s*(.+))?/i);
+  const pyMatch = text.match(/File "([^"]+\.py)", line (\d+)(?:, in (\w+))?\s*(?:\r?\n\s*(?:[^\n]+\r?\n\s*)?([A-Za-z0-9_]+Error:\s*.+))?/i)
+    || text.match(/FAILED\s+([a-zA-Z0-9_./\\-]+\.py)::(\w+)\s*-\s*(.+)/i);
+  const phpMatch = text.match(/(?:in|on line)\s+([a-zA-Z0-9_./\\-]+\.php)(?::|\s+on\s+line\s+)(\d+)/i)
+    || text.match(/([a-zA-Z0-9_./\\-]+\.php):(\d+)/i);
+  const testMatch = text.match(/●\s+([^\r\n]+)/i)
+    || text.match(/(?:FAIL|failed|failing)\s+test\s+["'`]?([^"'`\r\n]+)["'`]?/i)
+    || text.match(/(?:FAIL|failed|failing)\s+["'`]?([^"'`\r\n]+)["'`]?/i);
+
+  const location = text.match(/(?:^|\s)([^ \r\n:]+\.[a-zA-Z0-9]{1,6}):(\d+)(?::(\d+))?(?:\s|$)/)
+    || text.match(/(?:^|\s)((?:[a-zA-Z0-9_.-]+[/\\])+[a-zA-Z0-9_.-]+):(\d+)(?::(\d+))?(?:\s|$)/);
+
+  const candidateFile = tsMatch?.[1] || pyMatch?.[1] || phpMatch?.[1] || location?.[1] || null;
+  const isKeyword = !candidateFile
+    || /^(?:error|warning|info|failed|status|exit|code|time|line|col)$/i.test(candidateFile)
+    || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(candidateFile)
+    || /\.\d+$/.test(candidateFile);
+  const file = isKeyword ? null : candidateFile;
+  const line = file ? (tsMatch?.[2] ? Number(tsMatch[2]) : (pyMatch?.[2] ? Number(pyMatch[2]) : (phpMatch?.[2] ? Number(phpMatch[2]) : (location ? Number(location[2]) : null)))) : null;
+  const column = file ? (tsMatch?.[3] ? Number(tsMatch[3]) : (location?.[3] ? Number(location[3]) : null)) : null;
+  const test = testMatch?.[1]?.trim() || null;
+
+  const messageLine = text.split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l && !/^npm (?:error|warn)/i.test(l) && !/^yarn /i.test(l) && !/^(?:>|Exit code:)/i.test(l)) || '';
+  const rawMessage = (tsMatch?.[5] || pyMatch?.[4] || pyMatch?.[3] || messageLine).slice(0, 1000);
+  const message = redact(rawMessage);
+
   return {
-    file: location?.[1] || null,
-    line: location ? Number(location[2]) : null,
-    column: location?.[3] ? Number(location[3]) : null,
-    test: test?.[1]?.trim() || null,
-    message: message.slice(0, 1000),
+    file,
+    line,
+    column,
+    test,
+    message,
   };
 }
 function normalizeObservation(result, check = result?.script || '') {
@@ -2099,13 +2210,34 @@ function isGateOrUnverifiedResult(result) {
 }
 function diagnoseObservation(observation, metadata = {}) {
   const environment = new Set(['ENVIRONMENT_FAILURE', 'DEPENDENCY_FAILURE', 'COMMAND_NOT_AVAILABLE', 'TIMEOUT']);
+  const classification = observation.classification || classifyFailureCategory(observation);
+  const location = observation.extracted;
+  const text = `${observation?.stderr || ''}\n${observation?.stdout || ''}\n${observation?.error || ''}`;
+  let hypothesis = null;
+  if (/TS2304|Cannot find name/i.test(text)) {
+    hypothesis = `Hypothesis: Identifier not found in ${location?.file || 'code'}${location?.line ? `:${location.line}` : ''}. Likely a missing import or undeclared variable.`;
+  } else if (/TS2322|Type .* is not assignable/i.test(text)) {
+    hypothesis = `Hypothesis: Type mismatch in ${location?.file || 'code'}${location?.line ? `:${location.line}` : ''}. The provided type does not conform to the expected signature.`;
+  } else if (/TS2339|Property .* does not exist/i.test(text)) {
+    hypothesis = `Hypothesis: Property access error in ${location?.file || 'code'}${location?.line ? `:${location.line}` : ''}. Property is missing on the target type.`;
+  } else if (/AssertionError|Expected .* got/i.test(text)) {
+    hypothesis = `Hypothesis: Test assertion failure in ${location?.file || 'test'}${location?.line ? `:${location.line}` : ''}. Output value diverged from test expectation.`;
+  } else if (/SyntaxError|parse error/i.test(text)) {
+    hypothesis = `Hypothesis: Syntax parsing error in ${location?.file || 'code'}${location?.line ? `:${location.line}` : ''}. Check for unclosed brackets or invalid syntax.`;
+  } else if (location?.file) {
+    hypothesis = `Hypothesis: Verification failure in ${location.file}${location.line ? `:${location.line}` : ''}: ${(location.message || '').slice(0, 150)}`;
+  } else {
+    hypothesis = 'Hypothesis: General verification failure observed without a uniquely resolved source location.';
+  }
+
   return {
     taskId: metadata.taskId || null,
     attempt: metadata.attempt || 1,
     check: observation.check,
-    classification: observation.classification || classifyFailureCategory(observation),
-    environmentFailure: environment.has(observation.classification || classifyFailureCategory(observation)),
-    location: observation.extracted,
+    classification,
+    environmentFailure: environment.has(classification),
+    location,
+    hypothesis: redact(hypothesis),
     runtimeEvidence: observation.runtimeEvidence || null,
     context: { workspace: metadata.workspace || null, branch: metadata.branch || null },
   };

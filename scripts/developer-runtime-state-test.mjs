@@ -366,7 +366,10 @@ assert.deepEqual(timeoutCleanup.lifecycle.getStatus(timedOutResource), {
   quarantined: true,
   leaseActive: true,
   cleanupVerified: false,
+  launcherTerminated: false,
   resourceDeleted: false,
+  stagingDirectoryRemoved: false,
+  sandboxHandlesReleased: false,
   secureErasureProven: 'NOT_ESTABLISHED',
 });
 await assert.rejects(timeoutCleanup.lifecycle.createResource(), /still active or quarantined/);
@@ -393,7 +396,10 @@ assert.deepEqual(unverifiedRemoval.lifecycle.getStatus(unverifiedRemovalResource
   quarantined: true,
   leaseActive: true,
   cleanupVerified: false,
+  launcherTerminated: false,
   resourceDeleted: false,
+  stagingDirectoryRemoved: false,
+  sandboxHandlesReleased: false,
   secureErasureProven: 'NOT_ESTABLISHED',
 });
 assert.equal(canDeleteSandboxTemporaryRoot(unverifiedRemoval.lifecycle.getStatus(unverifiedRemovalResource)), false);
@@ -635,10 +641,7 @@ const cachedTaskId = 'isolated-dev-server-cached-test';
 const cachedRecord = { taskId: cachedTaskId, reused: true, port: 4173 };
 devServerManager._activeServers.set(cachedTaskId, cachedRecord);
 try {
-  await assert.rejects(
-    devServerManager.startDevServer(cachedTaskId, devProject),
-    /Project dev server was not started/,
-  );
+  assert.equal(await devServerManager.startDevServer(cachedTaskId, devProject), cachedRecord);
   assert.equal(devServerManager.getActiveServer(cachedTaskId), cachedRecord);
 } finally {
   devServerManager._activeServers.delete(cachedTaskId);

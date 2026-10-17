@@ -972,7 +972,11 @@ def _request_provider_completion(
         request["tool_choice"] = "required" if require_tool_call else "auto"
     if context_metrics is not None:
         _enforce_provider_payload_budget(request, context_metrics)
-    client = OpenAI(api_key=api_key, base_url=provider.base_url or None)
+    client = OpenAI(
+        api_key=api_key,
+        base_url=provider.base_url or None,
+        timeout=MODEL_REQUEST_TIMEOUT_SECONDS,
+    )
     json_text_retry = False
     try:
         _record_provider_dispatch(context_metrics)
@@ -1318,8 +1322,18 @@ def complete_coding_model(
     require_tool_call: bool = False,
     request_id: Optional[str] = None,
     session_id: Optional[str] = None,
+    execution_context: Optional[Dict[str, Any]] = None,
 ) -> tuple[Dict[str, Any], Any]:
     """Run Coding-only provider selection and response adaptation."""
+    if isinstance(execution_context, dict) and execution_context.get("mode") == "BENCHMARK":
+        # In Stage 0A / Stage 1 pre-integration, the Python provider lacks an authenticated
+        # IPC channel, cryptographic verifier, or proof-of-authorization from Electron.
+        # Benchmark live inference cannot rely on caller-asserted dictionary payloads and
+        # must remain explicitly BLOCKED until trusted Stage 1 IPC is established.
+        raise RuntimeError(
+            "Benchmark live inference is BLOCKED: Python provider dispatch lacks an "
+            "authenticated IPC / verification boundary (Stage 1 not established)."
+        )
     candidates = _candidates(registry, provider_id)
     if not candidates:
         raise RuntimeError("No provider is configured for the Coding Agent.")
