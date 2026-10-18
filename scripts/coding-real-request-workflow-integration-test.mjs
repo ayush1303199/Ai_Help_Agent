@@ -698,6 +698,7 @@ class FormController {
   assert.equal(bridgeClarification.phase, 'UNDERSTAND');
 
   // TEST 16: Intent Classification Routing Accuracy (classifyCodingRequestIntent)
+  // Sub-case A: Technical Inquiries & Explanations with Action Verbs (Must Stay Conversational)
   const q1 = classifyCodingRequestIntent('How does the authorization ledger verify HMAC signatures?');
   assert.equal(q1.intent, 'QUESTION_OR_EXPLANATION');
   assert.equal(q1.isActionableTask, false);
@@ -710,6 +711,55 @@ class FormController {
   assert.equal(q3.intent, 'QUESTION_OR_EXPLANATION');
   assert.equal(q3.isActionableTask, false);
 
+  const q4 = classifyCodingRequestIntent('How does developerAgent implement rollback?');
+  assert.equal(q4.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q4.isActionableTask, false);
+
+  const q5 = classifyCodingRequestIntent('Can you explain the approval flow?');
+  assert.equal(q5.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q5.isActionableTask, false);
+
+  const q6 = classifyCodingRequestIntent('Tell me about the project architecture.');
+  assert.equal(q6.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q6.isActionableTask, false);
+
+  const q7 = classifyCodingRequestIntent('Can you please explain how to fix the rollback bug?');
+  assert.equal(q7.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q7.isActionableTask, false);
+
+  const q8 = classifyCodingRequestIntent('What happens if verification fails during apply?');
+  assert.equal(q8.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q8.isActionableTask, false);
+
+  const q9 = classifyCodingRequestIntent('Why is the FormController using die()?');
+  assert.equal(q9.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q9.isActionableTask, false);
+
+  const q10 = classifyCodingRequestIntent('Where is the benchmark authorization ledger stored?');
+  assert.equal(q10.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q10.isActionableTask, false);
+
+  const q11 = classifyCodingRequestIntent('Tell me how developerAgent implements rollback');
+  assert.equal(q11.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q11.isActionableTask, false);
+
+  const q12 = classifyCodingRequestIntent('Help me understand the approval flow');
+  assert.equal(q12.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q12.isActionableTask, false);
+
+  const q13 = classifyCodingRequestIntent('I want to understand why rollback was called');
+  assert.equal(q13.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q13.isActionableTask, false);
+
+  const q14 = classifyCodingRequestIntent('Should we add tests for this endpoint?');
+  assert.equal(q14.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q14.isActionableTask, false);
+
+  const q15 = classifyCodingRequestIntent('Give me an overview of the rollback implementation');
+  assert.equal(q15.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(q15.isActionableTask, false);
+
+  // Sub-case B: Ambiguous / Vague Prompts (Must Require Clarification without Modifying Files)
   const c1 = classifyCodingRequestIntent('');
   assert.equal(c1.intent, 'CLARIFICATION_REQUIRED');
   assert.equal(c1.isActionableTask, false);
@@ -720,6 +770,53 @@ class FormController {
   assert.equal(c2.isActionableTask, false);
   assert.ok(c2.clarificationPrompt);
 
+  const c3 = classifyCodingRequestIntent('improve performance');
+  assert.equal(c3.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(c3.isActionableTask, false);
+  assert.ok(c3.clarificationPrompt);
+
+  const c4 = classifyCodingRequestIntent('fix the bug');
+  assert.equal(c4.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(c4.isActionableTask, false);
+  assert.ok(c4.clarificationPrompt);
+
+  const c5 = classifyCodingRequestIntent('clean it up');
+  assert.equal(c5.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(c5.isActionableTask, false);
+  assert.ok(c5.clarificationPrompt);
+
+  const c6 = classifyCodingRequestIntent('look into this');
+  assert.equal(c6.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(c6.isActionableTask, false);
+  assert.ok(c6.clarificationPrompt);
+
+  const c7 = classifyCodingRequestIntent('investigate this');
+  assert.equal(c7.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(c7.isActionableTask, false);
+  assert.ok(c7.clarificationPrompt);
+
+  // Sub-case C: Ambiguous Mixed-Intent Requests (Combining Action and Inquiry)
+  const m1 = classifyCodingRequestIntent('Fix the rollback or explain why it failed');
+  assert.equal(m1.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(m1.isActionableTask, false);
+  assert.ok(m1.clarificationPrompt);
+
+  const m2 = classifyCodingRequestIntent('Should I fix this or what do you recommend?');
+  assert.equal(m2.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(m2.isActionableTask, false);
+  assert.ok(m2.clarificationPrompt);
+
+  const m3 = classifyCodingRequestIntent('Either add tests or explain why they cannot be added');
+  assert.equal(m3.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(m3.isActionableTask, false);
+  assert.ok(m3.clarificationPrompt);
+
+  const m4 = classifyCodingRequestIntent('Can you fix this or should we discuss the approach first?');
+  assert.equal(m4.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(m4.isActionableTask, false);
+  assert.ok(m4.clarificationPrompt);
+
+  // Sub-case D: Direct & Polite Action Directives (Must Reach Autonomous Workflow)
   const a1 = classifyCodingRequestIntent('fix debug probe and die in profile form controller');
   assert.equal(a1.intent, 'AUTONOMOUS_WORKFLOW_TASK');
   assert.equal(a1.isActionableTask, true);
@@ -727,6 +824,38 @@ class FormController {
   const a2 = classifyCodingRequestIntent('investigate why the user details test is failing');
   assert.equal(a2.intent, 'AUTONOMOUS_WORKFLOW_TASK');
   assert.equal(a2.isActionableTask, true);
+
+  const a3 = classifyCodingRequestIntent('Fix the rollback implementation.');
+  assert.equal(a3.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(a3.isActionableTask, true);
+
+  const a4 = classifyCodingRequestIntent('Add regression tests for approval handling.');
+  assert.equal(a4.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(a4.isActionableTask, true);
+
+  const a5 = classifyCodingRequestIntent('Find and fix the bug in this controller.');
+  assert.equal(a5.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(a5.isActionableTask, true);
+
+  const a6 = classifyCodingRequestIntent('Can you fix the rollback implementation?');
+  assert.equal(a6.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(a6.isActionableTask, true);
+
+  const a7 = classifyCodingRequestIntent('Please add regression tests for approval handling.');
+  assert.equal(a7.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(a7.isActionableTask, true);
+
+  const a8 = classifyCodingRequestIntent('Refactor the database connection helper.');
+  assert.equal(a8.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(a8.isActionableTask, true);
+
+  const a9 = classifyCodingRequestIntent('Could you please modify the rollback logic to handle stale locks?');
+  assert.equal(a9.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(a9.isActionableTask, true);
+
+  const a10 = classifyCodingRequestIntent('Patch the security vulnerability in auth controller.');
+  assert.equal(a10.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(a10.isActionableTask, true);
 
   // TEST 17: Preload Bridge End-to-End Execution with Real-Time Activity Streaming
   await fs.writeFile(

@@ -552,7 +552,7 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
   }
 
   // 1. Detect vague/ambiguous requests that require clarification before any action
-  const isVague = /^(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:the\s+)?performance|fix\s+(?:the\s+)?bug|do\s+something)\s*[.!?]*$/i.test(text)
+  const isVague = /^(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:the\s+)?performance|fix\s+(?:the\s+)?(?:bug|issue|code|it|problem)|clean\s+(?:it\s+)?up|do\s+something|look\s+into\s+this|check\s+this|investigate\s+this)\s*[.!?]*$/i.test(text)
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(text) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(text));
   if (isVague) {
     return {
@@ -562,18 +562,59 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
     };
   }
 
-  // 2. Detect ordinary informational questions & technical explanations (read-only, no code modification)
-  const hasQuestionPrefix = /^(?:what\s+(?:is|are|does|do|can|would)|how\s+(?:does|do|can|to|is|are)|where\s+(?:is|are|can)|why\s+(?:is|are|does|do)|who\s+|which\s+|can\s+you\s+(?:explain|show|tell|describe|list)|could\s+you\s+(?:explain|show|tell|describe|list)|please\s+explain|explain\s+|describe\s+|show\s+me|tell\s+me\s+about|is\s+there\s+|are\s+there\s+)/i.test(text);
+  // 2. Detect ambiguous mixed-intent requests combining action directives and informational/exploratory questions
+  // e.g. "Fix the rollback or explain why it failed", "Should I fix this or what do you recommend?", "Either add tests or explain why"
+  const hasDisjunctiveInquiry = /\b(?:or\s+(?:should|can|could|would|what|why|how|explain|tell|describe|clarify|discuss|else)|either\b.*\bor\b|not\s+sure\s+(?:if|whether))\b/i.test(text);
   const hasActionVerb = /\b(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace)\b/i.test(text);
+  if (hasDisjunctiveInquiry && hasActionVerb) {
+    return {
+      intent: 'CLARIFICATION_REQUIRED',
+      clarificationPrompt: 'Your request combines an action directive and an informational inquiry. Please clarify whether you would like the agent to apply code changes or provide an explanation first.',
+      isActionableTask: false,
+    };
+  }
 
-  if ((hasQuestionPrefix && !hasActionVerb) || (text.endsWith('?') && !hasActionVerb)) {
+  // 3. Detect explicit informational & explanation requests (giving explanation precedence over embedded action verbs)
+  // e.g. "Can you explain...", "Please describe...", "Tell me about...", "Explain how X works", "Help me understand..."
+  const isExplicitExplanation = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:explain|describe|clarify|summarize|walk\s+me\s+through|tell\s+me(?:\s+about|\s+how|\s+why|\s+what|\s+if|\s+whether)?|show\s+me|help\s+me\s+understand|give\s+me\s+(?:an?\s+)?(?:overview|summary|explanation|details|breakdown)|provide\s+(?:an?\s+)?(?:overview|summary|explanation|details|breakdown))\b/i.test(text)
+    || /^(?:i\s+(?:want|would\s+like)\s+to\s+understand)\b/i.test(text);
+  if (isExplicitExplanation) {
     return {
       intent: 'QUESTION_OR_EXPLANATION',
       isActionableTask: false,
     };
   }
 
-  // 3. Actionable coding task, bug fix, or investigation requiring autonomous workflow
+  // 4. Detect inquiry questions (e.g. "How does developerAgent implement rollback?", "What does this do?", "Why is this failing?")
+  // Inquiries about behavior, architecture, or rationale stay conversational even if containing action verbs.
+  const isQuestionInquiry = /^(?:what\s+(?:is|are|does|do|can|would|happened|happens|was|were)|how\s+(?:does|do|did|is|are|was|were|would|should|might|will|can|could|to)|why\s+(?:is|are|does|do|did|was|were|would|should)|where\s+(?:is|are|can|do|does)|who\s+(?:is|are|wrote|modified)|which\s+(?:file|module|class|function|method|component|test|part)|is\s+there\s+|are\s+there\s+|does\s+it\s+|do\s+we\s+|should\s+(?:i|we|it)\s+|could\s+(?:we|i)\s+|can\s+(?:we|i)\s+|would\s+it\s+be\s+)/i.test(text);
+  if (isQuestionInquiry) {
+    return {
+      intent: 'QUESTION_OR_EXPLANATION',
+      isActionableTask: false,
+    };
+  }
+
+  // 5. Detect polite action directives (e.g. "Can you fix...", "Please add...", "Could you refactor...")
+  // When polite framing is followed immediately by an action verb, it represents a command to execute changes.
+  const isPoliteActionDirective = /^(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate)\b/i.test(text);
+  if (isPoliteActionDirective) {
+    return {
+      intent: 'AUTONOMOUS_WORKFLOW_TASK',
+      isActionableTask: true,
+    };
+  }
+
+  // 6. Detect trailing questions that do not start with a direct action command
+  const startsWithDirectAction = /^(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|find\s+and\s+fix)\b/i.test(text);
+  if (text.endsWith('?') && !startsWithDirectAction) {
+    return {
+      intent: 'QUESTION_OR_EXPLANATION',
+      isActionableTask: false,
+    };
+  }
+
+  // 7. Actionable coding task, bug fix, or investigation requiring autonomous workflow
   return {
     intent: 'AUTONOMOUS_WORKFLOW_TASK',
     isActionableTask: true,

@@ -210,17 +210,11 @@ _SECURITY_INSTRUCTION_MARKERS = (
     "destructive statements",
     "weaken safety boundaries",
     "authoritative coding agent owner",
-<<<<<<< HEAD
     "core task ownership",
     "prompt injection",
     "redacted password",
     "core coding agent engineering policy",
     "you are the coding agent",
-=======
-    "prompt injection",
-    "redacted password",
-    "core coding agent engineering policy",
->>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
 )
 
 
@@ -236,11 +230,7 @@ def _split_into_instruction_units(content: str) -> List[str]:
         stripped = line.strip()
         if not stripped:
             continue
-<<<<<<< HEAD
         if len(stripped) > 250 and any(delim in stripped for delim in (". ", "? ", "! ")):
-=======
-        if len(stripped) > 250 and ". " in stripped:
->>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
             sentences = re.split(r"(?<=[.!?])\s+", stripped)
             units.extend([s.strip() for s in sentences if s.strip()])
         else:
@@ -273,6 +263,29 @@ def _compact_system_context(message: Dict[str, Any], terms: set[str], stage: int
     if not units:
         return message
 
+    if stage == 0:
+        selected_lines = []
+        used = 0
+        for u in units:
+            size = len(u) + 1
+            if used + size > limit:
+                break
+            selected_lines.append(u)
+            used += size
+        compacted = "\n".join(selected_lines)
+        if len(selected_lines) < len(units):
+            compacted += "\n[Lower-relevance task context omitted.]"
+        return {**message, "content": compacted}
+
+    raw_units = units
+    seen_units: set[str] = set()
+    deduped_units: List[str] = []
+    for u in raw_units:
+        if u not in seen_units:
+            seen_units.add(u)
+            deduped_units.append(u)
+    units = deduped_units
+
     mandatory_indices = {
         i for i, unit in enumerate(units)
         if _is_mandatory_security_instruction(unit)
@@ -280,6 +293,8 @@ def _compact_system_context(message: Dict[str, Any], terms: set[str], stage: int
 
     # If the entire content consists of mandatory security instructions, preserve it without truncation
     if len(mandatory_indices) == len(units):
+        if len(deduped_units) < len(raw_units):
+            return {**message, "content": "\n".join(units)}
         return {**message, "content": content}
 
     mandatory_size = sum(len(units[i]) + 1 for i in mandatory_indices)
@@ -1120,15 +1135,10 @@ def _request_provider_completion(
                         return {
                             "role": "assistant",
                             "content": (
-<<<<<<< HEAD
                                 "INVESTIGATION_INCOMPLETE: The provider requested project inspection that this request "
                                 "could not execute, and its bounded tool-call recovery was exhausted. No conclusion "
                                 "is claimed from the missing inspection. Next step: retry this request after enabling "
                                 "a Coding provider with tool calling; the inspection must be completed before reporting findings."
-=======
-                                f"Investigation could not be completed with verified evidence. "
-                                f"Further inspection was planned for {fn_name}({fn_args}), but no additional tool rounds remain."
->>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
                             ),
                             "status": "INVESTIGATION_INCOMPLETE",
                             "continuation": {

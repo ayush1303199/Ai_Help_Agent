@@ -1970,8 +1970,8 @@ function normalizeVerificationStatus(result, passed) {
   if (GATE_FAILURE_STATUSES.has(result?.status)) return result.status;
   if (result?.executionBlocked === true) return 'BLOCKED';
   if (GATE_FAILURE_STATUSES.has(result?.evidenceState)) return result.evidenceState;
-  if (result?.skipped === true) return 'SKIPPED';
   if (VERIFICATION_FAILURE_STATUSES.has(result?.status)) return result.status;
+  if (result?.skipped === true) return 'SKIPPED';
   if (passed) return 'PASS';
   if (result?.status !== undefined) return 'UNVERIFIED';
   if (result?.error || result?.spawnError === true) return undefined;
