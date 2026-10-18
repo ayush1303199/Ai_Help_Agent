@@ -693,7 +693,7 @@ try {
   assert.equal(resWriteFail.reasonCode, 'LEDGER_WRITE_FAILED');
   assert.ok(resWriteFail.blockers.some((b) => b.includes('Failed to commit consumed token to durable ledger')));
 
-  // Test 7.4: Lock Contention and Stale Lock Recovery
+  // Test 7.4: Lock Contention and Stale Lock Fail-Closed
   const lockLedgerPath = path.join(tempDir, 'lock-test-ledger.json');
   const releaseLock1 = contract.acquireLedgerLock(lockLedgerPath);
   assert.equal(typeof releaseLock1, 'function');
@@ -703,6 +703,33 @@ try {
 
   // Release lock
   releaseLock1();
+
+  // Test 7.4b: Stale lockfile fails closed and is NOT automatically deleted
+  const staleLockPath = `${lockLedgerPath}.lock`;
+  const staleTime = Date.now() - 10000;
+  await fs.writeFile(staleLockPath, JSON.stringify({ pid: 999999, timestamp: staleTime }), 'utf8');
+  const pastDate = new Date(staleTime);
+  await fs.utimes(staleLockPath, pastDate, pastDate);
+
+  assert.throws(
+    () => contract.acquireLedgerLock(lockLedgerPath),
+    /LEDGER_LOCK_STALE_UNCERTAIN/i,
+    'Stale lockfile must fail closed with LEDGER_LOCK_STALE_UNCERTAIN rather than being automatically deleted',
+  );
+  // Verify stale lock was NOT deleted
+  assert.ok(await fs.stat(staleLockPath), 'Stale lockfile must remain on disk for inspection and fail closed');
+
+  // Test 7.4c: Malformed/ambiguous lock metadata fails closed
+  await fs.writeFile(staleLockPath, '{"broken json": ', 'utf8');
+  assert.throws(
+    () => contract.acquireLedgerLock(lockLedgerPath),
+    /LEDGER_LOCK_STALE_UNCERTAIN/i,
+    'Malformed lock metadata must fail closed with LEDGER_LOCK_STALE_UNCERTAIN',
+  );
+  assert.ok(await fs.stat(staleLockPath), 'Malformed lockfile must not be deleted');
+
+  // Clean up lockfile for remaining tests
+  await fs.unlink(staleLockPath);
 
   // Test 7.5: Production Default Path Resolution Does Not Use os.tmpdir()
   contract.setLedgerPathForTest(null);

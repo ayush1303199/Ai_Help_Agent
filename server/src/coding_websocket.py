@@ -10868,15 +10868,15 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             observations = semantic_task.get("observations") or []
             if observations:
                 obs_summary = "\n".join(
-                    f"- {obs.get('tool')}: {obs.get('evidenceRef', obs.get('evidenceId', 'executed'))}"
+                    f"- {obs.get('tool')}: {obs.get('evidenceRef', obs.get('evidenceId', 'unverified'))}"
                     for obs in observations[-5:]
                 )
                 content = (
-                    "Completed investigation with the following recorded evidence:\n"
+                    "Investigation recorded the following unverified project observations, but no authoritative summary was produced:\n"
                     + obs_summary
                 )
             else:
-                content = "Completed investigation. No additional evidence was found in the project scope."
+                content = "Investigation incomplete: no verified project observations or evidence were recorded in the project scope."
         proposal_evidence_clarification = bool(
             proposal_required
             and semantic_task.get("status") == "NEEDS_CLARIFICATION"

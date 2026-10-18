@@ -149,20 +149,8 @@ const STALE_LOCK_THRESHOLD_MS = 5000;
 const RETRY_INTERVAL_MS = 25;
 
 /**
- * Checks whether a process with the given PID is currently active.
- */
-function isProcessAlive(pid) {
-  if (typeof pid !== 'number' || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === 'EPERM'; // Process exists but owned by another user
-  }
-}
-
-/**
  * Cross-process mutual exclusion via lockfile on ledger.
+ * Fails closed on stale, ambiguous, or malformed lockfiles without automatic deletion.
  */
 function acquireLedgerLock(ledgerPath) {
   const lockPath = `${ledgerPath}.lock`;
@@ -191,26 +179,37 @@ function acquireLedgerLock(ledgerPath) {
       };
     } catch (err) {
       if (err.code === 'EEXIST') {
+        let stat;
         try {
-          const stat = fs.statSync(lockPath);
-          const age = Date.now() - stat.mtimeMs;
-          let shouldBreak = age > STALE_LOCK_THRESHOLD_MS;
-          if (!shouldBreak) {
-            try {
-              const raw = fs.readFileSync(lockPath, 'utf8');
-              const data = JSON.parse(raw);
-              if (data && typeof data.pid === 'number' && !isProcessAlive(data.pid)) {
-                shouldBreak = true;
-              }
-            } catch {}
-          }
-          if (shouldBreak) {
-            try {
-              fs.unlinkSync(lockPath);
-              continue;
-            } catch {}
-          }
-        } catch {}
+          stat = fs.statSync(lockPath);
+        } catch (statErr) {
+          if (statErr.code === 'ENOENT') continue; // Released concurrently by holder
+          throw new Error(`LEDGER_LOCK_FAILED: Cannot stat lockfile ${lockPath}: ${statErr.message}`);
+        }
+
+        let raw = '';
+        try {
+          raw = fs.readFileSync(lockPath, 'utf8');
+        } catch (readErr) {
+          if (readErr.code === 'ENOENT') continue; // Released concurrently by holder
+          throw new Error(`LEDGER_LOCK_FAILED: Cannot read lockfile ${lockPath}: ${readErr.message}`);
+        }
+
+        let metadata;
+        try {
+          metadata = JSON.parse(raw);
+        } catch {
+          throw new Error(`LEDGER_LOCK_STALE_UNCERTAIN: Malformed or unparseable lock metadata on ${lockPath}. Automatic deletion is prohibited; manual intervention required.`);
+        }
+
+        if (!metadata || typeof metadata !== 'object' || typeof metadata.pid !== 'number' || typeof metadata.timestamp !== 'number') {
+          throw new Error(`LEDGER_LOCK_STALE_UNCERTAIN: Ambiguous lock owner metadata on ${lockPath}. Automatic deletion is prohibited; manual intervention required.`);
+        }
+
+        const age = Date.now() - Math.max(stat.mtimeMs, metadata.timestamp);
+        if (age > STALE_LOCK_THRESHOLD_MS) {
+          throw new Error(`LEDGER_LOCK_STALE_UNCERTAIN: Stale lockfile detected (${age}ms old, pid=${metadata.pid}) on ${lockPath}. Automatic deletion is prohibited to prevent split-brain authorization.`);
+        }
 
         try {
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RETRY_INTERVAL_MS);
@@ -538,13 +537,20 @@ function validateLiveBenchmarkAuthorization(manifest, options = {}) {
         recordConsumedToken(token);
       } catch (err) {
         const isCollision = err.code === 'EEXIST' || err.message.includes('TOKEN_ALREADY_RESERVED');
+        const isStaleLock = err.message.includes('LEDGER_LOCK_STALE_UNCERTAIN');
         return Object.freeze({
           authorized: false,
           state: BENCHMARK_RESULT_CLASSIFICATIONS.BLOCKED,
-          reasonCode: isCollision ? 'REPLAY_DETECTED' : 'LEDGER_WRITE_FAILED',
+          reasonCode: isCollision
+            ? 'REPLAY_DETECTED'
+            : isStaleLock
+            ? 'LEDGER_LOCK_STALE_UNCERTAIN'
+            : 'LEDGER_WRITE_FAILED',
           blockers: Object.freeze([
             isCollision
               ? `Run token "${token.slice(0, 8)}..." has already been consumed (replay prevention): ${err.message}`
+              : isStaleLock
+              ? `Stale or ambiguous ledger lock prevented authorization: ${err.message}`
               : `Failed to commit consumed token to durable ledger: ${err.message}`,
           ]),
         });
