@@ -288,7 +288,21 @@ export class CodingAgentTransport {
         : message.requestId || '',
     );
     const request = this.requests.get(requestId);
-    if (!request) return;
+    if (!request) {
+      if (message.type === 'tool_call' && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          type: 'tool_result',
+          requestId,
+          toolCallId: String(message.toolCallId || ''),
+          result: {
+            ok: false,
+            code: 'REQUEST_NOT_FOUND',
+            error: 'The request is no longer active on the client.',
+          },
+        }));
+      }
+      return;
+    }
     if (message.type === 'activity_event') {
       const activity = parseCodingActivityEvent(message);
       if (activity && activity.executionId === requestId) {

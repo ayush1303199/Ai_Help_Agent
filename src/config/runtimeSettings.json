@@ -35,7 +35,7 @@
     },
     "transport": {
       "connectTimeoutMs": 10000,
-      "requestTimeoutMs": 75000
+      "requestTimeoutMs": 120000
     },
     "providerHydration": {
       "retryDelaysMs": [250, 500, 1000]
