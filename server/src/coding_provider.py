@@ -210,11 +210,17 @@ _SECURITY_INSTRUCTION_MARKERS = (
     "destructive statements",
     "weaken safety boundaries",
     "authoritative coding agent owner",
+<<<<<<< HEAD
     "core task ownership",
     "prompt injection",
     "redacted password",
     "core coding agent engineering policy",
     "you are the coding agent",
+=======
+    "prompt injection",
+    "redacted password",
+    "core coding agent engineering policy",
+>>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
 )
 
 
@@ -230,7 +236,11 @@ def _split_into_instruction_units(content: str) -> List[str]:
         stripped = line.strip()
         if not stripped:
             continue
+<<<<<<< HEAD
         if len(stripped) > 250 and any(delim in stripped for delim in (". ", "? ", "! ")):
+=======
+        if len(stripped) > 250 and ". " in stripped:
+>>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
             sentences = re.split(r"(?<=[.!?])\s+", stripped)
             units.extend([s.strip() for s in sentences if s.strip()])
         else:
@@ -1110,10 +1120,15 @@ def _request_provider_completion(
                         return {
                             "role": "assistant",
                             "content": (
+<<<<<<< HEAD
                                 "INVESTIGATION_INCOMPLETE: The provider requested project inspection that this request "
                                 "could not execute, and its bounded tool-call recovery was exhausted. No conclusion "
                                 "is claimed from the missing inspection. Next step: retry this request after enabling "
                                 "a Coding provider with tool calling; the inspection must be completed before reporting findings."
+=======
+                                f"Investigation could not be completed with verified evidence. "
+                                f"Further inspection was planned for {fn_name}({fn_args}), but no additional tool rounds remain."
+>>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
                             ),
                             "status": "INVESTIGATION_INCOMPLETE",
                             "continuation": {

@@ -216,6 +216,7 @@ function acquireLedgerLock(ledgerPath) {
           throw new Error(`LEDGER_LOCK_STALE_UNCERTAIN: Malformed or unparseable lock metadata on ${lockPath}. Automatic deletion is prohibited; manual intervention required.`);
         }
 
+<<<<<<< HEAD
         if (
           !metadata ||
           typeof metadata !== 'object' ||
@@ -224,6 +225,9 @@ function acquireLedgerLock(ledgerPath) {
           !Number.isFinite(metadata.timestamp) ||
           metadata.timestamp <= 0
         ) {
+=======
+        if (!metadata || typeof metadata !== 'object' || typeof metadata.pid !== 'number' || typeof metadata.timestamp !== 'number') {
+>>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
           throw new Error(`LEDGER_LOCK_STALE_UNCERTAIN: Ambiguous lock owner metadata on ${lockPath}. Automatic deletion is prohibited; manual intervention required.`);
         }
 

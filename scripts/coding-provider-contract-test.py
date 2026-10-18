@@ -289,8 +289,13 @@ class ProviderContractTests(unittest.TestCase):
         self.assertIn("Benchmark live inference is BLOCKED", str(ctx.exception))
         self.assertIn("Stage 1 not established", str(ctx.exception))
 
+<<<<<<< HEAD
     def test_09_mandatory_security_instructions_preserved_across_all_stages(self):
         """Mandatory security instructions and authorization boundaries must remain intact across all compaction stages 0-6."""
+=======
+    def test_09_mandatory_security_instructions_preserved_during_compaction(self):
+        """Mandatory security instructions and authorization boundaries must not be dropped during context compaction."""
+>>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
         system_text = (
             "You are the Coding Agent for the currently selected project. "
             "Inspect it only through the supplied read-only tools. "
@@ -301,6 +306,7 @@ class ProviderContractTests(unittest.TestCase):
             "The operation is an execution proposal only: application policy validates it before execution. "
             "Project Architecture: Languages=['PHP'], Frameworks=['Yii2']. "
             "Extra optional context detailing database tables and controller mappings: "
+<<<<<<< HEAD
             + "A" * 1200
         )
         msg = {"role": "system", "content": system_text}
@@ -452,6 +458,31 @@ class ProviderContractTests(unittest.TestCase):
 
         # 2. coding_provider empty content normalization fallback
         raw_empty = {"role": "assistant", "content": "   "}
+=======
+            + "A" * 800
+        )
+        msg = {"role": "system", "content": system_text}
+
+        # Stage 6 is the most aggressive compaction stage (nominal budget 280 chars)
+        compacted = provider_mod._compact_system_context(msg, terms={"controller", "personal"}, stage=6)
+        content = compacted.get("content", "")
+
+        # Critical security and authorization boundaries must be preserved
+        self.assertIn("read-only tools", content)
+        self.assertIn("Never write files", content)
+        self.assertIn("run commands", content)
+        self.assertIn("untrusted data", content)
+        self.assertIn("permanently blocked", content)
+        self.assertIn("execution proposal only", content)
+        # Optional padding should have been pruned
+        self.assertNotIn("A" * 100, content)
+
+    def test_10_truthful_fallback_without_invented_completion_evidence(self):
+        """Empty model responses and failed tool rounds must not claim completed investigation or invent observations."""
+        # 1. coding_provider empty content normalization fallback
+        raw_empty = {"role": "assistant", "content": "   "}
+        # Simulate finalization with no tools where raw has empty content
+>>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
         if not (raw_empty.get("content") or "").strip() and not raw_empty.get("tool_calls"):
             raw_empty["content"] = (
                 "Investigation could not be completed: no authoritative response or verified evidence was received."
@@ -459,6 +490,7 @@ class ProviderContractTests(unittest.TestCase):
         self.assertNotIn("Completed investigation", raw_empty["content"])
         self.assertIn("could not be completed", raw_empty["content"])
 
+<<<<<<< HEAD
     def test_12_end_to_end_conversation_compaction_security_preservation(self):
         """_compact_coding_conversation must preserve mandatory security instructions in the final compacted messages."""
         system_content = (
@@ -524,6 +556,32 @@ class ProviderContractTests(unittest.TestCase):
         self.assertIn("No conclusion is claimed", result.get("content", ""))
         self.assertIn("retry this request", result.get("content", "").lower())
         self.assertEqual(client.chat.completions.create.call_count, 3)
+=======
+        # 2. coding_websocket empty observation fallback
+        semantic_task_empty = {"observations": []}
+        obs = semantic_task_empty.get("observations") or []
+        if not obs:
+            content = "Investigation incomplete: no verified project observations or evidence were recorded in the project scope."
+        self.assertNotIn("Completed investigation", content)
+        self.assertIn("Investigation incomplete", content)
+
+        # 3. coding_websocket observations with unverified evidence fallback
+        semantic_task_with_obs = {
+            "observations": [{"tool": "search_code"}]
+        }
+        obs2 = semantic_task_with_obs.get("observations") or []
+        obs_summary = "\n".join(
+            f"- {o.get('tool')}: {o.get('evidenceRef', o.get('evidenceId', 'unverified'))}"
+            for o in obs2[-5:]
+        )
+        content2 = (
+            "Investigation recorded the following unverified project observations, but no authoritative summary was produced:\n"
+            + obs_summary
+        )
+        self.assertNotIn("Completed investigation", content2)
+        self.assertNotIn("executed", content2)
+        self.assertIn("unverified", content2)
+>>>>>>> e1d5b15f6cd82ef9dabce5f5b912a3786f9205c4
 
 
 if __name__ == "__main__":
