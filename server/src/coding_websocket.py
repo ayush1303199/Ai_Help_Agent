@@ -5493,26 +5493,61 @@ def _serialize_coding_tool_result(result: Any) -> str:
         return serialized
 
     data = safe_result.get("data") if isinstance(safe_result, dict) else None
-    content = data.get("content") if isinstance(data, dict) else None
-    if isinstance(content, str):
-        omission = "\n[Tool result truncated to fit the Coding Agent evidence limit.]"
-        low, high = 0, len(content)
+    if isinstance(data, dict):
+        content = data.get("content")
+        if isinstance(content, str):
+            omission = "\n[Tool result truncated to fit the Coding Agent evidence limit.]"
+            low, high = 0, len(content)
+            best = None
+            while low <= high:
+                midpoint = (low + high) // 2
+                truncated = content[:midpoint]
+                if midpoint < len(content):
+                    truncated += omission
+                candidate = dict(safe_result)
+                candidate_data = dict(data)
+                candidate_data["content"] = truncated
+                candidate["data"] = candidate_data
+                candidate_json = json.dumps(candidate, ensure_ascii=False, default=str)
+                if len(candidate_json) <= MAX_CODING_TOOL_RESULT_CHARS:
+                    best = candidate_json
+                    low = midpoint + 1
+                else:
+                    high = midpoint - 1
+            if best is not None:
+                return best
+        for list_key in ("results", "entries", "files", "symbols", "references", "items"):
+            items = data.get(list_key)
+            if isinstance(items, list) and items:
+                low, high = 0, len(items)
+                best = None
+                while low <= high:
+                    mid = (low + high) // 2
+                    candidate = dict(safe_result)
+                    candidate_data = dict(data)
+                    candidate_data[list_key] = items[:mid]
+                    candidate["data"] = candidate_data
+                    candidate_json = json.dumps(candidate, ensure_ascii=False, default=str)
+                    if len(candidate_json) <= MAX_CODING_TOOL_RESULT_CHARS:
+                        best = candidate_json
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+                if best is not None:
+                    return best
+    elif isinstance(data, list) and data:
+        low, high = 0, len(data)
         best = None
         while low <= high:
-            midpoint = (low + high) // 2
-            truncated = content[:midpoint]
-            if midpoint < len(content):
-                truncated += omission
+            mid = (low + high) // 2
             candidate = dict(safe_result)
-            candidate_data = dict(data)
-            candidate_data["content"] = truncated
-            candidate["data"] = candidate_data
+            candidate["data"] = data[:mid]
             candidate_json = json.dumps(candidate, ensure_ascii=False, default=str)
             if len(candidate_json) <= MAX_CODING_TOOL_RESULT_CHARS:
                 best = candidate_json
-                low = midpoint + 1
+                low = mid + 1
             else:
-                high = midpoint - 1
+                high = mid - 1
         if best is not None:
             return best
 

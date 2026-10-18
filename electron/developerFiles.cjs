@@ -691,8 +691,17 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
       if (stat.size > MAX_FILE_BYTES) continue;
       const content = await fs.readFile(target.target, 'utf8');
       const lines = content.split(/\r?\n/);
-      const nameMatch = entry.name.toLowerCase().includes(normalizedQuery);
-      if (nameMatch) {
+      const normalizedPath = childRelative.replace(/\\/g, '/').toLowerCase();
+      const normalizedEntryName = entry.name.toLowerCase();
+      const nameMatch = normalizedEntryName.includes(normalizedQuery);
+      const queryTokens = normalizedQuery
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .replace(/[_\-/.\\]+/g, ' ')
+        .split(/\s+/)
+        .map(t => t.toLowerCase())
+        .filter(t => t.length > 1);
+      const multiTokenMatch = queryTokens.length > 1 && queryTokens.every(tok => normalizedPath.includes(tok));
+      if (nameMatch || multiTokenMatch) {
         results.push({
           path: childRelative,
           line: 0,

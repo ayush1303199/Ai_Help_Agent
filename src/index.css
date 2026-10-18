@@ -760,3 +760,29 @@ body.overlay-body {
 .no-drag {
   -webkit-app-region: no-drag;
 }
+
+@keyframes wave-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.animate-wave-shimmer {
+  animation: wave-shimmer 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes wave-pulse-glow {
+  0%, 100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+.animate-wave-pulse {
+  animation: wave-pulse-glow 1.8s ease-in-out infinite;
+}

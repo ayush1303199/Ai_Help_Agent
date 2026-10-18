@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { runtimeConfig } from '../../config/runtimeConfig';
 import type { CodingConversationState, CodingPreference } from './codingSessionStore';
-import type { CodingActivity } from './codingTransport';
+import type { CodingActivity, CodingActivityMessage } from './codingTransport';
+
+function isCodingNarration(item: CodingActivity): item is CodingActivityMessage {
+  return !('event' in item);
+}
 
 function codingActivityLabel(item: CodingActivity): string {
   if (!('event' in item)) return `Agent narration · ${item.phase}`;
@@ -47,6 +51,25 @@ function codingActivityLabel(item: CodingActivity): string {
   }
 }
 
+function codingActivityIcon(item: CodingActivity): string {
+  if (!('event' in item)) return '🧠';
+  switch (item.activityType) {
+    case 'SEARCHING': return '🔍';
+    case 'READING_FILE': return '📄';
+    case 'DISCOVERING_REPOSITORY': return '📁';
+    case 'INSPECTING_SYMBOL': return '🏷️';
+    case 'TRACING_CALLER': return '🔗';
+    case 'VERIFYING': return '⚡';
+    case 'INSPECTING_DATABASE': return '🗄️';
+    case 'PROPOSAL': return '✏️';
+    case 'TOOL':
+      if (item.action.tool === 'proposal_apply') return '✏️';
+      if (item.action.tool === 'rollback') return '↩️';
+      return '🛠️';
+    default: return '⚙️';
+  }
+}
+
 function codingActivityStatus(item: Extract<CodingActivity, { event: 'activity_event' }>) {
   switch (item.status) {
     case 'STARTED': return { icon: '●', label: 'Running', className: 'text-sky-300' };
@@ -59,23 +82,24 @@ function codingActivityStatus(item: Extract<CodingActivity, { event: 'activity_e
     case 'BLOCKED': return { icon: '⊘', label: 'Blocked · not executed', className: 'text-amber-300' };
     case 'UNCERTAIN': return { icon: '⚠', label: 'Uncertain · not established', className: 'text-amber-300' };
     case 'NOT_ESTABLISHED': return { icon: '⚠', label: 'Not established', className: 'text-amber-300' };
+    default: return { icon: '●', label: String(item.status || 'Active'), className: 'text-sky-300' };
   }
 }
 
 function CodingActivityEntry({ item }: { item: CodingActivity }) {
   if (!('event' in item)) {
-    return <div className="text-[11px] text-slate-400">
-      <p>
-        <span className="mr-2 font-semibold text-slate-500">{codingActivityLabel(item)}</span>
+    return <div className="flex items-start gap-2 rounded-md border border-slate-800/80 bg-slate-900/40 px-2.5 py-1.5 text-[11px] text-slate-400">
+      <span className="shrink-0" aria-hidden="true">🧠</span>
+      <div className="min-w-0 flex-1">
+        <span className="mr-2 font-semibold text-slate-400">{codingActivityLabel(item)}</span>
         <span>{item.message}</span>
-        <span className="ml-2 text-slate-600">Not evidence of execution</span>
-      </p>
-      {item.plan && <div className="ml-2 mt-1 border-l border-slate-700 pl-2">
-        <p>{String(item.plan.goal || '')}</p>
-        {Array.isArray(item.plan.steps) && <ol className="mt-1 list-inside list-decimal">
-          {item.plan.steps.map((step, stepIndex) => <li key={stepIndex}>{String(step)}</li>)}
-        </ol>}
-      </div>}
+        {item.plan && <div className="ml-2 mt-1 border-l border-slate-700 pl-2">
+          <p>{String(item.plan.goal || '')}</p>
+          {Array.isArray(item.plan.steps) && <ol className="mt-1 list-inside list-decimal">
+            {item.plan.steps.map((step, stepIndex) => <li key={stepIndex}>{String(step)}</li>)}
+          </ol>}
+        </div>}
+      </div>
     </div>;
   }
 
@@ -92,30 +116,72 @@ function CodingActivityEntry({ item }: { item: CodingActivity }) {
     item.repairAttempt !== undefined ? `repair attempt ${item.repairAttempt}` : undefined,
   ].filter(Boolean);
   const status = codingActivityStatus(item);
-  return <div className="text-[11px] text-slate-400">
-    <p className="flex flex-wrap items-center gap-1.5">
-      <span className="font-semibold text-sky-300">{codingActivityLabel(item)}</span>
-      {item.action.target && (
-        <code className="rounded bg-slate-800/80 px-1.5 py-0.5 font-mono text-[11px] text-sky-200">
-          {item.action.target}
-        </code>
-      )}
-      <span className={`font-semibold ${status.className}`} aria-label={status.label}>
-        {status.icon} {status.label}
+  const icon = codingActivityIcon(item);
+
+  return <div className="rounded-lg border border-slate-800/90 bg-slate-950/70 p-2.5 shadow-sm transition hover:border-slate-700/80">
+    <div className="flex flex-wrap items-center justify-between gap-1.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <span className="text-sm shrink-0" aria-hidden="true">{icon}</span>
+        <span className="font-semibold text-sky-200">{codingActivityLabel(item)}</span>
+        {item.action.target && (
+          <code className="rounded-md border border-slate-700/60 bg-slate-900 px-2 py-0.5 font-mono text-[11px] font-medium text-sky-300 break-all">
+            {item.action.target}
+          </code>
+        )}
+      </div>
+      <span
+        className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+          item.status === 'COMPLETED'
+            ? 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+            : item.status === 'FAILED'
+            ? 'border border-rose-500/30 bg-rose-500/10 text-rose-300'
+            : item.status === 'SKIPPED'
+            ? 'border border-slate-700 bg-slate-800/60 text-slate-400'
+            : 'border border-sky-500/30 bg-sky-500/10 text-sky-300'
+        }`}
+        aria-label={status.label}
+      >
+        <span>{status.icon}</span>
+        <span>{status.label}</span>
       </span>
-    </p>
-    {item.action.reason && <p className="ml-2 mt-0.5 text-[10px] text-slate-500">{item.action.reason}</p>}
-    {details.length > 0 && <p className="ml-2 mt-0.5 text-[10px] text-slate-400">{details.join(' · ')}</p>}
-    {result?.paths && result.paths.length > 0 && <ul className="ml-2 mt-0.5 list-inside list-disc text-[10px] text-slate-300">
-      {result.paths.map((path) => <li key={path}>{path}</li>)}
-    </ul>}
+    </div>
+    {details.length > 0 && (
+      <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-6 text-[10px] text-slate-400">
+        {details.map((d, i) => (
+          <span key={i} className="rounded bg-slate-900 px-1.5 py-0.5 text-slate-300 border border-slate-800">
+            {d}
+          </span>
+        ))}
+      </div>
+    )}
+    {item.action.reason && (
+      <p className="mt-1 pl-6 text-[10px] text-slate-500">{item.action.reason}</p>
+    )}
+    {result?.paths && result.paths.length > 0 && (
+      <div className="mt-1.5 pl-6">
+        <ul className="space-y-0.5 text-[10px] text-slate-400 font-mono">
+          {result.paths.slice(0, 5).map((path) => (
+            <li key={path} className="truncate text-slate-300">
+              📄 {path}
+            </li>
+          ))}
+          {result.paths.length > 5 && (
+            <li className="text-slate-500">
+              + {result.paths.length - 5} more files…
+            </li>
+          )}
+        </ul>
+      </div>
+    )}
     {item.action.expectedEvidence && item.action.expectedEvidence.length > 0 && (
-      <p className="ml-2 mt-0.5 text-[10px] text-slate-500">Evidence sought: {item.action.expectedEvidence.join(', ')}</p>
+      <p className="mt-1 pl-6 text-[10px] text-slate-500">Evidence sought: {item.action.expectedEvidence.join(', ')}</p>
     )}
     {item.status !== 'SKIPPED' && item.error?.message && (
-      <p className="ml-2 mt-0.5 text-[10px] text-rose-300">{item.error.message}</p>
+      <p className="mt-1 pl-6 text-[10px] text-rose-300">{item.error.message}</p>
     )}
-    {item.terminalizedLocally && <p className="ml-2 mt-0.5 text-amber-300">No terminal result was received.</p>}
+    {item.terminalizedLocally && (
+      <p className="mt-1 pl-6 text-[10px] text-amber-300">No terminal result was received.</p>
+    )}
   </div>;
 }
 
@@ -725,22 +791,91 @@ export function CodingAgentWorkspace({
             {message.content && <button type="button" onClick={() => { void copyMessages([message], copyKey); }} className="rounded px-1.5 py-0.5 text-[10px] text-slate-500 hover:text-sky-200" aria-label={`Copy ${message.role} message`}>{copiedItem === copyKey ? 'Copied' : 'Copy Markdown'}</button>}
           </div>
           {message.content ? <CodingMarkdown content={message.content} /> : message.streaming && <p className="text-sm leading-relaxed text-slate-300">I’m understanding the request and inspecting the relevant files…</p>}
-          {message.role === 'assistant' && messageIndex === messages.length - 1 && activity.length > 0 && <div className="mt-3 space-y-2 rounded-md border border-slate-700 bg-slate-900/70 p-2.5">
-            {activity.filter((item, idx, arr) => {
+          {message.role === 'assistant' && messageIndex === messages.length - 1 && (activity.length > 0 || busy || streaming) && (() => {
+            const narrationItems = activity.filter(isCodingNarration);
+            const toolItems = activity.filter((item, idx, arr) => {
+              if (!('event' in item)) return false;
               if (idx === 0) return true;
               const prev = arr[idx - 1];
-              if ('event' in item && 'event' in prev) {
+              if ('event' in prev) {
                 if (item.status === 'SKIPPED' && prev.status === 'SKIPPED' &&
                     item.action.tool === prev.action.tool && item.action.target === prev.action.target) {
                   return false;
                 }
               }
               return true;
-            }).map((item) => <CodingActivityEntry
-              key={'event' in item ? `${item.executionId}:${item.activityId}` : item.id}
-              item={item}
-            />)}
-          </div>}
+            });
+
+            return (
+              <div className="mt-3 space-y-2.5">
+                {(busy || streaming) && (
+                  <div className="relative overflow-hidden rounded-lg border border-sky-500/30 bg-slate-900/80 px-3 py-2 shadow-sm">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="relative flex h-2 w-2">
+                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75" />
+                          <span className="relative inline-flex h-2 w-2 rounded-full bg-sky-500" />
+                        </span>
+                        <span className="text-xs font-medium text-sky-200">
+                          {streaming
+                            ? 'Generating response…'
+                            : toolItems.length > 0
+                            ? 'Investigating codebase and analyzing context…'
+                            : 'Thinking and analyzing project…'}
+                        </span>
+                      </div>
+                      <span className="animate-wave-pulse font-mono text-[10px] uppercase tracking-wider text-sky-400/90">
+                        Active
+                      </span>
+                    </div>
+                    <div className="mt-2 h-0.5 w-full overflow-hidden rounded-full bg-slate-800">
+                      <div className="h-full w-full bg-gradient-to-r from-transparent via-sky-400 to-transparent animate-wave-shimmer" />
+                    </div>
+                  </div>
+                )}
+
+                {narrationItems.length > 0 && (
+                  <details
+                    className="group rounded-lg border border-slate-800 bg-slate-950/60 transition-colors hover:border-slate-700/80"
+                    open={Boolean((busy || streaming) && !message.content)}
+                  >
+                    <summary className="flex cursor-pointer select-none items-center justify-between px-3 py-2 text-xs font-medium text-slate-300 hover:text-sky-200">
+                      <span className="flex items-center gap-2">
+                        <span>🧠</span>
+                        <span className="font-semibold text-slate-200">Thinking Process</span>
+                        <span className="font-normal text-[10px] text-slate-500">
+                          ({narrationItems.length} {narrationItems.length === 1 ? 'step' : 'steps'})
+                        </span>
+                      </span>
+                      <span className="text-[10px] text-slate-500 transition-transform group-open:rotate-180">▼</span>
+                    </summary>
+                    <div className="space-y-1.5 border-t border-slate-800/80 p-2.5">
+                      {narrationItems.map((item, idx) => (
+                        <div key={`narration-${idx}`} className="flex items-start gap-2 text-[11px] text-slate-400">
+                          <span className="mt-0.5 shrink-0 text-slate-500">•</span>
+                          <div className="min-w-0 flex-1">
+                            {item.phase && <span className="mr-1.5 font-medium text-slate-300">[{item.phase}]</span>}
+                            <span>{item.message}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+
+                {toolItems.length > 0 && (
+                  <div className="space-y-1.5">
+                    {toolItems.map((item) => (
+                      <CodingActivityEntry
+                        key={'event' in item ? `${item.executionId}:${item.activityId}` : item.id}
+                        item={item}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </article>;
         })}
         {showAllMessages && messages.length > 10 && (
