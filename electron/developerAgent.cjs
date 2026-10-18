@@ -2758,7 +2758,11 @@ async function executeAutonomousCodingWorkflow({
   });
 
   if (!gateResult.allowed) {
-    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'approval_rejected' });
+    reject(task.taskId, owner);
+    const currentTurnState = conversationTurns.get(turn.turnId)?.state;
+    if (!['completed', 'failed', 'cancelled'].includes(currentTurnState)) {
+      advanceConversationTurn(turn.turnId, 'cancelled', owner, { phase: 'approval_rejected' });
+    }
     return {
       outcome: 'APPROVAL_REJECTED',
       phase: 'APPROVE',

@@ -265,6 +265,21 @@ class FormController {
   assert.match(rejectedApproval.detail, /Exact proposed diff:/);
   assert.match(rejectedApproval.detail, /FormController\.php/);
   assert.match(rejectedApproval.detail, /Manifest: [a-f0-9]{64}/i);
+  assert.equal(
+    require('../electron/developerAgent.cjs').getTaskForTest(unapprovedResult.taskId).state,
+    'cancelled',
+    'Rejecting the workflow proposal must leave its task terminally cancelled.'
+  );
+  await assert.rejects(
+    async () => invokeIpc('developer:proposal-approve', sender, unapprovedResult.taskId),
+    /awaiting approval|invalid, stale, or mismatched|authorization/i,
+    'A rejected workflow proposal must not be approved through the separate proposal IPC.'
+  );
+  await assert.rejects(
+    async () => invokeIpc('developer:proposal-apply', sender, unapprovedResult.taskId),
+    /proposal must be approved exactly once|invalid, stale, or mismatched|authorization/i,
+    'A rejected workflow proposal must not be applied through the separate proposal IPC.'
+  );
 
   // Verify file on disk remained 100% untouched
   const untouchedContent = await fs.readFile(
