@@ -144,9 +144,22 @@ function reserveTokenAtomically(ledgerPath, token) {
   }
 }
 
-const LOCK_TIMEOUT_MS = 3000;
+const LOCK_TIMEOUT_MS = 8000;
 const STALE_LOCK_THRESHOLD_MS = 5000;
 const RETRY_INTERVAL_MS = 25;
+
+/**
+ * Checks whether a process with the given PID is currently active.
+ */
+function isProcessAlive(pid) {
+  if (typeof pid !== 'number' || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM'; // Process exists but owned by another user
+  }
+}
 
 /**
  * Cross-process mutual exclusion via lockfile on ledger.
@@ -181,7 +194,17 @@ function acquireLedgerLock(ledgerPath) {
         try {
           const stat = fs.statSync(lockPath);
           const age = Date.now() - stat.mtimeMs;
-          if (age > STALE_LOCK_THRESHOLD_MS) {
+          let shouldBreak = age > STALE_LOCK_THRESHOLD_MS;
+          if (!shouldBreak) {
+            try {
+              const raw = fs.readFileSync(lockPath, 'utf8');
+              const data = JSON.parse(raw);
+              if (data && typeof data.pid === 'number' && !isProcessAlive(data.pid)) {
+                shouldBreak = true;
+              }
+            } catch {}
+          }
+          if (shouldBreak) {
             try {
               fs.unlinkSync(lockPath);
               continue;
