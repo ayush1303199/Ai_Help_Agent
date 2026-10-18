@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import errno
 import hashlib
 import hmac
 import json
@@ -10,6 +11,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 from pathlib import Path
@@ -2074,6 +2076,14 @@ def compute_next_best_action(session_data: Dict[str, Any], intent_info: Dict[str
                 }
 
     elif intent in (TaskIntent.BUG_INVESTIGATION, TaskIntent.BUG_FIX):
+        topic_terms = sorted(_proposal_topic_terms({"userRequest": intent_info.get("request")}), key=len, reverse=True)
+        unsearched_topics = [t for t in topic_terms if t.lower() not in searched_queries]
+        if unsearched_topics:
+            return {
+                "action": "search_code",
+                "target": unsearched_topics[0],
+                "rationale": f"Search project source for domain concept '{unsearched_topics[0]}' from user request.",
+            }
         for cand in ("exception", "throw", "error", "500", "status"):
             if cand.lower() not in searched_queries:
                 return {
@@ -2707,10 +2717,19 @@ def get_backend_project_state() -> Dict[str, Any]:
     root = _active_backend_project.get("projectRoot")
     status = _active_backend_project.get("status", "PROJECT_NOT_ATTACHED")
     if root:
-        import os
-        if not os.path.isdir(root):
-            status = "PROJECT_MISSING"
+        try:
+            project_stat = os.stat(root)
+        except OSError as error:
+            status = (
+                "PROJECT_MISSING"
+                if error.errno in {errno.ENOENT, errno.ENOTDIR}
+                else "PROJECT_INACCESSIBLE"
+            )
             _active_backend_project["status"] = status
+        else:
+            if not stat.S_ISDIR(project_stat.st_mode):
+                status = "PROJECT_MISSING"
+                _active_backend_project["status"] = status
     return {
         "projectRoot": root,
         "status": status,
@@ -2723,17 +2742,27 @@ def set_backend_project_state(project_root: Any) -> Dict[str, Any]:
     if isinstance(project_root, dict):
         project_root = project_root.get("projectRoot")
     if project_root and isinstance(project_root, str):
-        import os
-        if os.path.isdir(project_root):
+        try:
+            project_stat = os.stat(project_root)
+        except OSError as error:
             _active_backend_project["projectRoot"] = project_root
-            _active_backend_project["status"] = "PROJECT_ATTACHED"
+            _active_backend_project["status"] = (
+                "PROJECT_MISSING"
+                if error.errno in {errno.ENOENT, errno.ENOTDIR}
+                else "PROJECT_INACCESSIBLE"
+            )
+        else:
+            if stat.S_ISDIR(project_stat.st_mode):
+                _active_backend_project["projectRoot"] = project_root
+                _active_backend_project["status"] = "PROJECT_ATTACHED"
+            else:
+                _active_backend_project["projectRoot"] = project_root
+                _active_backend_project["status"] = "PROJECT_MISSING"
             try:
-                UNIVERSAL_EVENT_STREAM.emit("PROJECT_DISCOVERED", {"projectRoot": project_root})
+                if _active_backend_project["status"] == "PROJECT_ATTACHED":
+                    UNIVERSAL_EVENT_STREAM.emit("PROJECT_DISCOVERED", {"projectRoot": project_root})
             except Exception:
                 pass
-        else:
-            _active_backend_project["projectRoot"] = project_root
-            _active_backend_project["status"] = "PROJECT_MISSING"
     else:
         _active_backend_project["projectRoot"] = None
         _active_backend_project["status"] = "PROJECT_DETACHED"
@@ -5024,6 +5053,29 @@ def _format_database_credential_report(result: Dict[str, Any]) -> str:
         "- **Password:** [REDACTED]",
         f"- **Credential source:** {display(result.get('credentialSource'), 'Not resolved')}",
     ])
+
+
+def _format_investigation_observation_fallback(semantic_task: Any) -> str:
+    raw_observations = semantic_task.get("observations") if isinstance(semantic_task, dict) else None
+    observations = [obs for obs in raw_observations if isinstance(obs, dict)] if isinstance(raw_observations, list) else []
+    if observations:
+        obs_lines = []
+        for obs in observations[-5:]:
+            tool_name = str(obs.get("tool") or "unknown_tool")
+            is_failed = (
+                obs.get("outcome") in {"FAILED", "BLOCKED", "TIMEOUT", "ERROR"}
+                or obs.get("status") in {"FAILED", "BLOCKED", "TIMEOUT", "ERROR"}
+                or obs.get("ok") is False
+                or bool(obs.get("error"))
+            )
+            evidence_label = "failed" if is_failed else str(obs.get("evidenceRef") or obs.get("evidenceId") or "unverified")
+            obs_lines.append(f"- {tool_name}: {evidence_label}")
+        obs_summary = "\n".join(obs_lines)
+        return (
+            "Investigation recorded the following unverified project observations, but no authoritative summary was produced:\n"
+            + obs_summary
+        )
+    return "Investigation incomplete: no verified project observations or evidence were recorded in the project scope."
 
 
 async def _resolve_semantic_task_with_model(
@@ -9413,10 +9465,12 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         "If those measurements are unavailable, say so explicitly, explain the evidence behind any likely candidate, "
         "and state what measurement would confirm it. Never imply that a query was benchmarked or executed. "
         "Autonomous investigation rules: "
-        "1. Discover target files automatically from the user's natural-language request using search_code, search_symbols, or read_file. Never ask the user for paths you can find. "
-        "2. Trace code relationships (multi-hop): when inspecting a method or class, trace its queries, callers, callees, and helpers. "
-        "3. For performance and duplicate-query questions, inspect all queries in the method, check for loop executions (N+1), scope overrides (such as ->where() overriding default scopes instead of ->andWhere()), lack of request-level caching, and missing indexes. "
-        "4. Separate observed code facts from runtime execution latency: note that exact microsecond timings require database EXPLAIN or runtime profiling, but static code defects (e.g. duplicate queries or unindexed scans) must be identified with concrete file/line evidence."
+        "1. Discover target files automatically from the user's natural-language request using search_code, search_symbols, or read_file. Never stop prematurely or declare that a file is missing simply because a colloquial class/file name from the prompt was not found literally. Decompose requests into feature concepts, module names, symbols, forms, models, and persistence references. Never ask the user for paths you can find. "
+        "2. Trace code relationships end-to-end (multi-hop): map route/entrypoint -> controller/handler -> form model/validation -> persistence/transactions -> response/view. When inspecting a method or class, trace its queries, callers, callees, validation errors, and helpers. "
+        "3. Inspect validation, error propagation, transaction rollbacks before exit, null-checks, and debug/probe statements left in production paths. For performance questions, inspect all queries in the method, check for loop executions (N+1), scope overrides (such as ->where() overriding default scopes instead of ->andWhere()), lack of request-level caching, and missing indexes. "
+        "4. Evidence-driven defect classification: require exact file path, symbol, line range, control-flow explanation, expected vs. observed behavior, impact, and confidence classification (CONFIRMED, LIKELY, UNVERIFIED, NOT A BUG). "
+        "5. Separate observed code facts from runtime execution latency: note that exact microsecond timings require database EXPLAIN or runtime profiling, but static code defects (e.g. duplicate queries, missing rollbacks, or unindexed scans) must be identified with concrete file/line evidence. "
+        "6. Workflow discipline: Proposal -> Approval -> Apply -> Verify -> Audit. Keep auto edit/repair opt-in, off by default (max 3 repair attempts). Never claim tests passed without authoritative execution evidence."
     )
     if investigation_gate_required:
         system += (
@@ -10818,15 +10872,60 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         else:
             final_message = None
 
+        proposal_evidence_incomplete = False
         if (
             proposal_required
             and not _has_relevant_proposal_source_evidence(semantic_task)
             and not _is_clarification_response(final_message.get("content") if final_message else "")
         ):
-            raise RuntimeError(
-                "The Coding Agent did not read implementation source relevant to the requested change, so it cannot safely create a proposal. "
-                "The request remains incomplete; no proposal was prepared."
+            session_data = CODING_TASK_STORE.get_or_create(
+                session_id,
+                project_root=project_root,
+                scope=scope,
             )
+            planned_action = compute_next_best_action(session_data, intent_info, arch)
+            planned_call = _coding_tool_call_for_next_action(
+                planned_action,
+                max(0, MAX_CODING_TOOL_ROUNDS - 1),
+                scope,
+            )
+            if planned_call:
+                next_tool = planned_call["function"]["name"]
+                next_arguments = json.loads(planned_call["function"]["arguments"])
+                next_reason = (
+                    planned_action.get("rationale")
+                    or planned_action.get("reason")
+                    or "Continue source discovery using the recorded project context."
+                )
+            else:
+                next_tool = "get_repository_map"
+                next_arguments = {}
+                next_reason = "Discover the active project's source layout before selecting another targeted read."
+            next_action = {
+                "tool": next_tool,
+                "arguments": next_arguments,
+                "reason": next_reason,
+                "expectedEvidence": "Relevant implementation source read successfully.",
+                "confidence": semantic_task.get("confidence", 0.5),
+            }
+            semantic_task["status"] = "INVESTIGATION_INCOMPLETE"
+            semantic_task["nextAction"] = next_action
+            semantic_task["nextActionName"] = next_tool
+            semantic_task["continuation"] = {
+                "status": "READY_TO_RESUME",
+                "nextAction": next_action,
+                "completedToolCalls": tool_calls[-20:],
+                "evidenceCount": len(semantic_task.get("evidence") or []),
+            }
+            content = (
+                "Investigation incomplete: relevant implementation source was not successfully inspected within "
+                "the bounded read-only tool budget. No root cause or proposal is claimed. "
+                f"Next step: {next_tool} {json.dumps(next_arguments, ensure_ascii=False)}. "
+                "Send 'continue' to resume from the recorded project evidence."
+            )
+            final_message = {"role": "assistant", "content": content}
+            _persist_agent_task_state(session, semantic_task, session_id, "INVESTIGATION_INCOMPLETE")
+            proposal_evidence_incomplete = True
 
         if not final_message or final_message.get("tool_calls"):
             task_state_context_message["content"] = (
@@ -10865,18 +10964,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 selected_provider_id = getattr(selected_provider, "id", None) or selected_provider_id
         content = str(final_message.get("content") or "").strip()
         if not content:
-            observations = semantic_task.get("observations") or []
-            if observations:
-                obs_summary = "\n".join(
-                    f"- {obs.get('tool')}: {obs.get('evidenceRef', obs.get('evidenceId', 'executed'))}"
-                    for obs in observations[-5:]
-                )
-                content = (
-                    "Completed investigation with the following recorded evidence:\n"
-                    + obs_summary
-                )
-            else:
-                content = "Completed investigation. No additional evidence was found in the project scope."
+            content = _format_investigation_observation_fallback(semantic_task)
         proposal_evidence_clarification = bool(
             proposal_required
             and semantic_task.get("status") == "NEEDS_CLARIFICATION"
@@ -10908,7 +10996,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     f"category: {', '.join(unresolved)}."
                 )
                 final_message = {"role": "assistant", "content": content}
-        if proposal_required and not _is_clarification_response(content):
+        if proposal_required and not proposal_evidence_incomplete and not _is_clarification_response(content):
             diagnostics = [_proposal_response_shape(content)]
             if not _is_unified_diff_response(content):
                 final_message, selected_provider = await asyncio.to_thread(
@@ -11062,6 +11150,13 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 "taskId": semantic_task.get("taskId"),
                 "intent": semantic_task["intent"]["primary"],
             })
+        elif proposal_evidence_incomplete:
+            semantic_task["status"] = "INVESTIGATION_INCOMPLETE"
+            CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_INCOMPLETE", {
+                "taskId": semantic_task.get("taskId"),
+                "reason": "RELEVANT_SOURCE_NOT_INSPECTED",
+                "nextAction": semantic_task.get("nextAction"),
+            })
         elif not investigation_gate_blocked:
             CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_COMPLETED", {
                 "taskId": semantic_task.get("taskId"),
@@ -11109,7 +11204,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 if proposal_evidence_clarification
                 else (
                     "INVESTIGATION_INCOMPLETE"
-                    if credential_task_blocked or investigation_gate_blocked
+                    if proposal_evidence_incomplete or credential_task_blocked or investigation_gate_blocked
                     else (
                         "INVESTIGATION_COMPLETE"
                         if (is_perf_inv or is_db_inv or (not proposal_required and _has_read_file_evidence(conversation)))
@@ -11155,7 +11250,10 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             ),
         })
         try:
-            UNIVERSAL_EVENT_STREAM.emit("TASK_COMPLETED", {"requestId": request_id, "session": session_id})
+            UNIVERSAL_EVENT_STREAM.emit(
+                "TASK_INCOMPLETE" if proposal_evidence_incomplete else "TASK_COMPLETED",
+                {"requestId": request_id, "session": session_id},
+            )
         except Exception:
             pass
     except Exception as error:

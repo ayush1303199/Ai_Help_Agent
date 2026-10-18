@@ -149,20 +149,8 @@ const STALE_LOCK_THRESHOLD_MS = 5000;
 const RETRY_INTERVAL_MS = 25;
 
 /**
- * Checks whether a process with the given PID is currently active.
- */
-function isProcessAlive(pid) {
-  if (typeof pid !== 'number' || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === 'EPERM'; // Process exists but owned by another user
-  }
-}
-
-/**
  * Cross-process mutual exclusion via lockfile on ledger.
+ * Fails closed on stale, ambiguous, or malformed lockfiles without automatic deletion.
  */
 function acquireLedgerLock(ledgerPath) {
   const lockPath = `${ledgerPath}.lock`;
@@ -175,8 +163,9 @@ function acquireLedgerLock(ledgerPath) {
   while (Date.now() - startTime < LOCK_TIMEOUT_MS) {
     try {
       const fd = fs.openSync(lockPath, 'wx', 0o600);
+      const ownerToken = crypto.randomUUID();
       try {
-        const payload = JSON.stringify({ pid: process.pid, timestamp: Date.now() });
+        const payload = JSON.stringify({ pid: process.pid, timestamp: Date.now(), ownerToken });
         fs.writeFileSync(fd, payload, 'utf8');
         fs.fsyncSync(fd);
       } finally {
@@ -185,32 +174,63 @@ function acquireLedgerLock(ledgerPath) {
       return () => {
         try {
           if (fs.existsSync(lockPath)) {
-            fs.unlinkSync(lockPath);
+            let currentPayload;
+            try {
+              currentPayload = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+            } catch {
+              return;
+            }
+            if (
+              currentPayload &&
+              typeof currentPayload === 'object' &&
+              currentPayload.ownerToken === ownerToken &&
+              currentPayload.pid === process.pid
+            ) {
+              fs.unlinkSync(lockPath);
+            }
           }
         } catch {}
       };
     } catch (err) {
       if (err.code === 'EEXIST') {
+        let stat;
         try {
-          const stat = fs.statSync(lockPath);
-          const age = Date.now() - stat.mtimeMs;
-          let shouldBreak = age > STALE_LOCK_THRESHOLD_MS;
-          if (!shouldBreak) {
-            try {
-              const raw = fs.readFileSync(lockPath, 'utf8');
-              const data = JSON.parse(raw);
-              if (data && typeof data.pid === 'number' && !isProcessAlive(data.pid)) {
-                shouldBreak = true;
-              }
-            } catch {}
-          }
-          if (shouldBreak) {
-            try {
-              fs.unlinkSync(lockPath);
-              continue;
-            } catch {}
-          }
-        } catch {}
+          stat = fs.statSync(lockPath);
+        } catch (statErr) {
+          if (statErr.code === 'ENOENT') continue; // Released concurrently by holder
+          throw new Error(`LEDGER_LOCK_FAILED: Cannot stat lockfile ${lockPath}: ${statErr.message}`);
+        }
+
+        let raw = '';
+        try {
+          raw = fs.readFileSync(lockPath, 'utf8');
+        } catch (readErr) {
+          if (readErr.code === 'ENOENT') continue; // Released concurrently by holder
+          throw new Error(`LEDGER_LOCK_FAILED: Cannot read lockfile ${lockPath}: ${readErr.message}`);
+        }
+
+        let metadata;
+        try {
+          metadata = JSON.parse(raw);
+        } catch {
+          throw new Error(`LEDGER_LOCK_STALE_UNCERTAIN: Malformed or unparseable lock metadata on ${lockPath}. Automatic deletion is prohibited; manual intervention required.`);
+        }
+
+        if (
+          !metadata ||
+          typeof metadata !== 'object' ||
+          !Number.isInteger(metadata.pid) ||
+          metadata.pid <= 0 ||
+          !Number.isFinite(metadata.timestamp) ||
+          metadata.timestamp <= 0
+        ) {
+          throw new Error(`LEDGER_LOCK_STALE_UNCERTAIN: Ambiguous lock owner metadata on ${lockPath}. Automatic deletion is prohibited; manual intervention required.`);
+        }
+
+        const age = Date.now() - Math.max(stat.mtimeMs, metadata.timestamp);
+        if (age > STALE_LOCK_THRESHOLD_MS) {
+          throw new Error(`LEDGER_LOCK_STALE_UNCERTAIN: Stale lockfile detected (${age}ms old, pid=${metadata.pid}) on ${lockPath}. Automatic deletion is prohibited to prevent split-brain authorization.`);
+        }
 
         try {
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RETRY_INTERVAL_MS);
@@ -276,15 +296,24 @@ function recordConsumedToken(token) {
     existing.add(token);
 
     const tmpPath = path.join(dir, `.tmp-${crypto.randomUUID()}.json`);
-    const fd = fs.openSync(tmpPath, 'w', 0o600);
     try {
-      fs.writeFileSync(fd, JSON.stringify([...existing]), { encoding: 'utf8' });
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
+      const fd = fs.openSync(tmpPath, 'w', 0o600);
+      try {
+        fs.writeFileSync(fd, JSON.stringify([...existing]), { encoding: 'utf8' });
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
 
-    fs.renameSync(tmpPath, ledgerPath);
+      fs.renameSync(tmpPath, ledgerPath);
+    } catch (writeErr) {
+      try {
+        if (fs.existsSync(tmpPath)) {
+          fs.unlinkSync(tmpPath);
+        }
+      } catch {}
+      throw writeErr;
+    }
     consumedAuthorizationTokens.add(token);
   } catch (err) {
     if (err.code === 'EEXIST' || err.message.includes('TOKEN_ALREADY_RESERVED')) {
@@ -538,13 +567,20 @@ function validateLiveBenchmarkAuthorization(manifest, options = {}) {
         recordConsumedToken(token);
       } catch (err) {
         const isCollision = err.code === 'EEXIST' || err.message.includes('TOKEN_ALREADY_RESERVED');
+        const isStaleLock = err.message.includes('LEDGER_LOCK_STALE_UNCERTAIN');
         return Object.freeze({
           authorized: false,
           state: BENCHMARK_RESULT_CLASSIFICATIONS.BLOCKED,
-          reasonCode: isCollision ? 'REPLAY_DETECTED' : 'LEDGER_WRITE_FAILED',
+          reasonCode: isCollision
+            ? 'REPLAY_DETECTED'
+            : isStaleLock
+            ? 'LEDGER_LOCK_STALE_UNCERTAIN'
+            : 'LEDGER_WRITE_FAILED',
           blockers: Object.freeze([
             isCollision
               ? `Run token "${token.slice(0, 8)}..." has already been consumed (replay prevention): ${err.message}`
+              : isStaleLock
+              ? `Stale or ambiguous ledger lock prevented authorization: ${err.message}`
               : `Failed to commit consumed token to durable ledger: ${err.message}`,
           ]),
         });
@@ -700,4 +736,7 @@ module.exports = {
   acquireLedgerLock,
   getProtectedDefaultLedgerPath,
   reserveTokenAtomically,
+  recordConsumedToken,
+  isTokenConsumed,
+  getReservationPath,
 };

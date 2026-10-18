@@ -270,6 +270,9 @@ interface CodingAgentWorkspaceProps {
     providerConfigured: boolean;
     projectAttached: boolean;
     projectStatus: string;
+    projectRoot: string | null;
+    projectIdentity: string;
+    canInspectProject: boolean;
     sandbox: {
       available: boolean;
       verified: boolean;
@@ -316,6 +319,7 @@ interface CodingAgentWorkspaceProps {
   onCancelRequest: () => void;
   onSendMessage: () => void;
   onClearMessages: () => void;
+  onExecuteWorkflow?: (userRequest: string, options?: { autoRepairEnabled?: boolean; maxRepairAttempts?: number }) => Promise<unknown>;
   conversations: CodingConversationState[];
   activeConversationId: string;
   onRestoreConversation: (session: CodingConversationState) => void;
@@ -509,6 +513,7 @@ export function CodingAgentWorkspace({
   onCancelRequest,
   onSendMessage,
   onClearMessages,
+  onExecuteWorkflow,
   conversations,
   activeConversationId,
   onRestoreConversation,
@@ -574,6 +579,9 @@ export function CodingAgentWorkspace({
             <p role="status" className="mt-1 text-[11px] text-amber-200">
               Project command execution remains blocked by the shared execution gate; this preflight is informational only.
             </p>
+            <p className="mt-1 text-[10px] text-slate-400">
+              Project identity: {acceptancePreflight.projectIdentity} · Read-only source inspection: {acceptancePreflight.canInspectProject ? 'available' : 'unavailable'}
+            </p>
             {acceptancePreflight.blockers.length > 0 && (
               <ul className="mt-1 list-disc space-y-1 pl-5 text-[11px] text-amber-100">
                 {acceptancePreflight.blockers.map((blocker) => <li key={blocker.code}>{blocker.message}</li>)}
@@ -604,7 +612,7 @@ export function CodingAgentWorkspace({
               <span className={`rounded px-1.5 py-0.5 text-[9px] font-mono font-semibold uppercase tracking-wider ${
                 projectStatus === 'PROJECT_ATTACHED'
                   ? 'border border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-                  : projectStatus === 'PROJECT_MISSING' || projectStatus === 'ATTACH_FAILED'
+                  : projectStatus === 'PROJECT_MISSING' || projectStatus === 'PROJECT_INACCESSIBLE' || projectStatus === 'ATTACH_FAILED'
                   ? 'border border-rose-500/40 bg-rose-500/10 text-rose-300'
                   : projectStatus === 'PROJECT_DETACHED'
                   ? 'border border-amber-500/40 bg-amber-500/10 text-amber-300'
@@ -958,7 +966,20 @@ export function CodingAgentWorkspace({
         <textarea value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSendMessage(); } }} placeholder="Ask about the project or describe a change…" rows={2} className="min-w-0 flex-1 resize-y bg-transparent px-2 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500" />
         {streaming
           ? <button onClick={onCancelRequest} className="rounded-xl border border-rose-400/50 px-4 py-2.5 text-sm font-semibold text-rose-200 hover:bg-rose-500/10">Stop</button>
-          : <button onClick={onSendMessage} disabled={!input.trim() || busy || proposalNeedsDecision} title={proposalNeedsDecision ? 'Approve, apply, or reject the pending proposal first.' : undefined} className="rounded-xl bg-sky-400 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-300 disabled:opacity-40">{busy ? 'Working…' : 'Send'}</button>}
+          : <>
+              {onExecuteWorkflow && isTrustedDesktop && (
+                <button
+                  type="button"
+                  onClick={() => { if (input.trim()) void onExecuteWorkflow(input.trim()); }}
+                  disabled={!input.trim() || busy || proposalNeedsDecision}
+                  title={proposalNeedsDecision ? 'Approve, apply, or reject the pending proposal first.' : 'Execute end-to-end autonomous investigation and repair workflow'}
+                  className="rounded-xl border border-sky-400/60 bg-sky-500/10 px-3 py-2.5 text-xs font-semibold text-sky-200 transition hover:bg-sky-500/20 disabled:opacity-40"
+                >
+                  Auto Workflow
+                </button>
+              )}
+              <button onClick={onSendMessage} disabled={!input.trim() || busy || proposalNeedsDecision} title={proposalNeedsDecision ? 'Approve, apply, or reject the pending proposal first.' : undefined} className="rounded-xl bg-sky-400 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-sky-300 disabled:opacity-40">{busy ? 'Working…' : 'Send'}</button>
+            </>}
       </div>
       {messages.length > 0 && <button onClick={onClearMessages} disabled={busy || streaming || proposalNeedsDecision} title={proposalNeedsDecision ? 'Finish the pending proposal before starting a new conversation.' : undefined} className="mt-2 self-start text-xs text-slate-400 hover:text-slate-200 disabled:opacity-40">New Coding conversation</button>}
     </>

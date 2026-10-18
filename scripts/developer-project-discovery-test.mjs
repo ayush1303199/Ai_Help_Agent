@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import developerFiles from '../electron/developerFiles.cjs';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { requireProjectProcessIsolation } = require('../electron/coding-pipeline/projectProcessIsolation.cjs');
 
 const testRoot = await fs.mkdtemp(path.join(process.cwd(), '.coding-discovery-test-'));
 const originalRoots = process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS;
@@ -43,6 +47,16 @@ try {
   assert.equal(unique.projectRoot, await fs.realpath(uniqueProject));
   assert.deepEqual(unique.matches, [await fs.realpath(uniqueProject)]);
   assert.equal(developerFiles.getProjectRoot(uniqueOwner), await fs.realpath(uniqueProject));
+  const attachedState = await developerFiles.getProjectState(uniqueOwner);
+  assert.equal(attachedState.status, 'PROJECT_ATTACHED');
+  assert.equal(attachedState.projectRoot, await fs.realpath(uniqueProject));
+  assert.throws(
+    () => requireProjectProcessIsolation('Discovery regression test'),
+    /was not started.*(?:sandbox|isolation mechanism)/i,
+  );
+  await fs.writeFile(path.join(uniqueProject, 'DiscoveryProbe.js'), 'export class DiscoveryProbe {}', 'utf8');
+  const readOnlySearch = await developerFiles.searchCode('DiscoveryProbe', uniqueOwner);
+  assert.ok(readOnlySearch.results.some((item) => item.path.endsWith('DiscoveryProbe.js')));
   developerFiles.configureAuditDirectory(auditDirectory);
   await developerFiles.listDirectory('.', uniqueOwner);
   assert.equal((await fs.readdir(uniqueProject)).includes('.dev-mode-audit.log'), false);
@@ -118,6 +132,18 @@ try {
   assert.equal(nonExistent.matches.length, 0);
   assert.equal(nonExistent.projectRoot, null);
   developerFiles.releaseProject(71015);
+
+  const missingOwner = 71020;
+  const missingPath = path.join(testRoot, 'missing-project-folder');
+  const missingAttachment = await developerFiles.attachProject(missingPath, missingOwner);
+  assert.equal(missingAttachment.status, 'PROJECT_MISSING');
+  const missingState = await developerFiles.getProjectState(missingOwner);
+  assert.equal(missingState.status, 'PROJECT_MISSING');
+  assert.equal(missingState.projectRoot, missingPath);
+  assert.equal(developerFiles.projectStatusForFsError({ code: 'EACCES' }), 'PROJECT_INACCESSIBLE');
+  assert.equal(developerFiles.projectStatusForFsError({ code: 'EPERM' }), 'PROJECT_INACCESSIBLE');
+  assert.equal(developerFiles.projectStatusForFsError({ code: 'ENOENT' }), 'PROJECT_MISSING');
+  developerFiles.clearProject(missingOwner);
 
   console.log('Coding project discovery tests passed (unique/ambiguous match, bounds, exclusions, cross-project, and file resolution).');
 } finally {

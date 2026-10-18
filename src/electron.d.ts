@@ -279,7 +279,7 @@ interface Window {
     onScreenReadShortcut: (callback: () => void) => () => void;
     chooseDeveloperProject: () => Promise<{ canceled: boolean; projectRoot: string | null }>;
     discoverDeveloperProject: (projectName: string) => Promise<{ matches: string[]; projectRoot: string | null }>;
-    getDeveloperProjectState: () => Promise<{ status: 'PROJECT_ATTACHED' | 'PROJECT_DETACHED' | 'PROJECT_MISSING' | 'PROJECT_NOT_ATTACHED' | 'PROJECT_STALE' | 'PROJECT_SESSION_RECONNECTING'; projectRoot: string | null; reason?: string | null }>;
+    getDeveloperProjectState: () => Promise<{ status: 'PROJECT_ATTACHED' | 'PROJECT_DETACHED' | 'PROJECT_MISSING' | 'PROJECT_INACCESSIBLE' | 'PROJECT_NOT_ATTACHED' | 'PROJECT_STALE' | 'PROJECT_SESSION_RECONNECTING'; projectRoot: string | null; reason?: string | null }>;
     getDeveloperAcceptancePreflight: () => Promise<{
       ready: boolean;
       canRunProjectCommands: boolean;
@@ -384,7 +384,30 @@ interface Window {
         at?: string;
       }>;
     }>;
-    onDeveloperActivity?: (callback: (event: import('./features/coding/codingActivity').CodingActivityEvent) => void) => () => void;
+    executeDeveloperWorkflow: (payload: {
+      userRequest: string;
+      scope?: string;
+      autoRepairEnabled?: boolean;
+      maxRepairAttempts?: number;
+      tools?: Record<string, unknown> | null;
+    }) => Promise<{
+      outcome: string;
+      phase: string;
+      taskId?: string;
+      turnId?: string;
+      filesModified: string[];
+      codeApplied?: boolean;
+      codeVerified?: boolean;
+      verificationStatus?: string;
+      error?: string;
+      reason?: string;
+      message?: string;
+      requirements?: Record<string, unknown>;
+      clarificationPrompt?: string;
+      continuation?: Record<string, unknown>;
+      worktreeAudit?: Record<string, unknown>;
+    }>;
+    onDeveloperActivity?: (callback: (event: Record<string, unknown>) => void) => () => void;
     undoDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; evidence?: Array<{ kind: string; operation?: string; paths?: string[]; decision?: string; reason?: string; at?: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperSession: () => Promise<{ sessionId: string }>;

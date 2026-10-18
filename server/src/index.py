@@ -1165,12 +1165,18 @@ def get_coding_acceptance_preflight() -> Dict[str, Any]:
         and bool(project_state.get("projectRoot"))
     )
     if not project_attached:
-        project_missing = project_state.get("status") == "PROJECT_MISSING"
+        project_status = project_state.get("status", "PROJECT_STATUS_UNAVAILABLE")
+        project_missing = project_status == "PROJECT_MISSING"
+        project_inaccessible = project_status == "PROJECT_INACCESSIBLE"
         blockers.append({
-            "code": "project_missing",
+            "code": "project_inaccessible" if project_inaccessible else "project_missing",
             "message": (
                 "The selected project folder is missing from disk. Attach an existing project under Developer > Advanced."
                 if project_missing
+                else "The selected project folder cannot be accessed. Check folder permissions, then select it again under Developer > Advanced."
+                if project_inaccessible
+                else "The project was detached. Attach an existing project under Developer > Advanced."
+                if project_status == "PROJECT_DETACHED"
                 else "No project is attached. Attach an existing project under Developer > Advanced."
             ),
         })
@@ -1188,6 +1194,9 @@ def get_coding_acceptance_preflight() -> Dict[str, Any]:
         "providerConfigured": provider_configured,
         "projectAttached": project_attached,
         "projectStatus": project_state.get("status", "PROJECT_STATUS_UNAVAILABLE"),
+        "projectRoot": project_state.get("projectRoot"),
+        "projectIdentity": "NOT_VERIFIED",
+        "canInspectProject": project_attached,
         "sandbox": {
             "available": False,
             "verified": False,
@@ -1737,10 +1746,10 @@ def _search_coding_code(
             detail={"code": "INVALID_PROJECT_SCOPE", "message": "Search scope is outside the active project or unavailable."},
         )
 
-    query_terms = list(dict.fromkeys(re.findall(r"[a-z0-9_]+", norm_query)))
-    if not query_terms:
-        query_terms = [norm_query]
     query_normalized = _normalized_search_text(query)
+    query_terms = list(dict.fromkeys(re.findall(r"[a-z0-9_]+", query_normalized)))
+    if not query_terms:
+        query_terms = [query_normalized]
 
     candidates: List[Tuple[int, str, Path]] = []
     for dirpath, dirnames, filenames in os.walk(str(scope_dir), followlinks=False):
@@ -1784,6 +1793,8 @@ def _search_coding_code(
                     continue
             filename_normalized = _normalized_search_text(file_path.name)
             filename_terms = [term for term in query_terms if term in filename_normalized]
+            path_normalized = _normalized_search_text(relative_path)
+            path_terms = [term for term in query_terms if term in path_normalized]
             if filename_terms:
                 score = (
                     100 if query_normalized and query_normalized in filename_normalized else 0
@@ -1793,6 +1804,24 @@ def _search_coding_code(
                     "line": 0,
                     "text": file_path.name,
                     "matchType": "filename",
+                }))
+            elif path_terms:
+                score = (
+                    70 * (len(path_terms) == len(query_terms))
+                    + 25 * len(path_terms)
+                    + 12 * any(
+                        segment in {
+                            "controller", "controllers", "handler", "handlers",
+                            "route", "routes", "service", "services", "model", "models",
+                        }
+                        for segment in path_normalized.split()
+                    )
+                )
+                results.append((score - path_priority, {
+                    "path": relative_path,
+                    "line": 0,
+                    "text": file_path.name,
+                    "matchType": "path",
                 }))
             matched_terms: Set[str] = set()
             matched_lines: List[Tuple[int, int, str]] = []

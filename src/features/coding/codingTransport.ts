@@ -529,3 +529,53 @@ export class CodingAgentTransport {
     }
   }
 }
+
+export type CodingRequestIntent =
+  | 'QUESTION_OR_EXPLANATION'
+  | 'CLARIFICATION_REQUIRED'
+  | 'AUTONOMOUS_WORKFLOW_TASK';
+
+export interface CodingRequestClassification {
+  intent: CodingRequestIntent;
+  clarificationPrompt?: string;
+  isActionableTask: boolean;
+}
+
+export function classifyCodingRequestIntent(rawRequest: string): CodingRequestClassification {
+  const text = String(rawRequest || '').trim();
+  if (!text) {
+    return {
+      intent: 'CLARIFICATION_REQUIRED',
+      clarificationPrompt: 'Please provide task requirements or the target issue to investigate.',
+      isActionableTask: false,
+    };
+  }
+
+  // 1. Detect vague/ambiguous requests that require clarification before any action
+  const isVague = /^(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:the\s+)?performance|fix\s+(?:the\s+)?bug|do\s+something)\s*[.!?]*$/i.test(text)
+    || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(text) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(text));
+  if (isVague) {
+    return {
+      intent: 'CLARIFICATION_REQUIRED',
+      clarificationPrompt: `The request "${text}" is ambiguous. Please specify the target behavior, expected outcome, or error details.`,
+      isActionableTask: false,
+    };
+  }
+
+  // 2. Detect ordinary informational questions & technical explanations (read-only, no code modification)
+  const hasQuestionPrefix = /^(?:what\s+(?:is|are|does|do|can|would)|how\s+(?:does|do|can|to|is|are)|where\s+(?:is|are|can)|why\s+(?:is|are|does|do)|who\s+|which\s+|can\s+you\s+(?:explain|show|tell|describe|list)|could\s+you\s+(?:explain|show|tell|describe|list)|please\s+explain|explain\s+|describe\s+|show\s+me|tell\s+me\s+about|is\s+there\s+|are\s+there\s+)/i.test(text);
+  const hasActionVerb = /\b(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace)\b/i.test(text);
+
+  if ((hasQuestionPrefix && !hasActionVerb) || (text.endsWith('?') && !hasActionVerb)) {
+    return {
+      intent: 'QUESTION_OR_EXPLANATION',
+      isActionableTask: false,
+    };
+  }
+
+  // 3. Actionable coding task, bug fix, or investigation requiring autonomous workflow
+  return {
+    intent: 'AUTONOMOUS_WORKFLOW_TASK',
+    isActionableTask: true,
+  };
+}

@@ -3,6 +3,7 @@ import { runtimeConfig } from '../../config/runtimeConfig';
 import { authenticatedBackendFetch } from '../../config/backendAuth';
 import { ConfirmationDialog } from '../../ui/ConfirmationDialog';
 import { CodingAgentWorkspace } from './CodingAgentWorkspace';
+import { hasProjectContextMismatch } from './projectContext';
 import { useCodingAgentController } from './useCodingAgentController';
 
 export interface CodingHistoryRestoreRequest {
@@ -16,6 +17,9 @@ interface CodingAcceptancePreflight {
   providerConfigured: boolean;
   projectAttached: boolean;
   projectStatus: string;
+  projectRoot: string | null;
+  projectIdentity: string;
+  canInspectProject: boolean;
   sandbox: {
     available: boolean;
     verified: boolean;
@@ -52,7 +56,10 @@ function isIsolationCapabilityState(value: unknown): value is IsolationCapabilit
     || value === 'NOT_ESTABLISHED';
 }
 
-function normalizeCodingAcceptancePreflight(value: unknown): CodingAcceptancePreflight {
+function normalizeCodingAcceptancePreflight(
+  value: unknown,
+  activeProjectRoot: string | null,
+): CodingAcceptancePreflight {
   const source = isRecord(value) ? value : {};
   const reportedSandbox = isRecord(source.sandbox) ? source.sandbox : {};
   const reportedCapabilities = isRecord(reportedSandbox.capabilityStates)
@@ -70,13 +77,30 @@ function normalizeCodingAcceptancePreflight(value: unknown): CodingAcceptancePre
         : []
     ))
     : [];
+  const reportedProjectRoot = typeof source.projectRoot === 'string' ? source.projectRoot : null;
+  const projectContextMismatch = hasProjectContextMismatch(
+    activeProjectRoot,
+    reportedProjectRoot,
+    source.projectAttached === true,
+  );
+  if (projectContextMismatch) {
+    blockers.push({
+      code: 'project_context_mismatch',
+      message: 'The selected project in the Coding Agent does not match the project reported by readiness. Refresh the project selection before continuing.',
+    });
+  }
 
   return {
     ready: false,
     canRunProjectCommands: false,
     providerConfigured: source.providerConfigured === true,
-    projectAttached: source.projectAttached === true,
-    projectStatus: typeof source.projectStatus === 'string' ? source.projectStatus : 'PREFLIGHT_UNVERIFIED',
+    projectAttached: source.projectAttached === true && !projectContextMismatch,
+    projectStatus: projectContextMismatch
+      ? 'PROJECT_CONTEXT_MISMATCH'
+      : typeof source.projectStatus === 'string' ? source.projectStatus : 'PREFLIGHT_UNVERIFIED',
+    projectRoot: reportedProjectRoot,
+    projectIdentity: 'NOT_VERIFIED',
+    canInspectProject: source.canInspectProject === true && !projectContextMismatch,
     sandbox: {
       available: false,
       verified: false,
@@ -129,7 +153,7 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
           if (!response.ok) throw new Error(`Readiness endpoint returned HTTP ${response.status}.`);
           return response.json();
         })();
-      setAcceptancePreflight(normalizeCodingAcceptancePreflight(preflight));
+      setAcceptancePreflight(normalizeCodingAcceptancePreflight(preflight, workspace.projectRoot));
     } catch (error) {
       setAcceptancePreflight({
         ready: false,
@@ -137,6 +161,9 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
         providerConfigured: false,
         projectAttached: false,
         projectStatus: 'PREFLIGHT_FAILED',
+        projectRoot: null,
+        projectIdentity: 'NOT_VERIFIED',
+        canInspectProject: false,
         sandbox: {
           available: false,
           verified: false,
@@ -153,11 +180,11 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
       acceptancePreflightRequest.current = false;
       setAcceptancePreflightBusy(false);
     }
-  }, []);
+  }, [workspace.projectRoot]);
 
   useEffect(() => {
     if (active) void refreshAcceptancePreflight();
-  }, [active, refreshAcceptancePreflight]);
+  }, [active, refreshAcceptancePreflight, workspace.projectStatus]);
 
   useEffect(() => {
     onBusyChange(workspace.streaming);

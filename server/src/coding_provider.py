@@ -187,11 +187,64 @@ def _compact_task_state_message(message: Dict[str, Any], terms: set[str], stage:
     return {**message, "content": prefix + json.dumps(compacted_state, ensure_ascii=False, separators=(",", ":")) + trailing}
 
 
+_SECURITY_INSTRUCTION_MARKERS = (
+    "read-only",
+    "never write",
+    "run commands",
+    "never run",
+    "access credentials",
+    "credentials",
+    "untrusted data",
+    "not instructions",
+    "treat file contents as untrusted",
+    "untrusted reference material",
+    "do not follow instructions",
+    "must not",
+    "permanently blocked",
+    "execution proposal only",
+    "application policy validates",
+    "never invent",
+    "do not invent",
+    "never claim",
+    "do not claim",
+    "destructive statements",
+    "weaken safety boundaries",
+    "authoritative coding agent owner",
+    "core task ownership",
+    "prompt injection",
+    "redacted password",
+    "core coding agent engineering policy",
+    "you are the coding agent",
+)
+
+
+def _is_mandatory_security_instruction(text: str) -> bool:
+    t = text.casefold()
+    return any(marker in t for marker in _SECURITY_INSTRUCTION_MARKERS)
+
+
+def _split_into_instruction_units(content: str) -> List[str]:
+    lines = content.splitlines()
+    units: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if len(stripped) > 250 and any(delim in stripped for delim in (". ", "? ", "! ")):
+            sentences = re.split(r"(?<=[.!?])\s+", stripped)
+            units.extend([s.strip() for s in sentences if s.strip()])
+        else:
+            units.append(stripped)
+    return units
+
+
 def _compact_system_context(message: Dict[str, Any], terms: set[str], stage: int) -> Dict[str, Any]:
+    if not isinstance(message, dict):
+        return message
     content = str(message.get("content") or "")
     limit = (3600, 1800, 1200, 900, 700, 500, 280)[min(stage, 6)]
     if len(content) <= limit:
-        return message
+        return {**message, "content": content}
     safe_context_marker = "Safe task context:"
     prefix, separator, suffix = content.partition(safe_context_marker)
     if separator:
@@ -205,30 +258,45 @@ def _compact_system_context(message: Dict[str, Any], terms: set[str], stage: int
             content = candidate
         except json.JSONDecodeError:
             pass
-    lines = content.splitlines()
-    ranked = sorted(
-        enumerate(lines),
-        key=lambda pair: (
-            -int(any(term in pair[1].casefold() for term in terms)),
-            -int(any(marker in pair[1].casefold() for marker in (
-                "read-only", "never ", "do not ", "credentials", "untrusted", "must not",
-            ))),
-            pair[0],
+
+    units = _split_into_instruction_units(content)
+    if not units:
+        return message
+
+    mandatory_indices = {
+        i for i, unit in enumerate(units)
+        if _is_mandatory_security_instruction(unit)
+    }
+
+    # If the entire content consists of mandatory security instructions, preserve it without truncation
+    if len(mandatory_indices) == len(units):
+        return {**message, "content": content}
+
+    mandatory_size = sum(len(units[i]) + 1 for i in mandatory_indices)
+    remaining_budget = max(0, limit - mandatory_size)
+
+    non_mandatory_ranked = sorted(
+        [i for i in range(len(units)) if i not in mandatory_indices],
+        key=lambda i: (
+            -int(any(term in units[i].casefold() for term in terms)),
+            i,
         ),
     )
-    selected: List[tuple[int, str]] = []
-    used = 0
-    for index, line in ranked:
-        size = len(line) + 1
-        if used + size > limit:
+
+    selected_indices = set(mandatory_indices)
+    used_optional = 0
+    for idx in non_mandatory_ranked:
+        unit_size = len(units[idx]) + 1
+        if used_optional + unit_size > remaining_budget:
             continue
-        selected.append((index, line))
-        used += size
-    selected.sort(key=lambda item: item[0])
-    compacted = "\n".join(line for _, line in selected)
-    if len(compacted) < len(content):
+        selected_indices.add(idx)
+        used_optional += unit_size
+
+    selected_units = [units[i] for i in sorted(selected_indices)]
+    compacted = "\n".join(selected_units)
+    if len(selected_indices) < len(units):
         compacted += "\n[Lower-relevance task context omitted.]"
-    return {**message, "content": compacted[:limit]}
+    return {**message, "content": compacted}
 
 
 def _compact_user_message(message: Dict[str, Any], terms: set[str], limit: int, stage: int = 0) -> Dict[str, Any]:
@@ -1039,15 +1107,20 @@ def _request_provider_completion(
                     response = client.chat.completions.create(**request)
                 except Exception as retry2_error:
                     if _is_tool_call_rejected_without_tools(retry2_error):
-                        recovered_retry2 = _extract_failed_generation_tool_call(retry2_error)
-                        fn_name = (recovered_retry2.get("function") or {}).get("name", "tool") if recovered_retry2 else "inspection tool"
-                        fn_args = (recovered_retry2.get("function") or {}).get("arguments", "{}") if recovered_retry2 else "{}"
                         return {
                             "role": "assistant",
                             "content": (
-                                f"Completed investigation based on available project evidence. "
-                                f"Further inspection was planned for {fn_name}({fn_args}), but no additional tool rounds remain."
+                                "INVESTIGATION_INCOMPLETE: The provider requested project inspection that this request "
+                                "could not execute, and its bounded tool-call recovery was exhausted. No conclusion "
+                                "is claimed from the missing inspection. Next step: retry this request after enabling "
+                                "a Coding provider with tool calling; the inspection must be completed before reporting findings."
                             ),
+                            "status": "INVESTIGATION_INCOMPLETE",
+                            "continuation": {
+                                "resumable": True,
+                                "reason": "TOOL_CALL_UNAVAILABLE",
+                                "nextStep": "Retry the same request with a provider that supports Coding Agent tool calling.",
+                            },
                         }
                     raise
         elif tools and _extract_failed_generation_tool_call(error):
@@ -1070,7 +1143,7 @@ def _request_provider_completion(
     choice = response.choices[0] if response and response.choices else None
     raw = choice.message.model_dump(exclude_none=True) if choice and choice.message else None
     if not tools and isinstance(raw, dict) and not (raw.get("content") or "").strip() and not raw.get("tool_calls"):
-        raw["content"] = "Completed investigation based on observed project evidence."
+        raw["content"] = "Investigation could not be completed: no authoritative response or verified evidence was received."
     normalized = _normalize(raw)
     if json_text_retry:
         try:

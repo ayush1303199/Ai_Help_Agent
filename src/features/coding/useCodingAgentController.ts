@@ -8,6 +8,7 @@ import {
   finalizeCodingActivities,
   parseCodingActivityEvent,
   upsertCodingActivity,
+  classifyCodingRequestIntent,
   type CodingActivity,
   type CodingTransportResult,
 } from './codingTransport';
@@ -28,11 +29,13 @@ import {
 
 export type ProjectLifecycleState =
   | 'NO_PROJECT'
+  | 'PROJECT_UNVERIFIED'
   | 'SELECTING_PROJECT'
   | 'ATTACHING_PROJECT'
   | 'PROJECT_ATTACHED'
   | 'PROJECT_UNAVAILABLE'
   | 'PROJECT_MISSING'
+  | 'PROJECT_INACCESSIBLE'
   | 'PROJECT_DETACHED'
   | 'ATTACH_FAILED';
 
@@ -239,13 +242,8 @@ export function useCodingAgentController({
   const activeActivityExecutionRef = useRef<string | null>(null);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
-  const [projectRoot, setProjectRoot] = useState<string | null>(() => (
-    window.electronAPI ? readStoredProjectRoot() || savedConversation?.projectRoot || null : null
-  ));
-  const [projectLifecycleState, setProjectLifecycleState] = useState<ProjectLifecycleState>(() => {
-    const saved = window.electronAPI ? readStoredProjectRoot() || savedConversation?.projectRoot : null;
-    return saved ? 'PROJECT_ATTACHED' : 'NO_PROJECT';
-  });
+  const [projectRoot, setProjectRoot] = useState<string | null>(null);
+  const [projectLifecycleState, setProjectLifecycleState] = useState<ProjectLifecycleState>('PROJECT_UNVERIFIED');
   const [projectCandidates, setProjectCandidates] = useState<string[]>([]);
   const [directory, setDirectory] = useState<Array<{ name: string; type: 'file' | 'directory' }>>([]);
   const [path, setPath] = useState('.');
@@ -269,6 +267,17 @@ export function useCodingAgentController({
   const turnIdsRef = useRef(new Map<string, string>());
   useEffect(() => {
     const unsubscribe = window.electronAPI?.onDeveloperActivity?.((rawEvent) => {
+      if (rawEvent && typeof rawEvent === 'object' && (rawEvent as { type?: unknown }).type === 'workflow_progress') {
+        const wp = rawEvent as { phase?: string; message?: string; operationSequence?: number };
+        const msg: CodingActivity = {
+          id: `workflow:${wp.operationSequence || Date.now()}`,
+          executionId: activeActivityExecutionRef.current || 'workflow',
+          phase: String(wp.phase || 'workflow').toLowerCase(),
+          message: String(wp.message || `Workflow phase: ${wp.phase}`),
+        };
+        setActivity((previous) => upsertCodingActivity(previous, msg));
+        return;
+      }
       const activityEvent = parseCodingActivityEvent(rawEvent);
       if (!activityEvent || !proposal?.id) return;
       const proposalIds = new Set([proposal.id, proposal.proposalId].filter(Boolean));
@@ -322,6 +331,12 @@ export function useCodingAgentController({
             persistStoredProjectRoot(null);
             setDirectory([]);
             onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
+          } else if (state.status === 'PROJECT_INACCESSIBLE') {
+            setProjectRoot(null);
+            setProjectLifecycleState('PROJECT_INACCESSIBLE');
+            persistStoredProjectRoot(null);
+            setDirectory([]);
+            onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
           } else if (state.status === 'PROJECT_DETACHED') {
             setProjectRoot(null);
             setProjectLifecycleState('PROJECT_DETACHED');
@@ -345,14 +360,20 @@ export function useCodingAgentController({
                   persistStoredProjectRoot(null);
                   setDirectory([]);
                   onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
+                } else if (attached.status === 'PROJECT_INACCESSIBLE') {
+                  setProjectRoot(null);
+                  setProjectLifecycleState('PROJECT_INACCESSIBLE');
+                  persistStoredProjectRoot(null);
+                  setDirectory([]);
+                  onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
                 } else {
                   setProjectLifecycleState('NO_PROJECT');
                 }
               } catch {
-                setProjectLifecycleState('NO_PROJECT');
+                setProjectLifecycleState('PROJECT_UNAVAILABLE');
               }
             } else {
-              setProjectLifecycleState('NO_PROJECT');
+              setProjectLifecycleState('PROJECT_UNAVAILABLE');
             }
           }
         } catch {
@@ -389,11 +410,17 @@ export function useCodingAgentController({
             persistStoredProjectRoot(null);
             setDirectory([]);
             onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
+          } else if (state.status === 'PROJECT_INACCESSIBLE') {
+            setProjectRoot(null);
+            setProjectLifecycleState('PROJECT_INACCESSIBLE');
+            persistStoredProjectRoot(null);
+            setDirectory([]);
+            onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
           } else {
             const savedRoot = getSavedRoot();
             if (!savedRoot) {
               setProjectRoot(null);
-              setProjectLifecycleState('NO_PROJECT');
+              setProjectLifecycleState('PROJECT_UNAVAILABLE');
               setProjectCandidates([]);
               setDirectory([]);
               return;
@@ -426,7 +453,7 @@ export function useCodingAgentController({
         } catch (error) {
           if (active) {
             setProjectRoot(null);
-            setProjectLifecycleState('NO_PROJECT');
+            setProjectLifecycleState('PROJECT_UNAVAILABLE');
             setDirectory([]);
             onError(error instanceof Error ? error.message : String(error));
           }
@@ -486,18 +513,19 @@ export function useCodingAgentController({
     let currentScope = path;
     const projectContinuation: string | null = null;
     if (!currentProjectRoot) {
-      currentProjectRoot = readStoredProjectRoot() || savedConversation?.projectRoot || null;
-      if (!currentProjectRoot) {
+      if (window.electronAPI?.getDeveloperProjectState) {
         try {
-          if (window.electronAPI?.getDeveloperProjectState) {
-            const auth = await window.electronAPI.getDeveloperProjectState();
-            if (auth?.projectRoot) currentProjectRoot = auth.projectRoot;
-          } else {
-            const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-state`);
-            if (res.ok) {
-              const st = await res.json();
-              if (st.projectRoot && st.attached) currentProjectRoot = st.projectRoot;
-            }
+          const auth = await window.electronAPI.getDeveloperProjectState();
+          if (auth?.status === 'PROJECT_ATTACHED' && auth.projectRoot) currentProjectRoot = auth.projectRoot;
+        } catch {
+          // ignore
+        }
+      } else {
+        try {
+          const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-state`);
+          if (res.ok) {
+            const st = await res.json();
+            if (st.status === 'PROJECT_ATTACHED' && st.projectRoot) currentProjectRoot = st.projectRoot;
           }
         } catch {
           // ignore
@@ -592,6 +620,101 @@ export function useCodingAgentController({
       onStatus('Coding preference saved for future Coding Agent sessions.');
     }
 
+
+    const classification = classifyCodingRequestIntent(question);
+
+    // 1. If request is vague or missing requirements, provide clarification prompt without modifying files
+    if (classification.intent === 'CLARIFICATION_REQUIRED') {
+      const clarificationText = classification.clarificationPrompt
+        || 'Please provide additional task requirements or error details to proceed.';
+      setMessages((previous) => [
+        ...previous,
+        { role: 'user', content: question },
+        { role: 'assistant', content: clarificationText, streaming: false, requestId: crypto.randomUUID() },
+      ]);
+      setInput('');
+      return;
+    }
+
+    // 2. If in desktop mode with electronAPI and the intent is an actionable coding task / investigation
+    if (!repairContext && classification.intent === 'AUTONOMOUS_WORKFLOW_TASK' && window.electronAPI?.executeDeveloperWorkflow) {
+      const requestId = crypto.randomUUID();
+      const userMessage: CodingMessage = { role: 'user', content: question };
+      const assistantMessage: CodingMessage = { role: 'assistant', content: '', streaming: true, requestId };
+      setMessages((previous) => [...previous, userMessage, assistantMessage]);
+      setInput('');
+      activeActivityExecutionRef.current = requestId;
+      setStreaming(true);
+      setBusy(true);
+
+      try {
+        setActivity((previous) => upsertCodingActivity(previous, {
+          id: `start:${requestId}`,
+          executionId: requestId,
+          phase: 'workflow',
+          message: 'Starting the authorized autonomous coding workflow.',
+        }));
+
+        const result = await window.electronAPI.executeDeveloperWorkflow({
+          userRequest: question,
+          scope: currentScope,
+          autoRepairEnabled: autoRepairChoice,
+          maxRepairAttempts: 2,
+        });
+
+        let outcomeContent = '';
+        if (result.outcome === 'CLARIFICATION_REQUIRED') {
+          outcomeContent = result.clarificationPrompt || 'Clarification required to proceed with this task.';
+        } else if (result.outcome === 'APPROVAL_REJECTED') {
+          outcomeContent = 'The proposed patch was rejected by the user. No changes were applied.';
+        } else if (result.outcome === 'NO_DEFECT_FOUND') {
+          outcomeContent = result.message || 'No supported defect pattern was found in the source files inspected.';
+        } else if (result.outcome === 'INVESTIGATION_INCOMPLETE') {
+          const continuationDetail = result.continuation && typeof result.continuation === 'object' && (result.continuation as { nextStep?: { reason?: string } }).nextStep?.reason
+            ? ` Next step: ${(result.continuation as { nextStep?: { reason?: string } }).nextStep?.reason}`
+            : '';
+          outcomeContent = `${result.message || 'The investigation is incomplete; no root cause is supported by inspected evidence.'}${continuationDetail}`;
+        } else if (result.outcome === 'SUCCESS') {
+          outcomeContent = `Autonomous coding workflow completed successfully.\n\nModified files:\n${result.filesModified.map((f: string) => `- \`${f}\``).join('\n')}\n\nVerification: All checks passed (exit 0).`;
+          setAppliedPatchLog((previous) => [
+            ...previous,
+            {
+              proposalId: result.taskId || `task-${Date.now()}`,
+              state: 'completed',
+              appliedAt: new Date().toISOString(),
+              files: result.filesModified,
+              verification: 'PASS',
+            },
+          ]);
+        } else if (result.outcome === 'VERIFICATION_UNAVAILABLE') {
+          outcomeContent = 'Verification runner was unavailable or offline. All changes were rolled back to preserve the repository; completion cannot be verified.';
+        } else if (result.outcome === 'TEST_FAILED') {
+          outcomeContent = 'Verification checks failed after applying the proposed patch. All changes were automatically rolled back to preserve the repository.';
+        } else if (result.outcome === 'APPLY_FAILED') {
+          outcomeContent = `Applying the proposed patch failed: ${result.error || 'Apply error'}. Repository remains untouched.`;
+        } else if (result.outcome === 'CANCELLED') {
+          outcomeContent = 'The workflow was cancelled.';
+        } else {
+          outcomeContent = `Workflow finished with status: ${result.outcome}.`;
+        }
+
+        setMessages((previous) => previous.map((message) => message.requestId === requestId
+          ? { ...message, content: outcomeContent, streaming: false }
+          : message));
+        onStatus(`Workflow completed: ${result.outcome}`);
+        return;
+      } catch (error) {
+        const errorText = error instanceof Error ? error.message : String(error);
+        onError(errorText);
+        setMessages((previous) => previous.map((message) => message.requestId === requestId
+          ? { ...message, content: `Autonomous workflow error: ${errorText}`, streaming: false }
+          : message));
+        return;
+      } finally {
+        setBusy(false);
+        setStreaming(false);
+      }
+    }
 
     const requestId = crypto.randomUUID();
     const userMessage: CodingMessage = { role: 'user', content: question };
@@ -1088,6 +1211,9 @@ export function useCodingAgentController({
         } else if (attached.status === 'PROJECT_MISSING') {
           setProjectLifecycleState('PROJECT_MISSING');
           onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
+        } else if (attached.status === 'PROJECT_INACCESSIBLE') {
+          setProjectLifecycleState('PROJECT_INACCESSIBLE');
+          onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
         } else {
           setProjectLifecycleState('ATTACH_FAILED');
           onError(`Project attachment failed (ATTACH_FAILED): ${attached.reason || 'Could not attach'}`);
@@ -1586,6 +1712,11 @@ export function useCodingAgentController({
     proposal?.verification?.status,
   ]);
 
+  const executeWorkflow = async (userRequest: string, options?: { autoRepairEnabled?: boolean; maxRepairAttempts?: number }) => {
+    void options;
+    return sendMessage(userRequest);
+  };
+
   return {
     workspace: {
       messages, input, projectRoot, projectStatus: projectLifecycleState, projectCandidates,
@@ -1608,6 +1739,7 @@ export function useCodingAgentController({
       onCancelRepair: cancelVerificationRepairChain,
       onCancelRequest: cancelActiveRequest,
       onSendMessage: () => void sendMessage(), onClearMessages: clearMessages,
+      onExecuteWorkflow: (userRequest: string, options?: { autoRepairEnabled?: boolean; maxRepairAttempts?: number }) => executeWorkflow(userRequest, options),
       conversations: conversationStates, activeConversationId: conversationId,
       onRestoreConversation: restoreHistory, onDeleteConversation: deleteConversation,
       codingPreferences: preferences, onToggleCodingPreference: togglePreference,

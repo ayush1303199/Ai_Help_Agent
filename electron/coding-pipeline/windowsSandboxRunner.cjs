@@ -653,6 +653,17 @@ const sandboxResourceLifecycle = createSandboxResourceLifecycle({
   verifyTemporaryRootRemoved: verifySandboxTemporaryRootRemoved,
 });
 
+function combineSandboxRunAndCleanupFailures(runFailure, cleanupFailure) {
+  const runMessage = runFailure instanceof Error ? runFailure.message : String(runFailure);
+  const cleanupMessage = cleanupFailure instanceof Error ? cleanupFailure.message : String(cleanupFailure);
+  const combined = new AggregateError(
+    [runFailure, cleanupFailure],
+    `Windows Sandbox run failed (${runMessage}) and cleanup failed (${cleanupMessage}).`,
+  );
+  combined.isolationFailure = true;
+  return combined;
+}
+
 async function runWindowsSandboxCommand({
   projectRoot,
   workingDirectory = '.',
@@ -700,6 +711,8 @@ async function runWindowsSandboxCommand({
   let hostWait;
   let commandResult;
   let hostLifecycleObservation;
+  let runFailed = false;
+  let runFailure;
   try {
     baselineSandboxClients = listSandboxClientPids();
     sandboxResourceLifecycle.setBaselinePids(resource, baselineSandboxClients);
@@ -839,13 +852,14 @@ async function runWindowsSandboxCommand({
       };
     }
   } catch (error) {
+    runFailed = true;
+    runFailure = error;
     if (sandboxProcess && error instanceof Error) {
       if (!error.hostWait?.terminationAttempt?.requested) {
         error.hostTerminationAttempt = requestSandboxLauncherTermination(sandboxProcess);
       }
       error.isolationFailure = true;
     }
-    throw error;
   } finally {
     let cleanupError;
     try {
@@ -859,9 +873,13 @@ async function runWindowsSandboxCommand({
         : '';
       const error = new Error(`${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}${outcome}`);
       error.isolationFailure = true;
+      if (runFailed) {
+        throw combineSandboxRunAndCleanupFailures(runFailure, error);
+      }
       throw error;
     }
   }
+  if (runFailed) throw runFailure;
   if (commandResult) {
     commandResult.hostLifecycleObservation = hostLifecycleObservation;
     if (commandResult.resultEnvelope) {
@@ -892,6 +910,7 @@ function assertSandboxProbe(checks, result) {
 
 module.exports = {
   assertSandboxProbe,
+  combineSandboxRunAndCleanupFailures,
   isValidSandboxGuestResult,
   HOST_PROBE_ENVIRONMENT_MARKER,
   parseSandboxCleanupOutcome,

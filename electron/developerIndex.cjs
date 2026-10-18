@@ -29,7 +29,15 @@ function isSensitivePath(relativePath) {
     .some((segment) => sensitiveDirectories.has(segment.toLowerCase()) || sensitiveNames.test(segment));
 }
 const digest = (text) => crypto.createHash('sha256').update(text).digest('hex');
-const REPO_CONFIG_FILES = new Set(['package.json', 'tsconfig.json', 'tsconfig.app.json', 'vite.config.js', 'vite.config.ts', 'vite.config.mjs', 'eslint.config.js', 'eslint.config.mjs', 'playwright.config.js', 'playwright.config.ts', 'README.md', 'README.MD', '.gitignore']);
+const REPO_CONFIG_FILES = new Set([
+  'package.json', 'tsconfig.json', 'tsconfig.app.json',
+  'vite.config.js', 'vite.config.ts', 'vite.config.mjs',
+  'eslint.config.js', 'eslint.config.mjs',
+  'playwright.config.js', 'playwright.config.ts',
+  'composer.json', 'composer.lock', 'phpunit.xml', 'phpunit.xml.dist',
+  'requirements.txt', 'pyproject.toml', 'Gemfile', 'pom.xml', 'build.gradle',
+  'Cargo.toml', 'go.mod', 'README.md', 'README.MD', '.gitignore'
+]);
 
 function inside(root, target) {
   const relative = path.relative(root, target);
@@ -95,7 +103,7 @@ async function readProjectMetadata(root) {
         const relative = path.relative(root, path.join(directory, entry.name)).replace(/\\/g, '/');
         if (isIgnoredName(normalizedName) || isSensitivePath(relative) || normalizedName.startsWith('.')) continue;
         directoryNames.add(relative);
-        if (['src', 'app', 'client', 'server', 'electron', 'scripts', 'tests', 'test', '__tests__', 'lib'].includes(entry.name)) {
+        if (['src', 'app', 'client', 'server', 'electron', 'scripts', 'tests', 'test', '__tests__', 'lib', 'modules', 'controllers', 'models', 'views', 'routes', 'api', 'handlers', 'services', 'packages'].includes(entry.name)) {
           sourceDirectories.push(relative);
           if (entry.name === 'test' || entry.name === 'tests' || normalizedName.includes('test')) testDirectories.push(relative);
           if (entry.name === 'server' || entry.name === 'electron') featureHints.add(entry.name);
@@ -115,11 +123,15 @@ async function readProjectMetadata(root) {
         if (lowerName.endsWith('.ts') || lowerName.endsWith('.tsx') || lowerName.endsWith('.js') || lowerName.endsWith('.jsx')) languages.add(lowerName.endsWith('.ts') || lowerName.endsWith('.tsx') ? 'typescript' : 'javascript');
         if (REPO_CONFIG_FILES.has(entry.name) || lowerName.endsWith('.config.js') || lowerName.endsWith('.config.ts') || lowerName.endsWith('.config.mjs') || lowerName.endsWith('.config.cjs')) configFiles.push(relative);
         if (entry.name === 'package.json' || entry.name === 'tsconfig.json' || entry.name === 'vite.config.ts' || entry.name === 'vite.config.js' || entry.name === 'electron' || relative.includes('/electron/')) featureHints.add(entry.name);
-        if (['index.js', 'index.ts', 'main.js', 'main.ts', 'server.js', 'server.ts', 'preload.js', 'preload.cjs', 'electron/main.cjs'].includes(entry.name)) entryPoints.push(relative);
+        if (['index.js', 'index.ts', 'main.js', 'main.ts', 'server.js', 'server.ts', 'preload.js', 'preload.cjs', 'electron/main.cjs', 'index.php', 'yii', 'artisan', 'manage.py', 'app.py', 'main.py', 'main.go'].includes(entry.name)) entryPoints.push(relative);
       }
     }
   };
   await walk(root, 0, 2);
+  if (nameLookup.has('composer.json')) featureHints.add('composer');
+  if (nameLookup.has('yii')) featureHints.add('yii2');
+  if (nameLookup.has('artisan')) featureHints.add('laravel');
+  if (nameLookup.has('manage.py')) featureHints.add('django');
   if (packageJson) {
     const depNames = Object.keys({ ...(packageJson.dependencies || {}), ...(packageJson.devDependencies || {}), ...(packageJson.peerDependencies || {}) });
     if (depNames.some((name) => /react|next|vue|svelte/.test(name))) featureHints.add('ui-framework');
@@ -139,7 +151,7 @@ async function readProjectMetadata(root) {
     nameLookup.has('pnpm-lock.yaml') ? 'pnpm' :
     nameLookup.has('yarn.lock') ? 'yarn' :
     nameLookup.has('package-lock.json') ? 'npm' : 'unknown'
-  ) : 'unknown';
+  ) : (nameLookup.has('composer.json') ? 'composer' : nameLookup.has('gemfile') ? 'bundler' : nameLookup.has('cargo.toml') ? 'cargo' : 'unknown');
   const sourceSet = [...new Set(sourceDirectories)].slice(0, 32);
   if (sourceSet.length === 0 && (languages.size || entryPoints.length)) sourceSet.push('.');
   const priorityFiles = [...new Set([...configFiles, ...entryPoints, ...sourceSet].filter((value) => value && !value.startsWith('.')))].slice(0, 80);
@@ -597,7 +609,7 @@ function mergeSearchResults(lexicalResults, semanticResults, limit = 100) {
 }
 
 module.exports = {
-  SUPPORTED, parseSource, buildIndex, buildRepositoryMap, searchSymbols, definitions, relationships,
+  SUPPORTED, parseSource, buildIndex, buildRepositoryMap, readProjectMetadata, searchSymbols, definitions, relationships,
   findReferences, inside, assertWithinRoot, isIgnoredName, isSensitivePath,
   configureSemanticSearch, searchSemantic, mergeSearchResults,
   INDEX_STAGE, runIndexStage,

@@ -693,7 +693,7 @@ try {
   assert.equal(resWriteFail.reasonCode, 'LEDGER_WRITE_FAILED');
   assert.ok(resWriteFail.blockers.some((b) => b.includes('Failed to commit consumed token to durable ledger')));
 
-  // Test 7.4: Lock Contention and Stale Lock Recovery
+  // Test 7.4: Lock Contention and Stale Lock Fail-Closed
   const lockLedgerPath = path.join(tempDir, 'lock-test-ledger.json');
   const releaseLock1 = contract.acquireLedgerLock(lockLedgerPath);
   assert.equal(typeof releaseLock1, 'function');
@@ -703,6 +703,33 @@ try {
 
   // Release lock
   releaseLock1();
+
+  // Test 7.4b: Stale lockfile fails closed and is NOT automatically deleted
+  const staleLockPath = `${lockLedgerPath}.lock`;
+  const staleTime = Date.now() - 10000;
+  await fs.writeFile(staleLockPath, JSON.stringify({ pid: 999999, timestamp: staleTime }), 'utf8');
+  const pastDate = new Date(staleTime);
+  await fs.utimes(staleLockPath, pastDate, pastDate);
+
+  assert.throws(
+    () => contract.acquireLedgerLock(lockLedgerPath),
+    /LEDGER_LOCK_STALE_UNCERTAIN/i,
+    'Stale lockfile must fail closed with LEDGER_LOCK_STALE_UNCERTAIN rather than being automatically deleted',
+  );
+  // Verify stale lock was NOT deleted
+  assert.ok(await fs.stat(staleLockPath), 'Stale lockfile must remain on disk for inspection and fail closed');
+
+  // Test 7.4c: Malformed/ambiguous lock metadata fails closed
+  await fs.writeFile(staleLockPath, '{"broken json": ', 'utf8');
+  assert.throws(
+    () => contract.acquireLedgerLock(lockLedgerPath),
+    /LEDGER_LOCK_STALE_UNCERTAIN/i,
+    'Malformed lock metadata must fail closed with LEDGER_LOCK_STALE_UNCERTAIN',
+  );
+  assert.ok(await fs.stat(staleLockPath), 'Malformed lockfile must not be deleted');
+
+  // Clean up lockfile for remaining tests
+  await fs.unlink(staleLockPath);
 
   // Test 7.5: Production Default Path Resolution Does Not Use os.tmpdir()
   contract.setLedgerPathForTest(null);
@@ -720,6 +747,212 @@ try {
   );
 
   console.log('[PASS] Section 7: Replay ledger concurrency hardening, collision prevention & path protection verified.');
+
+  // -------------------------------------------------------------------------
+  // SECTION 8: Authorization Ledger Hardening & Deterministic Offline Concurrency
+  // -------------------------------------------------------------------------
+  console.log('\n--- Section 8: Authorization Ledger Hardening & Deterministic Offline Concurrency ---');
+
+  const sec8Dir = path.join(tempDir, 'section8-hardening');
+  await fs.mkdir(sec8Dir, { recursive: true });
+  const sec8LedgerPath = path.join(sec8Dir, 'hardening-ledger.json');
+  contract.setLedgerPathForTest(sec8LedgerPath);
+
+  // Test 8.1: Granular Malformed Lock Metadata Fail-Closed Tests
+  const malformedLockPath = `${sec8LedgerPath}.lock`;
+  const malformedPayloads = [
+    { label: 'empty string', content: '' },
+    { label: 'raw boolean', content: 'true' },
+    { label: 'json array', content: '["not", "an", "object"]' },
+    { label: 'missing keys', content: '{}' },
+    { label: 'null pid', content: JSON.stringify({ pid: null, timestamp: Date.now() }) },
+    { label: 'string pid', content: JSON.stringify({ pid: '1234', timestamp: Date.now() }) },
+    { label: 'negative pid', content: JSON.stringify({ pid: -10, timestamp: Date.now() }) },
+    { label: 'float pid', content: JSON.stringify({ pid: 12.34, timestamp: Date.now() }) },
+    { label: 'null timestamp', content: JSON.stringify({ pid: 1234, timestamp: null }) },
+    { label: 'string timestamp', content: JSON.stringify({ pid: 1234, timestamp: 'invalid-time' }) },
+    { label: 'negative timestamp', content: JSON.stringify({ pid: 1234, timestamp: -500 }) },
+    { label: 'NaN timestamp', content: '{"pid": 1234, "timestamp": NaN}' },
+  ];
+
+  for (const { label, content } of malformedPayloads) {
+    await fs.writeFile(malformedLockPath, content, 'utf8');
+    assert.throws(
+      () => contract.acquireLedgerLock(sec8LedgerPath),
+      /LEDGER_LOCK_STALE_UNCERTAIN/i,
+      `Malformed lock metadata (${label}) must immediately throw LEDGER_LOCK_STALE_UNCERTAIN`,
+    );
+    assert.ok(
+      await fs.stat(malformedLockPath),
+      `Malformed lockfile (${label}) must not be deleted on fail-closed rejection`,
+    );
+  }
+  await fs.unlink(malformedLockPath);
+
+  // Test 8.2: Stale-But-Possibly-Live Ownership (>5000ms old) Fail-Closed
+  const staleTimeSec8 = Date.now() - 7000;
+  await fs.writeFile(
+    malformedLockPath,
+    JSON.stringify({ pid: 88888, timestamp: staleTimeSec8, ownerToken: 'stale-token-1' }),
+    'utf8',
+  );
+  const staleDateSec8 = new Date(staleTimeSec8);
+  await fs.utimes(malformedLockPath, staleDateSec8, staleDateSec8);
+
+  assert.throws(
+    () => contract.acquireLedgerLock(sec8LedgerPath),
+    /LEDGER_LOCK_STALE_UNCERTAIN/i,
+    'Stale lockfile (>5000ms old) must fail closed with LEDGER_LOCK_STALE_UNCERTAIN',
+  );
+  assert.ok(await fs.stat(malformedLockPath), 'Stale lockfile must not be deleted');
+
+  // Verify validateLiveBenchmarkAuthorization also fails closed with LEDGER_LOCK_STALE_UNCERTAIN
+  const staleManifest = {
+    humanAuthorization: {
+      explicitApproval: true,
+      approverIdentity: 'lead@example.com',
+      approvalTimestamp: new Date().toISOString(),
+    },
+    runToken: 'token-stale-lock-test',
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+    networkPermissionGranted: true,
+    provider: 'openai',
+    apiKey: 'sk-test-key-12345',
+    fixtures: ['FIX-01'],
+    destinationRoot: isolatedDestinationRoot,
+  };
+  const resStaleAuth = contract.validateLiveBenchmarkAuthorization(staleManifest, { projectRoot: projectMockRoot });
+  assert.equal(resStaleAuth.authorized, false);
+  assert.equal(resStaleAuth.state, 'BLOCKED');
+  assert.equal(resStaleAuth.reasonCode, 'LEDGER_LOCK_STALE_UNCERTAIN');
+  assert.ok(resStaleAuth.blockers.some((b) => b.includes('Stale or ambiguous ledger lock prevented authorization')));
+  assert.ok(await fs.stat(malformedLockPath), 'Stale lock must remain untouched after blocked authorization');
+
+  await fs.unlink(malformedLockPath);
+
+  // Test 8.3: Ownership-Token & PID Mismatch in Lock Release
+  const releaseOwnerA = contract.acquireLedgerLock(sec8LedgerPath);
+  assert.equal(typeof releaseOwnerA, 'function');
+
+  // Verify lock exists and has valid ownerToken and pid
+  const lockDataRawA = await fs.readFile(malformedLockPath, 'utf8');
+  const lockDataA = JSON.parse(lockDataRawA);
+  assert.equal(lockDataA.pid, process.pid);
+  assert.equal(typeof lockDataA.ownerToken, 'string');
+  assert.ok(lockDataA.ownerToken.length > 10);
+
+  // Simulate a lock takeover by another process / owner
+  const foreignOwnerToken = 'foreign-uuid-9999-8888';
+  await fs.writeFile(
+    malformedLockPath,
+    JSON.stringify({ pid: process.pid + 1, timestamp: Date.now(), ownerToken: foreignOwnerToken }),
+    'utf8',
+  );
+
+  // Owner A calls its release function; must NOT delete the lock because ownership mismatch
+  releaseOwnerA();
+  assert.ok(await fs.stat(malformedLockPath), 'Lockfile must NOT be deleted when ownerToken/PID does not match');
+
+  const lockDataAfterA = JSON.parse(await fs.readFile(malformedLockPath, 'utf8'));
+  assert.equal(lockDataAfterA.ownerToken, foreignOwnerToken, 'Foreign lock metadata must remain completely intact');
+
+  await fs.unlink(malformedLockPath);
+
+  // Test 8.4: Concurrent Contender Simulations (Clean Release Handover)
+  const contender1Release = contract.acquireLedgerLock(sec8LedgerPath);
+  assert.ok(await fs.stat(malformedLockPath));
+
+  // Contender 1 finishes and releases lock cleanly
+  contender1Release();
+  await assert.rejects(() => fs.stat(malformedLockPath), { code: 'ENOENT' }, 'Lockfile must be removed upon valid owner release');
+
+  // Contender 2 immediately acquires lock without error
+  const contender2Release = contract.acquireLedgerLock(sec8LedgerPath);
+  assert.ok(await fs.stat(malformedLockPath));
+  contender2Release();
+  await assert.rejects(() => fs.stat(malformedLockPath), { code: 'ENOENT' }, 'Lockfile must be removed upon contender 2 release');
+
+  // Test 8.5: Interrupted Ledger Update & Atomic Token Reservation Preservation
+  const interruptedToken = 'token-interrupted-offline-simulation-001';
+  contract.reserveTokenAtomically(sec8LedgerPath, interruptedToken);
+
+  // Verify reservation file exists on disk
+  const { reservationPath: interruptedResPath } = contract.getReservationPath(sec8LedgerPath, interruptedToken);
+  assert.ok(await fs.stat(interruptedResPath), 'Reservation file must exist immediately after atomic reservation');
+
+  // Ledger JSON file does not yet contain the token (simulating process death right after reservation)
+  const ledgerContentsBefore = contract.loadConsumedTokensLedger();
+  assert.equal(ledgerContentsBefore.has(interruptedToken), false);
+
+  // Attempting to authorize with the interrupted token must fail closed
+  const interruptedManifest = {
+    humanAuthorization: {
+      explicitApproval: true,
+      approverIdentity: 'lead@example.com',
+      approvalTimestamp: new Date().toISOString(),
+    },
+    runToken: interruptedToken,
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+    networkPermissionGranted: true,
+    provider: 'openai',
+    apiKey: 'sk-test-key-12345',
+    fixtures: ['FIX-01'],
+    destinationRoot: isolatedDestinationRoot,
+  };
+  const resInterrupted = contract.validateLiveBenchmarkAuthorization(interruptedManifest, { projectRoot: projectMockRoot });
+  assert.equal(resInterrupted.authorized, false);
+  assert.equal(resInterrupted.state, 'BLOCKED');
+  assert.ok(resInterrupted.blockers.some((b) => b.includes('has already been consumed (replay prevention)')));
+
+  // Direct check that reserveTokenAtomically throws EEXIST
+  assert.throws(
+    () => contract.reserveTokenAtomically(sec8LedgerPath, interruptedToken),
+    (err) => err.code === 'EEXIST' || err.message.includes('TOKEN_ALREADY_RESERVED'),
+    'Subsequent reservation of interrupted token must fail closed with EEXIST / TOKEN_ALREADY_RESERVED',
+  );
+
+  // Test Temporary File Cleanup on Interrupted Write:
+  // Check that no orphaned .tmp-*.json files are left in sec8Dir
+  const dirEntries = await fs.readdir(sec8Dir);
+  const orphanTmpFiles = dirEntries.filter((f) => f.startsWith('.tmp-'));
+  assert.equal(orphanTmpFiles.length, 0, 'No orphaned temporary files should be left in ledger directory');
+
+  // Test 8.6: Repeated Authorization Attempts (Token Replay Detection with Identical RunToken)
+  const repeatToken = 'token-repeat-authorization-002';
+  const repeatManifest = {
+    humanAuthorization: {
+      explicitApproval: true,
+      approverIdentity: 'lead@example.com',
+      approvalTimestamp: new Date().toISOString(),
+    },
+    runToken: repeatToken,
+    expiresAt: new Date(Date.now() + 60000).toISOString(),
+    networkPermissionGranted: true,
+    provider: 'openai',
+    apiKey: 'sk-test-key-12345',
+    fixtures: ['FIX-01'],
+    destinationRoot: isolatedDestinationRoot,
+  };
+
+  // Attempt 1: Valid initial authorization
+  const resAttempt1 = contract.validateLiveBenchmarkAuthorization(repeatManifest, { projectRoot: projectMockRoot });
+  assert.equal(resAttempt1.authorized, true);
+  assert.equal(resAttempt1.state, 'AUTHORIZED');
+
+  // Attempt 2: Immediate repeat authorization with identical runToken must be strictly rejected
+  const resAttempt2 = contract.validateLiveBenchmarkAuthorization(repeatManifest, { projectRoot: projectMockRoot });
+  assert.equal(resAttempt2.authorized, false);
+  assert.equal(resAttempt2.state, 'BLOCKED');
+  assert.ok(resAttempt2.blockers.some((b) => b.includes('has already been consumed (replay prevention)')));
+
+  // Attempt 3: Even after clearing in-memory token cache, durable ledger prevents replay
+  contract.clearInMemoryTokenCacheOnlyForTest();
+  const resAttempt3 = contract.validateLiveBenchmarkAuthorization(repeatManifest, { projectRoot: projectMockRoot });
+  assert.equal(resAttempt3.authorized, false);
+  assert.equal(resAttempt3.state, 'BLOCKED');
+  assert.ok(resAttempt3.blockers.some((b) => b.includes('has already been consumed (replay prevention)')));
+
+  console.log('[PASS] Section 8: Authorization ledger hardening, ownerToken release check, malformed lock fail-closed, and replay defense verified.');
 
   console.log('\n=== ALL BENCHMARK AUTHORIZATION AND ISOLATION TESTS PASSED ===');
 } finally {

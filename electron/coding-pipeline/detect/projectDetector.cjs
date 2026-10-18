@@ -54,6 +54,9 @@ async function detectProject(root) {
     hasPhpUnitConfig: rootFiles.has('phpunit.xml') || rootFiles.has('phpunit.xml.dist'),
     composer: rootFiles.has('composer.json') ? 'composer.json' : null,
     hasPackageJson: rootFiles.has('package.json'),
+    hasYii: rootFiles.has('yii'),
+    hasArtisan: rootFiles.has('artisan'),
+    hasManagePy: rootFiles.has('manage.py'),
     extensions: profile?.extensions || [],
     detectedFiles: files.size,
   };

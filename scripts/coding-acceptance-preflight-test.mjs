@@ -29,6 +29,9 @@ const missingProvider = buildCodingAcceptancePreflight({
 assert.ok(missingProvider.blockers.some((item) => item.code === 'runtime_provider_missing'));
 assert.equal(missingProvider.projectAttached, true);
 assert.equal(missingProvider.canRunProjectCommands, false);
+assert.equal(missingProvider.canInspectProject, true);
+assert.equal(missingProvider.projectIdentity, 'NOT_VERIFIED');
+assert.equal(missingProvider.projectRoot, attachedProject.projectRoot);
 
 const missingProject = buildCodingAcceptancePreflight({
   providerConfigured: readyProvider,
@@ -44,6 +47,15 @@ const missingFolder = buildCodingAcceptancePreflight({
   isolation: unverifiedWindows,
 });
 assert.match(missingFolder.blockers.find((item) => item.code === 'project_missing').message, /missing from disk/i);
+
+const inaccessibleProject = buildCodingAcceptancePreflight({
+  providerConfigured: readyProvider,
+  projectState: { status: 'PROJECT_INACCESSIBLE', projectRoot: 'C:\\restricted-project' },
+  isolation: unverifiedWindows,
+});
+assert.equal(inaccessibleProject.projectAttached, false);
+assert.equal(inaccessibleProject.canInspectProject, false);
+assert.ok(inaccessibleProject.blockers.some((item) => item.code === 'project_inaccessible'));
 
 const unsupportedPlatform = buildCodingAcceptancePreflight({
   providerConfigured: readyProvider,
@@ -122,8 +134,10 @@ assert.match(preflightNormalizer, /available: false/);
 assert.match(preflightNormalizer, /verified: false/);
 assert.match(preflightNormalizer, /isIsolationCapabilityState/);
 assert.match(preflightNormalizer, /Array\.isArray\(source\.blockers\)/);
-assert.match(codingPage, /setAcceptancePreflight\(normalizeCodingAcceptancePreflight\(preflight\)\)/);
+assert.match(codingPage, /setAcceptancePreflight\(normalizeCodingAcceptancePreflight\(preflight,\s*workspace\.projectRoot\)\)/);
 assert.match(codingPage, /getDeveloperAcceptancePreflight\(\)/);
+assert.match(codingPage, /hasProjectContextMismatch/);
+assert.match(codingPage, /PROJECT_CONTEXT_MISMATCH/);
 assert.match(codingWorkspace, /Project command execution remains blocked by the shared execution gate/);
 assert.match(codingWorkspace, /descriptive, not verification/);
 assert.doesNotMatch(codingWorkspace, /acceptancePreflight\.ready\s*\?/);
@@ -132,6 +146,8 @@ assert.match(codingPage, /\/api\/coding\/acceptance-preflight/);
 assert.doesNotMatch(codingPage, /if \(!window\.electronAPI\?\.getDeveloperAcceptancePreflight[^]*return;/);
 assert.match(codingWorkspace, /isBrowserDevelopment/);
 assert.match(codingWorkspace, /Select project folder/);
+assert.match(codingWorkspace, /Project identity: \{acceptancePreflight\.projectIdentity\}/);
+assert.match(codingWorkspace, /Read-only source inspection:/);
 assert.match(codingWorkspace, /aria-label="Project folder path"/);
 assert.match(codingWorkspace, /onAttachProjectByPath\?\.\(projectPathInput\.trim\(\)\)/);
 assert.match(codingController, /input\.setAttribute\('webkitdirectory', ''\)/);

@@ -20,12 +20,18 @@ function buildCodingAcceptancePreflight({
     });
   }
 
-  if (projectState?.status !== 'PROJECT_ATTACHED' || !projectState.projectRoot) {
+  const projectAttached = projectState?.status === 'PROJECT_ATTACHED' && Boolean(projectState.projectRoot);
+  if (!projectAttached) {
+    const projectStatus = projectState?.status || 'PROJECT_STATUS_UNAVAILABLE';
     blockers.push({
-      code: 'project_missing',
-      message: projectState?.status === 'PROJECT_MISSING'
+      code: projectStatus === 'PROJECT_INACCESSIBLE' ? 'project_inaccessible' : 'project_missing',
+      message: projectStatus === 'PROJECT_MISSING'
         ? 'The selected project folder is missing from disk. Attach an existing project under Developer > Advanced.'
-        : 'No project is attached. Attach an existing project under Developer > Advanced.',
+        : projectStatus === 'PROJECT_INACCESSIBLE'
+          ? 'The selected project folder cannot be accessed. Check folder permissions, then select it again under Developer > Advanced.'
+          : projectStatus === 'PROJECT_DETACHED'
+            ? 'The project was detached. Attach an existing project under Developer > Advanced.'
+            : 'No project is attached. Attach an existing project under Developer > Advanced.',
     });
   }
 
@@ -45,8 +51,11 @@ function buildCodingAcceptancePreflight({
     ready: blockers.length === 0,
     canRunProjectCommands: isolation?.available === true && isolation?.verified === true,
     providerConfigured: providerConfigured === true && !providerCheckError,
-    projectAttached: projectState?.status === 'PROJECT_ATTACHED' && Boolean(projectState.projectRoot),
+    projectAttached,
     projectStatus: projectState?.status || 'PROJECT_STATUS_UNAVAILABLE',
+    projectRoot: projectAttached ? projectState.projectRoot : projectState?.projectRoot || null,
+    projectIdentity: 'NOT_VERIFIED',
+    canInspectProject: projectAttached,
     sandbox: {
       available: isolation?.available === true,
       verified: isolation?.verified === true,

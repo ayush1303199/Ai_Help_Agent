@@ -29,6 +29,26 @@ const {
   realityLevelEvaluator,
   businessRevalidationEngine,
 } = require('./coding-pipeline/correctnessEngine.cjs');
+const {
+  CLASSIFICATION_CONFIRMED,
+  CLASSIFICATION_LIKELY,
+  CLASSIFICATION_UNVERIFIED,
+  CLASSIFICATION_NOT_A_BUG,
+  VALID_CLASSIFICATIONS,
+  classifyDefect,
+  traceExecutionFlow,
+  validateEvidenceReport,
+  validatePatchScope,
+  enforceApprovalGate,
+  analyzeTaskRequirements,
+  planProgressiveSearch,
+  discoverProjectArchitecture,
+  executeToolWithSafeguards,
+  manageRepairLoop,
+} = require('./coding-pipeline/investigationWorkflowContract.cjs');
+const developerFiles = require('./developerFiles.cjs');
+const { readProjectMetadata } = require('./developerIndex.cjs');
+const { detectProject } = require('./coding-pipeline/detect/projectDetector.cjs');
 const featureOwnership = require('../server/src/coding_feature_ownership.json');
 
 const STATES = Object.freeze([
@@ -89,6 +109,8 @@ const VERIFICATION_FAILURE_STATUSES = new Set([
   'ENVIRONMENT_FAILURE',
   'DEPENDENCY_FAILURE',
   'PROVIDER_FAILURE',
+  'SKIPPED',
+  'VERIFICATION_UNAVAILABLE',
 ]);
 const NON_PASS_EVIDENCE_STATES = new Set(['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED']);
 const GATE_FAILURE_STATUSES = new Set(['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED']);
@@ -520,6 +542,13 @@ function cancelSession(ownerWebContentsId) {
       task.cancelRequested = true;
       if (task.state !== 'applying' && task.state !== 'verifying') transition(task, 'cancelled');
       recordMutation(task, 'cancelled', {});
+    }
+  }
+  for (const turn of conversationTurns.values()) {
+    if ((turn.ownerWebContentsId === ownerWebContentsId || turn.sessionId === sessionId) && !['completed', 'failed', 'cancelled'].includes(turn.state)) {
+      turn.state = 'cancelled';
+      turn.updatedAt = now();
+      recordMutation(turn, 'conversation_turn_cancelled', {});
     }
   }
 }
@@ -1941,6 +1970,7 @@ function normalizeVerificationStatus(result, passed) {
   if (GATE_FAILURE_STATUSES.has(result?.status)) return result.status;
   if (result?.executionBlocked === true) return 'BLOCKED';
   if (GATE_FAILURE_STATUSES.has(result?.evidenceState)) return result.evidenceState;
+  if (result?.skipped === true) return 'SKIPPED';
   if (VERIFICATION_FAILURE_STATUSES.has(result?.status)) return result.status;
   if (passed) return 'PASS';
   if (result?.status !== undefined) return 'UNVERIFIED';
@@ -1958,6 +1988,8 @@ function isSuccessfulVerificationAttempt(attempt) {
     && (typeof attempt.check === 'string' && attempt.check.trim()
       || typeof attempt.script === 'string' && attempt.script.trim())
     && (attempt.status === undefined || attempt.status === 'PASS')
+    && isOptionalBoolean(attempt.skipped)
+    && attempt.skipped !== true
     && isOptionalBoolean(attempt.success)
     && attempt.success !== false
     && isOptionalBoolean(attempt.executionBlocked)
@@ -1976,6 +2008,8 @@ function isSuccessfulVerificationResult(result, attempts) {
     || result.status !== 'PASS'
     || result.executed !== true
     || result.exitCode !== 0
+    || !isOptionalBoolean(result.skipped)
+    || result.skipped === true
     || !isOptionalBoolean(result.success)
     || result.success === false
     || !isOptionalBoolean(result.executionBlocked)
@@ -2061,6 +2095,8 @@ function normalizeCommandResult(result) {
     && result.exitCode === 0
     && statusKnown
     && (result.status === undefined || result.status === 'PASS')
+    && isOptionalBoolean(result.skipped)
+    && result.skipped !== true
     && isOptionalBoolean(result.success)
     && result.success !== false
     && isOptionalBoolean(result.executionBlocked)
@@ -2129,12 +2165,26 @@ async function executeVerificationLoop({ run, maxAttempts = 2, diagnose = () => 
   return { ok: false, attempts: observations };
 }
 function selectVerificationChecks(packageJson, requested = []) {
-  const scripts = packageJson?.scripts || {};
+  const scripts = packageJson?.scripts || packageJson?.packageScripts || {};
   const names = Array.isArray(requested) && requested.length ? requested : ['test', 'typecheck', 'lint'];
-  return [...new Set(names)].filter((name) => {
+  const matched = [...new Set(names)].filter((name) => {
     try { commandPolicy(name); } catch { return false; }
     return typeof scripts[name] === 'string' && scripts[name].trim();
   });
+  if (matched.length > 0) return matched;
+  if (packageJson?.hasPhpUnitConfig || packageJson?.frameworks?.includes('yii2')) {
+    return ['phpunit'].filter((cmd) => { try { commandPolicy(cmd); return true; } catch { return false; } });
+  }
+  if (packageJson?.frameworks?.includes('django') || packageJson?.languages?.includes('python')) {
+    return ['python-test'].filter((cmd) => { try { commandPolicy(cmd); return true; } catch { return false; } });
+  }
+  if (packageJson?.languages?.includes('go')) {
+    return ['go-test'].filter((cmd) => { try { commandPolicy(cmd); return true; } catch { return false; } });
+  }
+  if (packageJson?.languages?.includes('rust')) {
+    return ['cargo-test'].filter((cmd) => { try { commandPolicy(cmd); return true; } catch { return false; } });
+  }
+  return [];
 }
 function extractFailure(result) {
   const text = `${result?.stderr || ''}\n${result?.stdout || ''}\n${result?.error || ''}`;
@@ -2206,7 +2256,7 @@ function verificationFailureFromError(error, script = '') {
   };
 }
 function isGateOrUnverifiedResult(result) {
-  return ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED', 'UNVERIFIED'].includes(result?.status)
+  return ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED', 'UNVERIFIED', 'VERIFICATION_UNAVAILABLE', 'SKIPPED'].includes(result?.status)
     || NON_PASS_EVIDENCE_STATES.has(result?.evidenceState)
     || result?.executionBlocked === true;
 }
@@ -2398,6 +2448,462 @@ async function runEngineeringLoop({
   }
   return { status: 'MAX_ATTEMPTS', attempts: observations, fixes };
 }
+
+async function executeAutonomousCodingWorkflow({
+  userRequest,
+  root: inputRoot,
+  scope = '.',
+  sessionId,
+  ownerWebContentsId,
+  autoRepairEnabled = false,
+  maxRepairAttempts = 2,
+  onProgress = () => {},
+  runCheck = null,
+  requestApproval = null,
+  tools = null,
+}) {
+  if (!sessionId || ownerWebContentsId === undefined) {
+    throw new Error('Developer session ownership is required.');
+  }
+  const root = await fs.realpath(inputRoot);
+  const owner = { sessionId, ownerWebContentsId };
+  const fileReader = tools?.readFile || ((p) => developerFiles.readFile(p, ownerWebContentsId));
+  const fileSearcher = tools?.searchCode || ((q, s) => developerFiles.searchCode(q, ownerWebContentsId, s));
+
+  // STAGE 1: UNDERSTAND
+  onProgress({ phase: 'UNDERSTAND', message: 'Analyzing task requirements and ambiguity.' });
+  const requirementsAnalysis = analyzeTaskRequirements(userRequest);
+  if (requirementsAnalysis.needsClarification) {
+    return {
+      outcome: 'CLARIFICATION_REQUIRED',
+      phase: 'UNDERSTAND',
+      requirements: requirementsAnalysis,
+      clarificationPrompt: requirementsAnalysis.clarificationPrompt,
+      filesModified: [],
+    };
+  }
+
+  // STAGE 2: DISCOVER
+  onProgress({ phase: 'DISCOVER', message: 'Discovering project architecture and conventions.' });
+  const metadata = await readProjectMetadata(root);
+  const detected = await detectProject(root);
+  const projectArch = discoverProjectArchitecture({ ...metadata, ...detected });
+  const selectedChecks = selectVerificationChecks({ ...metadata, ...detected });
+
+  // STAGE 3: INVESTIGATE
+  onProgress({ phase: 'INVESTIGATE', message: 'Investigating relevant files and tracing execution flow.' });
+  const turn = beginConversationTurn({ root, request: userRequest, sessionId, ownerWebContentsId, scope });
+  advanceConversationTurn(turn.turnId, 'understanding', owner, { phase: 'investigating' });
+
+  const sessionSearches = [];
+  const candidateFiles = new Map();
+  const searchFailures = [];
+  const searchTerms = [...new Set(requirementsAnalysis.domainTerms || [])];
+  const searchTermsToRun = searchTerms.slice(0, 5);
+
+  for (const term of searchTermsToRun) {
+    const searchPlan = planProgressiveSearch({ query: term, scope, sessionSearches });
+    if (!searchPlan.isDuplicate) {
+      const searchRecord = {
+        query: term,
+        scope,
+        status: 'RUNNING',
+        resultCount: 0,
+        candidates: [],
+      };
+      sessionSearches.push(searchRecord);
+      try {
+        const searchResult = await fileSearcher(term, scope);
+        const results = Array.isArray(searchResult?.results) ? searchResult.results : [];
+        searchRecord.status = 'COMPLETED';
+        searchRecord.resultCount = results.length;
+        searchRecord.candidates = results.slice(0, 20).flatMap((res) => (
+          res?.path
+            ? [{
+                path: res.path,
+                line: Number.isInteger(res.line) ? res.line : null,
+                score: Number.isFinite(res.score) ? res.score : null,
+                matchType: typeof res.matchType === 'string' ? res.matchType : null,
+              }]
+            : []
+        ));
+        for (const res of results) {
+          if (!res || typeof res.path !== 'string' || !res.path) continue;
+          candidateFiles.set(
+            res.path,
+            (candidateFiles.get(res.path) || 0) + (Number.isFinite(res.score) ? res.score : 1),
+          );
+        }
+      } catch (error) {
+        searchRecord.status = 'FAILED';
+        searchRecord.reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+        searchFailures.push({
+          query: term,
+          reason: searchRecord.reason,
+        });
+      }
+    }
+  }
+
+  // Read and inspect candidate files
+  const inspectedFiles = [];
+  const confirmedDefects = [];
+  const readFailures = [];
+  const rankedCandidates = [...candidateFiles.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([candidatePath]) => candidatePath);
+  for (const candidatePath of rankedCandidates) {
+    if (inspectedFiles.length >= 6) break;
+    try {
+      const fileData = await fileReader(candidatePath);
+      inspectedFiles.push({ path: candidatePath, content: fileData.content });
+
+      // Trace architectural execution flow
+      const trace = traceExecutionFlow({
+        route: candidatePath,
+        controllerFile: candidatePath,
+        controllerContent: fileData.content,
+      });
+
+      // Inspect for common code defects
+      const lines = fileData.content.split(/\r?\n/);
+      lines.forEach((line, lineIdx) => {
+        if (/die\(|var_dump\(|dd\(/i.test(line)) {
+          confirmedDefects.push(classifyDefect({
+            filePath: candidatePath,
+            symbol: 'debug_probe',
+            lines: `${lineIdx + 1}`,
+            codeSnippet: line.trim(),
+            controlFlow: 'Debug probe or terminating exit statement left in production code',
+            expected: 'Structured response returned to caller without terminating process',
+            observed: line.trim(),
+            evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+          }));
+        }
+      });
+
+      if (trace.layers.hasTransaction && trace.layers.transactionRollbacksInCatch === false) {
+        confirmedDefects.push(classifyDefect({
+          filePath: candidatePath,
+          symbol: trace.layers.controller || 'action',
+          lines: '1-100',
+          codeSnippet: '// Missing rollback in catch block',
+          controlFlow: 'Transaction opened with beginTransaction() but not rolled back in exception catch block',
+          expected: 'Transaction rolled back before returning or exiting catch block',
+          observed: 'No rollBack() statement in catch block',
+          evidenceType: 'CONTROL_FLOW_CONFIRMED',
+        }));
+      }
+    } catch (error) {
+      readFailures.push({
+        path: candidatePath,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  recordConversationFindings(turn.turnId, confirmedDefects, owner);
+
+  if (confirmedDefects.length === 0) {
+    const nextStep = readFailures.length
+      ? {
+          tool: 'read_file',
+          path: readFailures[0].path,
+          reason: 'A relevant search candidate could not be inspected.',
+        }
+      : rankedCandidates.length > inspectedFiles.length
+        ? {
+            tool: 'read_file',
+            path: rankedCandidates[inspectedFiles.length],
+            reason: 'The bounded source-read budget ended before all ranked candidates were inspected.',
+          }
+        : searchTerms.length > searchTermsToRun.length
+          ? {
+              tool: 'search_code',
+              query: searchTerms[searchTermsToRun.length],
+              reason: 'Additional distinct request terms remain beyond the current bounded search pass.',
+            }
+          : searchFailures.length || inspectedFiles.length === 0
+            ? {
+                tool: 'list_directory',
+                path: projectArch.recommendedScope || '.',
+                reason: 'No relevant source was successfully inspected; discover the actual project layout and choose a narrower query.',
+              }
+            : null;
+    if (nextStep) {
+      advanceConversationTurn(turn.turnId, 'failed', owner, {
+        phase: 'investigation_incomplete',
+        nextStep,
+      });
+      return {
+        outcome: 'INVESTIGATION_INCOMPLETE',
+        phase: 'INVESTIGATE',
+        turnId: turn.turnId,
+        architecture: projectArch,
+        inspectedFiles: inspectedFiles.map((f) => f.path),
+        searchFailures,
+        readFailures,
+        findings: [],
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        continuation: {
+          status: 'READY_TO_RESUME',
+          searchesCompleted: sessionSearches,
+          nextStep,
+        },
+        message: 'The investigation is incomplete; no root cause or absence-of-defect claim is supported by the inspected evidence.',
+      };
+    }
+    advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'investigation_complete' });
+    return {
+      outcome: 'NO_DEFECT_FOUND',
+      phase: 'INVESTIGATE',
+      turnId: turn.turnId,
+      architecture: projectArch,
+      inspectedFiles: inspectedFiles.map((f) => f.path),
+      findings: [],
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      message: 'No supported defect pattern was found in the source files inspected; this does not rule out unexamined or runtime defects.',
+    };
+  }
+
+  // STAGE 4: PLAN
+  onProgress({ phase: 'PLAN', message: 'Generating scoped patch proposal and capturing baseline.' });
+  const targetFile = confirmedDefects[0].filePath;
+  const originalFile = inspectedFiles.find((f) => f.path === targetFile);
+  if (!originalFile) {
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'planning_failed' });
+    return {
+      outcome: 'PLANNING_FAILED',
+      phase: 'PLAN',
+      turnId: turn.turnId,
+      error: `Could not retrieve original content for target file: ${targetFile}`,
+      filesModified: [],
+    };
+  }
+
+  // Construct minimal fix patch
+  let patchedContent = originalFile.content;
+  if (confirmedDefects.some((d) => d.symbol === 'debug_probe')) {
+    patchedContent = patchedContent
+      .replace(/\s*var_dump\([^)]*\);?/g, '')
+      .replace(/\s*die\([^)]*\);?/g, '');
+  }
+  if (confirmedDefects.some((d) => d.controlFlow.includes('Transaction opened'))) {
+    patchedContent = patchedContent.replace(
+      /(catch\s*\([^)]+\)\s*\{)([\s\S]*?)(\n\s*return\b)/,
+      '$1$2\n            $transaction->rollBack();$3'
+    );
+  }
+
+  const normTarget = targetFile.replace(/\\/g, '/');
+  const sourceLines = originalFile.content ? originalFile.content.split(/\r?\n/) : [];
+  if (originalFile.content.endsWith('\n') && sourceLines.at(-1) === '') sourceLines.pop();
+  const patchedLines = patchedContent ? patchedContent.split(/\r?\n/) : [];
+  if (patchedContent.endsWith('\n') && patchedLines.at(-1) === '') patchedLines.pop();
+
+  const rawPatch = [
+    `--- a/${normTarget}`,
+    `+++ b/${normTarget}`,
+    `@@ -1,${sourceLines.length} +1,${patchedLines.length} @@`,
+    ...sourceLines.map((l) => `-${l}`),
+    ...patchedLines.map((l) => `+${l}`),
+    '',
+  ].join('\n');
+
+  const beforeSnapshot = await snapshotTarget(root, targetFile);
+  const patchScope = validatePatchScope({
+    targetFiles: [targetFile],
+    acceptanceCriteria: requirementsAnalysis.acceptanceCriteria,
+  });
+
+  const task = await createProposal({
+    root,
+    raw: rawPatch,
+    expectedSnapshots: [beforeSnapshot],
+    sessionId,
+    ownerWebContentsId,
+    scope,
+    conversationTurnId: turn.turnId,
+  });
+
+  // STAGE 5: APPROVE
+  onProgress({ phase: 'APPROVE', message: 'Enforcing proposal approval gate.' });
+  let userApproved = false;
+  if (typeof requestApproval === 'function') {
+    userApproved = await requestApproval({ taskId: task.taskId, proposal: task, patchScope, diff: rawPatch });
+  }
+  if (typeof requestApproval !== 'function') {
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'approval_required' });
+    return {
+      outcome: 'APPROVAL_REQUIRED',
+      phase: 'APPROVE',
+      taskId: task.taskId,
+      turnId: turn.turnId,
+      reason: 'An explicit user approval callback is required before applying the proposal.',
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+    };
+  }
+
+  const gateResult = enforceApprovalGate({
+    originalProposalTargets: [targetFile],
+    attemptedMutationTargets: task.files.map((f) => f.path),
+    operationType: 'APPLY_PATCH',
+    userApproved,
+  });
+
+  if (!gateResult.allowed) {
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'approval_rejected' });
+    return {
+      outcome: 'APPROVAL_REJECTED',
+      phase: 'APPROVE',
+      taskId: task.taskId,
+      reason: gateResult.rejectionReason,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+    };
+  }
+
+  await approve(task.taskId, owner);
+
+  // STAGE 6: IMPLEMENT & STAGE 7: TEST
+  onProgress({ phase: 'IMPLEMENT', message: 'Applying minimal authorized patch.' });
+  await captureWorktreeBaseline(task.taskId, root, [targetFile]);
+  const authorizeFn = tools?.authorizeMutation || (async (req) => {
+    if (req?.proposalApproved) return { allowed: true };
+    return { allowed: false, reason: 'Proposal mutation requires approval.' };
+  });
+
+  let testOutcome = { status: 'NOT_RUN' };
+  const verifyRunner = typeof runCheck === 'function' && selectedChecks.length > 0
+    ? async () => {
+        onProgress({ phase: 'TEST', message: 'Running safe verification checks.' });
+        const loopResult = await runEngineeringLoop({
+          checks: selectedChecks,
+          runCheck,
+          proposeFix: async () => null,
+          approveFix: async () => true,
+          applyFix: async () => {},
+          maxAttempts: 1,
+          onProgress: (p) => onProgress({ phase: 'TEST_LOOP', ...p }),
+        });
+        testOutcome = loopResult;
+        return {
+          ok: loopResult.status === 'PASS',
+          status: loopResult.status,
+          executed: true,
+          exitCode: loopResult.status === 'PASS' ? 0 : 1,
+          attempts: loopResult.attempts,
+        };
+      }
+    : (async () => {
+        testOutcome = { status: 'VERIFICATION_UNAVAILABLE', reason: 'No test runner provided or offline.' };
+        return {
+          ok: false,
+          status: 'UNVERIFIED',
+          executed: false,
+          exitCode: null,
+          reason: testOutcome.reason,
+          attempts: [],
+        };
+      });
+
+  try {
+    await apply(task.taskId, owner, verifyRunner, root, authorizeFn);
+  } catch (error) {
+    const taskState = getTaskForTest(task.taskId);
+    const wasCancelled = error?.cancelled === true
+      || taskState?.cancelRequested === true
+      || taskState?.state === 'cancelled';
+    const failedDuringImplement = !testOutcome || testOutcome.status === 'NOT_RUN';
+    const rollbackFailed = Boolean(taskState?.error?.includes('Rollback verification failed'));
+    const verificationStatus = wasCancelled
+      ? 'CANCELLED'
+      : failedDuringImplement
+        ? 'NOT_RUN'
+        : testOutcome.status;
+    const outcome = wasCancelled
+      ? 'CANCELLED'
+      : failedDuringImplement
+        ? 'APPLY_FAILED'
+        : (verificationStatus === 'VERIFICATION_UNAVAILABLE' || testOutcome?.status === 'VERIFICATION_UNAVAILABLE')
+          ? 'VERIFICATION_UNAVAILABLE'
+          : (verificationStatus === 'SKIPPED' || testOutcome?.status === 'SKIPPED')
+            ? 'SKIPPED'
+            : 'TEST_FAILED';
+    const phase = wasCancelled ? 'CANCELLED' : failedDuringImplement ? 'IMPLEMENT' : 'VERIFY';
+    const currentTurnState = conversationTurns.get(turn.turnId)?.state;
+    if (!['completed', 'failed', 'cancelled'].includes(currentTurnState)) {
+      advanceConversationTurn(turn.turnId, outcome === 'CANCELLED' ? 'cancelled' : 'failed', owner, {
+        phase: outcome.toLowerCase(),
+      });
+    }
+    return {
+      outcome,
+      phase,
+      taskId: task.taskId,
+      turnId: turn.turnId,
+      verificationStatus,
+      codeApplied: rollbackFailed,
+      codeVerified: false,
+      filesModified: rollbackFailed ? task.files.map((f) => f.path) : [],
+      rollbackFailed,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  // STAGE 8-11: DIAGNOSE & REPAIR (if test failed and repair is enabled)
+  if (testOutcome.status !== 'PASS' && testOutcome.status !== 'VERIFICATION_UNAVAILABLE') {
+    const repairGov = manageRepairLoop({
+      approvedTargets: [targetFile],
+      attemptCount: 0,
+      maxAttempts: Math.max(1, Math.min(3, Number(maxRepairAttempts) || 2)),
+      autoRepairEnabled,
+      lastVerificationResult: testOutcome,
+      proposedMutationTargets: [targetFile],
+    });
+
+    if (!repairGov.allowRepair) {
+      onProgress({ phase: 'REPAIR_HALTED', reason: repairGov.reason });
+    }
+  }
+
+  // STAGE 12: AUDIT & REPORT
+  onProgress({ phase: 'AUDIT', message: 'Auditing modified files and verifying worktree preservation.' });
+  const auditResult = await verifyDirtyWorktreePreserved(task.taskId, [targetFile]);
+  const isPassing = testOutcome.status === 'PASS';
+  const currentTurn = conversationTurns.get(turn.turnId);
+  if (currentTurn && currentTurn.state !== 'completed') {
+    advanceConversationTurn(turn.turnId, isPassing ? 'completed' : 'failed', owner, {
+      phase: isPassing ? 'completed' : (testOutcome.status || 'unverified').toLowerCase(),
+      fileCount: task.files.length,
+    });
+  }
+
+  return {
+    outcome: isPassing
+      ? 'SUCCESS'
+      : testOutcome.status === 'VERIFICATION_UNAVAILABLE'
+        ? 'VERIFICATION_UNAVAILABLE'
+        : 'TEST_FAILED',
+    phase: isPassing ? 'AUDIT' : 'VERIFY',
+    taskId: task.taskId,
+    turnId: turn.turnId,
+    filesModified: task.files.map((f) => f.path),
+    codeApplied: true,
+    codeVerified: isPassing,
+    verificationStatus: testOutcome.status,
+    worktreeAudit: auditResult,
+    requirements: requirementsAnalysis,
+  };
+}
+
 function getTaskForTest(taskId) { return registry.get(taskId); }
 function isCancellationRequested(taskId, owner) {
   const task = getTask(taskId, owner);
@@ -2711,4 +3217,8 @@ module.exports = {
   verifyMutationTest, diagnoseFailureType, inspectEdgeCasesAndContract,
   verifyTaskBlindness, attemptOracleDiscovery, adjudicateWorkerConflict, classifyRealityLevel,
   revalidateBusinessTask, redlineBusinessClaim,
+  CLASSIFICATION_CONFIRMED, CLASSIFICATION_LIKELY, CLASSIFICATION_UNVERIFIED, CLASSIFICATION_NOT_A_BUG,
+  classifyDefect, traceExecutionFlow, validateEvidenceReport, validatePatchScope, enforceApprovalGate,
+  analyzeTaskRequirements, planProgressiveSearch, discoverProjectArchitecture, executeToolWithSafeguards, manageRepairLoop,
+  executeAutonomousCodingWorkflow, isSuccessfulVerificationResult, isSuccessfulVerificationAttempt, normalizeVerificationStatus,
 };

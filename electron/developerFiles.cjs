@@ -78,6 +78,7 @@ const PROJECT_STATUSES = Object.freeze({
   DETACHED: 'PROJECT_DETACHED',
   STALE: 'PROJECT_STALE',
   MISSING: 'PROJECT_MISSING',
+  INACCESSIBLE: 'PROJECT_INACCESSIBLE',
   RECONNECTING: 'PROJECT_SESSION_RECONNECTING',
   NOT_ATTACHED: 'PROJECT_NOT_ATTACHED',
 });
@@ -87,6 +88,12 @@ const projectDiscoveryMatches = new Map();
 let authoritativeProjectRoot = null;
 let authoritativeProjectStatus = PROJECT_STATUSES.NOT_ATTACHED;
 let auditDirectory = null;
+
+function projectStatusForFsError(error) {
+  return error?.code === 'ENOENT' || error?.code === 'ENOTDIR'
+    ? PROJECT_STATUSES.MISSING
+    : PROJECT_STATUSES.INACCESSIBLE;
+}
 
 function isInsideRoot(root, target) {
   const relative = path.relative(root, target);
@@ -540,10 +547,14 @@ function assertProjectOwner(ownerWebContentsId) {
     }
   } catch (err) {
     if (err.code === 'PROJECT_MISSING') throw err;
-    authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
-    const missingErr = new Error(`Developer project directory does not exist on disk (PROJECT_MISSING): ${assignedRoot}`);
-    missingErr.code = 'PROJECT_MISSING';
-    throw missingErr;
+    authoritativeProjectStatus = projectStatusForFsError(err);
+    const statusError = new Error(
+      authoritativeProjectStatus === PROJECT_STATUSES.MISSING
+        ? `Developer project directory does not exist on disk (${authoritativeProjectStatus}): ${assignedRoot}`
+        : `Developer project directory is inaccessible (${authoritativeProjectStatus}): ${assignedRoot}`,
+    );
+    statusError.code = authoritativeProjectStatus;
+    throw statusError;
   }
   return assignedRoot;
 }
@@ -567,9 +578,9 @@ async function validateProjectRoot(ownerWebContentsId) {
     }
     return resolvedRoot;
   } catch (err) {
-    authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
-    const error = new Error(`Invalid project path (PROJECT_MISSING): ${err.message}`);
-    error.code = 'PROJECT_MISSING';
+    authoritativeProjectStatus = projectStatusForFsError(err);
+    const error = new Error(`Invalid project path (${authoritativeProjectStatus}): ${err.message}`);
+    error.code = authoritativeProjectStatus;
     throw error;
   }
 }
@@ -656,8 +667,9 @@ async function readFile(relativePath, ownerWebContentsId) {
 }
 
 async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
-  const normalizedQuery = typeof query === 'string' ? query.trim().toLowerCase() : '';
-  if (!normalizedQuery) throw new Error('Search query is required.');
+  const rawQuery = typeof query === 'string' ? query.trim() : '';
+  const queryLower = rawQuery.toLowerCase();
+  if (!queryLower) throw new Error('Search query is required.');
   const root = await validateProjectRoot(ownerWebContentsId);
   let scope = String(relativeScope || '.').trim() || '.';
   let scopeTarget = await resolveProjectPath(scope, ownerWebContentsId);
@@ -670,12 +682,23 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
   const results = [];
   let filesVisited = 0;
 
+  const queryTokens = rawQuery
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/[_\-/.\\]+/g, ' ')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t.length > 1);
+  const normalizedQueryText = rawQuery.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2').replace(/[_\-/.\\]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const foldedQueryText = normalizedQueryText.toLowerCase();
+
   async function walk(relativeDirectory) {
-    if (results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES) return;
+    if (filesVisited >= MAX_SEARCH_FILES) return;
     const directory = await resolveProjectPath(relativeDirectory, ownerWebContentsId);
     const entries = await fs.readdir(directory.target, { withFileTypes: true });
     for (const entry of entries) {
-      if (results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES) return;
+      if (filesVisited >= MAX_SEARCH_FILES) return;
       const childRelative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
       if (isIgnoredName(entry.name) || isSensitivePath(childRelative)) continue;
       if (LOW_VALUE_PATH_PATTERN.test(childRelative)) continue;
@@ -693,30 +716,63 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
       const lines = content.split(/\r?\n/);
       const normalizedPath = childRelative.replace(/\\/g, '/').toLowerCase();
       const normalizedEntryName = entry.name.toLowerCase();
-      const nameMatch = normalizedEntryName.includes(normalizedQuery);
-      const queryTokens = normalizedQuery
-        .replace(/([a-z])([A-Z])/g, '$1 $2')
+      const nameMatch = normalizedEntryName.includes(queryLower);
+      const normalizedName = entry.name
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
         .replace(/[_\-/.\\]+/g, ' ')
-        .split(/\s+/)
-        .map(t => t.toLowerCase())
-        .filter(t => t.length > 1);
-      const multiTokenMatch = queryTokens.length > 1 && queryTokens.every(tok => normalizedPath.includes(tok));
-      if (nameMatch || multiTokenMatch) {
+        .toLowerCase();
+      const normalizedFullPath = childRelative
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+        .replace(/[_\-/.\\]+/g, ' ')
+        .toLowerCase();
+      const filenameTerms = queryTokens.filter((token) => normalizedName.includes(token)).length;
+      const pathTerms = queryTokens.filter((token) => normalizedFullPath.includes(token)).length;
+      const multiTokenMatch = queryTokens.length > 1 && pathTerms === queryTokens.length;
+      const rolePathMatch = /(?:controllers?|handlers?|routes?|services?|models?|modules?)/i.test(normalizedPath);
+      const pathRelevance = pathTerms * 18 + (rolePathMatch ? 24 : 0);
+      const pathSegmentMatch = queryTokens.length === 1
+        && queryTokens[0].length >= 3
+        && normalizedPath.split('/').slice(0, -1).some((seg) => seg === queryTokens[0])
+        && /(?:controller|service|handler|model|route|view|form|api|repo)/i.test(normalizedEntryName);
+      const declarationPattern = /^\s*(?:(?:export|abstract|final|public|private|protected|static|async)\s+)*(?:class|interface|trait|enum|function|def)\s+[A-Za-z_$][\w$]*/i;
+      if (nameMatch || (queryTokens.length > 0 && filenameTerms === queryTokens.length) || multiTokenMatch || pathSegmentMatch) {
         results.push({
           path: childRelative,
           line: 0,
           text: entry.name,
           matchType: 'filename',
+          score: (nameMatch ? 120 : 0)
+            + (filenameTerms === queryTokens.length ? 80 : filenameTerms * 20)
+            + (multiTokenMatch ? 35 : 0)
+            + (pathSegmentMatch ? 25 : 0)
+            + (rolePathMatch ? 24 : 0),
         });
       }
+      let matchingLines = 0;
       lines.forEach((line, lineIndex) => {
-        if (results.length >= MAX_SEARCH_RESULTS) return;
-        if (line.toLowerCase().includes(normalizedQuery)) {
+        if (matchingLines >= 3) return;
+        const normalizedLine = line
+          .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+          .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+          .replace(/[_\-/.\\]+/g, ' ')
+          .toLowerCase();
+        const matchedTerms = queryTokens.filter((token) => normalizedLine.includes(token)).length;
+        const exactMatch = line.toLowerCase().includes(rawQuery.toLowerCase())
+          || normalizedLine.includes(foldedQueryText);
+        if (exactMatch || (matchedTerms > 0 && (queryTokens.length === 1 || matchedTerms === queryTokens.length))) {
+          matchingLines += 1;
           results.push({
             path: childRelative,
             line: lineIndex + 1,
             text: line.slice(0, 240),
-            matchType: 'content',
+            matchType: declarationPattern.test(line) ? 'definition' : 'content',
+            score: (exactMatch ? 100 : 0)
+              + (matchedTerms === queryTokens.length ? 50 : matchedTerms * 15)
+              + (declarationPattern.test(line) ? 30 : 0)
+              + (/(?:route|router|path|url|endpoint)/i.test(line) ? 10 : 0)
+              + pathRelevance,
           });
         }
       });
@@ -724,8 +780,8 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
   }
 
   await walk(scope);
-  if (results.length === 0) {
-    async function addPhpScope(relativeDirectory, depth = 0) {
+  if (results.length === 0 && queryTokens.length > 0) {
+    async function addScopeFallback(relativeDirectory, depth = 0) {
       if (depth > 6 || results.length >= 40) return;
       const directory = await resolveProjectPath(relativeDirectory, ownerWebContentsId);
       const entries = await fs.readdir(directory.target, { withFileTypes: true });
@@ -734,18 +790,41 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
         const childRelative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
         if (LOW_VALUE_PATH_PATTERN.test(childRelative)) continue;
         if (entry.isDirectory()) {
-          if (depth < 4) await addPhpScope(childRelative, depth + 1);
+          if (depth < 4) await addScopeFallback(childRelative, depth + 1);
           continue;
         }
-        if (entry.isFile() && /\.php$/i.test(entry.name)
-          && /(?:controllers?|models?|views?|services?|modules?|components?)/i.test(childRelative)) {
-          results.push({ path: childRelative, line: 0, text: entry.name, matchType: 'scope-fallback', relationship: 'scope' });
+        const normalizedChild = childRelative.replace(/\\/g, '/').toLowerCase();
+        if (entry.isFile()
+          && queryTokens.some((tok) => tok.length >= 3 && normalizedChild.includes(tok))
+          && /(?:controllers?|models?|views?|services?|modules?|components?|routes?|handlers?|api)/i.test(normalizedChild)) {
+          const normalizedChild = childRelative.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+            .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+            .replace(/[_\-/.\\]+/g, ' ').toLowerCase();
+          const matchedTerms = queryTokens.filter((token) => normalizedChild.includes(token)).length;
+          results.push({
+            path: childRelative,
+            line: 0,
+            text: entry.name,
+            matchType: 'scope-fallback',
+            relationship: 'scope',
+            score: matchedTerms * 20 + (/(?:controllers?|models?|views?|services?|modules?|components?|routes?|handlers?|api)/i.test(normalizedChild) ? 15 : 0),
+          });
         }
       }
     }
-    await addPhpScope(scope);
+    await addScopeFallback(scope);
   }
-  const result = { query, scope, results, filesVisited, truncated: results.length >= MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES };
+  results.sort((left, right) => (right.score || 0) - (left.score || 0)
+    || left.path.localeCompare(right.path)
+    || left.line - right.line);
+  const truncatedResults = results.slice(0, MAX_SEARCH_RESULTS);
+  const result = {
+    query,
+    scope,
+    results: truncatedResults,
+    filesVisited,
+    truncated: results.length > MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES,
+  };
   await appendAudit(root, 'search_code', `${scope}:${query}`, 'success');
   return result;
 }
@@ -1428,23 +1507,14 @@ async function getProjectState(ownerWebContentsId = null) {
   }
   let candidate = (ownerWebContentsId !== null && ownerWebContentsId !== undefined && projectRoots.get(ownerWebContentsId))
     || authoritativeProjectRoot
-    || (projectRoots.size === 1 ? [...projectRoots.values()][0] : null);
-
-  if (!candidate && authoritativeProjectStatus !== PROJECT_STATUSES.DETACHED) {
-    try {
-      const response = await fetch('http://localhost:3001/api/coding/project-state', { signal: AbortSignal.timeout(500) });
-      if (response.ok) {
-        const backendState = await response.json();
-        if (backendState && backendState.status === 'PROJECT_ATTACHED' && backendState.projectRoot) {
-          candidate = backendState.projectRoot;
-        }
-      }
-    } catch {}
-  }
+    || null;
 
   if (!candidate) {
     if (authoritativeProjectStatus === PROJECT_STATUSES.MISSING) {
       return { status: PROJECT_STATUSES.MISSING, projectRoot: null, reason: 'Project directory is missing from disk.' };
+    }
+    if (authoritativeProjectStatus === PROJECT_STATUSES.INACCESSIBLE) {
+      return { status: PROJECT_STATUSES.INACCESSIBLE, projectRoot: null, reason: 'Project directory is inaccessible.' };
     }
     return { status: PROJECT_STATUSES.NOT_ATTACHED, projectRoot: null, reason: 'No project attached.' };
   }
@@ -1456,8 +1526,14 @@ async function getProjectState(ownerWebContentsId = null) {
       return { status: PROJECT_STATUSES.MISSING, projectRoot: candidate, reason: 'Project path is not a directory.' };
     }
   } catch (error) {
-    authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
-    return { status: PROJECT_STATUSES.MISSING, projectRoot: candidate, reason: `Project directory missing: ${error.message}` };
+    authoritativeProjectStatus = projectStatusForFsError(error);
+    return {
+      status: authoritativeProjectStatus,
+      projectRoot: candidate,
+      reason: authoritativeProjectStatus === PROJECT_STATUSES.MISSING
+        ? `Project directory is missing: ${error.message}`
+        : `Project directory is inaccessible: ${error.message}`,
+    };
   }
 
   authoritativeProjectRoot = candidate;
@@ -1476,8 +1552,13 @@ async function attachProject(projectRoot, ownerWebContentsId = null) {
     const resolved = await setAuthoritativeProject(projectRoot, ownerWebContentsId);
     return { status: PROJECT_STATUSES.ATTACHED, projectRoot: resolved };
   } catch (error) {
-    authoritativeProjectStatus = PROJECT_STATUSES.MISSING;
-    return { status: PROJECT_STATUSES.MISSING, projectRoot, reason: error.message };
+    authoritativeProjectRoot = projectRoot;
+    authoritativeProjectStatus = projectStatusForFsError(error);
+    if (ownerWebContentsId !== undefined && ownerWebContentsId !== null) {
+      projectRoots.set(ownerWebContentsId, projectRoot);
+      projectDiscoveryMatches.delete(ownerWebContentsId);
+    }
+    return { status: authoritativeProjectStatus, projectRoot, reason: error.message };
   }
 }
 
@@ -1629,4 +1710,5 @@ module.exports = {
   detectProjectType, detectDevServerConfiguration,
   createIsolatedWorkspaceCopy,
   getProjectState, attachProject, setAuthoritativeProject, detachAuthoritativeProject, PROJECT_STATUSES,
+  projectStatusForFsError,
 };

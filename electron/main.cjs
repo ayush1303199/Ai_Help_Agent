@@ -72,6 +72,7 @@ const verificationRepairChainsByToken = new Map();
 const verificationRepairChainsByTask = new Map();
 const VERIFICATION_REPAIR_CHAIN_TTL_MS = 30 * 60 * 1000;
 const MAX_REPAIR_DIAGNOSTIC_CHARS = 4000;
+const MAX_WORKFLOW_APPROVAL_DIFF_CHARS = 16000;
 
 if (!Number.isSafeInteger(runtimeSettings.developer.maxVerificationAttempts)
   || runtimeSettings.developer.maxVerificationAttempts < 1) {
@@ -2443,6 +2444,94 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('developer:business-claim-redline', (_event, payload) => {
     return developerAgent.redlineBusinessClaim(payload?.claim || {});
+  });
+  ipcMain.handle('developer:workflow-execute', async (event, payload) => {
+    assertTrustedCodingRendererSender(event);
+    const owner = ownedDeveloperSession(event);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
+    const scope = await developerFiles.resolveProjectScope(event.sender.id, payload?.scope || '.');
+    const userRequest = String(payload?.userRequest || payload?.request || '').trim();
+    if (!userRequest) throw new Error('A user request is required to execute the autonomous coding workflow.');
+    if (['requestApproval', 'userApproved', 'autoApprove'].some((key) => Object.prototype.hasOwnProperty.call(payload || {}, key))) {
+      throw new Error('Renderer-supplied approval claims are not accepted.');
+    }
+
+    let activitySeq = 0;
+    const onProgress = (progress) => {
+      if (event.sender.isDestroyed?.()) return;
+      event.sender.send('developer:activity', {
+        type: 'workflow_progress',
+        operationSequence: ++activitySeq,
+        ...progress,
+        timestamp: new Date().toISOString(),
+      });
+    };
+
+    const runCheck = async (script) => {
+      return developerFiles.runVerification(script, event.sender.id, {
+        scope,
+        isCancelled: () => false,
+      }).catch((error) => ({
+        ...verificationFailureResult(error, script),
+        stdout: '',
+        stderr: error instanceof Error ? error.message : String(error),
+      }));
+    };
+
+    const requestApproval = async ({ taskId, proposal, diff }) => {
+      if (proposal?.taskId !== taskId
+        || typeof proposal?.manifestHash !== 'string'
+        || !/^[a-f0-9]{64}$/i.test(proposal.manifestHash)
+        || !Array.isArray(proposal.targetFiles)
+        || proposal.targetFiles.length === 0
+        || typeof diff !== 'string'
+        || !diff.trim()) {
+        throw new Error('The proposed change could not be bound to a valid approval prompt.');
+      }
+      if (diff.length > MAX_WORKFLOW_APPROVAL_DIFF_CHARS) {
+        throw new Error('The proposed change is too large to display for explicit approval.');
+      }
+      const approvalWindow = BrowserWindow.fromWebContents(event.sender);
+      if (!approvalWindow || approvalWindow.isDestroyed()) {
+        throw new Error('The Coding Agent window is unavailable for approval.');
+      }
+      const response = await dialog.showMessageBox(approvalWindow, {
+        type: 'warning',
+        buttons: ['Reject proposal', 'Approve exact proposal'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        title: 'Approve coding change',
+        message: 'Review and approve this exact proposed change before it is applied.',
+        detail: [
+          `Project: ${root}`,
+          `Scope: ${scope}`,
+          `Request: ${userRequest}`,
+          `Proposal: ${taskId}`,
+          `Manifest: ${proposal.manifestHash}`,
+          `Targets: ${proposal.targetFiles.join(', ')}`,
+          '',
+          'Exact proposed diff:',
+          diff,
+        ].join('\n'),
+      });
+      return response.response === 1;
+    };
+
+    return developerAgent.executeAutonomousCodingWorkflow({
+      userRequest,
+      root,
+      sessionId: owner.sessionId,
+      ownerWebContentsId: owner.ownerWebContentsId,
+      scope,
+      autoRepairEnabled: Boolean(payload?.autoRepairEnabled),
+      maxRepairAttempts: Number.isInteger(payload?.maxRepairAttempts) ? payload.maxRepairAttempts : 2,
+      onProgress,
+      runCheck,
+      requestApproval,
+      tools: payload?.tools || null,
+    });
   });
   ipcMain.handle('general:session', (event) => {
     registerGeneralRenderer(event);
