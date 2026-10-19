@@ -35,10 +35,13 @@ Object.defineProperty(dom.window, 'crypto', { configurable: true, value: webcryp
 const providerRequests = [];
 const proposalRegistrations = [];
 const conversationRepairTokens = [];
+const conversationUpdates = [];
 let applyCalls = 0;
 let conversationCount = 0;
 let initialProjectSync = false;
 let autoModeGranted = false;
+let nextDoneMessage = null;
+let proposalHandoffPlan = null;
 
 class RuntimeWebSocket {
   static OPEN = 1;
@@ -65,15 +68,19 @@ class RuntimeWebSocket {
     }
     if (request.type !== 'chat') return;
     providerRequests.push(request);
+    const response = nextDoneMessage || {
+      content: diff,
+      proposalRequired: true,
+      status: 'PROPOSAL_READY',
+      filesRead: [{ path: 'src/index.ts', content: original }],
+      toolCalls: [],
+    };
+    nextDoneMessage = null;
     setTimeout(() => this.onmessage?.({
       data: JSON.stringify({
         type: 'done',
         requestId: request.requestId,
-        content: diff,
-        proposalRequired: true,
-        status: 'PROPOSAL_READY',
-        filesRead: [{ path: 'src/index.ts', content: original }],
-        toolCalls: [],
+        ...response,
       }),
     }), 0);
   }
@@ -103,15 +110,24 @@ window.electronAPI = {
       scope,
     };
   },
-  advanceDeveloperConversation: async ({ turnId, state }) => ({ turnId, state, updatedAt: new Date().toISOString() }),
+  advanceDeveloperConversation: async ({ turnId, state, phase, fileCount }) => {
+    const update = { turnId, state, phase, fileCount };
+    conversationUpdates.push(update);
+    return { ...update, updatedAt: new Date().toISOString() };
+  },
   readDeveloperFile: async () => ({ content: original }),
-  createDeveloperProposal: async (raw, snapshots, _script, _scope, _turnId, repairToken) => {
+  createDeveloperProposal: async (raw, snapshots, _script, _scope, _turnId, repairToken, handoffWorkflowRequestId) => {
     const index = proposalRegistrations.length;
-    proposalRegistrations.push({ raw, snapshots, repairToken });
+    proposalRegistrations.push({ raw, snapshots, repairToken, handoffWorkflowRequestId });
     return {
       id: `proposal-${index + 1}`,
       proposalId: `proposal-ref-${index + 1}`,
       manifestHash: `manifest-${index + 1}`,
+      taskPlan: handoffWorkflowRequestId ? {
+        schemaVersion: 2,
+        status: 'HANDED_OFF',
+        workItems: proposalHandoffPlan?.workItems?.map((item) => ({ ...item })) || [],
+      } : null,
       state: repairToken && autoModeGranted ? 'approved' : 'awaiting_approval',
       lifecycleState: repairToken && autoModeGranted ? 'APPROVED' : 'WAITING_FOR_APPROVAL',
       attemptNumber: repairToken ? 2 : 1,
@@ -280,6 +296,260 @@ try {
   assert.equal(applyCalls, 3, 'Auto mode must apply the initial proposal and one repair without a second approval click.');
   assert.equal(proposalRegistrations[3].repairToken, 'main-issued-one-time-token');
   console.log('Coding Auto mode edit-verify-repair runtime test passed.');
+
+  await act(async () => {
+    current.workspace.onClearMessages();
+  });
+  await waitForReact(() => current.workspace.proposal === null, 'The Auto mode test setup did not reset.');
+  const handoffRequest = 'Add bounded retry handling to the request processor';
+  const handoffWorkItems = [
+    {
+      id: 'WI-001',
+      objective: 'Persist retry settings.',
+      status: 'DELEGATED',
+      dependsOn: [],
+      requiredEvidence: ['APPROVED_SCOPE_PROPOSAL', 'EXPLICIT_APPROVAL', 'VERIFICATION_PASS'],
+    },
+    {
+      id: 'WI-002',
+      objective: 'Expose retry settings through the API.',
+      status: 'DELEGATED',
+      dependsOn: ['WI-001'],
+      requiredEvidence: ['APPROVED_SCOPE_PROPOSAL', 'EXPLICIT_APPROVAL', 'VERIFICATION_PASS'],
+    },
+    {
+      id: 'WI-003',
+      objective: 'Add focused retry behavior tests.',
+      status: 'DELEGATED',
+      dependsOn: ['WI-002'],
+      requiredEvidence: ['APPROVED_SCOPE_PROPOSAL', 'EXPLICIT_APPROVAL', 'VERIFICATION_PASS'],
+    },
+  ];
+  proposalHandoffPlan = {
+    schemaVersion: 2,
+    status: 'HANDED_OFF',
+    workItems: handoffWorkItems.map((item) => ({ ...item })),
+  };
+  let workflowRequest = null;
+  window.electronAPI.executeDeveloperWorkflow = async (payload) => {
+    workflowRequest = payload;
+    return {
+      outcome: 'IMPLEMENTATION_REQUIRED',
+      taskState: { status: 'INCOMPLETE', objective: { request: handoffRequest } },
+      taskPlan: {
+        schemaVersion: 2,
+        status: 'HANDED_OFF',
+        workItems: handoffWorkItems.map((item) => ({ ...item })),
+      },
+      nextAction: { tool: 'standard_coding_proposal' },
+    };
+  };
+  await act(async () => {
+    current.workspace.onInputChange(handoffRequest);
+  });
+  await act(async () => {
+    current.workspace.onSendMessage();
+  });
+  await waitForReact(
+    () => providerRequests.length === 5 && current.workspace.proposal?.id === 'proposal-5',
+    'An implementation-required investigation did not continue through the standard Coding Agent proposal flow.',
+  );
+  assert.equal(current.workspace.proposal?.state, 'awaiting_approval');
+  assert.equal(workflowRequest.userRequest, handoffRequest);
+  assert.equal(providerRequests[4].messages.filter((message) => (
+    message.role === 'user' && message.content === handoffRequest
+  )).length, 1, 'The original objective must be sent once during handoff.');
+  assert.match(
+    providerRequests[4].messages.at(-2).content,
+    /Continue the original user request through the standard Coding Agent workflow/,
+  );
+  const handoffPlanMessage = providerRequests[4].messages.at(-2).content;
+  for (const item of handoffWorkItems) {
+    assert.ok(handoffPlanMessage.includes(item.id), `The proposal workflow must receive work-item identity ${item.id}.`);
+    assert.ok(handoffPlanMessage.includes(item.objective), `The proposal workflow must receive objective ${item.id}.`);
+    for (const dependency of item.dependsOn) {
+      assert.ok(handoffPlanMessage.includes(dependency), `The proposal workflow must receive dependency ${dependency}.`);
+    }
+    for (const evidence of item.requiredEvidence) {
+      assert.ok(handoffPlanMessage.includes(evidence), `The proposal workflow must receive evidence requirement ${evidence}.`);
+    }
+  }
+  assert.equal(
+    proposalRegistrations[4].raw.includes('+console.log("changed");'),
+    true,
+    'The standard proposal flow should use the existing proposal registration boundary.',
+  );
+  assert.equal(typeof proposalRegistrations[4].handoffWorkflowRequestId, 'string');
+  assert.deepEqual(
+    current.workspace.proposal.handoffPlan?.workItems.map((item) => item.id),
+    handoffWorkItems.map((item) => item.id),
+    'The registered proposal must retain the exact version-2 handoff plan.',
+  );
+  assert.equal(applyCalls, 3, 'Handoff must prepare a proposal without applying it.');
+  assert.match(
+    current.workspace.messages.at(-1).content,
+    /original request remains incomplete until every handed-off work item is covered/i,
+    'The proposal-ready response must not claim the handed-off multi-item request is complete.',
+  );
+  assert.doesNotMatch(
+    current.workspace.messages.at(-1).content,
+    /request completed successfully|all requested work is complete/i,
+  );
+  console.log('Coding implementation-required handoff runtime test passed.');
+
+  await act(async () => {
+    current.workspace.onClearMessages();
+  });
+  await waitForReact(() => current.workspace.proposal === null, 'The handoff validation test setup did not reset.');
+  window.electronAPI.executeDeveloperWorkflow = async () => ({
+    outcome: 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED',
+    message: 'The approved proposal was applied and verification passed, but trusted item-specific evidence did not establish request completion.',
+    taskId: 'task-incomplete-coverage',
+    taskPlan: {
+      schemaVersion: 2,
+      status: 'BLOCKED',
+      workItems: handoffWorkItems.map((item) => ({ ...item, status: 'BLOCKED' })),
+    },
+    filesModified: ['src/request-processor.ts'],
+    codeApplied: true,
+    codeVerified: true,
+  });
+  await act(async () => {
+    current.workspace.onInputChange('Fix the request processor retry behavior.');
+  });
+  await act(async () => {
+    current.workspace.onSendMessage();
+  });
+  await waitForReact(
+    () => current.workspace.messages.at(-1)?.content.includes('The task remains incomplete'),
+    'The renderer must not present passing generic verification as completed request work.',
+  );
+  assert.match(current.workspace.messages.at(-1).content, /trusted item-specific evidence did not establish request completion/i);
+  assert.equal(current.workspace.appliedPatchLog.at(-1)?.state, 'blocked');
+  assert.equal(providerRequests.length, 5, 'Reporting unresolved item coverage must not start a second provider request.');
+  console.log('Coding honest item-coverage outcome rendering regression passed.');
+
+  await act(async () => {
+    current.workspace.onClearMessages();
+  });
+  await waitForReact(() => current.workspace.proposal === null, 'The invalid-plan test setup did not reset.');
+  window.electronAPI.executeDeveloperWorkflow = async () => ({
+    outcome: 'IMPLEMENTATION_REQUIRED',
+    taskPlan: { schemaVersion: 2, status: 'HANDED_OFF', workItems: [] },
+  });
+  await act(async () => {
+    current.workspace.onInputChange('Implement a change without a usable work plan.');
+  });
+  await act(async () => {
+    current.workspace.onSendMessage();
+  });
+  await waitForReact(
+    () => current.workspace.messages.at(-1)?.content.includes('did not return a valid version-2 handoff plan'),
+    'A malformed handoff plan must be surfaced instead of silently continuing without plan scope.',
+  );
+  assert.equal(providerRequests.length, 5, 'A malformed handoff plan must not start proposal generation.');
+  assert.equal(applyCalls, 3, 'A malformed handoff plan must not apply changes.');
+  console.log('Coding invalid handoff plan fail-closed regression passed.');
+  window.electronAPI.executeDeveloperWorkflow = async (payload) => {
+    workflowRequest = payload;
+    return {
+      outcome: 'IMPLEMENTATION_REQUIRED',
+      taskState: { status: 'INCOMPLETE', objective: { request: payload.userRequest } },
+      taskPlan: {
+        schemaVersion: 2,
+        status: 'HANDED_OFF',
+        workItems: handoffWorkItems.map((item) => ({ ...item })),
+      },
+      nextAction: { tool: 'standard_coding_proposal' },
+    };
+  };
+
+  await act(async () => {
+    current.workspace.onClearMessages();
+  });
+  await waitForReact(() => current.workspace.proposal === null, 'The incomplete-task test setup did not reset.');
+  const incompleteRequest = 'Explain the project entry point and identify any missing evidence.';
+  nextDoneMessage = {
+    content: 'The available evidence does not establish the complete request outcome.',
+    proposalRequired: false,
+    status: 'INVESTIGATION_INCOMPLETE',
+    agentTaskState: {
+      status: 'INVESTIGATION_INCOMPLETE',
+      originalRequest: incompleteRequest,
+      evidence: [{ id: 'evidence-one', status: 'CONFIRMED' }],
+      nextAction: {
+        tool: 'read_file',
+        reason: 'Inspect the remaining relevant source before concluding.',
+        expectedEvidence: ['Relevant source content'],
+      },
+    },
+    filesRead: [],
+    toolCalls: [],
+  };
+  await act(async () => {
+    current.workspace.onInputChange(incompleteRequest);
+  });
+  await act(async () => {
+    current.workspace.onSendMessage();
+  });
+  await waitForReact(
+    () => providerRequests.length === 6
+      && conversationUpdates.some((update) => update.state === 'blocked')
+      && current.workspace.messages.some((message) => (
+        message.requestId === providerRequests[5].requestId
+        && !message.streaming
+        && message.content.includes('Inspect the remaining relevant source before concluding.')
+      )),
+    'An incomplete backend task was not preserved as blocked with its next action in the renderer.',
+  );
+  const incompleteTurn = conversationUpdates.at(-1);
+  assert.equal(incompleteTurn?.state, 'blocked');
+  assert.equal(incompleteTurn?.phase, 'INVESTIGATION_INCOMPLETE');
+  assert.ok(providerRequests[5].messages.some((message) => (
+    message.role === 'user' && message.content === incompleteRequest
+  )));
+  assert.equal(current.workspace.messages.at(-1)?.content.includes('Task remains incomplete'), true);
+  console.log('Coding incomplete-task transport and lifecycle regression passed.');
+
+  for (const [index, [scenario, fallback]] of [
+    ['no-changes', 'NO_CHANGES'],
+    ['invalid-format', 'I recommend updating the implementation, but this is not a unified diff.'],
+  ].entries()) {
+    await act(async () => {
+      current.workspace.onClearMessages();
+    });
+    await waitForReact(() => current.workspace.proposal === null, `The ${scenario} test setup did not reset.`);
+    const updateCount = conversationUpdates.length;
+    nextDoneMessage = {
+      content: fallback,
+      proposalRequired: true,
+      status: 'PROPOSAL_READY',
+      filesRead: [],
+      toolCalls: [],
+    };
+    await act(async () => {
+      current.workspace.onInputChange(`Prepare a change for ${scenario} request.`);
+    });
+    await act(async () => {
+      current.workspace.onSendMessage();
+    });
+    await waitForReact(
+      () => conversationUpdates.slice(updateCount).some((update) => update.state === 'blocked')
+        && current.workspace.messages.at(-1)?.streaming === false,
+      `A ${scenario} proposal fallback was incorrectly treated as completed.`,
+    );
+    assert.equal(conversationUpdates.slice(updateCount).at(-1)?.state, 'blocked');
+    assert.equal(current.workspace.proposal, null, 'Invalid or absent diffs must not create a proposal.');
+    assert.equal(
+      current.workspace.messages.at(-1)?.content.includes(
+        scenario === 'no-changes' ? 'could not identify a safe change to propose' : 'No validated diff was generated',
+      ),
+      true,
+      'The user should be told that no proposal was created or applied.',
+    );
+    assert.equal(proposalRegistrations.length, 5);
+  }
+  console.log('Coding proposal fallback incomplete-state regressions passed.');
 } finally {
   if (root) await act(async () => root.unmount());
   await vite.close();

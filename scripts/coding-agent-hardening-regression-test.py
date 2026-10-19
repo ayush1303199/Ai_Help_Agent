@@ -1,10 +1,12 @@
 import asyncio
+import json
 import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 SERVER_SRC = Path(__file__).resolve().parents[1] / "server" / "src"
 sys.path.insert(0, str(SERVER_SRC))
@@ -30,6 +32,462 @@ class CodingAgentHardeningRegressionTests(unittest.TestCase):
             connection.commit()
         finally:
             connection.close()
+
+    def test_provider_failures_distinguish_quota_throttling_auth_and_transport(self):
+        class ProviderError(Exception):
+            def __init__(self, message, status_code=None):
+                super().__init__(message)
+                self.status_code = status_code
+
+        cases = (
+            (
+                ProviderError("Daily token quota exhausted; resets tomorrow", 429),
+                "PROVIDER_QUOTA_EXHAUSTED",
+                False,
+                "CHECK_PROVIDER_QUOTA_RESET",
+            ),
+            (
+                ProviderError("429 Too Many Requests: rate limit, retry after 30 seconds", 429),
+                "PROVIDER_THROTTLED",
+                True,
+                "WAIT_FOR_PROVIDER_RETRY_WINDOW",
+            ),
+            (
+                ProviderError("Invalid API key", 401),
+                "PROVIDER_AUTH_ERROR",
+                False,
+                "CHECK_CREDENTIALS_AND_PROVIDER_PERMISSIONS",
+            ),
+            (
+                ProviderError("Connection refused"),
+                "PROVIDER_NETWORK_FAILURE",
+                True,
+                "RETRY_AFTER_NETWORK_RECOVERY",
+            ),
+            (
+                ProviderError("Request timed out"),
+                "LLM_PROVIDER_TIMEOUT",
+                True,
+                "RETRY_AFTER_PROVIDER_TIMEOUT",
+            ),
+            (
+                ProviderError("Provider server error", 503),
+                "PROVIDER_SERVICE_UNAVAILABLE",
+                True,
+                "WAIT_FOR_PROVIDER_RECOVERY",
+            ),
+        )
+        for error, expected_category, expected_retryable, expected_action in cases:
+            with self.subTest(category=expected_category):
+                classification = websocket.classify_provider_exception(error)
+                self.assertEqual(classification["category"], expected_category)
+                self.assertEqual(classification["retryable"], expected_retryable)
+                self.assertEqual(classification["suggestedAction"], expected_action)
+                self.assertEqual(
+                    classification["classification"],
+                    "EXTERNAL_RESOURCE_FAILURE",
+                )
+                user_message = websocket._provider_failure_user_message(error, classification)
+                self.assertIn("saved as incomplete", user_message)
+                self.assertIn("continue this conversation", user_message)
+        ambiguous_limit = websocket.classify_provider_exception(
+            ProviderError("429", 429)
+        )
+        self.assertEqual(ambiguous_limit["category"], "PROVIDER_LIMIT_TYPE_UNKNOWN")
+        self.assertFalse(ambiguous_limit["retryable"])
+
+        class RetryAfterResponse:
+            status_code = 429
+            headers = {"retry-after": "15"}
+
+        retry_after_error = ProviderError("429", 429)
+        retry_after_error.response = RetryAfterResponse()
+        retry_after_classification = websocket.classify_provider_exception(retry_after_error)
+        self.assertEqual(retry_after_classification["category"], "PROVIDER_THROTTLED")
+        self.assertEqual(retry_after_classification["retryAfterSeconds"], 15)
+        with patch.object(websocket.time, "time", return_value=100):
+            self.assertEqual(
+                websocket._provider_recovery_wait_remaining({
+                    "classification": "PROVIDER_THROTTLED",
+                    "retryAfterSeconds": 30,
+                    "recordedAt": 85,
+                }),
+                15,
+            )
+        self.assertIn(
+            "15 seconds",
+            websocket._provider_failure_user_message(
+                retry_after_error,
+                retry_after_classification,
+            ),
+        )
+        exhausted_quota = websocket.classify_provider_exception(
+            ProviderError("429: daily token quota exhausted; reset in 24 hours", 429)
+        )
+        self.assertIn(
+            "reset window",
+            websocket._provider_failure_user_message(
+                ProviderError("429: daily token quota exhausted; reset in 24 hours", 429),
+                exhausted_quota,
+            ),
+        )
+
+    def test_provider_failure_preserves_incomplete_task_for_safe_continuation(self):
+        project_root = str(Path("C:/workspace/project"))
+        prior_task = {
+            "taskId": "task-1",
+            "turnId": "turn-1",
+            "status": "UNDERSTANDING",
+            "assistantContent": "An error was returned before the task finished.",
+            "projectContext": {"root": project_root},
+            "originalRequest": "Inspect the request execution lifecycle.",
+            "userRequest": "Inspect the request execution lifecycle.",
+            "goal": {"statement": "Inspect the request execution lifecycle."},
+            "facts": [{"id": "fact-1", "statement": "A confirmed observation."}],
+            "unknowns": [{"id": "unknown-1", "question": "What remains unverified?"}],
+            "evidence": [{"id": "evidence-1", "content": "Confirmed source evidence."}],
+            "actions": [{"id": "action-1", "status": "COMPLETED"}],
+            "timestamps": {"createdAt": "2026-01-01T00:00:00Z", "completedAt": None},
+            "nextAction": {"tool": "inspect_next_source", "reason": "Continue evidence gathering."},
+            "failures": [],
+            "workingMemory": {
+                "currentRequest": "Inspect the request execution lifecycle.",
+                "knownFacts": [{"id": "fact-1"}],
+            },
+            "conversationContext": {"recentMessages": [], "continuityDetected": False},
+        }
+        quota_error = RuntimeError("Daily token quota exhausted")
+        quota_classification = websocket.classify_provider_exception(quota_error)
+        self.assertTrue(
+            websocket._record_provider_failure(
+                prior_task,
+                quota_error,
+                quota_classification,
+                "turn-1",
+                "session-1",
+            ),
+            "An exhausted daily quota stays resumable without being marked retryable.",
+        )
+        self.assertEqual(prior_task["status"], "INCOMPLETE")
+        self.assertEqual(prior_task["providerRecovery"]["retryable"], False)
+        self.assertEqual(
+            prior_task["nextAction"]["tool"],
+            "inspect_next_source",
+            "The last uncompleted action must remain available for continuation.",
+        )
+        self.assertEqual(prior_task["facts"][0]["id"], "fact-1")
+        self.assertEqual(prior_task["evidence"][0]["id"], "evidence-1")
+        continuation_messages = [
+            {"role": "user", "content": "Inspect the request execution lifecycle."},
+            {"role": "assistant", "content": "Provider request failed with HTTP 429."},
+            {"role": "user", "content": "Continue this task after the provider is available."},
+        ]
+
+        self.assertTrue(
+            websocket._matches_prior_semantic_task(
+                continuation_messages,
+                prior_task,
+                project_root,
+            )
+        )
+        self.assertFalse(
+            websocket._matches_prior_semantic_task(
+                continuation_messages,
+                {**prior_task, "status": "FAILED"},
+                project_root,
+            ),
+            "Only tasks explicitly retained as provider-recoverable may bypass assistant-content matching.",
+        )
+        self.assertFalse(
+            websocket._matches_prior_semantic_task(
+                continuation_messages,
+                prior_task,
+                str(Path("C:/workspace/other-project")),
+            ),
+            "Provider recovery must remain bound to the original project.",
+        )
+
+        resumed = websocket._resume_semantic_task(
+            prior_task,
+            {"turnId": "turn-2"},
+            continuation_messages[-1]["content"],
+            "turn-2",
+        )
+        self.assertEqual(resumed["status"], "UNDERSTANDING")
+        self.assertEqual(resumed["taskId"], "task-1")
+        self.assertEqual(resumed["turnId"], "turn-2")
+        self.assertEqual(resumed["originalRequest"], prior_task["originalRequest"])
+        self.assertEqual(resumed["goal"], prior_task["goal"])
+        self.assertEqual(resumed["facts"], prior_task["facts"])
+        self.assertEqual(resumed["unknowns"], prior_task["unknowns"])
+        self.assertEqual(resumed["evidence"], prior_task["evidence"])
+        self.assertEqual(resumed["actions"], prior_task["actions"])
+        self.assertEqual(resumed["providerRecovery"]["state"], "RESUMED")
+        self.assertEqual(
+            resumed["providerRecovery"]["classification"],
+            prior_task["providerRecovery"]["classification"],
+        )
+
+    def test_websocket_blocks_unconfirmed_provider_retry_before_repository_or_model_work(self):
+        with tempfile.TemporaryDirectory(prefix="coding-provider-recovery-") as root:
+            session_id = "provider-recovery-gate-test"
+            prior_task = {
+                "taskId": "task-provider-recovery",
+                "turnId": "turn-provider-failure",
+                "status": "INCOMPLETE",
+                "assistantContent": "The configured provider's quota is exhausted.",
+                "projectContext": {"root": str(Path(root).resolve())},
+                "originalRequest": "Inspect how provider failures affect task continuation.",
+                "goal": {"statement": "Inspect how provider failures affect task continuation."},
+                "facts": [{"id": "fact-confirmed", "statement": "A repository fact."}],
+                "unknowns": [{"id": "unknown-open", "question": "What remains?"}],
+                "evidence": [{"id": "evidence-confirmed", "content": "A confirmed observation."}],
+                "actions": [{"id": "action-complete", "status": "COMPLETED"}],
+                "nextAction": {"tool": "inspect_next_source", "reason": "Continue the saved investigation."},
+                "failures": [],
+                "timestamps": {"createdAt": "2026-01-01T00:00:00Z", "completedAt": None},
+                "workingMemory": {"knownFacts": [{"id": "fact-confirmed"}]},
+                "conversationContext": {"recentMessages": [], "continuityDetected": False},
+                "providerRecovery": {
+                    "state": "WAITING_FOR_PROVIDER",
+                    "classification": "PROVIDER_QUOTA_EXHAUSTED",
+                    "retryable": False,
+                    "suggestedAction": "CHECK_PROVIDER_QUOTA_RESET",
+                },
+            }
+            session = websocket.CODING_TASK_STORE.get_or_create(
+                session_id,
+                project_root=str(Path(root).resolve()),
+            )
+            session["agentTaskState"] = prior_task
+            events = []
+
+            async def send_json(event):
+                events.append(event)
+
+            payload = {
+                "requestId": "provider-recovery-gate-turn",
+                "conversationId": session_id,
+                "sessionId": session_id,
+                "projectRoot": root,
+                "messages": [
+                    {"role": "user", "content": prior_task["originalRequest"]},
+                    {"role": "assistant", "content": prior_task["assistantContent"]},
+                    {"role": "user", "content": "Continue the saved task using its original objective and confirmed evidence."},
+                ],
+            }
+            websocket_state = {"pending": {}, "completed": {}, "tasks": set()}
+
+            async def send_request():
+                await websocket.handle_coding_payload(
+                    json.dumps({"type": "chat", **payload}),
+                    send_json,
+                    websocket_state,
+                    registry=None,
+                    config_path="",
+                )
+                await asyncio.gather(*list(websocket_state["tasks"]))
+
+            try:
+                with patch.object(websocket, "get_backend_project_state", return_value={"projectRoot": root}), \
+                     patch.object(websocket.DatabaseSessionManager, "get_session", return_value=None), \
+                     patch.object(websocket.ProjectContextLock, "resolve_authoritative_root", return_value=root), \
+                     patch.object(websocket, "register_coding_request_context", return_value={"projectId": "project", "repositoryId": "repo"}), \
+                     patch.object(websocket.UNIVERSAL_INDEX, "scan_and_update") as scan, \
+                     patch.object(websocket, "complete_coding_model") as provider:
+                    asyncio.run(send_request())
+
+                self.assertEqual(events[-1]["type"], "error")
+                self.assertEqual(events[-1]["category"], "PROVIDER_QUOTA_EXHAUSTED")
+                self.assertIn("No provider request was sent", events[-1]["message"])
+                self.assertEqual(events[-1]["agentTaskState"]["evidence"], prior_task["evidence"])
+                self.assertEqual(events[-1]["agentTaskState"]["nextAction"], prior_task["nextAction"])
+                self.assertEqual(session["agentTaskState"], prior_task)
+                scan.assert_not_called()
+                provider.assert_not_called()
+            finally:
+                websocket.CODING_TASK_STORE._sessions.pop(session_id, None)
+
+    def test_websocket_provider_quota_failure_emits_structured_incomplete_recovery_state(self):
+        with tempfile.TemporaryDirectory(prefix="coding-provider-failure-") as root:
+            session_id = "provider-quota-failure-websocket-test"
+            original_request = "Inspect the provider error path and preserve the investigation."
+            session = websocket.CODING_TASK_STORE.get_or_create(session_id, project_root=str(Path(root).resolve()))
+            events = []
+            provider = SimpleNamespace(id="mock-quota-provider", type="mock", model="quota-test")
+
+            async def send_json(event):
+                events.append(event)
+            websocket_state = {"pending": {}, "completed": {}, "tasks": set()}
+
+            async def send_request():
+                await websocket.handle_coding_payload(
+                    json.dumps({
+                        "type": "chat",
+                        "requestId": "provider-quota-failure-turn",
+                        "conversationId": session_id,
+                        "sessionId": session_id,
+                        "projectRoot": root,
+                        "messages": [{"role": "user", "content": original_request}],
+                    }),
+                    send_json,
+                    websocket_state,
+                    registry=SimpleNamespace(get_active_provider=lambda: provider),
+                    config_path="",
+                )
+                await asyncio.gather(*list(websocket_state["tasks"]))
+
+            semantic_resolution = {
+                "is_deterministic": False,
+                "route_to_code": True,
+                "resolved_by_model": True,
+                "semanticTask": {
+                    "intent": "GENERAL_REPOSITORY_TASK",
+                    "goal": original_request,
+                    "resourceCandidates": ["CODE", "REPOSITORY"],
+                    "resolvedResources": ["CODE", "REPOSITORY"],
+                },
+            }
+            try:
+                with patch.object(websocket, "get_backend_project_state", return_value={"projectRoot": root}), \
+                     patch.object(websocket.DatabaseSessionManager, "get_session", return_value=None), \
+                     patch.object(websocket.ProjectContextLock, "resolve_authoritative_root", return_value=root), \
+                     patch.object(websocket, "register_coding_request_context", return_value={"projectId": "project", "repositoryId": "repo"}), \
+                     patch.object(websocket.UNIVERSAL_INDEX, "scan_and_update"), \
+                     patch.object(websocket.ProjectContextLock, "lock"), \
+                     patch.object(websocket, "_resolve_semantic_task_with_model", new=AsyncMock(return_value=semantic_resolution)), \
+                     patch.object(websocket.DatabaseSessionManager, "resolve_database_intent", return_value={"is_deterministic": False}), \
+                     patch.object(websocket, "complete_coding_model", side_effect=RuntimeError(
+                         "429: daily token quota exhausted; resets tomorrow"
+                     )) as complete_model:
+                    asyncio.run(send_request())
+
+                failure = next(event for event in events if event.get("type") == "error")
+                self.assertEqual(complete_model.call_count, 1)
+                self.assertEqual(failure["category"], "PROVIDER_QUOTA_EXHAUSTED")
+                self.assertFalse(failure["retryable"])
+                self.assertEqual(failure["providerRecovery"]["state"], "WAITING_FOR_PROVIDER")
+                self.assertEqual(failure["agentTaskState"]["status"], "INCOMPLETE")
+                self.assertEqual(failure["agentTaskState"]["originalRequest"], original_request)
+                self.assertIsNotNone(failure["agentTaskState"]["nextAction"])
+                self.assertIn("check the provider's quota", failure["message"])
+            finally:
+                websocket.CODING_TASK_STORE._sessions.pop(session_id, None)
+
+    def test_confirmed_provider_recovery_reaches_mocked_model_with_saved_task_context(self):
+        with tempfile.TemporaryDirectory(prefix="coding-provider-resume-") as root:
+            session_id = "provider-recovery-resume-test"
+            project_root = str(Path(root).resolve())
+            original_request = "Inspect how provider failures affect task continuation."
+            prior_task = websocket._build_semantic_task(
+                request_id="turn-provider-failure",
+                session_id=session_id,
+                user_message=original_request,
+                intent="GENERAL_REPOSITORY_TASK",
+                resources=["CODE", "REPOSITORY"],
+                target=None,
+                project_root=project_root,
+                scope=".",
+                architecture={},
+                required_evidence=[],
+                conversation_message_count=2,
+                conversation_messages=[],
+            )
+            prior_task.update({
+                "taskId": "task-provider-resume",
+                "turnId": "turn-provider-failure",
+                "status": "INCOMPLETE",
+                "assistantContent": "The configured provider's quota is exhausted.",
+                "originalRequest": original_request,
+                "userRequest": original_request,
+                "facts": [{"id": "fact-confirmed", "statement": "A repository fact."}],
+                "unknowns": [{"id": "unknown-open", "question": "What remains?"}],
+                "evidence": [{"id": "evidence-confirmed", "content": "A confirmed observation."}],
+                "actions": [{"id": "action-complete", "status": "COMPLETED"}],
+                "nextAction": {"tool": "inspect_next_source", "reason": "Continue the saved investigation."},
+                "providerRecovery": {
+                    "state": "WAITING_FOR_PROVIDER",
+                    "classification": "PROVIDER_QUOTA_EXHAUSTED",
+                    "retryable": False,
+                    "suggestedAction": "CHECK_PROVIDER_QUOTA_RESET",
+                    "providerId": "mock-recovered-provider",
+                },
+            })
+            session = websocket.CODING_TASK_STORE.get_or_create(session_id, project_root=project_root)
+            session["agentTaskState"] = prior_task
+            events = []
+            provider = SimpleNamespace(id="mock-recovered-provider", type="mock", model="recovered")
+
+            async def send_json(event):
+                events.append(event)
+
+            payload = {
+                "requestId": "provider-recovery-resume-turn",
+                "conversationId": session_id,
+                "sessionId": session_id,
+                "projectRoot": root,
+                "resumeProviderTask": True,
+                "messages": [
+                    {"role": "user", "content": original_request},
+                    {"role": "assistant", "content": prior_task["assistantContent"]},
+                    {"role": "user", "content": "Continue the saved task using its original objective and confirmed evidence."},
+                ],
+            }
+            websocket_state = {"pending": {}, "completed": {}, "tasks": set()}
+
+            async def send_request():
+                await websocket.handle_coding_payload(
+                    json.dumps({"type": "chat", **payload}),
+                    send_json,
+                    websocket_state,
+                    registry=SimpleNamespace(get_active_provider=lambda: provider),
+                    config_path="",
+                )
+                await asyncio.gather(*list(websocket_state["tasks"]))
+
+            semantic_resolution = {
+                "is_deterministic": False,
+                "route_to_code": True,
+                "resolved_by_model": True,
+                "semanticTask": {
+                    "intent": "GENERAL_REPOSITORY_TASK",
+                    "goal": original_request,
+                    "resourceCandidates": ["CODE", "REPOSITORY"],
+                    "resolvedResources": ["CODE", "REPOSITORY"],
+                    "continuityDetected": True,
+                },
+            }
+            try:
+                with patch.object(websocket, "get_backend_project_state", return_value={"projectRoot": root}), \
+                     patch.object(websocket.DatabaseSessionManager, "get_session", return_value=None), \
+                     patch.object(websocket.ProjectContextLock, "resolve_authoritative_root", return_value=root), \
+                     patch.object(websocket, "register_coding_request_context", return_value={"projectId": "project", "repositoryId": "repo"}), \
+                     patch.object(websocket.UNIVERSAL_INDEX, "scan_and_update"), \
+                     patch.object(websocket.ProjectContextLock, "lock"), \
+                     patch.object(websocket, "clear_coding_provider_quota_block") as clear_quota_block, \
+                     patch.object(websocket, "_resolve_semantic_task_with_model", new=AsyncMock(return_value=semantic_resolution)), \
+                     patch.object(websocket.DatabaseSessionManager, "resolve_database_intent", return_value={"is_deterministic": False}), \
+                     patch.object(
+                         websocket,
+                         "complete_coding_model",
+                         return_value=(
+                             {"role": "assistant", "content": "The saved task resumed using its confirmed evidence."},
+                             provider,
+                         ),
+                     ) as complete_model:
+                    asyncio.run(send_request())
+
+                self.assertGreater(complete_model.call_count, 0)
+                self.assertTrue(any(event.get("type") == "done" for event in events), events[-3:])
+                final_state = session["agentTaskState"]
+                self.assertEqual(final_state["originalRequest"], original_request)
+                self.assertEqual(final_state["facts"][0]["id"], "fact-confirmed")
+                self.assertEqual(final_state["evidence"][0]["id"], "evidence-confirmed")
+                self.assertEqual(final_state["actions"][0]["id"], "action-complete")
+                self.assertEqual(final_state["providerRecovery"]["state"], "RESUMED")
+                clear_quota_block.assert_called_once_with("mock-recovered-provider")
+            finally:
+                websocket.CODING_TASK_STORE._sessions.pop(session_id, None)
 
     def test_sqlite_resolver_uses_explicit_target_and_rejects_ambiguity(self):
         with tempfile.TemporaryDirectory() as root:

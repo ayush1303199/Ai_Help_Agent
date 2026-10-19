@@ -79,13 +79,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   beginDeveloperConversation: (request, scope = '.', repairToken = null) => ipcRenderer.invoke('developer:conversation-start', { request, scope, repairToken }),
   inspectDeveloperDatabase: (request, contextMessages = []) => ipcRenderer.invoke('developer:database-inspect', { request, contextMessages }),
   advanceDeveloperConversation: (update) => ipcRenderer.invoke('developer:conversation-update', update),
-  createDeveloperProposal: (raw, snapshots, verificationScript = null, scope = '.', conversationTurnId = null, repairToken = null) => ipcRenderer.invoke('developer:proposal-create', { raw, snapshots, verificationScript, scope, conversationTurnId, repairToken }),
+  createDeveloperProposal: (raw, snapshots, verificationScript = null, scope = '.', conversationTurnId = null, repairToken = null, handoffWorkflowRequestId = null) => ipcRenderer.invoke('developer:proposal-create', { raw, snapshots, verificationScript, scope, conversationTurnId, repairToken, handoffWorkflowRequestId }),
   getDeveloperVerificationRepairContext: (id) => ipcRenderer.invoke('developer:verification-repair-context', id),
   cancelDeveloperVerificationRepairChain: (id) => ipcRenderer.invoke('developer:verification-repair-cancel', id),
   approveDeveloperProposal: (id, options = {}) => ipcRenderer.invoke('developer:proposal-approve', id, options),
   rejectDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-reject', id),
   applyDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-apply', id),
   executeDeveloperWorkflow: (payload) => ipcRenderer.invoke('developer:workflow-execute', payload),
+  cancelDeveloperWorkflow: (requestId) => ipcRenderer.invoke('developer:workflow-cancel', requestId),
   onDeveloperActivity: (callback) => {
     if (typeof callback !== 'function') return () => {};
     const listener = (_event, activity) => callback(activity);

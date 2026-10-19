@@ -18,6 +18,7 @@
     "build": "vite build",
     "test": "node scripts/test-all.mjs",
     "test:developer-agent": "node scripts/developer-agent-test.mjs",
+    "test:work-item-verifier": "node scripts/work-item-verification-contract-test.mjs",
     "test:coding-investigation": "node scripts/coding-investigation-workflow-test.mjs",
     "test:database-discovery": "node scripts/database-discovery-test.mjs",
     "test:developer-discovery": "node scripts/developer-project-discovery-test.mjs",

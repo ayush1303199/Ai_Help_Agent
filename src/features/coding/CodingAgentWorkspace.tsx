@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { runtimeConfig } from '../../config/runtimeConfig';
 import type { CodingConversationState, CodingPreference } from './codingSessionStore';
-import type { CodingActivity, CodingActivityMessage } from './codingTransport';
+import type { CodingActivity, CodingActivityMessage, CodingProviderRecovery } from './codingTransport';
 
 function isCodingNarration(item: CodingActivity): item is CodingActivityMessage {
   return !('event' in item);
@@ -22,7 +22,7 @@ function codingActivityLabel(item: CodingActivity): string {
   }
   switch (item.activityType) {
     case 'SEARCHING': return 'Searched code';
-    case 'READING_FILE': return 'Analyzed';
+    case 'READING_FILE': return 'Read file';
     case 'DISCOVERING_REPOSITORY': return 'Explored directory';
     case 'INSPECTING_SYMBOL': return 'Inspected symbol';
     case 'TRACING_CALLER': return 'Traced references';
@@ -108,6 +108,7 @@ function CodingActivityEntry({ item }: { item: CodingActivity }) {
     result?.count !== undefined ? `${result.count} results` : undefined,
     result?.rowCount !== undefined ? `${result.rowCount} rows` : undefined,
     result?.lineCount !== undefined ? `${result.lineCount} lines` : undefined,
+    result?.sourceContextTruncated ? 'provider context excerpted' : undefined,
     result?.databaseType,
     result?.executionStatus,
     result?.evidenceState ? `evidence ${result.evidenceState}` : undefined,
@@ -257,6 +258,17 @@ interface Proposal {
     history?: Array<{ phase?: string; message?: string; at?: string }>;
     metrics?: { filesRead?: number; filesChanged?: number; verificationRuns?: number; confidence?: string };
   } | null;
+  handoffPlan?: {
+    schemaVersion: 2;
+    status: 'HANDED_OFF';
+    workItems: Array<{
+      id: string;
+      objective: string;
+      status: string;
+      dependsOn: string[];
+      requiredEvidence: string[];
+    }>;
+  };
 }
 
 interface CodingAgentWorkspaceProps {
@@ -319,6 +331,10 @@ interface CodingAgentWorkspaceProps {
   onCancelRequest: () => void;
   onSendMessage: () => void;
   onClearMessages: () => void;
+  workflowCanResume?: boolean;
+  onContinueWorkflow?: () => void;
+  providerRecovery?: CodingProviderRecovery | null;
+  onResumeProviderTask?: () => void;
   onExecuteWorkflow?: (userRequest: string, options?: { autoRepairEnabled?: boolean; maxRepairAttempts?: number }) => Promise<unknown>;
   conversations: CodingConversationState[];
   activeConversationId: string;
@@ -513,6 +529,10 @@ export function CodingAgentWorkspace({
   onCancelRequest,
   onSendMessage,
   onClearMessages,
+  workflowCanResume = false,
+  onContinueWorkflow,
+  providerRecovery = null,
+  onResumeProviderTask,
   onExecuteWorkflow,
   conversations,
   activeConversationId,
@@ -894,6 +914,12 @@ export function CodingAgentWorkspace({
       {proposal && <article className="rounded-xl border border-sky-500/20 bg-slate-950/60 p-4">
         <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Coding Agent</p>
         <p className="mb-3 text-sm leading-relaxed text-slate-100">Here is the proposed change for review. Nothing is written until you approve it.</p>
+        {proposal.handoffPlan && <section role="status" className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] text-amber-100">
+          <p className="font-semibold">Request plan remains handed off; this proposal's approval and verification do not complete its work items.</p>
+          <ol className="mt-1 list-inside list-decimal">
+            {proposal.handoffPlan.workItems.map((item) => <li key={item.id}>{item.id} · {item.status} · {item.objective}</li>)}
+          </ol>
+        </section>}
         <section className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
         {proposal.state === 'awaiting_approval' && proposal.attemptNumber === 1 && <label className="mb-3 flex cursor-pointer items-start gap-2 rounded-md border border-sky-500/30 bg-sky-500/5 p-2 text-[11px] text-sky-100">
           <input
@@ -962,11 +988,33 @@ export function CodingAgentWorkspace({
       </article>}
       </div>
 
+      {providerRecovery?.state === 'WAITING_FOR_PROVIDER' && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-400/40 bg-amber-500/5 p-3">
+        <p className="text-xs text-amber-100">This task is incomplete; its objective and confirmed evidence are saved. Resolve the provider prerequisite shown above before resuming.</p>
+        {onResumeProviderTask && <button
+          type="button"
+          onClick={onResumeProviderTask}
+          disabled={busy || streaming || proposalNeedsDecision}
+          className="rounded-lg border border-amber-400/60 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-500/20 disabled:opacity-40"
+        >
+          Resume after provider is available
+        </button>}
+      </div>}
       <div className="mt-4 flex items-end gap-2 rounded-2xl border border-slate-700 bg-slate-950/80 p-2 shadow-lg">
         <textarea value={input} onChange={(event) => onInputChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSendMessage(); } }} placeholder="Ask about the project or describe a change…" rows={2} className="min-w-0 flex-1 resize-y bg-transparent px-2 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500" />
         {streaming
           ? <button onClick={onCancelRequest} className="rounded-xl border border-rose-400/50 px-4 py-2.5 text-sm font-semibold text-rose-200 hover:bg-rose-500/10">Stop</button>
           : <>
+              {workflowCanResume && onContinueWorkflow && isTrustedDesktop && (
+                <button
+                  type="button"
+                  onClick={onContinueWorkflow}
+                  disabled={busy || proposalNeedsDecision}
+                  title="Continue the bounded investigation with its saved search and inspection state"
+                  className="rounded-xl border border-amber-400/60 bg-amber-500/10 px-3 py-2.5 text-xs font-semibold text-amber-200 transition hover:bg-amber-500/20 disabled:opacity-40"
+                >
+                  Continue investigation
+                </button>
+              )}
               {onExecuteWorkflow && isTrustedDesktop && (
                 <button
                   type="button"

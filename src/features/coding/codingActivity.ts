@@ -25,6 +25,7 @@ export interface CodingActivityResult {
   count?: number;
   rowCount?: number;
   lineCount?: number;
+  sourceContextTruncated?: boolean;
   paths?: string[];
   databaseType?: string;
   executionStatus?: string;
@@ -174,6 +175,7 @@ export function parseCodingActivityEvent(value: unknown): CodingActivityEvent | 
     if (count !== undefined) result.count = count;
     if (rowCount !== undefined) result.rowCount = rowCount;
     if (lineCount !== undefined) result.lineCount = lineCount;
+    if (rawResult.sourceContextTruncated === true) result.sourceContextTruncated = true;
     if (rawResult.exitCode === null || exitCode !== undefined) result.exitCode = exitCode ?? null;
     if (typeof rawResult.executed === 'boolean') result.executed = rawResult.executed;
     const paths = boundedStringArray(rawResult.paths, 40, 300);

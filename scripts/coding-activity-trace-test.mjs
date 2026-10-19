@@ -4,7 +4,7 @@ import {
   parseCodingActivityEvent,
   upsertCodingActivity,
 } from '../src/features/coding/codingActivity.ts';
-import { CodingAgentTransport } from '../src/features/coding/codingTransport.ts';
+import { CodingAgentTransport, CodingTransportError } from '../src/features/coding/codingTransport.ts';
 
 function event(overrides = {}) {
   return {
@@ -31,6 +31,15 @@ const completed = parseCodingActivityEvent(event({
   result: { count: 2, paths: ['src/a.ts', 'src/b.ts'] },
 }));
 assert.ok(completed);
+const excerptedRead = parseCodingActivityEvent(event({
+  activityType: 'READING_FILE',
+  action: { tool: 'read_file', target: 'src/controller.php' },
+  status: 'COMPLETED',
+  result: { lineCount: 2400, sourceContextTruncated: true },
+}));
+assert.ok(excerptedRead);
+assert.equal(excerptedRead.result?.lineCount, 2400);
+assert.equal(excerptedRead.result?.sourceContextTruncated, true);
 let state = upsertCodingActivity([], started);
 assert.equal(state.length, 1, 'STARTED should create one active activity.');
 state = upsertCodingActivity(state, completed);
@@ -226,6 +235,9 @@ cancellationTransport.requests.set('cancel-unverified', {
   filesSearched: new Set(),
   toolCalls: [],
   activityCount: 0,
+  idleTimer: null,
+  maxDurationTimer: null,
+  cancellationTimer: null,
 });
 cancellationTransport.requests.set('cancel-confirmed', {
   scope: '.',
@@ -239,6 +251,9 @@ cancellationTransport.requests.set('cancel-confirmed', {
   filesSearched: new Set(),
   toolCalls: [],
   activityCount: 0,
+  idleTimer: null,
+  maxDurationTimer: null,
+  cancellationTimer: null,
 });
 cancellationTransport.requests.set('cancel-not-active', {
   scope: '.',
@@ -252,6 +267,9 @@ cancellationTransport.requests.set('cancel-not-active', {
   filesSearched: new Set(),
   toolCalls: [],
   activityCount: 0,
+  idleTimer: null,
+  maxDurationTimer: null,
+  cancellationTimer: null,
 });
 await cancellationTransport.handleMessage({}, JSON.stringify({
   type: 'cancelled',
@@ -272,9 +290,15 @@ assert.deepEqual(cancellationResults, ['CANCELLATION_UNVERIFIED', 'CANCELLED', '
 cancellationTransport.close();
 
 const outboundMessages = [];
-globalThis.window = { electronAPI: undefined };
+let receivedProviderFailure;
+globalThis.window = {
+  electronAPI: undefined,
+  setTimeout: globalThis.setTimeout.bind(globalThis),
+  clearTimeout: globalThis.clearTimeout.bind(globalThis),
+};
 const requestTransport = new CodingAgentTransport();
 requestTransport.connect = async () => ({
+  readyState: 1,
   send: payload => outboundMessages.push(JSON.parse(payload)),
 });
 const startedRoots = [];
@@ -288,11 +312,46 @@ await requestTransport.send(
     onActivity() {},
     onToken() {},
     onDone() {},
-    onError(error) { throw error; },
+    onError(error) { receivedProviderFailure = error; },
   },
 );
 assert.equal(startedRoots[0], 'C:\\workspace\\selected-project');
 assert.equal(outboundMessages[0].projectRoot, 'C:\\workspace\\selected-project');
+await requestTransport.handleMessage({}, JSON.stringify({
+  type: 'error',
+  requestId: 'selected-project-request',
+  classification: 'EXTERNAL_RESOURCE_FAILURE',
+  category: 'PROVIDER_QUOTA_EXHAUSTED',
+  retryable: false,
+  message: 'Provider quota exhausted; task preserved.',
+  providerRecovery: {
+    state: 'WAITING_FOR_PROVIDER',
+    classification: 'PROVIDER_QUOTA_EXHAUSTED',
+    retryable: false,
+    suggestedAction: 'CHECK_PROVIDER_QUOTA_RESET',
+  },
+  agentTaskState: { status: 'INCOMPLETE', originalRequest: 'Inspect this project.' },
+}));
+assert.ok(receivedProviderFailure instanceof CodingTransportError);
+assert.equal(receivedProviderFailure.providerRecovery?.state, 'WAITING_FOR_PROVIDER');
+assert.equal(receivedProviderFailure.category, 'PROVIDER_QUOTA_EXHAUSTED');
+await requestTransport.send(
+  'resumed-project-request',
+  [{ role: 'user', content: 'Continue the saved task.' }],
+  '.',
+  'C:\\workspace\\selected-project',
+  {
+    onStart() {},
+    onActivity() {},
+    onToken() {},
+    onDone() {},
+    onError(error) { throw error; },
+  },
+  undefined,
+  null,
+  true,
+);
+assert.equal(outboundMessages[1].resumeProviderTask, true);
 requestTransport.close();
 
 const genericText = {

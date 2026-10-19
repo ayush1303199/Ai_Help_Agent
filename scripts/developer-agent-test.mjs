@@ -4,6 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import agent from '../electron/developerAgent.cjs';
 import { ArtifactEngine, ARTIFACT_TYPES } from '../electron/coding-pipeline/artifacts.cjs';
+import { multiRepoCoordinator } from '../electron/coding-pipeline/multiRepo.cjs';
+import { taskOrchestrator } from '../electron/coding-pipeline/orchestrator.cjs';
+import { routeTaskMode } from '../electron/coding-pipeline/modes.cjs';
+import runtimeSettings from '../src/config/runtimeSettings.json' with { type: 'json' };
 
 const createUnboundProposal = agent.createProposal;
 agent.createProposal = async (input) => {
@@ -74,11 +78,11 @@ try {
   assert.throws(
     () => agent.beginConversationTurn({
       root,
-      request: 'x'.repeat(4001),
+      request: 'x'.repeat(runtimeSettings.developer.maxRequestChars + 1),
       sessionId,
       ownerWebContentsId,
     }),
-    /Coding request is too long \(4001 characters; maximum 4000\)/,
+    new RegExp(`Coding request is too long \\(${runtimeSettings.developer.maxRequestChars + 1} characters; maximum ${runtimeSettings.developer.maxRequestChars}\\)`),
     'Only an oversized current request should hit the character limit, with an actionable message.',
   );
   assert.throws(
@@ -96,6 +100,60 @@ try {
   });
   assert.equal(proposal.state, 'awaiting_approval');
   const owner = { ownerWebContentsId, sessionId };
+  const objectives = [
+    'Separate request parsing from transport handling while preserving observable behavior.',
+    'Investigate why a delayed background operation can leave its owning task in an inconsistent state.',
+    'Add a documented read-only report of the current project configuration without changing files.',
+    `Design a repository-wide update that preserves existing behavior. Constraints: ${'Retain caller compatibility, do not change public APIs, and use repository conventions. '.repeat(10)}Acceptance criteria: document assumptions and include relevant verification evidence.`,
+  ];
+  for (const [index, request] of objectives.entries()) {
+    const objectiveProposal = await agent.createProposal({
+      root,
+      ownerWebContentsId,
+      sessionId,
+      request,
+      raw: `--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+objective-${index}\n`,
+    });
+    const conversationTurn = agent.getConversationTurn(
+      agent.getTaskForTest(objectiveProposal.taskId).conversationTurnId,
+      owner,
+    );
+    const orchestratedTask = taskOrchestrator.getTask(objectiveProposal.taskId);
+    assert.equal(conversationTurn.request, request, 'The conversation must retain the complete original objective.');
+    if (request.length > 512) {
+      assert.equal(conversationTurn.requestSummary.length, 512, 'The bounded authorization summary must remain separate from the full task objective.');
+    }
+    assert.equal(objectiveProposal.runtime.plan.goal, request, 'Proposal task state must carry the original objective.');
+    assert.equal(objectiveProposal.runtime.taskMemory.goal, request, 'Task memory must retain the original objective.');
+    assert.equal(orchestratedTask.goal, request, 'The real orchestrator must receive the objective used for routing and skill selection.');
+    assert.equal(orchestratedTask.intent, '', 'Generic task creation must not inject a bug-investigation intent.');
+    assert.equal(orchestratedTask.mode, routeTaskMode({ goal: request }).mode, 'The orchestrator must use the request-derived mode rather than an implicit bug-investigation intent.');
+  }
+  const genericObjective = 'Document the available project settings without changing any files.';
+  const genericObjectiveProposal = await agent.createProposal({
+    root,
+    ownerWebContentsId,
+    sessionId,
+    request: genericObjective,
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+read-only-objective\n',
+  });
+  assert.equal(
+    taskOrchestrator.getTask(genericObjectiveProposal.taskId).activeSkill,
+    null,
+    'Unmatched objectives must not be assigned a specialized bug-investigation playbook.',
+  );
+  const performanceObjectiveProposal = await agent.createProposal({
+    root,
+    ownerWebContentsId,
+    sessionId,
+    request: 'Optimize memory usage and reduce request latency.',
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+performance-objective\n',
+  });
+  assert.equal(
+    taskOrchestrator.getTask(performanceObjectiveProposal.taskId).activeSkill,
+    'performance_analysis',
+    'A relevant objective signal must select its matching specialized playbook.',
+  );
   const authorizedMutations = [];
   const authorizeTestMutation = async (request) => {
     authorizedMutations.push(request);
@@ -144,6 +202,91 @@ try {
     && /^[a-f0-9]{64}$/.test(request.requestBinding?.requestHash || '')
     && request.requestBinding.authorizedFeatures.includes('shared')
   )), 'Every direct apply and undo authorization must carry its original request binding.');
+
+  const baselineFailureProposal = await agent.createProposal({
+    root,
+    ownerWebContentsId,
+    sessionId,
+    raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+baseline-failure\n',
+  });
+  agent.approve(baselineFailureProposal.taskId, owner);
+  const originalCaptureBaselineSnapshot = multiRepoCoordinator.captureBaselineSnapshot;
+  multiRepoCoordinator.captureBaselineSnapshot = async () => {
+    throw new Error('simulated baseline snapshot failure');
+  };
+  try {
+    await assert.rejects(
+      () => agent.apply(baselineFailureProposal.taskId, owner, passingVerification, null, authorizeTestMutation),
+      (error) => {
+        assert.equal(error.taskSnapshot.state, 'failed');
+        assert.equal(
+          agent.getConversationTurn(
+            agent.getTaskForTest(baselineFailureProposal.taskId).conversationTurnId,
+            owner,
+          ).state,
+          'failed',
+          'A pre-mutation failure must terminalize both proposal and conversation lifecycle state.',
+        );
+        return true;
+      },
+    );
+  } finally {
+    multiRepoCoordinator.captureBaselineSnapshot = originalCaptureBaselineSnapshot;
+  }
+  assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n', 'A failed baseline snapshot must not mutate project files.');
+
+  const assertCancellationRollsBack = async ({ cancelDuringVerification }) => {
+    const proposal = await agent.createProposal({
+      root,
+      ownerWebContentsId,
+      sessionId,
+      raw: '--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+cancellation-attempt\n',
+    });
+    agent.approve(proposal.taskId, owner);
+    let cancellationRequested = false;
+    const authorizeCancellation = async () => {
+      if (!cancelDuringVerification && !cancellationRequested) {
+        cancellationRequested = true;
+        agent.cancelTask(proposal.taskId, owner);
+      }
+      return { allowed: true };
+    };
+    const verifyCancellation = async () => {
+      if (cancelDuringVerification) {
+        cancellationRequested = true;
+        agent.cancelTask(proposal.taskId, owner);
+      }
+      return passingVerification();
+    };
+    await assert.rejects(
+      () => agent.apply(
+        proposal.taskId,
+        owner,
+        verifyCancellation,
+        null,
+        authorizeCancellation,
+      ),
+      (error) => {
+        assert.equal(error.taskSnapshot?.state, 'cancelled');
+        const task = agent.getTaskForTest(proposal.taskId);
+        const turn = agent.getConversationTurn(task.conversationTurnId, owner);
+        assert.equal(task.state, 'cancelled');
+        assert.equal(turn.state, 'cancelled');
+        assert.equal(task.runtime.phase, 'CANCELLED');
+        assert.equal(task.runtime.taskState, 'CANCELLED');
+        assert.ok(task.approval.consumedAt, 'Cancellation must not make a consumed approval reusable.');
+        return true;
+      },
+    );
+    assert.equal(
+      await fs.readFile(file, 'utf8'),
+      'one\ntwo\n',
+      'Cancellation must leave the project at its original snapshot.',
+    );
+    assert.equal(cancellationRequested, true);
+  };
+  await assertCancellationRollsBack({ cancelDuringVerification: false });
+  await assertCancellationRollsBack({ cancelDuringVerification: true });
 
   const meetingDirectory = path.join(root, 'src', 'features', 'meeting');
   await fs.mkdir(meetingDirectory, { recursive: true });

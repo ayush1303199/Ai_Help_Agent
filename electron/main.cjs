@@ -13,6 +13,7 @@ const developerBenchmark = require('./developerBenchmark.cjs');
 const generalAgent = require('./generalAgent.cjs');
 const { ProviderSecretVault } = require('./providerSecretVault.cjs');
 const { authorizeAppOwnedMutation } = require('./appOwnedPersistence.cjs');
+const { normalizeVerificationCriteria } = require('./coding-pipeline/workItemVerificationContract.cjs');
 const {
   projectProcessIsolationStatus,
   verifyProjectProcessIsolation,
@@ -70,7 +71,10 @@ let developerMutationIpcReady = false;
 const verificationRepairChainsByRoot = new Map();
 const verificationRepairChainsByToken = new Map();
 const verificationRepairChainsByTask = new Map();
+const workflowExecutions = new Map();
 const VERIFICATION_REPAIR_CHAIN_TTL_MS = 30 * 60 * 1000;
+const WORKFLOW_EXECUTION_TTL_MS = 30 * 60 * 1000;
+const MAX_WORKFLOW_EXECUTIONS = 128;
 const MAX_REPAIR_DIAGNOSTIC_CHARS = 4000;
 const MAX_WORKFLOW_APPROVAL_DIFF_CHARS = 16000;
 
@@ -87,6 +91,67 @@ if (!Number.isSafeInteger(runtimeSettings.developer.maxAutoRepairAttempts)
 function projectChainKey(root) {
   const resolved = path.resolve(root);
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function normalizeHandoffTaskPlan(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || value.schemaVersion !== 2
+    || value.status !== 'HANDED_OFF'
+    || !Array.isArray(value.workItems)
+    || value.workItems.length < 1
+    || value.workItems.length > 12) {
+    return null;
+  }
+  const workItems = [];
+  const itemPositions = new Map();
+  for (const candidate of value.workItems) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)
+      || typeof candidate.id !== 'string'
+      || !/^WI-\d{3}$/.test(candidate.id)
+      || itemPositions.has(candidate.id)
+      || typeof candidate.objective !== 'string'
+      || !candidate.objective.trim()
+      || candidate.status !== 'DELEGATED'
+      || !Array.isArray(candidate.dependsOn)
+      || !candidate.dependsOn.every((dependency) => typeof dependency === 'string')
+      || !Array.isArray(candidate.requiredEvidence)
+      || candidate.requiredEvidence.length === 0
+      || !candidate.requiredEvidence.every((evidence) => typeof evidence === 'string' && evidence.trim())
+      || (candidate.verificationCriteria !== undefined
+        && !normalizeVerificationCriteria(candidate.verificationCriteria))) {
+      return null;
+    }
+    itemPositions.set(candidate.id, workItems.length);
+    workItems.push({
+      id: candidate.id,
+      objective: candidate.objective.trim(),
+      status: 'DELEGATED',
+      dependsOn: [...candidate.dependsOn],
+      requiredEvidence: candidate.requiredEvidence.map((evidence) => evidence.trim()),
+      ...(candidate.verificationCriteria
+        ? { verificationCriteria: normalizeVerificationCriteria(candidate.verificationCriteria) }
+        : {}),
+    });
+  }
+  if (workItems.some((item, index) => item.dependsOn.some((dependency) => {
+    const dependencyPosition = itemPositions.get(dependency);
+    return dependencyPosition === undefined || dependencyPosition >= index;
+  }))) {
+    return null;
+  }
+  return { schemaVersion: 2, status: 'HANDED_OFF', workItems };
+}
+
+function pruneWorkflowExecutions() {
+  const currentTime = Date.now();
+  for (const [key, execution] of workflowExecutions) {
+    if (execution.settled && execution.expiresAt <= currentTime) workflowExecutions.delete(key);
+  }
+  while (workflowExecutions.size >= MAX_WORKFLOW_EXECUTIONS) {
+    const oldestCompleted = [...workflowExecutions.entries()].find(([, execution]) => execution.settled);
+    if (!oldestCompleted) throw new Error('The Coding workflow request capacity is full; wait for active work to finish.');
+    workflowExecutions.delete(oldestCompleted[0]);
+  }
 }
 
 function clearVerificationRepairChain(chain) {
@@ -1401,7 +1466,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:conversation-update', (event, payload) => {
     const owner = ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
-    const allowedRendererStates = new Set(['understanding', 'completed', 'failed', 'cancelled']);
+    const allowedRendererStates = new Set(['understanding', 'completed', 'failed', 'cancelled', 'blocked']);
     if (!allowedRendererStates.has(payload?.state)) throw new Error('Unsupported Coding conversation lifecycle update.');
     return developerAgent.advanceConversationTurn(payload?.turnId, payload.state, owner, {
       phase: payload.phase,
@@ -1521,7 +1586,14 @@ app.whenReady().then(async () => {
     if (name === 'read_file') {
       const relativePath = developerFiles.normalizeScopedProjectPath(root, scope, args.relativePath);
       try {
-        return { ok: true, tool: name, data: await developerFiles.readFile(relativePath, event.sender.id) };
+        return {
+          ok: true,
+          tool: name,
+          data: await developerFiles.readFile(relativePath, event.sender.id, {
+            startLine: args.startLine,
+            endLine: args.endLine,
+          }),
+        };
       } catch (error) {
         const targetPath = String(args.relativePath || args.path || relativePath);
         return {
@@ -1730,6 +1802,30 @@ app.whenReady().then(async () => {
       || tokenChain.status !== 'awaiting_repair')) {
       throw new Error('Verification repair authorization is invalid or expired.');
     }
+    let handoffExecution = null;
+    if (payload?.handoffWorkflowRequestId !== undefined && payload.handoffWorkflowRequestId !== null) {
+      if (typeof payload.handoffWorkflowRequestId !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(payload.handoffWorkflowRequestId)) {
+        throw new TypeError('Invalid implementation handoff request ID.');
+      }
+      handoffExecution = workflowExecutions.get(`${event.sender.id}:${payload.handoffWorkflowRequestId}`);
+      if (!handoffExecution?.settled
+        || handoffExecution.outcome !== 'IMPLEMENTATION_REQUIRED'
+        || handoffExecution.owner?.sessionId !== owner.sessionId
+        || handoffExecution.owner?.ownerWebContentsId !== owner.ownerWebContentsId
+        || !handoffExecution.root
+        || projectChainKey(handoffExecution.root) !== projectChainKey(root)
+        || handoffExecution.scope !== scope
+        || !normalizeHandoffTaskPlan(handoffExecution.taskPlan)) {
+        throw new Error('The implementation handoff plan is missing, stale, or mismatched with this project and renderer session.');
+      }
+      const handoffTurn = developerAgent.getConversationTurn(payload?.conversationTurnId, owner);
+      if (handoffTurn.requestHash !== handoffExecution.userRequestHash
+        || projectChainKey(handoffTurn.root) !== projectChainKey(root)
+        || handoffTurn.scope !== scope) {
+        throw new Error('The implementation handoff plan does not match this proposal conversation and project scope.');
+      }
+    }
     const verificationPlan = tokenChain
       ? { scripts: tokenChain.verificationScripts || [], missing: [] }
       : await developerFiles.getVerificationScripts(event.sender.id, [], scope);
@@ -1742,6 +1838,7 @@ app.whenReady().then(async () => {
       verificationScripts: verificationPlan.scripts,
       scope,
       conversationTurnId: payload?.conversationTurnId || null,
+      taskPlan: handoffExecution?.taskPlan || null,
     });
     const task = developerAgent.getTaskForTest(proposal.id);
     const chain = bindRepairProposalToChain(task, owner, root, repairToken);
@@ -2453,9 +2550,37 @@ app.whenReady().then(async () => {
     const scope = await developerFiles.resolveProjectScope(event.sender.id, payload?.scope || '.');
     const userRequest = String(payload?.userRequest || payload?.request || '').trim();
     if (!userRequest) throw new Error('A user request is required to execute the autonomous coding workflow.');
+    const isUuid = (value) => typeof value === 'string'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+    if (payload?.workflowRequestId !== undefined && !isUuid(payload.workflowRequestId)) {
+      throw new TypeError('Invalid Coding workflow request ID.');
+    }
     if (['requestApproval', 'userApproved', 'autoApprove'].some((key) => Object.prototype.hasOwnProperty.call(payload || {}, key))) {
       throw new Error('Renderer-supplied approval claims are not accepted.');
     }
+    if (payload?.continuationToken !== undefined && !isUuid(payload.continuationToken)) {
+      throw new TypeError('Invalid investigation continuation token.');
+    }
+    const workflowRequestId = payload?.workflowRequestId || crypto.randomUUID();
+    const workflowRequestKey = `${event.sender.id}:${workflowRequestId}`;
+    const workflowRequestFingerprint = crypto.createHash('sha256').update(JSON.stringify({
+      root,
+      scope,
+      userRequest,
+      continuationToken: payload?.continuationToken || null,
+      autoRepairEnabled: payload?.autoRepairEnabled === true,
+      maxRepairAttempts: payload?.maxRepairAttempts,
+      tools: payload?.tools || null,
+    })).digest('hex');
+    const existingWorkflow = workflowExecutions.get(workflowRequestKey);
+    if (existingWorkflow) {
+      if (existingWorkflow.fingerprint !== workflowRequestFingerprint) {
+        throw new Error('This Coding workflow request ID is already bound to different request content.');
+      }
+      return existingWorkflow.promise;
+    }
+    pruneWorkflowExecutions();
+    let execution = null;
 
     let activitySeq = 0;
     const onProgress = (progress) => {
@@ -2471,7 +2596,7 @@ app.whenReady().then(async () => {
     const runCheck = async (script) => {
       return developerFiles.runVerification(script, event.sender.id, {
         scope,
-        isCancelled: () => false,
+        isCancelled: () => execution?.cancelRequested === true || event.sender.isDestroyed?.() === true,
       }).catch((error) => ({
         ...verificationFailureResult(error, script),
         stdout: '',
@@ -2479,7 +2604,36 @@ app.whenReady().then(async () => {
       }));
     };
 
+    const assessFindingRelevance = async (assessment) => {
+      const response = await fetch(
+        `http://127.0.0.1:${services.http.port}/api/coding/assess-finding-relevance`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Coding-Auth': codingAuthToken,
+          },
+          body: JSON.stringify({
+            ...assessment,
+            requestId: workflowRequestId,
+            sessionId: owner.sessionId,
+          }),
+          signal: AbortSignal.timeout(45_000),
+        },
+      );
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(
+          typeof detail?.detail === 'string'
+            ? detail.detail
+            : `The configured Coding provider could not assess finding relevance (HTTP ${response.status}).`,
+        );
+      }
+      return response.json();
+    };
+
     const requestApproval = async ({ taskId, proposal, diff }) => {
+      if (execution) execution.taskId = taskId;
       if (proposal?.taskId !== taskId
         || typeof proposal?.manifestHash !== 'string'
         || !/^[a-f0-9]{64}$/i.test(proposal.manifestHash)
@@ -2519,19 +2673,66 @@ app.whenReady().then(async () => {
       return response.response === 1;
     };
 
-    return developerAgent.executeAutonomousCodingWorkflow({
+    execution = {
+      fingerprint: workflowRequestFingerprint,
+      promise: null,
+      settled: false,
+      cancelRequested: false,
+      taskId: null,
+      owner,
+      root,
+      scope,
+      userRequestHash: crypto.createHash('sha256').update(userRequest).digest('hex'),
+      outcome: null,
+      taskPlan: null,
+      expiresAt: Date.now() + WORKFLOW_EXECUTION_TTL_MS,
+    };
+    workflowExecutions.set(workflowRequestKey, execution);
+    const promise = developerAgent.executeAutonomousCodingWorkflow({
       userRequest,
       root,
       sessionId: owner.sessionId,
       ownerWebContentsId: owner.ownerWebContentsId,
       scope,
+      continuationToken: payload?.continuationToken,
       autoRepairEnabled: Boolean(payload?.autoRepairEnabled),
       maxRepairAttempts: Number.isInteger(payload?.maxRepairAttempts) ? payload.maxRepairAttempts : 2,
       onProgress,
       runCheck,
+      assessFindingRelevance,
       requestApproval,
+      isCancelled: () => execution.cancelRequested || event.sender.isDestroyed?.() === true,
       tools: payload?.tools || null,
     });
+    execution.promise = promise.then((result) => {
+      execution.settled = true;
+      execution.outcome = result?.outcome || null;
+      execution.taskPlan = result?.outcome === 'IMPLEMENTATION_REQUIRED'
+        ? normalizeHandoffTaskPlan(result.taskPlan)
+        : null;
+      execution.expiresAt = Date.now() + WORKFLOW_EXECUTION_TTL_MS;
+      return result;
+    }, (error) => {
+      workflowExecutions.delete(workflowRequestKey);
+      throw error;
+    });
+    return execution.promise;
+  });
+  ipcMain.handle('developer:workflow-cancel', (event, requestId) => {
+    assertTrustedCodingRendererSender(event);
+    const owner = ownedDeveloperSession(event);
+    if (typeof requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
+      throw new TypeError('Invalid Coding workflow request ID.');
+    }
+    const key = `${event.sender.id}:${requestId}`;
+    const execution = workflowExecutions.get(key);
+    if (!execution || execution.settled) return false;
+    if (execution.taskId) {
+      const task = developerAgent.cancelTask(execution.taskId, owner);
+      if (task.cancellationAccepted !== true) return false;
+    }
+    execution.cancelRequested = true;
+    return true;
   });
   ipcMain.handle('general:session', (event) => {
     registerGeneralRenderer(event);

@@ -47,6 +47,9 @@ CODING_COMPLETION_TOKENS = int(BACKEND_SETTINGS["codingCompletionTokens"])
 CODING_CONTEXT_BUDGET_TOKENS = int(
     _setting("AI_CODING_CONTEXT_BUDGET_TOKENS", BACKEND_SETTINGS["codingContextBudgetTokens"])
 )
+CODING_CONTEXT_FALLBACK_BUDGET_TOKENS = int(
+    _setting("AI_CODING_CONTEXT_FALLBACK_BUDGET_TOKENS", BACKEND_SETTINGS["codingContextFallbackBudgetTokens"])
+)
 CODING_PROVIDER_INPUT_LIMIT_TOKENS = int(
     _setting("AI_CODING_PROVIDER_INPUT_LIMIT_TOKENS", BACKEND_SETTINGS["codingProviderInputLimitTokens"])
 )
@@ -55,6 +58,8 @@ CODING_CONTEXT_BYTES_PER_TOKEN = int(BACKEND_SETTINGS["codingContextBytesPerToke
 CODING_CONTEXT_RETRY_RATIO = float(BACKEND_SETTINGS["codingContextRetryRatio"])
 if CODING_PROVIDER_INPUT_LIMIT_TOKENS < 0:
     raise RuntimeError("AI_CODING_PROVIDER_INPUT_LIMIT_TOKENS cannot be negative.")
+if CODING_CONTEXT_BUDGET_TOKENS < 512 or CODING_CONTEXT_FALLBACK_BUDGET_TOKENS < 512:
+    raise RuntimeError("Coding context token budgets must be at least 512 tokens.")
 if not 0 < CODING_CONTEXT_SAFETY_RATIO <= 0.8:
     raise RuntimeError("codingContextSafetyRatio must be greater than 0 and at most 0.8.")
 if not 1 <= CODING_CONTEXT_BYTES_PER_TOKEN <= 2:

@@ -331,8 +331,8 @@ interface Window {
       } | null;
       error: { code: string; message: string } | null;
     }>;
-    advanceDeveloperConversation: (update: { turnId: string; state: 'understanding' | 'completed' | 'failed' | 'cancelled'; phase?: string; fileCount?: number }) => Promise<{ turnId: string; state: string; updatedAt: string }>;
-    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null, scope?: string, conversationTurnId?: string | null, repairToken?: string | null) => Promise<{ id: string; proposalId?: string; manifestHash?: string | null; state: string; lifecycleState?: string; files: Array<{ operation: string; path: string; sourcePath: string | null; hash: string }>; attemptNumber?: number; maxAttempts?: number; attemptLabel?: string; repairAvailable?: boolean; autoRepairEnabled?: boolean; autoRepairAuthorized?: boolean; autoRepairBlockedReason?: string | null; reviewFlags?: string[]; verificationScripts?: string[]; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
+    advanceDeveloperConversation: (update: { turnId: string; state: 'understanding' | 'completed' | 'failed' | 'cancelled' | 'blocked'; phase?: string; fileCount?: number }) => Promise<{ turnId: string; state: string; updatedAt: string }>;
+    createDeveloperProposal: (raw: string, snapshots: Array<{ path: string; hash: string }>, verificationScript?: string | null, scope?: string, conversationTurnId?: string | null, repairToken?: string | null, handoffWorkflowRequestId?: string | null) => Promise<{ id: string; proposalId?: string; manifestHash?: string | null; state: string; lifecycleState?: string; files: Array<{ operation: string; path: string; sourcePath: string | null; hash: string }>; taskPlan?: { schemaVersion: number; status: string; workItems: Array<{ id: string; objective: string; status: string; dependsOn: string[]; requiredEvidence: string[]; verificationCriteria?: Array<{ id: string; type: 'FILE_SHA256'; path: string; sha256: string }>; verificationResult?: { status: string; reason: string; criteriaChecked: string[]; criteriaUnverified: string[] } }> } | null; attemptNumber?: number; maxAttempts?: number; attemptLabel?: string; repairAvailable?: boolean; autoRepairEnabled?: boolean; autoRepairAuthorized?: boolean; autoRepairBlockedReason?: string | null; reviewFlags?: string[]; verificationScripts?: string[]; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperVerificationRepairContext: (id: string) => Promise<{ repairToken: string; attemptNumber: number; maxAttempts: number; attemptLabel: string; check: string | null; classification: string; location: string | null; output: string }>;
     cancelDeveloperVerificationRepairChain: (id: string) => Promise<{ cancelled: boolean }>;
     approveDeveloperProposal: (id: string, options?: { autoRepair?: boolean }) => Promise<{ id: string; taskId?: string; state: string; lifecycleState?: string; autoRepairEnabled?: boolean; autoRepairReason?: string | null; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
@@ -387,6 +387,8 @@ interface Window {
     executeDeveloperWorkflow: (payload: {
       userRequest: string;
       scope?: string;
+      workflowRequestId?: string;
+      continuationToken?: string;
       autoRepairEnabled?: boolean;
       maxRepairAttempts?: number;
       tools?: Record<string, unknown> | null;
@@ -399,14 +401,57 @@ interface Window {
       codeApplied?: boolean;
       codeVerified?: boolean;
       verificationStatus?: string;
+      rollbackFailed?: boolean;
       error?: string;
       reason?: string;
       message?: string;
       requirements?: Record<string, unknown>;
+      findings?: Array<{
+        filePath: string;
+        symbol: string;
+        lines: string;
+        codeSnippet: string;
+        controlFlow: string;
+        expected: string;
+        observed: string;
+        classification: string;
+        isConfirmed: boolean;
+        evidenceType: string;
+      }>;
+      taskState?: {
+        objective: {
+          request: string;
+          scope: string;
+          acceptanceCriteria: string[];
+        };
+        status: string;
+        phase: string;
+        evidence: {
+          searches: Array<Record<string, unknown>>;
+          inspectedFiles: string[];
+          inspectionEvidence: Array<Record<string, unknown>>;
+          findings: Array<Record<string, unknown>>;
+        };
+        recoveries: Array<Record<string, unknown>>;
+        unresolvedQuestions: string[];
+        nextAction: Record<string, unknown> | null;
+      };
+      taskPlan?: {
+        schemaVersion: number;
+        status: string;
+        workItems: Array<{
+          id: string;
+          objective: string;
+          status: string;
+          dependsOn: string[];
+          requiredEvidence: string[];
+        }>;
+      };
       clarificationPrompt?: string;
       continuation?: Record<string, unknown>;
       worktreeAudit?: Record<string, unknown>;
     }>;
+    cancelDeveloperWorkflow?: (requestId: string) => Promise<boolean>;
     onDeveloperActivity?: (callback: (event: Record<string, unknown>) => void) => () => void;
     undoDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; evidence?: Array<{ kind: string; operation?: string; paths?: string[]; decision?: string; reason?: string; at?: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;

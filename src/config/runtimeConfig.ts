@@ -32,6 +32,11 @@ export const runtimeConfig = {
     pdfUploadTimeoutMs: configuredNumber(importMetaEnv.VITE_PDF_UPLOAD_TIMEOUT_MS, defaults.client.limits.pdfUploadTimeoutMs),
     transportConnectTimeoutMs: configuredNumber(importMetaEnv.VITE_TRANSPORT_CONNECT_TIMEOUT_MS, defaults.client.transport.connectTimeoutMs),
     transportRequestTimeoutMs: configuredNumber(importMetaEnv.VITE_TRANSPORT_REQUEST_TIMEOUT_MS, defaults.client.transport.requestTimeoutMs),
+    codingIdleTimeoutMs: configuredNumber(importMetaEnv.VITE_CODING_IDLE_TIMEOUT_MS, defaults.client.transport.codingIdleTimeoutMs),
+    codingMaxDurationMs: configuredNumber(importMetaEnv.VITE_CODING_MAX_DURATION_MS, defaults.client.transport.codingMaxDurationMs),
+    codingCancellationWaitMs: configuredNumber(importMetaEnv.VITE_CODING_CANCELLATION_WAIT_MS, defaults.client.transport.codingCancellationWaitMs),
+    codingModelTimeoutMs: configuredNumber(importMetaEnv.VITE_CODING_MODEL_TIMEOUT_MS, defaults.backend.modelRequestTimeoutSeconds * 1000),
+    codingToolTimeoutMs: configuredNumber(importMetaEnv.VITE_CODING_TOOL_TIMEOUT_MS, defaults.backend.codingToolWaitTimeoutSeconds * 1000),
   },
   audio: {
     systemSilenceMs: configuredNumber(importMetaEnv.VITE_SYSTEM_AUDIO_SILENCE_MS, defaults.client.audio.systemSilenceMs),

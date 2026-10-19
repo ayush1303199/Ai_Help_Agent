@@ -210,6 +210,85 @@ class ProviderContractTests(unittest.TestCase):
                             messages=oversized_messages,
                         )
 
+    def test_08_exhausted_daily_quota_is_not_retried_or_switched(self):
+        """Daily quota blocks later turns until an explicit recovery action clears it."""
+        mock_provider = MagicMock()
+        mock_provider.id = "test-provider-daily-quota"
+        mock_provider.type = "openai"
+        mock_provider.model = "gpt-4o-mini"
+        mock_provider.base_url = "https://api.openai.com/v1"
+
+        mock_registry = MagicMock()
+        mock_registry.get_active_provider.return_value = mock_provider
+        mock_registry.fallback_enabled = False
+        mock_registry.get_all_providers.return_value = [mock_provider]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = Exception(
+            "429: daily token quota exhausted; resets tomorrow"
+        )
+        provider_mod.clear_coding_provider_quota_block(mock_provider.id)
+        dummy_config = Path(__file__).resolve().parent / "dummy_config.json"
+        success_response = MagicMock()
+        success_response.choices = [MagicMock()]
+        success_response.choices[0].message.model_dump.return_value = {
+            "role": "assistant",
+            "content": "The provider is available again.",
+        }
+        try:
+            with patch("coding_provider.OpenAI", return_value=mock_client):
+                with patch("coding_provider._api_key", return_value="dummy-key"):
+                    with patch("coding_provider.provider_capability_states", return_value={"toolCalling": "SUPPORTED"}):
+                        with self.assertRaises(RuntimeError) as ctx:
+                            provider_mod.complete_coding_model(
+                                registry=mock_registry,
+                                config_path=dummy_config,
+                                messages=[{"role": "user", "content": "First conversation."}],
+                            )
+
+                        self.assertEqual(mock_client.chat.completions.create.call_count, 1)
+                        self.assertEqual(
+                            ctx.exception.provider_classification["category"],
+                            "PROVIDER_QUOTA_EXHAUSTED",
+                        )
+                        self.assertEqual(
+                            ctx.exception.provider_classification["providerId"],
+                            mock_provider.id,
+                        )
+
+                        with self.assertRaises(RuntimeError) as blocked:
+                            provider_mod.complete_coding_model(
+                                registry=mock_registry,
+                                config_path=dummy_config,
+                                messages=[{"role": "user", "content": "A separate conversation."}],
+                            )
+                        self.assertEqual(mock_client.chat.completions.create.call_count, 1)
+                        self.assertEqual(
+                            blocked.exception.provider_classification["category"],
+                            "PROVIDER_QUOTA_EXHAUSTED",
+                        )
+                        self.assertEqual(
+                            ws_mod.classify_provider_exception(blocked.exception)["category"],
+                            "PROVIDER_QUOTA_EXHAUSTED",
+                        )
+                        self.assertFalse(
+                            blocked.exception.provider_classification["retryable"]
+                        )
+
+                        mock_client.chat.completions.create.side_effect = [success_response]
+                        provider_mod.clear_coding_provider_quota_block(mock_provider.id)
+                        message, selected = provider_mod.complete_coding_model(
+                            registry=mock_registry,
+                            config_path=dummy_config,
+                            messages=[{"role": "user", "content": "Explicitly resumed conversation."}],
+                        )
+            self.assertEqual(message["content"], "The provider is available again.")
+            self.assertEqual(selected.id, mock_provider.id)
+            self.assertEqual(mock_client.chat.completions.create.call_count, 2)
+            mock_registry.get_eligible_providers.assert_not_called()
+        finally:
+            provider_mod.clear_coding_provider_quota_block(mock_provider.id)
+
     def test_08_live_benchmark_guard_stops_dispatch_when_prerequisites_absent(self):
         """Live benchmark mode guard must fail-closed and guarantee zero network dispatch when prerequisites are absent."""
         def check_live_benchmark_prerequisites(env: dict) -> tuple[bool, list[str]]:
@@ -450,14 +529,203 @@ class ProviderContractTests(unittest.TestCase):
         self.assertIn("- execute_query: failed", contradictory_res)
         self.assertIn("- inspect_table: failed", contradictory_res)
 
-        # 2. coding_provider empty content normalization fallback
-        raw_empty = {"role": "assistant", "content": "   "}
-        if not (raw_empty.get("content") or "").strip() and not raw_empty.get("tool_calls"):
-            raw_empty["content"] = (
-                "Investigation could not be completed: no authoritative response or verified evidence was received."
+        # 2. The production response validator rejects empty provider output.
+        with self.assertRaises(provider_mod.ModelOutputValidationError) as empty_error:
+            provider_mod.normalize_model_output(
+                {"role": "assistant", "content": "   "},
+                provider="test-provider",
+                model="test-model",
             )
-        self.assertNotIn("Completed investigation", raw_empty["content"])
-        self.assertIn("could not be completed", raw_empty["content"])
+        self.assertIn("empty assistant response", str(empty_error.exception))
+
+    def test_15_empty_finalization_retries_once_with_inspected_source(self):
+        """A blank final response retries with the actual prior read evidence, then returns the grounded answer."""
+        provider = MagicMock()
+        provider.id = "test-provider-empty-final"
+        provider.type = "openai"
+        provider.model = "gpt-4o-mini"
+        provider.base_url = "https://api.openai.com/v1"
+        provider.enabled = True
+
+        registry = MagicMock()
+        registry.get_active_provider.return_value = provider
+        registry.fallback_enabled = False
+
+        method_source = "\n".join([
+            "public function actionList() {",
+            "    $items = $this->loadItemsForCurrentUser();",
+            "    return $this->render('list', ['items' => $items]);",
+            "}",
+        ])
+        source_lines = [f"// surrounding file context {line}" for line in range(1, 1201)]
+        source_lines.extend(method_source.splitlines())
+        source_lines.append("public function actionListLegacy() { return $this->render('legacy'); }")
+        source_lines.extend(f"// trailing file context {line}" for line in range(1, 1201))
+        source = "\n".join(source_lines)
+        messages = [
+            {"role": "system", "content": "Analyze only the source evidence supplied in this conversation."},
+            {"role": "user", "content": "Explain the exact actionList method implementation in src/Controller.php."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "read-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "src/Controller.php"}),
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "read-1",
+                "name": "read_file",
+                "content": json.dumps({
+                    "ok": True,
+                    "data": {"path": "src/Controller.php", "content": source},
+                }),
+            },
+        ]
+        terms = ws_mod._provider_context_terms(messages)
+        serialized_read = ws_mod._serialize_coding_tool_result(
+            {"ok": True, "data": {"path": "src/Controller.php", "content": source}},
+            terms,
+        )
+        read_data = json.loads(serialized_read)["data"]
+        self.assertTrue(read_data["sourceContextTruncated"])
+        self.assertEqual(read_data["sourceLineCount"], len(source_lines))
+        self.assertIn(method_source, read_data["content"])
+        messages[-1]["content"] = serialized_read
+
+        def response(content):
+            result = MagicMock()
+            choice = MagicMock()
+            choice.message.model_dump.return_value = {"role": "assistant", "content": content}
+            result.choices = [choice]
+            return result
+
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [
+            response("  "),
+            response("The action renders the list view; the supplied source does not establish a defect."),
+        ]
+
+        with patch("coding_provider.OpenAI", return_value=client):
+            with patch("coding_provider._api_key", return_value="test-key"):
+                with patch("coding_provider.provider_capability_states", return_value={"toolCalling": "SUPPORTED"}):
+                    result, selected = provider_mod.complete_coding_model(
+                        registry=registry,
+                        config_path=Path(__file__).resolve().parent / "dummy_config.json",
+                        messages=messages,
+                        tools=None,
+                        request_id="empty-finalization",
+                        session_id="empty-finalization-session",
+                    )
+
+        self.assertEqual(selected.id, provider.id)
+        self.assertIn("does not establish a defect", result["content"])
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        retry_messages = client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        retry_tool_result = next(
+            message for message in retry_messages
+            if message.get("role") == "tool" and message.get("tool_call_id") == "read-1"
+        )
+        retry_data = json.loads(retry_tool_result["content"])["data"]
+        self.assertIn(method_source, retry_data["content"])
+        self.assertIn("actionListLegacy", retry_data["content"])
+        self.assertIn(
+            "previous finalization response was empty",
+            json.dumps(retry_messages, ensure_ascii=False),
+        )
+
+    def test_16_repeated_empty_finalization_is_rejected_and_remains_incomplete(self):
+        """Two empty final responses are reported as provider failure, never source-evidence success."""
+        provider = MagicMock()
+        provider.id = "test-provider-empty-final-failure"
+        provider.type = "openai"
+        provider.model = "gpt-4o-mini"
+        provider.base_url = "https://api.openai.com/v1"
+        provider.enabled = True
+
+        registry = MagicMock()
+        registry.get_active_provider.return_value = provider
+        registry.fallback_enabled = False
+
+        def empty_response():
+            result = MagicMock()
+            choice = MagicMock()
+            choice.message.model_dump.return_value = {"role": "assistant", "content": " "}
+            result.choices = [choice]
+            return result
+
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [empty_response(), empty_response()]
+        with patch("coding_provider.OpenAI", return_value=client):
+            with patch("coding_provider._api_key", return_value="test-key"):
+                with patch("coding_provider.provider_capability_states", return_value={"toolCalling": "SUPPORTED"}):
+                    with self.assertRaises(provider_mod.CodingProviderRequestError) as failure:
+                        provider_mod.complete_coding_model(
+                            registry=registry,
+                            config_path=Path(__file__).resolve().parent / "dummy_config.json",
+                            messages=[{"role": "user", "content": "Explain src/Controller.php"}],
+                            tools=None,
+                        )
+
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        classification = ws_mod.classify_provider_exception(failure.exception)
+        self.assertEqual(classification["category"], "PROVIDER_EMPTY_RESPONSE")
+        self.assertTrue(classification["retryable"])
+        self.assertIn("empty assistant response", str(failure.exception))
+        project_root = str(Path(__file__).resolve().parents[1])
+        self.assertIsNone(
+            ws_mod._provider_failure_evidence_fallback(
+                "Explain src/Controller.php",
+                {
+                    "projectRoot": project_root,
+                    "sourceEvidence": [{
+                        "projectRoot": project_root,
+                        "path": "src/Controller.php",
+                        "snippet": "public function actionList() { return $this->render('list'); }",
+                    }],
+                },
+                project_root,
+                classification,
+            )
+        )
+
+    def test_17_empty_finalization_retries_for_anthropic_and_gemini(self):
+        """Provider-specific adapters receive the same bounded evidence-preserving retry."""
+        messages = [{"role": "user", "content": "Explain the inspected source."}]
+        for provider_type, adapter_name in (
+            ("anthropic", "_anthropic_request"),
+            ("gemini", "_gemini_request"),
+        ):
+            with self.subTest(provider=provider_type):
+                provider = MagicMock()
+                provider.type = provider_type
+                provider.model = "test-model"
+                provider.base_url = "https://provider.invalid"
+                adapter = MagicMock(side_effect=[
+                    {"role": "assistant", "content": None},
+                    {"role": "assistant", "content": "Source-grounded response."},
+                ])
+                with patch(f"coding_provider.{adapter_name}", adapter):
+                    result = provider_mod._request_provider_completion(
+                        provider,
+                        "test-key",
+                        messages,
+                        tools=None,
+                        require_tool_call=False,
+                    )
+
+                self.assertEqual(result["content"], "Source-grounded response.")
+                self.assertEqual(adapter.call_count, 2)
+                retry_messages = adapter.call_args_list[1].args[2]
+                self.assertIn(
+                    "previous finalization response was empty",
+                    json.dumps(retry_messages, ensure_ascii=False),
+                )
 
     def test_12_end_to_end_conversation_compaction_security_preservation(self):
         """_compact_coding_conversation must preserve mandatory security instructions in the final compacted messages."""
@@ -525,7 +793,152 @@ class ProviderContractTests(unittest.TestCase):
         self.assertIn("retry this request", result.get("content", "").lower())
         self.assertEqual(client.chat.completions.create.call_count, 3)
 
+    def test_14_objective_relevance_uses_configured_provider_and_validates_citations(self):
+        """Relevance output is a cited hypothesis; the helper rejects malformed or unsupported evidence IDs."""
+        payload = {
+            "objective": {
+                "request": "Remove development-only output that terminates the response",
+                "scope": "src",
+                "acceptanceCriteria": ["Response reaches its caller."],
+            },
+            "findings": [
+                {
+                    "findingId": "finding-1",
+                    "filePath": "src/handler.py",
+                    "symbol": "handle_request",
+                    "lines": "12",
+                    "codeSnippet": "print(payload); raise SystemExit",
+                    "sourceEvidenceId": "source-1",
+                }
+            ],
+            "sourceEvidence": [
+                {
+                    "evidenceId": "source-1",
+                    "path": "src/handler.py",
+                    "excerpt": "12: print(payload); raise SystemExit",
+                }
+            ],
+        }
+        provider_response = {
+            "findings": [
+                {
+                    "findingId": "finding-1",
+                    "decision": "SUPPORTED",
+                    "relationship": "The cited statement terminates the handler before its response is returned.",
+                    "evidenceIds": ["source-1"],
+                    "contradictionEvidenceIds": [],
+                    "unresolvedAssumptions": [],
+                }
+            ]
+        }
+        mock_provider = MagicMock()
+        with patch(
+            "coding_websocket.complete_coding_model",
+            return_value=({"content": json.dumps(provider_response)}, mock_provider),
+        ) as complete_model:
+            result = ws_mod.assess_finding_objective_relevance(
+                MagicMock(),
+                Path("unused-config.json"),
+                payload,
+            )
+
+        self.assertEqual(result["findings"][0]["decision"], "SUPPORTED")
+        self.assertEqual(result["findings"][0]["evidenceIds"], ["source-1"])
+        self.assertEqual(
+            result["findings"][0]["provenance"],
+            "CONFIGURED_CODING_MODEL_HYPOTHESIS",
+        )
+        prompt = complete_model.call_args.args[2]
+        self.assertIn("Do not decide relevance from", prompt[0]["content"])
+        self.assertIn(payload["objective"]["request"], prompt[1]["content"])
+
+        provider_response["findings"][0]["evidenceIds"] = ["unknown-source"]
+        with patch(
+            "coding_websocket.complete_coding_model",
+            return_value=({"content": json.dumps(provider_response)}, mock_provider),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid or uncited relevance assessment"):
+                ws_mod.assess_finding_objective_relevance(
+                    MagicMock(),
+                    Path("unused-config.json"),
+                    payload,
+                )
+
+    def test_15_objective_relevance_rejects_missing_findings_and_invalid_contradictions(self):
+        """Every finding needs a decision, and contradiction decisions require cited counter-evidence."""
+        payload = {
+            "objective": {"request": "Preserve request processing behavior"},
+            "findings": [
+                {"findingId": "finding-a", "sourceEvidenceId": "source-a"},
+                {"findingId": "finding-b", "sourceEvidenceId": "source-b"},
+            ],
+            "sourceEvidence": [
+                {"evidenceId": "source-a", "path": "src/a.py", "excerpt": "evidence a"},
+                {"evidenceId": "source-b", "path": "src/b.py", "excerpt": "evidence b"},
+            ],
+        }
+        mock_provider = MagicMock()
+        incomplete = {"findings": [{
+            "findingId": "finding-a",
+            "decision": "UNRELATED",
+            "relationship": "Separate behavior.",
+            "evidenceIds": ["source-a"],
+            "contradictionEvidenceIds": [],
+            "unresolvedAssumptions": [],
+        }]}
+        with patch(
+            "coding_websocket.complete_coding_model",
+            return_value=({"content": json.dumps(incomplete)}, mock_provider),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "incomplete relevance assessment"):
+                ws_mod.assess_finding_objective_relevance(
+                    MagicMock(),
+                    Path("unused-config.json"),
+                    payload,
+                )
+
+        malformed_schema = {"findings": [
+            {
+                "findingId": finding_id,
+                "decision": "UNRELATED",
+                "relationship": "Separate behavior.",
+                "evidenceIds": [source_id],
+            }
+            for finding_id, source_id in (("finding-a", "source-a"), ("finding-b", "source-b"))
+        ]}
+        with patch(
+            "coding_websocket.complete_coding_model",
+            return_value=({"content": json.dumps(malformed_schema)}, mock_provider),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid or uncited relevance assessment"):
+                ws_mod.assess_finding_objective_relevance(
+                    MagicMock(),
+                    Path("unused-config.json"),
+                    payload,
+                )
+
+        contradicted = {"findings": [
+            {
+                "findingId": finding_id,
+                "decision": "CONTRADICTED",
+                "relationship": "The source contradicts the proposed relationship.",
+                "evidenceIds": [source_id],
+                "contradictionEvidenceIds": [],
+                "unresolvedAssumptions": [],
+            }
+            for finding_id, source_id in (("finding-a", "source-a"), ("finding-b", "source-b"))
+        ]}
+        with patch(
+            "coding_websocket.complete_coding_model",
+            return_value=({"content": json.dumps(contradicted)}, mock_provider),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "must cite contradictory source evidence"):
+                ws_mod.assess_finding_objective_relevance(
+                    MagicMock(),
+                    Path("unused-config.json"),
+                    payload,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
-

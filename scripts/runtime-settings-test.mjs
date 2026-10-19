@@ -17,6 +17,11 @@ for (const service of ['http', 'websocket', 'codingWebsocket']) {
 }
 assert.ok(Number.isInteger(settings.services.devServer.port));
 assert.ok(settings.client.transport.requestTimeoutMs > settings.backend.modelRequestTimeoutSeconds * 1000);
+assert.ok(settings.backend.codingContextBudgetTokens >= settings.backend.codingContextFallbackBudgetTokens);
+assert.ok(settings.backend.codingConversationChars >= settings.backend.codingMaxRequestChars);
+assert.ok(settings.developer.maxRequestChars >= settings.client.codingSession.maxTaskRequestChars);
+assert.ok(settings.developer.maxFileBytes > settings.developer.maxSearchFileBytes);
+assert.ok(settings.developer.investigationSearchTimeoutMs > 0);
 assert.equal(settings.client.audio.systemSilenceMs, 1800, 'Meeting voice should finalize speech promptly after a short pause');
 assert.equal(settings.client.audio.shortFragmentMaxWords, 2);
 assert.equal(settings.client.audio.shortFragmentMaxDurationMs, 5000);
@@ -29,7 +34,7 @@ assert.ok(backendBuild.includes('runtimeSettings.json'), 'PyInstaller must bundl
 
 const python = spawnSync(process.platform === 'win32' ? 'python' : 'python3', [
   '-c',
-  'import json,sys; sys.path.insert(0,"server/src"); import backend_config as c; print(json.dumps({"ports":[c.PORT,c.WS_PORT,c.CODING_WS_PORT],"max_tokens":c.MAX_TOKENS,"model_timeout":c.MODEL_REQUEST_TIMEOUT_SECONDS}))',
+  'import json,sys; sys.path.insert(0,"server/src"); import backend_config as c; print(json.dumps({"ports":[c.PORT,c.WS_PORT,c.CODING_WS_PORT],"max_tokens":c.MAX_TOKENS,"model_timeout":c.MODEL_REQUEST_TIMEOUT_SECONDS,"coding_context_budget":c.CODING_CONTEXT_BUDGET_TOKENS,"coding_context_fallback":c.CODING_CONTEXT_FALLBACK_BUDGET_TOKENS}))',
 ], {
   cwd: root,
   encoding: 'utf8',
@@ -44,5 +49,7 @@ assert.deepEqual(backend.ports, [
 ]);
 assert.equal(backend.max_tokens, 777, 'existing backend environment overrides must remain supported');
 assert.equal(backend.model_timeout, settings.backend.modelRequestTimeoutSeconds);
+assert.equal(backend.coding_context_budget, settings.backend.codingContextBudgetTokens);
+assert.equal(backend.coding_context_fallback, settings.backend.codingContextFallbackBudgetTokens);
 
 console.log('Runtime settings loading, packaging, and environment overrides passed.');

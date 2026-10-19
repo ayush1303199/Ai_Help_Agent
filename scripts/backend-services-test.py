@@ -93,6 +93,7 @@ from coding_websocket import (  # noqa: E402
     _file_creation_clarification_question,
     compute_next_best_action,
     _serialize_coding_tool_result,
+    _activity_event_payload,
     _compile_agent_task_context,
     _messages_for_active_coding_task,
     _resume_semantic_task,
@@ -403,7 +404,7 @@ class CodingProviderEvidenceFallbackTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_timeout_without_sufficient_evidence_stays_explicit_failure(self):
+    async def test_timeout_without_sufficient_evidence_stays_incomplete_for_recovery(self):
         with tempfile.TemporaryDirectory() as project_root:
             events, complete = await self._run_turn(
                 project_root,
@@ -415,7 +416,11 @@ class CodingProviderEvidenceFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(event.get("type") == "done" for event in events), events)
         error = next(event for event in events if event.get("type") == "error")
         self.assertEqual(error["category"], "LLM_PROVIDER_TIMEOUT")
-        self.assertEqual(error["agentTaskState"]["status"], "FAILED")
+        self.assertEqual(error["agentTaskState"]["status"], "INCOMPLETE")
+        self.assertEqual(
+            error["agentTaskState"]["providerRecovery"]["state"],
+            "WAITING_FOR_PROVIDER",
+        )
         self.assertEqual(complete.call_count, 1)
 
     async def test_non_provider_failure_does_not_use_evidence_fallback(self):
@@ -431,6 +436,35 @@ class CodingProviderEvidenceFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(event.get("type") == "done" for event in events), events)
         error = next(event for event in events if event.get("type") == "error")
         self.assertEqual(error["category"], "PROVIDER_TOOL_REJECTED")
+
+    async def test_empty_provider_response_keeps_inspected_task_incomplete(self):
+        with tempfile.TemporaryDirectory() as project_root:
+            failure = RuntimeError(
+                "The provider returned an empty assistant response after bounded retry; "
+                "no evidence-backed answer was produced."
+            )
+            failure.provider_classification = {
+                "classification": "PROVIDER_FAILURE",
+                "category": "PROVIDER_EMPTY_RESPONSE",
+                "retryable": True,
+                "isCodeDefect": False,
+                "suggestedAction": "RETRY_AFTER_PROVIDER_RESPONSE_FAILURE",
+            }
+            events, complete = await self._run_turn(
+                project_root,
+                "evidence-fallback-empty-provider-response",
+                "Explain src/logic.ts",
+                failure,
+                (project_root, "src/logic.ts", "export function compute() { return 42; }"),
+            )
+
+        self.assertFalse(any(event.get("type") == "done" for event in events), events)
+        error = next(event for event in events if event.get("type") == "error")
+        self.assertEqual(error["category"], "PROVIDER_EMPTY_RESPONSE")
+        self.assertTrue(error["retryable"])
+        self.assertEqual(error["agentTaskState"]["status"], "INCOMPLETE")
+        self.assertIn("empty final response", error["message"])
+        self.assertEqual(complete.call_count, 1)
 
     async def test_evidence_isolated_by_session_project_and_repository_path(self):
         with tempfile.TemporaryDirectory() as project_root:
@@ -523,6 +557,31 @@ class CodingProviderEvidenceFallbackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CodingActivityObserverTests(unittest.IsolatedAsyncioTestCase):
+    def test_read_activity_reports_when_provider_source_context_was_excerpted(self):
+        payload = _activity_event_payload(
+            {
+                "actionId": "task-1:turn-1:1:1",
+                "taskId": "task-1",
+                "tool": "read_file",
+                "target": "src/controller.php",
+            },
+            "request-1",
+            "session-1",
+            "COMPLETED",
+            result={
+                "ok": True,
+                "data": {
+                    "path": "src/controller.php",
+                    "content": "full source still read locally",
+                    "sourceContextTruncated": True,
+                    "sourceLineCount": 2400,
+                },
+            },
+        )
+
+        self.assertEqual(payload["result"]["lineCount"], 2400)
+        self.assertTrue(payload["result"]["sourceContextTruncated"])
+
     def _action(self, tool="search_code"):
         return {
             "actionId": "task-1:turn-1:1:1",
@@ -2608,7 +2667,9 @@ class CodingConversationBudgetTests(unittest.TestCase):
         parsed = json.loads(serialized)
         self.assertTrue(parsed["ok"])
         self.assertEqual(parsed["data"]["path"], "models/AdmOuPrgList.php")
-        self.assertIn("[Tool result truncated", parsed["data"]["content"])
+        self.assertIn("[File content compacted", parsed["data"]["content"])
+        self.assertTrue(parsed["data"]["sourceContextTruncated"])
+        self.assertEqual(parsed["data"]["sourceLineCount"], 1)
         self.assertTrue(_has_read_file_evidence([{
             "role": "tool",
             "name": "read_file",
@@ -7440,6 +7501,8 @@ class CodingDatabaseFastPathTests(unittest.IsolatedAsyncioTestCase):
                 question = first_done["content"]
                 self.assertEqual(first_done["intent"], "SOURCE_CHANGE")
                 self.assertEqual(first_done["status"], "NEEDS_CLARIFICATION")
+                self.assertFalse(first_done["proposalRequired"])
+                self.assertTrue(first_done["needsClarification"])
                 self.assertEqual(first_done["content"].count("?"), 1)
                 self.assertEqual(first_done["toolCalls"], [])
                 self.assertEqual(first_done["filesRead"], [])

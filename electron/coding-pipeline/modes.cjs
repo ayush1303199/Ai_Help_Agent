@@ -6,6 +6,7 @@
  */
 
 const OPERATING_MODES = Object.freeze({
+  AUDIT: 'AUDIT',
   ASK: 'ASK',
   INVESTIGATE: 'INVESTIGATE',
   PLAN: 'PLAN',
@@ -15,6 +16,17 @@ const OPERATING_MODES = Object.freeze({
 });
 
 const MODE_SPECIFICATIONS = Object.freeze({
+  AUDIT: {
+    mode: 'AUDIT',
+    description: 'Read-only repository audit & preservation inspection. Proposals, file writes, and Git mutations are strictly blocked.',
+    allowedLifecycleStates: ['queued', 'idle', 'reading', 'understanding', 'investigating', 'completed', 'cancelled'],
+    canProposeChanges: false,
+    canApplyChanges: false,
+    canExecuteVerification: false,
+    canMutateGit: false,
+    defaultComplexity: 'FAST',
+    maxToolBudget: 15,
+  },
   ASK: {
     mode: 'ASK',
     description: 'Answering questions, code explanations, and architecture inquiries with codebase context. Read-only.',
@@ -22,6 +34,7 @@ const MODE_SPECIFICATIONS = Object.freeze({
     canProposeChanges: false,
     canApplyChanges: false,
     canExecuteVerification: false,
+    canMutateGit: false,
     defaultComplexity: 'FAST',
     maxToolBudget: 5,
   },
@@ -32,6 +45,7 @@ const MODE_SPECIFICATIONS = Object.freeze({
     canProposeChanges: false,
     canApplyChanges: false,
     canExecuteVerification: true, // safe test run for repro
+    canMutateGit: false,
     defaultComplexity: 'DEEP',
     maxToolBudget: 25,
   },
@@ -42,6 +56,7 @@ const MODE_SPECIFICATIONS = Object.freeze({
     canProposeChanges: true, // generates plan artifact, not code patch
     canApplyChanges: false,
     canExecuteVerification: false,
+    canMutateGit: false,
     defaultComplexity: 'DEEP',
     maxToolBudget: 15,
   },
@@ -62,6 +77,7 @@ const MODE_SPECIFICATIONS = Object.freeze({
     canProposeChanges: false,
     canApplyChanges: false,
     canExecuteVerification: true,
+    canMutateGit: false,
     defaultComplexity: 'FAST',
     maxToolBudget: 10,
   },
@@ -116,29 +132,72 @@ function routeTaskMode({ goal = '', intent = '', userRequestedMode = null, expli
   if (userRequestedMode && OPERATING_MODES[userRequestedMode.toUpperCase()]) {
     resolvedMode = OPERATING_MODES[userRequestedMode.toUpperCase()];
   } else {
-    const text = `${goal} ${intent}`.toLowerCase();
-    if (text.includes('explain') || text.includes('how does') || text.includes('what is') || text.includes('where is')) {
+    const text = `${goal} ${intent}`.trim();
+    const textLower = text.toLowerCase();
+
+    // 1. Detect clear actionable requests first (e.g. "Fix the audit logging bug", "Implement an audit service", "Add tests for audit events")
+    const isActionDirective = /^(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:fix|repair|patch|implement|add|create|refactor|update|modify|change|remove|delete|write|build|resolve)\b/i.test(text);
+
+    // 2. Detect explicit read-only audit requests (e.g. "Perform a read-only audit", "Audit the repository without modifying files")
+    const isExplicitAudit = /^(?:run|perform|do|conduct|execute)\s+(?:an?\s+)?(?:read-only\s+|preservation\s+|security\s+)?audit\b/i.test(text)
+      || /\b(?:read-only|preservation)\s+audit\b/i.test(text)
+      || /\b(?:security|compliance)\s+audit\b/i.test(text)
+      || /^(?:audit|inspect)\s+(?:the\s+)?(?:codebase|repo|repository|project|worktree|modules?|controllers?|files?)\b/i.test(text)
+      || (/\b(?:audit|inspect)\b/i.test(text) && /\b(?:without\s+(?:modifying|changing|editing|writing|applying)|read-only|no\s+changes?)\b/i.test(text));
+
+    // 3. Detect conversational explanations and questions
+    const isQuestionOrExplanation = /^(?:what\s+(?:is|are|does|do|happens)|how\s+(?:does|do|can|is|are)|why\s+(?:is|does|do)|where\s+(?:is|can)|explain|describe|show\s+me|tell\s+me\s+about|help\s+me\s+understand)\b/i.test(text);
+
+    const isExplicitNoChange = /\b(?:do\s+not|don't|dont|never)\s+(?:(?:just|only|actually|any)\s+){0,2}(?:modify|change|edit|write|apply|implement|fix|repair|patch|add|create|refactor|update|remove|delete|touch)\b/i.test(text)
+      || /\bwithout\s+(?:(?:just|only|actually|any)\s+)?(?:modifying|changing|editing|writing|applying|implementing|fixing|repairing|patching|adding|creating|refactoring|updating|removing|deleting|touching)\b/i.test(text)
+      || /\b(?:do\s+not|don't|dont)\s+(?:want|need|expect)\s+(?:any\s+)?(?:code\s+)?(?:changes?|modifications?|edits?|patches?)\b/i.test(text)
+      || /\b(?:do\s+not|don't|dont|never)\s+(?:make|apply)\s+(?:any\s+)?(?:code\s+)?changes?(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text)
+      || /\bwithout\s+making\s+(?:any\s+)?(?:code\s+)?changes?(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text)
+      || /\bno\s+(?:(?:code|file|source)\s+)?(?:changes?|modifications?|edits?|writes?|patches?)(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text);
+    const hasInvestigationIntent = /\b(?:investigate|diagnose|find\s+(?:the\s+)?cause|root\s+cause|why|failing|fails|failed|broken|error|bug|bottleneck|performance)\b/i.test(text);
+    const hasVerificationIntent = /\b(?:test\s+only|verify\s+only|run\s+tests|check\s+build|verification)\b/i.test(text);
+    const hasPlanningIntent = /\b(?:plan|design|architect|roadmap)\b/i.test(text);
+
+    if (isExplicitNoChange) {
+      if (isExplicitAudit) {
+        resolvedMode = OPERATING_MODES.AUDIT;
+      } else if (isQuestionOrExplanation) {
+        resolvedMode = OPERATING_MODES.ASK;
+      } else if (hasInvestigationIntent) {
+        resolvedMode = OPERATING_MODES.INVESTIGATE;
+      } else if (hasVerificationIntent) {
+        resolvedMode = OPERATING_MODES.VERIFY;
+      } else if (hasPlanningIntent) {
+        resolvedMode = OPERATING_MODES.PLAN;
+      } else {
+        resolvedMode = OPERATING_MODES.ASK;
+      }
+    } else if (isActionDirective) {
+      resolvedMode = OPERATING_MODES.AUTONOMOUS;
+    } else if (isExplicitAudit) {
+      resolvedMode = OPERATING_MODES.AUDIT;
+    } else if (isQuestionOrExplanation) {
       resolvedMode = OPERATING_MODES.ASK;
     } else if (
-      text.includes('investigate') ||
-      text.includes('diagnose') ||
-      text.includes('find cause') ||
-      text.includes('why is') ||
-      text.includes('taking time') ||
-      text.includes('take time') ||
-      text.includes('slow') ||
-      text.includes('bottleneck') ||
-      text.includes('performance') ||
-      text.includes('measure') ||
-      text.includes('explain analyze') ||
-      text.includes('run explain')
+      textLower.includes('investigate') ||
+      textLower.includes('diagnose') ||
+      textLower.includes('find cause') ||
+      textLower.includes('why is') ||
+      textLower.includes('taking time') ||
+      textLower.includes('take time') ||
+      textLower.includes('slow') ||
+      textLower.includes('bottleneck') ||
+      textLower.includes('performance') ||
+      textLower.includes('measure') ||
+      textLower.includes('explain analyze') ||
+      textLower.includes('run explain')
     ) {
       resolvedMode = OPERATING_MODES.INVESTIGATE;
-    } else if (text.includes('plan') || text.includes('design') || text.includes('architect') || text.includes('roadmap')) {
+    } else if (textLower.includes('plan') || textLower.includes('design') || textLower.includes('architect') || textLower.includes('roadmap')) {
       resolvedMode = OPERATING_MODES.PLAN;
-    } else if (text.includes('test only') || text.includes('verify only') || text.includes('run tests') || text.includes('check build')) {
+    } else if (textLower.includes('test only') || textLower.includes('verify only') || textLower.includes('run tests') || textLower.includes('check build')) {
       resolvedMode = OPERATING_MODES.VERIFY;
-    } else if (text.includes('fix') || text.includes('implement') || text.includes('refactor') || text.includes('add feature')) {
+    } else if (/\b(?:fix|implement|refactor|add|create|update|patch|resolve)\b/i.test(textLower)) {
       resolvedMode = OPERATING_MODES.AUTONOMOUS;
     }
   }
@@ -167,6 +226,7 @@ function routeTaskMode({ goal = '', intent = '', userRequestedMode = null, expli
     canPropose: modeSpec.canProposeChanges,
     canApply: modeSpec.canApplyChanges,
     canVerify: modeSpec.canExecuteVerification,
+    canMutateGit: modeSpec.canMutateGit !== false,
   };
 }
 

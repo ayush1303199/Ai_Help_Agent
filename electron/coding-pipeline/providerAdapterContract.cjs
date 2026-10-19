@@ -20,6 +20,33 @@ const ISOLATION_CAPABILITIES = Object.freeze([
   'evidenceFreshnessIntegrityReplayProtection',
   'secureErasureEvidence',
 ]);
+const TRUSTED_SUPERVISOR_OPERATIONS = Object.freeze([
+  'issueExecutionGrant',
+  'consumeExecutionGrant',
+  'allocateWorker',
+  'observeWorkerReadiness',
+  'observeEffectiveIsolation',
+  'executeApprovedOperation',
+  'enforceDeadlineAndCancellation',
+  'collectHostEvidence',
+  'terminateWorker',
+  'verifyWorkerTerminationAndResourceRelease',
+  'persistLifecycleState',
+  'quarantineResource',
+  'resolveQuarantine',
+]);
+
+// This checks method shape only; it does not establish trust or authorize execution.
+function assertTrustedSupervisorInterface(supervisor) {
+  if (!supervisor || typeof supervisor !== 'object' || Array.isArray(supervisor)) {
+    throw new TypeError('Trusted supervisor interface must be an object.');
+  }
+  for (const operation of TRUSTED_SUPERVISOR_OPERATIONS) {
+    if (typeof supervisor[operation] !== 'function') {
+      throw new TypeError(`Trusted supervisor interface is missing required operation: ${operation}.`);
+    }
+  }
+}
 
 function createCapabilityStateMap(overrides = {}) {
   if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
@@ -155,7 +182,9 @@ function createHostObservedEvidenceCollector() {
 module.exports = {
   CAPABILITY_STATE_VALUES,
   ISOLATION_CAPABILITIES,
+  TRUSTED_SUPERVISOR_OPERATIONS,
   assertProviderAdapter,
+  assertTrustedSupervisorInterface,
   createCapabilityStateMap,
   createHostObservedEvidenceCollector,
   createProviderAdapter,

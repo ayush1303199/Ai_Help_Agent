@@ -12,8 +12,11 @@ const {
 const { runWindowsSandboxCommand } = require('./coding-pipeline/windowsSandboxRunner.cjs');
 
 const MAX_FILE_BYTES = developerSettings.maxFileBytes;
+const MAX_TARGETED_READ_LINES = 200;
+const MAX_SEARCH_FILE_BYTES = developerSettings.maxSearchFileBytes;
 const MAX_SEARCH_RESULTS = developerSettings.maxSearchResults;
 const MAX_SEARCH_FILES = developerSettings.maxSearchFiles;
+const MAX_SEARCH_DURATION_MS = developerSettings.investigationSearchTimeoutMs;
 const IGNORED_NAMES = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', 'logs', 'tmp', 'temp', '.dev-mode-audit.log']);
 function isIgnoredName(name) {
   const normalized = String(name || '').toLowerCase();
@@ -656,12 +659,35 @@ async function listDirectory(relativePath = '.', ownerWebContentsId) {
   return result;
 }
 
-async function readFile(relativePath, ownerWebContentsId) {
+async function readFile(relativePath, ownerWebContentsId, options = {}) {
   const { root, target } = await resolveProjectPath(relativePath, ownerWebContentsId);
   const stat = await fs.stat(target);
   if (!stat.isFile()) throw new Error('The requested path is not a file.');
   if (stat.size > MAX_FILE_BYTES) throw new Error(`File is too large to read (${Math.floor(MAX_FILE_BYTES / 1024)}KB limit).`);
-  const result = { path: relativePath, content: await fs.readFile(target, 'utf8') };
+  const content = await fs.readFile(target, 'utf8');
+  const lines = content.split(/\r?\n/);
+  const hasTargetedRange = options.startLine !== undefined || options.endLine !== undefined;
+  let resultContent = content;
+  let lineRange = { startLine: 1, endLine: lines.length, totalLines: lines.length, complete: true };
+  if (hasTargetedRange) {
+    const startLine = options.startLine === undefined ? 1 : options.startLine;
+    const endLine = options.endLine === undefined ? lines.length : options.endLine;
+    if (!Number.isInteger(startLine) || !Number.isInteger(endLine)
+      || startLine < 1 || endLine < startLine
+      || endLine - startLine + 1 > MAX_TARGETED_READ_LINES) {
+      throw new Error(`Targeted reads require a valid range of at most ${MAX_TARGETED_READ_LINES} lines.`);
+    }
+    if (startLine > lines.length) throw new Error('Targeted read starts beyond the end of the source file.');
+    const boundedEnd = Math.min(endLine, lines.length);
+    resultContent = lines.slice(startLine - 1, boundedEnd).join('\n');
+    lineRange = {
+      startLine,
+      endLine: boundedEnd,
+      totalLines: lines.length,
+      complete: startLine === 1 && boundedEnd === lines.length,
+    };
+  }
+  const result = { path: relativePath, content: resultContent, lineRange };
   await appendAudit(root, 'read_file', relativePath, 'success');
   return result;
 }
@@ -681,6 +707,12 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
   }
   const results = [];
   let filesVisited = 0;
+  const searchDeadline = Date.now() + Math.max(1000, Number(MAX_SEARCH_DURATION_MS) || 15000);
+  let timeBudgetExceeded = false;
+  const searchStopped = () => {
+    if (Date.now() >= searchDeadline) timeBudgetExceeded = true;
+    return timeBudgetExceeded || filesVisited >= MAX_SEARCH_FILES;
+  };
 
   const queryTokens = rawQuery
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
@@ -694,11 +726,11 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
   const foldedQueryText = normalizedQueryText.toLowerCase();
 
   async function walk(relativeDirectory) {
-    if (filesVisited >= MAX_SEARCH_FILES) return;
+    if (searchStopped()) return;
     const directory = await resolveProjectPath(relativeDirectory, ownerWebContentsId);
     const entries = await fs.readdir(directory.target, { withFileTypes: true });
     for (const entry of entries) {
-      if (filesVisited >= MAX_SEARCH_FILES) return;
+      if (searchStopped()) return;
       const childRelative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
       if (isIgnoredName(entry.name) || isSensitivePath(childRelative)) continue;
       if (LOW_VALUE_PATH_PATTERN.test(childRelative)) continue;
@@ -711,9 +743,6 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
       filesVisited += 1;
       const target = await resolveProjectPath(childRelative, ownerWebContentsId);
       const stat = await fs.stat(target.target);
-      if (stat.size > MAX_FILE_BYTES) continue;
-      const content = await fs.readFile(target.target, 'utf8');
-      const lines = content.split(/\r?\n/);
       const normalizedPath = childRelative.replace(/\\/g, '/').toLowerCase();
       const normalizedEntryName = entry.name.toLowerCase();
       const nameMatch = normalizedEntryName.includes(queryLower);
@@ -737,7 +766,11 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
         && normalizedPath.split('/').slice(0, -1).some((seg) => seg === queryTokens[0])
         && /(?:controller|service|handler|model|route|view|form|api|repo)/i.test(normalizedEntryName);
       const declarationPattern = /^\s*(?:(?:export|abstract|final|public|private|protected|static|async)\s+)*(?:class|interface|trait|enum|function|def)\s+[A-Za-z_$][\w$]*/i;
-      if (nameMatch || (queryTokens.length > 0 && filenameTerms === queryTokens.length) || multiTokenMatch || pathSegmentMatch) {
+      const filenameCandidate = nameMatch
+        || (queryTokens.length > 0 && filenameTerms === queryTokens.length)
+        || multiTokenMatch
+        || pathSegmentMatch;
+      if (filenameCandidate) {
         results.push({
           path: childRelative,
           line: 0,
@@ -750,6 +783,9 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
             + (rolePathMatch ? 24 : 0),
         });
       }
+      if (stat.size > MAX_SEARCH_FILE_BYTES) continue;
+      const content = await fs.readFile(target.target, 'utf8');
+      const lines = content.split(/\r?\n/);
       let matchingLines = 0;
       lines.forEach((line, lineIndex) => {
         if (matchingLines >= 3) return;
@@ -782,11 +818,11 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
   await walk(scope);
   if (results.length === 0 && queryTokens.length > 0) {
     async function addScopeFallback(relativeDirectory, depth = 0) {
-      if (depth > 6 || results.length >= 40) return;
+      if (depth > 6 || results.length >= 40 || searchStopped()) return;
       const directory = await resolveProjectPath(relativeDirectory, ownerWebContentsId);
       const entries = await fs.readdir(directory.target, { withFileTypes: true });
       for (const entry of entries) {
-        if (results.length >= 40 || isIgnoredName(entry.name) || isSensitivePath(entry.name)) continue;
+        if (results.length >= 40 || searchStopped() || isIgnoredName(entry.name) || isSensitivePath(entry.name)) continue;
         const childRelative = relativeDirectory === '.' ? entry.name : path.join(relativeDirectory, entry.name);
         if (LOW_VALUE_PATH_PATTERN.test(childRelative)) continue;
         if (entry.isDirectory()) {
@@ -823,7 +859,8 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
     scope,
     results: truncatedResults,
     filesVisited,
-    truncated: results.length > MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES,
+    truncated: results.length > MAX_SEARCH_RESULTS || filesVisited >= MAX_SEARCH_FILES || timeBudgetExceeded,
+    stopReason: timeBudgetExceeded ? 'TIME_BUDGET' : filesVisited >= MAX_SEARCH_FILES ? 'FILE_LIMIT' : null,
   };
   await appendAudit(root, 'search_code', `${scope}:${query}`, 'success');
   return result;

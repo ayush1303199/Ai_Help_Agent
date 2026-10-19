@@ -108,7 +108,7 @@ class TaskOrchestrator {
     sessionId,
     ownerWebContentsId = null,
     goal,
-    intent = 'BUG_INVESTIGATION',
+    intent = '',
     workspace = '',
     repository = '',
     project = '',

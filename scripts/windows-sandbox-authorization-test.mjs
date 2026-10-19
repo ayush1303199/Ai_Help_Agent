@@ -162,8 +162,8 @@ try {
   assert.ok(changedPhpGate >= 0 && changedPhpSpawn > changedPhpGate);
 
   const devServerStart = environmentSource.indexOf('async startDevServer(');
-  const devServerGate = environmentSource.indexOf("requireProjectProcessIsolation('Project dev server')", devServerStart);
-  const devServerSpawn = environmentSource.indexOf('spawn(shellCmd, shellArgs', devServerStart);
+  const devServerGate = environmentSource.indexOf("this._requireIsolation('Project dev server')", devServerStart);
+  const devServerSpawn = environmentSource.indexOf('this._spawnProcess(shellCmd, shellArgs', devServerStart);
   assert.ok(devServerStart >= 0 && devServerGate > devServerStart && devServerSpawn > devServerGate);
 
   const sandboxEntry = sandboxRunnerSource.indexOf('async function runWindowsSandboxCommand(');

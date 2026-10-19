@@ -10,11 +10,14 @@ import {
   upsertCodingActivity,
   classifyCodingRequestIntent,
   type CodingActivity,
+  type CodingProviderRecovery,
+  CodingTransportError,
   type CodingTransportResult,
 } from './codingTransport';
 import {
   codingPreferenceContext,
   compactCodingConversation,
+  compactCodingMessageContent,
   extractCodingPreference,
   readCodingConversationStates,
   readCodingPreferences,
@@ -112,17 +115,112 @@ interface CodingProposal {
   outcome?: string | null;
   error?: string | null;
   runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null;
+  handoffPlan?: WorkflowHandoffPlan;
+}
+
+interface WorkflowHandoffWorkItem {
+  id: string;
+  objective: string;
+  status: 'DELEGATED';
+  dependsOn: string[];
+  requiredEvidence: string[];
+  verificationCriteria?: Array<{
+    id: string;
+    type: 'FILE_SHA256';
+    path: string;
+    sha256: string;
+  }>;
+}
+
+interface WorkflowHandoffPlan {
+  schemaVersion: 2;
+  status: 'HANDED_OFF';
+  workItems: WorkflowHandoffWorkItem[];
+}
+
+function normalizeWorkflowVerificationCriteria(value: unknown): WorkflowHandoffWorkItem['verificationCriteria'] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) return null;
+  const ids = new Set<string>();
+  const criteria: NonNullable<WorkflowHandoffWorkItem['verificationCriteria']> = [];
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+    const criterion = candidate as Record<string, unknown>;
+    if (typeof criterion.id !== 'string'
+      || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(criterion.id)
+      || ids.has(criterion.id)
+      || criterion.type !== 'FILE_SHA256'
+      || typeof criterion.path !== 'string'
+      || !criterion.path.trim()
+      || /^[a-z]:\//i.test(criterion.path.trim().replace(/\\/g, '/'))
+      || criterion.path.replace(/\\/g, '/').split('/').some((segment) => segment === '..')
+      || typeof criterion.sha256 !== 'string'
+      || !/^[a-f0-9]{64}$/i.test(criterion.sha256)) {
+      return null;
+    }
+    ids.add(criterion.id);
+    criteria.push({
+      id: criterion.id,
+      type: 'FILE_SHA256',
+      path: criterion.path.trim().replace(/\\/g, '/').replace(/^\.\//, ''),
+      sha256: criterion.sha256.toLowerCase(),
+    });
+  }
+  return criteria;
+}
+
+function validateWorkflowHandoffPlan(value: unknown): WorkflowHandoffPlan | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const plan = value as Record<string, unknown>;
+  if (plan.schemaVersion !== 2 || plan.status !== 'HANDED_OFF'
+    || !Array.isArray(plan.workItems) || plan.workItems.length < 1 || plan.workItems.length > 12) {
+    return null;
+  }
+
+  const ids = new Set<string>();
+  const workItems: WorkflowHandoffWorkItem[] = [];
+  for (const candidate of plan.workItems) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+    const item = candidate as Record<string, unknown>;
+    const verificationCriteria = item.verificationCriteria === undefined
+      ? undefined
+      : normalizeWorkflowVerificationCriteria(item.verificationCriteria);
+    if (typeof item.id !== 'string' || !/^WI-\d{3}$/.test(item.id) || ids.has(item.id)
+      || typeof item.objective !== 'string' || !item.objective.trim()
+      || item.status !== 'DELEGATED'
+      || !Array.isArray(item.dependsOn) || !item.dependsOn.every((id) => typeof id === 'string')
+      || !Array.isArray(item.requiredEvidence) || item.requiredEvidence.length === 0
+      || !item.requiredEvidence.every((evidence) => typeof evidence === 'string' && evidence.trim())
+      || (item.verificationCriteria !== undefined && !verificationCriteria)) {
+      return null;
+    }
+    ids.add(item.id);
+    workItems.push({
+      id: item.id,
+      objective: item.objective.trim(),
+      status: 'DELEGATED',
+      dependsOn: [...item.dependsOn] as string[],
+      requiredEvidence: [...item.requiredEvidence] as string[],
+      ...(verificationCriteria ? { verificationCriteria } : {}),
+    });
+  }
+
+  const itemPositions = new Map(workItems.map((item, index) => [item.id, index]));
+  for (const [index, item] of workItems.entries()) {
+    if (item.dependsOn.some((dependency) => {
+      const dependencyPosition = itemPositions.get(dependency);
+      return dependencyPosition === undefined || dependencyPosition >= index || dependency === item.id;
+    })) {
+      return null;
+    }
+  }
+
+  return { schemaVersion: 2, status: 'HANDED_OFF', workItems };
 }
 
 interface CodingControllerOptions {
   maxContextChars: number;
   maxHistoryMessages: number;
   maxMessageChars: number;
-}
-
-function compactMessageContent(content: string, maxChars: number) {
-  if (content.length <= maxChars) return content;
-  return `${content.slice(0, maxChars)}\n[Earlier content omitted for speed]`;
 }
 
 export const PROJECT_NAME_BLACKLIST = new Set([
@@ -240,6 +338,7 @@ export function useCodingAgentController({
   const [messages, setMessages] = useState<CodingMessage[]>(() => savedConversation?.messages || []);
   const [activity, setActivity] = useState<CodingActivity[]>([]);
   const activeActivityExecutionRef = useRef<string | null>(null);
+  const activeWorkflowRequestRef = useRef<string | null>(null);
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [projectRoot, setProjectRoot] = useState<string | null>(null);
@@ -258,8 +357,12 @@ export function useCodingAgentController({
   const [autoRepairChoice, setAutoRepairChoice] = useState(false);
   const [autoRepairActive, setAutoRepairActive] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [workflowCanResume, setWorkflowCanResume] = useState(false);
+  const [providerRecovery, setProviderRecovery] = useState<CodingProviderRecovery | null>(null);
 
   const transportRef = useRef<CodingAgentTransport | null>(null);
+  const workflowContinuationRef = useRef<{ token: string; request: string } | null>(null);
+  const workflowExecutionInProgressRef = useRef(false);
   const repairRequestInProgressRef = useRef(false);
   const autoRepairActionRef = useRef('');
   const applyProposalRef = useRef<(targetProposal?: CodingProposal | null) => Promise<void>>(async () => {});
@@ -506,6 +609,8 @@ export function useCodingAgentController({
     overrideQuestion?: string,
     repairAttempt = 0,
     repairContext?: { repairToken: string; attemptNumber: number; maxAttempts: number; attemptLabel: string },
+    continuationToken?: string,
+    resumeProviderTask = false,
   ) => {
     const question = (overrideQuestion ?? input).trim();
     if (!question || streaming || busy) return;
@@ -622,9 +727,11 @@ export function useCodingAgentController({
 
 
     const classification = classifyCodingRequestIntent(question);
+    let implementationHandoffRequestId: string | null = null;
+    let implementationHandoffPlan: WorkflowHandoffPlan | null = null;
 
     // 1. If request is vague or missing requirements, provide clarification prompt without modifying files
-    if (classification.intent === 'CLARIFICATION_REQUIRED') {
+    if (!resumeProviderTask && classification.intent === 'CLARIFICATION_REQUIRED') {
       const clarificationText = classification.clarificationPrompt
         || 'Please provide additional task requirements or error details to proceed.';
       setMessages((previous) => [
@@ -637,13 +744,23 @@ export function useCodingAgentController({
     }
 
     // 2. If in desktop mode with electronAPI and the intent is an actionable coding task / investigation
-    if (!repairContext && classification.intent === 'AUTONOMOUS_WORKFLOW_TASK' && window.electronAPI?.executeDeveloperWorkflow) {
+    if (!resumeProviderTask
+      && !repairContext
+      && (continuationToken || classification.intent === 'AUTONOMOUS_WORKFLOW_TASK')
+      && window.electronAPI?.executeDeveloperWorkflow) {
+      if (workflowExecutionInProgressRef.current) return;
+      workflowExecutionInProgressRef.current = true;
+      if (!continuationToken) {
+        workflowContinuationRef.current = null;
+        setWorkflowCanResume(false);
+      }
       const requestId = crypto.randomUUID();
       const userMessage: CodingMessage = { role: 'user', content: question };
       const assistantMessage: CodingMessage = { role: 'assistant', content: '', streaming: true, requestId };
       setMessages((previous) => [...previous, userMessage, assistantMessage]);
       setInput('');
       activeActivityExecutionRef.current = requestId;
+      activeWorkflowRequestRef.current = requestId;
       setStreaming(true);
       setBusy(true);
 
@@ -658,18 +775,45 @@ export function useCodingAgentController({
         const result = await window.electronAPI.executeDeveloperWorkflow({
           userRequest: question,
           scope: currentScope,
+          workflowRequestId: requestId,
+          continuationToken,
           autoRepairEnabled: autoRepairChoice,
           maxRepairAttempts: 2,
         });
 
         let outcomeContent = '';
-        if (result.outcome === 'CLARIFICATION_REQUIRED') {
+        if (result.outcome === 'IMPLEMENTATION_REQUIRED') {
+          implementationHandoffPlan = validateWorkflowHandoffPlan(result.taskPlan);
+          if (implementationHandoffPlan) {
+            implementationHandoffRequestId = requestId;
+            onStatus('Continuing the original request and its validated work items through the standard Coding Agent proposal workflow.');
+          } else {
+            outcomeContent = 'The investigation requires implementation, but did not return a valid version-2 handoff plan. No standard proposal was started.';
+          }
+        } else if (result.outcome === 'CLARIFICATION_REQUIRED') {
           outcomeContent = result.clarificationPrompt || 'Clarification required to proceed with this task.';
         } else if (result.outcome === 'APPROVAL_REJECTED') {
           outcomeContent = 'The proposed patch was rejected by the user. No changes were applied.';
         } else if (result.outcome === 'NO_DEFECT_FOUND') {
           outcomeContent = result.message || 'No supported defect pattern was found in the source files inspected.';
+        } else if (result.outcome === 'INVESTIGATION_COMPLETED') {
+          const findings = Array.isArray(result.findings)
+            ? result.findings as Array<{ filePath?: string; symbol?: string; lines?: string; controlFlow?: string }>
+            : [];
+          const findingDetails = findings.map((finding) => {
+            const location = `${finding.filePath || 'source'}${finding.lines ? `:${finding.lines}` : ''}`;
+            return `- \`${location}\` — ${finding.symbol || 'supported finding'}${finding.controlFlow ? `: ${finding.controlFlow}` : ''}`;
+          }).join('\n');
+          outcomeContent = `${result.message || 'Read-only investigation completed.'}${findingDetails ? `\n\nFindings:\n${findingDetails}` : ''}`;
         } else if (result.outcome === 'INVESTIGATION_INCOMPLETE') {
+          const continuation = result.continuation as { status?: string; token?: string; nextStep?: { reason?: string } } | undefined;
+          if (continuation?.status === 'READY_TO_RESUME' && typeof continuation.token === 'string') {
+            workflowContinuationRef.current = { token: continuation.token, request: question };
+            setWorkflowCanResume(true);
+          } else {
+            workflowContinuationRef.current = null;
+            setWorkflowCanResume(false);
+          }
           const continuationDetail = result.continuation && typeof result.continuation === 'object' && (result.continuation as { nextStep?: { reason?: string } }).nextStep?.reason
             ? ` Next step: ${(result.continuation as { nextStep?: { reason?: string } }).nextStep?.reason}`
             : '';
@@ -686,23 +830,52 @@ export function useCodingAgentController({
               verification: 'PASS',
             },
           ]);
-        } else if (result.outcome === 'VERIFICATION_UNAVAILABLE') {
-          outcomeContent = 'Verification runner was unavailable or offline. All changes were rolled back to preserve the repository; completion cannot be verified.';
-        } else if (result.outcome === 'TEST_FAILED') {
-          outcomeContent = 'Verification checks failed after applying the proposed patch. All changes were automatically rolled back to preserve the repository.';
-        } else if (result.outcome === 'APPLY_FAILED') {
-          outcomeContent = `Applying the proposed patch failed: ${result.error || 'Apply error'}. Repository remains untouched.`;
+        } else if (result.outcome === 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED') {
+          outcomeContent = `${result.message || 'The approved proposal was applied and verification passed, but request completion could not be established from trusted item-specific evidence.'}\n\nThe task remains incomplete; review the applied files and resolve the outstanding work items:\n${result.filesModified.map((file: string) => `- \`${file}\``).join('\n')}`;
+          setAppliedPatchLog((previous) => [
+            ...previous,
+            {
+              proposalId: result.taskId || `task-${Date.now()}`,
+              state: 'blocked',
+              appliedAt: new Date().toISOString(),
+              files: result.filesModified,
+              verification: 'PASS',
+            },
+          ]);
+        } else if (['VERIFICATION_UNAVAILABLE', 'VERIFICATION_BLOCKED', 'TEST_FAILED', 'APPLY_FAILED'].includes(result.outcome)) {
+          const rollbackStatus = result.rollbackFailed
+            ? `Rollback could not be verified; changes may remain in: ${Array.isArray(result.filesModified) && result.filesModified.length
+              ? result.filesModified.join(', ')
+              : 'the approved target'}.`
+            : 'All changes were rolled back to preserve the repository.';
+          if (result.outcome === 'VERIFICATION_UNAVAILABLE') {
+            outcomeContent = `Verification runner was unavailable or offline. ${rollbackStatus} Completion cannot be verified.`;
+          } else if (result.outcome === 'VERIFICATION_BLOCKED') {
+            outcomeContent = `Verification was blocked (${result.verificationStatus || 'host evidence not established'}). ${rollbackStatus} Completion cannot be verified.`;
+          } else if (result.outcome === 'TEST_FAILED') {
+            outcomeContent = `Verification checks failed after applying the proposed patch. ${rollbackStatus}`;
+          } else {
+            outcomeContent = result.rollbackFailed
+              ? `Applying the proposed patch failed. ${rollbackStatus}`
+              : `Applying the proposed patch failed: ${result.error || 'Apply error'}. Repository remains untouched.`;
+          }
         } else if (result.outcome === 'CANCELLED') {
           outcomeContent = 'The workflow was cancelled.';
         } else {
           outcomeContent = `Workflow finished with status: ${result.outcome}.`;
         }
+        if (result.outcome !== 'INVESTIGATION_INCOMPLETE') {
+          workflowContinuationRef.current = null;
+          setWorkflowCanResume(false);
+        }
 
-        setMessages((previous) => previous.map((message) => message.requestId === requestId
-          ? { ...message, content: outcomeContent, streaming: false }
-          : message));
-        onStatus(`Workflow completed: ${result.outcome}`);
-        return;
+        if (implementationHandoffRequestId !== requestId) {
+          setMessages((previous) => previous.map((message) => message.requestId === requestId
+            ? { ...message, content: outcomeContent, streaming: false }
+            : message));
+          onStatus(`Workflow completed: ${result.outcome}`);
+          return;
+        }
       } catch (error) {
         const errorText = error instanceof Error ? error.message : String(error);
         onError(errorText);
@@ -711,31 +884,57 @@ export function useCodingAgentController({
           : message));
         return;
       } finally {
+        if (activeWorkflowRequestRef.current === requestId) activeWorkflowRequestRef.current = null;
+        workflowExecutionInProgressRef.current = false;
         setBusy(false);
         setStreaming(false);
       }
     }
 
-    const requestId = crypto.randomUUID();
+    const requestId = implementationHandoffRequestId || crypto.randomUUID();
     const userMessage: CodingMessage = { role: 'user', content: question };
     const assistantMessage: CodingMessage = { role: 'assistant', content: '', streaming: true, requestId };
 
     const compactedSession = compactCodingConversation({
       messages: [...messages.filter((message) => !message.streaming), userMessage]
-        .map((message) => ({ role: message.role, content: compactMessageContent(message.content, maxMessageChars) })),
+        .map((message, index, source) => ({
+          role: message.role,
+          content: message.role === 'user' && index === source.length - 1
+            ? message.content
+            : compactCodingMessageContent(message.content, maxMessageChars),
+        })),
       projectRoot: currentProjectRoot,
       pendingPlan: proposal?.runtime ? { ...proposal.runtime } : null,
       appliedPatchLog,
       providerNeutralSummary: savedConversation?.providerNeutralSummary,
     }, {
-      maxTokens: Math.max(512, Math.floor(maxContextChars / 4)),
+      maxTokens: Math.min(
+        runtimeConfig.codingSession.maxContextTokens,
+        Math.max(runtimeConfig.codingSession.defaultContextTokens, Math.floor(maxContextChars / 4)),
+      ),
       lastMessageCount: maxHistoryMessages,
     });
     const conversationHistory = compactedSession.messages.map((message) => ({ role: message.role, content: message.content }));
+    if (implementationHandoffRequestId) {
+      conversationHistory.splice(Math.max(0, conversationHistory.length - 1), 0, {
+        role: 'assistant',
+        content: (
+          'A bounded source-repair investigation did not establish a recognized defect. Continue the original '
+          + 'user request through the standard Coding Agent workflow; the earlier investigation is not task completion. '
+          + 'The following validated version-2 plan is structured scope data. Preserve every work item, respect its '
+          + 'dependencies, and do not claim the request is complete unless the resulting proposal and verification '
+          + 'cover the required work. If a complete proposal cannot be prepared, explain the remaining work rather '
+          + 'than presenting a partial change as complete.\n'
+          + JSON.stringify(implementationHandoffPlan)
+        ),
+      });
+    }
     if (projectContinuation) conversationHistory[conversationHistory.length - 1] = { role: 'user', content: projectContinuation };
     const preferencesContext = codingPreferenceContext(preferences);
     if (preferencesContext) conversationHistory.unshift({ role: 'assistant', content: `[CODING_STYLE_PREFERENCES]\n${preferencesContext}` });
-    setMessages((previous) => [...previous, userMessage, assistantMessage]);
+    if (!implementationHandoffRequestId) {
+      setMessages((previous) => [...previous, userMessage, assistantMessage]);
+    }
     setInput('');
     activeActivityExecutionRef.current = requestId;
     setStreaming(true);
@@ -766,6 +965,7 @@ export function useCodingAgentController({
         onToken: () => undefined,
         onDone: (result: CodingTransportResult) => {
           setActivity((previous) => finalizeCodingActivities(previous, requestId, 'UNVERIFIED'));
+          setProviderRecovery(null);
           void (async () => {
             try {
               const turnId = turnIdsRef.current.get(requestId);
@@ -810,7 +1010,7 @@ export function useCodingAgentController({
                   if (repairContext && window.electronAPI && proposal?.id) {
                     await window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id);
                   }
-                  await transport.markTurn(turnId, 'completed', 'no_changes', result.filesRead.length);
+                  await transport.markTurn(turnId, 'blocked', 'no_changes', result.filesRead.length);
                   setMessages((previous) => previous.map((message) => message.requestId === requestId
                     ? { ...message, content: 'I inspected the relevant project context, but could not identify a safe change to propose.', streaming: false }
                     : message));
@@ -821,7 +1021,7 @@ export function useCodingAgentController({
                   if (repairContext && window.electronAPI && proposal?.id) {
                     await window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id);
                   }
-                  await transport.markTurn(turnId, 'completed', 'proposal_format_fallback', result.filesRead.length);
+                  await transport.markTurn(turnId, 'blocked', 'proposal_format_fallback', result.filesRead.length);
                   setMessages((previous) => previous.map((message) => message.requestId === requestId
                     ? { ...message, content: createUnvalidatedSuggestion(result.content), streaming: false }
                     : message));
@@ -864,6 +1064,7 @@ export function useCodingAgentController({
                     path,
                     turnId,
                     repairContext?.repairToken || null,
+                    implementationHandoffPlan ? implementationHandoffRequestId : null,
                   )
                   : {
                       id: `proposal-${Date.now()}`,
@@ -880,7 +1081,14 @@ export function useCodingAgentController({
                       autoRepairBlockedReason: null,
                       reviewFlags: [],
                       runtime: null,
+                      taskPlan: null,
                     };
+                const registeredHandoffPlan = implementationHandoffPlan
+                  ? validateWorkflowHandoffPlan(registered.taskPlan)
+                  : null;
+                if (implementationHandoffPlan && !registeredHandoffPlan) {
+                  throw new Error('The proposal registration did not preserve its authorized implementation handoff plan.');
+                }
                 if (repairContext) {
                   setAutoRepairActive(registered.autoRepairAuthorized === true);
                   if (autoRepairActive && registered.autoRepairAuthorized !== true) {
@@ -935,21 +1143,45 @@ export function useCodingAgentController({
                   raw: result.content,
                   searchedFiles: result.filesRead.map((file) => file.path),
                   snapshots,
+                  handoffPlan: registeredHandoffPlan || undefined,
                   verification: null,
                   outcome: null,
                   error: null,
                   runtime: registered.runtime || null,
                 });
                 setMessages((previous) => previous.map((message) => message.requestId === requestId
-                  ? { ...message, content: `I inspected ${result.filesRead.length} file${result.filesRead.length === 1 ? '' : 's'} and prepared a proposal for your review. Nothing has been written.`, streaming: false }
+                  ? {
+                      ...message,
+                      content: `I inspected ${result.filesRead.length} file${result.filesRead.length === 1 ? '' : 's'} and prepared a proposal for your review. Nothing has been written.${implementationHandoffPlan
+                        ? `\n\nThe original request remains incomplete until every handed-off work item is covered by the approved proposal and verified. Generic test success alone does not prove item-specific objectives. Review all ${implementationHandoffPlan.workItems.length} work items and any machine-checkable criteria before approval:\n${implementationHandoffPlan.workItems.map((item) => `- ${item.id}: ${item.objective}${item.verificationCriteria?.length ? `\n  Host-checkable criteria: ${item.verificationCriteria.map((criterion) => `${criterion.id} (${criterion.type}: ${criterion.path} = ${criterion.sha256})`).join('; ')}` : '\n  Objective coverage: no supported machine-checkable criteria; completion will remain inconclusive.'}`).join('\n')}`
+                        : ''}`,
+                      streaming: false,
+                    }
                   : message));
               } else {
                 if (repairContext && window.electronAPI && proposal?.id) {
                   await window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id);
                 }
-                await transport.markTurn(turnId, 'completed', result.status || 'completed', result.filesRead.length);
+                const taskStatus = String(
+                  result.agentTaskState?.status || result.status || '',
+                ).toUpperCase();
+                const terminalState = ['COMPLETED', 'INVESTIGATION_COMPLETE'].includes(taskStatus)
+                  ? 'completed'
+                  : ['FAILED', 'ERROR', 'APPLY_FAILED', 'TEST_FAILED'].includes(taskStatus)
+                    ? 'failed'
+                    : 'blocked';
+                const nextActionReason = result.agentTaskState?.nextAction?.reason?.trim();
+                const incompleteDetail = terminalState === 'blocked'
+                  ? `\n\nTask remains incomplete${nextActionReason ? `: ${nextActionReason}` : '. Required evidence or input is still missing.'}`
+                  : '';
+                await transport.markTurn(turnId, terminalState, taskStatus || 'task_state_unverified', result.filesRead.length);
                 setMessages((previous) => previous.map((message) => message.requestId === requestId
-                  ? { ...message, content: result.content, streaming: false, performanceEvidence: result.performanceEvidence }
+                  ? {
+                      ...message,
+                      content: `${result.content}${incompleteDetail}`,
+                      streaming: false,
+                      performanceEvidence: result.performanceEvidence,
+                    }
                   : message));
               }
             } catch (error) {
@@ -969,6 +1201,9 @@ export function useCodingAgentController({
           })();
         },
         onError: (error) => {
+          if (error instanceof CodingTransportError && error.providerRecovery) {
+            setProviderRecovery(error.providerRecovery);
+          }
           if (repairContext && window.electronAPI && proposal?.id) {
             void window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id).catch(() => undefined);
           }
@@ -987,7 +1222,7 @@ export function useCodingAgentController({
         maxAttempts: repairContext.maxAttempts,
         label: repairContext.attemptLabel,
         repairToken: repairContext.repairToken,
-      } : null);
+      } : null, resumeProviderTask);
     } catch (error) {
       if (repairContext && window.electronAPI && proposal?.id) {
         await window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id).catch(() => undefined);
@@ -1561,6 +1796,9 @@ export function useCodingAgentController({
   const clearPreferences = () => setPreferences([]);
 
   const clearMessages = () => {
+    workflowContinuationRef.current = null;
+    setWorkflowCanResume(false);
+    setProviderRecovery(null);
     if (proposal?.repairAvailable && proposal.id && window.electronAPI) {
       void window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id).catch((error) => {
         onError(error instanceof Error ? error.message : String(error));
@@ -1587,6 +1825,17 @@ export function useCodingAgentController({
   };
 
   const cancelActiveRequest = () => {
+    const workflowRequestId = activeWorkflowRequestRef.current;
+    if (workflowRequestId && window.electronAPI?.cancelDeveloperWorkflow) {
+      void window.electronAPI.cancelDeveloperWorkflow(workflowRequestId).then((accepted) => {
+        onStatus(accepted
+          ? 'Cancellation requested for the autonomous workflow.'
+          : 'The autonomous workflow is already complete or cannot be cancelled.');
+      }).catch((error) => {
+        onError(error instanceof Error ? error.message : String(error));
+      });
+      return;
+    }
     const requestId = activeActivityExecutionRef.current;
     if (!requestId || !transportRef.current?.cancel(requestId)) {
       onError('The active Coding request could not be cancelled because its transport is unavailable.');
@@ -1620,6 +1869,9 @@ export function useCodingAgentController({
     appliedPatchLog?: CodingPatchRecord[];
     lastUsedProvider?: { id?: string; label?: string; model?: string; changedAt?: string } | null;
   }) => {
+    workflowContinuationRef.current = null;
+    setWorkflowCanResume(false);
+    setProviderRecovery(null);
     const restored = session.messages.map((message) => ({ ...message, streaming: false }));
     setMessages(restored);
     setConversationId(session.id.replace(/^coding-/, '').split('-turn-')[0] || crypto.randomUUID());
@@ -1716,6 +1968,22 @@ export function useCodingAgentController({
     void options;
     return sendMessage(userRequest);
   };
+  const continueWorkflow = () => {
+    const continuation = workflowContinuationRef.current;
+    if (!continuation || busy || streaming) return;
+    void sendMessage(continuation.request, 0, undefined, continuation.token);
+  };
+  const continueAfterProviderRecovery = () => {
+    if (!providerRecovery || busy || streaming) return;
+    setProviderRecovery(null);
+    void sendMessage(
+      'Continue the saved task using its original objective and confirmed evidence.',
+      0,
+      undefined,
+      undefined,
+      true,
+    );
+  };
 
   return {
     workspace: {
@@ -1724,6 +1992,9 @@ export function useCodingAgentController({
       onAttachProjectByPath: (targetPath: string) => void attachProjectByPath(targetPath),
       directory, path, filePath, fileContent, searchQuery, searchResults,
       proposal, autoRepairChoice, activity, busy, streaming, errorMessage, statusMessage, taskStatus,
+      workflowCanResume,
+      providerRecovery,
+      onResumeProviderTask: continueAfterProviderRecovery,
       onPauseTask: () => void pauseTask(), onResumeTask: (phase?: string) => void resumeTask(phase),
       onSteerTask: (dir: string) => void steerTask(dir),
       onSetTaskMode: (mode: string, complexity?: string) => void setTaskMode(mode, complexity),
@@ -1740,7 +2011,8 @@ export function useCodingAgentController({
       onCancelRequest: cancelActiveRequest,
       onSendMessage: () => void sendMessage(), onClearMessages: clearMessages,
       onExecuteWorkflow: (userRequest: string, options?: { autoRepairEnabled?: boolean; maxRepairAttempts?: number }) => executeWorkflow(userRequest, options),
-      conversations: conversationStates, activeConversationId: conversationId,
+      onContinueWorkflow: continueWorkflow,
+      conversations: conversationStates, activeConversationId: conversationId, appliedPatchLog,
       onRestoreConversation: restoreHistory, onDeleteConversation: deleteConversation,
       codingPreferences: preferences, onToggleCodingPreference: togglePreference,
       onResetCodingPreferences: clearPreferences,

@@ -70,6 +70,7 @@ const scripts = [
   'developer-agent-test.mjs',
   'developer-project-discovery-test.mjs',
   'coding-investigation-workflow-test.mjs',
+  'work-item-verification-contract-test.mjs',
   'coding-autonomous-workflow-integration-test.mjs',
   'coding-investigation-entrypoint-test.py',
   'coding-investigation-budget-test.py',

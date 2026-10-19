@@ -52,6 +52,43 @@ const SIMULATED_OR_UNTRUSTED_SOURCES = new Set([
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_EXECUTION_GRANT_TTL_MS = 5 * 60 * 1000;
+const EXECUTION_GRANT_FIELDS = Object.freeze([
+  'grantId',
+  'requestDigest',
+  'taskId',
+  'proposalId',
+  'projectIdentityDigest',
+  'canonicalRootDigest',
+  'approvedSnapshotDigest',
+  'approvedManifestDigest',
+  'verificationPlanDigest',
+  'operationDigest',
+  'policyRevision',
+  'configRevision',
+  'runId',
+  'nonce',
+  'issuedAt',
+  'expiresAt',
+  'issuerId',
+  'singleUse',
+  'consumedAt',
+]);
+const EXECUTION_GRANT_BINDINGS = Object.freeze([
+  'requestDigest',
+  'taskId',
+  'proposalId',
+  'projectIdentityDigest',
+  'canonicalRootDigest',
+  'approvedSnapshotDigest',
+  'approvedManifestDigest',
+  'verificationPlanDigest',
+  'operationDigest',
+  'policyRevision',
+  'configRevision',
+  'runId',
+  'issuerId',
+]);
 
 function normalizeSourceName(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
@@ -97,6 +134,92 @@ function makeDecision(state, reasonCode, reason, extra = {}) {
     invalidationReason: reason,
     ...extra,
   });
+}
+
+function validateExecutionGrantStructure(grant, expectedContext = {}) {
+  if (!grant || typeof grant !== 'object' || Array.isArray(grant)) {
+    return makeDecision('BLOCKED', 'GRANT_MISSING', 'Execution grant is missing or malformed.');
+  }
+  const unknownFields = Object.keys(grant).filter((field) => !EXECUTION_GRANT_FIELDS.includes(field));
+  if (unknownFields.length) {
+    return makeDecision('BLOCKED', 'GRANT_FIELDS_UNSUPPORTED', `Execution grant contains unsupported fields: ${unknownFields.join(', ')}.`);
+  }
+  for (const field of EXECUTION_GRANT_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(grant, field)) {
+      return makeDecision('BLOCKED', 'GRANT_FIELD_MISSING', `Execution grant is missing required field: ${field}.`, { fieldName: field });
+    }
+  }
+  for (const field of EXECUTION_GRANT_FIELDS.filter((name) => !['singleUse', 'consumedAt'].includes(name))) {
+    if (typeof grant[field] !== 'string' || !grant[field].trim()) {
+      return makeDecision('BLOCKED', 'GRANT_FIELD_INVALID', `Execution grant field '${field}' must be a non-empty string.`, { fieldName: field });
+    }
+  }
+  const digestFields = [
+    'requestDigest',
+    'projectIdentityDigest',
+    'canonicalRootDigest',
+    'approvedSnapshotDigest',
+    'approvedManifestDigest',
+    'verificationPlanDigest',
+    'operationDigest',
+  ];
+  for (const field of digestFields) {
+    if (!/^[a-f0-9]{64}$/i.test(grant[field])) {
+      return makeDecision('BLOCKED', 'GRANT_DIGEST_INVALID', `Execution grant field '${field}' must be a SHA-256 digest.`, { fieldName: field });
+    }
+  }
+  const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+  for (const field of ['grantId', 'runId', 'nonce']) {
+    if (!uuidPattern.test(grant[field])) {
+      return makeDecision('BLOCKED', 'GRANT_IDENTIFIER_INVALID', `Execution grant field '${field}' must be a UUID v4.`, { fieldName: field });
+    }
+  }
+  if (grant.grantId === grant.runId || grant.grantId === grant.nonce || grant.runId === grant.nonce
+    || grant.runId === grant.taskId) {
+    return makeDecision('BLOCKED', 'GRANT_IDENTIFIER_NOT_UNIQUE', 'Grant, nonce, run, and task identifiers must be distinct; runId must not reuse taskId.');
+  }
+  if (grant.singleUse !== true) {
+    return makeDecision('BLOCKED', 'GRANT_NOT_SINGLE_USE', 'Execution grant must be explicitly single-use.');
+  }
+  if (grant.consumedAt !== null) {
+    return makeDecision('BLOCKED', 'GRANT_ALREADY_CONSUMED', 'Execution grant has already been consumed.');
+  }
+
+  let issuedAt;
+  let expiresAt;
+  try {
+    issuedAt = parseTimestamp(grant.issuedAt, 'issuedAt');
+    expiresAt = parseTimestamp(grant.expiresAt, 'expiresAt');
+  } catch (error) {
+    return makeDecision('BLOCKED', 'GRANT_TIMESTAMP_INVALID', error.message);
+  }
+  const currentTime = Date.now();
+  if (issuedAt > currentTime || expiresAt <= issuedAt
+    || expiresAt - issuedAt > MAX_EXECUTION_GRANT_TTL_MS) {
+    return makeDecision('BLOCKED', 'GRANT_TIMESTAMP_INVALID', 'Execution grant timestamps are future-dated, contradictory, or exceed the maximum lifetime.');
+  }
+  if (expiresAt <= currentTime) {
+    return makeDecision('BLOCKED', 'GRANT_EXPIRED', 'Execution grant has expired.');
+  }
+
+  if (expectedContext.approvalConsumed !== true || expectedContext.snapshotValidated !== true) {
+    return makeDecision('BLOCKED', 'GRANT_PRECONDITIONS_NOT_MET', 'Proposal approval must be consumed and the approved project snapshot revalidated before a grant can be considered.');
+  }
+  for (const field of EXECUTION_GRANT_BINDINGS) {
+    if (typeof expectedContext[field] !== 'string' || !expectedContext[field].trim()) {
+      return makeDecision('BLOCKED', 'GRANT_BINDING_CONTEXT_MISSING', `Trusted grant binding context is missing '${field}'.`, { fieldName: field });
+    }
+    if (grant[field] !== expectedContext[field]) {
+      return makeDecision('BLOCKED', 'GRANT_BINDING_MISMATCH', `Execution grant does not match the expected '${field}'.`, { fieldName: field });
+    }
+  }
+
+  return makeDecision(
+    'NOT_ESTABLISHED',
+    'SUPERVISOR_ISSUER_NOT_ESTABLISHED',
+    'Execution grant structure and bindings are valid, but no trusted supervisor issuer, durable single-use ledger, or host isolation evidence verifier is connected. This result cannot authorize execution.',
+    { grantId: grant.grantId, runId: grant.runId },
+  );
 }
 
 function parseTimestamp(value, fieldName) {
@@ -400,6 +523,9 @@ function evaluateProviderEligibility(capabilities, evidenceState) {
 module.exports = {
   DEFAULT_TIMEOUT_MS,
   EVIDENCE_STATES,
+  EXECUTION_GRANT_BINDINGS,
+  EXECUTION_GRANT_FIELDS,
+  MAX_EXECUTION_GRANT_TTL_MS,
   MAX_TIMEOUT_MS,
   MANDATORY_CAPABILITIES,
   REQUIRED_EVIDENCE_FIELDS,
@@ -409,5 +535,6 @@ module.exports = {
   evaluateProviderEligibility,
   evaluateResultEnvelope,
   normalizeTimeoutMs,
+  validateExecutionGrantStructure,
   validateExecutionEvidenceManifest,
 };

@@ -32,6 +32,21 @@ try {
   const file = path.join(root, 'sample.txt');
   await fs.writeFile(file, 'one\ntwo\n', 'utf8');
 
+  const blockedTurn = agent.beginConversationTurn({
+    root,
+    request: 'Inspect the project and report remaining evidence needs.',
+    ...owner,
+  });
+  agent.advanceConversationTurn(blockedTurn.turnId, 'understanding', owner);
+  const blockedResult = agent.advanceConversationTurn(
+    blockedTurn.turnId,
+    'blocked',
+    owner,
+    { phase: 'INVESTIGATION_INCOMPLETE' },
+  );
+  assert.equal(blockedResult.state, 'blocked');
+  assert.equal(agent.getConversationTurn(blockedTurn.turnId, owner).state, 'blocked');
+
   const proposal = await createBoundProposal({
     root, sessionId, ownerWebContentsId,
     raw: patch('sample.txt', 'one', 'three'),

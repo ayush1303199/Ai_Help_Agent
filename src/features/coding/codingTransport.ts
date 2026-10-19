@@ -27,6 +27,16 @@ export function latestCodingUserRequest(messages: Array<{ role: 'user' | 'assist
   return '';
 }
 
+export function adaptiveCodingIdleTimeoutMs(
+  configuredIdleTimeoutMs: number,
+  operationTimeoutMs: number,
+) {
+  return Math.min(
+    Math.max(1000, configuredIdleTimeoutMs),
+    Math.max(1000, operationTimeoutMs + 10000),
+  );
+}
+
 export interface CodingReadFile {
   path: string;
   content: string;
@@ -37,6 +47,15 @@ export interface CodingTransportResult {
   content: string;
   proposalRequired: boolean;
   status?: string;
+  agentTaskState?: {
+    status?: string;
+    originalRequest?: string;
+    nextAction?: {
+      tool?: string;
+      reason?: string;
+      expectedEvidence?: string[];
+    } | null;
+  } | null;
   readOnly?: boolean;
   writeRequired?: boolean;
   applyRequired?: boolean;
@@ -54,6 +73,38 @@ export interface CodingTransportResult {
   configuredProviderId?: string | null;
   fallback?: boolean;
   verificationAttempt?: { attemptNumber: number; maxAttempts: number; label: string } | null;
+}
+
+export interface CodingProviderRecovery {
+  state: string;
+  classification: string;
+  retryable: boolean;
+  suggestedAction?: string;
+  retryAfterSeconds?: number;
+}
+
+export class CodingTransportError extends Error {
+  classification?: string;
+  category?: string;
+  retryable?: boolean;
+  suggestedAction?: string;
+  providerRecovery?: CodingProviderRecovery;
+
+  constructor(message: string, details: {
+    classification?: string;
+    category?: string;
+    retryable?: boolean;
+    suggestedAction?: string;
+    providerRecovery?: CodingProviderRecovery;
+  }) {
+    super(message);
+    this.name = 'CodingTransportError';
+    this.classification = details.classification;
+    this.category = details.category;
+    this.retryable = details.retryable;
+    this.suggestedAction = details.suggestedAction;
+    this.providerRecovery = details.providerRecovery;
+  }
 }
 
 export type CodingMutationNotification =
@@ -74,12 +125,19 @@ interface CodingRequestState {
   requestId: string;
   turnId: string;
   scope: string;
+  projectRoot: string;
   handlers: CodingHandlers;
   chunks: string[];
   filesRead: Map<string, string>;
   filesSearched: Set<string>;
   toolCalls: CodingTransportResult['toolCalls'];
   activityCount: number;
+  idleTimer: number | null;
+  maxDurationTimer: number | null;
+  cancellationTimer: number | null;
+  cancellationRequested: boolean;
+  cancellationReported: boolean;
+  operation: 'model' | 'tool';
 }
 
 const CODING_WS_URL = runtimeConfig.codingWsUrl;
@@ -113,6 +171,7 @@ export class CodingAgentTransport {
   private socket: WebSocket | null = null;
   private connecting: Promise<WebSocket> | null = null;
   private readonly requests = new Map<string, CodingRequestState>();
+  private readonly requestReservations = new Set<string>();
 
   async send(
     requestId: string,
@@ -122,10 +181,20 @@ export class CodingAgentTransport {
     handlers: CodingHandlers,
     conversationId?: string,
     verificationAttempt?: { attemptNumber: number; maxAttempts: number; label: string; repairToken?: string } | null,
+    resumeProviderTask = false,
   ): Promise<string> {
     const request = latestCodingUserRequest(messages);
     if (!request.trim()) throw new Error('The current Coding Agent request is missing. Please send it again.');
-    const socket = await this.connect();
+    if (this.requests.has(requestId) || this.requestReservations.has(requestId)) {
+      throw new Error('This Coding request ID is already active; duplicate execution was prevented.');
+    }
+    if ([...this.requests.values()].some((active) => (
+      active.projectRoot === projectRoot && active.cancellationRequested
+    ))) {
+      throw new Error('A previous Coding request for this project has unconfirmed cancellation. Wait for its final status before retrying.');
+    }
+    this.requestReservations.add(requestId);
+    let socket: WebSocket;
     let turnId = `browser-turn-${requestId.slice(0, 8)}`;
     let sessionId = conversationId
       ? (conversationId.startsWith('coding-session-') ? conversationId : `coding-session-${conversationId}`)
@@ -133,54 +202,80 @@ export class CodingAgentTransport {
     let currentProjectRoot = projectRoot;
     let currentScope = scope || '.';
 
-    if (window.electronAPI) {
-      const turn = await window.electronAPI.beginDeveloperConversation(request, scope, verificationAttempt?.repairToken || null);
-      turnId = turn.turnId;
-      sessionId = turn.sessionId || sessionId;
-      currentProjectRoot = turn.projectRoot;
-      currentScope = turn.scope;
-      handlers.onStart(turn.turnId, turn.projectRoot, turn.scope);
-      await window.electronAPI.advanceDeveloperConversation({
-        turnId: turn.turnId,
-        state: 'understanding',
-        phase: 'understanding',
-      });
-    } else {
-      handlers.onStart(turnId, currentProjectRoot, currentScope);
+    try {
+      socket = await this.connect();
+      if (window.electronAPI) {
+        const turn = await window.electronAPI.beginDeveloperConversation(request, scope, verificationAttempt?.repairToken || null);
+        turnId = turn.turnId;
+        sessionId = turn.sessionId || sessionId;
+        currentProjectRoot = turn.projectRoot;
+        currentScope = turn.scope;
+        handlers.onStart(turn.turnId, turn.projectRoot, turn.scope);
+        await window.electronAPI.advanceDeveloperConversation({
+          turnId: turn.turnId,
+          state: 'understanding',
+          phase: 'understanding',
+        });
+      } else {
+        handlers.onStart(turnId, currentProjectRoot, currentScope);
+      }
+    } finally {
+      this.requestReservations.delete(requestId);
     }
 
+    if (socket.readyState !== WebSocket.OPEN) {
+      throw new Error('The Coding Agent connection closed before the request could be sent.');
+    }
     this.requests.set(requestId, {
       requestId,
       turnId,
       scope: currentScope,
+      projectRoot: currentProjectRoot,
       handlers,
       chunks: [],
       filesRead: new Map(),
       filesSearched: new Set(),
       toolCalls: [],
       activityCount: 0,
+      idleTimer: null,
+      maxDurationTimer: null,
+      cancellationTimer: null,
+      cancellationRequested: false,
+      cancellationReported: false,
+      operation: 'model',
     });
-    socket.send(JSON.stringify({
-      type: 'chat',
-      requestId,
-      sessionId,
-      conversationId: conversationId || sessionId,
-      turnId,
-      projectRoot: currentProjectRoot,
-      scope: currentScope,
-      messages,
-      verificationAttempt: verificationAttempt
-        ? {
-            attemptNumber: verificationAttempt.attemptNumber,
-            maxAttempts: verificationAttempt.maxAttempts,
-            label: verificationAttempt.label,
-          }
-        : undefined,
-    }));
+    this.armRequestDeadlines(this.requests.get(requestId)!);
+    try {
+      socket.send(JSON.stringify({
+        type: 'chat',
+        requestId,
+        sessionId,
+        conversationId: conversationId || sessionId,
+        turnId,
+        projectRoot: currentProjectRoot,
+        scope: currentScope,
+        messages,
+        verificationAttempt: verificationAttempt
+          ? {
+              attemptNumber: verificationAttempt.attemptNumber,
+              maxAttempts: verificationAttempt.maxAttempts,
+              label: verificationAttempt.label,
+            }
+          : undefined,
+        resumeProviderTask: resumeProviderTask || undefined,
+      }));
+    } catch (error) {
+      const pending = this.requests.get(requestId);
+      if (pending) {
+        this.requests.delete(requestId);
+        this.clearRequestTimers(pending);
+      }
+      throw error;
+    }
     return turnId;
   }
 
-  async markTurn(turnId: string, state: 'completed' | 'failed' | 'cancelled', phase?: string, fileCount?: number) {
+  async markTurn(turnId: string, state: 'completed' | 'failed' | 'cancelled' | 'blocked', phase?: string, fileCount?: number) {
     if (window.electronAPI) {
       return window.electronAPI.advanceDeveloperConversation({ turnId, state, phase, fileCount });
     }
@@ -199,12 +294,18 @@ export class CodingAgentTransport {
 
   cancel(requestId: string) {
     if (!requestId || this.socket?.readyState !== WebSocket.OPEN) return false;
-    this.socket.send(JSON.stringify({ type: 'cancel', requestId }));
+    const request = this.requests.get(requestId);
+    if (!request) return false;
+    this.requestCancellation(request, 'Cancellation requested by the user.');
     return true;
   }
 
   close() {
+    for (const request of this.requests.values()) {
+      this.clearRequestTimers(request);
+    }
     this.requests.clear();
+    this.requestReservations.clear();
     this.socket?.close();
     this.socket = null;
     this.connecting = null;
@@ -235,7 +336,10 @@ export class CodingAgentTransport {
         if (!authenticated) reject(new Error('Coding Agent authentication failed.'));
         for (const [requestId, request] of this.requests) {
           this.requests.delete(requestId);
-          request.handlers.onError(new Error('The Coding Agent connection closed before the request completed.'));
+          this.clearRequestTimers(request);
+          if (!request.cancellationReported) {
+            request.handlers.onError(new Error('The Coding Agent connection closed before the request completed; execution status is unverified.'));
+          }
         }
       };
       socket.onmessage = async (event) => {
@@ -303,6 +407,28 @@ export class CodingAgentTransport {
       }
       return;
     }
+    this.resetIdleDeadline(request);
+    if (message.type === 'done' && request.cancellationRequested) {
+      this.requests.delete(requestId);
+      this.clearRequestTimers(request);
+      if (!request.cancellationReported) {
+        request.cancellationReported = true;
+        request.handlers.onDone({
+          requestId,
+          content: 'The request returned after cancellation was requested. Its final execution outcome is unverified; inspect the task state before retrying.',
+          proposalRequired: false,
+          status: 'CANCELLATION_UNVERIFIED',
+          readOnly: true,
+          writeRequired: false,
+          applyRequired: false,
+          approvalRequired: false,
+          toolCalls: request.toolCalls,
+          filesRead: [...request.filesRead.entries()].map(([path, content]) => ({ path, content })),
+          filesSearched: [...request.filesSearched],
+        });
+      }
+      return;
+    }
     if (message.type === 'activity_event') {
       const activity = parseCodingActivityEvent(message);
       if (activity && activity.executionId === requestId) {
@@ -330,6 +456,8 @@ export class CodingAgentTransport {
       return;
     }
     if (message.type === 'tool_call') {
+      request.operation = 'tool';
+      this.resetIdleDeadline(request);
       const toolCallId = String(message.toolCallId || '');
       const rawName = String(message.name || '');
       const rawArgs = message.arguments && typeof message.arguments === 'object'
@@ -419,22 +547,55 @@ export class CodingAgentTransport {
           },
         };
       }
-      if (socket.readyState === WebSocket.OPEN) {
+      if (socket.readyState === WebSocket.OPEN && !request.cancellationRequested) {
         socket.send(JSON.stringify({ type: 'tool_result', requestId, toolCallId, result }));
+      }
+      if (!request.cancellationRequested) {
+        request.operation = 'model';
+        this.resetIdleDeadline(request);
       }
       return;
     }
     if (message.type === 'done') {
       this.requests.delete(requestId);
+      this.clearRequestTimers(request);
       const rawVerificationAttempt = (message as Record<string, unknown>).verificationAttempt;
       const verificationAttempt = rawVerificationAttempt && typeof rawVerificationAttempt === 'object'
         ? rawVerificationAttempt as { attemptNumber?: unknown; maxAttempts?: unknown; label?: unknown }
+        : null;
+      const rawAgentTaskState = (message as Record<string, unknown>).agentTaskState;
+      const rawNextAction = rawAgentTaskState && typeof rawAgentTaskState === 'object'
+        ? (rawAgentTaskState as Record<string, unknown>).nextAction
         : null;
       request.handlers.onDone({
         requestId,
         content: String(message.content || request.chunks.join('')),
         proposalRequired: message.proposalRequired === true,
         status: typeof message.status === 'string' ? message.status : undefined,
+        agentTaskState: rawAgentTaskState && typeof rawAgentTaskState === 'object'
+          ? {
+              status: typeof (rawAgentTaskState as Record<string, unknown>).status === 'string'
+                ? (rawAgentTaskState as Record<string, unknown>).status as string
+                : undefined,
+              originalRequest: typeof (rawAgentTaskState as Record<string, unknown>).originalRequest === 'string'
+                ? (rawAgentTaskState as Record<string, unknown>).originalRequest as string
+                : undefined,
+              nextAction: rawNextAction && typeof rawNextAction === 'object'
+                ? {
+                    tool: typeof (rawNextAction as Record<string, unknown>).tool === 'string'
+                      ? (rawNextAction as Record<string, unknown>).tool as string
+                      : undefined,
+                    reason: typeof (rawNextAction as Record<string, unknown>).reason === 'string'
+                      ? (rawNextAction as Record<string, unknown>).reason as string
+                      : undefined,
+                    expectedEvidence: Array.isArray((rawNextAction as Record<string, unknown>).expectedEvidence)
+                      ? ((rawNextAction as Record<string, unknown>).expectedEvidence as unknown[])
+                        .filter((entry): entry is string => typeof entry === 'string')
+                      : undefined,
+                  }
+                : null,
+            }
+          : null,
         readOnly: message.readOnly === true,
         writeRequired: message.writeRequired === true,
         applyRequired: message.applyRequired === true,
@@ -481,8 +642,12 @@ export class CodingAgentTransport {
       return;
     }
     if (message.type === 'cancelled') {
-      this.requests.delete(requestId);
       const cancellationConfirmed = message.status === 'CANCELLED';
+      const cancellationReported = request.cancellationReported;
+      this.requests.delete(requestId);
+      this.clearRequestTimers(request);
+      if (cancellationReported) return;
+      request.cancellationReported = true;
       request.handlers.onDone({
         requestId,
         content: cancellationConfirmed
@@ -502,8 +667,109 @@ export class CodingAgentTransport {
     }
     if (message.type === 'error') {
       this.requests.delete(requestId);
-      request.handlers.onError(new Error(String(message.message || 'Coding Agent request failed.')));
+      this.clearRequestTimers(request);
+      const taskState = message.agentTaskState && typeof message.agentTaskState === 'object'
+        ? message.agentTaskState as Record<string, unknown>
+        : null;
+      const rawRecovery = message.providerRecovery && typeof message.providerRecovery === 'object'
+        ? message.providerRecovery
+        : taskState?.providerRecovery;
+      const recovery = rawRecovery && typeof rawRecovery === 'object'
+        ? rawRecovery as Record<string, unknown>
+        : null;
+      const providerRecovery = recovery
+        && typeof recovery.state === 'string'
+        && typeof recovery.classification === 'string'
+        && typeof recovery.retryable === 'boolean'
+        ? {
+            state: recovery.state,
+            classification: recovery.classification,
+            retryable: recovery.retryable,
+            suggestedAction: typeof recovery.suggestedAction === 'string' ? recovery.suggestedAction : undefined,
+            retryAfterSeconds: typeof recovery.retryAfterSeconds === 'number' ? recovery.retryAfterSeconds : undefined,
+          }
+        : undefined;
+      request.handlers.onError(new CodingTransportError(
+        String(message.message || 'Coding Agent request failed.'),
+        {
+          classification: typeof message.classification === 'string' ? message.classification : undefined,
+          category: typeof message.category === 'string' ? message.category : undefined,
+          retryable: typeof message.retryable === 'boolean' ? message.retryable : undefined,
+          suggestedAction: typeof message.suggestedAction === 'string' ? message.suggestedAction : undefined,
+          providerRecovery,
+        },
+      ));
     }
+  }
+
+  private armRequestDeadlines(request: CodingRequestState) {
+    const idleTimeout = Math.max(1000, runtimeConfig.limits.codingIdleTimeoutMs);
+    const maxDuration = Math.max(idleTimeout, runtimeConfig.limits.codingMaxDurationMs);
+    request.maxDurationTimer = window.setTimeout(
+      () => this.requestCancellation(request, 'The Coding request reached its configured maximum duration.'),
+      maxDuration,
+    );
+    this.resetIdleDeadline(request);
+  }
+
+  private resetIdleDeadline(request: CodingRequestState) {
+    if (request.cancellationRequested || !this.requests.has(request.requestId)) return;
+    if (request.idleTimer !== null) window.clearTimeout(request.idleTimer);
+    const operationTimeout = request.operation === 'tool'
+      ? runtimeConfig.limits.codingToolTimeoutMs
+      : runtimeConfig.limits.codingModelTimeoutMs;
+    const adaptiveIdleTimeout = adaptiveCodingIdleTimeoutMs(
+      runtimeConfig.limits.codingIdleTimeoutMs,
+      operationTimeout,
+    );
+    request.idleTimer = window.setTimeout(
+      () => this.requestCancellation(request, 'The Coding request stopped reporting progress before its idle deadline.'),
+      adaptiveIdleTimeout,
+    );
+  }
+
+  private requestCancellation(request: CodingRequestState, reason: string) {
+    if (request.cancellationRequested || !this.requests.has(request.requestId)) return;
+    request.cancellationRequested = true;
+    if (request.idleTimer !== null) window.clearTimeout(request.idleTimer);
+    if (request.maxDurationTimer !== null) window.clearTimeout(request.maxDurationTimer);
+    request.idleTimer = null;
+    request.maxDurationTimer = null;
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify({ type: 'cancel', requestId: request.requestId }));
+    }
+    request.handlers.onActivity({
+      id: `cancel:${request.requestId}`,
+      executionId: request.requestId,
+      phase: 'cancelling',
+      message: reason,
+    });
+    request.cancellationTimer = window.setTimeout(() => {
+      if (!this.requests.has(request.requestId) || request.cancellationReported) return;
+      request.cancellationReported = true;
+      request.handlers.onDone({
+        requestId: request.requestId,
+        content: `${reason} Cancellation was not confirmed. The request may still be running; do not retry until its final state is known.`,
+        proposalRequired: false,
+        status: 'CANCELLATION_UNVERIFIED',
+        readOnly: true,
+        writeRequired: false,
+        applyRequired: false,
+        approvalRequired: false,
+        toolCalls: request.toolCalls,
+        filesRead: [...request.filesRead.entries()].map(([path, content]) => ({ path, content })),
+        filesSearched: [...request.filesSearched],
+      });
+    }, Math.max(1000, runtimeConfig.limits.codingCancellationWaitMs));
+  }
+
+  private clearRequestTimers(request: CodingRequestState) {
+    if (request.idleTimer !== null && request.idleTimer !== undefined) globalThis.clearTimeout(request.idleTimer);
+    if (request.maxDurationTimer !== null && request.maxDurationTimer !== undefined) globalThis.clearTimeout(request.maxDurationTimer);
+    if (request.cancellationTimer !== null && request.cancellationTimer !== undefined) globalThis.clearTimeout(request.cancellationTimer);
+    request.idleTimer = null;
+    request.maxDurationTimer = null;
+    request.cancellationTimer = null;
   }
 
   private collectFileEvidence(name: string, value: unknown, request: CodingRequestState) {
@@ -570,6 +836,26 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
     return {
       intent: 'CLARIFICATION_REQUIRED',
       clarificationPrompt: 'Your request combines an action directive and an informational inquiry. Please clarify whether you would like the agent to apply code changes or provide an explanation first.',
+      isActionableTask: false,
+    };
+  }
+
+  const isExplicitNoChange = /\b(?:do\s+not|don't|dont|never)\s+(?:(?:just|only|actually|any)\s+){0,2}(?:modify|change|edit|write|apply|implement|fix|repair|patch|add|create|refactor|update|remove|delete|touch)\b/i.test(text)
+    || /\bwithout\s+(?:(?:just|only|actually|any)\s+)?(?:modifying|changing|editing|writing|applying|implementing|fixing|repairing|patching|adding|creating|refactoring|updating|removing|deleting|touching)\b/i.test(text)
+    || /\b(?:do\s+not|don't|dont)\s+(?:want|need|expect)\s+(?:any\s+)?(?:code\s+)?(?:changes?|modifications?|edits?|patches?)\b/i.test(text)
+    || /\b(?:do\s+not|don't|dont|never)\s+(?:make|apply)\s+(?:any\s+)?(?:code\s+)?changes?(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text)
+    || /\bwithout\s+making\s+(?:any\s+)?(?:code\s+)?changes?(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text)
+    || /\bno\s+(?:(?:code|file|source)\s+)?(?:changes?|modifications?|edits?|writes?|patches?)(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text);
+  if (isExplicitNoChange) {
+    const requestsInvestigation = /\b(?:investigate|diagnose|find\s+(?:the\s+)?cause|root\s+cause|why|failing|fails|failed|broken|error|bug|bottleneck|performance|trace)\b/i.test(text);
+    if (requestsInvestigation) {
+      return {
+        intent: 'AUTONOMOUS_WORKFLOW_TASK',
+        isActionableTask: true,
+      };
+    }
+    return {
+      intent: 'QUESTION_OR_EXPLANATION',
       isActionableTask: false,
     };
   }

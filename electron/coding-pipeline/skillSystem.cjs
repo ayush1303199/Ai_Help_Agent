@@ -229,10 +229,12 @@ class SkillSystem {
       }
     }
 
-    // Default to bug_investigation if no strong match
     if (!bestSkill || highestScore <= 0) {
-      bestSkill = this._skills.get('bug_investigation');
-      highestScore = 10;
+      return {
+        skill: null,
+        confidence: 0,
+        playbook: [],
+      };
     }
 
     return {

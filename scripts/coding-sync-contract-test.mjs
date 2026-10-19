@@ -14,6 +14,28 @@ const codingControllerSource = await fs.readFile(
   new URL('../src/features/coding/useCodingAgentController.ts', import.meta.url),
   'utf8',
 );
+const codingTransportSource = await fs.readFile(
+  new URL('../src/features/coding/codingTransport.ts', import.meta.url),
+  'utf8',
+);
+const codingWorkspaceSource = await fs.readFile(
+  new URL('../src/features/coding/CodingAgentWorkspace.tsx', import.meta.url),
+  'utf8',
+);
+assert.match(codingTransportSource, /new CodingTransportError\(/);
+assert.match(codingTransportSource, /providerRecovery,/);
+assert.match(codingTransportSource, /resumeProviderTask: resumeProviderTask \|\| undefined/);
+assert.match(codingTransportSource, /rawAgentTaskState/);
+assert.match(codingControllerSource, /'INVESTIGATION_COMPLETE'/);
+assert.match(codingControllerSource, /transport\.markTurn\(turnId, terminalState/);
+assert.match(
+  await fs.readFile(new URL('../electron/main.cjs', import.meta.url), 'utf8'),
+  /allowedRendererStates = new Set\(\[[^\]]*'blocked'/,
+  'The privileged conversation IPC must accept the blocked terminal state.',
+);
+assert.match(codingControllerSource, /error instanceof CodingTransportError && error\.providerRecovery/);
+assert.match(codingControllerSource, /Continue the saved task using its original objective and confirmed evidence/);
+assert.match(codingWorkspaceSource, /Resume after provider is available/);
 const applyProposalStart = codingControllerSource.indexOf('const applyProposal = async (');
 const repairRequestStart = codingControllerSource.indexOf('const requestVerificationRepair = async () =>');
 const undoProposalStart = codingControllerSource.indexOf('const undoProposal = async () =>');
@@ -231,7 +253,7 @@ test_cases = [
     ("Renderer disconnected unexpectedly", "RENDERER_DISCONNECTED"),
     ("Desktop window lost (ELECTRON_SESSION_DISCONNECTED)", "ELECTRON_SESSION_DISCONNECTED"),
     ("Could not connect to the isolated Coding Agent service", "BACKEND_UNAVAILABLE"),
-    ("Error code: 429 - rate limit exceeded", "PROVIDER_RATE_LIMIT"),
+    ("Error code: 429 - rate limit exceeded", "PROVIDER_THROTTLED"),
     ("Connection error: connection closed unexpectedly", "PROVIDER_NETWORK_FAILURE"),
 ]
 

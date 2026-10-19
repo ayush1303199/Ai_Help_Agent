@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -15,6 +16,12 @@ import { classifyCodingRequestIntent } from '../src/features/coding/codingTransp
 const require = createRequire(import.meta.url);
 const Module = require('node:module');
 const originalLoad = Module._load;
+const previousCodingAuthToken = process.env.AI_CODING_AUTH_TOKEN;
+const previousMutationHandshakeSecret = process.env.AI_CODING_MUTATION_HANDSHAKE_SECRET;
+const testCodingAuthToken = randomBytes(32).toString('base64url');
+const testMutationHandshakeSecret = randomBytes(32).toString('base64url');
+process.env.AI_CODING_AUTH_TOKEN = testCodingAuthToken;
+process.env.AI_CODING_MUTATION_HANDSHAKE_SECRET = testMutationHandshakeSecret;
 
 const handlers = new Map();
 const windows = [];
@@ -22,6 +29,7 @@ const userData = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-workflow-ipc
 const projectRoots = new Set();
 const dialogRequests = [];
 const dialogResponses = [];
+const authorizedMutationRequests = [];
 
 const electronMock = {
   app: Object.assign(new EventEmitter(), {
@@ -136,6 +144,84 @@ Module._load = function patchedLoad(request, parent, isMain) {
 // Require production main.cjs to register real IPC handlers
 require('../electron/main.cjs');
 require('../electron/preload.cjs');
+const originalFetch = globalThis.fetch;
+let relevanceAssessmentMode = 'supported';
+const relevanceAssessmentRequests = [];
+const canonicalMutationJson = (value) => {
+  if (Array.isArray(value)) return value.map(canonicalMutationJson);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalMutationJson(value[key])]));
+  }
+  return value;
+};
+globalThis.fetch = async (input, options = {}) => {
+  if (String(input).includes('/api/coding/policy/file-mutation')) {
+    const payload = JSON.parse(options.body || '{}');
+    const suppliedToken = options.headers?.['X-Coding-Auth'];
+    if (!suppliedToken) {
+      return { ok: false, status: 401, json: async () => ({ detail: 'Missing test authorization context.' }) };
+    }
+    if (suppliedToken !== testCodingAuthToken) {
+      return { ok: false, status: 401, json: async () => ({ detail: 'Invalid test authorization context.' }) };
+    }
+    const expectedProof = createHmac('sha256', testMutationHandshakeSecret)
+      .update(JSON.stringify(canonicalMutationJson(payload)))
+      .digest('hex');
+    if (options.headers?.['X-Coding-Mutation-Proof'] !== expectedProof) {
+      return { ok: false, status: 403, json: async () => ({ detail: 'Invalid test mutation proof.' }) };
+    }
+    const binding = payload.requestBinding;
+    if (payload.proposalApproved !== true
+      || !binding
+      || typeof binding.taskId !== 'string'
+      || typeof binding.turnId !== 'string'
+      || !/^[a-f0-9]{64}$/.test(binding.requestHash || '')
+      || typeof binding.root !== 'string'
+      || !projectRoots.has(path.resolve(binding.root))
+      || typeof binding.scope !== 'string'
+      || !Array.isArray(binding.authorizedFeatures)
+      || !binding.authorizedFeatures.length) {
+      return {
+        ok: true,
+        json: async () => ({ decision: 'BLOCK', reason: 'Approved request binding is incomplete or mismatched.' }),
+      };
+    }
+    authorizedMutationRequests.push({ operation: payload.operation, paths: payload.paths, binding });
+    return { ok: true, json: async () => ({ decision: 'ALLOW', reason: 'Test launch credentials and approved binding validated.' }) };
+  }
+  if (!String(input).includes('/api/coding/assess-finding-relevance')) {
+    return originalFetch(input, options);
+  }
+
+  const assessment = JSON.parse(options.body || '{}');
+  relevanceAssessmentRequests.push(assessment);
+  if (relevanceAssessmentMode === 'provider-error') {
+    return {
+      ok: false,
+      status: 503,
+      json: async () => ({ detail: 'Deterministic provider failure fixture.' }),
+    };
+  }
+  if (relevanceAssessmentMode === 'malformed') {
+    return { ok: true, json: async () => ({ findings: [] }) };
+  }
+
+  return {
+    ok: true,
+    json: async () => ({
+      findings: assessment.findings.map((finding) => ({
+        findingId: finding.findingId,
+        decision: relevanceAssessmentMode === 'supported' ? 'SUPPORTED' : 'UNRELATED',
+        relationship: relevanceAssessmentMode === 'supported'
+          ? 'The cited source contains the requested debug output and termination.'
+          : 'The cited source does not establish a relationship to the requested outcome.',
+        evidenceIds: [finding.sourceEvidenceId],
+        contradictionEvidenceIds: [],
+        unresolvedAssumptions: [],
+      })),
+    }),
+  };
+};
 for (let index = 0; index < 200 && (!handlers.has('developer:workflow-execute') || windows.length === 0); index += 1) {
   await new Promise((resolve) => setTimeout(resolve, 5));
 }
@@ -200,6 +286,266 @@ class FormController {
   // Attach project via real IPC
   await invokeIpc('developer:project-attach', sender, { projectRoot: projectDir });
 
+  const ipcDeveloperAgent = require('../electron/developerAgent.cjs');
+  const ipcDeveloperFiles = require('../electron/developerFiles.cjs');
+  await fs.writeFile(
+    path.join(projectDir, 'tests', 'region-sample.js'),
+    'line one\nline two\nline three\nline four\n',
+    'utf8'
+  );
+  const toolTurn = ipcDeveloperAgent.beginConversationTurn({
+    root: projectDir,
+    request: 'inspect a bounded source region',
+    sessionId: sessionRes.sessionId,
+    ownerWebContentsId: sender.id,
+  });
+  ipcDeveloperAgent.advanceConversationTurn(
+    toolTurn.turnId,
+    'understanding',
+    { sessionId: sessionRes.sessionId, ownerWebContentsId: sender.id },
+  );
+  const targetedToolRead = await invokeIpc('developer:tool', sender, {
+    name: 'read_file',
+    args: { relativePath: 'tests/region-sample.js', startLine: 2, endLine: 3 },
+    turnId: toolTurn.turnId,
+  });
+  assert.equal(targetedToolRead.ok, true);
+  assert.equal(targetedToolRead.data.content, 'line two\nline three');
+  assert.deepEqual(targetedToolRead.data.lineRange, {
+    startLine: 2,
+    endLine: 3,
+    totalLines: 5,
+    complete: false,
+  });
+
+  // TEST 1B: Main-owned handoff plan is bound to the registered proposal.
+  const originalWorkflowExecutor = ipcDeveloperAgent.executeAutonomousCodingWorkflow;
+  const handoffRequestId = 'b45d7af9-a28c-4be1-a9ea-6d1586e0e216';
+  const handoffRequest = 'Implement the related persistence and API changes.';
+  const trustedHandoffPlan = {
+    schemaVersion: 2,
+    status: 'HANDED_OFF',
+    workItems: [
+      {
+        id: 'WI-001',
+        objective: 'Persist the requested setting.',
+        status: 'DELEGATED',
+        dependsOn: [],
+        requiredEvidence: ['APPROVED_SCOPE_PROPOSAL', 'EXPLICIT_APPROVAL', 'VERIFICATION_PASS', 'PRESERVATION_AUDIT'],
+        verificationCriteria: [{
+          id: 'approved-file-state',
+          type: 'FILE_SHA256',
+          path: 'tests/region-sample.js',
+          sha256: createHash('sha256').update('line one updated\nline two\nline three\nline four\n').digest('hex'),
+        }],
+      },
+      {
+        id: 'WI-002',
+        objective: 'Expose the setting through the API.',
+        status: 'DELEGATED',
+        dependsOn: ['WI-001'],
+        requiredEvidence: ['APPROVED_SCOPE_PROPOSAL', 'EXPLICIT_APPROVAL', 'VERIFICATION_PASS'],
+      },
+    ],
+  };
+  let handoffPlanToReturn = trustedHandoffPlan;
+  ipcDeveloperAgent.executeAutonomousCodingWorkflow = async ({ userRequest }) => {
+    assert.equal(userRequest, handoffRequest, 'The original request must reach the production workflow boundary.');
+    return { outcome: 'IMPLEMENTATION_REQUIRED', taskPlan: handoffPlanToReturn };
+  };
+  let trustedHandoffTurn = null;
+  let boundHandoffProposal = null;
+  const handoffFixtureContent = 'line one\nline two\nline three\nline four\n';
+  const handoffDiff = [
+    '--- a/tests/region-sample.js',
+    '+++ b/tests/region-sample.js',
+    '@@ -1,4 +1,4 @@',
+    '-line one',
+    '+line one updated',
+    ' line two',
+    ' line three',
+    ' line four',
+    '',
+  ].join('\n');
+  try {
+    const handoffResult = await invokeIpc('developer:workflow-execute', sender, {
+      workflowRequestId: handoffRequestId,
+      userRequest: handoffRequest,
+    });
+    assert.equal(handoffResult.outcome, 'IMPLEMENTATION_REQUIRED');
+
+    await assert.rejects(
+      () => invokeIpc('developer:proposal-create', sender, {
+        raw: handoffDiff,
+        snapshots: [],
+        scope: '.',
+        handoffWorkflowRequestId: 'a45d7af9-a28c-4be1-a9ea-6d1586e0e216',
+      }),
+      /handoff plan is missing, stale, or mismatched/i,
+      'A forged or unknown workflow ID must not attach a renderer-supplied plan.',
+    );
+    await assert.rejects(
+      () => invokeIpc('developer:proposal-create', sender, {
+        raw: handoffDiff,
+        snapshots: [],
+        scope: 'tests',
+        handoffWorkflowRequestId: handoffRequestId,
+      }),
+      /handoff plan is missing, stale, or mismatched/i,
+      'A trusted workflow ID must not be reused outside its original project scope.',
+    );
+
+    const unrelatedTurn = ipcDeveloperAgent.beginConversationTurn({
+      root: projectDir,
+      request: 'A different coding request.',
+      sessionId: sessionRes.sessionId,
+      ownerWebContentsId: sender.id,
+      scope: '.',
+    });
+    ipcDeveloperAgent.advanceConversationTurn(
+      unrelatedTurn.turnId,
+      'understanding',
+      { sessionId: sessionRes.sessionId, ownerWebContentsId: sender.id },
+    );
+    await assert.rejects(
+      () => invokeIpc('developer:proposal-create', sender, {
+        raw: handoffDiff,
+        snapshots: [],
+        scope: '.',
+        conversationTurnId: unrelatedTurn.turnId,
+        handoffWorkflowRequestId: handoffRequestId,
+      }),
+      /does not match this proposal conversation/i,
+      'A valid handoff ID must not be rebound to a different original request.',
+    );
+
+    trustedHandoffTurn = ipcDeveloperAgent.beginConversationTurn({
+      root: projectDir,
+      request: handoffRequest,
+      sessionId: sessionRes.sessionId,
+      ownerWebContentsId: sender.id,
+      scope: '.',
+    });
+    ipcDeveloperAgent.advanceConversationTurn(
+      trustedHandoffTurn.turnId,
+      'understanding',
+      { sessionId: sessionRes.sessionId, ownerWebContentsId: sender.id },
+    );
+    const api = exposedWorld.get('electronAPI');
+    boundHandoffProposal = await api.createDeveloperProposal(
+      handoffDiff,
+      [{ path: 'tests/region-sample.js', hash: createHash('sha256').update(handoffFixtureContent).digest('hex') }],
+      null,
+      '.',
+      trustedHandoffTurn.turnId,
+      null,
+      handoffRequestId,
+    );
+    assert.deepEqual(boundHandoffProposal.taskPlan, trustedHandoffPlan);
+    assert.equal(boundHandoffProposal.state, 'awaiting_approval');
+    assert.equal(
+      ipcDeveloperAgent.getTaskForTest(boundHandoffProposal.id).state,
+      'awaiting_approval',
+      'The handoff proposal must still require explicit approval.',
+    );
+    assert.deepEqual(
+      ipcDeveloperAgent.getTaskForTest(boundHandoffProposal.id).taskPlan,
+      trustedHandoffPlan,
+      'The main-owned plan must persist on the proposal task.',
+    );
+    assert.equal(
+      await fs.readFile(path.join(projectDir, 'tests', 'region-sample.js'), 'utf8'),
+      handoffFixtureContent,
+      'Binding a multi-item handoff must not write before proposal approval.',
+    );
+    const approvedHandoff = await api.approveDeveloperProposal(boundHandoffProposal.id);
+    assert.equal(approvedHandoff.state, 'approved', 'The proposal must pass the existing explicit approval gate.');
+    const originalHandoffVerification = ipcDeveloperFiles.runVerification;
+    ipcDeveloperFiles.runVerification = async (script) => ({
+      ok: true,
+      script,
+      status: 'PASS',
+      executed: true,
+      exitCode: 0,
+      stdout: 'Deterministic approved verification passed.',
+      stderr: '',
+    });
+    let appliedHandoff;
+    try {
+      appliedHandoff = await api.applyDeveloperProposal(boundHandoffProposal.id);
+    } finally {
+      ipcDeveloperFiles.runVerification = originalHandoffVerification;
+    }
+    assert.equal(
+      appliedHandoff.state,
+      'completed',
+      `A properly authenticated and explicitly approved proposal must apply and verify: ${appliedHandoff.error || 'no error detail'}`,
+    );
+    assert.equal(appliedHandoff.taskPlan.workItems[0].status, 'COMPLETED', 'Host-observed matching file evidence must complete its item.');
+    assert.equal(appliedHandoff.taskPlan.workItems[1].status, 'DELEGATED', 'Unverified dependent work must remain unresolved.');
+    assert.equal(appliedHandoff.taskPlan.status, 'HANDED_OFF', 'The parent plan must remain nonterminal while required work is unresolved.');
+    assert.notEqual(appliedHandoff.taskPlan.status, 'COMPLETED', 'The parent plan must not complete with unresolved required work.');
+    assert.equal(appliedHandoff.verification.status, 'PASS', 'The approved host verification command must pass.');
+    assert.equal(
+      appliedHandoff.taskPlan.workItems[0].verificationResult.status,
+      'SATISFIED',
+      'The trusted verifier must report the matching criterion as satisfied.',
+    );
+    assert.deepEqual(
+      appliedHandoff.taskPlan.workItems[0].verificationResult.criteriaChecked,
+      ['approved-file-state'],
+    );
+    assert.equal(authorizedMutationRequests.length > 0, true, 'The approved proposal must reach the mutation policy boundary.');
+    assert.ok(
+      authorizedMutationRequests.some((request) => request.paths.includes('tests/region-sample.js')),
+      'The policy fixture must observe the authorized target path.',
+    );
+    const approvedTaskRecord = ipcDeveloperAgent.getTaskForTest(boundHandoffProposal.id);
+    const authorizedFileMutation = authorizedMutationRequests.find((request) => (
+      request.paths.includes('tests/region-sample.js')
+    ));
+    assert.equal(authorizedFileMutation.binding.taskId, approvedTaskRecord.authorizationContext.taskId);
+    assert.equal(authorizedFileMutation.binding.turnId, trustedHandoffTurn.turnId);
+    assert.equal(authorizedFileMutation.binding.requestHash, approvedTaskRecord.authorizationContext.requestHash);
+    assert.equal(authorizedFileMutation.binding.root, projectDir);
+    assert.equal(authorizedFileMutation.binding.scope, '.');
+    assert.equal(
+      appliedHandoff.taskPlan.workItems[0].verificationResult.itemId,
+      'WI-001',
+      'Host-observed evidence must be associated with the exact satisfied item.',
+    );
+    assert.equal(
+      await fs.readFile(path.join(projectDir, 'tests', 'region-sample.js'), 'utf8'),
+      'line one updated\nline two\nline three\nline four\n',
+      'An authenticated, explicitly approved mutation must write the approved proposal.',
+    );
+
+    handoffPlanToReturn = {
+      ...trustedHandoffPlan,
+      workItems: trustedHandoffPlan.workItems.map((item, index) => ({
+        ...item,
+        dependsOn: index === 0 ? ['WI-002'] : ['WI-001'],
+      })),
+    };
+    const malformedPlanRequestId = 'd35d7af9-a28c-4be1-a9ea-6d1586e0e216';
+    await invokeIpc('developer:workflow-execute', sender, {
+      workflowRequestId: malformedPlanRequestId,
+      userRequest: handoffRequest,
+    });
+    await assert.rejects(
+      () => invokeIpc('developer:proposal-create', sender, {
+        raw: handoffDiff,
+        snapshots: [],
+        scope: '.',
+        handoffWorkflowRequestId: malformedPlanRequestId,
+      }),
+      /handoff plan is missing, stale, or mismatched/i,
+      'A model-generated dependency cycle must not become a trusted proposal handoff.',
+    );
+  } finally {
+    ipcDeveloperAgent.executeAutonomousCodingWorkflow = originalWorkflowExecutor;
+  }
+
   // TEST 2: Real Production Entry Point Invokes Workflow & Streams Activity
   // Sub-case A: Empty / Missing Request Rejection
   await assert.rejects(
@@ -251,10 +597,41 @@ class FormController {
   );
   assert.equal(dialogRequests.length, dialogCountBeforeForgedApproval, 'Forged approval claims must not open or satisfy the approval prompt.');
 
+  // Deterministic test-only assessment responses exercise the real investigation gate.
+  const dialogCountBeforeAssessmentFailures = dialogRequests.length;
+  for (const mode of ['unrelated', 'provider-error', 'malformed']) {
+    relevanceAssessmentMode = mode;
+    const assessmentRequestCount = relevanceAssessmentRequests.length;
+    const incompleteAssessmentResult = await invokeIpc('developer:workflow-execute', sender, {
+      userRequest: 'fix debug probe and die in profile form controller',
+    });
+    assert.equal(incompleteAssessmentResult.outcome, 'INVESTIGATION_INCOMPLETE', `${mode} assessment must stop before approval.`);
+    assert.equal(incompleteAssessmentResult.phase, 'INVESTIGATE');
+    assert.equal(incompleteAssessmentResult.filesModified.length, 0);
+    assert.equal(incompleteAssessmentResult.codeApplied, false);
+    assert.ok(
+      relevanceAssessmentRequests.length > assessmentRequestCount,
+      `${mode} scenario must exercise the production IPC relevance-assessment call.`,
+    );
+    assert.equal(
+      dialogRequests.length,
+      dialogCountBeforeAssessmentFailures,
+      `${mode} assessment must not open the approval dialog.`,
+    );
+  }
+
+  relevanceAssessmentMode = 'supported';
+  const acceptedAssessmentRequestCount = relevanceAssessmentRequests.length;
+  const dialogCountBeforeRejection = dialogRequests.length;
   dialogResponses.push(0);
   const unapprovedResult = await invokeIpc('developer:workflow-execute', sender, {
     userRequest: 'fix debug probe and die in profile form controller',
   });
+  assert.ok(
+    relevanceAssessmentRequests.length > acceptedAssessmentRequestCount,
+    'The accepted assessment must be returned through the production IPC assessor boundary.',
+  );
+  assert.equal(dialogRequests.length, dialogCountBeforeRejection + 1, 'Supported findings must reach the native approval prompt.');
   assert.equal(unapprovedResult.outcome, 'APPROVAL_REJECTED');
   assert.equal(unapprovedResult.phase, 'APPROVE');
   assert.equal(unapprovedResult.filesModified.length, 0);
@@ -355,10 +732,12 @@ class FormController {
       autoRepairEnabled: false,
     });
 
-    assert.equal(successResult.outcome, 'SUCCESS');
+    assert.equal(successResult.outcome, 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED');
     assert.equal(successResult.phase, 'AUDIT');
     assert.equal(successResult.codeApplied, true);
     assert.equal(successResult.codeVerified, true);
+    assert.equal(successResult.taskPlan.status, 'BLOCKED');
+    assert.equal(successResult.taskPlan.workItems[0].status, 'BLOCKED');
     assert.deepEqual(successResult.filesModified, ['modules/profile/controllers/FormController.php']);
     assert.match(dialogRequests.at(-1).detail, /Exact proposed diff:/);
     assert.match(dialogRequests.at(-1).detail, /Manifest: [a-f0-9]{64}/i);
@@ -663,7 +1042,9 @@ class FormController {
   assert.equal(incompleteResult.filesModified.length, 0);
   assert.equal(incompleteResult.codeApplied, false);
   assert.equal(incompleteResult.codeVerified, false);
-  assert.equal(incompleteResult.continuation?.status, 'READY_TO_RESUME');
+  assert.equal(incompleteResult.continuation?.status, 'NEEDS_NARROWER_REQUEST');
+  assert.equal(incompleteResult.continuation?.token, undefined);
+  assert.equal(incompleteResult.continuation?.nextAction?.tool, 'list_directory');
   assert.match(incompleteResult.message, /investigation is incomplete/i);
 
   // TEST 14: Bounded Repair Governance Enforced (Clamped to at Most 3 Attempts)
@@ -816,6 +1197,26 @@ class FormController {
   assert.equal(m4.isActionableTask, false);
   assert.ok(m4.clarificationPrompt);
 
+  const readOnlyExplanation = classifyCodingRequestIntent('Do not implement a change; explain how the retry policy works.');
+  assert.equal(readOnlyExplanation.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(readOnlyExplanation.isActionableTask, false);
+
+  const noChangePreference = classifyCodingRequestIntent("I don't want code changes; explain how the retry policy works.");
+  assert.equal(noChangePreference.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(noChangePreference.isActionableTask, false);
+
+  const readOnlyInvestigation = classifyCodingRequestIntent('Do not change code; investigate why the retry is failing.');
+  assert.equal(readOnlyInvestigation.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(readOnlyInvestigation.isActionableTask, true);
+
+  const noChangeInvestigation = classifyCodingRequestIntent('Without changing files, investigate why the retry is failing.');
+  assert.equal(noChangeInvestigation.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(noChangeInvestigation.isActionableTask, true);
+
+  const negatedMixedIntent = classifyCodingRequestIntent('Do not fix this or explain why it failed?');
+  assert.equal(negatedMixedIntent.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(negatedMixedIntent.isActionableTask, false);
+
   // Sub-case D: Direct & Polite Action Directives (Must Reach Autonomous Workflow)
   const a1 = classifyCodingRequestIntent('fix debug probe and die in profile form controller');
   assert.equal(a1.intent, 'AUTONOMOUS_WORKFLOW_TASK');
@@ -885,9 +1286,11 @@ class FormController {
       autoRepairEnabled: false,
     });
 
-    assert.equal(endToEndResult.outcome, 'SUCCESS');
+    assert.equal(endToEndResult.outcome, 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED');
     assert.equal(endToEndResult.codeApplied, true);
     assert.equal(endToEndResult.codeVerified, true);
+    assert.equal(endToEndResult.taskPlan.status, 'BLOCKED');
+    assert.equal(endToEndResult.taskPlan.workItems[0].status, 'BLOCKED');
     assert.ok(endToEndResult.filesModified.length > 0);
 
     // Verify activity stream received workflow progress events
@@ -924,8 +1327,13 @@ class FormController {
     'Renderer-supplied autoApprove claims must be rejected fail-closed via preload bridge.'
   );
 
-  console.log('Real request-to-code workflow IPC integration verified successfully.');
+  console.log('Deterministic real-request IPC integration verified; relevance responses are test fixtures, not live-provider evidence.');
 } finally {
+  globalThis.fetch = originalFetch;
+  if (previousCodingAuthToken === undefined) delete process.env.AI_CODING_AUTH_TOKEN;
+  else process.env.AI_CODING_AUTH_TOKEN = previousCodingAuthToken;
+  if (previousMutationHandshakeSecret === undefined) delete process.env.AI_CODING_MUTATION_HANDSHAKE_SECRET;
+  else process.env.AI_CODING_MUTATION_HANDSHAKE_SECRET = previousMutationHandshakeSecret;
   for (const root of projectRoots) {
     await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }).catch(() => {});
   }

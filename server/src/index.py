@@ -6,6 +6,7 @@ import math
 import os
 import secrets
 import hmac
+import logging
 import threading
 import time
 import re
@@ -44,6 +45,7 @@ from backend_config import (
 from coding_websocket import (
     run_coding_websocket_server,
     register_coding_mutation_capability,
+    assess_finding_objective_relevance,
     get_coding_request_context,
     get_backend_project_state,
     set_backend_project_state,
@@ -80,6 +82,7 @@ from agent_control_service import AgentControlService
 from stt_service import SttService
 
 load_dotenv()
+_logger = logging.getLogger(__name__)
 
 CODING_AUTH_TOKEN = os.getenv("AI_CODING_AUTH_TOKEN") or secrets.token_urlsafe(32)
 CODING_MUTATION_HANDSHAKE_SECRET = os.getenv("AI_CODING_MUTATION_HANDSHAKE_SECRET") or ""
@@ -1870,6 +1873,25 @@ def search_coding_symbols_endpoint(query: str, limit: int = 15) -> Dict[str, Any
     root = _resolve_coding_project_root()
     syms = UNIVERSAL_INDEX.search_symbols(query, limit=limit, project_root=str(root))
     return {"query": query, "symbols": SecretProtector.redact_data(syms)}
+
+
+@app.post("/api/coding/assess-finding-relevance")
+async def assess_finding_relevance_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            assess_finding_objective_relevance,
+            registry,
+            CONFIG_PATH,
+            payload,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        _logger.warning("Coding finding relevance assessment unavailable: %s", error)
+        raise HTTPException(
+            status_code=503,
+            detail="The configured Coding provider could not assess finding relevance.",
+        ) from error
 
 
 @app.post("/api/coding/tool")
