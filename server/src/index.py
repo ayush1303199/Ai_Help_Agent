@@ -1793,6 +1793,26 @@ def _search_term_matches(term: str, normalized_text: str) -> bool:
     return any(variant in normalized_text for variant in variants)
 
 
+def _search_term_matches(term: str, normalized_text: str) -> bool:
+    if term in normalized_text:
+        return True
+
+    variants = set()
+    if len(term) > 4 and term.endswith("ies"):
+        variants.add(term[:-3] + "y")
+    if len(term) > 4 and term.endswith(("ches", "shes", "sses", "xes", "zes")):
+        variants.add(term[:-2])
+    if len(term) > 4 and term.endswith("s"):
+        variants.add(term[:-1])
+    if len(term) > 5 and term.endswith("ing"):
+        stem = term[:-3]
+        variants.update((stem, stem + "e"))
+    if len(term) > 4 and term.endswith("ed"):
+        stem = term[:-2]
+        variants.update((stem, stem + "e"))
+    return any(variant in normalized_text for variant in variants)
+
+
 def _search_coding_code(
     query: str,
     scope: str = ".",
