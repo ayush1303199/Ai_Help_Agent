@@ -35,6 +35,19 @@ class CodingInvestigationEntrypointTests(unittest.TestCase):
                 "    return UpdateProfile.CandidateProfileEditor().update_personal_details(request)\n",
                 encoding="utf-8",
             )
+            described_source = project / "src" / "ApplicationLifecycle.py"
+            described_source.parent.mkdir(parents=True)
+            described_source.write_text(
+                "def update_application():\n"
+                "    return True\n",
+                encoding="utf-8",
+            )
+            formatted_symbol_source = project / "src" / "UpdateApplication.py"
+            formatted_symbol_source.write_text(
+                "class UpdateApplication:\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
             attached = ws_mod.set_backend_project_state(str(project))
             self.assertEqual(attached["status"], "PROJECT_ATTACHED")
             self.assertEqual(Path(attached["projectRoot"]), project.resolve())
@@ -99,6 +112,42 @@ class CodingInvestigationEntrypointTests(unittest.TestCase):
                 self.assertIn(results[0]["path"], relevant_paths)
                 self.assertNotIn("fixtures", results[0]["path"])
                 self.assertLessEqual(len(results), 40)
+
+                described_search = client.post(
+                    "/api/coding/tool",
+                    headers={"x-coding-auth": index_mod.CODING_AUTH_TOKEN},
+                    json={
+                        "name": "search_code",
+                        "arguments": {"query": "updates applications"},
+                        "requestId": request_id,
+                        "scope": ".",
+                    },
+                )
+                self.assertEqual(described_search.status_code, 200)
+                described_payload = described_search.json()
+                self.assertTrue(described_payload.get("ok"), described_payload)
+                self.assertIn(
+                    described_source.relative_to(project).as_posix(),
+                    {result["path"] for result in described_payload["data"]["results"]},
+                )
+
+                formatted_symbol_search = client.post(
+                    "/api/coding/tool",
+                    headers={"x-coding-auth": index_mod.CODING_AUTH_TOKEN},
+                    json={
+                        "name": "search_code",
+                        "arguments": {"query": "update_application"},
+                        "requestId": request_id,
+                        "scope": ".",
+                    },
+                )
+                self.assertEqual(formatted_symbol_search.status_code, 200)
+                formatted_symbol_payload = formatted_symbol_search.json()
+                self.assertTrue(formatted_symbol_payload.get("ok"), formatted_symbol_payload)
+                self.assertIn(
+                    formatted_symbol_source.relative_to(project).as_posix(),
+                    {result["path"] for result in formatted_symbol_payload["data"]["results"]},
+                )
 
                 read = client.post(
                     "/api/coding/tool",

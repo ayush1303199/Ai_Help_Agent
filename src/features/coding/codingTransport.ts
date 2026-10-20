@@ -831,7 +831,7 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
   // 2. Detect ambiguous mixed-intent requests combining action directives and informational/exploratory questions
   // e.g. "Fix the rollback or explain why it failed", "Should I fix this or what do you recommend?", "Either add tests or explain why"
   const hasDisjunctiveInquiry = /\b(?:or\s+(?:should|can|could|would|what|why|how|explain|tell|describe|clarify|discuss|else)|either\b.*\bor\b|not\s+sure\s+(?:if|whether))\b/i.test(text);
-  const hasActionVerb = /\b(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace)\b/i.test(text);
+  const hasActionVerb = /\b(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|build|scaffold|setup|full-?stack)\b/i.test(text);
   if (hasDisjunctiveInquiry && hasActionVerb) {
     return {
       intent: 'CLARIFICATION_REQUIRED',

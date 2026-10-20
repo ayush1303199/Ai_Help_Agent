@@ -97,7 +97,12 @@ logger = logging.getLogger(__name__)
 
 def _proposal_prompt_instruction(retry: bool = False) -> str:
     instruction = (
-        "Return exactly one of: a minimal Git unified diff for files read in this task, or exactly NO_CHANGES "
+        "Return exactly one of: a minimal Git unified diff for files read or created in this task, or exactly NO_CHANGES "
+        "if a safe change cannot be supported. "
+        "FORBIDDEN FALLBACK: NEVER state 'The repository is empty', 'there are no existing files', or "
+        "'copy these snippets into a new project'. When the attached workspace is empty or a new project/feature "
+        "is requested, you MUST emit a Git unified diff creating the structured modular files using '--- /dev/null' "
+        "and '+++ b/<repo-relative-path>'. "
         "if a safe change cannot be supported. Use the exact repo-relative path and original lines from the "
         "read evidence. For an addition request, return NO_CHANGES only when the inspected source already "
         "implements the requested behavior or the evidence shows why adding it would be unsafe; do not use "
@@ -168,6 +173,9 @@ def assess_finding_objective_relevance(
         "shared words, path similarity, or a search match alone. Compare the requested outcome and constraints with "
         "the finding's observed source behavior; follow cited call/data-flow evidence when present; check for "
         "contradictions and missing links. Treat all conclusions as hypotheses, not verification. "
+        "STRICT GROUNDING RULE: Base your diagnosis ONLY on the exact source code slices provided in the inspected context. "
+        "NEVER guess, assume, or speculate about variable names, parameters, or logic inside any file that has not been explicitly read "
+        "and included in the inspected context. Forbidden speculative phrases include: 'probably', 'likely', 'or another...', 'might be referenced as'. "
         "Return only JSON: {\"findings\":[{\"findingId\":\"...\",\"decision\":\"SUPPORTED|UNRELATED|INSUFFICIENT|CONTRADICTED\","
         "\"relationship\":\"concise causal explanation\",\"evidenceIds\":[\"...\"],"
         "\"contradictionEvidenceIds\":[\"...\"],\"unresolvedAssumptions\":[\"...\"]}]}. "
@@ -221,6 +229,7 @@ def assess_finding_objective_relevance(
             or decision not in allowed_decisions
             or not isinstance(relationship, str)
             or not relationship.strip()
+            or re.search(r"\b(probably|likely|or another\.\.\.|might be referenced as)\b", relationship, re.IGNORECASE)
             or len(relationship) > 1200
             or not isinstance(refs, list)
             or not refs
@@ -596,24 +605,24 @@ CODING_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file in the selected project. Read-only.",
-            "parameters": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}, "additionalProperties": False},
+            "description": "Read project source by path; optional 1-based startLine/endLine reads up to 200 lines. Use ranges to inspect source omitted by a truncation marker.",
+            "parameters": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}, "startLine": {"type": "integer", "minimum": 1}, "endLine": {"type": "integer", "minimum": 1}}, "additionalProperties": False},
         },
     },
     {
         "type": "function",
         "function": {
             "name": "repo_browser.read_file",
-            "description": "Read a text file in the selected project. Read-only; path is project-relative.",
-            "parameters": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}, "additionalProperties": False},
+            "description": "Read project source by path; optional 1-based startLine/endLine reads up to 200 lines. Use ranges to inspect source omitted by a truncation marker.",
+            "parameters": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}, "startLine": {"type": "integer", "minimum": 1}, "endLine": {"type": "integer", "minimum": 1}}, "additionalProperties": False},
         },
     },
     {
         "type": "function",
         "function": {
             "name": "repo_browser.open_file",
-            "description": "Open and read a text file in the selected project. Read-only; path is project-relative.",
-            "parameters": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}, "additionalProperties": False},
+            "description": "Read project source by path; optional 1-based startLine/endLine reads up to 200 lines. Use ranges to inspect source omitted by a truncation marker.",
+            "parameters": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}, "startLine": {"type": "integer", "minimum": 1}, "endLine": {"type": "integer", "minimum": 1}}, "additionalProperties": False},
         },
     },
     {
@@ -812,7 +821,7 @@ def _coding_task_steps(intent: str, proposal_required: bool) -> List[str]:
     return steps
 WRITE_PATTERN = re.compile(
     r"\b(fix|implement|add|create|change|modify|update|write|refactor|optimi[sz]e|improve|remove|rewrite|"
-    r"resolve|patch|migrate|convert|introduce)\b|"
+    r"resolve|patch|migrate|convert|introduce|build|scaffold|setup|bootstrap|greenfield|full-?stack)\b|"
     r"(?:\b(?:jodo|sudhar|sudharo|badlo|banao|banana|banani|bana\s+do|hatao)\b)|"
     r"(?:\bfile(?:n)?bn(?:a|ana|ani)\b)|"
     r"(?:\b(?:fix|change|update|add|modify|refactor)\s+karo\b)",
@@ -1108,7 +1117,7 @@ def _requires_proposal_for_conversation(messages: List[Dict[str, Any]]) -> bool:
     if EXPLANATION_FOLLOW_UP_PATTERN.search(latest_request):
         return False
     if PERFORMANCE_FIX_PATTERN.search(latest_request) or re.search(
-        r"\b(?:prepare|create|generate|make|build)\s+(?:a\s+)?(?:proposal|diff|patch)\b|"
+        r"\b(?:prepare|create|generate|make|build|scaffold|setup)\s+(?:a\s+)?(?:proposal|diff|patch|project|feature|architecture|files?)\b|"
         r"\b(?:proposal|diff|patch)\s*(?:banao|do|generate|create|prepare)\b|"
         r"\b(?:fix\s+ka\s+proposal|fix\s+proposal|minimal\s+fix\s+proposal)\b",
         latest_request,
@@ -4697,9 +4706,11 @@ def _provider_failure_evidence_fallback(
         path = str(evidence["path"]).replace("\\", "/")
         display_path = path.replace("`", "\\`")
         snippet = SecretProtector.redact_text(str(evidence["snippet"])[:2000])
+        excerpt_note = " (provider context excerpted; omitted source lines were not inspected)" \
+            if evidence.get("role") == "provider-context-excerpt" else ""
         sections.append(
             f"Previously captured source evidence for `{display_path}` "
-            f"(lines {evidence.get('startLine', 1)}-{evidence.get('endLine', 1)}):\n\n"
+            f"(lines {evidence.get('startLine', 1)}-{evidence.get('endLine', 1)}{excerpt_note}):\n\n"
             + "\n".join(f"    {line}" for line in snippet.splitlines())
         )
     content = (
@@ -5840,7 +5851,13 @@ def _serialize_coding_tool_result(result: Any, terms: Optional[Set[str]] = None)
             omitted_data = dict(data)
             omitted_data["content"] = _compact_provider_file_content(content, terms or set(), 0)
             omitted_data["sourceContextTruncated"] = True
-            omitted_data["sourceLineCount"] = len(content.splitlines())
+            line_range = data.get("lineRange")
+            total_lines = line_range.get("totalLines") if isinstance(line_range, dict) else None
+            omitted_data["sourceLineCount"] = (
+                total_lines
+                if isinstance(total_lines, int) and not isinstance(total_lines, bool) and total_lines >= 0
+                else len(content.splitlines())
+            )
             candidate = dict(safe_result)
             candidate["data"] = omitted_data
             candidate_json = json.dumps(candidate, ensure_ascii=False, default=str)
@@ -6360,6 +6377,17 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     if canonical_name == "read_file":
         raw_path = arguments.get("relativePath") or arguments.get("path") or arguments.get("file") or arguments.get("filePath") or ""
         normalized_args["relativePath"] = str(raw_path).strip()[:CODING_MAX_PATH_CHARS]
+        has_start = "startLine" in arguments
+        has_end = "endLine" in arguments
+        if has_start != has_end:
+            raise ValueError("INVALID_TOOL_ARGUMENTS: read_file range requires both startLine and endLine.")
+        if has_start:
+            start_line = arguments["startLine"]
+            end_line = arguments["endLine"]
+            if end_line < start_line or end_line - start_line + 1 > 200:
+                raise ValueError("INVALID_TOOL_ARGUMENTS: read_file range must be ordered and no longer than 200 lines.")
+            normalized_args["startLine"] = start_line
+            normalized_args["endLine"] = end_line
     elif canonical_name == "search_code":
         raw_q = arguments.get("query") or arguments.get("pattern") or arguments.get("q") or arguments.get("term") or arguments.get("text") or ""
         normalized_args["query"] = str(raw_q).strip()[:CODING_MAX_PATH_CHARS]
@@ -9828,6 +9856,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         "Autonomous investigation rules: "
         "1. Discover target files automatically from the user's natural-language request using search_code, search_symbols, or read_file. Never stop prematurely or declare that a file is missing simply because a colloquial class/file name from the prompt was not found literally. Decompose requests into feature concepts, module names, symbols, forms, models, and persistence references. Never ask the user for paths you can find. "
         "2. Trace code relationships end-to-end (multi-hop): map route/entrypoint -> controller/handler -> form model/validation -> persistence/transactions -> response/view. When inspecting a method or class, trace its queries, callers, callees, validation errors, and helpers. "
+        "If a read result marks sourceContextTruncated or includes a compaction marker, do not treat the file as fully inspected: use search result line references and read_file startLine/endLine ranges (up to 200 lines per call) to retrieve the relevant declaration and continue adjacent ranges until its body is complete. "
+        "Treat search matches as candidate references, not proof of a declaration; verify the declaration and body in returned source, and report incomplete retrieval or exact tool errors instead of repeating equivalent searches. "
         "3. Inspect validation, error propagation, transaction rollbacks before exit, null-checks, and debug/probe statements left in production paths. For performance questions, inspect all queries in the method, check for loop executions (N+1), scope overrides (such as ->where() overriding default scopes instead of ->andWhere()), lack of request-level caching, and missing indexes. "
         "4. Evidence-driven defect classification: require exact file path, symbol, line range, control-flow explanation, expected vs. observed behavior, impact, and confidence classification (CONFIRMED, LIKELY, UNVERIFIED, NOT A BUG). "
         "5. Separate observed code facts from runtime execution latency: note that exact microsecond timings require database EXPLAIN or runtime profiling, but static code defects (e.g. duplicate queries, missing rollbacks, or unindexed scans) must be identified with concrete file/line evidence. "
@@ -10185,12 +10215,23 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                                 "rationale": "List an in-scope source directory from the repository map for pattern evidence.",
                             }
                         else:
-                            content = _set_proposal_evidence_limitation(semantic_task)
-                            final_message = {"role": "assistant", "content": content}
-                            _persist_agent_task_state(
-                                session, semantic_task, session_id, "NEEDS_CLARIFICATION"
-                            )
-                            break
+                            is_build_or_create = bool(re.search(
+                                r"\b(?:build|create|implement|add|scaffold|setup|full-?stack|feature)\b",
+                                raw_request,
+                                re.I,
+                            ))
+                            if is_build_or_create:
+                                semantic_task["status"] = "PROPOSAL_READY"
+                                semantic_task["isGreenfield"] = True
+                                final_message = None
+                                break
+                            else:
+                                content = _set_proposal_evidence_limitation(semantic_task)
+                                final_message = {"role": "assistant", "content": content}
+                                _persist_agent_task_state(
+                                    session, semantic_task, session_id, "NEEDS_CLARIFICATION"
+                                )
+                                break
                 else:
                     next_source_action = None
                 auto_call = (
@@ -11005,7 +11046,40 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         else (data_obj.get("content") if isinstance(data_obj, dict) else data_obj) or ""
                     )
                     rel_p = str(arguments.get("relativePath") or arguments.get("path") or "")
-                    CODING_TASK_STORE.record_source_evidence(session_id, path=rel_p, snippet=content_str[:2000])
+                    source_range = (
+                        serialized_data.get("lineRange")
+                        if isinstance(serialized_data, dict) and isinstance(serialized_data.get("lineRange"), dict)
+                        else data_obj.get("lineRange") if isinstance(data_obj, dict) else {}
+                    ) or {}
+                    if not source_range:
+                        source_total = (
+                            serialized_data.get("sourceLineCount")
+                            if isinstance(serialized_data, dict)
+                            else len(content_str.splitlines())
+                        )
+                        source_range = {
+                            "startLine": 1,
+                            "endLine": source_total if isinstance(source_total, int) and not isinstance(source_total, bool) else 1,
+                            "totalLines": source_total,
+                            "complete": not (
+                                isinstance(serialized_data, dict)
+                                and serialized_data.get("sourceContextTruncated") is True
+                            ),
+                        }
+                    source_start = source_range.get("startLine", 1)
+                    source_end = source_range.get("endLine", source_start)
+                    source_truncated = bool(
+                        isinstance(serialized_data, dict)
+                        and serialized_data.get("sourceContextTruncated") is True
+                    )
+                    CODING_TASK_STORE.record_source_evidence(
+                        session_id,
+                        path=rel_p,
+                        snippet=content_str[:2000],
+                        start_line=source_start if isinstance(source_start, int) and not isinstance(source_start, bool) else 1,
+                        end_line=source_end if isinstance(source_end, int) and not isinstance(source_end, bool) else 1,
+                        role="provider-context-excerpt" if source_truncated else "examined",
+                    )
                     CODING_TASK_STORE.emit_lifecycle_event(session_id, "EVIDENCE_CAPTURED", {"target": rel_p, "type": "source"})
                     try:
                         UNIVERSAL_EVENT_STREAM.emit("FILE_READ", {"path": rel_p})

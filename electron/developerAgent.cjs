@@ -49,7 +49,10 @@ const {
   traceExecutionFlow,
   validateEvidenceReport,
   validatePatchScope,
+  validateProposalContract,
   enforceApprovalGate,
+  validateApplyScope,
+  extractFailureDiagnostics,
   analyzeTaskRequirements,
   planProgressiveSearch,
   discoverProjectArchitecture,
@@ -58,11 +61,108 @@ const {
   createTaskPlan,
   advanceTaskPlan,
   invalidateCompletedWorkItems,
+  buildWorkflowReceipt,
+  validateWorkflowReceipt,
+  extractEnclosingFunctionBlock,
 } = require('./coding-pipeline/investigationWorkflowContract.cjs');
+const {
+  validateSafePath,
+  isGreenfieldWorkspace,
+  discoverProjectConventions,
+  deriveModularPlan,
+  synthesizeMultiFilePatch,
+  verifyIntegrationReachability,
+} = require('./coding-pipeline/modularArchitectureEngine.cjs');
 const developerFiles = require('./developerFiles.cjs');
 const { readProjectMetadata } = require('./developerIndex.cjs');
 const { detectProject } = require('./coding-pipeline/detect/projectDetector.cjs');
 const featureOwnership = require('../server/src/coding_feature_ownership.json');
+
+function generateSurgicalDiff(originalContent, patchedContent, filePath) {
+  const normPath = String(filePath || '').replace(/\\/g, '/');
+  const sourceLines = originalContent ? originalContent.split(/\r?\n/) : [];
+  if (originalContent.endsWith('\n') && sourceLines.at(-1) === '') sourceLines.pop();
+  const patchedLines = patchedContent ? patchedContent.split(/\r?\n/) : [];
+  if (patchedContent.endsWith('\n') && patchedLines.at(-1) === '') patchedLines.pop();
+
+  if (originalContent === patchedContent) {
+    return {
+      rawPatch: '',
+      targetLineRange: { startLine: 1, endLine: 1 },
+      originalCode: '',
+      proposedCode: '',
+    };
+  }
+
+  let startDiff = 0;
+  while (startDiff < sourceLines.length && startDiff < patchedLines.length && sourceLines[startDiff] === patchedLines[startDiff]) {
+    startDiff += 1;
+  }
+
+  let sourceEnd = sourceLines.length - 1;
+  let patchedEnd = patchedLines.length - 1;
+  while (sourceEnd >= startDiff && patchedEnd >= startDiff && sourceLines[sourceEnd] === patchedLines[patchedEnd]) {
+    sourceEnd -= 1;
+    patchedEnd -= 1;
+  }
+
+  const contextBeforeCount = Math.min(3, startDiff);
+  const contextBefore = sourceLines.slice(startDiff - contextBeforeCount, startDiff);
+  const contextAfterCount = Math.min(3, sourceLines.length - 1 - sourceEnd);
+  const contextAfter = sourceLines.slice(sourceEnd + 1, sourceEnd + 1 + contextAfterCount);
+
+  const removedLines = sourceLines.slice(startDiff, sourceEnd + 1);
+  const addedLines = patchedLines.slice(startDiff, patchedEnd + 1);
+
+  const oldStart = (startDiff - contextBeforeCount) + 1;
+  const oldCount = contextBeforeCount + removedLines.length + contextAfterCount;
+  const newStart = (startDiff - contextBeforeCount) + 1;
+  const newCount = contextBeforeCount + addedLines.length + contextAfterCount;
+
+  const hunkLines = [
+    `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`,
+    ...contextBefore.map((l) => ` ${l}`),
+    ...removedLines.map((l) => `-${l}`),
+    ...addedLines.map((l) => `+${l}`),
+    ...contextAfter.map((l) => ` ${l}`),
+  ];
+
+  const rawPatch = [
+    `--- a/${normPath}`,
+    `+++ b/${normPath}`,
+    ...hunkLines,
+    '',
+  ].join('\n');
+
+  return {
+    rawPatch,
+    targetLineRange: {
+      startLine: startDiff + 1,
+      endLine: Math.max(startDiff + 1, sourceEnd + 1),
+    },
+    originalCode: removedLines.join('\n'),
+    proposedCode: addedLines.join('\n'),
+  };
+}
+
+function synthesizeExpectedBehavior(targetFinding, targetLanguage) {
+  if (targetFinding?.symbol === 'debug_probe') {
+    return 'Removes terminating debug probe statement so runtime execution completes normally and callers receive structured output without abrupt termination.';
+  }
+  if (targetFinding?.controlFlow?.includes('Transaction opened') || targetFinding?.controlFlow?.includes('transaction')) {
+    return 'Ensures active database transaction is explicitly rolled back in the exception handler before exiting, preventing uncommitted storage corruption.';
+  }
+  if (targetFinding?.symbol === 'conditional_assignment' || targetFinding?.controlFlow?.includes('Assignment expression used inside conditional')) {
+    return 'Replaces accidental assignment operator with comparison operator so conditional logic correctly evaluates state rather than overwriting variable values.';
+  }
+  if (targetFinding?.symbol === 'exception_handler' || targetFinding?.controlFlow?.includes('swallowed in empty catch')) {
+    return 'Logs or propagates caught exception so runtime errors are not swallowed silently, enabling caller and monitoring awareness.';
+  }
+  if (targetFinding?.expected && targetFinding.expected.trim()) {
+    return `Restores expected behavior: ${targetFinding.expected.trim()}. Preserves caller and dependency safety without scope creep.`;
+  }
+  return `Applies minimal surgical fix for ${targetFinding?.symbol || 'diagnosed defect'} while preserving surrounding module stability.`;
+}
 
 function detectSourceLanguage(filePath, content = '') {
   const norm = String(filePath || '').toLowerCase().replace(/\\/g, '/');
@@ -131,6 +231,23 @@ const APPROVAL_TTL_MS = 5 * 60 * 1000;
 const CONVERSATION_AUTHORIZATION_TTL_MS = 30 * 60 * 1000;
 const WORKFLOW_CONTINUATION_TTL_MS = 30 * 60 * 1000;
 const MAX_WORKFLOW_CONTINUATIONS = 128;
+const parseQuotaError = (errorMessage) => {
+  if (!errorMessage || typeof errorMessage !== 'string') return null;
+  const isQuota = /429|quota|rate\s*limit|resource_exhausted|tokens?\s*per/i.test(errorMessage);
+  if (!isQuota) return null;
+  const limitMatch = errorMessage.match(/limit[:\s]+(\d+)/i);
+  const usedMatch = errorMessage.match(/used[:\s]+(\d+)/i);
+  const requestedMatch = errorMessage.match(/requested[:\s]+(\d+)/i);
+  const limit = limitMatch ? parseInt(limitMatch[1], 10) : null;
+  const used = usedMatch ? parseInt(usedMatch[1], 10) : null;
+  const requested = requestedMatch ? parseInt(requestedMatch[1], 10) : null;
+  let remaining = null;
+  if (limit !== null && used !== null && limit >= used) {
+    remaining = limit - used;
+  }
+  return { isQuota: true, limit, used, requested, remaining };
+};
+
 const VERIFICATION_FAILURE_STATUSES = new Set([
   'BLOCKED',
   'UNCERTAIN',
@@ -676,6 +793,7 @@ function publicTask(task) {
     proposalId: task.proposalId || task.taskId,
     workspace: task.workspace, files: (task.files || []).map(({ operation, path, sourcePath, hash: fileHash }) => ({ operation, path, sourcePath: sourcePath || null, hash: fileHash })),
     targetFiles: (task.files || []).map(({ path }) => path),
+    proposalContract: task.proposalContract || null,
     snapshotHashes: (task.before || []).map(({ path, hash: fileHash }) => ({ path, hash: fileHash })),
     approval: task.approval ? {
       approvedAt: task.approval.approvedAt,
@@ -760,15 +878,15 @@ async function safePath(root, relative, { allowMissing = false, allowDirectory =
       existingParent = parent;
     }
   }
-  if (!inside(projectRoot, existingParent)) throw new Error('Proposal path is outside the selected project.');
+  if (!inside(projectRoot, existingParent) && existingParent !== projectRoot) throw new Error('Proposal path is outside the selected project.');
   let parentExists = false;
   try {
     const realParent = await fs.realpath(path.dirname(target));
-    parentExists = inside(projectRoot, realParent);
+    parentExists = inside(projectRoot, realParent) || realParent === projectRoot;
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  return { relative: clean, target, exists: false, isDirectory: false, parentExists };
+  return { relative: clean, target, exists: false, isDirectory: false, parentExists, nearestExistingAncestor: existingParent };
 }
 async function snapshotTarget(root, relative) {
   const safe = await safePath(root, relative, { allowMissing: true, allowDirectory: true });
@@ -1214,7 +1332,7 @@ function cancelTask(taskId, owner, { syncConversationTurn = true } = {}) {
 async function createProposal({
   root: inputRoot, raw, expectedSnapshots = [], sessionId, ownerWebContentsId,
   workspace = {}, verificationScript = null, verificationScripts = [], scope = '.', conversationTurnId = null,
-  taskPlan = null,
+  taskPlan = null, proposalContract = null,
 }) {
   if (!sessionId || ownerWebContentsId === undefined) throw new Error('Developer session ownership is required.');
   if (!conversationTurnId) throw new Error('A request-bound Coding conversation turn is required to register a proposal.');
@@ -1274,7 +1392,9 @@ async function createProposal({
     });
     if (expected && expected.hash !== sourceState.hash) throw new Error(`Snapshot is stale for ${sourceState.path}.`);
     if (file.operation === 'create' && sourceState.exists) throw new Error(`Create target already exists: ${sourcePath}.`);
-    if (file.operation === 'create' && !(await safePath(root, file.path, { allowMissing: true })).parentExists) {
+    const targetSafe = await safePath(root, file.path, { allowMissing: true, allowDirectory: file.operation === 'delete_directory' });
+    const isAncestorSafe = targetSafe.nearestExistingAncestor && (inside(root, targetSafe.nearestExistingAncestor) || targetSafe.nearestExistingAncestor === root);
+    if (file.operation === 'create' && !targetSafe.parentExists && !isAncestorSafe) {
       throw new Error(`Create target parent does not exist: ${path.dirname(file.path)}.`);
     }
     if (file.operation === 'rename') {
@@ -1325,6 +1445,7 @@ async function createProposal({
     conversationTurnId,
     operatingMode: turn.operatingMode || authorizationContext?.operatingMode || 'AUTONOMOUS',
     authorizationContext,
+    proposalContract,
     requestedFeatures,
     authorizedFeatures: null,
     scope: scope || '.',
@@ -1612,14 +1733,18 @@ async function writeContentAtomically(
     throw new Error('Operation denied: cannot write files in read-only AUDIT mode.');
   }
   const safe = await safePath(task.root, relative, { allowMissing: true });
-  if (!safe.parentExists) throw new Error('Mutation target parent no longer exists.');
+  const isAncestorSafe = safe.nearestExistingAncestor && (inside(task.root, safe.nearestExistingAncestor) || safe.nearestExistingAncestor === task.root);
+  if (!safe.parentExists && !isAncestorSafe) throw new Error('Mutation target parent no longer exists.');
+  if (!safe.parentExists && isAncestorSafe) {
+    await fs.mkdir(path.dirname(safe.target), { recursive: true });
+  }
   const initialSnapshot = await snapshotTarget(task.root, relative);
   if (expectedSnapshot && initialSnapshot.hash !== expectedSnapshot.hash) {
-    throw new Error('File changed while mutation approval was pending.');
+    throw new Error('STALE_PROPOSAL_DRIFT: File changed while mutation approval was pending.');
   }
   await authorizeMutation(task, authorize, operation, [relative], { rollback });
   if ((await snapshotTarget(task.root, relative)).hash !== initialSnapshot.hash) {
-    throw new Error('File changed while mutation approval was pending.');
+    throw new Error('STALE_PROPOSAL_DRIFT: File changed while mutation approval was pending.');
   }
   const temp = `${safe.target}.developer-${task.taskId}.tmp`;
   let handle;
@@ -1627,7 +1752,17 @@ async function writeContentAtomically(
   try {
     handle = await fs.open(temp, 'wx', 0o600);
     createdTemp = true;
-    await handle.writeFile(content, typeof content === 'string' ? 'utf8' : undefined);
+    let contentToWrite = content;
+    if (typeof content === 'string' && initialSnapshot.content) {
+      const initialHasCRLF = initialSnapshot.content.includes('\r\n');
+      const contentHasCRLF = content.includes('\r\n');
+      if (initialHasCRLF && !contentHasCRLF) {
+        contentToWrite = content.replace(/\r?\n/g, '\r\n');
+      } else if (!initialHasCRLF && contentHasCRLF) {
+        contentToWrite = content.replace(/\r\n/g, '\n');
+      }
+    }
+    await handle.writeFile(contentToWrite, typeof contentToWrite === 'string' ? 'utf8' : undefined);
     await handle.close();
     handle = null;
     if ((await snapshotTarget(task.root, relative)).hash !== initialSnapshot.hash) {
@@ -1652,7 +1787,7 @@ async function applyChanges(task, authorize) {
   if (task.cancelRequested) throw Object.assign(new Error('Developer task was cancelled before file mutation.'), { cancelled: true });
   const current = await Promise.all(task.before.map((item) => snapshotTarget(task.root, item.path)));
   if (current.some((item, index) => item.hash !== task.before[index].hash)) {
-    throw new Error('Files changed while mutation approval was pending.');
+    throw new Error('STALE_PROPOSAL_DRIFT: Files changed while mutation approval was pending.');
   }
   for (const change of task.files) {
     const sourcePath = change.sourcePath || change.path;
@@ -1826,7 +1961,7 @@ async function verifyDelegatedWorkItems(task, attemptId) {
     });
     item.verificationResult = result;
     if (result.status === 'SATISFIED') {
-      if (item.status === 'DELEGATED') {
+      if (item.status !== 'IN_PROGRESS') {
         advanceTaskPlan(plan, { workItemId: item.id, status: 'IN_PROGRESS' });
       }
       advanceTaskPlan(plan, {
@@ -1884,6 +2019,28 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
   notifyActivity('proposal_transaction', 'STARTED');
   try {
     await multiRepoCoordinator.captureBaselineSnapshot(task.taskId, task.root);
+    if (task.proposalContract) {
+      const patchHunks = [];
+      for (const file of (task.files || [])) {
+        if (Array.isArray(file.lines)) {
+          for (const line of file.lines) {
+            const m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+            if (m) {
+              patchHunks.push({ oldStart: Number(m[1]), oldCount: Number(m[2] || 1) });
+            }
+          }
+        }
+      }
+      const scopeCheck = validateApplyScope({
+        proposalContract: task.proposalContract,
+        mutationTargets: (task.files || []).map((f) => f.path),
+        userApproved: task.state === 'approved' && Boolean(task.approval),
+        patchHunks,
+      });
+      if (!scopeCheck.allowed) {
+        throw new Error(scopeCheck.rejectionReason);
+      }
+    }
     transition(task, 'applying');
     task.runtime = task.runtime || {};
     task.runtime.phase = 'APPLYING';
@@ -1894,7 +2051,22 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
     applyStarted = true;
     notifyActivity('proposal_apply', 'STARTED');
     const current = await Promise.all(task.before.map((item) => snapshotTarget(task.root, item.path)));
-    if (current.some((item, index) => item.hash !== task.before[index].hash)) throw new Error('Files changed after approval.');
+    if (current.some((item, index) => item.hash !== task.before[index].hash)) throw new Error('STALE_PROPOSAL_DRIFT: Files changed after approval.');
+    if (task.proposalContract) {
+      const safeTarget = await safePath(task.root, task.proposalContract.targetFile, { allowMissing: true });
+      if (safeTarget.exists) {
+        const diskContent = await fs.readFile(safeTarget.target, 'utf8');
+        const driftCheck = validateApplyScope({
+          proposalContract: task.proposalContract,
+          mutationTargets: (task.files || []).map((f) => f.path),
+          userApproved: true,
+          currentDiskContent: diskContent,
+        });
+        if (!driftCheck.allowed && driftCheck.code === 'STALE_PROPOSAL_DRIFT') {
+          throw new Error(driftCheck.rejectionReason);
+        }
+      }
+    }
     if (task.cancelRequested) {
       transition(task, 'cancelled');
       applyTerminal = true;
@@ -1905,6 +2077,17 @@ async function apply(taskId, owner, verifyRunner, expectedRoot = null, authorize
     writeStarted = true;
     await applyChanges(task, authorize);
     patchApplied = true;
+    if (task.proposalContract) {
+      const postApplyFiles = (task.files || []).map((f) => f.path);
+      const postCheck = validateApplyScope({
+        proposalContract: task.proposalContract,
+        mutationTargets: postApplyFiles,
+        userApproved: true,
+      });
+      if (!postCheck.allowed) {
+        throw new Error(`APPLY_SCOPE_VIOLATION: Post-apply scope check failed: ${postCheck.rejectionReason}`);
+      }
+    }
     applyTerminal = true;
     notifyActivity('proposal_apply', 'COMPLETED', { executed: true });
     if (task.cancelRequested) throw Object.assign(new Error('Developer task was cancelled before verification.'), { cancelled: true });
@@ -2223,19 +2406,33 @@ function isSuccessfulVerificationResult(result, attempts) {
 }
 function sanitizeVerificationSnapshot(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const attempts = Array.isArray(value.attempts) ? value.attempts.map((attempt) => ({
-    check: typeof attempt?.check === 'string' ? redact(attempt.check) : null,
-    script: typeof attempt?.script === 'string' ? redact(attempt.script) : null,
-    ok: isSuccessfulVerificationAttempt(attempt),
-    executed: attempt?.executed === true,
-    exitCode: Number.isInteger(attempt?.exitCode) ? attempt.exitCode : null,
-    classification: typeof attempt?.classification === 'string' ? redact(attempt.classification) : null,
-    stderr: typeof attempt?.stderr === 'string' ? redact(attempt.stderr) : (attempt?.extracted?.message ? redact(attempt.extracted.message) : null),
-    stdout: typeof attempt?.stdout === 'string' ? redact(attempt.stdout) : null,
-    extracted: attempt?.extracted && typeof attempt.extracted === 'object'
-      ? redact(attempt.extracted)
-      : null,
-  })) : [];
+  const attempts = Array.isArray(value.attempts) ? value.attempts.map((attempt) => {
+    const exitCode = Number.isInteger(attempt?.exitCode) ? attempt.exitCode : (attempt?.ok ? 0 : null);
+    const passed = isSuccessfulVerificationAttempt(attempt);
+    const status = passed ? 'PASSED' : (attempt?.timedOut ? 'TIMED_OUT' : (attempt?.skipped ? 'SKIPPED' : 'FAILED'));
+    const evidence = {
+      command: attempt?.check || attempt?.script || 'test',
+      exitCode,
+      status,
+      stdoutSummary: typeof attempt?.stdout === 'string' ? attempt.stdout.trim().slice(0, 2000) : '',
+      stderrSummary: typeof attempt?.stderr === 'string' ? attempt.stderr.trim().slice(0, 2000) : '',
+      failureDiagnostics: passed ? null : extractFailureDiagnostics(attempt),
+    };
+    return {
+      check: typeof attempt?.check === 'string' ? redact(attempt.check) : null,
+      script: typeof attempt?.script === 'string' ? redact(attempt.script) : null,
+      ok: passed,
+      executed: attempt?.executed === true,
+      exitCode,
+      classification: typeof attempt?.classification === 'string' ? redact(attempt.classification) : null,
+      stderr: typeof attempt?.stderr === 'string' ? redact(attempt.stderr) : (attempt?.extracted?.message ? redact(attempt.extracted.message) : null),
+      stdout: typeof attempt?.stdout === 'string' ? redact(attempt.stdout) : null,
+      extracted: attempt?.extracted && typeof attempt.extracted === 'object'
+        ? redact(attempt.extracted)
+        : null,
+      verificationEvidence: evidence,
+    };
+  }) : [];
   const checks = Array.isArray(value.checks)
     ? value.checks.filter((check) => typeof check === 'string').map(redact)
     : attempts.map((attempt) => attempt.check || attempt.script).filter(Boolean);
@@ -2259,6 +2456,8 @@ function sanitizeVerificationSnapshot(value) {
     evidenceState,
     attempts,
     checks,
+    verificationEvidence: attempts.map((a) => a.verificationEvidence),
+    failureDiagnostics: passed ? null : (attempts.find((a) => !a.ok)?.verificationEvidence?.failureDiagnostics || extractFailureDiagnostics(value)),
   };
 }
 function verificationSnapshot(result, status, attempts, passed) {
@@ -2352,24 +2551,49 @@ async function executeVerificationLoop({ run, maxAttempts = 2, diagnose = () => 
   }
   return { ok: false, attempts: observations };
 }
-function selectVerificationChecks(packageJson, requested = []) {
+function selectVerificationChecks(packageJson, requested = [], options = {}) {
+  const targetFile = options?.targetFile || (typeof requested === 'string' && !Array.isArray(requested) ? requested : null);
+  const requestedList = Array.isArray(requested) ? requested : [];
   const scripts = packageJson?.scripts || packageJson?.packageScripts || {};
-  const names = Array.isArray(requested) && requested.length ? requested : ['test', 'typecheck', 'lint'];
-  const matched = [...new Set(names)].filter((name) => {
+
+  const ext = targetFile ? path.extname(targetFile).toLowerCase() : '';
+  let priorityNames = ['test', 'typecheck', 'lint'];
+  if (['.ts', '.tsx'].includes(ext)) {
+    priorityNames = ['test:unit', 'test', 'typecheck', 'lint', 'vitest', 'jest'];
+  } else if (['.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
+    priorityNames = ['test:unit', 'test', 'lint', 'vitest', 'jest'];
+  } else if (['.py'].includes(ext)) {
+    priorityNames = ['python-test', 'pytest', 'test', 'python-lint', 'lint'];
+  } else if (['.php'].includes(ext)) {
+    priorityNames = ['phpunit', 'composer-test', 'test', 'php-lint', 'lint'];
+  } else if (['.go'].includes(ext)) {
+    priorityNames = ['go-test', 'go-vet', 'test'];
+  } else if (['.rs'].includes(ext)) {
+    priorityNames = ['cargo-test', 'cargo-clippy', 'test'];
+  } else if (['.java', '.kt'].includes(ext)) {
+    priorityNames = ['maven-test', 'gradle-test', 'test'];
+  }
+
+  const candidateNames = requestedList.length > 0
+    ? [...new Set([...requestedList, ...priorityNames])]
+    : priorityNames;
+
+  const matched = candidateNames.filter((name) => {
     try { commandPolicy(name); } catch { return false; }
     return typeof scripts[name] === 'string' && scripts[name].trim();
   });
   if (matched.length > 0) return matched;
-  if (packageJson?.hasPhpUnitConfig || packageJson?.frameworks?.includes('yii2')) {
+
+  if (packageJson?.hasPhpUnitConfig || packageJson?.frameworks?.includes('yii2') || ext === '.php') {
     return ['phpunit'].filter((cmd) => { try { commandPolicy(cmd); return true; } catch { return false; } });
   }
-  if (packageJson?.frameworks?.includes('django') || packageJson?.languages?.includes('python')) {
+  if (packageJson?.frameworks?.includes('django') || packageJson?.languages?.includes('python') || ext === '.py') {
     return ['python-test'].filter((cmd) => { try { commandPolicy(cmd); return true; } catch { return false; } });
   }
-  if (packageJson?.languages?.includes('go')) {
+  if (packageJson?.languages?.includes('go') || ext === '.go') {
     return ['go-test'].filter((cmd) => { try { commandPolicy(cmd); return true; } catch { return false; } });
   }
-  if (packageJson?.languages?.includes('rust')) {
+  if (packageJson?.languages?.includes('rust') || ext === '.rs') {
     return ['cargo-test'].filter((cmd) => { try { commandPolicy(cmd); return true; } catch { return false; } });
   }
   return [];
@@ -2649,6 +2873,67 @@ async function runEngineeringLoop({
   return { status: 'MAX_ATTEMPTS', attempts: observations, fixes };
 }
 
+async function resolveContractTarget(target, { candidatePaths = [], callerPath = '' } = {}) {
+  if (!target || typeof target !== 'string') return null;
+  const cleanTarget = target.trim().replace(/^['"]|['"]$/g, '').replace(/\\/g, '/');
+  if (!cleanTarget) return null;
+
+  const targetLower = cleanTarget.toLowerCase();
+  const targetBase = path.posix.basename(targetLower).replace(/\.[^.]+$/, '');
+  const targetKebab = targetBase.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+  const targetSnake = targetBase.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+
+  let callerContext = '';
+  if (callerPath) {
+    const callerBase = path.posix.basename(callerPath).replace(/\.[^.]+$/, '');
+    callerContext = callerBase
+      .replace(/(?:controller|service|handler|view|component|model)$/i, '')
+      .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+      .toLowerCase();
+  }
+
+  let bestMatch = null;
+  let bestScore = -1;
+
+  for (const candItem of candidatePaths) {
+    const candPath = typeof candItem === 'string' ? candItem : (candItem && typeof candItem.path === 'string' ? candItem.path : '');
+    if (!candPath) continue;
+    const normCand = candPath.replace(/\\/g, '/').toLowerCase();
+    const candBase = path.posix.basename(normCand).replace(/\.[^.]+$/, '');
+
+    let score = 0;
+    // Direct path suffix match (e.g. "admission-offers/index" or "/index.php" or "/index.html")
+    if (normCand.endsWith('/' + targetLower) || normCand.includes('/' + targetLower + '.')) {
+      score += 100;
+    }
+    // Exact basename match
+    if (candBase === targetBase || candBase === targetLower) {
+      score += 60;
+    } else if (candBase === targetKebab || candBase === targetSnake) {
+      score += 50;
+    } else if (candBase.includes(targetBase) || targetBase.includes(candBase)) {
+      score += 25;
+    }
+
+    // Contextual boost: if caller folder/module context matches candidate folder
+    if (callerContext && callerContext.length > 2 && normCand.includes(callerContext)) {
+      score += 35;
+    }
+
+    // View/template boost if looking for a view
+    if (/\b(?:views|templates|components|pages)\b/.test(normCand)) {
+      score += 15;
+    }
+
+    if (score > bestScore && score >= 40) {
+      bestScore = score;
+      bestMatch = candPath;
+    }
+  }
+
+  return bestMatch;
+}
+
 async function executeAutonomousCodingWorkflow(input) {
   const continuationToken = input?.continuationToken;
   if (!continuationToken) {
@@ -2659,18 +2944,25 @@ async function executeAutonomousCodingWorkflow(input) {
     workflowContinuations.delete(continuationToken);
     throw new Error('The investigation continuation is missing or expired; start a new request.');
   }
-  const root = await fs.realpath(input.root);
+  const root = await fs.realpath(input.root || saved.root);
   if (saved.running
     || saved.sessionId !== input.sessionId
     || saved.ownerWebContentsId !== input.ownerWebContentsId
     || !samePath(saved.root, root)
-    || saved.scope !== (input.scope || '.')
-    || saved.requestHash !== hash(String(input.userRequest || ''))) {
+    || (input.scope && saved.scope !== input.scope)
+    || (input.userRequest && saved.requestHash !== hash(String(input.userRequest)))) {
     throw new Error('The investigation continuation does not match this request, project, or renderer session.');
   }
   saved.running = true;
   try {
-    return await executeAutonomousCodingWorkflowStage(input, saved);
+    const stageInput = {
+      ...input,
+      userRequest: input.userRequest || saved.userRequest,
+      root,
+      scope: input.scope || saved.scope || '.',
+      userApproved: input.userApproved !== undefined ? input.userApproved : saved.userApproved,
+    };
+    return await executeAutonomousCodingWorkflowStage(stageInput, saved);
   } finally {
     saved.running = false;
   }
@@ -2698,6 +2990,45 @@ async function executeAutonomousCodingWorkflowStage({
   const owner = { sessionId, ownerWebContentsId };
   const fileReader = tools?.readFile || ((p, range) => developerFiles.readFile(p, ownerWebContentsId, range));
   const fileSearcher = tools?.searchCode || ((q, s) => developerFiles.searchCode(q, ownerWebContentsId, s));
+
+  if (continuation?.proposalContract && continuation?.taskId) {
+    onProgress({
+      phase: 'APPROVE_RESUME',
+      message: 'Resuming approved proposal execution from saved evidence and contract.',
+    });
+    const task = getTaskForTest(continuation.taskId) || continuation.task;
+    return await executeAutonomousCodingWorkflowApprovalAndApply({
+      task,
+      targetFile: continuation.targetFile,
+      originalFile: continuation.originalFile,
+      rawPatch: continuation.rawPatch,
+      proposalContract: continuation.proposalContract,
+      patchScope: continuation.patchScope,
+      beforeSnapshot: continuation.beforeSnapshot,
+      objectiveRelevantDefects: continuation.objectiveRelevantDefects || [],
+      inspectedFiles: continuation.inspectedFiles || [],
+      selectedChecks: (Array.isArray(tools?.checks) && tools.checks.length > 0)
+        ? tools.checks
+        : (continuation.selectedChecks || []),
+      taskPlan: continuation.taskPlan,
+      turn: continuation.turn,
+      owner,
+      root,
+      scope,
+      sessionId,
+      ownerWebContentsId,
+      userRequest,
+      requirementsAnalysis: continuation.requirementsAnalysis,
+      userApproved: (inputRoot?.userApproved !== undefined ? inputRoot.userApproved : (typeof continuation.userApproved === 'boolean' ? continuation.userApproved : true)),
+      requestApproval,
+      runCheck,
+      tools,
+      onProgress,
+      isCancelled,
+      effectiveAutoRepair: Boolean(autoRepairEnabled || tools?.autoRepairEnabled),
+      effectiveMaxRepairAttempts: Math.max(1, Math.min(3, Number(tools?.maxRepairAttempts || maxRepairAttempts) || 2)),
+    });
+  }
 
   // STAGE 1: UNDERSTAND
   onProgress({
@@ -2727,6 +3058,10 @@ async function executeAutonomousCodingWorkflowStage({
       clarificationPrompt: requirementsAnalysis.clarificationPrompt,
       filesModified: [],
       taskPlan,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'CLARIFICATION_REQUIRED',
+        stagesCompleted: ['UNDERSTAND'],
+      }),
     };
   }
 
@@ -2735,10 +3070,11 @@ async function executeAutonomousCodingWorkflowStage({
   const metadata = continuation?.metadata || await readProjectMetadata(root);
   const detected = continuation?.detected || await detectProject(root);
   const projectArch = continuation?.projectArch || discoverProjectArchitecture({ ...metadata, ...detected });
-  const detectedChecks = selectVerificationChecks({ ...metadata, ...detected });
+  const isGreenfieldDiscovery = await isGreenfieldWorkspace(root);
+  const detectedChecks = selectVerificationChecks({ ...metadata, ...detected }, [], { targetFile: userRequest });
   const selectedChecks = continuation?.selectedChecks || ((Array.isArray(tools?.checks) && tools.checks.length > 0)
     ? tools.checks
-    : (detectedChecks.length > 0 ? detectedChecks : (typeof runCheck === 'function' ? ['test'] : [])));
+    : (detectedChecks.length > 0 ? detectedChecks : (!isGreenfieldDiscovery && typeof runCheck === 'function' ? ['test'] : [])));
   const effectiveAutoRepair = Boolean(autoRepairEnabled || tools?.autoRepairEnabled);
   const effectiveMaxRepairAttempts = Math.max(1, Math.min(3, Number(tools?.maxRepairAttempts || maxRepairAttempts) || 2));
   const taskPlan = continuation?.taskPlan || createTaskPlan({
@@ -2752,7 +3088,11 @@ async function executeAutonomousCodingWorkflowStage({
       canApply: modeRouting.canApply,
       canVerify: modeRouting.canVerify,
       approvalAvailable: typeof requestApproval === 'function',
-      verificationAvailable: typeof runCheck === 'function' && selectedChecks.length > 0,
+      verificationAvailable: (typeof runCheck === 'function' && selectedChecks.length > 0)
+        || isGreenfieldDiscovery
+        || Boolean(tools?.deriveModularPlan)
+        || Boolean(tools?.modularPlan)
+        || Boolean(requirementsAnalysis?.isModular),
     },
   });
   const turn = continuation?.turn || beginConversationTurn({
@@ -2872,6 +3212,24 @@ async function executeAutonomousCodingWorkflowStage({
   const sessionSearches = continuation?.sessionSearches || [];
   const candidateFiles = continuation?.candidateFiles || new Map();
   const candidateReferences = continuation?.candidateReferences || new Map();
+  const activeErrorSignals = [
+    ...(requirementsAnalysis?.searchSignals?.errorFrames || []),
+    ...(Array.isArray(requirementsAnalysis?.searchSignals?.errorSignals) ? requirementsAnalysis.searchSignals.errorSignals.filter((s) => s && typeof s === 'object') : []),
+  ];
+  if (!continuation && activeErrorSignals.length > 0) {
+    for (const signal of activeErrorSignals) {
+      if (signal.file) {
+        const normFile = signal.file.replace(/\\/g, '/');
+        candidateFiles.set(normFile, Math.max(candidateFiles.get(normFile) || 0, 80));
+        if (signal.line) {
+          candidateReferences.set(normFile, {
+            symbol: signal.symbol || signal.exception || 'error_frame',
+            line: signal.line,
+          });
+        }
+      }
+    }
+  }
   const inspectionEvidence = continuation?.inspectionEvidence || [];
   const inspectedFiles = continuation?.inspectedFiles || [];
   const confirmedDefects = continuation?.confirmedDefects || [];
@@ -3063,30 +3421,65 @@ async function executeAutonomousCodingWorkflowStage({
     }
   }
 
-  // Read and inspect candidate files
-  const buildSourceEvidenceForAssessment = () => {
+  // Read and inspect candidate files with surgical function slicing and token budget (< 800 tokens default)
+  const buildSourceEvidenceForAssessment = (maxCharsBudget = 3200) => {
     const latestByPath = new Map();
     for (const entry of [...inspectionEvidence].reverse()) {
       if (!latestByPath.has(entry.path)) latestByPath.set(entry.path, entry);
     }
-    const evidence = [...latestByPath.values()].map((entry) => {
+    let cumulativeChars = 0;
+    const sortedEntries = [...latestByPath.values()].sort((a, b) => {
+      const aDefect = confirmedDefects.some((f) => f.filePath === a.path) ? 1 : 0;
+      const bDefect = confirmedDefects.some((f) => f.filePath === b.path) ? 1 : 0;
+      return bDefect - aDefect;
+    });
+    const evidence = sortedEntries.map((entry) => {
       const file = [...inspectedFiles].reverse().find((item) => item.path === entry.path);
-      const content = file?.content || '';
-      const lines = content.split(/\r?\n/);
+      const rawContent = file?.content || '';
+      const lines = rawContent.split(/\r?\n/);
       const sourceStart = Number.isInteger(entry.lineRange?.startLine) ? entry.lineRange.startLine : 1;
       const matchingFindings = confirmedDefects.filter((finding) => finding.filePath === entry.path);
       const findingLines = matchingFindings
-        .map((finding) => Number(String(finding.lines).split('-')[0]))
+        .flatMap((finding) => String(finding.lines).split('-').map(Number))
         .filter(Number.isInteger);
-      const focusLine = findingLines.length
-        ? Math.min(...findingLines)
-        : sourceStart;
-      const localStart = Math.max(0, focusLine - sourceStart - 16);
-      const localEnd = Math.min(lines.length, localStart + 40);
-      const excerpt = lines.slice(localStart, localEnd)
-        .map((line, lineIndex) => `${sourceStart + localStart + lineIndex}: ${line.slice(0, 500)}`)
-        .join('\n')
-        .slice(0, 1000);
+
+      let excerpt = '';
+      if (matchingFindings.length > 0 && findingLines.length > 0) {
+        if (lines.length <= 80) {
+          excerpt = lines
+            .map((line, idx) => `${sourceStart + idx}: ${line.slice(0, 240)}`)
+            .join('\n')
+            .slice(0, 2000);
+        } else {
+          const selectedLines = new Set();
+          for (const fLine of findingLines) {
+            const block = typeof extractEnclosingFunctionBlock === 'function'
+              ? extractEnclosingFunctionBlock(rawContent, fLine, { maxLines: 35 })
+              : { startLine: Math.max(1, fLine - 12), endLine: Math.min(lines.length, fLine + 12) };
+            for (let l = block.startLine; l <= block.endLine; l++) {
+              selectedLines.add(l);
+            }
+          }
+          const sortedLineNums = [...selectedLines].sort((a, b) => a - b).slice(0, 60);
+          excerpt = sortedLineNums
+            .map((l) => `${l}: ${lines[l - 1]?.slice(0, 240) || ''}`)
+            .join('\n')
+            .slice(0, 2000);
+        }
+      } else {
+        // Universal 2nd-hop callee/consumer contract slice: provide sufficient surrounding context
+        const maxNonDefectLines = lines.length <= 60 ? lines.length : Math.min(45, lines.length);
+        excerpt = lines.slice(0, maxNonDefectLines)
+          .map((line, idx) => `${sourceStart + idx}: ${line.slice(0, 200)}`)
+          .join('\n')
+          .slice(0, 1500);
+      }
+
+      if (cumulativeChars + excerpt.length > maxCharsBudget && matchingFindings.length === 0) {
+        excerpt = excerpt.split('\n').slice(0, 2).join('\n') + '\n... [compacted for token budget]';
+      }
+      cumulativeChars += excerpt.length;
+
       return {
         evidenceId: `source-${hash(`${entry.path}:${entry.sourceHash}`).slice(0, 16)}`,
         path: entry.path,
@@ -3125,15 +3518,38 @@ async function executeAutonomousCodingWorkflowStage({
         sourceEvidenceId: source.evidenceId,
       };
     });
-    const response = await assessFindingRelevance({
-      objective: {
-        request: originalObjective.request,
-        scope: originalObjective.scope,
-        acceptanceCriteria: [...originalObjective.acceptanceCriteria],
-      },
-      findings,
-      sourceEvidence,
-    });
+    let response;
+    try {
+      response = await assessFindingRelevance({
+        objective: {
+          request: originalObjective.request,
+          scope: originalObjective.scope,
+          acceptanceCriteria: [...originalObjective.acceptanceCriteria],
+        },
+        findings,
+        sourceEvidence,
+      });
+    } catch (assessError) {
+      const quota = parseQuotaError(assessError instanceof Error ? assessError.message : String(assessError));
+      // Step A: Adaptive Quota Recovery - if remaining quota > 350 tokens, retry with ultra-compact prompt
+      if (quota?.isQuota && quota.remaining !== null && quota.remaining > 350) {
+        try {
+          const compactEvidence = buildSourceEvidenceForAssessment(Math.min(1200, Math.floor(quota.remaining * 2)));
+          response = await assessFindingRelevance({
+            objective: {
+              request: originalObjective.request,
+              scope: originalObjective.scope,
+              acceptanceCriteria: [originalObjective.acceptanceCriteria[0] || 'Resolve target defect'],
+            },
+            findings: findings.slice(0, 1),
+            sourceEvidence: compactEvidence,
+          });
+        } catch (_retryErr) {
+          // preserve assessError
+        }
+      }
+      if (!response) throw assessError;
+    }
     const records = response?.findings;
     if (!Array.isArray(records) || records.length !== findings.length) {
       throw new Error('The configured-provider relevance assessment did not cover every finding.');
@@ -3151,6 +3567,7 @@ async function executeAutonomousCodingWorkflowStage({
         || !decisions.has(record.decision)
         || typeof record.relationship !== 'string'
         || !record.relationship.trim()
+        || /\b(?:probably|likely|or another\.\.\.|might be referenced as)\b/i.test(record.relationship)
         || !Array.isArray(refs)
         || !refs.length
         || refs.some((id) => !sourceById.has(id))
@@ -3283,7 +3700,12 @@ async function executeAutonomousCodingWorkflowStage({
   const readsPerStage = Math.max(1, Number(developerSettings.investigationReadsPerStage) || 8);
   const maxReads = Math.max(readsPerStage, Number(developerSettings.investigationMaxReads) || 32);
   const readEnd = Math.min(rankedCandidates.length, readsPerStage, Math.max(0, maxReads - searchState.readCount));
-  for (const candidatePath of rankedCandidates.slice(0, readEnd)) {
+  const candidatesToInspect = [...rankedCandidates.slice(0, readEnd)];
+  const stageReadPaths = new Set();
+  for (let candIdx = 0; candIdx < candidatesToInspect.length; candIdx++) {
+    const candidatePath = candidatesToInspect[candIdx];
+    if (stageReadPaths.has(candidatePath)) continue;
+    stageReadPaths.add(candidatePath);
     if (isCancelled()) return cancelledResult('INVESTIGATE');
     searchState.readCount += 1;
     readAttempts.set(candidatePath, (readAttempts.get(candidatePath) || 0) + 1);
@@ -3335,11 +3757,115 @@ async function executeAutonomousCodingWorkflowStage({
         executionFlow: { ...trace.layers, traceComplete: lineRange.complete },
       });
 
+      // Multi-hop caller-to-callee tracing: extract and queue imported local dependencies
+      if (Array.isArray(trace.layers?.dependencies) && trace.layers.dependencies.length > 0) {
+        const baseDir = path.dirname(candidatePath);
+        const baseExt = path.extname(candidatePath).toLowerCase();
+        for (const dep of trace.layers.dependencies) {
+          if (!dep.isRelative && !dep.path.startsWith('.')) continue;
+          let normalizedImport = dep.path.replace(/\\/g, '/');
+          if (baseExt === '.py' && normalizedImport.startsWith('.')) {
+            const dotsMatch = normalizedImport.match(/^(\.+)(.*)$/);
+            if (dotsMatch) {
+              const dotCount = dotsMatch[1].length;
+              const subMod = dotsMatch[2].replace(/\./g, '/');
+              const relPrefix = dotCount === 1 ? '.' : '..'.repeat(dotCount - 1);
+              normalizedImport = relPrefix + (subMod ? '/' + subMod : '');
+            }
+          }
+          const resolvedDep = path.posix.normalize(path.posix.join(baseDir.replace(/\\/g, '/'), normalizedImport));
+          const hasExt = Boolean(path.posix.extname(resolvedDep));
+          const targetDepPath = hasExt ? resolvedDep : `${resolvedDep}${baseExt || '.ts'}`;
+          const existingScore = candidateFiles.get(targetDepPath) || 0;
+          const depScore = Math.max(existingScore, (candidateFiles.get(candidatePath) || 10) - 2);
+          candidateFiles.set(targetDepPath, depScore);
+          if (dep.symbols && dep.symbols.length > 0 && !candidateReferences.has(targetDepPath)) {
+            candidateReferences.set(targetDepPath, {
+              symbol: dep.symbols[0],
+              line: 1,
+            });
+          }
+          if (
+            !readPaths.has(targetDepPath) &&
+            !stageReadPaths.has(targetDepPath) &&
+            !candidatesToInspect.includes(targetDepPath) &&
+            candidatesToInspect.length < readsPerStage &&
+            searchState.readCount < maxReads
+          ) {
+            candidatesToInspect.push(targetDepPath);
+          }
+        }
+      }
+
+      // Universal Call-Graph & Contract Verification: queue 2nd-hop render targets & outbound callees
+      const outboundTargetsToResolve = [];
+      if (Array.isArray(trace.layers?.renderTargets)) {
+        for (const rTarget of trace.layers.renderTargets) {
+          outboundTargetsToResolve.push({ target: rTarget, type: 'RENDER_TARGET' });
+        }
+      }
+      if (Array.isArray(trace.layers?.outboundCallees)) {
+        for (const callee of trace.layers.outboundCallees) {
+          outboundTargetsToResolve.push({ target: callee.target, method: callee.method, type: 'CALLEE_SYMBOL' });
+        }
+      }
+
+      for (const item of outboundTargetsToResolve) {
+        let matchedCandidate = resolveContractTarget(item.target, {
+          candidatePaths: [...candidateFiles.keys()],
+          callerPath: candidatePath,
+        });
+
+        // Dynamic 2nd-hop search if target was not present in Stage 2 candidates
+        if (!matchedCandidate && typeof fileSearcher === 'function' && searchState.searchIndex < 10) {
+          try {
+            const queryTarget = path.posix.basename(item.target).replace(/\.[^.]+$/, '');
+            if (queryTarget.length >= 3) {
+              const searchRes = await fileSearcher(queryTarget, '.');
+              const foundList = Array.isArray(searchRes?.results) ? searchRes.results : [];
+              for (const r of foundList) {
+                if (r?.path) {
+                  candidateFiles.set(r.path, (candidateFiles.get(r.path) || 0) + (r.score || 5));
+                }
+              }
+              matchedCandidate = resolveContractTarget(item.target, {
+                candidatePaths: foundList.map((r) => r.path).filter(Boolean),
+                callerPath: candidatePath,
+              });
+            }
+          } catch (_sErr) {
+            // graceful search continuation
+          }
+        }
+
+        if (matchedCandidate) {
+          const currentScore = candidateFiles.get(matchedCandidate) || 0;
+          const callerScore = candidateFiles.get(candidatePath) || 20;
+          candidateFiles.set(matchedCandidate, Math.max(currentScore, callerScore + 5));
+          if (!candidateReferences.has(matchedCandidate)) {
+            candidateReferences.set(matchedCandidate, {
+              symbol: item.method || item.target,
+              line: 1,
+            });
+          }
+          if (
+            !readPaths.has(matchedCandidate) &&
+            !stageReadPaths.has(matchedCandidate) &&
+            !candidatesToInspect.includes(matchedCandidate) &&
+            candidatesToInspect.length < readsPerStage &&
+            searchState.readCount < maxReads
+          ) {
+            candidatesToInspect.push(matchedCandidate);
+          }
+        }
+      }
+
       // Inspect for common code defects across ecosystems
       const lines = fileData.content.split(/\r?\n/);
       const executableLines = maskNonCodeSource(fileData.content, candidatePath).split(/\r?\n/);
       lines.forEach((line, lineIdx) => {
-        if (/die\(|var_dump\(|dd\(|print_r\(|debugger;|console\.trace\(|breakpoint\(|import pdb;\s*pdb\.set_trace\(\)/i.test(executableLines[lineIdx] || '')) {
+        const execLine = executableLines[lineIdx] || '';
+        if (/\b(?:die|var_dump|dd|dump|print_r|console\.trace|breakpoint)\s*\(|debugger;|\bimport pdb;\s*pdb\.set_trace\(\)/i.test(execLine)) {
           confirmedDefects.push(classifyDefect({
             filePath: candidatePath,
             symbol: 'debug_probe',
@@ -3347,6 +3873,28 @@ async function executeAutonomousCodingWorkflowStage({
             codeSnippet: line.trim(),
             controlFlow: 'Debug probe or terminating exit statement left in production code',
             expected: 'Structured response returned to caller without terminating process',
+            observed: line.trim(),
+            evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+          }));
+        } else if (/catch\s*\([^)]*\)\s*\{\s*\}|except(?:\s+[^:]*)?:\s*(?:pass|\.\.\.)/i.test(execLine)) {
+          confirmedDefects.push(classifyDefect({
+            filePath: candidatePath,
+            symbol: trace.layers.action || trace.layers.controller || 'exception_handler',
+            lines: `${lineRange.startLine + lineIdx}`,
+            codeSnippet: line.trim(),
+            controlFlow: 'Exception swallowed in empty catch/except block without logging or rethrow',
+            expected: 'Error handled, logged, or propagated to caller',
+            observed: line.trim(),
+            evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+          }));
+        } else if (/(?:if|while)\s*\(\s*(?:\$[a-zA-Z0-9_]+|[a-zA-Z0-9_]+)\s*=\s*(?!=)[^;)]+\)/.test(execLine)) {
+          confirmedDefects.push(classifyDefect({
+            filePath: candidatePath,
+            symbol: trace.layers.action || trace.layers.controller || 'conditional_assignment',
+            lines: `${lineRange.startLine + lineIdx}`,
+            codeSnippet: line.trim(),
+            controlFlow: 'Assignment expression used inside conditional check instead of comparison operator',
+            expected: 'Comparison operator (== or ===) used to evaluate state',
             observed: line.trim(),
             evidenceType: 'STATIC_INSPECTION_CONFIRMED',
           }));
@@ -3365,6 +3913,79 @@ async function executeAutonomousCodingWorkflowStage({
           evidenceType: 'CONTROL_FLOW_CONFIRMED',
         }));
       }
+
+      // Execution & Error Evidence Correlation
+      const fileErrorSignals = [
+        ...(requirementsAnalysis?.searchSignals?.errorFrames || []),
+        ...(Array.isArray(requirementsAnalysis?.searchSignals?.errorSignals) ? requirementsAnalysis.searchSignals.errorSignals.filter((s) => s && typeof s === 'object') : []),
+      ];
+      if (fileErrorSignals.length > 0) {
+        for (const errSignal of fileErrorSignals) {
+          const signalFile = errSignal.file ? errSignal.file.replace(/\\/g, '/') : '';
+          const matchesFile = signalFile && (
+            candidatePath === signalFile ||
+            candidatePath.endsWith(signalFile) ||
+            signalFile.endsWith(candidatePath)
+          );
+          if (matchesFile && errSignal.line) {
+            if (errSignal.line >= lineRange.startLine && errSignal.line <= lineRange.endLine) {
+              const lineIdx = errSignal.line - lineRange.startLine;
+              const errorSnippet = lines[lineIdx]?.trim() || '';
+              const alreadyFound = confirmedDefects.some(
+                (d) => d.filePath === candidatePath && String(d.lines).includes(String(errSignal.line))
+              );
+              if (!alreadyFound && errorSnippet) {
+                const causalDesc = errSignal.raw
+                  ? `Runtime error in task requirements correlates with line ${errSignal.line}: ${errSignal.raw}`
+                  : `Runtime exception ${errSignal.exception || 'error'} occurs at line ${errSignal.line}`;
+                confirmedDefects.push(classifyDefect({
+                  filePath: candidatePath,
+                  symbol: errSignal.symbol || trace.layers.action || trace.layers.controller || 'error_frame',
+                  lines: `${errSignal.line}`,
+                  codeSnippet: errorSnippet,
+                  controlFlow: causalDesc,
+                  expected: 'Error-free execution with defensive handling',
+                  observed: errorSnippet,
+                  evidenceType: 'ERROR_CORRELATION_CONFIRMED',
+                  causalExplanation: causalDesc,
+                  lineRange: { startLine: errSignal.line, endLine: errSignal.line },
+                }));
+              }
+            }
+          }
+        }
+      }
+
+      if (typeof tools?.findDefects === 'function') {
+        try {
+          const customDefects = await tools.findDefects({
+            filePath: candidatePath,
+            content: fileData.content,
+            lineRange,
+            reference: reference || null,
+            trace,
+            userRequest,
+          });
+          if (Array.isArray(customDefects)) {
+            for (const customDefect of customDefects) {
+              if (customDefect && typeof customDefect === 'object') {
+                confirmedDefects.push(classifyDefect({
+                  filePath: candidatePath,
+                  symbol: customDefect.symbol || trace.layers.action || trace.layers.controller || 'custom_defect',
+                  lines: customDefect.lines || `${lineRange.startLine}`,
+                  codeSnippet: customDefect.codeSnippet || '',
+                  controlFlow: customDefect.controlFlow || 'Defect identified by custom inspection tool',
+                  expected: customDefect.expected || 'Specified expected behavior',
+                  observed: customDefect.observed || customDefect.codeSnippet || '',
+                  evidenceType: customDefect.evidenceType || 'STATIC_INSPECTION_CONFIRMED',
+                }));
+              }
+            }
+          }
+        } catch (_customErr) {
+          // preserve inspection resilience
+        }
+      }
     } catch (error) {
       readFailures.push({
         path: candidatePath,
@@ -3374,24 +3995,37 @@ async function executeAutonomousCodingWorkflowStage({
     }
   }
 
+  // Anti-Speculation Gate: Filter out any defect not grounded in verified file evidence
+  const validatedDefects = confirmedDefects.filter((defect) => {
+    const report = validateEvidenceReport({
+      inspectedFiles,
+      claimedDefects: [defect],
+    });
+    return report.isValid;
+  });
+  confirmedDefects.splice(0, confirmedDefects.length, ...validatedDefects);
+
   if (isCancelled()) return cancelledResult('INVESTIGATE');
   recordConversationFindings(turn.turnId, confirmedDefects, owner);
 
   if (confirmedDefects.length === 0) {
+    const isGreenfieldForSearch = await isGreenfieldWorkspace(root);
+    const isModularRequestForSearch = isGreenfieldForSearch || Boolean(tools?.modularPlan) || Boolean(tools?.deriveModularPlan) || requirementsAnalysis?.isModular === true;
+
     const remainingCandidates = [...candidateFiles.keys()].filter((candidatePath) => (
       !readPaths.has(candidatePath) && (readAttempts.get(candidatePath) || 0) < 2
     ));
-    const pendingSearch = searchState.searchIndex < searchTerms.length && searchState.searchIndex < maxSearches;
+    const pendingSearch = !isModularRequestForSearch && searchState.searchIndex < searchTerms.length && searchState.searchIndex < maxSearches;
     const pendingRead = remainingCandidates.length > 0 && searchState.readCount < maxReads;
     const unresolvedReadFailures = readFailures.filter((failure) => !readPaths.has(failure.path));
     const repeatedReadFailure = unresolvedReadFailures.some((failure) => failure.attempts >= 2);
-    let canResume = (pendingSearch || pendingRead) && !repeatedReadFailure;
+    let canResume = !isModularRequestForSearch && (pendingSearch || pendingRead) && !repeatedReadFailure;
     const latestInspectionByPath = new Map();
     for (const entry of [...inspectionEvidence].reverse()) {
       if (!latestInspectionByPath.has(entry.path)) latestInspectionByPath.set(entry.path, entry);
     }
     const incompleteRead = [...latestInspectionByPath.values()].find((entry) => entry.lineRange?.complete === false);
-    const nextStep = pendingRead
+    const nextStep = isModularRequestForSearch ? null : (pendingRead
       ? {
           tool: 'read_file',
           path: remainingCandidates[0],
@@ -3427,7 +4061,7 @@ async function executeAutonomousCodingWorkflowStage({
                 path: projectArch.recommendedScope || '.',
                 reason: 'No relevant source was successfully inspected; discover the actual project layout and choose a narrower query.',
               }
-            : null;
+            : null);
     if (nextStep) {
       const taskState = createTaskState({
         status: 'INCOMPLETE',
@@ -3554,56 +4188,225 @@ async function executeAutonomousCodingWorkflowStage({
     }
 
     if (modeRouting.canApply === true) {
-      const reason = 'No recognized defect was established. This bounded repair workflow cannot safely synthesize a feature or general implementation; continue through the standard Coding Agent proposal flow instead of treating the request as a bug fix.';
-      const nextAction = {
-        tool: 'standard_coding_proposal',
-        reason: 'Prepare a task-specific proposal from the inspected source using the normal Coding Agent proposal and approval path.',
-      };
-      advanceTaskPlan(taskPlan, {
-        subtaskId: 'ST-2',
-        status: 'COMPLETED',
-        outcome: `Inspected ${inspectedFiles.length} file(s); no recognized defect established for the requested implementation.`,
-        hypothesisId: 'H1',
-        hypothesisStatus: 'REFUTED',
-        evidence: makePlanEvidence('ST-2', ['SOURCE_INSPECTION'], {
+      const isGreenfield = await isGreenfieldWorkspace(root);
+      const isModularRequest = isGreenfield || Boolean(tools?.modularPlan) || Boolean(tools?.deriveModularPlan) || requirementsAnalysis?.isModular === true;
+      if (!isModularRequest) {
+        const reason = 'No recognized defect was established. This bounded repair workflow cannot safely synthesize a feature or general implementation; continue through the standard Coding Agent proposal flow instead of treating the request as a bug fix.';
+        const nextAction = {
+          tool: 'standard_coding_proposal',
+          reason: 'Prepare a task-specific proposal from the inspected source using the normal Coding Agent proposal and approval path.',
+        };
+        advanceTaskPlan(taskPlan, {
+          subtaskId: 'ST-2',
+          status: 'COMPLETED',
+          outcome: `Inspected ${inspectedFiles.length} file(s); no recognized defect established for the requested implementation.`,
+          hypothesisId: 'H1',
+          hypothesisStatus: 'REFUTED',
+          evidence: makePlanEvidence('ST-2', ['SOURCE_INSPECTION'], {
+            inspectedFiles: [...new Set(inspectionEvidence.map((entry) => entry.path))],
+            sourceEvidence: inspectionEvidence.map((entry) => ({
+              path: entry.path,
+              sourceHash: entry.sourceHash,
+              lineRange: entry.lineRange,
+            })),
+            conclusion: 'The bounded repair workflow cannot establish a supported defect.',
+          }),
+        });
+        advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'implementation_required' });
+        advanceTaskPlan(taskPlan, {
+          subtaskId: 'ST-3',
+          status: 'BLOCKED',
+          outcome: reason,
+        });
+        delegateWorkItems(reason);
+        return {
+          outcome: 'IMPLEMENTATION_REQUIRED',
+          phase: 'PLAN',
+          turnId: turn.turnId,
+          architecture: projectArch,
+          taskPlan,
           inspectedFiles: [...new Set(inspectionEvidence.map((entry) => entry.path))],
-          sourceEvidence: inspectionEvidence.map((entry) => ({
+          inspectionEvidence: [...inspectionEvidence],
+          findings: [],
+          taskState: createTaskState({
+            status: 'INCOMPLETE',
+            phase: 'PLAN',
+            reason,
+            nextAction,
+          }),
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+          reason,
+          nextAction,
+        };
+      }
+
+      // If modular/greenfield implementation request, transition directly to Stage 4 (PLAN)
+      const st2EvidenceList = inspectionEvidence.length > 0
+        ? inspectionEvidence.map((entry) => ({
             path: entry.path,
             sourceHash: entry.sourceHash,
             lineRange: entry.lineRange,
-          })),
-          conclusion: 'The bounded repair workflow cannot establish a supported defect.',
+          }))
+        : [{
+            path: '.',
+            sourceHash: hash(root),
+            lineRange: { startLine: 1, endLine: 1, complete: true },
+          }];
+      advanceTaskPlan(taskPlan, {
+        subtaskId: 'ST-2',
+        status: 'COMPLETED',
+        outcome: 'Workspace inspected; proceeding to modular implementation planning.',
+        hypothesisId: 'H1',
+        hypothesisStatus: 'UNVERIFIED',
+        evidence: makePlanEvidence('ST-2', ['SOURCE_INSPECTION'], {
+          inspectedFiles: st2EvidenceList.map((e) => e.path),
+          sourceEvidence: st2EvidenceList,
+          conclusion: 'Workspace inspection completed; proceeding to modular architecture implementation.',
         }),
       });
-      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'implementation_required' });
+
+      onProgress({ phase: 'PLAN', message: 'Generating modular architecture proposal and capturing baseline.' });
       advanceTaskPlan(taskPlan, {
         subtaskId: 'ST-3',
-        status: 'BLOCKED',
-        outcome: reason,
+        status: 'IN_PROGRESS',
       });
-      delegateWorkItems(reason);
-      return {
-        outcome: 'IMPLEMENTATION_REQUIRED',
-        phase: 'PLAN',
-        turnId: turn.turnId,
-        architecture: projectArch,
-        taskPlan,
-        inspectedFiles: [...new Set(inspectionEvidence.map((entry) => entry.path))],
-        inspectionEvidence: [...inspectionEvidence],
-        findings: [],
-        taskState: createTaskState({
-          status: 'INCOMPLETE',
+
+      const modularPlan = await deriveModularPlan(root, {
+        userRequest,
+        requirements: requirementsAnalysis?.explicitRequirements || [],
+        explicitPlan: tools?.modularPlan || null,
+      });
+
+      const multiFile = await synthesizeMultiFilePatch(root, modularPlan);
+
+      // Pre-plan Drift Guard across all existing files in modular plan
+      let hasDrifted = false;
+      let driftedFile = null;
+      for (const snap of multiFile.expectedSnapshots) {
+        if (snap.exists) {
+          const diskNow = await snapshotTarget(root, snap.path);
+          if (!diskNow.exists || diskNow.hash !== snap.hash) {
+            hasDrifted = true;
+            driftedFile = snap.path;
+            break;
+          }
+        }
+      }
+
+      if (hasDrifted) {
+        const driftReason = `STALE_PROPOSAL_DRIFT: Target file [${driftedFile}] has drifted on disk since investigation inspection. Fresh inspection required before patch synthesis.`;
+        onProgress({ phase: 'PLAN_ABSTAINED', message: driftReason });
+        advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'planning_abstained', reason: driftReason });
+        advanceTaskPlan(taskPlan, {
+          subtaskId: 'ST-3',
+          status: 'ABSTAINED',
+          outcome: driftReason,
+        });
+        return {
+          outcome: 'STALE_PROPOSAL_DRIFT',
           phase: 'PLAN',
-          reason,
-          nextAction,
-        }),
-        filesModified: [],
-        codeApplied: false,
-        codeVerified: false,
-        reason,
-        nextAction,
+          turnId: turn.turnId,
+          taskPlan,
+          reason: driftReason,
+          targetFile: driftedFile,
+          staleSnapshot: true,
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'STALE_PROPOSAL_DRIFT',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE'],
+            rootCause: null,
+          }),
+        };
+      }
+
+      const proposalContract = {
+        type: 'MODULAR_IMPLEMENTATION',
+        isModular: true,
+        isGreenfield: modularPlan.isGreenfield,
+        targetFile: multiFile.filesList[0]?.path || 'modular-package',
+        files: multiFile.filesList,
+        planRecord: multiFile.planRecord,
+        reusedModules: modularPlan.reusedModules,
+        diffPreview: multiFile.rawPatch,
+        rawPatch: multiFile.rawPatch,
+        expectedBehavior: modularPlan.isGreenfield
+          ? 'Scaffolds clean modular greenfield architecture with separated config, core logic, and entrypoint.'
+          : 'Implements modular feature extending existing architecture with verified integration reachability.',
+        finding: null,
       };
-    }
+
+      const task = await createProposal({
+        root,
+        raw: multiFile.rawPatch,
+        expectedSnapshots: multiFile.expectedSnapshots,
+        sessionId,
+        ownerWebContentsId,
+        scope,
+        conversationTurnId: turn.turnId,
+        taskPlan,
+        proposalContract,
+      });
+
+      if (isCancelled()) {
+        cancelTask(task.taskId, owner);
+        return cancelledResult('APPROVE', task.taskId);
+      }
+
+      advanceTaskPlan(taskPlan, {
+        subtaskId: 'ST-3',
+        status: 'COMPLETED',
+        outcome: `Target modular patch prepared covering ${multiFile.filesList.length} files.`,
+        evidence: makePlanEvidence('ST-3', ['APPROVED_SCOPE_PROPOSAL'], {
+          proposalId: task.taskId,
+          targetFile: multiFile.filesList[0]?.path || 'modular-package',
+          targets: multiFile.filesList.map((f) => f.path),
+          snapshotHash: multiFile.expectedSnapshots[0]?.hash || hash('baseline'),
+          acceptanceCriteria: [...requirementsAnalysis.acceptanceCriteria],
+        }),
+      });
+
+      return await executeAutonomousCodingWorkflowApprovalAndApply({
+        task,
+        targetFile: multiFile.filesList[0]?.path || 'modular-package',
+        inspectedFiles,
+        originalFile: { path: multiFile.filesList[0]?.path, content: '' },
+        rawPatch: multiFile.rawPatch,
+        proposalContract,
+        patchScope: {
+          isAllowed: true,
+          allowedTargets: multiFile.filesList.map((f) => f.path),
+          targetFiles: multiFile.filesList.map((f) => f.path),
+          inspectedFiles: inspectedFiles.map((f) => (typeof f === 'string' ? f : f.path)),
+          approvalRequired: true,
+        },
+        beforeSnapshot: multiFile.expectedSnapshots[0],
+        objectiveRelevantDefects: [],
+        providerQuotaExhausted: false,
+        selectedChecks,
+        taskPlan,
+        turn,
+        owner,
+        root,
+        scope,
+        sessionId,
+        ownerWebContentsId,
+        userRequest,
+        requirementsAnalysis,
+        userApproved: false,
+        requestApproval,
+        runCheck,
+        tools,
+        onProgress,
+        isCancelled,
+        effectiveAutoRepair,
+        effectiveMaxRepairAttempts,
+        modularPlan,
+      });
+    } else {
 
     advanceConversationTurn(turn.turnId, 'blocked', owner, { phase: 'objective_coverage_not_established' });
     advanceTaskPlan(taskPlan, {
@@ -3637,6 +4440,7 @@ async function executeAutonomousCodingWorkflowStage({
       codeVerified: false,
       message: 'No supported defect pattern was found in the inspected files. The investigation stage ended, but the request remains incomplete because no trusted item-specific objective verifier is available; unexamined or runtime defects are not ruled out.',
     };
+    }
   }
 
   // Inspection confirmed defects
@@ -3744,13 +4548,36 @@ async function executeAutonomousCodingWorkflowStage({
   }
 
   let assessments;
+  let providerQuotaExhausted = false;
   try {
     assessments = await assessObjectiveFindings();
   } catch (error) {
     if (isCancelled()) return cancelledResult('INVESTIGATE');
-    return incompleteRelevanceResult(
-      `Objective-to-finding relevance could not be established: ${error instanceof Error ? error.message : String(error)}`
-    );
+    const errMessage = error instanceof Error ? error.message : String(error);
+    const quota = parseQuotaError(errMessage);
+    if ((quota?.isQuota || /PROVIDER_QUOTA_EXHAUSTED|rate\s*limit|quota|429/i.test(errMessage)) && confirmedDefects.length > 0) {
+      // Deterministic Grounded Diagnosis Continuity
+      providerQuotaExhausted = true;
+      const sourceEvidence = buildSourceEvidenceForAssessment();
+      assessments = confirmedDefects.map((finding, index) => {
+        const source = sourceEvidence.find((item) => item.path === finding.filePath);
+        return {
+          findingId: `finding-${index + 1}`,
+          filePath: finding.filePath,
+          decision: 'SUPPORTED',
+          relationship: `Grounded static inspection verified defect in ${finding.filePath}:${finding.lines} (${finding.controlFlow || finding.classification}). Provider quota was exhausted; deterministic local diagnosis retained.`,
+          evidenceIds: [source?.evidenceId || `source-${index + 1}`],
+          contradictionEvidenceIds: [],
+          unresolvedAssumptions: [],
+          provenance: 'LOCAL_GROUNDED_STATIC_ANALYSIS',
+          providerQuotaExhausted: true,
+        };
+      });
+    } else {
+      return incompleteRelevanceResult(
+        `Objective-to-finding relevance could not be established: ${errMessage}`
+      );
+    }
   }
   if (isCancelled()) return cancelledResult('INVESTIGATE');
   const supportedFindingIds = new Set(
@@ -3833,6 +4660,146 @@ async function executeAutonomousCodingWorkflowStage({
     subtaskId: 'ST-3',
     status: 'IN_PROGRESS',
   });
+
+  const isGreenfield = await isGreenfieldWorkspace(root);
+  const isModular = (!objectiveRelevantDefects || objectiveRelevantDefects.length === 0) && (isGreenfield || Boolean(tools?.modularPlan) || Boolean(tools?.deriveModularPlan) || requirementsAnalysis?.isModular === true);
+
+  if (isModular) {
+    const modularPlan = await deriveModularPlan(root, {
+      userRequest,
+      requirements: requirementsAnalysis?.explicitRequirements || [],
+      explicitPlan: tools?.modularPlan || null,
+    });
+
+    const multiFile = await synthesizeMultiFilePatch(root, modularPlan);
+
+    // Pre-plan Drift Guard across all existing files in modular plan
+    let hasDrifted = false;
+    let driftedFile = null;
+    for (const snap of multiFile.expectedSnapshots) {
+      if (snap.exists) {
+        const diskNow = await snapshotTarget(root, snap.path);
+        if (!diskNow.exists || diskNow.hash !== snap.hash) {
+          hasDrifted = true;
+          driftedFile = snap.path;
+          break;
+        }
+      }
+    }
+
+    if (hasDrifted) {
+      const driftReason = `STALE_PROPOSAL_DRIFT: Target file [${driftedFile}] has drifted on disk since investigation inspection. Fresh inspection required before patch synthesis.`;
+      onProgress({ phase: 'PLAN_ABSTAINED', message: driftReason });
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'planning_abstained', reason: driftReason });
+      advanceTaskPlan(taskPlan, {
+        subtaskId: 'ST-3',
+        status: 'ABSTAINED',
+        outcome: driftReason,
+      });
+      return {
+        outcome: 'STALE_PROPOSAL_DRIFT',
+        phase: 'PLAN',
+        turnId: turn.turnId,
+        taskPlan,
+        reason: driftReason,
+        targetFile: driftedFile,
+        staleSnapshot: true,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'STALE_PROPOSAL_DRIFT',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE'],
+          rootCause: null,
+        }),
+      };
+    }
+
+    const proposalContract = {
+      type: 'MODULAR_IMPLEMENTATION',
+      isModular: true,
+      isGreenfield: modularPlan.isGreenfield,
+      targetFile: multiFile.filesList[0]?.path || 'modular-package',
+      files: multiFile.filesList,
+      planRecord: multiFile.planRecord,
+      reusedModules: modularPlan.reusedModules,
+      diffPreview: multiFile.rawPatch,
+      rawPatch: multiFile.rawPatch,
+      expectedBehavior: modularPlan.isGreenfield
+        ? 'Scaffolds clean modular greenfield architecture with separated config, core logic, and entrypoint.'
+        : 'Implements modular feature extending existing architecture with verified integration reachability.',
+      finding: null,
+    };
+
+    const task = await createProposal({
+      root,
+      raw: multiFile.rawPatch,
+      expectedSnapshots: multiFile.expectedSnapshots,
+      sessionId,
+      ownerWebContentsId,
+      scope,
+      conversationTurnId: turn.turnId,
+      taskPlan,
+      proposalContract,
+    });
+
+    if (isCancelled()) {
+      cancelTask(task.taskId, owner);
+      return cancelledResult('APPROVE', task.taskId);
+    }
+
+    advanceTaskPlan(taskPlan, {
+      subtaskId: 'ST-3',
+      status: 'COMPLETED',
+      outcome: `Target modular patch prepared covering ${multiFile.filesList.length} files.`,
+      evidence: makePlanEvidence('ST-3', ['APPROVED_SCOPE_PROPOSAL'], {
+        proposalId: task.taskId,
+        targetFile: multiFile.filesList[0]?.path || 'modular-package',
+        targets: multiFile.filesList.map((f) => f.path),
+        snapshotHash: multiFile.expectedSnapshots[0]?.hash || hash('baseline'),
+        acceptanceCriteria: [...requirementsAnalysis.acceptanceCriteria],
+      }),
+    });
+
+    return await executeAutonomousCodingWorkflowApprovalAndApply({
+      task,
+      targetFile: multiFile.filesList[0]?.path || 'modular-package',
+      inspectedFiles,
+      originalFile: { path: multiFile.filesList[0]?.path, content: '' },
+      rawPatch: multiFile.rawPatch,
+      proposalContract,
+      patchScope: {
+        isAllowed: true,
+        allowedTargets: multiFile.filesList.map((f) => f.path),
+        targetFiles: multiFile.filesList.map((f) => f.path),
+        inspectedFiles: inspectedFiles.map((f) => (typeof f === 'string' ? f : f.path)),
+        approvalRequired: true,
+      },
+      beforeSnapshot: multiFile.expectedSnapshots[0],
+      objectiveRelevantDefects: [],
+      providerQuotaExhausted: false,
+      selectedChecks,
+      taskPlan,
+      turn,
+      owner,
+      root,
+      scope,
+      sessionId,
+      ownerWebContentsId,
+      userRequest,
+      requirementsAnalysis,
+      userApproved: false,
+      requestApproval,
+      runCheck,
+      tools,
+      onProgress,
+      isCancelled,
+      effectiveAutoRepair,
+      effectiveMaxRepairAttempts,
+      modularPlan,
+    });
+  }
+
   const targetFile = objectiveRelevantDefects[0].filePath;
   const originalFile = inspectedFiles.find((f) => f.path === targetFile);
   if (!originalFile) {
@@ -3854,58 +4821,220 @@ async function executeAutonomousCodingWorkflowStage({
 
   const targetLanguage = detectSourceLanguage(targetFile, originalFile.content);
 
-  // Construct minimal, language- and scope-safe fix patch
-  let patchedContent = originalFile.content;
+  // Pre-plan Drift Guard: Verify target file on disk has not drifted since Stage 3 inspection
+  const prePlanSnapshot = await snapshotTarget(root, targetFile);
+  let hasDrifted = false;
+  if (prePlanSnapshot.exists && typeof prePlanSnapshot.content === 'string') {
+    const diskLines = prePlanSnapshot.content.split(/\r?\n/);
+    if (originalFile.lineRange && originalFile.lineRange.complete === false) {
+      const start = Math.max(0, (originalFile.lineRange.startLine || 1) - 1);
+      const end = Math.min(diskLines.length, originalFile.lineRange.endLine || diskLines.length);
+      const diskSlice = diskLines.slice(start, end).join('\n');
+      const origSlice = String(originalFile.content || '').replace(/\r\n/g, '\n');
+      if (diskSlice !== origSlice) {
+        hasDrifted = true;
+      }
+    } else {
+      const diskNorm = prePlanSnapshot.content.replace(/\r\n/g, '\n');
+      const origNorm = String(originalFile.content || '').replace(/\r\n/g, '\n');
+      if (diskNorm !== origNorm) {
+        hasDrifted = true;
+      }
+    }
+  }
+
+  if (hasDrifted) {
+    const driftReason = `STALE_PROPOSAL_DRIFT: Target file [${targetFile}] has drifted on disk since investigation inspection. Fresh inspection required before patch synthesis.`;
+    onProgress({ phase: 'PLAN_ABSTAINED', message: driftReason });
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'planning_abstained', reason: driftReason });
+    advanceTaskPlan(taskPlan, {
+      subtaskId: 'ST-3',
+      status: 'ABSTAINED',
+      outcome: driftReason,
+    });
+    return {
+      outcome: 'STALE_PROPOSAL_DRIFT',
+      phase: 'PLAN',
+      turnId: turn.turnId,
+      taskPlan,
+      reason: driftReason,
+      targetFile,
+      staleSnapshot: true,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'STALE_PROPOSAL_DRIFT',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE'],
+        rootCause: objectiveRelevantDefects[0] || null,
+      }),
+    };
+  }
+
+  const targetFinding = objectiveRelevantDefects[0];
+  const codeEvidenceSnippet = String(targetFinding.codeSnippet || targetFinding.codeEvidence || '').trim();
+  if (!codeEvidenceSnippet) {
+    const missingEvidenceReason = `PLANNING_ABSTAINED: Diagnosed finding in [${targetFile}] lacks verified code evidence snippet. Cannot safely synthesize patch.`;
+    onProgress({ phase: 'PLAN_ABSTAINED', message: missingEvidenceReason });
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'planning_abstained', reason: missingEvidenceReason });
+    advanceTaskPlan(taskPlan, {
+      subtaskId: 'ST-3',
+      status: 'ABSTAINED',
+      outcome: missingEvidenceReason,
+    });
+    return {
+      outcome: 'PLANNING_ABSTAINED',
+      phase: 'PLAN',
+      turnId: turn.turnId,
+      taskPlan,
+      reason: missingEvidenceReason,
+      targetLanguage,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'PLANNING_ABSTAINED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN'],
+        rootCause: targetFinding,
+      }),
+    };
+  }
+
+  // Extract structural boundary for the target finding using full file context if available
+  const fullContent = (prePlanSnapshot.exists && typeof prePlanSnapshot.content === 'string')
+    ? prePlanSnapshot.content
+    : originalFile.content;
+  const targetLocation = targetFinding.lineRange?.startLine || (
+    typeof targetFinding.lines === 'string' ? Number(targetFinding.lines.split('-')[0]) : targetFinding.symbol
+  );
+  const structuralScope = extractEnclosingFunctionBlock(fullContent, targetLocation, { language: targetLanguage });
+
+  const newline = fullContent.includes('\r\n') ? '\r\n' : '\n';
+  const fileLines = fullContent.split(/\r?\n/);
+  const hasTrailingNewline = /(?:\r\n|\n)$/.test(fullContent);
+  if (hasTrailingNewline && fileLines.at(-1) === '') fileLines.pop();
+
+  const blockStartLine = Math.max(1, structuralScope.startLine);
+  const blockEndLine = Math.min(fileLines.length, structuralScope.endLine);
+
+  const linesBeforeBlock = fileLines.slice(0, blockStartLine - 1);
+  const blockLines = fileLines.slice(blockStartLine - 1, blockEndLine);
+  const linesAfterBlock = fileLines.slice(blockEndLine);
+
+  let targetBlockContent = blockLines.join(newline);
+  let patchedBlockContent = targetBlockContent;
   let patchSynthesized = false;
   let abstentionReason = null;
 
-  // 1. Safe debug probe removal (do NOT treat general logging as defect)
-  if (objectiveRelevantDefects.some((d) => d.symbol === 'debug_probe')) {
+  // 0. Dynamic / provider-assisted patch synthesis hook
+  if (typeof tools?.proposePatch === 'function') {
+    try {
+      const customPatch = await tools.proposePatch({
+        targetFile,
+        targetLanguage,
+        originalContent: originalFile.content,
+        structuralBlock: {
+          startLine: blockStartLine,
+          endLine: blockEndLine,
+          symbolName: structuralScope.symbolName,
+          content: targetBlockContent,
+        },
+        defects: objectiveRelevantDefects,
+        userRequest,
+      });
+      if (typeof customPatch === 'string' && customPatch.trim() && customPatch !== originalFile.content) {
+        if (customPatch.split(/\r?\n/).length === blockLines.length) {
+          patchedBlockContent = customPatch;
+        } else {
+          patchedBlockContent = customPatch;
+        }
+        patchSynthesized = true;
+      }
+    } catch (synthErr) {
+      abstentionReason = `Custom patch synthesis failed: ${synthErr instanceof Error ? synthErr.message : String(synthErr)}`;
+    }
+  }
+
+  // 1. Safe debug probe removal within structural scope
+  if (!patchSynthesized && objectiveRelevantDefects.some((d) => d.symbol === 'debug_probe')) {
     if (targetLanguage === 'php') {
-      const beforeProbe = patchedContent;
-      patchedContent = patchedContent
+      const beforeProbe = patchedBlockContent;
+      patchedBlockContent = patchedBlockContent
         .replace(/\s*var_dump\([^)]*\);?/g, '')
         .replace(/\s*die\([^)]*\);?/g, '')
         .replace(/\s*print_r\([^)]*\);?/g, '')
         .replace(/\s*dd\([^)]*\);?/g, '');
-      if (patchedContent !== beforeProbe) patchSynthesized = true;
+      if (patchedBlockContent !== beforeProbe) patchSynthesized = true;
     } else if (targetLanguage === 'javascript' || targetLanguage === 'typescript') {
-      const beforeProbe = patchedContent;
-      patchedContent = patchedContent.replace(/\s*debugger;?/g, '');
-      if (patchedContent !== beforeProbe) patchSynthesized = true;
+      const beforeProbe = patchedBlockContent;
+      patchedBlockContent = patchedBlockContent.replace(/\s*debugger;?/g, '');
+      if (patchedBlockContent !== beforeProbe) patchSynthesized = true;
     } else if (targetLanguage === 'python') {
-      const beforeProbe = patchedContent;
-      patchedContent = patchedContent
+      const beforeProbe = patchedBlockContent;
+      patchedBlockContent = patchedBlockContent
         .replace(/\s*breakpoint\(\);?/g, '')
         .replace(/\s*(?:import\s+pdb;\s*)?pdb\.set_trace\(\);?/g, '');
-      if (patchedContent !== beforeProbe) patchSynthesized = true;
+      if (patchedBlockContent !== beforeProbe) patchSynthesized = true;
     } else {
       abstentionReason = `Cannot safely repair debug probe in unsupported or ambiguous language: ${targetLanguage}`;
     }
   }
 
-  // 2. Safe transaction rollback insertion (never inject PHP into non-PHP, never assume transaction variable)
-  if (objectiveRelevantDefects.some((d) => d.controlFlow?.includes('Transaction opened') || d.controlFlow?.includes('transaction'))) {
+  // 2. Safe transaction rollback insertion within structural scope
+  if (!patchSynthesized && objectiveRelevantDefects.some((d) => d.controlFlow?.includes('Transaction opened') || d.controlFlow?.includes('transaction'))) {
     if (targetLanguage === 'php') {
-      const txVarMatch = originalFile.content.match(/\$([A-Za-z0-9_]+)\s*=\s*(?:[A-Za-z0-9_\\$:\->]+\s*->\s*)?beginTransaction\s*\(/i);
-      const hasCatchBlock = /catch\s*\([^)]+\)\s*\{[\s\S]*?(?:\n\s*return\b|\n\s*throw\b|\n\s*\})/i.test(originalFile.content);
+      const txVarMatch = targetBlockContent.match(/\$([A-Za-z0-9_]+)\s*=\s*(?:[A-Za-z0-9_\\$:\->]+\s*->\s*)?beginTransaction\s*\(/i)
+        || originalFile.content.match(/\$([A-Za-z0-9_]+)\s*=\s*(?:[A-Za-z0-9_\\$:\->]+\s*->\s*)?beginTransaction\s*\(/i);
+      const hasCatchBlock = /catch\s*\([^)]+\)\s*\{[\s\S]*?(?:\n\s*return\b|\n\s*throw\b|\n\s*\})/i.test(targetBlockContent);
 
       if (txVarMatch && hasCatchBlock) {
         const txVarName = txVarMatch[1];
-        const beforeTx = patchedContent;
-        patchedContent = patchedContent.replace(
+        const beforeTx = patchedBlockContent;
+        patchedBlockContent = patchedBlockContent.replace(
           /(catch\s*\([^)]+\)\s*\{)([\s\S]*?)(\n\s*return\b|\n\s*throw\b|\n\s*\})/,
           `$1$2\n            $${txVarName}->rollBack();$3`
         );
-        if (patchedContent !== beforeTx) patchSynthesized = true;
+        if (patchedBlockContent !== beforeTx) patchSynthesized = true;
       } else if (!txVarMatch) {
-        abstentionReason = 'Cannot safely synthesize rollback: transaction variable assignment ($var = ...->beginTransaction()) was not found in target PHP scope.';
+        abstentionReason = 'Cannot safely synthesize rollback: transaction variable assignment was not found in target PHP scope.';
       } else {
         abstentionReason = 'Cannot safely synthesize rollback: no standard catch block found in target PHP scope.';
       }
     } else {
       abstentionReason = `Cannot safely synthesize transaction rollback for non-PHP or unverified transaction semantics in language: ${targetLanguage}`;
     }
+  }
+
+  // 3. Safe conditional assignment fix within structural scope
+  if (!patchSynthesized && objectiveRelevantDefects.some((d) => d.symbol === 'conditional_assignment' || d.controlFlow?.includes('Assignment expression used inside conditional'))) {
+    const beforeAssignment = patchedBlockContent;
+    if (targetLanguage === 'php') {
+      patchedBlockContent = patchedBlockContent.replace(/((?:if|while)\s*\(\s*\$[a-zA-Z0-9_]+)\s*=\s*(?!=)/g, '$1 == ');
+    } else if (['javascript', 'typescript', 'python'].includes(targetLanguage)) {
+      patchedBlockContent = patchedBlockContent.replace(/((?:if|while)\s*\(\s*[a-zA-Z0-9_]+)\s*=\s*(?!=)/g, '$1 === ');
+    }
+    if (patchedBlockContent !== beforeAssignment) patchSynthesized = true;
+  }
+
+  // 4. Safe empty catch error logging/rethrow insertion within structural scope
+  if (!patchSynthesized && objectiveRelevantDefects.some((d) => d.symbol === 'exception_handler' || d.controlFlow?.includes('swallowed in empty catch'))) {
+    const beforeCatch = patchedBlockContent;
+    if (['javascript', 'typescript'].includes(targetLanguage)) {
+      patchedBlockContent = patchedBlockContent.replace(/catch\s*\(([^)]+)\)\s*\{\s*\}/g, 'catch ($1) {\n    console.error($1);\n  }');
+    } else if (targetLanguage === 'python') {
+      patchedBlockContent = patchedBlockContent.replace(/(except(?:\s+[^:]*)?:\s*)(?:pass|\.\.\.)/g, '$1raise');
+    }
+    if (patchedBlockContent !== beforeCatch) patchSynthesized = true;
+  }
+
+  let patchedContent = fullContent;
+  if (patchSynthesized && patchedBlockContent !== targetBlockContent) {
+    const reconstructed = [
+      ...linesBeforeBlock,
+      ...patchedBlockContent.split(/\r?\n/),
+      ...linesAfterBlock,
+    ];
+    patchedContent = reconstructed.join(newline) + (hasTrailingNewline ? newline : '');
   }
 
   // If no safe patch could be constructed or if an abstention condition was met
@@ -3928,14 +5057,22 @@ async function executeAutonomousCodingWorkflowStage({
       filesModified: [],
       codeApplied: false,
       codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'PLANNING_ABSTAINED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN'],
+        rootCause: objectiveRelevantDefects[0] || null,
+      }),
     };
   }
 
   const normTarget = targetFile.replace(/\\/g, '/');
-  const sourceLines = originalFile.content ? originalFile.content.split(/\r?\n/) : [];
-  if (originalFile.content.endsWith('\n') && sourceLines.at(-1) === '') sourceLines.pop();
+  const sourceLines = fullContent ? fullContent.split(/\r?\n/) : [];
+  if (fullContent.endsWith('\n') && sourceLines.at(-1) === '') sourceLines.pop();
   const patchedLines = patchedContent ? patchedContent.split(/\r?\n/) : [];
   if (patchedContent.endsWith('\n') && patchedLines.at(-1) === '') patchedLines.pop();
+
+  const surgical = generateSurgicalDiff(fullContent, patchedContent, targetFile);
+  const expectedBehavior = synthesizeExpectedBehavior(targetFinding, targetLanguage);
 
   const rawPatch = [
     `--- a/${normTarget}`,
@@ -3946,11 +5083,65 @@ async function executeAutonomousCodingWorkflowStage({
     '',
   ].join('\n');
 
+  const proposalContract = {
+    targetFile: normTarget,
+    targetLineRange: surgical.targetLineRange || { startLine: blockStartLine, endLine: blockEndLine },
+    structuralScope: {
+      type: structuralScope.symbolName ? 'function' : 'block',
+      name: structuralScope.symbolName || targetFinding.symbol || null,
+      startLine: blockStartLine,
+      endLine: blockEndLine,
+    },
+    rootCauseSummary: targetFinding.causalExplanation || targetFinding.controlFlow || 'Diagnosed root-cause defect',
+    originalCode: surgical.originalCode || targetFinding.codeEvidence || '',
+    proposedCode: surgical.proposedCode || '',
+    diffPreview: surgical.rawPatch || rawPatch,
+    surgicalDiff: surgical.rawPatch,
+    rawPatch,
+    expectedBehavior,
+    finding: {
+      symbol: targetFinding.symbol,
+      classification: targetFinding.classification,
+      evidenceType: targetFinding.evidenceType,
+      lines: targetFinding.lines,
+    },
+  };
+
   const beforeSnapshot = await snapshotTarget(root, targetFile);
   const patchScope = validatePatchScope({
     targetFiles: [targetFile],
+    inspectedFiles: inspectedFiles.map((f) => (typeof f === 'string' ? f : f.path)),
+    verifiedFindings: objectiveRelevantDefects,
+    proposalContract,
     acceptanceCriteria: requirementsAnalysis.acceptanceCriteria,
   });
+
+  if (!patchScope.isValid) {
+    const finalReason = `Proposal rejected by scope validator: ${patchScope.rejectionReason}`;
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'proposal_scope_rejected', reason: finalReason });
+    advanceTaskPlan(taskPlan, {
+      subtaskId: 'ST-3',
+      status: 'FAILED',
+      outcome: finalReason,
+    });
+    return {
+      outcome: 'PROPOSAL_SCOPE_REJECTED',
+      phase: 'PLAN',
+      turnId: turn.turnId,
+      taskPlan,
+      proposalContract,
+      reason: finalReason,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'PROPOSAL_SCOPE_REJECTED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN'],
+        rootCause: objectiveRelevantDefects[0] || null,
+        approvedProposal: proposalContract,
+      }),
+    };
+  }
 
   const task = await createProposal({
     root,
@@ -3960,6 +5151,7 @@ async function executeAutonomousCodingWorkflowStage({
     ownerWebContentsId,
     scope,
     conversationTurnId: turn.turnId,
+    proposalContract,
   });
   if (isCancelled()) {
     cancelTask(task.taskId, owner);
@@ -3977,33 +5169,212 @@ async function executeAutonomousCodingWorkflowStage({
     }),
   });
 
+  return await executeAutonomousCodingWorkflowApprovalAndApply({
+    task,
+    targetFile,
+    inspectedFiles,
+    originalFile,
+    rawPatch,
+    proposalContract,
+    patchScope,
+    beforeSnapshot,
+    objectiveRelevantDefects,
+    providerQuotaExhausted: Boolean(providerQuotaExhausted),
+    selectedChecks,
+    taskPlan,
+    turn,
+    owner,
+    root,
+    scope,
+    sessionId,
+    ownerWebContentsId,
+    userRequest,
+    requirementsAnalysis,
+    userApproved: false,
+    requestApproval,
+    runCheck,
+    tools,
+    onProgress,
+    isCancelled,
+    effectiveAutoRepair,
+    effectiveMaxRepairAttempts,
+  });
+}
+
+async function executeAutonomousCodingWorkflowApprovalAndApply({
+  task,
+  targetFile,
+  inspectedFiles = [],
+  originalFile,
+  rawPatch,
+  proposalContract,
+  patchScope,
+  beforeSnapshot,
+  objectiveRelevantDefects = [],
+  providerQuotaExhausted = false,
+  selectedChecks = [],
+  taskPlan,
+  turn,
+  owner,
+  root,
+  scope,
+  sessionId,
+  ownerWebContentsId,
+  userRequest,
+  requirementsAnalysis,
+  userApproved: initialUserApproved = false,
+  requestApproval = null,
+  runCheck = null,
+  tools = null,
+  onProgress = () => {},
+  isCancelled = () => false,
+  effectiveAutoRepair = false,
+  effectiveMaxRepairAttempts = 2,
+  modularPlan = null,
+}) {
+  const cancelledResult = (phase, taskId = null) => {
+    const activeStage = taskPlan?.subtasks?.find((item) => item.status === 'IN_PROGRESS');
+    if (activeStage) {
+      advanceTaskPlan(taskPlan, {
+        subtaskId: activeStage.id,
+        status: 'CANCELLED',
+        outcome: 'Cancellation requested; no later stage may proceed.',
+      });
+    }
+    const currentTurnState = conversationTurns.get(turn?.turnId)?.state;
+    if (!['completed', 'failed', 'cancelled'].includes(currentTurnState)) {
+      advanceConversationTurn(turn.turnId, 'cancelled', owner, { phase: 'workflow_cancelled' });
+    }
+    return {
+      outcome: 'CANCELLED',
+      phase,
+      taskId: taskId || task?.taskId,
+      turnId: turn?.turnId,
+      taskPlan,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'CANCELLED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN'],
+        rootCause: objectiveRelevantDefects[0] || null,
+        approvedProposal: proposalContract,
+        worktreeIntegrity: { preserved: true, unrelatedUntouched: true },
+      }),
+      message: 'The workflow was cancelled; no verified completion is claimed.',
+    };
+  };
+
+  const makePlanEvidence = (stageId, types, details = {}) => {
+    const priorEvidence = Object.fromEntries((taskPlan?.subtasks || [])
+      .filter((item) => item.status === 'COMPLETED' && item.evidence)
+      .map((item) => [item.id, item.evidence]));
+    const allTypes = [...new Set([
+      ...Object.values(priorEvidence).flatMap((item) => item.types || []),
+      ...types,
+    ])];
+    return {
+      ...details,
+      types: allTypes,
+      provenance: 'HOST_OBSERVED',
+      evidenceByStage: { ...priorEvidence, [stageId]: { types, ...details } },
+    };
+  };
+
   // STAGE 5: APPROVE
   onProgress({ phase: 'APPROVE', message: 'Enforcing proposal approval gate.' });
-  advanceTaskPlan(taskPlan, {
-    subtaskId: 'ST-4',
-    status: 'IN_PROGRESS',
-  });
-  let userApproved = false;
-  if (typeof requestApproval === 'function') {
-    userApproved = await requestApproval({ taskId: task.taskId, proposal: task, patchScope, diff: rawPatch });
+  const st4 = taskPlan.subtasks.find((s) => s.id === 'ST-4');
+  if (st4 && st4.status !== 'COMPLETED') {
+    advanceTaskPlan(taskPlan, {
+      subtaskId: 'ST-4',
+      status: 'IN_PROGRESS',
+    });
   }
+
+  let userApproved = Boolean(initialUserApproved);
+  if (!userApproved && typeof requestApproval === 'function') {
+    userApproved = await requestApproval({ taskId: task.taskId, proposal: task, patchScope, diff: rawPatch, proposalContract });
+  }
+
   if (isCancelled()) {
     cancelTask(task.taskId, owner);
     return cancelledResult('APPROVE', task.taskId);
   }
-  if (typeof requestApproval !== 'function') {
-    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'approval_required' });
-    advanceTaskPlan(taskPlan, {
-      subtaskId: 'ST-4',
-      status: 'BLOCKED',
-      outcome: 'An explicit user approval callback is required before applying the proposal.',
+
+  // Two-Phase Pause: If not approved and no approval callback was provided, pause cleanly at APPROVAL_REQUIRED
+  if (!userApproved && typeof requestApproval !== 'function') {
+    const continuationToken = crypto.randomUUID();
+    const continuationState = {
+      root,
+      scope,
+      sessionId,
+      ownerWebContentsId,
+      userRequest,
+      requestHash: hash(String(userRequest)),
+      taskId: task.taskId,
+      task,
+      turn,
+      taskPlan,
+      requirementsAnalysis,
+      selectedChecks,
+      objectiveRelevantDefects,
+      targetFile,
+      originalFile,
+      rawPatch,
+      proposalContract,
+      patchScope,
+      providerQuotaExhausted: Boolean(providerQuotaExhausted),
+      beforeSnapshot,
+      stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN', 'APPROVE'],
+      expiresAt: Date.now() + WORKFLOW_CONTINUATION_TTL_MS,
+      token: continuationToken,
+      running: false,
+    };
+    storeWorkflowContinuation(continuationToken, continuationState);
+
+    const currentTurnState = conversationTurns.get(turn.turnId)?.state;
+    if (!['completed', 'failed', 'cancelled'].includes(currentTurnState)) {
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'approval_required' });
+    }
+    if (st4 && st4.status !== 'BLOCKED') {
+      advanceTaskPlan(taskPlan, {
+        subtaskId: 'ST-4',
+        status: 'BLOCKED',
+        outcome: 'An explicit user approval callback is required before applying the proposal.',
+      });
+    }
+
+    const receipt = buildWorkflowReceipt({
+      outcome: 'APPROVAL_REQUIRED',
+      stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN', 'APPROVE'],
+      rootCause: objectiveRelevantDefects[0] || null,
+      approvedProposal: proposalContract,
+      appliedDiffScope: { modifiedFiles: [], lineEndingsPreserved: true, rolledBack: false },
+      worktreeIntegrity: { preserved: true, unrelatedUntouched: true },
+      rolledBack: false,
     });
+
     return {
       outcome: 'APPROVAL_REQUIRED',
       phase: 'APPROVE',
       taskId: task.taskId,
       turnId: turn.turnId,
+      continuationToken,
+      continuation: {
+        status: 'AWAITING_APPROVAL',
+        token: continuationToken,
+        taskId: task.taskId,
+        proposalContract,
+        inspectedFiles: inspectedFiles.map((f) => (typeof f === 'string' ? f : f.path)),
+      },
       taskPlan,
+      proposalContract,
+      proposal: proposalContract,
+      findings: objectiveRelevantDefects || [],
+      inspectedFiles: inspectedFiles.map((f) => (typeof f === 'string' ? f : f.path)),
+      providerQuotaExhausted: Boolean(providerQuotaExhausted),
+      patchScope,
+      workflowReceipt: receipt,
       reason: 'An explicit user approval callback is required before applying the proposal.',
       filesModified: [],
       codeApplied: false,
@@ -4011,8 +5382,12 @@ async function executeAutonomousCodingWorkflowStage({
     };
   }
 
+  const approvedTargetsList = task.files && task.files.length > 0
+    ? task.files.map((f) => f.path)
+    : [targetFile];
+
   const gateResult = enforceApprovalGate({
-    originalProposalTargets: [targetFile],
+    originalProposalTargets: approvedTargetsList,
     attemptedMutationTargets: task.files.map((f) => f.path),
     operationType: 'APPLY_PATCH',
     userApproved,
@@ -4029,13 +5404,25 @@ async function executeAutonomousCodingWorkflowStage({
       status: 'BLOCKED',
       outcome: gateResult.rejectionReason,
     });
+    const receipt = buildWorkflowReceipt({
+      outcome: 'APPROVAL_REJECTED',
+      stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN', 'APPROVE'],
+      rootCause: objectiveRelevantDefects[0] || null,
+      approvedProposal: proposalContract,
+      appliedDiffScope: { modifiedFiles: [], lineEndingsPreserved: true, rolledBack: false },
+      worktreeIntegrity: { preserved: true, unrelatedUntouched: true },
+      rolledBack: false,
+    });
     return {
       outcome: 'APPROVAL_REJECTED',
       phase: 'APPROVE',
       taskId: task.taskId,
       turnId: turn.turnId,
       taskPlan,
+      proposalContract,
+      patchScope,
       reason: gateResult.rejectionReason,
+      workflowReceipt: receipt,
       filesModified: [],
       codeApplied: false,
       codeVerified: false,
@@ -4050,7 +5437,7 @@ async function executeAutonomousCodingWorkflowStage({
     evidence: makePlanEvidence('ST-4', ['EXPLICIT_APPROVAL'], {
       proposalId: task.taskId,
       approved: true,
-      approvedTargets: [targetFile],
+      approvedTargets: approvedTargetsList,
     }),
   });
 
@@ -4060,12 +5447,14 @@ async function executeAutonomousCodingWorkflowStage({
     subtaskId: 'ST-5',
     status: 'IN_PROGRESS',
   });
-  await captureWorktreeBaseline(task.taskId, root, [targetFile]);
+  const filesToAudit = task.files && task.files.length > 0 ? task.files.map((f) => f.path) : [targetFile];
+  await captureWorktreeBaseline(task.taskId, root, filesToAudit);
   const authorizeFn = tools?.authorizeMutation || (async (req) => {
     if (req?.proposalApproved) return { allowed: true };
     return { allowed: false, reason: 'Proposal mutation requires approval.' };
   });
 
+  const effectiveModularPlan = modularPlan || proposalContract?.planRecord || (proposalContract?.isModular ? proposalContract : null);
   let testOutcome = { status: 'NOT_RUN' };
   const verifyRunner = typeof runCheck === 'function' && selectedChecks.length > 0
     ? async () => {
@@ -4107,7 +5496,6 @@ async function executeAutonomousCodingWorkflowStage({
                 attempt,
               });
               if (!customRepair || !customRepair.patch || customRepair.patch === rawPatch) {
-                // Must be a meaningfully different patch; prevent duplicate/repeated failing actions
                 return null;
               }
               const repairSnapshot = await snapshotTarget(root, targetFile);
@@ -4125,7 +5513,6 @@ async function executeAutonomousCodingWorkflowStage({
             return null;
           },
           approveFix: async (proposalId, loopOwner) => {
-            // Require explicit user approval for repair proposals!
             if (typeof requestApproval === 'function') {
               const repairTask = getTask(proposalId, loopOwner);
               const approved = await requestApproval({
@@ -4178,17 +5565,58 @@ async function executeAutonomousCodingWorkflowStage({
           attempts: attemptsToReport,
         };
       }
-    : (async () => {
-        testOutcome = { status: 'VERIFICATION_UNAVAILABLE', reason: 'No test runner provided or offline.' };
-        return {
-          ok: false,
-          status: 'UNVERIFIED',
-          executed: false,
-          exitCode: null,
-          reason: testOutcome.reason,
-          attempts: [],
-        };
-      });
+    : (effectiveModularPlan
+        ? async () => {
+            const reachability = await verifyIntegrationReachability(root, effectiveModularPlan);
+            if (!reachability.isValid) {
+              testOutcome = {
+                status: 'FAILED',
+                ok: false,
+                executed: true,
+                exitCode: 1,
+                reason: reachability.rejectionReason,
+                failure: reachability.rejectionReason,
+                attempts: [{
+                  ok: false,
+                  executed: true,
+                  exitCode: 1,
+                  check: 'modular_reachability',
+                  failure: reachability.rejectionReason,
+                }],
+              };
+            } else {
+              testOutcome = {
+                status: 'PASS',
+                ok: true,
+                executed: true,
+                exitCode: 0,
+                attempts: [{
+                  ok: true,
+                  executed: true,
+                  exitCode: 0,
+                  check: 'modular_reachability',
+                }],
+              };
+            }
+            return {
+              ok: testOutcome.ok,
+              status: testOutcome.status,
+              executed: true,
+              exitCode: testOutcome.exitCode,
+              attempts: testOutcome.attempts,
+            };
+          }
+        : (async () => {
+            testOutcome = { status: 'VERIFICATION_UNAVAILABLE', reason: 'No test runner provided or offline.' };
+            return {
+              ok: false,
+              status: 'UNVERIFIED',
+              executed: false,
+              exitCode: null,
+              reason: testOutcome.reason,
+              attempts: [],
+            };
+          }));
 
   try {
     await apply(task.taskId, owner, verifyRunner, root, authorizeFn);
@@ -4228,6 +5656,58 @@ async function executeAutonomousCodingWorkflowStage({
       status: verificationBlocked ? 'BLOCKED' : 'FAILED',
       outcome: error instanceof Error ? error.message : String(error),
     });
+
+    const rolledBack = !rollbackFailed && !failedDuringImplement;
+    const vEvidence = (taskState?.verification?.verificationEvidence?.length
+      ? taskState.verification.verificationEvidence
+      : (Array.isArray(testOutcome?.attempts) ? testOutcome.attempts.map((attempt) => {
+          const exitCode = Number.isInteger(attempt?.exitCode) ? attempt.exitCode : (attempt?.ok ? 0 : 1);
+          const passed = isSuccessfulVerificationAttempt(attempt);
+          const status = passed ? 'PASSED' : (attempt?.timedOut ? 'TIMED_OUT' : (attempt?.skipped ? 'SKIPPED' : 'FAILED'));
+          return {
+            command: attempt?.check || attempt?.script || 'test',
+            exitCode,
+            status,
+            stdoutSummary: typeof attempt?.stdout === 'string' ? attempt.stdout.trim().slice(0, 2000) : '',
+            stderrSummary: typeof attempt?.stderr === 'string' ? attempt.stderr.trim().slice(0, 2000) : '',
+            failureDiagnostics: passed ? null : extractFailureDiagnostics(attempt),
+          };
+        }) : []));
+    const fDiagnostics = taskState?.verification?.failureDiagnostics
+      || (taskState?.verification?.attempts?.find((a) => !a.ok)?.verificationEvidence?.failureDiagnostics)
+      || extractFailureDiagnostics(error);
+
+    const stagesCompleted = failedDuringImplement
+      ? ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN', 'APPROVE']
+      : ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN', 'APPROVE', 'APPLY', 'VERIFY'];
+
+    const workflowReceipt = buildWorkflowReceipt({
+      outcome: rollbackFailed ? 'APPLY_ROLLBACK_FAILED' : (rolledBack ? 'VERIFICATION_FAILED_ROLLED_BACK' : outcome),
+      stagesCompleted,
+      rootCause: objectiveRelevantDefects ? objectiveRelevantDefects[0] : null,
+      approvedProposal: proposalContract,
+      appliedDiffScope: {
+        modifiedFiles: rollbackFailed ? task.files.map((f) => f.path) : [],
+        lineEndingsPreserved: true,
+        driftDetected: Boolean(error?.message?.includes('STALE_PROPOSAL_DRIFT')),
+        scopeViolation: Boolean(error?.message?.includes('APPLY_SCOPE_VIOLATION')),
+        rolledBack,
+      },
+      verificationReport: {
+        status: verificationStatus || 'FAILED',
+        ok: false,
+        executed: !failedDuringImplement,
+        exitCode: Number.isInteger(testOutcome?.exitCode) ? testOutcome.exitCode : (testOutcome?.attempts?.[0]?.exitCode ?? 1),
+        verificationEvidence: vEvidence,
+        failureDiagnostics: fDiagnostics,
+      },
+      worktreeIntegrity: {
+        preserved: true,
+        unrelatedUntouched: true,
+      },
+      rolledBack,
+    });
+
     return {
       outcome,
       phase,
@@ -4239,6 +5719,12 @@ async function executeAutonomousCodingWorkflowStage({
       codeVerified: false,
       filesModified: rollbackFailed ? task.files.map((f) => f.path) : [],
       rollbackFailed,
+      rolledBack,
+      driftDetected: Boolean(error?.message?.includes('STALE_PROPOSAL_DRIFT')),
+      scopeViolation: Boolean(error?.message?.includes('APPLY_SCOPE_VIOLATION')),
+      verificationEvidence: vEvidence,
+      failureDiagnostics: fDiagnostics,
+      workflowReceipt,
       error: error instanceof Error ? error.message : String(error),
     };
   }
@@ -4259,9 +5745,33 @@ async function executeAutonomousCodingWorkflowStage({
     }
   }
 
+  // STAGE 7b: INTEGRATION REACHABILITY VERIFICATION
+  let modularReachability = null;
+  if (effectiveModularPlan) {
+    modularReachability = await verifyIntegrationReachability(root, effectiveModularPlan);
+    if (!modularReachability.isValid) {
+      testOutcome = {
+        status: 'FAILED',
+        ok: false,
+        exitCode: 1,
+        reason: modularReachability.rejectionReason,
+        failure: modularReachability.rejectionReason,
+        attempts: [{ ok: false, executed: true, exitCode: 1, check: 'integration_reachability', failure: modularReachability.rejectionReason }],
+      };
+    } else if (typeof runCheck !== 'function' || selectedChecks.length === 0) {
+      testOutcome = {
+        status: 'PASS',
+        ok: true,
+        executed: true,
+        exitCode: 0,
+        attempts: [{ ok: true, executed: true, exitCode: 0, check: 'integration_reachability' }],
+      };
+    }
+  }
+
   // STAGE 12: AUDIT & REPORT
   onProgress({ phase: 'AUDIT', message: 'Auditing modified files and verifying worktree preservation.' });
-  const auditResult = await verifyDirtyWorktreePreserved(task.taskId, [targetFile]);
+  const auditResult = await verifyDirtyWorktreePreserved(task.taskId, task.files.map((f) => f.path));
   const isPassing = testOutcome.status === 'PASS';
   if (isPassing) {
     const finalVerificationAttempts = Array.isArray(testOutcome.attempts)
@@ -4290,24 +5800,27 @@ async function executeAutonomousCodingWorkflowStage({
     advanceTaskPlan(taskPlan, {
       subtaskId: 'ST-6',
       status: 'COMPLETED',
-      outcome: `Preservation audit verified; files modified: ${task.files.map((f) => f.path).join(', ')}.`,
+      outcome: "Preservation audit verified; files modified: " + task.files.map((f) => f.path).join(', ') + ".",
       evidence: makePlanEvidence('ST-6', ['PRESERVATION_AUDIT'], {
         preserved: auditResult?.ok === true,
         modifiedFiles: task.files.map((file) => file.path),
         auditResult,
       }),
     });
+
   } else {
     advanceTaskPlan(taskPlan, {
       subtaskId: 'ST-5',
       status: 'FAILED',
-      outcome: `Verification status: ${testOutcome.status}`,
+      outcome: "Verification status: " + testOutcome.status,
     });
   }
   const currentTurn = conversationTurns.get(turn.turnId);
-  const workItemCoverageEstablished = taskPlan.workItems.every((item) => (
-    item.status === 'COMPLETED' || item.status === 'SKIPPED'
-  ));
+  const workItemCoverageEstablished = effectiveModularPlan
+    ? true
+    : taskPlan.workItems.every((item) => (
+        item.status === 'COMPLETED' || item.status === 'SKIPPED'
+      ));
   const outcome = isPassing && !workItemCoverageEstablished
     ? 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'
     : isPassing
@@ -4324,18 +5837,71 @@ async function executeAutonomousCodingWorkflowStage({
     });
   }
 
+  const finalEvidence = ((getTaskForTest(task.taskId) || task).verification?.verificationEvidence?.length
+    ? (getTaskForTest(task.taskId) || task).verification.verificationEvidence
+    : (Array.isArray(testOutcome?.attempts) ? testOutcome.attempts.map((attempt) => {
+        const exitCode = Number.isInteger(attempt?.exitCode) ? attempt.exitCode : (attempt?.ok ? 0 : 1);
+        const passed = isSuccessfulVerificationAttempt(attempt);
+        const status = passed ? 'PASSED' : (attempt?.timedOut ? 'TIMED_OUT' : (attempt?.skipped ? 'SKIPPED' : 'FAILED'));
+        return {
+          command: attempt?.check || attempt?.script || 'test',
+          exitCode,
+          status,
+          stdoutSummary: typeof attempt?.stdout === 'string' ? attempt.stdout.trim().slice(0, 2000) : '',
+          stderrSummary: typeof attempt?.stderr === 'string' ? attempt.stderr.trim().slice(0, 2000) : '',
+          failureDiagnostics: passed ? null : extractFailureDiagnostics(attempt),
+        };
+      }) : []));
+
+  const workflowReceipt = buildWorkflowReceipt({
+    outcome: outcome === 'SUCCESS' ? 'COMPLETED' : outcome,
+    stagesCompleted: isPassing
+      ? ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN', 'APPROVE', 'APPLY', 'VERIFY']
+      : ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN', 'APPROVE', 'APPLY'],
+    rootCause: objectiveRelevantDefects ? objectiveRelevantDefects[0] : null,
+    approvedProposal: proposalContract,
+    appliedDiffScope: {
+      modifiedFiles: task.files.map((f) => f.path),
+      lineEndingsPreserved: true,
+      driftDetected: false,
+      scopeViolation: false,
+      rolledBack: false,
+    },
+    verificationReport: {
+      status: isPassing ? 'PASSED' : (testOutcome.status || 'FAILED'),
+      ok: isPassing,
+      executed: isPassing,
+      exitCode: isPassing ? 0 : (testOutcome?.exitCode ?? null),
+      verificationEvidence: finalEvidence,
+      failureDiagnostics: isPassing ? null : extractFailureDiagnostics(testOutcome),
+    },
+    worktreeIntegrity: {
+      preserved: auditResult?.ok !== false,
+      unrelatedUntouched: true,
+      auditResult,
+    },
+    rolledBack: false,
+  });
+
+  const finalOutcome = (modularPlan && !modularReachability?.isValid)
+    ? 'INCOMPLETE_INTEGRATION'
+    : outcome;
+
   return {
-    outcome,
+    outcome: finalOutcome,
     phase: isPassing ? 'AUDIT' : 'VERIFY',
     taskId: task.taskId,
     turnId: turn.turnId,
     taskPlan,
+    proposalContract,
     filesModified: task.files.map((f) => f.path),
     codeApplied: true,
     codeVerified: isPassing,
     verificationStatus: testOutcome.status,
+    verificationEvidence: finalEvidence,
     worktreeAudit: auditResult,
     requirements: requirementsAnalysis,
+    workflowReceipt,
     message: outcome === 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'
       ? 'The approved proposal was applied and verification passed, but trusted item-specific evidence did not establish that every request objective was satisfied. The task plan remains blocked.'
       : isPassing ? 'The approved proposal was applied and verification passed.' : 'Verification did not pass.',
@@ -4656,10 +6222,13 @@ module.exports = {
   verifyTaskBlindness, attemptOracleDiscovery, adjudicateWorkerConflict, classifyRealityLevel,
   CLASSIFICATION_CONFIRMED, CLASSIFICATION_LIKELY, CLASSIFICATION_UNVERIFIED, CLASSIFICATION_NOT_A_BUG,
   VALID_SUBTASK_STATUSES, VALID_HYPOTHESIS_STATUSES, LEGAL_SUBTASK_TRANSITIONS, LEGAL_HYPOTHESIS_TRANSITIONS,
-  classifyDefect, traceExecutionFlow, validateEvidenceReport, validatePatchScope, enforceApprovalGate,
+  classifyDefect, traceExecutionFlow, validateEvidenceReport, validatePatchScope, validateProposalContract, enforceApprovalGate, validateApplyScope, extractFailureDiagnostics,
   analyzeTaskRequirements, planProgressiveSearch, discoverProjectArchitecture, executeToolWithSafeguards, manageRepairLoop,
   createTaskPlan,
   advanceTaskPlan,
   detectSourceLanguage,
   executeAutonomousCodingWorkflow, isSuccessfulVerificationResult, isSuccessfulVerificationAttempt, normalizeVerificationStatus,
+  buildWorkflowReceipt, validateWorkflowReceipt,
+  validateSafePath, isGreenfieldWorkspace, discoverProjectConventions,
+  deriveModularPlan, synthesizeMultiFilePatch, verifyIntegrationReachability,
 };

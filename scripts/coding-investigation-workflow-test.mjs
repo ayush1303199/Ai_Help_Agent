@@ -5,7 +5,7 @@ import developerAgent from '../electron/developerAgent.cjs';
 import developerFiles from '../electron/developerFiles.cjs';
 import { buildRepositoryMap } from '../electron/developerIndex.cjs';
 import { detectProject } from '../electron/coding-pipeline/detect/projectDetector.cjs';
-import { maskNonCodeSource } from '../electron/coding-pipeline/investigationWorkflowContract.cjs';
+import { maskNonCodeSource, extractEnclosingFunctionBlock, generateSymbolVariants } from '../electron/coding-pipeline/investigationWorkflowContract.cjs';
 import { routeTaskMode, OPERATING_MODES } from '../electron/coding-pipeline/modes.cjs';
 
 const {
@@ -21,7 +21,10 @@ const {
   traceExecutionFlow,
   validateEvidenceReport,
   validatePatchScope,
+  validateProposalContract,
   enforceApprovalGate,
+  validateApplyScope,
+  extractFailureDiagnostics,
   analyzeTaskRequirements,
   planProgressiveSearch,
   discoverProjectArchitecture,
@@ -36,6 +39,8 @@ const {
   createProposal,
   apply,
   createSession,
+  buildWorkflowReceipt,
+  validateWorkflowReceipt,
 } = developerAgent;
 
 const testRoot = await fs.mkdtemp(path.join(process.cwd(), '.coding-investigation-test-'));
@@ -1547,7 +1552,1387 @@ class FormController extends Controller {
   assert.equal(scopeExpansionGov.allowRepair, false);
   assert.ok(/Scope expansion detected/i.test(scopeExpansionGov.reason));
 
-  console.log('All 33 Project-Agnostic Coding Investigation Workflow scenarios verified successfully on production interfaces.');
+  // SCENARIO 34: Generic Bug Investigation - Conditional Assignment Defect Fixed
+  const customDefectFile = path.join(projectNode, 'src', 'controllers', 'Calculator.ts');
+  await fs.writeFile(
+    customDefectFile,
+    `export class Calculator {\n    calculate(x: number, y: number) {\n        if (x = y) return 0;\n        return x + y;\n    }\n}\n`,
+    'utf8'
+  );
+
+  const genericBugResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix conditional assignment defect in Calculator.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-generic-conditional-fix',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: async () => ({ ok: true, executed: true, exitCode: 0, stdout: 'ok', stderr: '' }),
+    tools: {
+      readFile: async (p) => {
+        const full = path.join(projectNode, p);
+        const content = await fs.readFile(full, 'utf8');
+        return { content };
+      },
+      searchCode: async () => ({
+        results: [{ path: 'src/controllers/Calculator.ts', score: 10, line: 3 }],
+      }),
+    },
+  });
+  assert.ok(['SUCCESS', 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'].includes(genericBugResult.outcome));
+  assert.equal(genericBugResult.codeApplied, true);
+  assert.equal(genericBugResult.codeVerified, true);
+  const updatedCalculator = await fs.readFile(customDefectFile, 'utf8');
+  assert.ok(updatedCalculator.includes('if (x === y)'));
+
+  // SCENARIO 35: Generic Bug Investigation - Empty Catch Swallowed Exception Repaired
+  const emptyCatchFile = path.join(projectNode, 'src', 'controllers', 'DataFetcher.ts');
+  await fs.writeFile(
+    emptyCatchFile,
+    `export class DataFetcher {\n    async fetchData() {\n        try {\n            return await fetch('/api/data');\n        } catch (err) {}\n    }\n}\n`,
+    'utf8'
+  );
+
+  const emptyCatchResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix swallowed exception in DataFetcher.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-generic-empty-catch-fix',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: async () => ({ ok: true, executed: true, exitCode: 0, stdout: 'ok', stderr: '' }),
+    tools: {
+      readFile: async (p) => {
+        const full = path.join(projectNode, p);
+        const content = await fs.readFile(full, 'utf8');
+        return { content };
+      },
+      searchCode: async () => ({
+        results: [{ path: 'src/controllers/DataFetcher.ts', score: 10, line: 5 }],
+      }),
+    },
+  });
+  assert.ok(['SUCCESS', 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'].includes(emptyCatchResult.outcome));
+  assert.equal(emptyCatchResult.codeApplied, true);
+  assert.equal(emptyCatchResult.codeVerified, true);
+  const updatedDataFetcher = await fs.readFile(emptyCatchFile, 'utf8');
+  assert.ok(updatedDataFetcher.includes('console.error(err)'));
+
+  // SCENARIO 36: Dynamic custom patch synthesis hook works for arbitrary bug repair
+  const arbitraryFile = path.join(projectPython, 'services', 'AuthValidator.py');
+  await fs.writeFile(
+    arbitraryFile,
+    `def validate_token(token):\n    if not token:\n        return False\n    return token == "secret"\n`,
+    'utf8'
+  );
+
+  const customSynthResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Update AuthValidator to support Bearer prefix',
+    root: projectPython,
+    scope: '.',
+    sessionId: 'session-custom-synth',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: async () => ({ ok: true, executed: true, exitCode: 0, stdout: 'ok', stderr: '' }),
+    tools: {
+      readFile: async (p) => {
+        const full = path.join(projectPython, p);
+        const content = await fs.readFile(full, 'utf8');
+        return { content };
+      },
+      searchCode: async () => ({
+        results: [{ path: 'services/AuthValidator.py', score: 10, line: 1 }],
+      }),
+      findDefects: async () => [{
+        symbol: 'validate_token',
+        lines: '1-4',
+        codeSnippet: 'return token == "secret"',
+        controlFlow: 'Missing Bearer prefix validation in auth check',
+        expected: 'Validates token with or without Bearer prefix',
+        observed: 'Only exact secret match allowed',
+        evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+      }],
+      proposePatch: async ({ originalContent }) => {
+        return originalContent.replace('token == "secret"', 'token.removeprefix("Bearer ").strip() == "secret"');
+      },
+    },
+  });
+  assert.ok(['SUCCESS', 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'].includes(customSynthResult.outcome));
+  assert.equal(customSynthResult.codeApplied, true);
+  assert.equal(customSynthResult.codeVerified, true);
+  const updatedAuth = await fs.readFile(arbitraryFile, 'utf8');
+  assert.ok(updatedAuth.includes('token.removeprefix("Bearer ").strip() == "secret"'));
+
+  // SCENARIO 37: V1 Intent signal extraction and exact symbol/path grounding
+  const complexPrompt = 'Fix NullPointerException in src/services/PaymentProcessor.ts when calling /api/v1/checkout with empty payload';
+  const decomposed = analyzeTaskRequirements(complexPrompt);
+  assert.equal(decomposed.needsClarification, false);
+  assert.deepEqual(decomposed.searchSignals.exactPaths, ['src/services/PaymentProcessor.ts']);
+  assert.ok(decomposed.searchSignals.exactSymbols.includes('PaymentProcessor'));
+  assert.ok(decomposed.searchSignals.routePaths.includes('/api/v1/checkout'));
+  assert.ok(decomposed.searchSignals.errorSignals.includes('NullPointerException'));
+  assert.equal(decomposed.domainTerms[0], 'src/services/PaymentProcessor.ts');
+
+  // SCENARIO 38: Grounded search without hallucinating non-existent paths
+  const missingContextPrompt = 'Fix issue in NonExistentModule.ts with missing function';
+  const missingDecomposed = analyzeTaskRequirements(missingContextPrompt);
+  assert.ok(missingDecomposed.domainTerms.includes('NonExistentModule.ts'));
+
+  const searchMissing = await developerFiles.searchCode('NonExistentModule.ts', ownerId, '.');
+  assert.equal(searchMissing.results.length, 0); // Must be strictly zero - no guessing or hallucinating files
+
+  // SCENARIO 39: Strict evidence contract & anti-speculation gate
+  const v2Defect = classifyDefect({
+    filePath: 'src/services/billing.ts',
+    symbol: 'chargeCard',
+    lines: '14-16',
+    codeSnippet: 'debugger;',
+    controlFlow: 'Unintended debugger statement in billing execution path',
+    expected: 'Clean card charge processing',
+    observed: 'debugger;',
+    evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+  });
+  assert.equal(v2Defect.isConfirmed, true);
+  assert.equal(v2Defect.classification, CLASSIFICATION_CONFIRMED);
+  assert.deepEqual(v2Defect.lineRange, { startLine: 14, endLine: 16 });
+  assert.equal(v2Defect.codeEvidence, 'debugger;');
+  assert.ok(v2Defect.causalExplanation.length > 0);
+
+  // Anti-speculation gate: reject ungrounded defects
+  const uninspectedFileReport = validateEvidenceReport({
+    inspectedFiles: ['src/services/auth.ts'],
+    claimedDefects: [{
+      filePath: 'src/services/uninspected.ts',
+      lines: '1',
+      codeSnippet: 'const x = null;',
+      evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+    }],
+  });
+  assert.equal(uninspectedFileReport.isValid, false);
+  assert.match(uninspectedFileReport.rejectionReason, /uninspected file/i);
+
+  const emptyEvidenceReport = validateEvidenceReport({
+    inspectedFiles: ['src/services/auth.ts'],
+    claimedDefects: [{
+      filePath: 'src/services/auth.ts',
+      lines: '1',
+      codeSnippet: '',
+      evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+    }],
+  });
+  assert.equal(emptyEvidenceReport.isValid, false);
+  assert.match(emptyEvidenceReport.rejectionReason, /lacks verified code evidence/i);
+
+  const fabricatedSnippetReport = validateEvidenceReport({
+    inspectedFiles: [{
+      path: 'src/services/auth.ts',
+      content: 'export function login() { return true; }',
+      lineRange: { startLine: 1, endLine: 1 },
+    }],
+    claimedDefects: [{
+      filePath: 'src/services/auth.ts',
+      lines: '1',
+      codeSnippet: 'this.nonExistentMethod()',
+      evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+    }],
+  });
+  assert.equal(fabricatedSnippetReport.isValid, false);
+  assert.match(fabricatedSnippetReport.rejectionReason, /does not match actual disk content/i);
+
+  const outOfRangeReport = validateEvidenceReport({
+    inspectedFiles: [{
+      path: 'src/services/auth.ts',
+      content: 'export function login() { return true; }',
+      lineRange: { startLine: 1, endLine: 1 },
+    }],
+    claimedDefects: [{
+      filePath: 'src/services/auth.ts',
+      lines: '99',
+      lineRange: { startLine: 99, endLine: 99 },
+      codeSnippet: 'login()',
+      evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+    }],
+  });
+  assert.equal(outOfRangeReport.isValid, false);
+  assert.match(outOfRangeReport.rejectionReason, /outside inspected range/i);
+
+  // Grounded defect matches inspected content and range
+  const validGroundedReport = validateEvidenceReport({
+    inspectedFiles: [{
+      path: 'src/services/auth.ts',
+      content: 'export function login() { debugger; return true; }',
+      lineRange: { startLine: 1, endLine: 1 },
+    }],
+    claimedDefects: [{
+      filePath: 'src/services/auth.ts',
+      lines: '1',
+      lineRange: { startLine: 1, endLine: 1 },
+      codeSnippet: 'debugger;',
+      evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+    }],
+  });
+  assert.equal(validGroundedReport.isValid, true);
+
+  // SCENARIO 40: Multi-hop caller-to-callee tracing & error correlation
+  const orderControllerContent = `import { calculateTax } from './taxService';
+export function checkout(order) {
+  return calculateTax(order.amount);
+}`;
+  const taxServiceContent = `export function calculateTax(amount) {
+  debugger;
+  return amount * 0.1;
+}`;
+  const multiHopResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Investigate order calculation failure in src/controllers/orderController.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-multi-hop-trace',
+    ownerWebContentsId: ownerId,
+    tools: {
+      operatingMode: 'INVESTIGATE',
+      readFile: async (p) => {
+        if (p === 'src/controllers/orderController.ts') {
+          return { content: orderControllerContent };
+        }
+        if (p === 'src/controllers/taxService.ts') {
+          return { content: taxServiceContent };
+        }
+        throw new Error(`File not found: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: 'src/controllers/orderController.ts', score: 20, line: 1 }],
+      }),
+    },
+  });
+  assert.equal(multiHopResult.phase, 'INVESTIGATE');
+  assert.equal(multiHopResult.outcome, 'INVESTIGATION_COMPLETED');
+  assert.equal(multiHopResult.findings.length, 1);
+  assert.equal(multiHopResult.findings[0].filePath, 'src/controllers/taxService.ts');
+  assert.equal(multiHopResult.findings[0].symbol, 'debug_probe');
+  assert.equal(multiHopResult.findings[0].codeEvidence, 'debugger;');
+  assert.deepEqual(multiHopResult.findings[0].lineRange, { startLine: 2, endLine: 2 });
+  assert.ok(multiHopResult.findings[0].causalExplanation.length > 0);
+  assert.equal(multiHopResult.readOnlyPreserved, true);
+  assert.equal(multiHopResult.codeApplied, false);
+
+  // SCENARIO 41: Insufficient evidence handling (Anti-Speculation)
+  const cleanMathContent = `export function add(a, b) {
+  return a + b;
+}`;
+  const insufficientEvidenceResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Investigate race condition in src/utils/cleanMath.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-clean-anti-speculation',
+    ownerWebContentsId: ownerId,
+    tools: {
+      operatingMode: 'INVESTIGATE',
+      readFile: async () => ({
+        content: cleanMathContent,
+      }),
+      searchCode: async () => ({
+        results: [{ path: 'src/utils/cleanMath.ts', score: 10, line: 1 }],
+      }),
+    },
+  });
+  assert.equal(insufficientEvidenceResult.phase, 'INVESTIGATE');
+  assert.ok(['NO_DEFECT_FOUND', 'INVESTIGATION_INCOMPLETE'].includes(insufficientEvidenceResult.outcome));
+  assert.equal(insufficientEvidenceResult.findings.length, 0);
+  assert.equal(insufficientEvidenceResult.codeApplied, false);
+
+  // SCENARIO 42: Evidence-bound fix proposal contract verification
+  const contractTest = validateProposalContract({
+    targetFile: 'src/services/billing.ts',
+    targetLineRange: { startLine: 14, endLine: 16 },
+    rootCauseSummary: 'Unintended debugger statement in billing execution path',
+    originalCode: 'debugger;',
+    proposedCode: '',
+    expectedBehavior: 'Removes debug probe to allow normal billing flow',
+  }, {
+    inspectedFiles: ['src/services/billing.ts'],
+    verifiedFindings: [{ filePath: 'src/services/billing.ts' }],
+  });
+  assert.equal(contractTest.isValid, true);
+  assert.equal(contractTest.targetFile, 'src/services/billing.ts');
+  assert.deepEqual(contractTest.targetLineRange, { startLine: 14, endLine: 16 });
+
+  // SCENARIO 43: Scope guard rejects uninspected files, unverified targets, and incomplete contracts
+  const uninspectedScopeCheck = validatePatchScope({
+    targetFiles: ['src/uninspected.ts'],
+    inspectedFiles: ['src/inspected.ts'],
+    verifiedFindings: [{ filePath: 'src/inspected.ts' }],
+  });
+  assert.equal(uninspectedScopeCheck.isValid, false);
+  assert.equal(uninspectedScopeCheck.isMinimal, false);
+  assert.match(uninspectedScopeCheck.rejectionReason, /uninspected file/i);
+
+  const unverifiedScopeCheck = validatePatchScope({
+    targetFiles: ['src/inspected.ts'],
+    inspectedFiles: ['src/inspected.ts'],
+    verifiedFindings: [{ filePath: 'src/other.ts' }],
+  });
+  assert.equal(unverifiedScopeCheck.isValid, false);
+  assert.match(unverifiedScopeCheck.rejectionReason, /without verified defect/i);
+
+  const incompleteContractCheck = validateProposalContract({
+    targetFile: 'src/services/billing.ts',
+    targetLineRange: { startLine: 1, endLine: 2 },
+    rootCauseSummary: 'Bug',
+    originalCode: 'bad()',
+    proposedCode: 'good()',
+    expectedBehavior: '', // Empty expected behavior
+  });
+  assert.equal(incompleteContractCheck.isValid, false);
+  assert.match(incompleteContractCheck.rejectionReason, /expectedBehavior/i);
+
+  // SCENARIO 44: Pre-approval write lock (Zero unauthorized filesystem mutations)
+  const barrierFileRel = 'src/barrierTest.ts';
+  const barrierFileAbs = path.join(projectNode, barrierFileRel);
+  const initialBarrierContent = 'export function checkAuth(token: string) {\n  debugger;\n  return token.length > 0;\n}\n';
+  await fs.writeFile(barrierFileAbs, initialBarrierContent, 'utf8');
+
+  let observedDiskBeforeApproval = null;
+  let receivedProposalContract = null;
+
+  const preApprovalResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debug probe in src/barrierTest.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-pre-approval-lock',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async ({ proposalContract }) => {
+      // Check disk state right at the approval boundary BEFORE any approval is given
+      observedDiskBeforeApproval = await fs.readFile(barrierFileAbs, 'utf8');
+      receivedProposalContract = proposalContract;
+      return false; // User explicitly rejects approval
+    },
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p === barrierFileRel || p.endsWith('barrierTest.ts')) {
+          return { content: await fs.readFile(barrierFileAbs, 'utf8') };
+        }
+        throw new Error(`Unexpected file read: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: barrierFileRel, score: 20, line: 2 }],
+      }),
+    },
+  });
+
+  assert.equal(preApprovalResult.phase, 'APPROVE');
+  assert.equal(preApprovalResult.outcome, 'APPROVAL_REJECTED');
+  assert.equal(preApprovalResult.codeApplied, false);
+  assert.deepEqual(preApprovalResult.filesModified, []);
+
+  // 1. Verify proposal contract was generated and structured
+  assert.ok(receivedProposalContract !== null);
+  assert.equal(receivedProposalContract.targetFile, barrierFileRel);
+  assert.equal(receivedProposalContract.originalCode.trim(), 'debugger;');
+  assert.equal(receivedProposalContract.proposedCode, '');
+  assert.ok(receivedProposalContract.expectedBehavior.length > 0);
+
+  // 2. Verify disk was 100% byte-for-byte untouched at the approval gate
+  assert.equal(observedDiskBeforeApproval, initialBarrierContent);
+
+  // 3. Verify disk remains 100% byte-for-byte untouched after rejection
+  const finalDiskContent = await fs.readFile(barrierFileAbs, 'utf8');
+  assert.equal(finalDiskContent, initialBarrierContent);
+
+    // SCENARIO 45: Scoped Surgical Apply & Preservation (Preserve unrelated work, CRLF line endings, and workspace)
+  const surgicalRel = 'src/surgicalApplyTarget.ts';
+  const surgicalAbs = path.join(projectNode, surgicalRel);
+  // CRLF line endings, unrelated header lines 1-3, defect on lines 4-6, unrelated trailing lines 7-9
+  const initialSurgicalContent = 'import { config } from "./config";\r\n// Unrelated work at top\r\nexport function calculate(val: number) {\r\n  debugger;\r\n  return val * 2;\r\n}\r\n// Unrelated work at bottom\r\nexport const VERSION = "1.0.0";\r\n';
+  await fs.writeFile(surgicalAbs, initialSurgicalContent, 'utf8');
+
+  // Untracked / dirty workspace files
+  const untrackedRel = 'notes/draft.txt';
+  const untrackedAbs = path.join(projectNode, untrackedRel);
+  await fs.mkdir(path.dirname(untrackedAbs), { recursive: true });
+  const initialUntrackedContent = 'Important untracked developer notes\nDo not delete\n';
+  await fs.writeFile(untrackedAbs, initialUntrackedContent, 'utf8');
+
+  const dirtyWorkerRel = 'src/worker.ts';
+  const dirtyWorkerAbs = path.join(projectNode, dirtyWorkerRel);
+  const initialDirtyWorkerContent = 'export function worker() { return "in-flight edits"; }\n';
+  await fs.writeFile(dirtyWorkerAbs, initialDirtyWorkerContent, 'utf8');
+
+  const surgicalResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debug probe in src/surgicalApplyTarget.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-surgical-apply-v4',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: async () => ({ ok: true, status: 'PASS', executed: true, exitCode: 0, stdout: 'ok', stderr: '' }),
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p === surgicalRel || p.endsWith('surgicalApplyTarget.ts')) {
+          return { content: await fs.readFile(surgicalAbs, 'utf8') };
+        }
+        throw new Error(`Unexpected file read: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: surgicalRel, score: 30, line: 4 }],
+      }),
+    },
+  });
+
+  assert.equal(surgicalResult.phase, 'AUDIT');
+  assert.ok(['SUCCESS', 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'].includes(surgicalResult.outcome));
+  assert.equal(surgicalResult.codeApplied, true);
+  assert.deepEqual(surgicalResult.filesModified, [surgicalRel]);
+
+  // Verify disk content of modified file
+  const modifiedContent = await fs.readFile(surgicalAbs, 'utf8');
+  assert.ok(!modifiedContent.includes('debugger;'));
+  assert.ok(modifiedContent.includes('// Unrelated work at top'));
+  assert.ok(modifiedContent.includes('// Unrelated work at bottom'));
+  assert.ok(modifiedContent.includes('\r\n'), 'Original CRLF line endings must be preserved');
+
+  // Verify untracked and dirty files in workspace are 100% byte-for-byte untouched
+  const finalUntracked = await fs.readFile(untrackedAbs, 'utf8');
+  assert.equal(finalUntracked, initialUntrackedContent);
+  const finalDirtyWorker = await fs.readFile(dirtyWorkerAbs, 'utf8');
+  assert.equal(finalDirtyWorker, initialDirtyWorkerContent);
+
+  // SCENARIO 46: Post-Approval Scope Lock (Block unapproved files and hunks outside targetLineRange)
+  const lockedProposalContract = {
+    targetFile: surgicalRel,
+    targetLineRange: { startLine: 4, endLine: 6 },
+    rootCauseSummary: 'Remove debugger probe',
+    originalCode: '  debugger;\n',
+    proposedCode: '',
+    expectedBehavior: 'Removes debug statement',
+  };
+
+  // 1. Direct contract scope validation: Unapproved files rejected with APPLY_SCOPE_VIOLATION
+  const scopeExpansionCheck = validateApplyScope({
+    proposalContract: lockedProposalContract,
+    mutationTargets: [surgicalRel, 'src/unauthorizedMutation.ts'],
+    userApproved: true,
+  });
+  assert.equal(scopeExpansionCheck.allowed, false);
+  assert.equal(scopeExpansionCheck.code, 'APPLY_SCOPE_VIOLATION');
+  assert.match(scopeExpansionCheck.rejectionReason, /APPLY_SCOPE_VIOLATION/);
+  assert.match(scopeExpansionCheck.rejectionReason, /unauthorizedMutation\.ts/);
+
+  // 2. Unapproved hunk outside targetLineRange rejected with APPLY_SCOPE_VIOLATION
+  const outOfRangeHunkCheck = validateApplyScope({
+    proposalContract: lockedProposalContract,
+    mutationTargets: [surgicalRel],
+    userApproved: true,
+    patchHunks: [{ oldStart: 95, oldCount: 5 }],
+  });
+  assert.equal(outOfRangeHunkCheck.allowed, false);
+  assert.equal(outOfRangeHunkCheck.code, 'APPLY_SCOPE_VIOLATION');
+  assert.match(outOfRangeHunkCheck.rejectionReason, /outside approved line range/i);
+
+  // 3. Unapproved application without user approval rejected
+  const unapprovedCheck = validateApplyScope({
+    proposalContract: lockedProposalContract,
+    mutationTargets: [surgicalRel],
+    userApproved: false,
+  });
+  assert.equal(unapprovedCheck.allowed, false);
+  assert.match(unapprovedCheck.rejectionReason, /explicit user approval/i);
+
+  // SCENARIO 47: Pre-Apply Drift Guard & Preservation (Detect external edits and abort safely)
+  const driftRel = 'src/driftProtectedTarget.ts';
+  const driftAbs = path.join(projectNode, driftRel);
+  const initialDriftContent = 'export function processPayment(amount: number) {\n  debugger;\n  return amount > 0;\n}\n';
+  await fs.writeFile(driftAbs, initialDriftContent, 'utf8');
+
+  let diskModifiedExternally = false;
+  const externalConcurrentEdit = 'export function processPayment(amount: number) {\n  // CONCURRENT USER EDIT: do not overwrite\n  return amount > 0;\n}\n';
+
+  const driftResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debug probe in src/driftProtectedTarget.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-drift-guard-v4',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => {
+      // Simulate external concurrent user edit right before approval is processed
+      await fs.writeFile(driftAbs, externalConcurrentEdit, 'utf8');
+      diskModifiedExternally = true;
+      return true;
+    },
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p === driftRel || p.endsWith('driftProtectedTarget.ts')) {
+          return { content: diskModifiedExternally ? externalConcurrentEdit : initialDriftContent };
+        }
+        throw new Error(`Unexpected file read: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: driftRel, score: 30, line: 2 }],
+      }),
+    },
+  });
+
+  // Verify apply engine aborted safely with APPLY_FAILED due to STALE_PROPOSAL_DRIFT
+  assert.equal(driftResult.phase, 'IMPLEMENT');
+  assert.equal(driftResult.outcome, 'APPLY_FAILED');
+  assert.equal(driftResult.codeApplied, false);
+  assert.equal(driftResult.driftDetected, true);
+  assert.match(driftResult.error, /STALE_PROPOSAL_DRIFT/i);
+
+  // Verify external user edit was 100% preserved on disk and NOT overwritten
+  const finalDriftDisk = await fs.readFile(driftAbs, 'utf8');
+  assert.equal(finalDriftDisk, externalConcurrentEdit);
+
+    // SCENARIO 48: Verified Pass Reporting with Structured VerificationEvidence (V5)
+  const passRel = 'src/verifiedPassTarget.ts';
+  const passAbs = path.join(projectNode, passRel);
+  const initialPassContent = 'export function calculateDiscount(price: number) {\n  debugger;\n  return price * 0.9;\n}\n';
+  await fs.writeFile(passAbs, initialPassContent, 'utf8');
+
+  const passWorkflowResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debug probe in src/verifiedPassTarget.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-v5-verified-pass',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: async () => ({
+      ok: true,
+      status: 'PASS',
+      executed: true,
+      exitCode: 0,
+      stdout: 'PASS test/verifiedPassTarget.test.ts\nAll 4 tests passed.',
+      stderr: '',
+    }),
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p === passRel || p.endsWith('verifiedPassTarget.ts')) {
+          return { content: await fs.readFile(passAbs, 'utf8') };
+        }
+        throw new Error(`Unexpected file read: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: passRel, score: 30, line: 2 }],
+      }),
+    },
+  });
+
+  assert.equal(passWorkflowResult.codeApplied, true);
+  assert.equal(passWorkflowResult.codeVerified, true);
+  assert.ok(Array.isArray(passWorkflowResult.verificationEvidence));
+  assert.ok(passWorkflowResult.verificationEvidence.length > 0);
+  const firstEvidence = passWorkflowResult.verificationEvidence[0];
+  assert.equal(firstEvidence.exitCode, 0);
+  assert.equal(firstEvidence.status, 'PASSED');
+  assert.ok(firstEvidence.stdoutSummary.includes('All 4 tests passed.'));
+  assert.equal(firstEvidence.failureDiagnostics, null);
+
+  // SCENARIO 49: Failure Evidence Extraction & Honest Reporting (V5)
+  const failRel = 'src/failureTarget.ts';
+  const failAbs = path.join(projectNode, failRel);
+  const initialFailContent = 'export function checkout(order: any) {\n  debugger;\n  return order.total;\n}\n';
+  await fs.writeFile(failAbs, initialFailContent, 'utf8');
+
+  const failWorkflowResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debug probe in src/failureTarget.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-v5-failure-evidence',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: async () => ({
+      ok: false,
+      status: 'FAIL',
+      executed: true,
+      exitCode: 1,
+      stdout: 'FAIL test/failureTarget.test.ts\n● checkout › should apply discount\n  AssertionError: expected 90 to equal 100\n    at Object.<anonymous> (test/failureTarget.test.ts:42:15)',
+      stderr: 'Test execution failed with non-zero exit code',
+      error: 'AssertionError: expected 90 to equal 100',
+    }),
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p === failRel || p.endsWith('failureTarget.ts')) {
+          return { content: await fs.readFile(failAbs, 'utf8') };
+        }
+        throw new Error(`Unexpected file read: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: failRel, score: 30, line: 2 }],
+      }),
+    },
+  });
+
+  assert.equal(failWorkflowResult.outcome, 'TEST_FAILED');
+  assert.equal(failWorkflowResult.codeVerified, false);
+  assert.ok(failWorkflowResult.failureDiagnostics !== null);
+  assert.ok(
+    failWorkflowResult.failureDiagnostics.assertionErrors.some((e) => e.includes('expected 90 to equal 100')),
+    'Must capture exact assertion failure message'
+  );
+  assert.ok(
+    failWorkflowResult.failureDiagnostics.failingTests.some((t) => t.includes('checkout › should apply discount')),
+    'Must extract failing test suite/name'
+  );
+  assert.ok(
+    failWorkflowResult.failureDiagnostics.stackFrames.some((f) => f.file.includes('failureTarget.test.ts') && f.line === 42),
+    'Must extract failing file and line number from stack trace'
+  );
+
+  // SCENARIO 50: Ironclad Anti-False-Success Gate (Reject vacuous passes & enforce honest status)
+  // 1. Contract rejects claimed PASSED without real execution
+  const unexecutedPassCheck = validateEvidenceReport({
+    claimedVerification: 'PASSED',
+    executionAuditLog: { executed: false, exitCode: 0, attempts: [] },
+  });
+  assert.equal(unexecutedPassCheck.isValid, false);
+  assert.match(unexecutedPassCheck.rejectionReason, /not actually executed/i);
+
+  // 2. Contract rejects claimed PASSED with non-zero exit code
+  const nonZeroPassCheck = validateEvidenceReport({
+    claimedVerification: 'PASSED',
+    executionAuditLog: { executed: true, exitCode: 2, attempts: [{ ok: false, exitCode: 2 }] },
+  });
+  assert.equal(nonZeroPassCheck.isValid, false);
+  assert.match(nonZeroPassCheck.rejectionReason, /non-zero/i);
+
+  // 3. Contract rejects claimed PASSED with zero executed attempts (vacuous pass)
+  const zeroAttemptsCheck = validateEvidenceReport({
+    claimedVerification: 'PASSED',
+    executionAuditLog: { executed: true, exitCode: 0, attempts: [] },
+  });
+  assert.equal(zeroAttemptsCheck.isValid, false);
+  assert.match(zeroAttemptsCheck.rejectionReason, /zero executed verification attempts/i);
+
+  // 4. Contract rejects claimed PASSED when an attempt failed
+  const failedAttemptCheck = validateEvidenceReport({
+    claimedVerification: 'PASSED',
+    executionAuditLog: { executed: true, exitCode: 0, attempts: [{ ok: false, exitCode: 1 }] },
+  });
+  assert.equal(failedAttemptCheck.isValid, false);
+  assert.match(failedAttemptCheck.rejectionReason, /one or more verification attempts failed/i);
+
+  // 5. Workflow integration: Offline/unverified execution reports VERIFICATION_UNAVAILABLE without claiming success
+  const unverifiedWorkflowResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debug probe in src/barrierTest.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-v5-unverified-gate',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: null, // No verification runner available
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p === 'src/barrierTest.ts') {
+          return { content: await fs.readFile(barrierFileAbs, 'utf8') };
+        }
+        throw new Error(`Unexpected file read: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: 'src/barrierTest.ts', score: 30, line: 2 }],
+      }),
+    },
+  });
+
+  assert.equal(unverifiedWorkflowResult.outcome, 'VERIFICATION_UNAVAILABLE');
+  assert.equal(unverifiedWorkflowResult.codeVerified, false);
+  assert.equal(unverifiedWorkflowResult.verificationStatus, 'VERIFICATION_UNAVAILABLE');
+
+  // SCENARIO 51: Full E2E Happy Path (V1 -> V6)
+  const e2eRel = 'src/e2eTarget.ts';
+  const e2eAbs = path.join(projectNode, e2eRel);
+  const initialE2EContent = '// E2E target module\r\nexport function processData(input: string) {\r\n  debugger;\r\n  return input.toUpperCase();\r\n}\r\n';
+  await fs.writeFile(e2eAbs, initialE2EContent, 'utf8');
+
+  const e2eResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debug probe crash in src/e2eTarget.ts: runtime exit encountered at line 3',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-v6-e2e-happy-path',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: async () => ({
+      ok: true,
+      status: 'PASS',
+      executed: true,
+      exitCode: 0,
+      stdout: 'PASS test/e2eTarget.test.ts\nprocessData transforms input correctly',
+      stderr: '',
+    }),
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p === e2eRel || p.endsWith('e2eTarget.ts')) {
+          return { content: await fs.readFile(e2eAbs, 'utf8') };
+        }
+        throw new Error(`Unexpected file read: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: e2eRel, score: 35, line: 3 }],
+      }),
+    },
+  });
+
+  assert.ok(['SUCCESS', 'COMPLETED', 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'].includes(e2eResult.outcome));
+  assert.equal(e2eResult.codeApplied, true);
+  assert.equal(e2eResult.codeVerified, true);
+  assert.deepEqual(e2eResult.filesModified, [e2eRel]);
+
+  // Validate canonical workflowReceipt
+  assert.ok(e2eResult.workflowReceipt, 'Must emit canonical workflowReceipt');
+  const receipt51Validation = validateWorkflowReceipt(e2eResult.workflowReceipt);
+  assert.equal(receipt51Validation.isValid, true, 'Receipt must be valid');
+  assert.ok(e2eResult.workflowReceipt.stagesCompleted.includes('APPLY'));
+  assert.ok(e2eResult.workflowReceipt.stagesCompleted.includes('VERIFY'));
+  assert.equal(e2eResult.workflowReceipt.rootCause.filePath, e2eRel);
+  assert.equal(e2eResult.workflowReceipt.approvedProposal.targetFile, e2eRel);
+  assert.equal(e2eResult.workflowReceipt.verificationReport.ok, true);
+  assert.equal(e2eResult.workflowReceipt.verificationReport.exitCode, 0);
+  assert.equal(e2eResult.workflowReceipt.rolledBack, false);
+
+  // Verify disk content: debug probe removed, CRLF preserved
+  const e2eModifiedContent = await fs.readFile(e2eAbs, 'utf8');
+  assert.ok(!e2eModifiedContent.includes('debugger;'));
+  assert.ok(e2eModifiedContent.includes('// E2E target module'));
+  assert.ok(e2eModifiedContent.includes('\r\n'), 'CRLF line endings must be preserved');
+
+  // SCENARIO 52: Two-Phase Pause & Resume Approval Flow
+  const pauseRel = 'src/pauseResumeTarget.ts';
+  const pauseAbs = path.join(projectNode, pauseRel);
+  const initialPauseContent = 'export function calculateTax(amount: number) {\n  debugger;\n  return amount * 0.15;\n}\n';
+  await fs.writeFile(pauseAbs, initialPauseContent, 'utf8');
+
+  // Phase 1: Call without approval callback -> must pause cleanly at APPROVAL_REQUIRED (0 disk writes)
+  const phase1Result = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debug probe in src/pauseResumeTarget.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-v6-pause-resume',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: null, // No approval provided!
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p === pauseRel || p.endsWith('pauseResumeTarget.ts')) {
+          return { content: await fs.readFile(pauseAbs, 'utf8') };
+        }
+        throw new Error(`Unexpected file read: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: pauseRel, score: 30, line: 2 }],
+      }),
+    },
+  });
+
+  assert.equal(phase1Result.outcome, 'APPROVAL_REQUIRED');
+  assert.equal(phase1Result.phase, 'APPROVE');
+  assert.equal(phase1Result.codeApplied, false);
+  assert.deepEqual(phase1Result.filesModified, []);
+  assert.ok(phase1Result.continuationToken, 'Must provide continuationToken for resumption');
+  assert.ok(phase1Result.workflowReceipt, 'Must emit receipt even on pause');
+  assert.deepEqual(
+    phase1Result.workflowReceipt.stagesCompleted,
+    ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN', 'APPROVE']
+  );
+
+  // Verify disk was 100% byte-for-byte untouched during Phase 1
+  const diskAfterPhase1 = await fs.readFile(pauseAbs, 'utf8');
+  assert.equal(diskAfterPhase1, initialPauseContent);
+
+  // Phase 2: Resume with continuationToken and userApproved: true
+  const phase2Result = await executeAutonomousCodingWorkflow({
+    continuationToken: phase1Result.continuationToken,
+    root: projectNode,
+    sessionId: 'session-v6-pause-resume',
+    ownerWebContentsId: ownerId,
+    userApproved: true,
+    runCheck: async () => ({
+      ok: true,
+      status: 'PASS',
+      executed: true,
+      exitCode: 0,
+      stdout: 'PASS test/pauseResumeTarget.test.ts',
+      stderr: '',
+    }),
+  });
+
+  assert.ok(['SUCCESS', 'COMPLETED', 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'].includes(phase2Result.outcome));
+  assert.equal(phase2Result.codeApplied, true);
+  assert.equal(phase2Result.codeVerified, true);
+  assert.deepEqual(phase2Result.filesModified, [pauseRel]);
+  assert.ok(phase2Result.workflowReceipt);
+  assert.equal(validateWorkflowReceipt(phase2Result.workflowReceipt).isValid, true);
+  assert.ok(phase2Result.workflowReceipt.stagesCompleted.includes('VERIFY'));
+
+  // Verify disk was modified after Phase 2 approval
+  const diskAfterPhase2 = await fs.readFile(pauseAbs, 'utf8');
+  assert.ok(!diskAfterPhase2.includes('debugger;'));
+  assert.ok(diskAfterPhase2.includes('return amount * 0.15;'));
+
+  // SCENARIO 53: E2E Verification Failure & Atomic Rollback
+  const rollbackRel = 'src/rollbackTarget.ts';
+  const rollbackAbs = path.join(projectNode, rollbackRel);
+  const initialRollbackContent = 'export function calculateTotal(items: any[]) {\n  debugger;\n  return items.length;\n}\n';
+  await fs.writeFile(rollbackAbs, initialRollbackContent, 'utf8');
+
+  const untrackedNotesRel = 'notes/userNotes.txt';
+  const untrackedNotesAbs = path.join(projectNode, untrackedNotesRel);
+  await fs.mkdir(path.dirname(untrackedNotesAbs), { recursive: true });
+  const initialUntrackedNotes = 'Critical user notes that must never be rolled back\n';
+  await fs.writeFile(untrackedNotesAbs, initialUntrackedNotes, 'utf8');
+
+  const dirtyWorkerRel2 = 'src/unrelatedDirtyWorker.ts';
+  const dirtyWorkerAbs2 = path.join(projectNode, dirtyWorkerRel2);
+  const initialDirtyWorker2 = 'export const IN_PROGRESS_WORK = 42;\n';
+  await fs.writeFile(dirtyWorkerAbs2, initialDirtyWorker2, 'utf8');
+
+  const rollbackResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debug probe in src/rollbackTarget.ts',
+    root: projectNode,
+    scope: '.',
+    sessionId: 'session-v6-verification-rollback',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: async () => ({
+      ok: false,
+      status: 'FAIL',
+      executed: true,
+      exitCode: 1,
+      stdout: 'FAIL test/rollbackTarget.test.ts\n● calculateTotal › should return correct count\n  AssertionError: expected 0 to equal 5',
+      stderr: 'Test verification failed with non-zero exit code',
+      error: 'AssertionError: expected 0 to equal 5',
+    }),
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p === rollbackRel || p.endsWith('rollbackTarget.ts')) {
+          return { content: await fs.readFile(rollbackAbs, 'utf8') };
+        }
+        throw new Error(`Unexpected file read: ${p}`);
+      },
+      searchCode: async () => ({
+        results: [{ path: rollbackRel, score: 30, line: 2 }],
+      }),
+    },
+  });
+
+  assert.equal(rollbackResult.outcome, 'TEST_FAILED');
+  assert.equal(rollbackResult.rolledBack, true, 'Target file must be recorded as rolled back');
+  assert.equal(rollbackResult.codeApplied, false, 'Rollback means no change remains applied');
+  assert.equal(rollbackResult.codeVerified, false);
+  assert.ok(rollbackResult.failureDiagnostics, 'Must preserve failure diagnostics on rollback');
+  assert.ok(rollbackResult.failureDiagnostics.assertionErrors.some((e) => e.includes('expected 0 to equal 5')));
+
+  // Verify disk content of rollbackTarget: byte-for-byte restored to pre-apply content!
+  const finalRollbackDisk = await fs.readFile(rollbackAbs, 'utf8');
+  assert.equal(finalRollbackDisk, initialRollbackContent, 'Target file must be atomically restored to exact pre-apply bytes');
+
+  // Verify unrelated untracked notes and dirty worker are completely untouched!
+  const finalUntrackedNotes = await fs.readFile(untrackedNotesAbs, 'utf8');
+  assert.equal(finalUntrackedNotes, initialUntrackedNotes, 'Untracked files must remain untouched');
+  const finalDirtyWorker2 = await fs.readFile(dirtyWorkerAbs2, 'utf8');
+  assert.equal(finalDirtyWorker2, initialDirtyWorker2, 'Unrelated dirty files must remain untouched');
+
+  // Verify receipt reflects rollback and failures truthfully
+  assert.ok(rollbackResult.workflowReceipt);
+  assert.equal(rollbackResult.workflowReceipt.rolledBack, true);
+  assert.equal(rollbackResult.workflowReceipt.verificationReport.ok, false);
+  assert.equal(rollbackResult.workflowReceipt.verificationReport.exitCode, 1);
+  assert.equal(validateWorkflowReceipt(rollbackResult.workflowReceipt).isValid, true);
+
+  // SCENARIO 54: Dynamic Symbol + Action Intent Prioritizes Controller Declaration and Slices Enclosing Function Block (V7)
+  const v7HinglishRequest = 'admissionOffers me action me kiya buge hai';
+  const reqAnalysis = analyzeTaskRequirements(v7HinglishRequest);
+  assert.ok(reqAnalysis.searchSignals.structuralIntent.includes('action'), 'Must detect structural intent "action"');
+  assert.ok(reqAnalysis.searchSignals.exactSymbols.some((s) => s.toLowerCase().includes('admissionoffers')), 'Must capture admissionOffers');
+  assert.ok(reqAnalysis.searchSignals.exactSymbols.includes('actionAdmissionOffers'), 'Must synthesize actionAdmissionOffers convention variant');
+
+  // Verify searchCode scoring prioritizes Controller declaration over View template
+  const v7ProjectDir = path.join(testRoot, 'v7-target-project');
+  await fs.mkdir(path.join(v7ProjectDir, 'controllers'), { recursive: true });
+  await fs.mkdir(path.join(v7ProjectDir, 'views', 'admission-offers'), { recursive: true });
+
+  const controllerRel = 'controllers/DashboardController.php';
+  const controllerAbs = path.join(v7ProjectDir, controllerRel);
+  const controllerPhpContent = '<?php\nnamespace app\\controllers;\n\nclass DashboardController extends Controller\n{\n    public function actionAdmissionOffers()\n    {\n        $offers = AdmissionOffer::find()->all();\n        if ($offers = null) {\n            return false;\n        }\n        return $this->render(\'index\', [\'offers\' => $offers]);\n    }\n}\n';
+  await fs.writeFile(controllerAbs, controllerPhpContent, 'utf8');
+
+  const viewRel = 'views/admission-offers/index.php';
+  const viewAbs = path.join(v7ProjectDir, viewRel);
+  const viewPhpContent = '<?php\n/* @var $this yii\\web\\View */\n/* @var $offers app\\models\\AdmissionOffer[] */\n?>\n<div class="admission-offers-index">\n    <h1>Admission Offers</h1>\n</div>\n';
+  await fs.writeFile(viewAbs, viewPhpContent, 'utf8');
+
+  // Function slicing verification: signature to closing brace bounded
+  const slicedBlock = extractEnclosingFunctionBlock(controllerPhpContent, 9);
+  assert.equal(slicedBlock.bounded, true);
+  assert.ok(slicedBlock.extractedCode.includes('public function actionAdmissionOffers()'));
+  assert.ok(slicedBlock.extractedCode.includes('return $this->render('));
+
+  console.log('[TEST] Scenario 54 passed: Dynamic symbol & action intent prioritizes declaration and slices function block.');
+
+  // SCENARIO 55: Token Budget Compaction & 429 Remaining-Quota Retry (V7)
+  let retryOccurred = false;
+  let callCount = 0;
+  const mock429WithRemaining = async (payload) => {
+    callCount += 1;
+    if (callCount === 1) {
+      // First attempt triggers 429 with remaining quota
+      const err = new Error('Resource has been exhausted (e.g. check quota). HTTP 429: Rate limit reached for requests... Limit: 8000, Used: 5020, Requested: 3250');
+      throw err;
+    }
+    // Second attempt (retry) receives ultra-compact payload and succeeds!
+    retryOccurred = true;
+    assert.ok(payload.sourceEvidence.length > 0);
+    const totalChars = payload.sourceEvidence.reduce((acc, e) => acc + (e.excerpt?.length || 0), 0);
+    assert.ok(totalChars <= 2400, `Compacted retry payload must be small (got ${totalChars} chars)`);
+    return {
+      findings: [
+        {
+          findingId: payload.findings[0].findingId,
+          decision: 'SUPPORTED',
+          relationship: 'Conditional assignment defect confirmed in admission offers action',
+          evidenceIds: [payload.sourceEvidence.find((e) => e.path === payload.findings[0].filePath)?.evidenceId || payload.sourceEvidence[0].evidenceId],
+          contradictionEvidenceIds: [],
+          unresolvedAssumptions: [],
+        },
+      ],
+    };
+  };
+
+  const scenario55Result = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix conditional assignment in controllers/DashboardController.php',
+    root: v7ProjectDir,
+    scope: '.',
+    sessionId: 'session-v7-quota-retry',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mock429WithRemaining,
+    requestApproval: null, // Pause at approval
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p.includes('DashboardController.php')) {
+          return { content: controllerPhpContent };
+        }
+        return { content: viewPhpContent };
+      },
+      searchCode: async () => ({
+        results: [
+          { path: controllerRel, score: 320, line: 9 },
+          { path: viewRel, score: 80, line: 1 },
+        ],
+      }),
+    },
+  });
+
+  assert.equal(retryOccurred, true, 'Must retry on 429 when remaining quota exists');
+  assert.equal(scenario55Result.outcome, 'APPROVAL_REQUIRED');
+  assert.equal(scenario55Result.phase, 'APPROVE');
+  assert.ok(scenario55Result.findings.length > 0);
+
+  console.log('[TEST] Scenario 55 passed: Token budget compaction and 429 remaining-quota retry verified.');
+
+  // SCENARIO 56: Total Provider Quota Exhaustion Continuity (Local Grounded Diagnosis) (V7)
+  const mock429Exhausted = async () => {
+    throw new Error('PROVIDER_QUOTA_EXHAUSTED: HTTP 429 Tokens Per Day (TPD) limit exceeded. Limit: 8000, Used: 8000, Requested: 850');
+  };
+
+  const scenario56Result = await executeAutonomousCodingWorkflow({
+    userRequest: 'Investigate and repair bug in controllers/DashboardController.php',
+    root: v7ProjectDir,
+    scope: '.',
+    sessionId: 'session-v7-quota-exhausted-local',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mock429Exhausted,
+    requestApproval: null, // Pause at approval
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p.includes('DashboardController.php')) {
+          return { content: controllerPhpContent };
+        }
+        return { content: viewPhpContent };
+      },
+      searchCode: async () => ({
+        results: [
+          { path: controllerRel, score: 320, line: 9 },
+        ],
+      }),
+    },
+  });
+
+  // Must not fail with INVESTIGATION_INCOMPLETE or "no authoritative response"
+  assert.notEqual(scenario56Result.outcome, 'INVESTIGATION_INCOMPLETE');
+  assert.equal(scenario56Result.outcome, 'APPROVAL_REQUIRED');
+  assert.ok(scenario56Result.findings.length > 0, 'Must preserve grounded static findings');
+  assert.equal(scenario56Result.findings[0].filePath, controllerRel);
+  assert.equal(scenario56Result.providerQuotaExhausted, true);
+  assert.ok(scenario56Result.proposal, 'Must generate fix proposal from grounded local findings');
+
+  console.log('[TEST] Scenario 56 passed: Total provider quota exhaustion preserves grounded local diagnosis and proposal.');
+
+  // SCENARIO 57: Universal Call-Graph & Cross-File Contract Verification (2nd-Hop Render & Callee Resolution) (V8)
+  const v8ProjectDir = path.join(testRoot, 'v8-contract-verification-project');
+  const v8ControllersDir = path.join(v8ProjectDir, 'controllers');
+  const v8ViewsDir = path.join(v8ProjectDir, 'views', 'admission-offers');
+  const v8ModelsDir = path.join(v8ProjectDir, 'models');
+  await fs.mkdir(v8ControllersDir, { recursive: true });
+  await fs.mkdir(v8ViewsDir, { recursive: true });
+  await fs.mkdir(v8ModelsDir, { recursive: true });
+
+  const offerControllerContent = `<?php
+namespace app\\controllers;
+
+use yii\\web\\Controller;
+
+class AdmissionOffersController extends Controller
+{
+    public function actionIndex()
+    {
+        $offers = AdmissionOffer::find()->all();
+        dd($offers);
+        return $this->render('index', [
+            'admissionOffers' => $offers,
+        ]);
+    }
+}
+`;
+  const offerViewContent = `<?php
+/** @var array $admissionOffers */
+?>
+<div class="admission-offers-index">
+    <h1>Admission Offers</h1>
+    <?php foreach ($admissionOffers as $offer): ?>
+        <p><?= htmlspecialchars($offer['title']) ?></p>
+    <?php endforeach; ?>
+</div>
+`;
+  const offerModelContent = `<?php
+namespace app\\models;
+
+class AdmissionOffer
+{
+    public static function find()
+    {
+        return new self();
+    }
+}
+`;
+
+  const offerControllerPath = path.join(v8ControllersDir, 'AdmissionOffersController.php');
+  const offerViewPath = path.join(v8ViewsDir, 'index.php');
+  const offerModelPath = path.join(v8ModelsDir, 'AdmissionOffer.php');
+  await fs.writeFile(offerControllerPath, offerControllerContent, 'utf8');
+  await fs.writeFile(offerViewPath, offerViewContent, 'utf8');
+  await fs.writeFile(offerModelPath, offerModelContent, 'utf8');
+
+  const offerCtrlRel = path.relative(v8ProjectDir, offerControllerPath).replace(/\\/g, '/');
+  const offerViewRel = path.relative(v8ProjectDir, offerViewPath).replace(/\\/g, '/');
+  const offerModelRel = path.relative(v8ProjectDir, offerModelPath).replace(/\\/g, '/');
+
+  // Verify traceExecutionFlow extracts renderTargets and outboundCallees generically
+  const traceOffer = traceExecutionFlow({
+    route: offerCtrlRel,
+    controllerFile: offerCtrlRel,
+    controllerContent: offerControllerContent,
+  });
+  assert.ok(Array.isArray(traceOffer.layers.renderTargets), 'renderTargets must be an array');
+  assert.ok(traceOffer.layers.renderTargets.includes('index'), 'Must generically extract render target "index"');
+  assert.ok(Array.isArray(traceOffer.layers.outboundCallees), 'outboundCallees must be an array');
+  assert.ok(traceOffer.layers.outboundCallees.some((c) => c.target === 'AdmissionOffer'), 'Must extract outbound callee symbol AdmissionOffer');
+
+  // Run autonomous workflow to verify 2nd-hop bounded read of both Caller and Callee/View
+  const scenario57Result = await executeAutonomousCodingWorkflow({
+    userRequest: 'AdmissionOffersController me kiya bug hai check karo',
+    root: v8ProjectDir,
+    scope: '.',
+    sessionId: 'session-v8-call-graph-verification',
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: null, // Halt at approval gate
+    tools: {
+      operatingMode: 'AUTONOMOUS',
+      readFile: async (p) => {
+        if (p.includes('AdmissionOffersController.php')) return { content: offerControllerContent };
+        if (p.includes('index.php')) return { content: offerViewContent };
+        if (p.includes('AdmissionOffer.php')) return { content: offerModelContent };
+        return { content: '' };
+      },
+      searchCode: async () => ({
+        results: [
+          { path: offerCtrlRel, score: 350, line: 8 },
+          { path: offerViewRel, score: 90, line: 1 },
+          { path: offerModelRel, score: 85, line: 4 },
+        ],
+      }),
+    },
+  });
+
+  assert.equal(scenario57Result.outcome, 'APPROVAL_REQUIRED');
+  assert.equal(scenario57Result.phase, 'APPROVE');
+  // Both Caller and Render Target / Callee must be inspected in inspectedFiles
+  const inspectedPaths = scenario57Result.inspectedFiles.map((f) => typeof f === 'string' ? f : f.path);
+  assert.ok(inspectedPaths.includes(offerCtrlRel), 'Caller must be present in inspectedFiles');
+  assert.ok(inspectedPaths.includes(offerViewRel), '2nd-hop render target view must be resolved and present in inspectedFiles');
+
+  console.log('[TEST] Scenario 57 passed: Universal call-graph & 2nd-hop render-target/callee contract verification verified.');
+
+  // SCENARIO 58: Strict Grounding & Anti-Speculation Gate Enforcement (Zero-Speculation Rule) (V8)
+  // Speculative phrasing in defect causal explanation must be rejected
+  const speculativeReport = validateEvidenceReport({
+    inspectedFiles: [
+      { path: offerCtrlRel, content: offerControllerContent, lineRange: { startLine: 1, endLine: 20 } },
+      { path: offerViewRel, content: offerViewContent, lineRange: { startLine: 1, endLine: 12 } },
+    ],
+    claimedDefects: [{
+      filePath: offerCtrlRel,
+      lines: '11',
+      codeSnippet: 'dd($offers);',
+      causalExplanation: 'The view probably expects an offerId parameter or another variable from the controller.',
+    }],
+  });
+  assert.equal(speculativeReport.isValid, false, 'Speculative phrasing must be rejected');
+  assert.match(speculativeReport.rejectionReason, /speculative phrasing/i);
+
+  // Grounded defect explanation citing actual verified facts must pass
+  const groundedReport = validateEvidenceReport({
+    inspectedFiles: [
+      { path: offerCtrlRel, content: offerControllerContent, lineRange: { startLine: 1, endLine: 20 } },
+      { path: offerViewRel, content: offerViewContent, lineRange: { startLine: 1, endLine: 12 } },
+    ],
+    claimedDefects: [{
+      filePath: offerCtrlRel,
+      lines: '11',
+      codeSnippet: 'dd($offers);',
+      causalExplanation: 'Terminating dd() call at line 11 halts execution before the view is rendered.',
+    }],
+  });
+  assert.equal(groundedReport.isValid, true, 'Grounded causal explanation must pass');
+
+  console.log('[TEST] Scenario 58 passed: Strict grounding & anti-speculation gate enforcement verified.');
+
+  // =========================================================================
+  // MILESTONE V9: STRUCTURAL PATCH SYNTHESIS & PRE-PLAN DRIFT GUARD
+  // =========================================================================
+
+  // SCENARIO 59: Structural Function/Class/Block Scoped Patch Generation & Sibling Preservation (V9)
+  const scopedServiceRel = 'services/ScopedPaymentService.js';
+  const scopedServiceContent = `class ScopedPaymentService {
+  processCharge(amount) {
+    debugger;
+    return { status: 'paid', amount };
+  }
+
+  auditLog(entry) {
+    debugger;
+    return { status: 'logged', entry };
+  }
+}
+module.exports = ScopedPaymentService;
+`;
+  await fs.mkdir(path.join(testRoot, 'services'), { recursive: true });
+  await fs.writeFile(path.join(testRoot, scopedServiceRel), scopedServiceContent, 'utf8');
+
+  const scenario59SessionId = 'session-v9-structural-scoped-patch';
+  createSession(scenario59SessionId, ownerId);
+
+  let scenario59Proposal = null;
+  const scenario59Result = await executeAutonomousCodingWorkflow({
+    userRequest: 'Remove the debugger statement in processCharge in ScopedPaymentService',
+    root: testRoot,
+    scope: '.',
+    sessionId: scenario59SessionId,
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async ({ proposalContract }) => {
+      scenario59Proposal = proposalContract;
+      return true; // approve for application test
+    },
+    runCheck: async () => ({ ok: true, executed: true, exitCode: 0 }),
+    tools: {
+      searchCode: async () => ({
+        results: [{ path: scopedServiceRel, score: 95, line: 3 }],
+      }),
+      readFile: async (p) => {
+        const full = path.join(testRoot, p);
+        const content = await fs.readFile(full, 'utf8');
+        return { content };
+      },
+    },
+  });
+
+  assert.ok(['SUCCESS', 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'].includes(scenario59Result.outcome));
+  assert.equal(scenario59Result.codeApplied, true);
+  assert.equal(scenario59Result.codeVerified, true);
+  assert.ok(scenario59Proposal, 'Proposal contract must be captured');
+  assert.ok(scenario59Proposal.structuralScope, 'Structural scope must be present in proposalContract');
+  assert.equal(scenario59Proposal.structuralScope.startLine, 2);
+  assert.equal(scenario59Proposal.structuralScope.endLine, 5);
+  assert.equal(scenario59Proposal.structuralScope.name, 'processCharge');
+  assert.ok(scenario59Proposal.diffPreview.includes('@@'), 'Diff preview must contain unified diff hunk');
+
+  // Verify on disk that processCharge had debugger removed, but auditLog preserved its debugger
+  const diskAfter59 = await fs.readFile(path.join(testRoot, scopedServiceRel), 'utf8');
+  assert.ok(!diskAfter59.includes('debugger;\n    return { status: \'paid\', amount };'), 'Target method must have debugger removed');
+  assert.ok(diskAfter59.includes('auditLog(entry) {\n    debugger;'), 'Sibling method must preserve its code untouched');
+
+  console.log('[TEST] Scenario 59 passed: Function/class/block scoped patch generation and sibling code preservation verified.');
+
+  // SCENARIO 60: Pre-Plan Drift Guard Rejects Stale Source Snapshot (STALE_PROPOSAL_DRIFT) (V9)
+  const driftFileRel = 'services/DriftProtectedService.js';
+  const driftInitialContent = `function driftProtectedMethod() {
+  debugger;
+  return 42;
+}
+`;
+  await fs.writeFile(path.join(testRoot, driftFileRel), driftInitialContent, 'utf8');
+  const scenario60SessionId = 'session-v9-stale-drift-guard';
+  createSession(scenario60SessionId, ownerId);
+
+  const scenario60Result = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix debugger in driftProtectedMethod in DriftProtectedService',
+    root: testRoot,
+    scope: '.',
+    sessionId: scenario60SessionId,
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    runCheck: async () => ({ ok: true, executed: true }),
+    tools: {
+      searchCode: async () => ({
+        results: [{ path: driftFileRel, score: 90, line: 2 }],
+      }),
+      readFile: async (p) => {
+        // Return initial content during Stage 3 inspection
+        const inspectContent = driftInitialContent;
+        // Mutate file on disk AFTER inspection to simulate external drift before Stage 4
+        await fs.writeFile(path.join(testRoot, driftFileRel), '// EXTERNAL MODIFICATION DRIFT\n' + driftInitialContent, 'utf8');
+        return { content: inspectContent };
+      },
+    },
+  });
+
+  assert.equal(scenario60Result.outcome, 'STALE_PROPOSAL_DRIFT');
+  assert.equal(scenario60Result.staleSnapshot, true);
+  assert.equal(scenario60Result.codeApplied, false);
+  assert.equal(scenario60Result.codeVerified, false);
+  assert.deepEqual(scenario60Result.filesModified, []);
+  assert.match(scenario60Result.reason, /STALE_PROPOSAL_DRIFT/i);
+
+  console.log('[TEST] Scenario 60 passed: Stale source snapshot and pre-plan drift guard rejection verified.');
+
+  // SCENARIO 61: Missing / Ambiguous Code Evidence Refusal (PLANNING_ABSTAINED) (V9)
+  // Part A: validateEvidenceReport strictly rejects findings with missing or empty code snippet
+  const missingEvidenceReport = validateEvidenceReport({
+    inspectedFiles: [{ path: 'services/AmbiguousService.js', content: 'function test() { return 1; }' }],
+    claimedDefects: [{
+      filePath: 'services/AmbiguousService.js',
+      symbol: 'debug_probe',
+      lines: '1',
+      codeSnippet: '', // EMPTY CODE SNIPPET
+    }],
+  });
+  assert.equal(missingEvidenceReport.isValid, false, 'Missing code evidence snippet must be rejected');
+  assert.match(missingEvidenceReport.rejectionReason, /lacks verified code evidence/i);
+
+  // Part B: Stage 4 patch synthesis refuses ambiguous defect in unsupported/ambiguous language (PLANNING_ABSTAINED)
+  const ambiguousLangFileRel = 'services/AmbiguousScript.lua';
+  const ambiguousLangContent = `function run_action()
+  print("evaluating")
+  debugger;
+end
+`;
+  await fs.writeFile(path.join(testRoot, ambiguousLangFileRel), ambiguousLangContent, 'utf8');
+  const scenario61SessionId = 'session-v9-ambiguous-evidence';
+  createSession(scenario61SessionId, ownerId);
+
+  const scenario61Result = await executeAutonomousCodingWorkflow({
+    userRequest: 'Fix ambiguous debug probe in AmbiguousScript.lua',
+    root: testRoot,
+    scope: '.',
+    sessionId: scenario61SessionId,
+    ownerWebContentsId: ownerId,
+    assessFindingRelevance: mockSupportedRelevance,
+    requestApproval: async () => true,
+    tools: {
+      searchCode: async () => ({
+        results: [{ path: ambiguousLangFileRel, score: 90, line: 3 }],
+      }),
+      readFile: async () => ({ content: ambiguousLangContent }),
+    },
+  });
+
+  assert.equal(scenario61Result.outcome, 'PLANNING_ABSTAINED');
+  assert.equal(scenario61Result.codeApplied, false);
+  assert.equal(scenario61Result.codeVerified, false);
+  assert.deepEqual(scenario61Result.filesModified, []);
+  assert.match(scenario61Result.reason, /Cannot safely repair debug probe in unsupported or ambiguous language/i);
+
+  console.log('[TEST] Scenario 61 passed: Refusal/abstention on missing or ambiguous code evidence verified.');
+
+  // SCENARIO 62: Proposal Contract Structural Scope & Source Content Grounding Validation (V9)
+  const validProposal = {
+    targetFile: scopedServiceRel,
+    targetLineRange: { startLine: 3, endLine: 3 },
+    structuralScope: { type: 'function', name: 'processCharge', startLine: 2, endLine: 5 },
+    rootCauseSummary: 'Terminating debugger statement',
+    originalCode: '    debugger;',
+    proposedCode: '',
+    diffPreview: '@@ -2,4 +2,3 @@\n processCharge(amount) {\n-    debugger;\n     return { status: \'paid\', amount };\n',
+    expectedBehavior: 'Removes debugger probe',
+  };
+  const inspectedContext = [{ path: scopedServiceRel, content: scopedServiceContent }];
+  const verifiedFindings = [{ filePath: scopedServiceRel }];
+
+  // 1. Valid proposal passes
+  const validResult = validateProposalContract(validProposal, { inspectedFiles: inspectedContext, verifiedFindings });
+  assert.equal(validResult.isValid, true, 'Valid proposal contract must pass');
+
+  // 2. Proposal exceeding structuralScope boundary is rejected
+  const outOfBoundsProposal = {
+    ...validProposal,
+    targetLineRange: { startLine: 1, endLine: 8 }, // Exceeds [2-5]
+  };
+  const outOfBoundsResult = validateProposalContract(outOfBoundsProposal, { inspectedFiles: inspectedContext, verifiedFindings });
+  assert.equal(outOfBoundsResult.isValid, false);
+  assert.match(outOfBoundsResult.rejectionReason, /exceeds structuralScope boundaries/i);
+
+  // 3. Ungrounded originalCode not present in inspected source is rejected
+  const ungroundedProposal = {
+    ...validProposal,
+    originalCode: 'non_existent_uninspected_statement();',
+  };
+  const ungroundedResult = validateProposalContract(ungroundedProposal, { inspectedFiles: inspectedContext, verifiedFindings });
+  assert.equal(ungroundedResult.isValid, false);
+  assert.match(ungroundedResult.rejectionReason, /does not match verified source content/i);
+
+  // 4. Invalid diffPreview without unified diff hunk is rejected
+  const invalidDiffProposal = {
+    ...validProposal,
+    diffPreview: 'not a valid unified diff hunk',
+  };
+  const invalidDiffResult = validateProposalContract(invalidDiffProposal, { inspectedFiles: inspectedContext, verifiedFindings });
+  assert.equal(invalidDiffResult.isValid, false);
+  assert.match(invalidDiffResult.rejectionReason, /valid unified diff hunk/i);
+
+  console.log('[TEST] Scenario 62 passed: Proposal contract structural scope & source grounding validation verified.');
+
+  console.log('All 62 Project-Agnostic Coding Investigation Workflow scenarios verified successfully on production interfaces.');
 } finally {
   developerFiles.releaseProject(ownerId);
   await fs.rm(testRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });

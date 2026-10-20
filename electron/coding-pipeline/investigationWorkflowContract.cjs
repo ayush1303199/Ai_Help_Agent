@@ -23,21 +23,26 @@ function classifyDefect({
   filePath,
   symbol,
   lines,
+  lineRange,
   codeSnippet,
+  codeEvidence,
   controlFlow,
+  causalExplanation,
   expected,
   observed,
   evidenceType,
 }) {
-  if (!filePath || !symbol || !lines) {
+  const lineSpec = lines || (typeof lineRange === 'object' && lineRange !== null ? `${lineRange.startLine}-${lineRange.endLine}` : null);
+  if (!filePath || !symbol || !lineSpec) {
     throw new Error('Defect classification requires exact filePath, symbol, and line range.');
   }
 
   let classification = CLASSIFICATION_UNVERIFIED;
   let isConfirmed = false;
 
-  const normalizedSnippet = String(codeSnippet || '').trim();
+  const normalizedSnippet = String(codeEvidence || codeSnippet || '').trim();
   const normalizedEvidence = String(evidenceType || '').toUpperCase();
+  const normalizedCausal = String(causalExplanation || controlFlow || observed || '').trim();
 
   // If behavior matches expected design
   if (
@@ -48,8 +53,9 @@ function classifyDefect({
     isConfirmed = false;
   } else if (
     normalizedEvidence.includes('CONFIRMED')
-    || /die\(|var_dump\(|print_r\(|dd\(|dump\(|console\.log\(|debugger;|print\(|System\.out\.println\(|fmt\.Print/i.test(normalizedSnippet)
+    || /\b(?:die|var_dump|print_r|dd|dump|console\.log|print|System\.out\.println|fmt\.Print)\s*\(|debugger;/i.test(normalizedSnippet)
     || (controlFlow && /not rolled back|missing (?:rollback|null-check)|unhandled exception|resource leak|unhandled rejection/i.test(controlFlow))
+    || (causalExplanation && /uncaught|unhandled|null pointer|undefined property|correlates with line/i.test(causalExplanation))
   ) {
     classification = CLASSIFICATION_CONFIRMED;
     isConfirmed = true;
@@ -58,12 +64,21 @@ function classifyDefect({
     isConfirmed = false;
   }
 
+  const normalizedRange = typeof lineRange === 'object' && lineRange !== null
+    ? { startLine: Number(lineRange.startLine) || 1, endLine: Number(lineRange.endLine) || 1 }
+    : (typeof lineSpec === 'string' && lineSpec.includes('-')
+        ? { startLine: Number(lineSpec.split('-')[0]) || 1, endLine: Number(lineSpec.split('-')[1]) || 1 }
+        : { startLine: Number(lineSpec) || 1, endLine: Number(lineSpec) || 1 });
+
   return {
     filePath,
     symbol,
-    lines,
+    lines: String(lineSpec),
+    lineRange: normalizedRange,
     codeSnippet: normalizedSnippet,
-    controlFlow: String(controlFlow || ''),
+    codeEvidence: normalizedSnippet,
+    causalExplanation: normalizedCausal,
+    controlFlow: String(controlFlow || normalizedCausal),
     expected: String(expected || ''),
     observed: String(observed || ''),
     classification,
@@ -256,6 +271,103 @@ function traceExecutionFlow({ route, controllerFile, controllerContent, action }
   if (detectedAction && detectedAction !== 'unknownAction') callChain.push(`action:${detectedAction}`);
   if (modelName) callChain.push(`model:${modelName}`);
 
+  // 8. Extract Imported Dependencies / Symbols (Multi-Hop Tracing)
+  const importedDependencies = [];
+  // JS/TS imports and requires
+  const esmImportRegex = /(?:import\s+(?:(?:\{([^}]+)\})|(?:\*\s+as\s+([A-Za-z0-9_]+))|([A-Za-z0-9_]+))\s+from\s+['"]([^'"]+)['"])|(?:(?:const|let|var)\s+(?:(?:\{([^}]+)\})|([A-Za-z0-9_]+))\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\))/g;
+  let match;
+  while ((match = esmImportRegex.exec(rawContent)) !== null) {
+    const rawPath = match[4] || match[7];
+    const rawSymbols = match[1] || match[2] || match[3] || match[5] || match[6] || '';
+    if (rawPath) {
+      const symbols = rawSymbols
+        ? rawSymbols.split(',').map((s) => s.trim().replace(/^.* as /, '')).filter(Boolean)
+        : [];
+      importedDependencies.push({
+        path: rawPath,
+        symbols,
+        isRelative: rawPath.startsWith('.') || rawPath.startsWith('/'),
+      });
+    }
+  }
+
+  // Python imports
+  const pyImportRegex = /(?:from\s+([A-Za-z0-9_.]+)\s+import\s+([A-Za-z0-9_,\s*]+))|(?:import\s+([A-Za-z0-9_.]+))/g;
+  while ((match = pyImportRegex.exec(rawContent)) !== null) {
+    const rawMod = match[1] || match[3];
+    const rawSymbols = match[2] || '';
+    if (rawMod) {
+      const symbols = rawSymbols
+        ? rawSymbols.split(',').map((s) => s.trim()).filter(Boolean)
+        : [];
+      importedDependencies.push({
+        path: rawMod,
+        symbols,
+        isRelative: rawMod.startsWith('.'),
+      });
+    }
+  }
+
+  // PHP use / require
+  const phpUseRegex = /(?:use\s+([A-Za-z0-9_\\]+)(?:\s+as\s+([A-Za-z0-9_]+))?;)|(?:(?:require|require_once|include|include_once)\s*(?:\(?\s*__DIR__\s*\.\s*)?['"]([^'"]+)['"]\)?)/g;
+  while ((match = phpUseRegex.exec(rawContent)) !== null) {
+    if (match[1]) {
+      const fullNamespace = match[1];
+      const alias = match[2] || fullNamespace.split('\\').pop();
+      importedDependencies.push({
+        path: fullNamespace,
+        symbols: [alias],
+        isRelative: false,
+      });
+    } else if (match[3]) {
+      const relPath = match[3];
+      importedDependencies.push({
+        path: relPath,
+        symbols: [],
+        isRelative: relPath.startsWith('.') || relPath.startsWith('/'),
+      });
+    }
+  }
+
+  // 9. Generic Outbound Render / View / Component Targets Extraction (Universal 2nd-Hop)
+  const renderTargets = [];
+  const renderRegexes = [
+    // PHP / Express / Django / Flask / Rails render/view calls
+    /(?:\$this->|res\.)?(?:render|renderPartial|render_template|view|display|show)\s*\(\s*['"]([^'"]+)['"]/g,
+    // JSX / TSX Component invocations (<TargetComponent ... />)
+    /<([A-Z][A-Za-z0-9_]+)(?:\s+[^>]*?)?(?:\/?>)/g,
+  ];
+  for (const regex of renderRegexes) {
+    let rMatch;
+    while ((rMatch = regex.exec(rawContent)) !== null) {
+      const target = rMatch[1];
+      if (target && !renderTargets.includes(target)) {
+        renderTargets.push(target);
+      }
+    }
+  }
+
+  // 10. Generic Outbound Callee Symbols & Static Invocations (Universal 2nd-Hop)
+  const outboundCallees = [];
+  const calleeRegexes = [
+    // Static method calls: ClassName::methodName(...)
+    /\b([A-Z][A-Za-z0-9_]+)::([A-Za-z0-9_]+)\s*\(/g,
+    // Method calls on services / models: this.service.method(...) or this->service->method(...)
+    /(?:this|self|\$this)[.->]+([A-Za-z0-9_]+)[.->]+([A-Za-z0-9_]+)\s*\(/g,
+    // Service/Model class references: e.g. UserValidator.validate(...)
+    /\b([A-Z][A-Za-z0-9_]+(?:Service|Model|Repository|Validator|Client|Helper))\s*[.:]+([A-Za-z0-9_]+)\s*\(/g,
+  ];
+  for (const regex of calleeRegexes) {
+    let cMatch;
+    while ((cMatch = regex.exec(rawContent)) !== null) {
+      const target = cMatch[1];
+      const method = cMatch[2] || undefined;
+      if (target && !outboundCallees.some((item) => item.target === target && item.method === method)) {
+        outboundCallees.push({ target, method });
+      }
+    }
+  }
+
   return {
     layers: {
       framework,
@@ -267,6 +379,9 @@ function traceExecutionFlow({ route, controllerFile, controllerContent, action }
       transactionCommits,
       transactionRollbacksInCatch: rollbackInCatch,
       callChain,
+      dependencies: importedDependencies,
+      renderTargets,
+      outboundCallees,
     },
     traceComplete: true,
   };
@@ -294,6 +409,84 @@ function validateEvidenceReport({
     };
   }
 
+  // Anti-Speculation Gate: Validate claimed defects against actual inspected files
+  if (Array.isArray(claimedDefects) && claimedDefects.length > 0) {
+    const inspectedMap = new Map();
+    for (const item of inspectedFiles) {
+      if (typeof item === 'string') {
+        inspectedMap.set(item, null);
+      } else if (item && typeof item === 'object' && item.path) {
+        inspectedMap.set(item.path, item);
+      }
+    }
+
+    for (const defect of claimedDefects) {
+      if (!defect || typeof defect !== 'object') continue;
+      // 1. File must have been inspected if inspectedFiles was populated
+      if (inspectedMap.size > 0 && defect.filePath && !inspectedMap.has(defect.filePath)) {
+        return {
+          isValid: false,
+          verificationAccepted: false,
+          rejectionReason: `Defect in uninspected file rejected: ${defect.filePath}. Root-cause diagnosis requires grounded source inspection.`,
+        };
+      }
+
+      // 2. Code evidence must be non-empty
+      const snippet = String(defect.codeEvidence || defect.codeSnippet || '').trim();
+      if (!snippet) {
+        return {
+          isValid: false,
+          verificationAccepted: false,
+          rejectionReason: `Defect in ${defect.filePath || 'unknown file'} lacks verified code evidence.`,
+        };
+      }
+
+      // 3. If file content is available in inspectedFiles, verify code evidence exists in content
+      // (Omission defects like missing rollbacks describe missing control flow rather than literal matches)
+      const inspectedEntry = inspectedMap.get(defect.filePath);
+      const isOmission = String(defect.evidenceType || '').includes('CONTROL_FLOW') || snippet.startsWith('//');
+      if (!isOmission && inspectedEntry && typeof inspectedEntry.content === 'string') {
+        const fileContent = inspectedEntry.content.replace(/\r\n/g, '\n');
+        const snippetLines = snippet.replace(/\r\n/g, '\n').split('\n').map((l) => l.trim()).filter(Boolean);
+        const snippetMatched = snippetLines.some((sLine) => fileContent.includes(sLine));
+        if (!snippetMatched) {
+          return {
+            isValid: false,
+            verificationAccepted: false,
+            rejectionReason: `Defect code evidence does not match actual disk content of ${defect.filePath}.`,
+          };
+        }
+      }
+
+      // 4. Line range validation against inspected file range
+      if (inspectedEntry && inspectedEntry.lineRange && typeof inspectedEntry.lineRange === 'object') {
+        const startLine = defect.lineRange?.startLine || Number(String(defect.lines).split('-')[0]);
+        if (
+          Number.isInteger(startLine) &&
+          inspectedEntry.lineRange.startLine &&
+          inspectedEntry.lineRange.endLine &&
+          (startLine < inspectedEntry.lineRange.startLine || startLine > inspectedEntry.lineRange.endLine)
+        ) {
+          return {
+            isValid: false,
+            verificationAccepted: false,
+            rejectionReason: `Defect line ${startLine} is outside inspected range ${inspectedEntry.lineRange.startLine}-${inspectedEntry.lineRange.endLine} for ${defect.filePath}.`,
+          };
+        }
+      }
+
+      // 5. Zero-speculation enforcement: reject ungrounded speculative language in causal explanation
+      const explanation = String(defect.causalExplanation || defect.relationship || '').trim();
+      if (explanation && /\b(?:probably|likely|or another\.\.\.|might be referenced as)\b/i.test(explanation)) {
+        return {
+          isValid: false,
+          verificationAccepted: false,
+          rejectionReason: `Defect explanation in ${defect.filePath || 'unknown file'} contains speculative phrasing. Grounded diagnosis must cite inspected source evidence without unverified speculation.`,
+        };
+      }
+    }
+  }
+
   if (claimedVerification === 'PASSED') {
     if (!executionAuditLog || typeof executionAuditLog !== 'object') {
       return {
@@ -302,11 +495,32 @@ function validateEvidenceReport({
         rejectionReason: 'Authoritative execution audit log is required to claim tests passed.',
       };
     }
+    if (executionAuditLog.executed !== true) {
+      return {
+        isValid: false,
+        verificationAccepted: false,
+        rejectionReason: 'Cannot claim PASSED when verification was not actually executed.',
+      };
+    }
     if (executionAuditLog.exitCode !== 0) {
       return {
         isValid: false,
         verificationAccepted: false,
         rejectionReason: `Cannot claim PASSED when execution audit log exited with non-zero code (${executionAuditLog.exitCode}).`,
+      };
+    }
+    if (Array.isArray(executionAuditLog.attempts) && executionAuditLog.attempts.length === 0) {
+      return {
+        isValid: false,
+        verificationAccepted: false,
+        rejectionReason: 'Cannot claim PASSED with zero executed verification attempts.',
+      };
+    }
+    if (Array.isArray(executionAuditLog.attempts) && executionAuditLog.attempts.some((a) => a.exitCode !== 0 || a.ok === false)) {
+      return {
+        isValid: false,
+        verificationAccepted: false,
+        rejectionReason: 'Cannot claim PASSED when one or more verification attempts failed.',
       };
     }
     return {
@@ -334,26 +548,226 @@ function validateEvidenceReport({
 }
 
 /**
- * Validates that proposed patches are minimal and preserve unrelated dirty work.
+ * Validates the structured proposal contract ensuring evidence grounding,
+ * exact line ranges, root-cause link, and expected runtime behavior statements.
+ */
+function validateProposalContract(contract, { inspectedFiles = [], verifiedFindings = [] } = {}) {
+  if (!contract || typeof contract !== 'object') {
+    return { isValid: false, rejectionReason: 'Proposal contract must be a non-null object.' };
+  }
+  const norm = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
+
+  if (contract.isModular === true) {
+    if (!contract.targetFile && (!Array.isArray(contract.files) || contract.files.length === 0)) {
+      return { isValid: false, rejectionReason: 'Modular proposal contract requires targetFile or files array.' };
+    }
+    if (!contract.expectedBehavior || typeof contract.expectedBehavior !== 'string' || !contract.expectedBehavior.trim()) {
+      return { isValid: false, rejectionReason: 'Modular proposal contract requires expectedBehavior statement.' };
+    }
+    return { isValid: true };
+  }
+
+  // 1. targetFile validation
+  if (!contract.targetFile || typeof contract.targetFile !== 'string') {
+    return { isValid: false, rejectionReason: 'Proposal contract missing valid targetFile string.' };
+  }
+  const targetNorm = norm(contract.targetFile);
+
+  // 2. Stage 3 inspection grounding
+  if (Array.isArray(inspectedFiles) && inspectedFiles.length > 0) {
+    const inspectedSet = new Set(
+      inspectedFiles.map((f) => norm(typeof f === 'string' ? f : f?.path)).filter(Boolean)
+    );
+    if (!inspectedSet.has(targetNorm)) {
+      return {
+        isValid: false,
+        rejectionReason: `Scope violation: targetFile [${contract.targetFile}] was not inspected in Stage 3.`,
+      };
+    }
+  }
+
+  // 3. Verified finding grounding
+  if (Array.isArray(verifiedFindings) && verifiedFindings.length > 0) {
+    const findingSet = new Set(
+      verifiedFindings.map((f) => norm(f?.filePath)).filter(Boolean)
+    );
+    if (!findingSet.has(targetNorm)) {
+      return {
+        isValid: false,
+        rejectionReason: `Scope violation: targetFile [${contract.targetFile}] has no verified defect finding.`,
+      };
+    }
+  }
+
+  // 4. targetLineRange validation
+  if (
+    !contract.targetLineRange ||
+    typeof contract.targetLineRange !== 'object' ||
+    !Number.isInteger(contract.targetLineRange.startLine) ||
+    !Number.isInteger(contract.targetLineRange.endLine) ||
+    contract.targetLineRange.startLine < 1 ||
+    contract.targetLineRange.endLine < contract.targetLineRange.startLine
+  ) {
+    return { isValid: false, rejectionReason: 'Proposal contract requires valid startLine and endLine (>= 1, endLine >= startLine).' };
+  }
+
+  // 5. rootCauseSummary validation
+  if (!contract.rootCauseSummary || typeof contract.rootCauseSummary !== 'string' || !contract.rootCauseSummary.trim()) {
+    return { isValid: false, rejectionReason: 'Proposal contract requires a non-empty rootCauseSummary.' };
+  }
+
+  // 6. originalCode validation
+  if (typeof contract.originalCode !== 'string') {
+    return { isValid: false, rejectionReason: 'Proposal contract requires originalCode string.' };
+  }
+
+  // 7. proposedCode validation
+  if (typeof contract.proposedCode !== 'string') {
+    return { isValid: false, rejectionReason: 'Proposal contract requires proposedCode string.' };
+  }
+
+  // 8. expectedBehavior validation
+  if (!contract.expectedBehavior || typeof contract.expectedBehavior !== 'string' || !contract.expectedBehavior.trim()) {
+    return { isValid: false, rejectionReason: 'Proposal contract requires a non-empty expectedBehavior statement.' };
+  }
+
+  // 9. Verified source content grounding
+  if (Array.isArray(inspectedFiles) && inspectedFiles.length > 0) {
+    const inspectedEntry = inspectedFiles.find((f) => norm(typeof f === 'string' ? f : f?.path) === targetNorm);
+    if (inspectedEntry && typeof inspectedEntry.content === 'string') {
+      const fileLines = inspectedEntry.content.split(/\r?\n/);
+      if (contract.targetLineRange.endLine > fileLines.length) {
+        return {
+          isValid: false,
+          rejectionReason: `targetLineRange [${contract.targetLineRange.startLine}-${contract.targetLineRange.endLine}] exceeds total file lines (${fileLines.length}) in ${contract.targetFile}.`,
+        };
+      }
+      const origCode = contract.originalCode.trim();
+      if (origCode) {
+        const fileContentNorm = inspectedEntry.content.replace(/\r\n/g, '\n');
+        const origCodeNorm = origCode.replace(/\r\n/g, '\n');
+        if (!fileContentNorm.includes(origCodeNorm)) {
+          return {
+            isValid: false,
+            rejectionReason: `Proposal originalCode does not match verified source content of ${contract.targetFile}.`,
+          };
+        }
+      }
+    }
+  }
+
+  // 10. Structural scope validation
+  if (contract.structuralScope && typeof contract.structuralScope === 'object') {
+    const scope = contract.structuralScope;
+    if (
+      Number.isInteger(scope.startLine) &&
+      Number.isInteger(scope.endLine) &&
+      scope.startLine >= 1 &&
+      scope.endLine >= scope.startLine
+    ) {
+      if (
+        contract.targetLineRange.startLine < scope.startLine ||
+        contract.targetLineRange.endLine > scope.endLine
+      ) {
+        return {
+          isValid: false,
+          rejectionReason: `Proposal targetLineRange [${contract.targetLineRange.startLine}-${contract.targetLineRange.endLine}] exceeds structuralScope boundaries [${scope.startLine}-${scope.endLine}].`,
+        };
+      }
+    }
+  }
+
+  // 11. Diff Preview unified diff hunk validation
+  if (contract.diffPreview && typeof contract.diffPreview === 'string') {
+    if (!contract.diffPreview.includes('@@')) {
+      return {
+        isValid: false,
+        rejectionReason: 'Proposal diffPreview must contain a valid unified diff hunk.',
+      };
+    }
+  }
+
+  return {
+    isValid: true,
+    targetFile: contract.targetFile,
+    targetLineRange: contract.targetLineRange,
+    structuralScope: contract.structuralScope || null,
+    rootCauseSummary: contract.rootCauseSummary,
+    originalCode: contract.originalCode,
+    proposedCode: contract.proposedCode,
+    diffPreview: contract.diffPreview || '',
+    expectedBehavior: contract.expectedBehavior,
+  };
+}
+
+/**
+ * Validates that proposed patches are minimal, grounded in inspected evidence,
+ * and preserve unrelated dirty work.
  */
 function validatePatchScope({
   targetFiles = [],
+  inspectedFiles = [],
+  verifiedFindings = [],
+  proposalContract = null,
   proposedChanges = [],
   acceptanceCriteria = [],
   modifiedFiles = [],
   existingDirtyFiles = [],
 }) {
-  const targetSet = new Set(targetFiles);
-  const touchedFiles = modifiedFiles.length > 0 ? modifiedFiles : targetFiles;
-  
-  const touchesUnrelated = existingDirtyFiles.some((dirty) => !targetSet.has(dirty) && touchedFiles.includes(dirty));
-  
+  const norm = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
+  const targetSet = new Set(targetFiles.map(norm));
+  const touchedFiles = (modifiedFiles.length > 0 ? modifiedFiles : targetFiles).map(norm);
+
+  const dirtySet = new Set(existingDirtyFiles.map(norm));
+  const touchesUnrelated = touchedFiles.some((dirty) => dirtySet.has(dirty) && !targetSet.has(dirty));
+
+  let isValid = !touchesUnrelated;
+  let rejectionReason = touchesUnrelated ? 'Proposed patch touches unrelated dirty files.' : null;
+
+  // Verify all target files were inspected in Stage 3 if inspectedFiles is provided
+  if (isValid && Array.isArray(inspectedFiles) && inspectedFiles.length > 0) {
+    const inspectedSet = new Set(
+      inspectedFiles.map((f) => norm(typeof f === 'string' ? f : f?.path)).filter(Boolean)
+    );
+    const uninspectedTargets = targetFiles.filter((t) => !inspectedSet.has(norm(t)));
+    if (uninspectedTargets.length > 0) {
+      isValid = false;
+      rejectionReason = `Scope violation: proposed patch touches uninspected file(s): [${uninspectedTargets.join(', ')}]. All modifications must be grounded in Stage 3 evidence.`;
+    }
+  }
+
+  // Verify target files correspond to verified findings if verifiedFindings is provided
+  if (isValid && Array.isArray(verifiedFindings) && verifiedFindings.length > 0) {
+    const findingFiles = new Set(
+      verifiedFindings.map((f) => norm(f?.filePath)).filter(Boolean)
+    );
+    const unverifiedTargets = targetFiles.filter((t) => !findingFiles.has(norm(t)));
+    if (unverifiedTargets.length > 0) {
+      isValid = false;
+      rejectionReason = `Scope violation: proposed patch touches file(s) without verified defect findings: [${unverifiedTargets.join(', ')}].`;
+    }
+  }
+
+  // Validate proposal contract if supplied
+  if (isValid && proposalContract) {
+    const contractResult = validateProposalContract(proposalContract, { inspectedFiles, verifiedFindings });
+    if (!contractResult.isValid) {
+      isValid = false;
+      rejectionReason = contractResult.rejectionReason;
+    }
+  }
+
+  const isMinimal = isValid && targetFiles.length > 0 && targetFiles.length <= 5;
+
   return {
-    isMinimal: targetFiles.length > 0 && targetFiles.length <= 5,
+    isValid,
+    isMinimal,
     targetFiles,
     acceptanceCriteria,
     touchedFiles,
     preservesUnrelatedFiles: !touchesUnrelated,
+    proposalContract: proposalContract || null,
+    rejectionReason,
   };
 }
 
@@ -388,13 +802,399 @@ function enforceApprovalGate({
   return {
     allowed: true,
     operationType,
+    approvedTargets: [...approvedSet],
   };
 }
+
+/**
+ * Extracts structured diagnostics from execution output across all major test frameworks and languages.
+ * (Node/Vitest/Jest/Mocha, Python/Pytest/Unittest, PHP/PHPUnit, Go test, Rust cargo test, Maven/Gradle).
+ */
+function extractFailureDiagnostics(resultOrText) {
+  const text = typeof resultOrText === 'string'
+    ? resultOrText
+    : `${resultOrText?.stderr || ''}\n${resultOrText?.stdout || ''}\n${resultOrText?.error || ''}\n${resultOrText?.failure || ''}\n${resultOrText?.message || ''}`;
+
+  const cleanText = text.replace(/\u001b\[[0-9;]*m/g, ''); // strip ANSI codes
+  const lines = cleanText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  // 1. Failing test names
+  const failingTests = [];
+  const testRegexes = [
+    /(?:FAIL|failed|failing)\s+test\s+["'`]?([^"'`\r\n]+)["'`]?/gi,
+    /●\s+([^\r\n]+)/g,
+    /FAILED\s+([^\s\r\n:]+::\w+)/g,
+    /\d+\)\s+([^:\r\n]+):/g,
+    /--- FAIL:\s+([^\s\r\n]+)/g,
+  ];
+  for (const re of testRegexes) {
+    let m;
+    while ((m = re.exec(cleanText)) !== null) {
+      if (m[1] && !failingTests.includes(m[1].trim())) {
+        failingTests.push(m[1].trim());
+      }
+    }
+  }
+
+  // 2. Assertion errors
+  const assertionErrors = [];
+  const assertionRegexes = [
+    /AssertionError(?: \[[^\]]+\])?:?\s*(.+)/gi,
+    /Failed asserting that\s+(.+)/gi,
+    /Expected:?\s*(.+?)\s+Received:?\s*(.+)/gi,
+    /assert\s+.+==.+/gi,
+    /Expected values to be strictly equal:\s*(.+)/gi,
+  ];
+  for (const re of assertionRegexes) {
+    let m;
+    while ((m = re.exec(cleanText)) !== null) {
+      const msg = (m[1] || m[0]).trim();
+      if (msg && !assertionErrors.includes(msg)) {
+        assertionErrors.push(msg.slice(0, 300));
+      }
+    }
+  }
+
+  // 3. Compiler / Syntax errors
+  const compilerErrors = [];
+  const compilerRegexes = [
+    /(?:error\s+TS\d+:\s*.+)/gi,
+    /(?:SyntaxError:\s*.+)/gi,
+    /(?:TypeError:\s*.+)/gi,
+    /(?:Parse error:\s*.+)/gi,
+    /(?:Fatal error:\s*.+)/gi,
+  ];
+  for (const re of compilerRegexes) {
+    let m;
+    while ((m = re.exec(cleanText)) !== null) {
+      const msg = m[0].trim();
+      if (msg && !compilerErrors.includes(msg)) {
+        compilerErrors.push(msg.slice(0, 300));
+      }
+    }
+  }
+
+  // 4. Stack frames / File locations
+  const stackFrames = [];
+  const frameRegex = /(?:at\s+(?:.+?\s+\()?|File\s+["']?|in\s+)([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)[:\s,]+(?:line\s+)?(\d+)(?::(\d+))?/gi;
+  let frameMatch;
+  while ((frameMatch = frameRegex.exec(cleanText)) !== null) {
+    const file = frameMatch[1];
+    const line = Number(frameMatch[2]);
+    const column = frameMatch[3] ? Number(frameMatch[3]) : null;
+    if (file && !file.includes('node_modules') && !file.includes('internal/')) {
+      stackFrames.push({ file, line, column });
+    }
+  }
+
+  // Primary summary line
+  const summary = assertionErrors[0]
+    || compilerErrors[0]
+    || (failingTests.length > 0 ? `Test failed: ${failingTests[0]}` : null)
+    || lines.find((l) => /error|fail|exception/i.test(l) && !/^npm /i.test(l))
+    || 'Verification check failed with non-zero exit code';
+
+  return {
+    summary: summary.slice(0, 500),
+    failingTests,
+    assertionErrors,
+    compilerErrors,
+    stackFrames: stackFrames.slice(0, 10),
+  };
+}
+
+/**
+ * Strictly verifies post-approval apply conditions (Milestone V4):
+ * - User approval is confirmed (userApproved === true)
+ * - Proposal contract is valid and non-null
+ * - Mutation targets strictly match proposalContract.targetFile (blocking scope expansion)
+ * - Target file on disk has not drifted from proposalContract.originalCode (pre-apply drift guard)
+ * - Target diff hunks do not exceed approved targetLineRange
+ */
+function validateApplyScope({
+  proposalContract = null,
+  mutationTargets = [],
+  files = [],
+  userApproved = false,
+  currentDiskContent = null,
+  targetLineRange = null,
+  patchHunks = [],
+} = {}) {
+  if (!userApproved) {
+    return {
+      allowed: false,
+      code: 'APPROVAL_REQUIRED',
+      rejectionReason: 'APPLY_SCOPE_VIOLATION: Mutation requires explicit user approval before apply.',
+    };
+  }
+
+  if (!proposalContract || typeof proposalContract !== 'object') {
+    return {
+      allowed: false,
+      code: 'APPLY_SCOPE_VIOLATION',
+      rejectionReason: 'APPLY_SCOPE_VIOLATION: A valid V3 proposal contract is required to apply changes.',
+    };
+  }
+
+  const contractValidation = validateProposalContract(proposalContract);
+  if (!contractValidation.isValid) {
+    return {
+      allowed: false,
+      code: 'APPLY_SCOPE_VIOLATION',
+      rejectionReason: `APPLY_SCOPE_VIOLATION: Proposal contract is invalid: ${contractValidation.rejectionReason}`,
+    };
+  }
+
+  const norm = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
+  const approvedTarget = norm(proposalContract.targetFile);
+  const targets = (
+    mutationTargets.length > 0
+      ? mutationTargets
+      : files.map((f) => (typeof f === 'string' ? f : f?.path))
+  ).filter(Boolean);
+
+  const approvedTargets = proposalContract.isModular === true && Array.isArray(proposalContract.files)
+    ? proposalContract.files.map((f) => norm(typeof f === 'string' ? f : f?.path))
+    : [approvedTarget];
+
+  const unapproved = targets.filter((t) => !approvedTargets.includes(norm(t)));
+  if (unapproved.length > 0) {
+    return {
+      allowed: false,
+      code: 'APPLY_SCOPE_VIOLATION',
+      rejectionReason: `APPLY_SCOPE_VIOLATION: Attempted mutation targets [${unapproved.join(', ')}] exceed approved proposal contract targets [${approvedTargets.join(', ')}].`,
+    };
+  }
+
+  if (proposalContract.isModular === true) {
+    return {
+      allowed: true,
+      driftDetected: false,
+      rejectionReason: null,
+    };
+  }
+
+  // Pre-apply drift detection on target region if currentDiskContent is provided
+  if (typeof currentDiskContent === 'string' && proposalContract.originalCode) {
+    const range = targetLineRange || proposalContract.targetLineRange;
+    const diskLines = currentDiskContent.split(/\r?\n/);
+    if (range && Number.isInteger(range.startLine) && Number.isInteger(range.endLine)) {
+      const sliceStart = Math.max(0, range.startLine - 1);
+      const sliceEnd = Math.min(diskLines.length, range.endLine);
+      const targetSlice = diskLines.slice(sliceStart, sliceEnd).join('\n').trim();
+      const expectedSlice = proposalContract.originalCode.replace(/\r?\n/g, '\n').trim();
+
+      if (expectedSlice && !targetSlice.includes(expectedSlice) && !currentDiskContent.includes(expectedSlice)) {
+        return {
+          allowed: false,
+          code: 'STALE_PROPOSAL_DRIFT',
+          rejectionReason: `STALE_PROPOSAL_DRIFT: Target file lines ${range.startLine}-${range.endLine} on disk drifted from approved proposal contract code.`,
+        };
+      }
+    }
+  }
+
+  // Check patch hunks against targetLineRange if provided
+  if (Array.isArray(patchHunks) && patchHunks.length > 0 && proposalContract.targetLineRange) {
+    const { startLine, endLine } = proposalContract.targetLineRange;
+    const tolerance = 5;
+    const minAllowed = Math.max(1, startLine - tolerance);
+    const maxAllowed = endLine + tolerance;
+    for (const hunk of patchHunks) {
+      const hunkStart = Number(hunk.oldStart || hunk.start || hunk.startLine || 0);
+      const hunkCount = Number(hunk.oldCount || hunk.count || hunk.lineCount || 1);
+      const hunkEnd = hunkStart + hunkCount - 1;
+      if (hunkStart > 0 && (hunkEnd < minAllowed || hunkStart > maxAllowed)) {
+        return {
+          allowed: false,
+          code: 'APPLY_SCOPE_VIOLATION',
+          rejectionReason: `APPLY_SCOPE_VIOLATION: Patch hunk @@ -${hunkStart},${hunkCount} @@ is outside approved line range [${startLine}-${endLine}].`,
+        };
+      }
+    }
+  }
+
+  return {
+    allowed: true,
+    code: 'APPROVED_SCOPE_VALID',
+    targetFile: proposalContract.targetFile,
+    targetLineRange: proposalContract.targetLineRange,
+  };
+}
+
 
 /**
  * Converts a user request into explicit requirements and acceptance criteria,
  * detecting underspecified or ambiguous requests that require clarification.
  */
+const STRUCTURAL_KEYWORDS = [
+  'action', 'method', 'function', 'func', 'fn', 'handler',
+  'controller', 'service', 'endpoint', 'route', 'class', 'view', 'component',
+];
+
+function generateSymbolVariants(symbols, structuralKeywords = []) {
+  const variants = new Set();
+  const keywords = (structuralKeywords || []).map((k) => String(k).toLowerCase());
+  for (const sym of symbols || []) {
+    if (!sym || typeof sym !== 'string') continue;
+    const cleanSym = sym.trim();
+    if (!cleanSym || cleanSym.length < 2) continue;
+    variants.add(cleanSym);
+
+    // camelCase to snake_case
+    const snake = cleanSym.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+    variants.add(snake);
+
+    // snake_case to camelCase
+    const camel = cleanSym.replace(/_([a-z0-9])/gi, (_, c) => c.toUpperCase());
+    const lowerCamel = camel.charAt(0).toLowerCase() + camel.slice(1);
+    const upperCamel = camel.charAt(0).toUpperCase() + camel.slice(1);
+    variants.add(lowerCamel);
+    variants.add(upperCamel);
+
+    const hasAction = keywords.some((k) => /action/i.test(k));
+    const hasHandler = keywords.some((k) => /handler/i.test(k));
+    const hasController = keywords.some((k) => /controller/i.test(k));
+    const hasService = keywords.some((k) => /service/i.test(k));
+
+    if (hasAction) {
+      variants.add(`action${upperCamel}`);
+      variants.add(`action_${snake}`);
+      variants.add(`${lowerCamel}Action`);
+      variants.add(`${snake}_action`);
+    }
+    if (hasHandler) {
+      variants.add(`handle${upperCamel}`);
+      variants.add(`${lowerCamel}Handler`);
+      variants.add(`${upperCamel}Handler`);
+      variants.add(`handle_${snake}`);
+      variants.add(`${snake}_handler`);
+    }
+    if (hasController) {
+      variants.add(`${upperCamel}Controller`);
+      variants.add(`${lowerCamel}Controller`);
+      variants.add(`${snake}_controller`);
+    }
+    if (hasService) {
+      variants.add(`${upperCamel}Service`);
+      variants.add(`${lowerCamel}Service`);
+      variants.add(`${snake}_service`);
+    }
+  }
+  return [...variants];
+}
+
+function extractEnclosingFunctionBlock(content, targetLineOrSymbol, options = {}) {
+  const maxLines = Number.isInteger(options.maxLines) ? options.maxLines : 60;
+  const minLines = Number.isInteger(options.minLines) ? options.minLines : 15;
+  if (typeof content !== 'string' || !content.trim()) {
+    return { extractedCode: '', startLine: 1, endLine: 1, symbolName: null, bounded: true };
+  }
+  const lines = content.split(/\r?\n/);
+  const totalLines = lines.length;
+
+  let targetIndex = -1;
+  let targetSymbol = null;
+  if (typeof targetLineOrSymbol === 'number' && targetLineOrSymbol > 0) {
+    targetIndex = Math.min(Math.max(1, targetLineOrSymbol), totalLines) - 1;
+  } else if (typeof targetLineOrSymbol === 'string' && targetLineOrSymbol.trim()) {
+    targetSymbol = targetLineOrSymbol.trim();
+    const escaped = targetSymbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const symRegex = new RegExp(`(?:function\\s+|def\\s+|fn\\s+|func\\s+|class\\s+|\\b)${escaped}\\b|\\b${escaped}\\s*\\(`, 'i');
+    for (let i = 0; i < totalLines; i++) {
+      if (symRegex.test(lines[i])) {
+        targetIndex = i;
+        break;
+      }
+    }
+    if (targetIndex === -1) {
+      const lower = targetSymbol.toLowerCase();
+      for (let i = 0; i < totalLines; i++) {
+        if (lines[i].toLowerCase().includes(lower)) {
+          targetIndex = i;
+          break;
+        }
+      }
+    }
+  }
+  if (targetIndex === -1) targetIndex = 0;
+
+  const CONTROL_FLOW_REGEX = /^\s*(?:if|for|while|switch|catch|with|foreach)\b/;
+  const FUNC_SIGNATURE_REGEX = /^\s*(?:(?:export|default|abstract|final|public|private|protected|static|async|function|\*)\s+)*(?:function(?:\s+[\w$]+)?|def\s+[\w$]+|fn\s+[\w$]+|func\s+(?:\([^)]*\)\s*)?[\w$]+)\s*(?:\([^)]*\))?/i;
+  const METHOD_SIGNATURE_REGEX = /^\s*(?:(?:export|default|abstract|final|public|private|protected|static|async)\s+)+[\w$]+\s*\([^)]*\)/i;
+  const BARE_METHOD_REGEX = /^\s*(?!if\b|for\b|while\b|switch\b|catch\b|with\b|return\b)[A-Za-z_$][\w$]*\s*\([^)]*\)\s*(?::\s*[^;{]+)?\s*\{?\s*$/i;
+
+  let declStart = targetIndex;
+  for (let i = targetIndex; i >= Math.max(0, targetIndex - 35); i--) {
+    const curLine = lines[i];
+    if (CONTROL_FLOW_REGEX.test(curLine)) continue;
+    if (FUNC_SIGNATURE_REGEX.test(curLine) || METHOD_SIGNATURE_REGEX.test(curLine) || BARE_METHOD_REGEX.test(curLine)) {
+      declStart = i;
+      break;
+    }
+  }
+
+  const isPython = options.language === 'python' || lines[declStart].trim().startsWith('def ') || lines[declStart].trim().endsWith(':');
+  let blockEnd = declStart;
+  let foundOpen = false;
+  let openBraces = 0;
+
+  if (isPython) {
+    const indentMatch = lines[declStart].match(/^(\s*)/);
+    const baseIndent = indentMatch ? indentMatch[1].length : 0;
+    for (let i = declStart + 1; i < totalLines; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      const curMatch = line.match(/^(\s*)/);
+      const lineIndent = curMatch ? curMatch[1].length : 0;
+      if (lineIndent <= baseIndent) {
+        blockEnd = i - 1;
+        break;
+      }
+      blockEnd = i;
+      if (blockEnd - declStart >= maxLines) break;
+    }
+  } else {
+    for (let i = declStart; i < totalLines; i++) {
+      const line = lines[i];
+      const cleanLine = line.replace(/(["'`])(?:\\.|[^\\])*?\1/g, '').replace(/\/\/.*$|\/\*.*?\*\//g, '');
+      const opens = (cleanLine.match(/\{/g) || []).length;
+      const closes = (cleanLine.match(/\}/g) || []).length;
+      if (opens > 0) foundOpen = true;
+      openBraces += opens - closes;
+      blockEnd = i;
+      if (foundOpen && openBraces <= 0) {
+        break;
+      }
+      if (blockEnd - declStart >= maxLines) break;
+    }
+  }
+
+  const startLine = Math.max(1, declStart + 1);
+  const endLine = (foundOpen && openBraces <= 0)
+    ? Math.min(totalLines, blockEnd + 1)
+    : Math.min(totalLines, Math.max(startLine + minLines - 1, blockEnd + 1));
+  const extractedLines = lines.slice(startLine - 1, endLine);
+
+  let detectedSymbol = targetSymbol;
+  if (!detectedSymbol && declStart >= 0 && declStart < totalLines) {
+    const declLine = lines[declStart];
+    const match = declLine.match(/(?:function\s+([A-Za-z_$][\w$]*)|def\s+([A-Za-z_$][\w$]*)|fn\s+([A-Za-z_$][\w$]*)|([A-Za-z_$][\w$]*)\s*\([^)]*\))/);
+    if (match) {
+      detectedSymbol = match[1] || match[2] || match[3] || match[4] || null;
+    }
+  }
+
+  return {
+    startLine,
+    endLine,
+    symbolName: detectedSymbol,
+    extractedCode: extractedLines.join('\n'),
+    lineCount: extractedLines.length,
+    bounded: true,
+  };
+}
+
 function analyzeTaskRequirements(userRequest) {
   const text = String(userRequest || '').trim();
   if (!text) {
@@ -422,7 +1222,72 @@ function analyzeTaskRequirements(userRequest) {
     };
   }
 
-  // Extract explicit requirements
+  // Extract high-precision signals (paths, symbols, routes, errors, quoted phrases)
+  const exactPaths = [];
+  const exactSymbols = [];
+  const routePaths = [];
+  const errorSignals = [];
+  const quotedLiterals = [];
+
+  // 1. Quoted literals: "..." or '...' or `...`
+  const quotePattern = /["'`](\S(?:[\s\S]*?\S)?)["'`]/g;
+  let qMatch;
+  while ((qMatch = quotePattern.exec(text)) !== null) {
+    const val = qMatch[1].trim();
+    if (val.length > 1 && val.length < 100) quotedLiterals.push(val);
+  }
+
+  // 2. Route / API endpoints: e.g. /api/v1/users, /auth/login
+  const routePattern = /(?:\/[\w\-:{}]+){2,}/g;
+  let rMatch;
+  while ((rMatch = routePattern.exec(text)) !== null) {
+    routePaths.push(rMatch[0].trim());
+  }
+
+  // 3. Relative file paths with extensions or slashes (excluding leading slash routes)
+  const pathPattern = /(?:[A-Za-z0-9_.-]+[/\\])+[A-Za-z0-9_.-]+\.[a-z0-9]{1,5}|\b[A-Za-z0-9_.-]+\.(?:[a-z]{1,5}|[cm]?[jt]sx?|php|py|rb|go|rs|java|kt|c|cpp|h|hpp|vue|svelte|html|css|json|ya?ml|sql|sh)\b/gi;
+  let pMatch;
+  while ((pMatch = pathPattern.exec(text)) !== null) {
+    const val = pMatch[0].trim();
+    if (val.length > 2 && !val.startsWith('http://') && !val.startsWith('https://')) {
+      exactPaths.push(val.replace(/\\/g, '/'));
+    }
+  }
+
+  // 4. Error / Exception signals: e.g. TypeError, NullPointerException, HTTP 500, etc.
+  const errorPattern = /\b(?:[A-Z][a-zA-Z]*(?:Error|Exception|Fault|Failure)|HTTP\s+[45]\d{2}|[45]\d{2}\s+(?:Internal|Not\s+Found|Forbidden|Unauthorized|Bad\s+Request))\b/g;
+  let eMatch;
+  while ((eMatch = errorPattern.exec(text)) !== null) {
+    errorSignals.push(eMatch[0].trim());
+  }
+
+  // 4b. Structured stack frames / runtime error locations
+  const errorFrames = [];
+  const stackPattern = /(?:(?:at\s+[\w$.<>]+\s+\()?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+):(\d+)(?::(\d+))?\)?)|(?:File\s+["']([^"']+)["'],\s+line\s+(\d+)(?:,\s+in\s+([A-Za-z0-9_]+))?)/g;
+  let stMatch;
+  while ((stMatch = stackPattern.exec(text)) !== null) {
+    const file = (stMatch[1] || stMatch[4] || '').replace(/\\/g, '/');
+    const line = parseInt(stMatch[2] || stMatch[5], 10);
+    const symbol = stMatch[6] || null;
+    if (file && Number.isInteger(line)) {
+      errorFrames.push({
+        file,
+        line,
+        symbol,
+        raw: stMatch[0].trim(),
+      });
+      exactPaths.push(file);
+    }
+  }
+
+  // 5. Code symbols: CamelCase, PascalCase, snake_case with underscores, or functions like name()
+  const symbolPattern = /\b(?:[a-z]+[A-Z][a-zA-Z0-9]*|[A-Z][a-z0-9]+[A-Z][a-zA-Z0-9]*|[a-z0-9]+_[a-z0-9_]+|[A-Za-z_$][\w$]*(?=\(\)))\b/g;
+  let sMatch;
+  while ((sMatch = symbolPattern.exec(text)) !== null) {
+    exactSymbols.push(sMatch[0].trim());
+  }
+
+  // Extract explicit requirements & domain words
   const words = text
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .replace(/[_\-/.\\]+/g, ' ')
@@ -442,9 +1307,35 @@ function analyzeTaskRequirements(userRequest) {
     'here', 'then', 'than', 'about', 'into', 'onto', 'after', 'before',
     'method', 'call', 'unreferenced', 'module', 'modules',
   ]);
+
   const uniqueTerms = [...new Set(words)]
     .filter((word) => !searchStopWords.has(word))
     .sort((left, right) => right.length - left.length || left.localeCompare(right));
+
+  // Structural intent detection and convention-aware symbol synthesis
+  const lowerText = text.toLowerCase();
+  const matchedStructural = STRUCTURAL_KEYWORDS.filter((keyword) => {
+    const kwRegex = new RegExp(`\\b${keyword}\\b`, 'i');
+    return kwRegex.test(lowerText);
+  });
+  const synthesizedVariants = matchedStructural.length > 0 ? generateSymbolVariants(exactSymbols, matchedStructural) : [];
+
+  // Assemble prioritized domain terms:
+  // 1. Exact relative paths
+  // 2. Exact symbols / identifiers & synthesized declaration variants
+  // 3. Route endpoints & quoted literals
+  // 4. Error signals
+  // 5. General filtered domain terms
+  const prioritizedDomainTerms = [...new Set([
+    ...exactPaths,
+    ...exactSymbols,
+    ...synthesizedVariants,
+    ...routePaths,
+    ...quotedLiterals,
+    ...errorSignals,
+    ...uniqueTerms,
+  ])].filter((term) => term && term.length > 1);
+
   const listedRequirements = text
     .split(/\r?\n/)
     .map((line) => line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$/)?.[1]?.trim())
@@ -457,14 +1348,27 @@ function analyzeTaskRequirements(userRequest) {
     'No regressions in surrounding modules',
   ];
 
+  const isBugFix = /\b(?:fix|repair|patch|debug|bug|issue|defect|error|trace|fail|failing|failed|broken)\b/i.test(text);
+  const isModular = !isBugFix && /\b(?:modular|clean\s+architecture|full-?stack|fullstack|multi-layer|separate\s+files?|build\s+(?:a\s+)?complete|scaffold|setup\s+project|create\s+project|new\s+feature|add\s+feature)\b/i.test(text);
+
   return {
     explicitRequirements,
     acceptanceCriteria,
-    domainTerms: uniqueTerms,
+    domainTerms: prioritizedDomainTerms,
+    searchSignals: {
+      exactPaths: [...new Set(exactPaths)],
+      exactSymbols: [...new Set([...exactSymbols, ...synthesizedVariants])],
+      structuralIntent: matchedStructural,
+      routePaths: [...new Set(routePaths)],
+      errorSignals: [...new Set(errorSignals)],
+      errorFrames: errorFrames,
+      quotedLiterals: [...new Set(quotedLiterals)],
+    },
     ambiguityScore: 'LOW',
     needsClarification: false,
     clarificationPrompt: null,
     inventedAssumptions: false,
+    isModular,
   };
 }
 
@@ -1092,8 +1996,11 @@ function advanceTaskPlan(taskPlan, {
       }
       if (subtaskId === 'ST-4') {
         const proposalEvidence = taskPlan.subtasks.find((item) => item.id === 'ST-3')?.evidence;
-        const expectedTargets = proposalEvidence?.targets || [proposalEvidence?.targetFile].filter(Boolean);
-        const approvedTargets = Array.isArray(evidence.approvedTargets) ? evidence.approvedTargets : [];
+        const normTarget = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
+        const rawExpected = proposalEvidence?.targets || [proposalEvidence?.targetFile].filter(Boolean);
+        const rawApproved = Array.isArray(evidence.approvedTargets) ? evidence.approvedTargets : [];
+        const expectedTargets = rawExpected.map(normTarget);
+        const approvedTargets = rawApproved.map(normTarget);
         if (evidence.approved !== true
           || !evidence.proposalId
           || evidence.proposalId !== proposalEvidence?.proposalId
@@ -1200,6 +2107,91 @@ function advanceTaskPlan(taskPlan, {
   return taskPlan;
 }
 
+/**
+ * Constructs a canonical machine-verifiable workflow receipt for an autonomous coding execution.
+ */
+function buildWorkflowReceipt({
+  outcome,
+  stagesCompleted = [],
+  rootCause = null,
+  approvedProposal = null,
+  appliedDiffScope = null,
+  verificationReport = null,
+  worktreeIntegrity = null,
+  rolledBack = false,
+}) {
+  return {
+    outcome: String(outcome || 'UNKNOWN'),
+    stagesCompleted: Array.isArray(stagesCompleted) ? [...stagesCompleted] : [],
+    rootCause: rootCause ? {
+      filePath: rootCause.filePath || null,
+      lineRange: rootCause.lineRange || (rootCause.lines ? { startLine: Number(String(rootCause.lines).split('-')[0]) || 1, endLine: Number(String(rootCause.lines).split('-')[1]) || 1 } : null),
+      codeEvidence: rootCause.codeEvidence || rootCause.codeSnippet || null,
+      symbol: rootCause.symbol || null,
+      causalExplanation: rootCause.causalExplanation || rootCause.controlFlow || null,
+    } : null,
+    approvedProposal: approvedProposal ? {
+      targetFile: approvedProposal.targetFile || null,
+      targetLineRange: approvedProposal.targetLineRange || null,
+      expectedBehavior: approvedProposal.expectedBehavior || null,
+      rootCauseSummary: approvedProposal.rootCauseSummary || null,
+    } : null,
+    appliedDiffScope: appliedDiffScope ? {
+      modifiedFiles: Array.isArray(appliedDiffScope.modifiedFiles) ? [...appliedDiffScope.modifiedFiles] : [],
+      lineEndingsPreserved: appliedDiffScope.lineEndingsPreserved !== false,
+      driftDetected: Boolean(appliedDiffScope.driftDetected),
+      scopeViolation: Boolean(appliedDiffScope.scopeViolation),
+      rolledBack: Boolean(rolledBack || appliedDiffScope.rolledBack),
+    } : null,
+    verificationReport: verificationReport ? {
+      status: verificationReport.status || (verificationReport.ok ? 'PASSED' : 'FAILED'),
+      ok: Boolean(verificationReport.ok),
+      executed: Boolean(verificationReport.executed),
+      exitCode: Number.isInteger(verificationReport.exitCode) ? verificationReport.exitCode : null,
+      verificationEvidence: Array.isArray(verificationReport.verificationEvidence) ? verificationReport.verificationEvidence : [],
+      failureDiagnostics: verificationReport.failureDiagnostics || null,
+    } : null,
+    worktreeIntegrity: worktreeIntegrity ? {
+      preserved: worktreeIntegrity.preserved !== false,
+      unrelatedUntouched: worktreeIntegrity.unrelatedUntouched !== false,
+      auditResult: worktreeIntegrity.auditResult || null,
+    } : null,
+    rolledBack: Boolean(rolledBack),
+    timestamp: new Date().toISOString(),
+  };
+}
+
+/**
+ * Validates the canonical workflow receipt for structural integrity and honest consistency.
+ */
+function validateWorkflowReceipt(receipt) {
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
+    return { isValid: false, rejectionReason: 'Receipt must be a valid non-null object.' };
+  }
+  if (!Array.isArray(receipt.stagesCompleted) || receipt.stagesCompleted.length === 0) {
+    return { isValid: false, rejectionReason: 'Receipt must contain non-empty stagesCompleted array.' };
+  }
+  const terminalSuccess = ['SUCCESS', 'COMPLETED'].includes(receipt.outcome);
+  if (terminalSuccess) {
+    if (!receipt.stagesCompleted.includes('APPLY') || !receipt.stagesCompleted.includes('VERIFY')) {
+      return { isValid: false, rejectionReason: 'Successful receipt must include APPLY and VERIFY stages.' };
+    }
+    if (!receipt.verificationReport || receipt.verificationReport.ok !== true || receipt.verificationReport.exitCode !== 0) {
+      return { isValid: false, rejectionReason: 'Successful receipt requires verified verificationReport with exitCode 0.' };
+    }
+    if (!receipt.approvedProposal) {
+      return { isValid: false, rejectionReason: 'Successful receipt requires approvedProposal.' };
+    }
+    if (!receipt.appliedDiffScope || !receipt.appliedDiffScope.modifiedFiles.length) {
+      return { isValid: false, rejectionReason: 'Successful receipt requires appliedDiffScope with modified files.' };
+    }
+  }
+  if (receipt.rolledBack === true && terminalSuccess) {
+    return { isValid: false, rejectionReason: 'Rolled back workflow cannot claim successful outcome.' };
+  }
+  return { isValid: true };
+}
+
 module.exports = {
   CLASSIFICATION_CONFIRMED,
   CLASSIFICATION_LIKELY,
@@ -1217,8 +2209,13 @@ module.exports = {
   traceExecutionFlow,
   validateEvidenceReport,
   validatePatchScope,
+  validateProposalContract,
   enforceApprovalGate,
+  validateApplyScope,
+  extractFailureDiagnostics,
   invalidateCompletedWorkItems,
+  extractEnclosingFunctionBlock,
+  generateSymbolVariants,
   analyzeTaskRequirements,
   planProgressiveSearch,
   discoverProjectArchitecture,
@@ -1226,4 +2223,6 @@ module.exports = {
   manageRepairLoop,
   createTaskPlan,
   advanceTaskPlan,
+  buildWorkflowReceipt,
+  validateWorkflowReceipt,
 };

@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { verifyIntegrationReachability } from '../electron/coding-pipeline/modularArchitectureEngine.cjs';
 import {
   digestText,
   evaluateRealTaskDataset,
@@ -1327,7 +1328,44 @@ class FormController {
     'Renderer-supplied autoApprove claims must be rejected fail-closed via preload bridge.'
   );
 
-  console.log('Deterministic real-request IPC integration verified; relevance responses are test fixtures, not live-provider evidence.');
+  // TEST 19: Greenfield Live Full-Stack Intercept & File Materialization (Milestone V10.1)
+  const greenfieldProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-greenfield-fullstack-'));
+  projectRoots.add(greenfieldProject);
+  await invokeIpc('developer:project-attach', sender, { projectRoot: greenfieldProject });
+  dialogResponses.push(1); // 1 = Approve exact proposal
+  const livePrompt = "Act as an expert Full-Stack Developer. Build a complete 'Add Order' feature using Next.js (App Router) for the frontend and Node.js with Express and MongoDB for the backend... Provide clean, modular code snippets...";
+  const greenfieldResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: livePrompt,
+    scope: '.',
+  });
+  assert.equal(greenfieldResult.outcome, 'SUCCESS', 'Greenfield request must complete with SUCCESS outcome: ' + JSON.stringify(greenfieldResult));
+  assert.equal(greenfieldResult.codeApplied, true, 'Greenfield patch must be applied to disk.');
+  assert.equal(greenfieldResult.codeVerified, true, 'Greenfield architecture must pass verification.');
+  assert.ok(Array.isArray(greenfieldResult.filesModified) && greenfieldResult.filesModified.length >= 4, 'Must create multi-layer files.');
+  const expectedGreenfieldFiles = [
+    'config/db.js',
+    'models/orderModel.js',
+    'controllers/orderController.js',
+    'routes/orderRoutes.js',
+    'server.js',
+    'components/OrderForm.jsx',
+    'app/orders/page.jsx',
+  ];
+  for (const relFile of expectedGreenfieldFiles) {
+    const fullPath = path.join(greenfieldProject, ...relFile.split('/'));
+    const stat = await fs.stat(fullPath);
+    assert.ok(stat.isFile(), 'Created file [' + relFile + '] must exist on disk.');
+    const textContent = await fs.readFile(fullPath, 'utf8');
+    assert.ok(textContent.trim().length > 20, 'File [' + relFile + '] must contain non-empty code.');
+  }
+  const reachabilityResult = await verifyIntegrationReachability(greenfieldProject, {
+    modulesToCreate: expectedGreenfieldFiles.map((p) => ({ path: p })),
+    integrationPoints: [],
+  });
+  assert.equal(reachabilityResult.isValid, true, 'All created files must pass integration reachability.');
+  console.log('TEST 19 PASSED: Greenfield Live Full-Stack Intercept & File Materialization verified.');
+
+    console.log('Deterministic real-request IPC integration verified; relevance responses are test fixtures, not live-provider evidence.');
 } finally {
   globalThis.fetch = originalFetch;
   if (previousCodingAuthToken === undefined) delete process.env.AI_CODING_AUTH_TOKEN;

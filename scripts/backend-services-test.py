@@ -2657,10 +2657,20 @@ class CodingConversationBudgetTests(unittest.TestCase):
         self.assertGreater(completion.call_count, 0)
 
     def test_tool_results_are_bounded(self):
+        source_lines = [f"line {line}: implementation details" for line in range(1, 2401)]
         serialized = _serialize_coding_tool_result({
             "ok": True,
             "tool": "read_file",
-            "data": {"path": "models/AdmOuPrgList.php", "content": "x" * 12000},
+            "data": {
+                "path": "models/AdmOuPrgList.php",
+                "content": "\n".join(source_lines),
+                "lineRange": {
+                    "startLine": 1,
+                    "endLine": len(source_lines),
+                    "totalLines": len(source_lines),
+                    "complete": True,
+                },
+            },
         })
 
         self.assertLessEqual(len(serialized), 6000)
@@ -2669,7 +2679,7 @@ class CodingConversationBudgetTests(unittest.TestCase):
         self.assertEqual(parsed["data"]["path"], "models/AdmOuPrgList.php")
         self.assertIn("[File content compacted", parsed["data"]["content"])
         self.assertTrue(parsed["data"]["sourceContextTruncated"])
-        self.assertEqual(parsed["data"]["sourceLineCount"], 1)
+        self.assertEqual(parsed["data"]["sourceLineCount"], len(source_lines))
         self.assertTrue(_has_read_file_evidence([{
             "role": "tool",
             "name": "read_file",
@@ -2843,11 +2853,14 @@ class CodingConversationBudgetTests(unittest.TestCase):
                 name, arguments = _validate_tool_call({
                     "function": {
                         "name": tool_name,
-                        "arguments": "{\"path\":\"modules/academic/controller.js\"}",
+                        "arguments": "{\"path\":\"modules/academic/controller.js\",\"startLine\":40,\"endLine\":80}",
                     },
                 })
 
-                self.assertEqual((name, arguments), ("read_file", {"relativePath": "modules/academic/controller.js"}))
+                self.assertEqual((name, arguments), (
+                    "read_file",
+                    {"relativePath": "modules/academic/controller.js", "startLine": 40, "endLine": 80},
+                ))
         self.assertEqual(MAX_CODING_TOOL_ROUNDS, 7)
 
     def test_read_file_schema_and_planned_calls_use_one_path_argument(self):
@@ -2861,7 +2874,11 @@ class CodingConversationBudgetTests(unittest.TestCase):
             {
                 "type": "object",
                 "required": ["path"],
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "startLine": {"type": "integer", "minimum": 1},
+                    "endLine": {"type": "integer", "minimum": 1},
+                },
                 "additionalProperties": False,
             },
         )
@@ -2874,6 +2891,110 @@ class CodingConversationBudgetTests(unittest.TestCase):
             json.loads(call["function"]["arguments"]),
             {"path": "components/helper/NumberHelper.php"},
         )
+
+    def test_read_file_range_survives_provider_tool_validation_for_truncated_source(self):
+        source_lines = [f"function helper_{line}() {{ return {line}; }}" for line in range(1, 2401)]
+        matching_line = 1837
+        source_lines[matching_line - 1] = "export async function requestedHandler() {"
+        for line_index in range(matching_line, 2050):
+            source_lines[line_index] = f"  const stage_{line_index} = {line_index};"
+        source_lines[2050] = "  return stage_2049;"
+        source_lines[2051] = "}"
+        serialized_source = _serialize_coding_tool_result({
+            "ok": True,
+            "tool": "read_file",
+            "data": {
+                "path": "src/generated-large-file.js",
+                "content": "\n".join(source_lines),
+                "lineRange": {
+                    "startLine": 1,
+                    "endLine": len(source_lines),
+                    "totalLines": len(source_lines),
+                    "complete": True,
+                },
+            },
+        }, {"requestedhandler"})
+        provider_source = json.loads(serialized_source)["data"]
+        self.assertTrue(provider_source["sourceContextTruncated"])
+        self.assertEqual(provider_source["sourceLineCount"], len(source_lines))
+        self.assertIn("requestedHandler", provider_source["content"])
+        tool = {
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({
+                    "path": "src/generated-large-file.js",
+                    "startLine": matching_line - 8,
+                    "endLine": matching_line + 12,
+                }),
+            },
+        }
+        name, arguments = _validate_tool_call(tool)
+
+        self.assertEqual(name, "read_file")
+        self.assertEqual(arguments, {
+            "relativePath": "src/generated-large-file.js",
+            "startLine": matching_line - 8,
+            "endLine": matching_line + 12,
+        })
+        self.assertIn(source_lines[matching_line - 1], provider_source["content"])
+        import index
+        with tempfile.TemporaryDirectory() as project_root:
+            target = Path(project_root) / "src" / "generated-large-file.js"
+            target.parent.mkdir(parents=True)
+            target.write_text("\n".join(source_lines), encoding="utf-8")
+            with patch.object(index, "get_backend_project_state", return_value={
+                "attached": True,
+                "projectRoot": project_root,
+            }):
+                first_result = index.execute_coding_tool_endpoint({
+                    "name": "read_file",
+                    "arguments": {
+                        "path": "src/generated-large-file.js",
+                        "startLine": matching_line - 8,
+                        "endLine": matching_line + 191,
+                    },
+                })
+                second_result = index.execute_coding_tool_endpoint({
+                    "name": "read_file",
+                    "arguments": {
+                        "path": "src/generated-large-file.js",
+                        "startLine": matching_line + 192,
+                        "endLine": matching_line + 215,
+                    },
+                })
+        self.assertTrue(first_result["ok"])
+        self.assertTrue(second_result["ok"])
+        first_read = first_result["data"]
+        second_read = second_result["data"]
+        self.assertIn("requestedHandler", first_read["content"])
+        self.assertNotIn("}", first_read["content"].splitlines()[-1])
+        self.assertEqual(first_read["lineRange"]["startLine"], matching_line - 8)
+        self.assertEqual(first_read["lineRange"]["endLine"], matching_line + 191)
+        self.assertEqual(first_read["lineRange"]["totalLines"], len(source_lines))
+        self.assertFalse(first_read["lineRange"]["complete"])
+        self.assertEqual(second_read["content"].splitlines()[-1], "}")
+        self.assertEqual(second_read["lineRange"]["startLine"], matching_line + 192)
+        self.assertEqual(second_read["lineRange"]["endLine"], matching_line + 215)
+        self.assertFalse(second_read["lineRange"]["complete"])
+        retrieved_body = first_read["content"].splitlines() + second_read["content"].splitlines()
+        expected_range = source_lines[matching_line - 9:matching_line + 215]
+        self.assertEqual(retrieved_body, expected_range)
+        for invalid_range in (
+            {"startLine": matching_line},
+            {"startLine": matching_line, "endLine": matching_line + 200},
+            {"startLine": matching_line + 1, "endLine": matching_line},
+        ):
+            with self.subTest(invalid_range=invalid_range):
+                with self.assertRaisesRegex(ValueError, "INVALID_TOOL_ARGUMENTS"):
+                    _validate_tool_call({
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({
+                                "path": "src/generated-large-file.js",
+                                **invalid_range,
+                            }),
+                        },
+                    })
 
     def test_tool_registry_is_exact_and_uses_provider_declarations(self):
         declared_canonical_tools = {

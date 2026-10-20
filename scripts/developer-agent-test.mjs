@@ -7,7 +7,7 @@ import { ArtifactEngine, ARTIFACT_TYPES } from '../electron/coding-pipeline/arti
 import { multiRepoCoordinator } from '../electron/coding-pipeline/multiRepo.cjs';
 import { taskOrchestrator } from '../electron/coding-pipeline/orchestrator.cjs';
 import { routeTaskMode } from '../electron/coding-pipeline/modes.cjs';
-import runtimeSettings from '../src/config/runtimeSettings.json' with { type: 'json' };
+const runtimeSettings = JSON.parse(await fs.readFile(new URL('../src/config/runtimeSettings.json', import.meta.url), 'utf8'));
 
 const createUnboundProposal = agent.createProposal;
 agent.createProposal = async (input) => {

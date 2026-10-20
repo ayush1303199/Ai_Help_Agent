@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { developer: developerSettings } = require('../src/config/runtimeSettings.json');
 const { detectProject, PROJECT_MANIFESTS, VERIFICATION_PROFILES } = require('./coding-pipeline/detect/projectDetector.cjs');
+const { maskNonCodeSource } = require('./coding-pipeline/investigationWorkflowContract.cjs');
 const {
   markProjectProcessIsolationUnavailable,
   requireProjectProcessIsolation,
@@ -765,8 +766,17 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
         && queryTokens[0].length >= 3
         && normalizedPath.split('/').slice(0, -1).some((seg) => seg === queryTokens[0])
         && /(?:controller|service|handler|model|route|view|form|api|repo)/i.test(normalizedEntryName);
-      const declarationPattern = /^\s*(?:(?:export|abstract|final|public|private|protected|static|async)\s+)*(?:class|interface|trait|enum|function|def)\s+[A-Za-z_$][\w$]*/i;
+      const hasStructuralIntent = queryTokens.some((t) => (
+        ['action', 'method', 'function', 'func', 'fn', 'handler', 'controller', 'service', 'class'].includes(t)
+      )) || /^(?:action[A-Z]|handle[A-Z]|get[A-Z]|post[A-Z]|def_|fn_|func_)/.test(rawQuery);
+      const isViewOrTemplate = /(?:[\/\\]views?[\/\\]|[\/\\]templates?[\/\\]|[\/\\]tpl[\/\\]|\.(?:phtml|blade\.php|twig|html)$)/i.test(childRelative);
+      const declarationPattern = /^\s*(?:(?:export|abstract|final|public|private|protected|static|async)\s+)*(?:class|interface|trait|enum|function|def|fn|func|sub)?\s*(?:[A-Za-z_$][\w$]*\s+)?([A-Za-z_$][\w$]*)\s*\(/i;
+      const queryPathNormalized = rawQuery.replace(/\\/g, '/').toLowerCase();
+      const pathMatch = normalizedPath.includes(queryLower)
+        || normalizedPath.endsWith('/' + queryLower)
+        || (queryPathNormalized.includes('/') && normalizedPath.includes(queryPathNormalized));
       const filenameCandidate = nameMatch
+        || pathMatch
         || (queryTokens.length > 0 && filenameTerms === queryTokens.length)
         || multiTokenMatch
         || pathSegmentMatch;
@@ -776,7 +786,7 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
           line: 0,
           text: entry.name,
           matchType: 'filename',
-          score: (nameMatch ? 120 : 0)
+          score: (pathMatch ? 150 : (nameMatch ? 120 : 0))
             + (filenameTerms === queryTokens.length ? 80 : filenameTerms * 20)
             + (multiTokenMatch ? 35 : 0)
             + (pathSegmentMatch ? 25 : 0)
@@ -786,6 +796,7 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
       if (stat.size > MAX_SEARCH_FILE_BYTES) continue;
       const content = await fs.readFile(target.target, 'utf8');
       const lines = content.split(/\r?\n/);
+      let executableLines = null;
       let matchingLines = 0;
       lines.forEach((line, lineIndex) => {
         if (matchingLines >= 3) return;
@@ -799,14 +810,16 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
           || normalizedLine.includes(foldedQueryText);
         if (exactMatch || (matchedTerms > 0 && (queryTokens.length === 1 || matchedTerms === queryTokens.length))) {
           matchingLines += 1;
+          executableLines ||= maskNonCodeSource(content, childRelative).split(/\r?\n/);
+          const isDeclaration = declarationPattern.test(executableLines[lineIndex] || '');
           results.push({
             path: childRelative,
             line: lineIndex + 1,
             text: line.slice(0, 240),
-            matchType: declarationPattern.test(line) ? 'definition' : 'content',
+            matchType: isDeclaration ? 'definition' : 'content',
             score: (exactMatch ? 100 : 0)
               + (matchedTerms === queryTokens.length ? 50 : matchedTerms * 15)
-              + (declarationPattern.test(line) ? 30 : 0)
+              + (isDeclaration ? 30 : 0)
               + (/(?:route|router|path|url|endpoint)/i.test(line) ? 10 : 0)
               + pathRelevance,
           });
@@ -830,13 +843,15 @@ async function searchCode(query, ownerWebContentsId, relativeScope = '.') {
           continue;
         }
         const normalizedChild = childRelative.replace(/\\/g, '/').toLowerCase();
+        const nonGenericTokens = queryTokens.filter((tok) => !['module', 'modules', 'app', 'apps', 'file', 'files', 'code'].includes(tok));
+        const effectiveTokens = nonGenericTokens.length > 0 ? nonGenericTokens : queryTokens;
         if (entry.isFile()
-          && queryTokens.some((tok) => tok.length >= 3 && normalizedChild.includes(tok))
+          && effectiveTokens.some((tok) => tok.length >= 3 && normalizedChild.includes(tok))
           && /(?:controllers?|models?|views?|services?|modules?|components?|routes?|handlers?|api)/i.test(normalizedChild)) {
-          const normalizedChild = childRelative.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+          const normalizedChildFolded = childRelative.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
             .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
             .replace(/[_\-/.\\]+/g, ' ').toLowerCase();
-          const matchedTerms = queryTokens.filter((token) => normalizedChild.includes(token)).length;
+          const matchedTerms = queryTokens.filter((token) => normalizedChildFolded.includes(token)).length;
           results.push({
             path: childRelative,
             line: 0,

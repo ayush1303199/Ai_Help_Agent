@@ -1097,6 +1097,7 @@ def provider_capabilities() -> Dict[str, Any]:
 CODING_IGNORED_NAMES = {".git", "node_modules", "dist", "build", ".next", "coverage", "logs", "tmp", "temp"}
 CODING_SENSITIVE_NAMES = {".ssh", ".aws", ".azure", ".config"}
 CODING_MAX_FILE_BYTES = 2 * 1024 * 1024
+CODING_MAX_TARGETED_READ_LINES = 200
 
 
 def _is_inside_project_root(root: Path, target: Path) -> bool:
@@ -1635,7 +1636,7 @@ def list_coding_directory_get_endpoint(path: str = ".", scope: str = ".") -> Lis
 
 
 @app.get("/api/coding/read-file")
-def read_coding_file_endpoint(path: str, scope: str = ".") -> Dict[str, str]:
+def read_coding_file_endpoint(path: str, scope: str = ".") -> Dict[str, Any]:
     return _read_coding_file(path, scope)
 
 
@@ -1643,7 +1644,9 @@ def _read_coding_file(
     path: str,
     scope: str = ".",
     project_root: Optional[str] = None,
-) -> Dict[str, str]:
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+) -> Dict[str, Any]:
     root = _resolve_coding_project_root(project_root)
     clean = path.replace("\\", "/").strip().lstrip("./")
     if not clean:
@@ -1688,7 +1691,44 @@ def _read_coding_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
     rel = str(target.relative_to(root)).replace("\\", "/")
-    return {"path": rel, "content": content}
+    lines = content.splitlines()
+    total_lines = len(lines)
+    has_start = start_line is not None
+    has_end = end_line is not None
+    if has_start != has_end:
+        raise HTTPException(status_code=400, detail="Targeted reads require both startLine and endLine.")
+    if has_start:
+        if (
+            isinstance(start_line, bool)
+            or isinstance(end_line, bool)
+            or not isinstance(start_line, int)
+            or not isinstance(end_line, int)
+            or start_line < 1
+            or end_line < start_line
+            or end_line - start_line + 1 > CODING_MAX_TARGETED_READ_LINES
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Targeted reads require a valid range of at most {CODING_MAX_TARGETED_READ_LINES} lines.",
+            )
+        if start_line > total_lines:
+            raise HTTPException(status_code=400, detail="Targeted read starts beyond the end of the source file.")
+        bounded_end = min(end_line, total_lines)
+        content = "\n".join(lines[start_line - 1:bounded_end])
+        line_range = {
+            "startLine": start_line,
+            "endLine": bounded_end,
+            "totalLines": total_lines,
+            "complete": start_line == 1 and bounded_end == total_lines,
+        }
+    else:
+        line_range = {
+            "startLine": 1,
+            "endLine": total_lines,
+            "totalLines": total_lines,
+            "complete": True,
+        }
+    return {"path": rel, "content": content, "lineRange": line_range}
 
 
 @app.get("/api/coding/search-code")
@@ -1730,7 +1770,27 @@ def _search_path_priority(relative_path: str) -> int:
 
 def _normalized_search_text(value: str) -> str:
     separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
-    return " ".join(re.findall(r"[a-z0-9_]+", separated.casefold()))
+    return " ".join(re.findall(r"[a-z0-9]+", separated.casefold()))
+
+
+def _search_term_matches(term: str, normalized_text: str) -> bool:
+    if term in normalized_text:
+        return True
+
+    variants = set()
+    if len(term) > 4 and term.endswith("ies"):
+        variants.add(term[:-3] + "y")
+    if len(term) > 4 and term.endswith(("ches", "shes", "sses", "xes", "zes")):
+        variants.add(term[:-2])
+    if len(term) > 4 and term.endswith("s"):
+        variants.add(term[:-1])
+    if len(term) > 5 and term.endswith("ing"):
+        stem = term[:-3]
+        variants.update((stem, stem + "e"))
+    if len(term) > 4 and term.endswith("ed"):
+        stem = term[:-2]
+        variants.update((stem, stem + "e"))
+    return any(variant in normalized_text for variant in variants)
 
 
 def _search_coding_code(
@@ -1795,9 +1855,15 @@ def _search_coding_code(
                 if b"\0" in source.read(8192):
                     continue
             filename_normalized = _normalized_search_text(file_path.name)
-            filename_terms = [term for term in query_terms if term in filename_normalized]
+            filename_terms = [
+                term for term in query_terms
+                if _search_term_matches(term, filename_normalized)
+            ]
             path_normalized = _normalized_search_text(relative_path)
-            path_terms = [term for term in query_terms if term in path_normalized]
+            path_terms = [
+                term for term in query_terms
+                if _search_term_matches(term, path_normalized)
+            ]
             if filename_terms:
                 score = (
                     100 if query_normalized and query_normalized in filename_normalized else 0
@@ -1832,7 +1898,7 @@ def _search_coding_code(
                 for line_number, line in enumerate(source, start=1):
                     folded_line = line.casefold()
                     normalized_line = _normalized_search_text(line)
-                    terms = {term for term in query_terms if term in normalized_line}
+                    terms = {term for term in query_terms if _search_term_matches(term, normalized_line)}
                     if not terms:
                         continue
                     matched_terms.update(terms)
@@ -1890,7 +1956,7 @@ async def assess_finding_relevance_endpoint(payload: Dict[str, Any]) -> Dict[str
         _logger.warning("Coding finding relevance assessment unavailable: %s", error)
         raise HTTPException(
             status_code=503,
-            detail="The configured Coding provider could not assess finding relevance.",
+            detail=f"The configured Coding provider could not assess finding relevance: {error}",
         ) from error
 
 
@@ -1923,7 +1989,13 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         if canonical == "read_file":
             rel_path = str(args.get("relativePath") or args.get("path") or args.get("file") or "").strip()
-            data = _read_coding_file(rel_path, scope, project_root)
+            data = _read_coding_file(
+                rel_path,
+                scope,
+                project_root,
+                start_line=args.get("startLine"),
+                end_line=args.get("endLine"),
+            )
             return {"ok": True, "data": SecretProtector.redact_data(data)}
         elif canonical == "list_directory":
             rel_path = str(args.get("relativePath") or args.get("path") or args.get("dir") or scope or ".").strip()
@@ -2615,8 +2687,8 @@ DEVELOPER_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file in the selected project. Read-only.",
-            "parameters": {"type": "object", "required": ["relativePath"], "properties": {"relativePath": {"type": "string"}}, "additionalProperties": False},
+            "description": "Read project source by path; optional 1-based startLine/endLine reads up to 200 lines. Use ranges to inspect source omitted by a truncation marker.",
+            "parameters": {"type": "object", "required": ["relativePath"], "properties": {"relativePath": {"type": "string"}, "startLine": {"type": "integer", "minimum": 1}, "endLine": {"type": "integer", "minimum": 1}}, "additionalProperties": False},
         },
     },
     {

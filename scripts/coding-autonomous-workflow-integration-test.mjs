@@ -1384,6 +1384,18 @@ class AccountDetails {
     complete: false,
   });
 
+  const mixedSymbolPath = path.join(projectDir, 'src', 'mixed-symbols.py');
+  await fs.mkdir(path.dirname(mixedSymbolPath), { recursive: true });
+  await fs.writeFile(
+    mixedSymbolPath,
+    '"""Example text:\ndef requested_operation():\n    pass\n"""\ndef requested_operation():\n    return True\n',
+    'utf8'
+  );
+  const mixedSymbolSearch = await developerFiles.searchCode('requested_operation', ownerWebContentsId, '.');
+  const mixedSymbolMatches = mixedSymbolSearch.results.filter((result) => result.path.endsWith('mixed-symbols.py'));
+  assert.ok(mixedSymbolMatches.some((result) => result.line === 2 && result.matchType === 'content'));
+  assert.ok(mixedSymbolMatches.some((result) => result.line === 5 && result.matchType === 'definition'));
+
   console.log('Production End-to-End Autonomous Coding Workflow integration verified successfully.');
 } finally {
   developerAgent.releaseSession(ownerWebContentsId);

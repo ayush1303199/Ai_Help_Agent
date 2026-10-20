@@ -12,6 +12,7 @@ SERVER_SRC = Path(__file__).resolve().parents[1] / "server" / "src"
 sys.path.insert(0, str(SERVER_SRC))
 
 import coding_intelligence as intelligence  # noqa: E402
+import coding_provider as provider  # noqa: E402
 import coding_websocket as websocket  # noqa: E402
 
 
@@ -227,6 +228,83 @@ class CodingAgentHardeningRegressionTests(unittest.TestCase):
             resumed["providerRecovery"]["classification"],
             prior_task["providerRecovery"]["classification"],
         )
+
+    def test_resumed_task_evidence_is_distinguished_from_provider_tool_results(self):
+        project_root = str(Path("C:/workspace/project"))
+        original_request = "Inspect the request execution lifecycle."
+        source_evidence = {
+            "evidenceId": "ev-read-source",
+            "taskId": "task-source-resume",
+            "sessionId": "source-resume-session",
+            "projectRoot": project_root,
+            "scope": ".",
+            "type": "FILE",
+            "source": "read_file",
+            "target": "src/handler.py",
+            "summary": '{"data":{"path":"src/handler.py","content":"def handle(): pass"}}',
+            "provenance": "READ_ONLY_TOOL_RESULT",
+            "verified": True,
+        }
+        prior_task = {
+            "taskId": "task-source-resume",
+            "turnId": "turn-provider-failure",
+            "status": "INCOMPLETE",
+            "originalRequest": original_request,
+            "userRequest": original_request,
+            "goal": {"statement": original_request},
+            "projectContext": {"root": project_root},
+            "evidence": [source_evidence],
+            "providerRecovery": {
+                "state": "WAITING_FOR_PROVIDER",
+                "classification": "PROVIDER_QUOTA_EXHAUSTED",
+                "retryable": False,
+            },
+            "conversationContext": {"recentMessages": [], "continuityDetected": False},
+            "workingMemory": {},
+            "timestamps": {},
+        }
+        resumed = websocket._resume_semantic_task(
+            prior_task,
+            {"turnId": "turn-resume"},
+            "Continue the saved task.",
+            "turn-resume",
+        )
+        task_state = websocket._compile_agent_task_context(resumed)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Current bounded AgentTaskState (authoritative):\n"
+                    + json.dumps(task_state, ensure_ascii=False)
+                ),
+            },
+            {"role": "user", "content": "Continue the saved task."},
+        ]
+
+        compiled, _tools, metrics = provider.compile_coding_context(
+            messages,
+            None,
+            SimpleNamespace(type="openai", model="gpt-4o-mini"),
+            compaction_pass=0,
+        )
+        payload_metrics = provider._payload_component_metrics({
+            "messages": compiled,
+            "tools": [],
+        })
+
+        self.assertEqual(resumed["taskId"], prior_task["taskId"])
+        self.assertEqual(resumed["originalRequest"], original_request)
+        self.assertEqual(resumed["evidence"], [source_evidence])
+        self.assertEqual(metrics["selectedEvidenceCount"], 0)
+        self.assertEqual(metrics["selectedToolResultCount"], 0)
+        self.assertEqual(metrics["selectedEvidenceCountBasis"], "provider tool-result messages only")
+        self.assertEqual(metrics["selectedTaskEvidenceCount"], 1)
+        self.assertEqual(metrics["selectedHistoricalSourceEvidenceCount"], 1)
+        self.assertFalse(metrics["historicalSourceEvidenceFreshnessChecked"])
+        self.assertEqual(payload_metrics["toolResultSizeBytes"], 2)
+        self.assertEqual(payload_metrics["selectedTaskEvidenceCount"], 1)
+        self.assertEqual(payload_metrics["selectedHistoricalSourceEvidenceCount"], 1)
+        self.assertFalse(websocket._has_read_source_evidence(compiled))
 
     def test_websocket_blocks_unconfirmed_provider_retry_before_repository_or_model_work(self):
         with tempfile.TemporaryDirectory(prefix="coding-provider-recovery-") as root:

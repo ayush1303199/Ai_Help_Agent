@@ -36,7 +36,7 @@ OPENAI_COMPATIBLE = {
     "mistral", "xai", "perplexity", "fireworks", "cerebras", "custom",
     "custom-openai",
 }
-CODING_MAX_COMPLETION_TOKENS = CODING_COMPLETION_TOKENS
+CODING_MAX_COMPLETION_TOKENS = max(1024, CODING_COMPLETION_TOKENS)
 _logger = logging.getLogger(__name__)
 _provider_quota_blocks: Dict[str, Dict[str, Any]] = {}
 _provider_quota_blocks_lock = threading.RLock()
@@ -735,6 +735,43 @@ def _task_identity(messages: List[Dict[str, Any]]) -> tuple[str, int]:
     return "", 0
 
 
+def _task_state_evidence_metrics(system_texts: List[str]) -> Dict[str, Any]:
+    """Count task-state evidence carried in context without claiming source freshness."""
+    task_evidence_count = 0
+    historical_source_evidence_count = 0
+    source_read_tools = {
+        "read_file",
+        "repo_browser.read_file",
+        "repo_browser.open_file",
+    }
+    for content in system_texts:
+        marker = re.search(
+            r"(?:Current bounded AgentTaskState|Current authoritative AgentTaskState)[^:\n]*:\s*",
+            content,
+        )
+        if not marker:
+            continue
+        try:
+            state, _end = json.JSONDecoder().raw_decode(content[marker.end():])
+        except json.JSONDecodeError:
+            continue
+        evidence = state.get("evidence") if isinstance(state, dict) else None
+        if not isinstance(evidence, list):
+            continue
+        task_evidence_count += sum(isinstance(item, dict) for item in evidence)
+        historical_source_evidence_count += sum(
+            isinstance(item, dict)
+            and item.get("provenance") == "READ_ONLY_TOOL_RESULT"
+            and str(item.get("source") or "").casefold() in source_read_tools
+            for item in evidence
+        )
+    return {
+        "selectedTaskEvidenceCount": task_evidence_count,
+        "selectedHistoricalSourceEvidenceCount": historical_source_evidence_count,
+        "historicalSourceEvidenceFreshnessChecked": False,
+    }
+
+
 def _deduplicate_tool_groups(
     groups: List[List[Dict[str, Any]]],
     task_id: str,
@@ -940,6 +977,12 @@ def compile_coding_context(
             if _serialized_size(output) + tool_chars <= max_chars:
                 break
     estimated_chars = _serialized_size(output) + tool_chars
+    tool_result_count = sum(message.get("role") == "tool" for message in output)
+    task_evidence_metrics = _task_state_evidence_metrics([
+        str(message.get("content") or "")
+        for message in output
+        if isinstance(message, dict) and message.get("role") == "system"
+    ])
     application_budget = CODING_CONTEXT_BUDGET_TOKENS
     provider_limit = CODING_PROVIDER_INPUT_LIMIT_TOKENS or None
     model_limit = _context_window_tokens(provider)
@@ -947,11 +990,14 @@ def compile_coding_context(
         "contextItemCount": len(prepared) + len(compacted_tools or []),
         "estimatedInputBytes": estimated_chars,
         "estimatedInputTokens": _estimate_tokens(estimated_chars),
-        "selectedEvidenceCount": sum(message.get("role") == "tool" for message in output),
+        "selectedEvidenceCount": tool_result_count,
+        "selectedToolResultCount": tool_result_count,
+        "selectedEvidenceCountBasis": "provider tool-result messages only",
+        **task_evidence_metrics,
         "discardedEvidenceCount": max(
             0,
             sum(message.get("role") == "tool" for message in prepared)
-            - sum(message.get("role") == "tool" for message in output),
+            - tool_result_count,
         ),
         "discardedItemCount": max(0, len(prepared) - len(output)),
         "compactedItemCount": compacted_item_count,
@@ -987,7 +1033,7 @@ def compile_coding_context(
     return output, compacted_tools, metrics
 
 
-def _payload_component_metrics(payload: Dict[str, Any]) -> Dict[str, int]:
+def _payload_component_metrics(payload: Dict[str, Any]) -> Dict[str, Any]:
     system_texts = []
     if isinstance(payload.get("messages"), list):
         messages = payload["messages"]
@@ -1044,11 +1090,13 @@ def _payload_component_metrics(payload: Dict[str, Any]) -> Dict[str, int]:
         except json.JSONDecodeError:
             continue
         task_state_size += _serialized_size(state)
+    task_evidence_metrics = _task_state_evidence_metrics(system_texts)
     return {
         "systemSizeBytes": system_size,
         "conversationSizeBytes": conversation_size,
         "taskStateSizeBytes": task_state_size,
         "toolResultSizeBytes": tool_result_size,
+        **task_evidence_metrics,
         "toolSchemaSizeBytes": _serialized_size(payload.get("tools") or []),
         "providerControlSizeBytes": _serialized_size({
             key: value for key, value in payload.items()
