@@ -42,15 +42,12 @@ class CodingInvestigationEntrypointTests(unittest.TestCase):
                 "    return True\n",
                 encoding="utf-8",
             )
-<<<<<<< Updated upstream
             formatted_symbol_source = project / "src" / "UpdateApplication.py"
             formatted_symbol_source.write_text(
                 "class UpdateApplication:\n"
                 "    pass\n",
                 encoding="utf-8",
             )
-=======
->>>>>>> Stashed changes
             attached = ws_mod.set_backend_project_state(str(project))
             self.assertEqual(attached["status"], "PROJECT_ATTACHED")
             self.assertEqual(Path(attached["projectRoot"]), project.resolve())
@@ -134,7 +131,6 @@ class CodingInvestigationEntrypointTests(unittest.TestCase):
                     {result["path"] for result in described_payload["data"]["results"]},
                 )
 
-<<<<<<< Updated upstream
                 formatted_symbol_search = client.post(
                     "/api/coding/tool",
                     headers={"x-coding-auth": index_mod.CODING_AUTH_TOKEN},
@@ -152,9 +148,6 @@ class CodingInvestigationEntrypointTests(unittest.TestCase):
                     formatted_symbol_source.relative_to(project).as_posix(),
                     {result["path"] for result in formatted_symbol_payload["data"]["results"]},
                 )
-
-=======
->>>>>>> Stashed changes
                 read = client.post(
                     "/api/coding/tool",
                     headers={"x-coding-auth": index_mod.CODING_AUTH_TOKEN},

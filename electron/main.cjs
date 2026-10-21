@@ -7,6 +7,7 @@ const { fileURLToPath } = require('node:url');
 const fs = require('node:fs/promises');
 const developerFiles = require('./developerFiles.cjs');
 const developerAgent = require('./developerAgent.cjs');
+const { createAntigravityTerminalRunner } = require('./coding-pipeline/antigravityTerminalRunner.cjs');
 const developerIndex = require('./developerIndex.cjs');
 const developerContext = require('./developerContext.cjs');
 const developerBenchmark = require('./developerBenchmark.cjs');
@@ -14,12 +15,24 @@ const generalAgent = require('./generalAgent.cjs');
 const { ProviderSecretVault } = require('./providerSecretVault.cjs');
 const { authorizeAppOwnedMutation } = require('./appOwnedPersistence.cjs');
 const { normalizeVerificationCriteria } = require('./coding-pipeline/workItemVerificationContract.cjs');
+const { TrustedLocalDesktopBroker } = require('./coding-pipeline/trustedLocalDesktopBroker.cjs');
+const { createInlineWorkflowApprovalBroker } = require('./coding-pipeline/inlineWorkflowApproval.cjs');
+const { loadElectronE2eTestMode } = require('./electronE2eTestMode.cjs');
 const {
   projectProcessIsolationStatus,
   verifyProjectProcessIsolation,
 } = require('./coding-pipeline/projectProcessIsolation.cjs');
 const { buildCodingAcceptancePreflight } = require('./coding-pipeline/acceptancePreflight.cjs');
-const runtimeSettings = require('../src/config/runtimeSettings.json');
+const defaultRuntimeSettings = require('../src/config/runtimeSettings.json');
+const electronE2eTestMode = loadElectronE2eTestMode(defaultRuntimeSettings);
+const terminalRunner = createAntigravityTerminalRunner({
+  runVerification: (script, ownerWebContentsId, options) => (
+    developerFiles.runVerification(script, ownerWebContentsId, options)
+  ),
+  commandPolicy: (script) => developerAgent.commandPolicy(script),
+});
+if (electronE2eTestMode) app.setPath('userData', electronE2eTestMode.userDataDirectory);
+const runtimeSettings = electronE2eTestMode?.runtimeSettings || defaultRuntimeSettings;
 const { services, electron: electronSettings } = runtimeSettings;
 const devServerUrl = `http://${services.devServer.host}:${services.devServer.port}`;
 
@@ -72,11 +85,197 @@ const verificationRepairChainsByRoot = new Map();
 const verificationRepairChainsByToken = new Map();
 const verificationRepairChainsByTask = new Map();
 const workflowExecutions = new Map();
+const inlineWorkflowApprovalBroker = createInlineWorkflowApprovalBroker();
 const VERIFICATION_REPAIR_CHAIN_TTL_MS = 30 * 60 * 1000;
 const WORKFLOW_EXECUTION_TTL_MS = 30 * 60 * 1000;
 const MAX_WORKFLOW_EXECUTIONS = 128;
 const MAX_REPAIR_DIAGNOSTIC_CHARS = 4000;
 const MAX_WORKFLOW_APPROVAL_DIFF_CHARS = 16000;
+const BROKER_REGISTRY_RETRY_INITIAL_MS = 500;
+const BROKER_REGISTRY_RETRY_MAX_MS = 10000;
+const BROKER_REGISTRY_RECONCILE_INTERVAL_MS = 5000;
+const rendererOrigin = new URL(devServerUrl).origin;
+const rendererHost = new URL(rendererOrigin).hostname;
+const trustedBrokerOrigins = [...new Set([
+  rendererOrigin,
+  `http://localhost:${services.devServer.port}`,
+  `http://127.0.0.1:${services.devServer.port}`,
+  `http://${rendererHost}:${services.devServer.port}`,
+])];
+let trustedBroker = null;
+let brokerShutdownStarted = false;
+let brokerRegistrySyncTask = null;
+
+async function publishTrustedBrokerRegistry(projects = trustedBroker?.registeredProjects() || []) {
+  if (!trustedBroker?.endpoint) return;
+  const response = await fetch(new URL('/api/coding/broker/register', services.http.baseUrl), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Coding-Auth': codingAuthToken },
+    body: JSON.stringify({ endpoint: trustedBroker.endpoint, projects }),
+    signal: AbortSignal.timeout(electronSettings.portConnectTimeoutMs * 2),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Trusted broker registration failed (${response.status})${detail ? `: ${detail.slice(0, 300)}` : ''}.`);
+  }
+}
+
+async function disableTrustedBroker() {
+  const broker = trustedBroker;
+  trustedBroker = null;
+  if (broker) await broker.stop();
+}
+
+function waitForBrokerRegistrySync(delayMs) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, delayMs);
+    timer.unref?.();
+  });
+}
+
+function synchronizeTrustedBrokerRegistry() {
+  if (brokerRegistrySyncTask || !trustedBroker?.endpoint || brokerShutdownStarted) {
+    return brokerRegistrySyncTask || Promise.resolve();
+  }
+  brokerRegistrySyncTask = (async () => {
+    let retryDelayMs = BROKER_REGISTRY_RETRY_INITIAL_MS;
+    let lastFailure = '';
+    while (trustedBroker?.endpoint && !brokerShutdownStarted) {
+      try {
+        await publishTrustedBrokerRegistry();
+        if (lastFailure) {
+          console.info('[CODING][BROKER] Backend broker registry synchronized after recovery.');
+          lastFailure = '';
+        }
+        retryDelayMs = BROKER_REGISTRY_RETRY_INITIAL_MS;
+        await waitForBrokerRegistrySync(BROKER_REGISTRY_RECONCILE_INTERVAL_MS);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== lastFailure) {
+          console.warn(`[CODING][BROKER] Backend registry synchronization is retrying: ${message}`);
+          lastFailure = message;
+        }
+        await waitForBrokerRegistrySync(retryDelayMs);
+        retryDelayMs = Math.min(retryDelayMs * 2, BROKER_REGISTRY_RETRY_MAX_MS);
+      }
+    }
+  })().finally(() => {
+    brokerRegistrySyncTask = null;
+  });
+  return brokerRegistrySyncTask;
+}
+
+async function registerTrustedBrokerProject(ownerId, projectRoot) {
+  if (!trustedBroker?.endpoint || !Number.isInteger(ownerId) || typeof projectRoot !== 'string') return;
+  try {
+    await trustedBroker.registerProject({ root: projectRoot, registrationOwnerId: ownerId });
+    await publishTrustedBrokerRegistry();
+  } catch (error) {
+    void synchronizeTrustedBrokerRegistry();
+    throw error;
+  }
+}
+
+async function unregisterTrustedBrokerProject(ownerId) {
+  if (!trustedBroker?.endpoint || !Number.isInteger(ownerId)) return;
+  await trustedBroker.unregisterProject(ownerId);
+  await publishTrustedBrokerRegistry();
+}
+
+function createTrustedDesktopBroker() {
+  return new TrustedLocalDesktopBroker({
+    allowedOrigins: trustedBrokerOrigins,
+    browserApproval: true,
+    synchronizeProjects: async () => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (window.isDestroyed() || window.webContents.isDestroyed()) continue;
+        const ownerId = window.webContents.id;
+        const root = developerFiles.getProjectRoot(ownerId);
+        if (root) await registerTrustedBrokerProject(ownerId, root);
+      }
+    },
+    executeWorkflow: async (input) => {
+      const result = await developerAgent.executeAutonomousCodingWorkflow({
+        userRequest: input.userRequest,
+        root: input.root,
+        scope: input.scope,
+        sessionId: input.sessionId,
+        ownerWebContentsId: input.ownerWebContentsId,
+        userApproved: false,
+        isCancelled: input.isCancelled,
+        requestApproval: input.requestApproval,
+        tools: { authorizeMutation: input.authorizeMutation },
+      });
+      if (electronE2eTestMode) {
+        electronE2eTestMode.recordWorkflowResult(input.workflowRequestId, result);
+      }
+      return result;
+    },
+    onLeaseCreated: async ({ root, ownerWebContentsId, sessionId }) => {
+      const result = await developerFiles.attachProject(root, ownerWebContentsId);
+      if (result.status !== 'PROJECT_ATTACHED' || !result.projectRoot) {
+        throw new Error(result.reason || 'The registered project could not be attached to its broker lease.');
+      }
+      developerAgent.createSessionForBroker(ownerWebContentsId, sessionId);
+    },
+    onLeaseReleased: async ({ ownerWebContentsId }) => {
+      developerAgent.releaseSession(ownerWebContentsId);
+      developerFiles.releaseProject(ownerWebContentsId);
+    },
+    getTask: (taskId, owner) => developerAgent.getTaskProposalForBroker(taskId, owner),
+    validateSnapshots: (taskId, owner) => developerAgent.validateTaskProposalSnapshots(taskId, owner),
+    requestApproval: async (approval) => {
+      if (electronE2eTestMode && process.env.AI_CODING_E2E_INLINE_APPROVAL !== '1') {
+        return electronE2eTestMode.requestApproval({
+          root: approval.root,
+          scope: approval.scope,
+          workflowRequestId: approval.workflowRequestId,
+          proposal: {
+            ...approval.proposal,
+            targetFiles: approval.proposal.files.map((file) => file.path),
+          },
+          proposalContract: approval.proposalContract,
+          diff: approval.diff,
+        });
+      }
+      const ownerWindow = BrowserWindow.getAllWindows().find((window) => (
+        !window.isDestroyed()
+        && !window.webContents.isDestroyed()
+        && window.webContents.id === approval.ownerWebContentsId
+      ));
+      if (!ownerWindow) return false;
+      const pending = inlineWorkflowApprovalBroker.request({
+        webContents: ownerWindow.webContents,
+        workflowRequestId: approval.workflowRequestId,
+        proposalId: approval.proposalId,
+        proposalDigest: approval.proposalDigest,
+        fileOperations: approval.fileOperations,
+        diff: approval.diff.slice(0, MAX_WORKFLOW_APPROVAL_DIFF_CHARS),
+        sessionId: approval.sessionId,
+        projectId: approval.projectId || null,
+        validateSnapshots: () => developerAgent.validateTaskProposalSnapshots(
+          approval.taskId,
+          {
+            sessionId: approval.sessionId,
+            ownerWebContentsId: approval.ownerWebContentsId,
+          },
+        ),
+        onTransition: (snapshot) => {
+          if (!ownerWindow.isDestroyed() && !ownerWindow.webContents.isDestroyed()) {
+            ownerWindow.webContents.send('developer:inline-approval-transition', {
+              proposalId: approval.proposalId,
+              snapshot,
+            });
+          }
+        },
+        deleteConfirmationRequired: approval.fileOperations.some((operation) => (
+          operation.operation === 'delete' || operation.operation === 'delete_directory'
+        )),
+      });
+      return pending.promise;
+    },
+  });
+}
 
 if (!Number.isSafeInteger(runtimeSettings.developer.maxVerificationAttempts)
   || runtimeSettings.developer.maxVerificationAttempts < 1) {
@@ -1063,6 +1262,16 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+  try {
+    trustedBroker = createTrustedDesktopBroker();
+    await trustedBroker.start();
+    void synchronizeTrustedBrokerRegistry();
+  } catch (error) {
+    console.error('[CODING][BROKER] Trusted local browser workflow is unavailable:', error);
+    await disableTrustedBroker().catch((stopError) => {
+      console.error('[CODING][BROKER] Broker cleanup failed after startup error:', stopError);
+    });
+  }
   developerAgent.configureDurability({
     journalFile: path.join(app.getPath('userData'), 'developer-task-journal.json'),
     auditFile: path.join(app.getPath('userData'), 'developer-audit.jsonl'),
@@ -1355,17 +1564,30 @@ app.whenReady().then(async () => {
     if (result.status === 'PROJECT_ATTACHED' && result.projectRoot) {
       developerIndexCaches.delete(result.projectRoot);
       developerContext.invalidateContextCache(result.projectRoot);
+      try {
+        await registerTrustedBrokerProject(event.sender.id, result.projectRoot);
+      } catch (error) {
+        console.error('[CODING][BROKER] Project registration failed; browser mutation is unavailable:', error);
+      }
     }
     return result;
   });
-  ipcMain.handle('developer:choose-project', (event) => {
+  ipcMain.handle('developer:choose-project', async (event) => {
     developerAgent.getSession(event.sender.id);
     const currentRoot = developerFiles.getProjectRoot(event.sender.id);
     if (currentRoot) {
       developerIndexCaches.delete(currentRoot);
       developerContext.invalidateContextCache(currentRoot);
     }
-    return developerFiles.chooseProjectFolder(dialog, event.sender.id);
+    const result = await developerFiles.chooseProjectFolder(dialog, event.sender.id);
+    if (result?.status === 'PROJECT_ATTACHED' && result.projectRoot) {
+      try {
+        await registerTrustedBrokerProject(event.sender.id, result.projectRoot);
+      } catch (error) {
+        console.error('[CODING][BROKER] Project registration failed; browser mutation is unavailable:', error);
+      }
+    }
+    return result;
   });
   ipcMain.handle('developer:discover-project', async (event, payload) => {
     developerAgent.getSession(event.sender.id);
@@ -1381,14 +1603,26 @@ app.whenReady().then(async () => {
         `Project '${projectName}' was not found in [${result.roots.join(', ')}]. Use Advanced > Select folder to choose it directly.`,
       );
     }
+    if (result.projectRoot) {
+      try {
+        await registerTrustedBrokerProject(event.sender.id, result.projectRoot);
+      } catch (error) {
+        console.error('[CODING][BROKER] Project registration failed; browser mutation is unavailable:', error);
+      }
+    }
     return { matches: result.matches, projectRoot: result.projectRoot };
   });
-  ipcMain.handle('developer:clear-project', (event) => {
+  ipcMain.handle('developer:clear-project', async (event) => {
     developerAgent.getSession(event.sender.id);
     const currentRoot = developerFiles.getProjectRoot(event.sender.id);
     if (currentRoot) {
       developerIndexCaches.delete(currentRoot);
       developerContext.invalidateContextCache(currentRoot);
+    }
+    try {
+      await unregisterTrustedBrokerProject(event.sender.id);
+    } catch (error) {
+      console.error('[CODING][BROKER] Project unregister failed:', error);
     }
     developerFiles.clearProject(event.sender.id);
   });
@@ -1703,7 +1937,7 @@ app.whenReady().then(async () => {
     if (name === 'run_verification' || name === 'terminal.run_command') {
       const script = String(args.command || args.script || args.check || '');
       try {
-        return { ok: true, tool: name, data: await developerFiles.runVerification(script, event.sender.id) };
+        return { ok: true, tool: name, data: await terminalRunner.runCheck(script, event.sender.id) };
       } catch (error) {
         const data = verificationFailureResult(error, script);
         return {
@@ -1765,7 +1999,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:provider-discovery', (_event, providers) => developerBenchmark.discoverProviders(providers));
   ipcMain.handle('developer:run-verification', (event, script) => {
     ownedDeveloperSession(event);
-    return developerFiles.runVerification(script, event.sender.id).catch((error) => (
+    return terminalRunner.runCheck(script, event.sender.id).catch((error) => (
       verificationFailureResult(error, script)
     ));
   });
@@ -2043,7 +2277,7 @@ app.whenReady().then(async () => {
         onProgress: (progress) => {
           if (progress.check) publishDeveloperActivity({ phase: 'verification', status: 'PROGRESS' });
         },
-        runCheck: (script) => developerFiles.runVerification(script, event.sender.id, {
+        runCheck: (script) => terminalRunner.runCheck(script, event.sender.id, {
           scope: task.scope,
           isCancelled: () => developerAgent.isCancellationRequested(id, owner),
         }).catch((error) => ({
@@ -2594,7 +2828,7 @@ app.whenReady().then(async () => {
     };
 
     const runCheck = async (script) => {
-      return developerFiles.runVerification(script, event.sender.id, {
+      return terminalRunner.runCheck(script, event.sender.id, {
         scope,
         isCancelled: () => execution?.cancelRequested === true || event.sender.isDestroyed?.() === true,
       }).catch((error) => ({
@@ -2632,7 +2866,7 @@ app.whenReady().then(async () => {
       return response.json();
     };
 
-    const requestApproval = async ({ taskId, proposal, diff }) => {
+    const requestApproval = async ({ taskId, proposal, diff, proposalContract }) => {
       if (execution) execution.taskId = taskId;
       if (proposal?.taskId !== taskId
         || typeof proposal?.manifestHash !== 'string'
@@ -2646,31 +2880,74 @@ app.whenReady().then(async () => {
       if (diff.length > MAX_WORKFLOW_APPROVAL_DIFF_CHARS) {
         throw new Error('The proposed change is too large to display for explicit approval.');
       }
-      const approvalWindow = BrowserWindow.fromWebContents(event.sender);
-      if (!approvalWindow || approvalWindow.isDestroyed()) {
-        throw new Error('The Coding Agent window is unavailable for approval.');
-      }
-      const response = await dialog.showMessageBox(approvalWindow, {
-        type: 'warning',
-        buttons: ['Reject proposal', 'Approve exact proposal'],
-        defaultId: 0,
-        cancelId: 0,
-        noLink: true,
-        title: 'Approve coding change',
-        message: 'Review and approve this exact proposed change before it is applied.',
-        detail: [
-          `Project: ${root}`,
-          `Scope: ${scope}`,
-          `Request: ${userRequest}`,
-          `Proposal: ${taskId}`,
-          `Manifest: ${proposal.manifestHash}`,
-          `Targets: ${proposal.targetFiles.join(', ')}`,
-          '',
-          'Exact proposed diff:',
+      if (electronE2eTestMode && process.env.AI_CODING_E2E_INLINE_APPROVAL !== '1') {
+        return electronE2eTestMode.requestApproval({
+          root,
+          scope,
+          workflowRequestId,
+          proposal,
+          proposalContract,
           diff,
-        ].join('\n'),
+        });
+      }
+      const fileOperations = Array.isArray(proposal.files)
+        ? proposal.files.map((file) => ({
+            path: file.path,
+            sourcePath: file.sourcePath || null,
+            operation: file.operation,
+            hash: file.hash || null,
+            content: file.content ?? null,
+          }))
+        : proposal.targetFiles.map((target) => ({
+            path: target,
+            sourcePath: null,
+            operation: 'modify',
+            hash: null,
+            content: null,
+          }));
+      const pending = inlineWorkflowApprovalBroker.request({
+        webContents: event.sender,
+        workflowRequestId,
+        proposalId: taskId,
+        proposalDigest: proposal.manifestHash,
+        fileOperations,
+        diff,
+        sessionId: null,
+        validateSnapshots: () => developerAgent.validateTaskProposalSnapshots(
+          taskId,
+          owner,
+        ),
+        onTransition: (snapshot) => {
+          if (!event.sender.isDestroyed()) {
+            event.sender.send('developer:inline-approval-transition', {
+              proposalId: taskId,
+              snapshot,
+            });
+          }
+        },
+        deleteConfirmationRequired: fileOperations.some((file) => (
+          file.operation === 'delete' || file.operation === 'delete_directory'
+        )),
       });
-      return response.response === 1;
+      execution.pendingApprovalRequestId = pending.approvalRequestId;
+      try {
+        const decision = await pending.promise;
+        if (electronE2eTestMode && process.env.AI_CODING_E2E_INLINE_APPROVAL === '1') {
+          electronE2eTestMode.recordInlineApproval({
+            root,
+            scope,
+            workflowRequestId,
+            proposal,
+            diff,
+            approved: decision.approved,
+          });
+        }
+        return decision.approved;
+      } finally {
+        if (execution.pendingApprovalRequestId === pending.approvalRequestId) {
+          execution.pendingApprovalRequestId = null;
+        }
+      }
     };
 
     execution = {
@@ -2678,6 +2955,7 @@ app.whenReady().then(async () => {
       promise: null,
       settled: false,
       cancelRequested: false,
+      pendingApprovalRequestId: null,
       taskId: null,
       owner,
       root,
@@ -2711,6 +2989,7 @@ app.whenReady().then(async () => {
         ? normalizeHandoffTaskPlan(result.taskPlan)
         : null;
       execution.expiresAt = Date.now() + WORKFLOW_EXECUTION_TTL_MS;
+      if (electronE2eTestMode) electronE2eTestMode.recordWorkflowResult(workflowRequestId, result);
       return result;
     }, (error) => {
       workflowExecutions.delete(workflowRequestKey);
@@ -2732,7 +3011,34 @@ app.whenReady().then(async () => {
       if (task.cancellationAccepted !== true) return false;
     }
     execution.cancelRequested = true;
+    if (execution.pendingApprovalRequestId) {
+      inlineWorkflowApprovalBroker.cancel(execution.pendingApprovalRequestId, event.sender.id);
+    }
     return true;
+  });
+  ipcMain.handle('developer:workflow-approval-decision', (event, payload) => {
+    assertTrustedCodingRendererSender(event);
+    ownedDeveloperSession(event);
+    const isUuid = (value) => typeof value === 'string'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+    if (!payload || typeof payload !== 'object'
+      || !isUuid(payload.approvalRequestId)
+      || typeof payload.proposalId !== 'string'
+      || !isUuid(payload.proposalId)
+      || typeof payload.proposalDigest !== 'string'
+      || !/^[a-f0-9]{64}$/i.test(payload.proposalDigest)
+      || typeof payload.approved !== 'boolean'
+      || (payload.deleteConfirmed !== undefined && typeof payload.deleteConfirmed !== 'boolean')) {
+      throw new TypeError('Invalid inline Coding proposal decision.');
+    }
+    return inlineWorkflowApprovalBroker.decide({
+      webContentsId: event.sender.id,
+      approvalRequestId: payload.approvalRequestId,
+      proposalId: payload.proposalId,
+      proposalDigest: payload.proposalDigest,
+      approved: payload.approved,
+      deleteConfirmed: payload.deleteConfirmed === true,
+    });
   });
   ipcMain.handle('general:session', (event) => {
     registerGeneralRenderer(event);
@@ -2821,6 +3127,25 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', (event) => {
+  if (brokerShutdownStarted || !trustedBroker?.endpoint) return;
+  event.preventDefault();
+  brokerShutdownStarted = true;
+  void (async () => {
+    try {
+      await publishTrustedBrokerRegistry([]);
+    } catch (error) {
+      console.error('[CODING][BROKER] Could not clear backend broker discovery during shutdown:', error);
+    }
+    try {
+      await trustedBroker.stop();
+    } catch (error) {
+      console.error('[CODING][BROKER] Broker shutdown failed:', error);
+    }
+    app.quit();
+  })();
 });
 
 app.on('will-quit', () => {

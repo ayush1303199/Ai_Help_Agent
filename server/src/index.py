@@ -9,6 +9,7 @@ import hmac
 import logging
 import threading
 import time
+from datetime import datetime
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -86,6 +87,8 @@ _logger = logging.getLogger(__name__)
 
 CODING_AUTH_TOKEN = os.getenv("AI_CODING_AUTH_TOKEN") or secrets.token_urlsafe(32)
 CODING_MUTATION_HANDSHAKE_SECRET = os.getenv("AI_CODING_MUTATION_HANDSHAKE_SECRET") or ""
+_trusted_desktop_broker_lock = threading.RLock()
+_trusted_desktop_broker_state: Dict[str, Any] = {"endpoint": None, "projects": [], "sessions": {}}
 _renderer_host = str((SERVICES.get("devServer") or {}).get("host") or "127.0.0.1")
 _renderer_port = int((SERVICES.get("devServer") or {}).get("port") or 3000)
 TRUSTED_RENDERER_ORIGINS = {
@@ -1284,7 +1287,7 @@ def register_coding_mutation_handshake(payload: Dict[str, Any], request: Request
 
 
 @app.post("/api/coding/project-attach")
-def attach_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def attach_coding_project_endpoint(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     project_root = str(payload.get("projectRoot") or "").strip()
     if not project_root:
         raise HTTPException(status_code=400, detail="projectRoot is required.")
@@ -1296,12 +1299,300 @@ def attach_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
         UNIVERSAL_INDEX.scan_and_update(str(p.resolve()), max_files=200)
     except Exception:
         pass
+    origin = request.headers.get("origin")
+    if origin in TRUSTED_RENDERER_ORIGINS:
+        await _synchronize_trusted_desktop_broker(origin)
     return res
 
 
 @app.post("/api/coding/project-clear")
 def clear_coding_project_endpoint() -> Dict[str, Any]:
     return set_backend_project_state(None)
+
+
+def _canonical_project_root_hash(project_root: str) -> str:
+    canonical = os.path.realpath(project_root).replace("\\", "/")
+    if os.name == "nt":
+        canonical = canonical.lower()
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _synchronize_trusted_desktop_broker(origin: str) -> None:
+    with _trusted_desktop_broker_lock:
+        endpoint = _trusted_desktop_broker_state.get("endpoint")
+    if not endpoint:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), follow_redirects=False) as client:
+            response = await client.post(
+                f"{endpoint}/v1/synchronize",
+                json={},
+                headers={"Origin": origin},
+            )
+    except httpx.HTTPError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "BROKER_UNAVAILABLE", "message": f"Trusted broker synchronization failed: {type(error).__name__}."},
+        ) from error
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "BROKER_SYNC_FAILED", "message": "The trusted broker could not synchronize the attached project."},
+        )
+
+
+@app.post("/api/coding/broker/register")
+def register_trusted_desktop_broker(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    supplied_token = request.headers.get("x-coding-auth", "")
+    if not hmac.compare_digest(supplied_token, CODING_AUTH_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized trusted desktop broker registration.")
+    endpoint = payload.get("endpoint")
+    projects = payload.get("projects")
+    if not isinstance(endpoint, str) or not isinstance(projects, list):
+        raise HTTPException(status_code=400, detail="A broker endpoint and project registry are required.")
+    try:
+        parsed_endpoint = urlparse(endpoint)
+        endpoint_port = parsed_endpoint.port
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="The broker endpoint is invalid.") from error
+    if (
+        parsed_endpoint.scheme != "http"
+        or parsed_endpoint.hostname not in {"127.0.0.1", "::1", "localhost"}
+        or not isinstance(endpoint_port, int)
+        or not 1 <= endpoint_port <= 65535
+        or parsed_endpoint.path not in {"", "/"}
+        or parsed_endpoint.query
+        or parsed_endpoint.fragment
+    ):
+        raise HTTPException(status_code=400, detail="The trusted broker must use a dynamic loopback HTTP endpoint.")
+    normalized_projects = []
+    for item in projects:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("projectId"), str)
+            or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", item["projectId"], re.I)
+            or not isinstance(item.get("rootHash"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", item["rootHash"], re.I)
+        ):
+            raise HTTPException(status_code=400, detail="Broker project registrations must contain opaque IDs and root hashes only.")
+        normalized_projects.append({"projectId": item["projectId"], "rootHash": item["rootHash"].lower()})
+    with _trusted_desktop_broker_lock:
+        _trusted_desktop_broker_state.update({
+            "endpoint": endpoint.rstrip("/"),
+            "projects": normalized_projects,
+        })
+        _trusted_desktop_broker_state.setdefault("sessions", {})
+    return {"registered": True, "projectCount": len(normalized_projects)}
+
+
+@app.get("/api/coding/broker")
+async def get_trusted_desktop_broker(request: Request) -> Dict[str, Any]:
+    origin = request.headers.get("origin")
+    client_host = request.client.host if request.client else ""
+    is_loopback = client_host in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
+    if not is_loopback or origin not in TRUSTED_RENDERER_ORIGINS:
+        raise HTTPException(status_code=403, detail="Trusted desktop broker discovery is available only to the configured local renderer.")
+    await _synchronize_trusted_desktop_broker(origin)
+    state = get_backend_project_state()
+    if state.get("status") != "PROJECT_ATTACHED" or not state.get("projectRoot"):
+        raise HTTPException(status_code=409, detail="Attach the authorized project before requesting broker access.")
+    active_root_hash = _canonical_project_root_hash(state["projectRoot"])
+    with _trusted_desktop_broker_lock:
+        projects = [
+            {"projectId": item["projectId"]}
+            for item in _trusted_desktop_broker_state.get("projects", [])
+            if hmac.compare_digest(item["rootHash"], active_root_hash)
+        ]
+        endpoint = _trusted_desktop_broker_state.get("endpoint")
+    if not endpoint or not projects:
+        code = "BROKER_UNAVAILABLE" if not endpoint else "BROKER_PROJECT_NOT_REGISTERED"
+        message = (
+            "No trusted desktop broker is registered with the coding backend."
+            if not endpoint
+            else "The attached workspace has not yet synchronized with the trusted desktop broker."
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": code,
+                "message": message,
+            },
+        )
+    return {"projects": projects}
+
+
+async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResponse:
+    origin = request.headers.get("origin")
+    client_host = request.client.host if request.client else ""
+    if origin not in TRUSTED_RENDERER_ORIGINS or client_host not in (
+        "127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"
+    ):
+        raise HTTPException(status_code=403, detail="Trusted desktop broker access requires the configured local renderer.")
+
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > 256 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail={"code": "BROKER_REQUEST_TOO_LARGE", "message": "Broker request exceeds the configured size limit."},
+        )
+    try:
+        body = await request.body()
+        if len(body) > 256 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail={"code": "BROKER_REQUEST_TOO_LARGE", "message": "Broker request exceeds the configured size limit."},
+            )
+        payload = json.loads(body)
+    except HTTPException:
+        raise
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise HTTPException(status_code=400, detail="Broker request must be a JSON object.") from error
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Broker request must be a JSON object.")
+
+    await _synchronize_trusted_desktop_broker(origin)
+    state = get_backend_project_state()
+    if state.get("status") != "PROJECT_ATTACHED" or not state.get("projectRoot"):
+        raise HTTPException(status_code=409, detail="Attach the authorized project before requesting broker access.")
+    active_root_hash = _canonical_project_root_hash(state["projectRoot"])
+    with _trusted_desktop_broker_lock:
+        endpoint = _trusted_desktop_broker_state.get("endpoint")
+        registered = list(_trusted_desktop_broker_state.get("projects", []))
+        sessions = _trusted_desktop_broker_state.setdefault("sessions", {})
+        now = time.time()
+        for session_id, session in list(sessions.items()):
+            if session.get("expiresAt", 0) <= now:
+                sessions.pop(session_id, None)
+        active_projects = {
+            item["projectId"]: item for item in registered
+            if hmac.compare_digest(item["rootHash"], active_root_hash)
+        }
+    if not endpoint:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "BROKER_UNAVAILABLE", "message": "The trusted desktop broker is unavailable."},
+        )
+
+    if route == "sessions":
+        if set(payload) != {"projectId"} or payload.get("projectId") not in active_projects:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "BROKER_PROJECT_UNAUTHORIZED", "message": "The requested project is not attached to this local browser session."},
+            )
+        project_id = payload["projectId"]
+    else:
+        expected_keys = {"brokerSessionId", "sessionLeaseToken"}
+        if route == "workflows":
+            expected_keys |= {"userRequest", "scope", "executionMode"}
+        elif route == "approval_decision":
+            expected_keys |= {
+                "proposalId",
+                "proposalDigest",
+                "approvalNonce",
+                "approved",
+                "deleteConfirmed",
+            }
+        if set(payload) != expected_keys:
+            raise HTTPException(status_code=400, detail="Broker request contains unsupported authority fields.")
+        session_id = payload.get("brokerSessionId")
+        with _trusted_desktop_broker_lock:
+            session = sessions.get(session_id) if isinstance(session_id, str) else None
+        if not session:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "BROKER_SESSION_UNAUTHORIZED", "message": "The broker session is unknown or expired."},
+            )
+        project_id = session["projectId"]
+        if route in {"workflows", "approval", "approval_decision"} and project_id not in active_projects:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "BROKER_PROJECT_UNAUTHORIZED", "message": "The attached project changed before workflow execution."},
+            )
+        if not any(item["projectId"] == project_id for item in registered):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "BROKER_PROJECT_UNAUTHORIZED", "message": "The broker project registration is no longer active."},
+            )
+
+    broker_path = {
+        "sessions": "/v1/sessions",
+        "workflows": "/v1/workflows",
+        "cancel": "/v1/workflows/cancel",
+        "approval": "/v1/workflows/approval",
+        "approval_decision": "/v1/workflows/approval/decision",
+        "release": "/v1/sessions/release",
+    }.get(route)
+    if not broker_path:
+        raise HTTPException(status_code=404, detail="Broker route was not found.")
+    forwarded_payload = {"projectId": project_id} if route == "sessions" else payload
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(900.0), follow_redirects=False) as client:
+            upstream = await client.post(
+                f"{endpoint}{broker_path}",
+                json=forwarded_payload,
+                headers={"Origin": origin},
+            )
+    except httpx.TimeoutException as error:
+        raise HTTPException(
+            status_code=504,
+            detail={"code": "BROKER_TIMEOUT", "message": "The trusted desktop broker did not complete the request in time."},
+        ) from error
+    except httpx.RequestError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "BROKER_UNAVAILABLE", "message": "The trusted desktop broker could not be reached."},
+        ) from error
+    try:
+        response_payload = upstream.json()
+    except ValueError as error:
+        raise HTTPException(status_code=502, detail="The trusted desktop broker returned an invalid response.") from error
+
+    if route == "sessions" and upstream.status_code == 201:
+        lease = response_payload
+        session_id = lease.get("brokerSessionId") if isinstance(lease, dict) else None
+        expires_at = lease.get("expiresAt") if isinstance(lease, dict) else None
+        if not isinstance(session_id, str) or not isinstance(expires_at, str):
+            raise HTTPException(status_code=502, detail="The trusted desktop broker issued an invalid session lease.")
+        try:
+            expiration = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+        except ValueError as error:
+            raise HTTPException(status_code=502, detail="The trusted desktop broker issued an invalid lease expiration.") from error
+        with _trusted_desktop_broker_lock:
+            sessions[session_id] = {"projectId": project_id, "expiresAt": expiration}
+    elif route == "release" and upstream.status_code == 200:
+        with _trusted_desktop_broker_lock:
+            sessions.pop(payload.get("brokerSessionId"), None)
+    return JSONResponse(status_code=upstream.status_code, content=response_payload)
+
+
+@app.post("/api/coding/broker/sessions")
+async def proxy_trusted_desktop_broker_session(request: Request) -> JSONResponse:
+    return await proxy_trusted_desktop_broker("sessions", request)
+
+
+@app.post("/api/coding/broker/workflows")
+async def proxy_trusted_desktop_broker_workflow(request: Request) -> JSONResponse:
+    return await proxy_trusted_desktop_broker("workflows", request)
+
+
+@app.post("/api/coding/broker/workflows/cancel")
+async def proxy_trusted_desktop_broker_cancel(request: Request) -> JSONResponse:
+    return await proxy_trusted_desktop_broker("cancel", request)
+
+
+@app.post("/api/coding/broker/workflows/approval")
+async def proxy_trusted_desktop_broker_approval(request: Request) -> JSONResponse:
+    return await proxy_trusted_desktop_broker("approval", request)
+
+
+@app.post("/api/coding/broker/workflows/approval/decision")
+async def proxy_trusted_desktop_broker_approval_decision(request: Request) -> JSONResponse:
+    return await proxy_trusted_desktop_broker("approval_decision", request)
+
+
+@app.post("/api/coding/broker/sessions/release")
+async def proxy_trusted_desktop_broker_release(request: Request) -> JSONResponse:
+    return await proxy_trusted_desktop_broker("release", request)
 
 
 DISALLOWED_PROJECT_NAMES: Set[str] = {

@@ -1,4 +1,5 @@
 import { runtimeConfig } from '../../config/runtimeConfig.ts';
+import type { CodingExecutionMode } from './codingExecutionSettings.ts';
 import {
   parseCodingActivityEvent,
   type CodingActivity,
@@ -165,6 +166,391 @@ export async function codingFetch(input: RequestInfo | URL, init: RequestInit = 
   const auth = await codingAuthHeaders();
   if (auth['X-Coding-Auth']) headers.set('X-Coding-Auth', auth['X-Coding-Auth']);
   return fetch(input, { ...init, headers });
+}
+
+type DeveloperWorkflowResult = Awaited<
+  ReturnType<NonNullable<Window['electronAPI']>['executeDeveloperWorkflow']>
+>;
+
+export interface TrustedBrokerPendingApproval {
+  taskId: string;
+  proposalId: string;
+  proposalDigest: string;
+  approvalNonce: string;
+  deleteConfirmationRequired: boolean;
+  fileOperations: Array<{
+    path: string;
+    sourcePath: string | null;
+    operation: string;
+    hash: string;
+    content: string | null;
+  }>;
+  diff: string;
+  envelope?: {
+    proposalId: string;
+    proposalDigest: string;
+    projectId: string | null;
+    summary: string;
+    fileBadges: Array<{ filePath: string; action: 'create' | 'modify' | 'delete'; lineCount: number }>;
+    diffPreview: Array<{ filePath: string; action: 'create' | 'modify' | 'delete'; lines: string[] }>;
+    debugTrace: { stage: string; timestamp: string; sessionId: string | null; verificationStatus: string };
+  };
+  transitions?: Array<{
+    stage: string;
+    timestamp: string;
+    verificationStatus?: string;
+    proposalId?: string;
+    proposalDigest?: string;
+    projectId?: string;
+    sessionId?: string | null;
+  }>;
+}
+
+export interface TrustedBrokerApprovalActions {
+  approve: (deleteConfirmed: boolean) => Promise<void>;
+  reject: () => Promise<void>;
+}
+
+interface TrustedBrokerWorkflowResponse {
+  outcome: string;
+  filesModified: string[];
+  [key: string]: unknown;
+}
+
+function brokerErrorMessage(value: unknown, fallback: string): string {
+  if (value && typeof value === 'object' && 'error' in value) {
+    const error = value.error;
+    if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') {
+      const stage = 'stage' in error && typeof error.stage === 'string' ? ` [stage: ${error.stage}]` : '';
+      const diagnosticId = 'diagnosticId' in error && typeof error.diagnosticId === 'string'
+        ? ` [diagnostic: ${error.diagnosticId}]`
+        : '';
+      return `${error.message}${stage}${diagnosticId}`;
+    }
+  }
+  if (value && typeof value === 'object' && 'detail' in value) {
+    const detail = value.detail;
+    if (typeof detail === 'string') return detail;
+    if (detail && typeof detail === 'object' && 'message' in detail && typeof detail.message === 'string') {
+      return detail.message;
+    }
+  }
+  return fallback;
+}
+
+function brokerErrorCode(value: unknown): string | null {
+  if (!value || typeof value !== 'object') return null;
+  if ('error' in value) {
+    const error = value.error;
+    if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string') {
+      return error.code;
+    }
+  }
+  if ('detail' in value) {
+    const detail = value.detail;
+    if (detail && typeof detail === 'object' && 'code' in detail && typeof detail.code === 'string') {
+      return detail.code;
+    }
+  }
+  return null;
+}
+
+function waitForBrokerDiscoveryRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Broker discovery was cancelled.', 'AbortError'));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      reject(new DOMException('Broker discovery was cancelled.', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function readBrokerResponse(response: Response, label: string): Promise<unknown> {
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`${label} returned an invalid response (${response.status}).`);
+  }
+  if (!response.ok) throw new Error(brokerErrorMessage(payload, `${label} failed (${response.status}).`));
+  return payload;
+}
+
+async function brokerFetch(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  label: string,
+  useCodingAuth = false,
+): Promise<Response> {
+  try {
+    return useCodingAuth ? await codingFetch(input, init) : await fetch(input, init);
+  } catch (error) {
+    throw new Error(
+      `${label} at ${String(input)} could not be reached: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+export async function executeTrustedBrokerWorkflow(
+  userRequest: string,
+  scope: string,
+  signal?: AbortSignal,
+  onApprovalPending?: (
+    approval: TrustedBrokerPendingApproval,
+    actions: TrustedBrokerApprovalActions,
+    snapshot?: NonNullable<TrustedBrokerPendingApproval['transitions']>[number],
+  ) => void,
+  options: {
+    projectRoot?: string | null;
+    executionMode?: CodingExecutionMode;
+    autoAuthorizeAttachedProject?: boolean;
+  } = {},
+): Promise<DeveloperWorkflowResult> {
+  if (options.projectRoot && options.autoAuthorizeAttachedProject !== false) {
+    const attachResponse = await brokerFetch(
+      new URL('/api/coding/project-attach', runtimeConfig.services.http.baseUrl),
+      {
+        method: 'POST',
+        credentials: 'omit',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectRoot: options.projectRoot }),
+        signal,
+      },
+      'Attached workspace broker synchronization',
+      true,
+    );
+    const attached = await readBrokerResponse(attachResponse, 'Attached workspace broker synchronization');
+    if (!attached || typeof attached !== 'object'
+      || !('status' in attached) || attached.status !== 'PROJECT_ATTACHED') {
+      throw new Error('The selected workspace could not be synchronized with the trusted broker.');
+    }
+  }
+  const discoveryUrl = new URL('/api/coding/broker', runtimeConfig.services.http.baseUrl);
+  let discovery: unknown;
+  let discoveryResponse: Response | null = null;
+  let discoveryPayload: unknown = null;
+  const maxDiscoveryAttempts = 7;
+  for (let attempt = 0; attempt < maxDiscoveryAttempts; attempt += 1) {
+    discoveryResponse = await brokerFetch(
+      discoveryUrl,
+      { method: 'GET', credentials: 'omit', signal },
+      'Trusted desktop broker discovery',
+      true,
+    );
+    try {
+      discoveryPayload = await discoveryResponse.clone().json();
+    } catch {
+      discoveryPayload = null;
+    }
+    const retryableCode = ['BROKER_UNAVAILABLE', 'BROKER_PROJECT_NOT_REGISTERED'].includes(
+      brokerErrorCode(discoveryPayload) || '',
+    );
+    if (discoveryResponse.ok) {
+      discovery = await readBrokerResponse(discoveryResponse, 'Trusted desktop broker discovery');
+      break;
+    }
+    if (discoveryResponse.status !== 503 || !retryableCode || attempt === maxDiscoveryAttempts - 1) {
+      throw new Error(brokerErrorMessage(
+        discoveryPayload,
+        `Trusted desktop broker discovery failed (${discoveryResponse.status}).`,
+      ));
+    }
+    await waitForBrokerDiscoveryRetry(Math.min(250 * (2 ** attempt), 4000), signal);
+  }
+  if (!discoveryResponse?.ok) {
+    throw new Error(brokerErrorMessage(discoveryPayload, 'Trusted desktop broker discovery did not complete.'));
+  }
+  if (!discovery || typeof discovery !== 'object'
+    || !('projects' in discovery)
+    || !Array.isArray(discovery.projects)) {
+    throw new Error('Trusted desktop broker discovery returned an invalid project registry.');
+  }
+  const registeredProject = discovery.projects.find((item) => (
+    item && typeof item === 'object'
+    && 'projectId' in item
+    && typeof item.projectId === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(item.projectId)
+  ));
+  if (!registeredProject || typeof registeredProject.projectId !== 'string') {
+    throw new Error('No trusted desktop broker project matches the attached workspace.');
+  }
+  if (signal?.aborted) {
+    return { outcome: 'CANCELLED', phase: 'broker', filesModified: [] } as DeveloperWorkflowResult;
+  }
+
+  const apiBaseUrl = runtimeConfig.services.http.baseUrl;
+  const lease = await readBrokerResponse(await brokerFetch(new URL('/api/coding/broker/sessions', apiBaseUrl), {
+    method: 'POST',
+    credentials: 'omit',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projectId: registeredProject.projectId }),
+  }, 'Trusted desktop broker session', true), 'Trusted desktop broker session');
+  if (!lease || typeof lease !== 'object'
+    || !('brokerSessionId' in lease) || typeof lease.brokerSessionId !== 'string'
+    || !('sessionLeaseToken' in lease) || typeof lease.sessionLeaseToken !== 'string') {
+    throw new Error('Trusted desktop broker issued an invalid session lease.');
+  }
+
+  const sessionBinding = {
+    brokerSessionId: lease.brokerSessionId,
+    sessionLeaseToken: lease.sessionLeaseToken,
+  };
+  const workflowResponse = brokerFetch(new URL('/api/coding/broker/workflows', apiBaseUrl), {
+    method: 'POST',
+    credentials: 'omit',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...sessionBinding,
+      userRequest,
+      scope: scope || '.',
+      executionMode: options.executionMode || 'inline_review',
+    }),
+  }, 'Trusted desktop coding workflow', true).then(async (response) => (
+    await readBrokerResponse(response, 'Trusted desktop coding workflow') as TrustedBrokerWorkflowResponse
+  ));
+  let cancellationFailed = false;
+  let cancellationPromise: Promise<void> | null = null;
+  const requestCancellation = (): Promise<void> => {
+    if (cancellationPromise) return cancellationPromise;
+    cancellationPromise = brokerFetch(new URL('/api/coding/broker/workflows/cancel', apiBaseUrl), {
+      method: 'POST',
+      credentials: 'omit',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sessionBinding),
+    }, 'Trusted broker cancellation', true).then(async (response) => {
+      await readBrokerResponse(response, 'Trusted broker cancellation');
+    }).catch((error: unknown) => {
+      cancellationFailed = true;
+      throw error;
+    });
+    return cancellationPromise;
+  };
+  const onAbort = () => {
+    void requestCancellation().catch(() => undefined);
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    if (signal?.aborted) {
+      await requestCancellation();
+      return { outcome: 'CANCELLED', phase: 'broker', filesModified: [] } as DeveloperWorkflowResult;
+    }
+    let result = await workflowResponse as DeveloperWorkflowResult & {
+      approval?: TrustedBrokerPendingApproval;
+    };
+    if (result.outcome === 'AWAITING_APPROVAL') {
+      const pendingApproval = result.approval;
+      if (!pendingApproval
+        || typeof pendingApproval.taskId !== 'string'
+        || typeof pendingApproval.proposalId !== 'string'
+        || !/^[a-f0-9]{64}$/i.test(pendingApproval.proposalDigest)
+        || typeof pendingApproval.approvalNonce !== 'string'
+        || !Array.isArray(pendingApproval.fileOperations)
+        || typeof pendingApproval.diff !== 'string'
+        || pendingApproval.envelope?.proposalId !== pendingApproval.proposalId
+        || pendingApproval.envelope?.proposalDigest !== pendingApproval.proposalDigest) {
+        throw new Error('Trusted desktop coding workflow returned an invalid staged approval envelope.');
+      }
+      if (!onApprovalPending) {
+        await requestCancellation();
+        return { outcome: 'CANCELLED', phase: 'broker', filesModified: [] } as DeveloperWorkflowResult;
+      }
+      let resolveDecision!: (value: DeveloperWorkflowResult) => void;
+      let rejectDecision!: (error: Error) => void;
+      const decisionResult = new Promise<DeveloperWorkflowResult>((resolve, reject) => {
+        resolveDecision = resolve;
+        rejectDecision = reject;
+      });
+      let decisionStarted = false;
+      const decide = async (approved: boolean, deleteConfirmed: boolean) => {
+        if (decisionStarted) return decisionResult.then(() => undefined);
+        decisionStarted = true;
+        try {
+          const response = await brokerFetch(
+            new URL('/api/coding/broker/workflows/approval/decision', apiBaseUrl),
+            {
+              method: 'POST',
+              credentials: 'omit',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                ...sessionBinding,
+                proposalId: pendingApproval.proposalId,
+                proposalDigest: pendingApproval.proposalDigest,
+                approvalNonce: pendingApproval.approvalNonce,
+                approved,
+                deleteConfirmed,
+              }),
+            },
+            'Trusted broker approval decision',
+            true,
+          );
+          const payload = await readBrokerResponse(response, 'Trusted broker approval decision');
+          if (!payload || typeof payload !== 'object' || !('result' in payload)
+            || !payload.result || typeof payload.result !== 'object') {
+            throw new Error('Trusted broker approval decision returned no completed workflow result.');
+          }
+          resolveDecision(payload.result as DeveloperWorkflowResult);
+        } catch (error) {
+          const normalized = error instanceof Error ? error : new Error(String(error));
+          rejectDecision(normalized);
+          throw normalized;
+        }
+        return decisionResult.then(() => undefined);
+      };
+      const actions: TrustedBrokerApprovalActions = {
+        approve: (deleteConfirmed) => decide(true, deleteConfirmed),
+        reject: () => decide(false, false),
+      };
+      onApprovalPending(pendingApproval, actions);
+      const aborted = signal
+        ? new Promise<null>((resolve) => {
+            if (signal.aborted) resolve(null);
+            else signal.addEventListener('abort', () => resolve(null), { once: true });
+          })
+        : new Promise<never>(() => {});
+      const approvedResult = await Promise.race([decisionResult, aborted]);
+      if (!approvedResult) {
+        await requestCancellation();
+        result = { outcome: 'CANCELLED', phase: 'broker', filesModified: [] } as DeveloperWorkflowResult;
+      } else {
+        result = approvedResult as DeveloperWorkflowResult & { approval?: TrustedBrokerPendingApproval };
+      }
+    }
+    if (cancellationPromise) await cancellationPromise;
+    if (!result || typeof result !== 'object'
+      || typeof result.outcome !== 'string'
+      || !Array.isArray(result.filesModified)
+      || !result.filesModified.every((file) => typeof file === 'string')) {
+      throw new Error('Trusted desktop coding workflow returned an invalid result.');
+    }
+    if (cancellationFailed) throw new Error('Cancellation could not be confirmed; the workflow result is not safe to report.');
+    return result;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    if (!cancellationFailed) {
+      try {
+        const releaseResponse = await brokerFetch(new URL('/api/coding/broker/sessions/release', apiBaseUrl), {
+          method: 'POST',
+          credentials: 'omit',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(sessionBinding),
+        }, 'Trusted broker session release', true);
+        if (!releaseResponse.ok) {
+          console.warn(`Trusted broker session release was deferred to lease expiry (${releaseResponse.status}).`);
+        }
+      } catch (error) {
+        console.warn('Trusted broker session release was deferred to lease expiry.', error);
+      }
+    }
+  }
 }
 
 export class CodingAgentTransport {
@@ -805,6 +1191,31 @@ export interface CodingRequestClassification {
   intent: CodingRequestIntent;
   clarificationPrompt?: string;
   isActionableTask: boolean;
+}
+
+export function shouldRequireDeveloperWorkflowForAttachedProject({
+  intent,
+  requestText,
+  hasAttachedProject,
+  hasDeveloperWorkflowBridge,
+  isResumingProviderTask = false,
+  hasRepairContext = false,
+}: {
+  intent: CodingRequestIntent;
+  requestText: string;
+  hasAttachedProject: boolean;
+  hasDeveloperWorkflowBridge: boolean;
+  isResumingProviderTask?: boolean;
+  hasRepairContext?: boolean;
+}): boolean {
+  const requestsProjectCreation = /\b(?:build|create|scaffold|bootstrap|set\s*up)\b/i.test(requestText)
+    && /\b(?:new|complete|full-?stack|from\s+scratch|project|application|app)\b/i.test(requestText);
+  return intent === 'AUTONOMOUS_WORKFLOW_TASK'
+    && requestsProjectCreation
+    && hasAttachedProject
+    && !hasDeveloperWorkflowBridge
+    && !isResumingProviderTask
+    && !hasRepairContext;
 }
 
 export function classifyCodingRequestIntent(rawRequest: string): CodingRequestClassification {

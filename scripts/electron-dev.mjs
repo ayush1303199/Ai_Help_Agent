@@ -25,6 +25,7 @@ const codingAuthEnvironment = {
   AI_CODING_AUTH_TOKEN: codingAuthToken,
   AI_CODING_MUTATION_HANDSHAKE_SECRET: codingMutationHandshakeSecret,
   AI_CODING_BROWSER_ACCESS: '1',
+  AI_CODING_BROKER_HOST: '0',
 };
 let shuttingDown = false;
 

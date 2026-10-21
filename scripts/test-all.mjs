@@ -65,6 +65,14 @@ function waitForChildClose(child) {
 
 const scripts = [
   'architecture-boundary-test.mjs',
+  'trusted-local-desktop-broker-test.mjs',
+  'trusted-desktop-broker-backend-test.py',
+  'trusted-local-desktop-broker-host-test.mjs',
+  'coding-browser-broker-approval-test.mjs',
+  'antigravity-terminal-runner-test.mjs',
+  'coding-route-reachability-test.mjs',
+  'coding-electron-e2e-harness-test.mjs',
+  'inline-workflow-approval-test.mjs',
   'runtime-settings-test.mjs',
   'developer-pipeline-contract-test.mjs',
   'developer-agent-test.mjs',
@@ -78,6 +86,7 @@ const scripts = [
   'developer-lifecycle-test.mjs',
   'coding-diff-test.mjs',
   'coding-activity-trace-test.mjs',
+  'coding-browser-broker-approval-test.mjs',
   'coding-agent-policy-test.py',
   'developer-runtime-state-test.mjs',
   'coding-acceptance-preflight-test.mjs',

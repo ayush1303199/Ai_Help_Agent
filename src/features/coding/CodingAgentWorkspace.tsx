@@ -2,6 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import { runtimeConfig } from '../../config/runtimeConfig';
 import type { CodingConversationState, CodingPreference } from './codingSessionStore';
 import type { CodingActivity, CodingActivityMessage, CodingProviderRecovery } from './codingTransport';
+import { InlineProposalActionCard } from './InlineProposalActionCard';
+import { CodingExecutionSettingsControl } from './CodingExecutionSettingsControl';
+import type { CodingExecutionSettings } from './codingExecutionSettings';
 
 function isCodingNarration(item: CodingActivity): item is CodingActivityMessage {
   return !('event' in item);
@@ -208,6 +211,15 @@ interface DiffFile {
 
 interface Proposal {
   id?: string;
+  proposalDigest?: string;
+  debugTrace?: { stage?: string; verificationStatus?: string; timestamp?: string; sessionId?: string | null } | null;
+  browserBroker?: boolean;
+  deleteConfirmationRequired?: boolean;
+  workflowApproval?: {
+    requestId: string;
+    proposalDigest: string;
+    deleteConfirmationRequired: boolean;
+  };
   state?: string;
   lifecycleState?: string;
   repairAttempt?: number;
@@ -276,6 +288,10 @@ interface CodingAgentWorkspaceProps {
   input: string;
   projectRoot: string | null;
   projectStatus?: string;
+  executionSettings: CodingExecutionSettings;
+  brokerStatus: 'unknown' | 'syncing' | 'ready' | 'unavailable';
+  onExecutionSettingsChange: (settings: Partial<CodingExecutionSettings>) => void;
+  onSynchronizeBroker: () => void;
   acceptancePreflight?: {
     ready: boolean;
     canRunProjectCommands: boolean;
@@ -306,6 +322,7 @@ interface CodingAgentWorkspaceProps {
   searchResults: SearchResult[];
   proposal: Proposal | null;
   autoRepairChoice: boolean;
+  deleteConfirmed: boolean;
   activity: CodingActivity[];
   busy: boolean;
   streaming: boolean;
@@ -323,6 +340,7 @@ interface CodingAgentWorkspaceProps {
   onSearch: () => void;
   onApproveProposal: () => void;
   onAutoRepairChange: (enabled: boolean) => void;
+  onDeleteConfirmationChange: (confirmed: boolean) => void;
   onRejectProposal: () => void;
   onApplyProposal: () => void;
   onUndoProposal: () => void;
@@ -492,6 +510,10 @@ export function CodingAgentWorkspace({
   input,
   projectRoot,
   projectStatus,
+  executionSettings,
+  brokerStatus,
+  onExecutionSettingsChange,
+  onSynchronizeBroker,
   acceptancePreflight,
   acceptancePreflightBusy = false,
   onRefreshAcceptancePreflight,
@@ -504,6 +526,7 @@ export function CodingAgentWorkspace({
   searchResults,
   proposal,
   autoRepairChoice,
+  deleteConfirmed,
   activity,
   busy,
   streaming,
@@ -521,6 +544,7 @@ export function CodingAgentWorkspace({
   onSearch,
   onApproveProposal,
   onAutoRepairChange,
+  onDeleteConfirmationChange,
   onRejectProposal,
   onApplyProposal,
   onUndoProposal,
@@ -729,6 +753,13 @@ export function CodingAgentWorkspace({
               </div>
               {searchResults.length > 0 && <div className="max-h-32 overflow-y-auto rounded-md border border-slate-700 bg-slate-950 p-2">{searchResults.map((result, index) => <button key={`${result.path}-${result.line}-${index}`} onClick={() => onReadFile(result.path)} className="block w-full truncate px-1 py-1 text-left text-[11px] text-slate-300 hover:text-sky-300">{result.path}{result.line > 0 ? `:${result.line}` : ''} · {result.text}</button>)}</div>}
             </div>}
+            <CodingExecutionSettingsControl
+              settings={executionSettings}
+              brokerStatus={brokerStatus}
+              disabled={busy || streaming}
+              onChange={onExecutionSettingsChange}
+              onSynchronize={onSynchronizeBroker}
+            />
             <div className="mt-4 border-t border-slate-700 pt-3">
               <div className="flex items-center justify-between gap-2">
                 <div><p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Coding preferences</p><p className="mt-1 text-[11px] text-slate-400">Only explicit recurring style corrections are remembered.</p></div>
@@ -921,6 +952,19 @@ export function CodingAgentWorkspace({
           </ol>
         </section>}
         <section className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+        <InlineProposalActionCard
+          files={proposal.files}
+          state={proposal.state}
+          busy={busy}
+          deleteConfirmationRequired={Boolean(proposal.workflowApproval?.deleteConfirmationRequired || proposal.deleteConfirmationRequired)}
+          deleteConfirmed={deleteConfirmed}
+          onDeleteConfirmationChange={onDeleteConfirmationChange}
+          onApprove={onApproveProposal}
+          onApply={onApplyProposal}
+          onReject={onRejectProposal}
+          onUndo={onUndoProposal}
+          trace={proposal.debugTrace}
+        />
         {proposal.state === 'awaiting_approval' && proposal.attemptNumber === 1 && <label className="mb-3 flex cursor-pointer items-start gap-2 rounded-md border border-sky-500/30 bg-sky-500/5 p-2 text-[11px] text-sky-100">
           <input
             type="checkbox"
@@ -933,9 +977,10 @@ export function CodingAgentWorkspace({
         </label>}
         {proposal.autoRepairEnabled && <p role="status" className="mb-3 rounded-md border border-sky-500/30 bg-sky-500/5 p-2 text-[11px] text-sky-100">Auto mode enabled for this approved scope · up to 3 repair attempts · no automatic deletions.</p>}
         {proposal.autoRepairBlockedReason && <p role="status" className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] text-amber-100">{proposal.autoRepairBlockedReason}</p>}
-        <div className="flex items-start justify-between gap-3">
+        <div className="mb-3 flex items-start justify-between gap-3">
           <div>
-            <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-200">Proposed diff · {proposal.state === 'cancelled' ? 'rejected' : proposal.lifecycleState || proposal.state || 'pending'}</p>
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-200">Proposed change · {proposal.state === 'cancelled' ? 'rejected' : proposal.lifecycleState || proposal.state || 'pending'}</p>
+            {proposal.browserBroker && proposal.proposalDigest && <p className="mt-1 break-all font-mono text-[10px] text-slate-400">Broker proposal digest: {proposal.proposalDigest}</p>}
             {proposal.attemptLabel && <p className="mt-1 text-[11px] text-amber-100">{proposal.attemptLabel}</p>}
             <p className="mt-1 text-[11px] text-slate-400">Reviewed files: {proposal.searchedFiles.join(', ')}</p>
             {proposal.runtime && <p className="mt-1 text-[10px] text-emerald-300">Pipeline: {proposal.runtime.phase || proposal.runtime.taskState || 'proposal'} · plan v{proposal.runtime.planVersion || 1}</p>}
@@ -944,12 +989,6 @@ export function CodingAgentWorkspace({
             <p className="font-semibold">Extra review required for sensitive project configuration</p>
             <p className="mt-1">{proposal.reviewFlags.map((flag) => flag.replace(/-/g, ' ')).join(' · ')}</p>
           </div>}
-          <div className="flex shrink-0 flex-wrap justify-end gap-2">
-            {proposal.state === 'awaiting_approval' && <button onClick={onApproveProposal} disabled={busy} className="rounded-md bg-amber-400 px-2.5 py-1.5 text-[11px] font-medium text-slate-950 disabled:opacity-40">Approve</button>}
-            {proposal.state === 'approved' && <button onClick={onApplyProposal} disabled={busy} className="rounded-md bg-emerald-400 px-2.5 py-1.5 text-[11px] font-medium text-slate-950 disabled:opacity-40">Apply and verify</button>}
-            {proposal.state === 'completed' && <button onClick={onUndoProposal} disabled={busy} className="rounded-md border border-rose-400/60 px-2.5 py-1.5 text-[11px] text-rose-200 disabled:opacity-40">Undo</button>}
-            {proposal.state === 'awaiting_approval' && <button onClick={onRejectProposal} disabled={busy} className="rounded-md border border-slate-600 px-2.5 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Reject</button>}
-          </div>
         </div>
         {proposal.runtime?.metrics && <div className="mt-3 grid grid-cols-2 gap-2 rounded-md border border-slate-700 bg-slate-950 p-2 text-[10px] text-slate-400 sm:grid-cols-4">
           <span>Files read: {proposal.runtime.metrics.filesRead || 0}</span><span>Files changed: {proposal.runtime.metrics.filesChanged || 0}</span><span>Checks: {proposal.runtime.metrics.verificationRuns || 0}</span><span>Confidence: {proposal.runtime.metrics.confidence || 'LOW'}</span>
@@ -974,7 +1013,6 @@ export function CodingAgentWorkspace({
             </div>)}
           </>}
         </div>}
-        {proposal.files.length > 0 ? <div className="mt-3 space-y-3">{proposal.files.map((file) => <div key={`${file.operation}:${file.sourcePath || ''}:${file.path}`} className="overflow-hidden rounded-md border border-slate-700 bg-slate-950"><p className="border-b border-slate-700 px-2 py-1.5 text-xs font-medium text-slate-200">{file.operation.toUpperCase().replace('_', ' ')} · {file.sourcePath ? `${file.sourcePath} → ${file.path}` : file.path}</p>{file.operation === 'delete_directory' ? <p className="px-2 py-2 text-xs text-rose-200">The directory and its contents will be removed after a separate exact-target confirmation.</p> : <pre className="max-h-80 overflow-auto p-2 text-[11px] leading-relaxed">{file.lines.map((line, lineIndex) => <span key={`${file.path}-${lineIndex}`} className={`block ${line.startsWith('+') && !line.startsWith('+++') ? 'bg-emerald-500/10 text-emerald-200' : line.startsWith('-') && !line.startsWith('---') ? 'bg-rose-500/10 text-rose-200' : 'text-slate-400'}`}>{line || ' '}</span>)}</pre>}</div>)}</div> : <pre className="mt-3 overflow-auto rounded-md border border-slate-700 bg-slate-950 p-2 text-[11px] text-slate-300">{proposal.raw || 'No safe changes proposed.'}</pre>}
         {proposal.verification && <div className={`mt-3 rounded-md border p-2 text-[11px] ${proposal.verification.status === 'PASS' ? 'border-emerald-500/30 text-emerald-200' : 'border-rose-500/30 text-rose-200'}`}><p>Verification: {proposal.verification.status || 'UNKNOWN'}</p>{proposal.verification.reason && <p className="mt-1 text-slate-400">{proposal.verification.reason}</p>}{proposal.fileState && <p className="mt-1">{proposal.fileState}</p>}{proposal.verification.attempts?.filter((attempt) => !attempt.ok).map((attempt, attemptIndex) => <p key={`${attempt.check || 'check'}-${attemptIndex}`} className="mt-1 text-rose-200">{attempt.check || 'check'}: {attempt.classification || 'failed'}{attempt.extracted?.file ? ` · ${attempt.extracted.file}${attempt.extracted.line ? `:${attempt.extracted.line}` : ''}` : ''}{attempt.extracted?.message ? ` · ${attempt.extracted.message}` : ''}</p>)}</div>}
         {proposal.error && <p className="mt-2 text-[11px] text-rose-300">{proposal.error}</p>}
         {proposal.state === 'failed' && proposal.verification?.status === 'CODE_FAILURE' && proposal.repairAvailable && <div className="mt-3 flex items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-2">

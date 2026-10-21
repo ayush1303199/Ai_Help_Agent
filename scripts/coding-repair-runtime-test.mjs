@@ -24,6 +24,7 @@ const previous = {
   document: globalThis.document,
   localStorage: globalThis.localStorage,
   webSocket: globalThis.WebSocket,
+  fetch: globalThis.fetch,
   actEnvironment: globalThis.IS_REACT_ACT_ENVIRONMENT,
 };
 globalThis.window = dom.window;
@@ -31,6 +32,20 @@ globalThis.document = dom.window.document;
 globalThis.localStorage = dom.window.localStorage;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 Object.defineProperty(dom.window, 'crypto', { configurable: true, value: webcrypto });
+globalThis.fetch = async (input, init) => {
+  if (String(input).includes('/api/coding/project-attach')) {
+    return Response.json({ status: 'PROJECT_ATTACHED', projectRoot });
+  }
+  if (String(input).includes('/api/coding/broker')) {
+    return new Response(JSON.stringify({
+      error: { code: 'BROKER_UNAVAILABLE', message: 'Trusted desktop broker is unavailable.' },
+    }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  return previous.fetch(input, init);
+};
 
 const providerRequests = [];
 const proposalRegistrations = [];
@@ -201,8 +216,9 @@ localStorage.setItem('ai_help_agent_coding_project_root', projectRoot);
 const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true } });
 let root;
 let current;
-const waitForReact = async (predicate, message) => {
-  for (let index = 0; index < 100; index += 1) {
+const waitForReact = async (predicate, message, timeoutMs = 500) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
     if (predicate()) return;
     await act(async () => new Promise((resolve) => setTimeout(resolve, 5)));
   }
@@ -227,7 +243,27 @@ try {
   await waitForReact(
     () => initialProjectSync && current?.workspace?.projectRoot === projectRoot,
     'The attached project did not initialize.',
+    5000,
   );
+  const greenfieldPrompt = "Act as an expert Full-Stack Developer. Build a complete 'Add Order' feature using Next.js (App Router) for the frontend and Node.js with Express and MongoDB for the backend. Provide clean, modular code snippets.";
+  await act(async () => {
+    current.workspace.onInputChange(greenfieldPrompt);
+  });
+  await act(async () => {
+    current.workspace.onSendMessage();
+  });
+  await waitForReact(
+    () => current.workspace.messages.at(-1)?.content.includes('Trusted desktop broker is unavailable.'),
+    'The unavailable browser broker was not surfaced to the user.',
+    20000,
+  );
+  assert.equal(providerRequests.length, 0, 'An attached project build request without the desktop bridge must not be sent as provider chat.');
+  assert.match(
+    current.workspace.messages.at(-1).content,
+    /trusted desktop broker is unavailable/i,
+    'The user must be told that the attached project broker workflow is unavailable.',
+  );
+
   await act(async () => {
     current.workspace.onInputChange('Make a safe change.');
   });
@@ -562,6 +598,8 @@ try {
   else globalThis.localStorage = previous.localStorage;
   if (previous.webSocket === undefined) delete globalThis.WebSocket;
   else globalThis.WebSocket = previous.webSocket;
+  if (previous.fetch === undefined) delete globalThis.fetch;
+  else globalThis.fetch = previous.fetch;
   if (previous.actEnvironment === undefined) delete globalThis.IS_REACT_ACT_ENVIRONMENT;
   else globalThis.IS_REACT_ACT_ENVIRONMENT = previous.actEnvironment;
 }

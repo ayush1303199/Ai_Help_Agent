@@ -632,8 +632,8 @@ try {
   developerFiles.runVerification = originalRunVerification;
   globalThis.fetch = originalFetch;
   if (mainLoaded) {
-    const closeHandler = electronMock.app.listeners('will-quit')[0];
-    closeHandler?.();
+    const closeHandler = electronMock.app.listeners('before-quit')[0];
+    closeHandler?.({ preventDefault() {} });
   }
   await developerAgent.flushDurability();
   for (const root of projectRoots) await fs.rm(root, { recursive: true, force: true });

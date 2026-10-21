@@ -12,6 +12,24 @@ function normalizePath(p) {
   return String(p || '').replace(/\\/g, '/').replace(/^\.\//, '');
 }
 
+function validateRoutePath(value) {
+  if (typeof value !== 'string') throw new Error('Route path must be a string.');
+  const routePath = value.trim();
+  let decodedPath;
+  try {
+    decodedPath = decodeURIComponent(routePath);
+  } catch {
+    throw new Error('Route path contains invalid percent encoding.');
+  }
+  if (!routePath.startsWith('/')
+    || routePath.startsWith('//')
+    || /[\\?#\u0000-\u001f\u007f]/.test(routePath)
+    || decodedPath.split('/').some((segment) => segment === '..')) {
+    throw new Error('Route path must be an origin-relative path without traversal or query data.');
+  }
+  return routePath;
+}
+
 function inside(parent, child) {
   const rel = path.relative(parent, child);
   return Boolean(rel) && !rel.startsWith('..') && !path.isAbsolute(rel);
@@ -191,6 +209,55 @@ function cleanEntityName(name) {
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
+function extractRequestedRoute(text) {
+  const match = String(text || '').match(/\b(GET|POST|PUT|PATCH|DELETE)\s+(\/[A-Za-z0-9_/:.-]*)/i);
+  if (!match) return null;
+  const method = match[1].toUpperCase();
+  const routePath = validateRoutePath(match[2].replace(/[.,;]+$/, '').replace(/\/+$/, '') || '/');
+  return { method, path: routePath };
+}
+
+function extractRequestedFields(text) {
+  const fields = [];
+  const seen = new Set();
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const match = line.match(/^\s*(?:[-*]\s*)?([A-Za-z_$][\w$]*)\s*(?::\s*|\(\s*)(string|number|boolean|integer|date|email|array|object)?\s*([^)]*)\)?\s*$/i);
+    if (!match || !match[2]) continue;
+    const name = match[1];
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const declaredType = (match[2] || 'string').toLowerCase();
+    const type = declaredType === 'integer' ? 'number' : declaredType;
+    const metadata = `${match[2] || ''} ${match[3] || ''} ${line}`;
+    const defaultMatch = metadata.match(/\bdefault\s*[:=]\s*("[^"]*"|'[^']*'|true|false|null|-?\d+(?:\.\d+)?)/i);
+    let defaultValue = null;
+    if (defaultMatch) {
+      const literal = defaultMatch[1];
+      try {
+        defaultValue = literal.startsWith("'")
+          ? literal.slice(1, -1)
+          : JSON.parse(literal);
+      } catch {
+        defaultValue = null;
+      }
+    }
+    fields.push({
+      name,
+      type,
+      required: /\brequired\b/i.test(metadata),
+      hasDefault: Boolean(defaultMatch),
+      defaultValue,
+    });
+  }
+  return fields;
+}
+
+function pascalCaseIdentifier(value) {
+  const words = String(value || '').split(/[^A-Za-z0-9]+/).filter(Boolean);
+  const combined = words.map((word) => word[0].toUpperCase() + word.slice(1)).join('');
+  return /^[A-Z]/.test(combined) ? combined : `Resource${combined}`;
+}
+
 async function deriveModularPlan(root, { userRequest = '', requirements = [], explicitPlan = null } = {}) {
   const conventions = await discoverProjectConventions(root);
   const plan = {
@@ -198,6 +265,7 @@ async function deriveModularPlan(root, { userRequest = '', requirements = [], ex
     language: conventions.language,
     modulesToCreate: [],
     integrationPoints: [],
+    routeContracts: [],
     reusedModules: [],
     planRecord: [],
   };
@@ -239,6 +307,24 @@ async function deriveModularPlan(root, { userRequest = '', requirements = [], ex
         });
       }
     }
+    if (Array.isArray(explicitPlan.routeContracts)) {
+      for (const route of explicitPlan.routeContracts) {
+        if (!route || typeof route.method !== 'string' || typeof route.path !== 'string') {
+          throw new Error('Explicit route contracts require an HTTP method and path.');
+        }
+        const method = route.method.toUpperCase();
+        const routePath = validateRoutePath(route.path);
+        if (!/^[A-Z]{3,10}$/.test(method)
+          || !routePath) {
+          throw new Error('Explicit route contract is invalid.');
+        }
+        plan.routeContracts.push({
+          method,
+          path: routePath,
+          targetFile: validateSafePath(root, route.targetFile),
+        });
+      }
+    }
     if (Array.isArray(explicitPlan.reusedModules)) {
       plan.reusedModules.push(...explicitPlan.reusedModules);
     }
@@ -255,6 +341,92 @@ async function deriveModularPlan(root, { userRequest = '', requirements = [], ex
     const isMultiLayer = isFullStack || hasDatabase || /\b(controller|router|route|model|schema|component|page)\b/i.test(text);
 
     if (isMultiLayer) {
+      const requestedRoute = extractRequestedRoute(text);
+      const requestedFields = extractRequestedFields(text);
+      const wantsUi = /\b(frontend|front-end|ui|form|page|component|client|react|vue|angular|svelte|html)\b/i.test(text);
+      if (requestedRoute && wantsUi && requestedFields.length > 0) {
+        const resourceName = requestedRoute.path.split('/').filter(Boolean).at(-1)?.replace(/^:/, '') || 'resource';
+        const entityBase = resourceName.endsWith('ies')
+          ? `${resourceName.slice(0, -3)}y`
+          : resourceName.endsWith('s') ? resourceName.slice(0, -1) : resourceName;
+        const entityPascal = pascalCaseIdentifier(entityBase);
+        const entityCamel = entityPascal[0].toLowerCase() + entityPascal.slice(1);
+        const routeStem = entityCamel;
+        const configPath = 'config/environment.js';
+        const modelPath = `models/${entityCamel}Schema.js`;
+        const controllerPath = `controllers/${entityCamel}Controller.js`;
+        const routePath = `routes/${entityCamel}Routes.js`;
+        const serverPath = 'server.js';
+        const componentPath = `components/${entityPascal}Form.jsx`;
+        const fieldsLiteral = JSON.stringify(requestedFields, null, 2);
+        const requiredChecks = requestedFields
+          .filter((field) => field.required)
+          .map((field) => `    if (payload.${field.name} === undefined || payload.${field.name} === null || payload.${field.name} === '') errors.push(${JSON.stringify(`${field.name} is required.`)});`)
+          .join('\n');
+        const initialState = JSON.stringify(Object.fromEntries(requestedFields.map((field) => [
+          field.name,
+          field.hasDefault ? field.defaultValue : '',
+        ])), null, 2);
+        const formFields = requestedFields.map((field) => `      <label key=${JSON.stringify(field.name)}>\n        <span>${field.name}</span>\n        <input name=${JSON.stringify(field.name)} type=${JSON.stringify(field.type === 'number' ? 'number' : 'text')} value={form.${field.name} ?? ''} onChange={(event) => setForm((current) => ({ ...current, ${field.name}: event.target.value }))} ${field.required ? 'required' : ''} />\n      </label>`).join('\n');
+        const responseStatus = requestedRoute.method === 'POST' ? 201 : 200;
+        const routeContract = {
+          method: requestedRoute.method,
+          path: requestedRoute.path,
+          targetFile: routePath,
+          integrationFile: serverPath,
+          controllerFile: controllerPath,
+          modelFile: modelPath,
+          staticMountVerification: true,
+        };
+        plan.modulesToCreate = [
+          {
+            path: configPath,
+            responsibility: 'CONFIGURATION',
+            dependencies: [],
+            content: `'use strict';\n\nmodule.exports = {\n  databaseUrl: process.env.DATABASE_URL || null,\n  port: Number(process.env.PORT) || 0,\n};\n`,
+          },
+          {
+            path: modelPath,
+            responsibility: 'DATA_MODEL',
+            dependencies: [],
+            content: `'use strict';\n\nconst fields = ${fieldsLiteral};\n\nfunction validate(payload) {\n  const errors = [];\n  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return { valid: false, errors: ['A JSON object is required.'] };\n${requiredChecks}\n  for (const field of fields) {\n    const value = payload[field.name];\n    if (value === undefined || value === null || value === '') continue;\n    if (field.type === 'number' && !Number.isFinite(Number(value))) errors.push(field.name + ' must be a number.');\n    if (field.type === 'boolean' && typeof value !== 'boolean' && value !== 'true' && value !== 'false') errors.push(field.name + ' must be a boolean.');\n  }\n  return { valid: errors.length === 0, errors };\n}\n\nfunction applyDefaults(payload) {\n  const value = { ...payload };\n  for (const field of fields) if (value[field.name] === undefined && field.hasDefault) value[field.name] = field.defaultValue;\n  return value;\n}\n\nmodule.exports = { fields, validate, applyDefaults };\n`,
+          },
+          {
+            path: controllerPath,
+            responsibility: 'CORE_BUSINESS_LOGIC',
+            dependencies: [modelPath],
+            content: `'use strict';\n\nconst schema = require('../${modelPath}');\n\nasync function handle${entityPascal}(request) {\n  try {\n    const validation = schema.validate(request.body);\n    if (!validation.valid) return { status: 400, body: { errors: validation.errors } };\n    return { status: ${responseStatus}, body: { data: schema.applyDefaults(request.body) } };\n  } catch (error) {\n    return { status: 500, body: { error: error instanceof Error ? error.message : 'Request failed.' } };\n  }\n}\n\nmodule.exports = { handle${entityPascal} };\n`,
+          },
+          {
+            path: routePath,
+            responsibility: 'ROUTING',
+            dependencies: [controllerPath],
+            content: `'use strict';\n\nconst { handle${entityPascal} } = require('../${controllerPath}');\nconst route = { method: ${JSON.stringify(requestedRoute.method)}, path: ${JSON.stringify(requestedRoute.path)} };\n\nfunction registerRoutes(app) {\n  if (!app || typeof app.register !== 'function') throw new TypeError('A route registry is required.');\n  app.register(route.method, route.path, async (request) => handle${entityPascal}(request));\n  return [route];\n}\n\nmodule.exports = { registerRoutes, route };\n`,
+          },
+          {
+            path: serverPath,
+            responsibility: 'APPLICATION_ENTRYPOINT',
+            dependencies: [configPath, routePath],
+            content: `'use strict';\n\nconst http = require('node:http');\nconst config = require('./${configPath}');\nconst { registerRoutes } = require('./${routePath}');\n\nfunction createApplication() {\n  const routes = new Map();\n  const app = { register(method, routePath, handler) { routes.set(method + ' ' + routePath, handler); } };\n  registerRoutes(app);\n  const server = http.createServer(async (request, response) => {\n    const handler = routes.get(request.method + ' ' + new URL(request.url, 'http://localhost').pathname);\n    if (!handler) { response.writeHead(404).end(); return; }\n    const chunks = [];\n    for await (const chunk of request) chunks.push(chunk);\n    let body = {};\n    if (chunks.length) {\n      try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }\n      catch { response.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Invalid JSON body.' })); return; }\n    }\n    const result = await handler({ body });\n    response.writeHead(result.status, { 'Content-Type': 'application/json' }).end(JSON.stringify(result.body));\n  });\n  return server;\n}\n\nif (require.main === module) {\n  const server = createApplication();\n  server.listen(config.port, () => console.info(JSON.stringify({ status: 'listening', port: server.address().port })));\n}\n\nmodule.exports = { createApplication };\n`,
+          },
+          {
+            path: componentPath,
+            responsibility: 'UI_PRESENTATION',
+            dependencies: [],
+            content: `import { useState } from 'react';\n\nconst initialForm = ${initialState};\n\nexport default function ${entityPascal}Form() {\n  const [form, setForm] = useState(initialForm);\n  const [loading, setLoading] = useState(false);\n  const [error, setError] = useState('');\n  const [success, setSuccess] = useState('');\n  async function submit(event) {\n    event.preventDefault();\n    setLoading(true); setError(''); setSuccess('');\n    try {\n      const response = await fetch(${JSON.stringify(requestedRoute.path)}, { method: ${JSON.stringify(requestedRoute.method)}, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form) });\n      const result = await response.json();\n      if (!response.ok) throw new Error(result.error || result.errors?.join(', ') || 'Request failed.');\n      setSuccess('Saved successfully.');\n    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Request failed.'); }\n    finally { setLoading(false); }\n  }\n  return <form onSubmit={submit}>\n${formFields}\n    <button type=\"submit\" disabled={loading}>{loading ? 'Saving…' : 'Submit'}</button>\n    {error && <p role=\"alert\">{error}</p>}\n    {success && <p role=\"status\">{success}</p>}\n  </form>;\n}\n`,
+          },
+        ];
+        plan.routeContracts = [routeContract];
+        plan.planRecord = plan.modulesToCreate.map((module) => ({
+          path: module.path,
+          action: 'create',
+          responsibility: module.responsibility,
+          status: 'planned',
+        }));
+        plan.routeSchema = { entity: entityPascal, fields: requestedFields };
+        return plan;
+      }
+
       const entityPascal = extractEntityFromRequest(userRequest);
       const entityCamel = entityPascal.charAt(0).toLowerCase() + entityPascal.slice(1);
       const entityPlural = entityCamel.endsWith('s') ? entityCamel : `${entityCamel}s`;
@@ -312,6 +484,10 @@ async function deriveModularPlan(root, { userRequest = '', requirements = [], ex
           dependencies: [componentPath],
           content: `// Page view for ${entityPascal}\nimport ${entityPascal}Form from '${isNextAppRouter ? '../../' : '../'}${componentPath}';\n\nexport default function ${entityPascal}Page() {\n  return {\n    page: '${entityPascal}Page',\n    title: '${entityPascal} Management',\n    Component: ${entityPascal}Form,\n  };\n}\n`,
         },
+      ];
+      plan.routeContracts = [
+        { method: 'POST', path: `/api/${entityPlural}`, targetFile: routePath },
+        { method: 'GET', path: `/api/${entityPlural}`, targetFile: routePath },
       ];
 
       plan.planRecord = plan.modulesToCreate.map((m) => ({
@@ -546,7 +722,7 @@ async function synthesizeMultiFilePatch(root, modularPlan, options = {}) {
  * Validates that after application, all created modules exist on disk and integration points
  * are truly functional and reachable, not merely present.
  */
-async function verifyIntegrationReachability(root, modularPlan) {
+async function verifyIntegrationReachability(root, modularPlan, { probeRoute } = {}) {
   const result = {
     isValid: true,
     verifiedFiles: [],
@@ -608,6 +784,103 @@ async function verifyIntegrationReachability(root, modularPlan) {
       result.isValid = false;
       result.incompleteIntegrations.push({ path: safePath, reason: err.message });
       result.rejectionReason = `Integration point verification failed for [${safePath}]: ${err.message}`;
+      return result;
+    }
+  }
+
+  const integratedPaths = new Set([
+    ...(modularPlan.modulesToCreate || []).map((module) => normalizePath(module.path)),
+    ...(modularPlan.integrationPoints || []).map((point) => normalizePath(point.targetFile)),
+  ]);
+  for (const route of modularPlan.routeContracts || []) {
+    const targetFile = validateSafePath(root, route.targetFile);
+    const routePath = validateRoutePath(route.path);
+    if (!integratedPaths.has(normalizePath(targetFile))) {
+      result.isValid = false;
+      result.incompleteIntegrations.push({
+        path: targetFile,
+        reason: 'The route contract target is not part of the approved integration plan.',
+      });
+      result.rejectionReason = `Route target is outside the approved integration plan: ${targetFile}.`;
+      return result;
+    }
+    if (route.staticMountVerification === true) {
+      const routeModule = modularPlan.modulesToCreate.find((module) => (
+        normalizePath(module.path) === normalizePath(targetFile)
+      ));
+      const serverPath = validateSafePath(root, route.integrationFile);
+      const serverModule = modularPlan.modulesToCreate.find((module) => (
+        normalizePath(module.path) === normalizePath(serverPath)
+      ));
+      const routeSource = routeModule
+        ? await fs.readFile(path.join(root, ...targetFile.split('/')), 'utf8')
+        : '';
+      const serverSource = serverModule
+        ? await fs.readFile(path.join(root, ...serverPath.split('/')), 'utf8')
+        : '';
+      const controllerPath = validateSafePath(root, route.controllerFile);
+      const modelPath = validateSafePath(root, route.modelFile);
+      const controllerModule = modularPlan.modulesToCreate.find((module) => (
+        normalizePath(module.path) === normalizePath(controllerPath)
+      ));
+      const modelModule = modularPlan.modulesToCreate.find((module) => (
+        normalizePath(module.path) === normalizePath(modelPath)
+      ));
+      const controllerSource = controllerModule
+        ? await fs.readFile(path.join(root, ...controllerPath.split('/')), 'utf8')
+        : '';
+      const modelSource = modelModule
+        ? await fs.readFile(path.join(root, ...modelPath.split('/')), 'utf8')
+        : '';
+      const routeDeclaration = routeSource.includes(JSON.stringify(route.method))
+        && routeSource.includes(JSON.stringify(routePath))
+        && /function\s+registerRoutes\s*\(/.test(routeSource)
+        && routeSource.includes(`require('../${controllerPath}')`);
+      const controllerImportsModel = controllerSource.includes(`require('../${modelPath}')`)
+        && modelSource.includes('function validate(');
+      const routeImportPath = path.posix.relative(
+        path.posix.dirname(serverPath),
+        targetFile,
+      );
+      const serverMount = serverSource.includes(`require('./${routeImportPath}')`)
+        && /registerRoutes\s*\(\s*app\s*\)/.test(serverSource);
+      if (!routeDeclaration || !controllerImportsModel || !serverMount) {
+        result.isValid = false;
+        result.incompleteIntegrations.push({
+          path: targetFile,
+          reason: 'The requested route is not declared and mounted by the generated server entrypoint.',
+        });
+        result.rejectionReason = `Route mount verification failed for ${route.method} ${routePath}.`;
+        return result;
+      }
+      result.verifiedFiles.push(serverPath);
+      result.routeMounts = [...(result.routeMounts || []), {
+        method: route.method,
+        path: routePath,
+        targetFile,
+        integrationFile: serverPath,
+        status: 'PASS',
+      }];
+      continue;
+    }
+    if (typeof probeRoute !== 'function') {
+      result.isValid = false;
+      result.incompleteIntegrations.push({
+        path: targetFile,
+        reason: `Live route ${route.method} ${routePath} was not probed.`,
+      });
+      result.rejectionReason = `Live route reachability is unverified: ${route.method} ${routePath}.`;
+      return result;
+    }
+    const observation = await probeRoute({ method: route.method, path: routePath, targetFile });
+    if (!observation || observation.executed !== true || !Number.isInteger(observation.status)
+      || observation.status < 200 || observation.status >= 500 || observation.status === 404) {
+      result.isValid = false;
+      result.incompleteIntegrations.push({
+        path: targetFile,
+        reason: `Live route ${route.method} ${routePath} did not return a host-observed non-404 response.`,
+      });
+      result.rejectionReason = `Live route reachability failed: ${route.method} ${routePath} returned ${Number.isInteger(observation?.status) ? observation.status : 'no status'}.`;
       return result;
     }
   }

@@ -5,14 +5,16 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { verifyIntegrationReachability } from '../electron/coding-pipeline/modularArchitectureEngine.cjs';
 import {
   digestText,
   evaluateRealTaskDataset,
   QUALITY_DIMENSIONS,
   REAL_TASK_RUBRIC_VERSION,
 } from './coding-agent-real-task-evaluator.mjs';
-import { classifyCodingRequestIntent } from '../src/features/coding/codingTransport.ts';
+import {
+  classifyCodingRequestIntent,
+  shouldRequireDeveloperWorkflowForAttachedProject,
+} from '../src/features/coding/codingTransport.ts';
 
 const require = createRequire(import.meta.url);
 const Module = require('node:module');
@@ -28,16 +30,35 @@ const handlers = new Map();
 const windows = [];
 const userData = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-workflow-ipc-userdata-'));
 const projectRoots = new Set();
+async function listFilesRecursively(root, current = root) {
+  const entries = await fs.readdir(current, { withFileTypes: true });
+  const nested = await Promise.all(entries.map(async (entry) => {
+    const fullPath = path.join(current, entry.name);
+    return entry.isDirectory()
+      ? listFilesRecursively(root, fullPath)
+      : [path.relative(root, fullPath)];
+  }));
+  return nested.flat();
+}
 const dialogRequests = [];
 const dialogResponses = [];
+const inlineApprovalRequests = [];
+const inlineApprovalErrors = [];
+let concurrentApprovalMutation = null;
 const authorizedMutationRequests = [];
+let resolveAppQuit;
+const appQuitComplete = new Promise((resolve) => { resolveAppQuit = resolve; });
 
 const electronMock = {
   app: Object.assign(new EventEmitter(), {
     isPackaged: false,
     getPath: () => userData,
     whenReady: () => Promise.resolve(),
-    quit() {},
+    quit() {
+      let prevented = false;
+      this.emit('before-quit', { preventDefault() { prevented = true; } });
+      if (!prevented) resolveAppQuit();
+    },
   }),
   ipcMain: {
     handle(name, handler) {
@@ -237,6 +258,23 @@ const invokeIpc = async (name, sender, ...args) => {
 
 try {
   const sender = windows[0].webContents;
+  electronMock.ipcRenderer.on('developer:workflow-approval-pending', (_event, approval) => {
+    inlineApprovalRequests.push(approval);
+    void (async () => {
+      if (concurrentApprovalMutation) {
+        const mutate = concurrentApprovalMutation;
+        concurrentApprovalMutation = null;
+        await mutate();
+      }
+      const response = dialogResponses.length ? dialogResponses.shift() : 0;
+      await invokeIpc('developer:workflow-approval-decision', sender, {
+        approvalRequestId: approval.approvalRequestId,
+        proposalId: approval.proposalId,
+        proposalDigest: approval.proposalDigest,
+        approved: response === 1,
+      });
+    })().catch((error) => inlineApprovalErrors.push(error));
+  });
 
   // Initialize Developer Session via real IPC
   const sessionRes = await invokeIpc('developer:session', sender);
@@ -623,7 +661,7 @@ class FormController {
 
   relevanceAssessmentMode = 'supported';
   const acceptedAssessmentRequestCount = relevanceAssessmentRequests.length;
-  const dialogCountBeforeRejection = dialogRequests.length;
+  const inlineApprovalCountBeforeRejection = inlineApprovalRequests.length;
   dialogResponses.push(0);
   const unapprovedResult = await invokeIpc('developer:workflow-execute', sender, {
     userRequest: 'fix debug probe and die in profile form controller',
@@ -632,17 +670,15 @@ class FormController {
     relevanceAssessmentRequests.length > acceptedAssessmentRequestCount,
     'The accepted assessment must be returned through the production IPC assessor boundary.',
   );
-  assert.equal(dialogRequests.length, dialogCountBeforeRejection + 1, 'Supported findings must reach the native approval prompt.');
+  assert.equal(inlineApprovalRequests.length, inlineApprovalCountBeforeRejection + 1, 'Supported findings must reach the inline approval contract.');
   assert.equal(unapprovedResult.outcome, 'APPROVAL_REJECTED');
   assert.equal(unapprovedResult.phase, 'APPROVE');
   assert.equal(unapprovedResult.filesModified.length, 0);
   assert.equal(unapprovedResult.codeApplied, false);
-  const rejectedApproval = dialogRequests.at(-1);
-  assert.equal(rejectedApproval.buttons[0], 'Reject proposal');
-  assert.equal(rejectedApproval.buttons[1], 'Approve exact proposal');
-  assert.match(rejectedApproval.detail, /Exact proposed diff:/);
-  assert.match(rejectedApproval.detail, /FormController\.php/);
-  assert.match(rejectedApproval.detail, /Manifest: [a-f0-9]{64}/i);
+  const rejectedApproval = inlineApprovalRequests.at(-1);
+  assert.equal(rejectedApproval.envelope.proposalDigest, rejectedApproval.proposalDigest);
+  assert.match(rejectedApproval.proposalDigest, /^[a-f0-9]{64}$/i);
+  assert.match(rejectedApproval.diff, /FormController\.php/);
   assert.equal(
     require('../electron/developerAgent.cjs').getTaskForTest(unapprovedResult.taskId).state,
     'cancelled',
@@ -740,8 +776,8 @@ class FormController {
     assert.equal(successResult.taskPlan.status, 'BLOCKED');
     assert.equal(successResult.taskPlan.workItems[0].status, 'BLOCKED');
     assert.deepEqual(successResult.filesModified, ['modules/profile/controllers/FormController.php']);
-    assert.match(dialogRequests.at(-1).detail, /Exact proposed diff:/);
-    assert.match(dialogRequests.at(-1).detail, /Manifest: [a-f0-9]{64}/i);
+    assert.match(inlineApprovalRequests.at(-1).diff, /FormController\.php/);
+    assert.match(inlineApprovalRequests.at(-1).proposalDigest, /^[a-f0-9]{64}$/i);
 
     // Verify file on disk was patched cleanly
     const patchedContent = await fs.readFile(
@@ -987,31 +1023,28 @@ class FormController {
     initialProfileController,
     'utf8'
   );
-  // Hook showMessageBox to simulate concurrent race edit right as approval is given
-  const originalShowMessageBox = electronMock.dialog.showMessageBox;
-  electronMock.dialog.showMessageBox = async (_window, options) => {
-    dialogRequests.push(options);
-    // Concurrent external write modifies target file before apply runs
+  concurrentApprovalMutation = async () => {
     await fs.writeFile(
       path.join(projectDir, 'modules', 'profile', 'controllers', 'FormController.php'),
       '<?php // concurrent external edit ?>\n',
       'utf8'
     );
-    return { response: 1 }; // User approves based on earlier snapshot
   };
 
   try {
+    dialogResponses.push(1);
     const concurrentResult = await invokeIpc('developer:workflow-execute', sender, {
       userRequest: 'fix debug probe and die in profile form controller',
       autoRepairEnabled: false,
     });
 
-    assert.equal(concurrentResult.phase, 'IMPLEMENT');
-    assert.equal(concurrentResult.outcome, 'APPLY_FAILED');
+    assert.equal(concurrentResult.phase, 'APPROVE');
+    assert.equal(concurrentResult.outcome, 'APPROVAL_REJECTED');
     assert.equal(concurrentResult.codeVerified, false);
-    assert.match(concurrentResult.error, /snapshot|mismatch|modified|changed/i);
+    assert.equal(inlineApprovalErrors.length, 1);
+    assert.match(inlineApprovalErrors[0].message, /project files changed/i);
   } finally {
-    electronMock.dialog.showMessageBox = originalShowMessageBox;
+    concurrentApprovalMutation = null;
     // Restore clean initial file
     await fs.writeFile(
       path.join(projectDir, 'modules', 'profile', 'controllers', 'FormController.php'),
@@ -1333,40 +1366,72 @@ class FormController {
   projectRoots.add(greenfieldProject);
   await invokeIpc('developer:project-attach', sender, { projectRoot: greenfieldProject });
   dialogResponses.push(1); // 1 = Approve exact proposal
-  const livePrompt = "Act as an expert Full-Stack Developer. Build a complete 'Add Order' feature using Next.js (App Router) for the frontend and Node.js with Express and MongoDB for the backend... Provide clean, modular code snippets...";
+  const livePrompt = `Build a full-stack order form and API.
+Create POST /api/orders
+Fields:
+- customerName: string (required)
+- itemCount: number (default=1)
+Add a frontend form with loading, success, and error states.`;
+  const livePromptClassification = classifyCodingRequestIntent(livePrompt);
+  assert.equal(livePromptClassification.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(livePromptClassification.isActionableTask, true);
+  assert.equal(shouldRequireDeveloperWorkflowForAttachedProject({
+    intent: livePromptClassification.intent,
+    requestText: livePrompt,
+    hasAttachedProject: true,
+    hasDeveloperWorkflowBridge: false,
+  }), true, 'An actionable request with an attached project must not fall back to text-only browser chat.');
+  assert.equal(shouldRequireDeveloperWorkflowForAttachedProject({
+    intent: livePromptClassification.intent,
+    requestText: livePrompt,
+    hasAttachedProject: true,
+    hasDeveloperWorkflowBridge: true,
+  }), false, 'The Electron workflow bridge must remain the allowed materialization route.');
+  assert.equal(shouldRequireDeveloperWorkflowForAttachedProject({
+    intent: 'QUESTION_OR_EXPLANATION',
+    requestText: livePrompt,
+    hasAttachedProject: true,
+    hasDeveloperWorkflowBridge: false,
+  }), false, 'Read-only questions may continue through conversational chat.');
+  assert.equal(shouldRequireDeveloperWorkflowForAttachedProject({
+    intent: livePromptClassification.intent,
+    requestText: livePrompt,
+    hasAttachedProject: true,
+    hasDeveloperWorkflowBridge: false,
+    isResumingProviderTask: true,
+  }), false, 'Existing provider task continuations retain their existing route.');
+  assert.equal(shouldRequireDeveloperWorkflowForAttachedProject({
+    intent: classifyCodingRequestIntent('Make a safe change.').intent,
+    requestText: 'Make a safe change.',
+    hasAttachedProject: true,
+    hasDeveloperWorkflowBridge: false,
+  }), false, 'Ordinary browser proposal tasks must retain their existing provider proposal route.');
   const greenfieldResult = await invokeIpc('developer:workflow-execute', sender, {
     userRequest: livePrompt,
     scope: '.',
   });
-  assert.equal(greenfieldResult.outcome, 'SUCCESS', 'Greenfield request must complete with SUCCESS outcome: ' + JSON.stringify(greenfieldResult));
-  assert.equal(greenfieldResult.codeApplied, true, 'Greenfield patch must be applied to disk.');
-  assert.equal(greenfieldResult.codeVerified, true, 'Greenfield architecture must pass verification.');
-  assert.ok(Array.isArray(greenfieldResult.filesModified) && greenfieldResult.filesModified.length >= 4, 'Must create multi-layer files.');
-  const expectedGreenfieldFiles = [
-    'config/db.js',
-    'models/orderModel.js',
-    'controllers/orderController.js',
-    'routes/orderRoutes.js',
-    'server.js',
-    'components/OrderForm.jsx',
-    'app/orders/page.jsx',
-  ];
-  for (const relFile of expectedGreenfieldFiles) {
-    const fullPath = path.join(greenfieldProject, ...relFile.split('/'));
-    const stat = await fs.stat(fullPath);
-    assert.ok(stat.isFile(), 'Created file [' + relFile + '] must exist on disk.');
-    const textContent = await fs.readFile(fullPath, 'utf8');
-    assert.ok(textContent.trim().length > 20, 'File [' + relFile + '] must contain non-empty code.');
-  }
-  const reachabilityResult = await verifyIntegrationReachability(greenfieldProject, {
-    modulesToCreate: expectedGreenfieldFiles.map((p) => ({ path: p })),
-    integrationPoints: [],
-  });
-  assert.equal(reachabilityResult.isValid, true, 'All created files must pass integration reachability.');
-  console.log('TEST 19 PASSED: Greenfield Live Full-Stack Intercept & File Materialization verified.');
+  assert.equal(greenfieldResult.outcome, 'SUCCESS', JSON.stringify(greenfieldResult));
+  assert.equal(greenfieldResult.codeApplied, true, 'A syntactically mounted dynamic route plan should apply.');
+  assert.equal(greenfieldResult.codeVerified, true, 'The generated route and module graph must pass verification.');
+  const greenfieldFiles = await listFilesRecursively(greenfieldProject);
+  assert.ok(greenfieldFiles.some((file) => file.endsWith('Schema.js')));
+  assert.ok(greenfieldFiles.some((file) => file.endsWith('Controller.js')));
+  assert.ok(greenfieldFiles.some((file) => file.endsWith('Routes.js')));
+  assert.ok(greenfieldFiles.includes('server.js'));
+  assert.ok(greenfieldFiles.some((file) => file.endsWith('Form.jsx')));
+  console.log('TEST 19 PASSED: Dynamic full-stack schema, route, server mount, and UI modules apply and verify.');
 
     console.log('Deterministic real-request IPC integration verified; relevance responses are test fixtures, not live-provider evidence.');
 } finally {
+  electronMock.app.quit();
+  let shutdownTimeout;
+  await Promise.race([
+    appQuitComplete,
+    new Promise((resolve) => {
+      shutdownTimeout = setTimeout(resolve, 15000);
+    }),
+  ]);
+  clearTimeout(shutdownTimeout);
   globalThis.fetch = originalFetch;
   if (previousCodingAuthToken === undefined) delete process.env.AI_CODING_AUTH_TOKEN;
   else process.env.AI_CODING_AUTH_TOKEN = previousCodingAuthToken;

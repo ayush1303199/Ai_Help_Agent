@@ -453,6 +453,46 @@ interface Window {
     }>;
     cancelDeveloperWorkflow?: (requestId: string) => Promise<boolean>;
     onDeveloperActivity?: (callback: (event: Record<string, unknown>) => void) => () => void;
+    decideDeveloperWorkflowApproval?: (decision: {
+      approvalRequestId: string;
+      proposalId: string;
+      proposalDigest: string;
+      approved: boolean;
+      deleteConfirmed?: boolean;
+    }) => Promise<{ decisionAccepted: true; approved: boolean }>;
+    onDeveloperWorkflowApprovalPending?: (callback: (approval: {
+      approvalRequestId: string;
+      workflowRequestId: string;
+      proposalId: string;
+      proposalDigest: string;
+      fileOperations: Array<{
+        path: string;
+        sourcePath: string | null;
+        operation: string;
+        hash: string | null;
+        content: string | null;
+      }>;
+      diff: string;
+      deleteConfirmationRequired: boolean;
+      envelope?: {
+        proposalId: string;
+        proposalDigest: string;
+        projectId: string | null;
+        summary: string;
+        fileBadges: Array<{ filePath: string; action: 'create' | 'modify' | 'delete'; lineCount: number }>;
+        diffPreview: Array<{ filePath: string; action: 'create' | 'modify' | 'delete'; lines: string[] }>;
+        debugTrace: { stage: string; timestamp: string; sessionId: string | null; verificationStatus: string };
+      };
+    }) => void) => () => void;
+    onDeveloperInlineApprovalTransition?: (callback: (transition: {
+      proposalId: string;
+      snapshot: {
+        stage: string;
+        timestamp: string;
+        verificationStatus: string;
+        sessionId: string | null;
+      };
+    }) => void) => () => void;
     undoDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; evidence?: Array<{ kind: string; operation?: string; paths?: string[]; decision?: string; reason?: string; at?: string }>; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperProposal: (id: string) => Promise<{ id: string; state: string; lifecycleState?: string; runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null; }>;
     getDeveloperSession: () => Promise<{ sessionId: string }>;

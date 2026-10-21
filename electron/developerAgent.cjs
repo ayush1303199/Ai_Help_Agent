@@ -672,6 +672,13 @@ function createSession(ownerWebContentsId) {
   sessions.set(ownerWebContentsId, sessionId);
   return sessionId;
 }
+function createSessionForBroker(ownerWebContentsId, brokerSessionId) {
+  if (typeof brokerSessionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(brokerSessionId)) {
+    throw new TypeError('Developer session ID must be a cryptographically generated UUID.');
+  }
+  sessions.set(ownerWebContentsId, brokerSessionId);
+  return brokerSessionId;
+}
 function getSession(ownerWebContentsId) {
   if (!sessions.has(ownerWebContentsId)) return createSession(ownerWebContentsId);
   return sessions.get(ownerWebContentsId);
@@ -1524,6 +1531,51 @@ async function createProposal({
   transition(task, 'awaiting_approval'); return publicTask(task);
 }
 function getTask(taskId, owner) { const task = registry.get(taskId); if (!task) throw new Error('Unknown Developer task.'); assertOwner(task, owner); return task; }
+function getTaskProposalForBroker(taskId, owner) {
+  const task = getTask(taskId, owner);
+  return {
+    taskId: task.taskId,
+    proposalId: task.proposalId || task.taskId,
+    state: task.state,
+    manifestHash: task.manifestHash || proposalManifestHash(task),
+    approval: task.approval ? {
+      proposalId: task.approval.proposalId,
+      manifestHash: task.approval.manifestHash,
+      expiresAt: task.approval.expiresAt,
+      consumedAt: task.approval.consumedAt,
+    } : null,
+    scope: task.scope || '.',
+    files: (task.files || []).map((file) => ({
+      path: file.path,
+      sourcePath: file.sourcePath || null,
+      operation: file.operation,
+      hash: file.hash,
+      content: file.content ?? null,
+    })),
+    before: (task.before || []).map(({ path: targetPath, exists, type, hash: snapshotHash }) => ({
+      path: targetPath,
+      exists,
+      type,
+      hash: snapshotHash,
+    })),
+  };
+}
+async function validateTaskProposalSnapshots(taskId, owner) {
+  const task = getTask(taskId, owner);
+  const expected = task.before || [];
+  const current = await Promise.all(expected.map((item) => snapshotTarget(task.root, item.path)));
+  const drifted = current.some((snapshot, index) => (
+    snapshot.exists !== expected[index].exists
+    || snapshot.type !== expected[index].type
+    || snapshot.hash !== expected[index].hash
+  ));
+  if (drifted) {
+    const error = new Error('The approved project files changed after proposal planning.');
+    error.code = 'STALE_PROPOSAL_DRIFT';
+    throw error;
+  }
+  return true;
+}
 function assertTaskAuthorization(task) {
   const context = task.authorizationContext;
   const turn = conversationTurns.get(task.conversationTurnId);
@@ -5459,7 +5511,7 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
   const verifyRunner = typeof runCheck === 'function' && selectedChecks.length > 0
     ? async () => {
         onProgress({ phase: 'TEST', message: 'Running safe verification checks.' });
-        const loopResult = await runEngineeringLoop({
+        let loopResult = await runEngineeringLoop({
           taskId: task.taskId,
           owner,
           checks: selectedChecks,
@@ -5546,6 +5598,28 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
           onProgress: (p) => onProgress({ phase: 'TEST_LOOP', ...p }),
           isCancelled: () => isCancelled() || conversationTurns.get(turn.turnId)?.state === 'cancelled',
         });
+        if (loopResult.status === 'PASS' && effectiveModularPlan) {
+          const reachability = await verifyIntegrationReachability(root, effectiveModularPlan);
+          if (!reachability.isValid) {
+            loopResult = {
+              ...loopResult,
+              ok: false,
+              status: 'FAILED',
+              exitCode: 1,
+              reason: reachability.rejectionReason,
+              attempts: [
+                ...(Array.isArray(loopResult.attempts) ? loopResult.attempts : []),
+                {
+                  ok: false,
+                  executed: true,
+                  exitCode: 1,
+                  check: 'integration_reachability',
+                  failure: reachability.rejectionReason,
+                },
+              ],
+            };
+          }
+        }
         testOutcome = loopResult;
         const finalCheckCount = selectedChecks.length || 1;
         const attemptsToReport = loopResult.status === 'PASS'
@@ -5627,6 +5701,9 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       || taskState?.state === 'cancelled';
     const failedDuringImplement = !testOutcome || testOutcome.status === 'NOT_RUN';
     const rollbackFailed = Boolean(taskState?.error?.includes('Rollback verification failed'));
+    const incompleteIntegration = /^Live route reachability (?:is unverified|failed):/i.test(
+      String(testOutcome?.reason || ''),
+    );
     const verificationStatus = wasCancelled
       ? 'CANCELLED'
       : failedDuringImplement
@@ -5637,6 +5714,8 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       ? 'CANCELLED'
       : failedDuringImplement
         ? 'APPLY_FAILED'
+        : incompleteIntegration
+          ? 'INCOMPLETE_INTEGRATION'
         : verificationBlocked
           ? 'VERIFICATION_BLOCKED'
         : (verificationStatus === 'VERIFICATION_UNAVAILABLE' || testOutcome?.status === 'VERIFICATION_UNAVAILABLE')
@@ -5673,7 +5752,16 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
             failureDiagnostics: passed ? null : extractFailureDiagnostics(attempt),
           };
         }) : []));
-    const fDiagnostics = taskState?.verification?.failureDiagnostics
+    const fDiagnostics = (typeof testOutcome?.reason === 'string' && testOutcome.reason
+        ? {
+            summary: testOutcome.reason,
+            failingTests: [],
+            assertionErrors: [],
+            compilerErrors: [],
+            stackFrames: [],
+          }
+        : null)
+      || taskState?.verification?.failureDiagnostics
       || (taskState?.verification?.attempts?.find((a) => !a.ok)?.verificationEvidence?.failureDiagnostics)
       || extractFailureDiagnostics(error);
 
@@ -5682,7 +5770,11 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       : ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN', 'APPROVE', 'APPLY', 'VERIFY'];
 
     const workflowReceipt = buildWorkflowReceipt({
-      outcome: rollbackFailed ? 'APPLY_ROLLBACK_FAILED' : (rolledBack ? 'VERIFICATION_FAILED_ROLLED_BACK' : outcome),
+      outcome: rollbackFailed
+        ? 'APPLY_ROLLBACK_FAILED'
+        : incompleteIntegration && rolledBack
+          ? 'INCOMPLETE_INTEGRATION_ROLLED_BACK'
+          : rolledBack ? 'VERIFICATION_FAILED_ROLLED_BACK' : outcome,
       stagesCompleted,
       rootCause: objectiveRelevantDefects ? objectiveRelevantDefects[0] : null,
       approvedProposal: proposalContract,
@@ -5725,7 +5817,9 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       verificationEvidence: vEvidence,
       failureDiagnostics: fDiagnostics,
       workflowReceipt,
-      error: error instanceof Error ? error.message : String(error),
+      error: typeof testOutcome?.reason === 'string' && testOutcome.reason
+        ? testOutcome.reason
+        : error instanceof Error ? error.message : String(error),
     };
   }
 
@@ -6200,8 +6294,9 @@ function resetForTest() {
 }
 
 module.exports = {
-  STATES, STATE_ALIASES, transitions, createSession, getSession, cancelSession, beginConversationTurn, inspectDatabaseRequest, advanceConversationTurn, recordConversationFindings, getConversationTurn, validateConversationToolContext, createProposal, approve, reject, apply, undo,
-  getTask: (id, owner) => publicTask(getTask(id, owner)), getTaskForTest, getTaskMutationContext, getProposalAuthorizationContext, normalizeCommandResult,
+  STATES, STATE_ALIASES, transitions, createSession, createSessionForBroker, getSession, cancelSession, beginConversationTurn, inspectDatabaseRequest, advanceConversationTurn, recordConversationFindings, getConversationTurn, validateConversationToolContext, createProposal, approve, reject, apply, undo,
+  getTask: (id, owner) => publicTask(getTask(id, owner)), getTaskProposalForBroker,
+  validateTaskProposalSnapshots, getTaskForTest, getTaskMutationContext, getProposalAuthorizationContext, normalizeCommandResult,
   classifyFailure, classifyFailureCategory, commandPolicy, selectVerificationChecks, extractFailure, normalizeObservation,
   diagnoseObservation, executeVerificationLoop, runVerificationChecks, runEngineeringLoop, isCancellationRequested,
   verificationFailureFromError,

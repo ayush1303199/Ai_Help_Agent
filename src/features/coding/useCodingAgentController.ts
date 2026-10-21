@@ -4,16 +4,25 @@ import { runtimeConfig } from '../../config/runtimeConfig';
 import { createUnvalidatedSuggestion, parseUnifiedDiff, validateUnifiedFile, type DeveloperDiffFile } from './codingDiff';
 import {
   codingFetch,
+  executeTrustedBrokerWorkflow,
   CodingAgentTransport,
   finalizeCodingActivities,
   parseCodingActivityEvent,
   upsertCodingActivity,
   classifyCodingRequestIntent,
+  shouldRequireDeveloperWorkflowForAttachedProject,
   type CodingActivity,
   type CodingProviderRecovery,
+  type TrustedBrokerApprovalActions,
+  type TrustedBrokerPendingApproval,
   CodingTransportError,
   type CodingTransportResult,
 } from './codingTransport';
+import {
+  readCodingExecutionSettings,
+  writeCodingExecutionSettings,
+  type CodingExecutionSettings,
+} from './codingExecutionSettings';
 import {
   codingPreferenceContext,
   compactCodingConversation,
@@ -65,6 +74,15 @@ interface DeveloperSearchResult {
 interface CodingProposal {
   id?: string;
   proposalId?: string;
+  proposalDigest?: string;
+  debugTrace?: { stage?: string; verificationStatus?: string; timestamp?: string; sessionId?: string | null } | null;
+  browserBroker?: boolean;
+  deleteConfirmationRequired?: boolean;
+  workflowApproval?: {
+    requestId: string;
+    proposalDigest: string;
+    deleteConfirmationRequired: boolean;
+  };
   requestId?: string;
   manifestHash?: string | null;
   state?: string;
@@ -116,6 +134,16 @@ interface CodingProposal {
   error?: string | null;
   runtime?: { phase?: string; taskState?: string; planVersion?: number; metrics?: Record<string, unknown>; history?: Array<{ phase?: string; message?: string }> } | null;
   handoffPlan?: WorkflowHandoffPlan;
+}
+
+function isDeveloperDiffOperation(
+  value: string,
+): value is DeveloperDiffFile['operation'] {
+  return value === 'create'
+    || value === 'modify'
+    || value === 'delete'
+    || value === 'rename'
+    || value === 'delete_directory';
 }
 
 interface WorkflowHandoffWorkItem {
@@ -353,7 +381,16 @@ export function useCodingAgentController({
   const [appliedPatchLog, setAppliedPatchLog] = useState<CodingPatchRecord[]>(() => savedConversation?.appliedPatchLog || []);
   const [lastProvider, setLastProvider] = useState<{ id?: string; label?: string; model?: string; changedAt?: string } | null>(null);
   const [preferences, setPreferences] = useState<CodingPreference[]>(readCodingPreferences);
+  const [executionSettings, setExecutionSettings] = useState<CodingExecutionSettings>(readCodingExecutionSettings);
+  const [brokerStatus, setBrokerStatus] = useState<'unknown' | 'syncing' | 'ready' | 'unavailable'>('unknown');
   const [proposal, setProposal] = useState<CodingProposal | null>(null);
+  const [deleteConfirmed, setDeleteConfirmed] = useState(false);
+  const browserBrokerApprovalRef = useRef<{
+    taskId: string;
+    proposalId: string;
+    proposalDigest: string;
+    actions: TrustedBrokerApprovalActions;
+  } | null>(null);
   const [autoRepairChoice, setAutoRepairChoice] = useState(false);
   const [autoRepairActive, setAutoRepairActive] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -363,6 +400,7 @@ export function useCodingAgentController({
   const transportRef = useRef<CodingAgentTransport | null>(null);
   const workflowContinuationRef = useRef<{ token: string; request: string } | null>(null);
   const workflowExecutionInProgressRef = useRef(false);
+  const workflowAbortControllerRef = useRef<AbortController | null>(null);
   const repairRequestInProgressRef = useRef(false);
   const autoRepairActionRef = useRef('');
   const applyProposalRef = useRef<(targetProposal?: CodingProposal | null) => Promise<void>>(async () => {});
@@ -388,7 +426,77 @@ export function useCodingAgentController({
         && !proposalIds.has(activityEvent.proposalId || '')) return;
       setActivity((previous) => upsertCodingActivity(previous, activityEvent));
     });
-    return () => unsubscribe?.();
+    const unsubscribeApproval = window.electronAPI?.onDeveloperWorkflowApprovalPending?.((approval) => {
+      if (!approval
+        || typeof approval.approvalRequestId !== 'string'
+        || typeof approval.proposalId !== 'string'
+        || !/^[a-f0-9]{64}$/i.test(approval.proposalDigest)
+        || typeof approval.diff !== 'string'
+        || !Array.isArray(approval.fileOperations)) return;
+      const parsedFiles = parseUnifiedDiff(approval.diff);
+      const files = parsedFiles.length > 0
+        ? parsedFiles
+        : approval.fileOperations.map((operation) => ({
+            path: operation.path,
+            sourcePath: operation.sourcePath || undefined,
+            operation: isDeveloperDiffOperation(operation.operation) ? operation.operation : 'modify',
+            lines: [],
+          }));
+      const requestId = activeWorkflowRequestRef.current || approval.workflowRequestId;
+      setDeleteConfirmed(false);
+      setProposal({
+        id: approval.proposalId,
+        proposalId: approval.proposalId,
+        proposalDigest: approval.proposalDigest,
+        debugTrace: approval.envelope?.debugTrace || {
+          stage: 'AWAITING_INLINE_APPROVAL',
+          verificationStatus: 'NOT_STARTED',
+        },
+        workflowApproval: {
+          requestId: approval.approvalRequestId,
+          proposalDigest: approval.proposalDigest,
+          deleteConfirmationRequired: approval.deleteConfirmationRequired === true,
+        },
+        requestId,
+        state: 'awaiting_approval',
+        lifecycleState: 'AWAITING_APPROVAL',
+        files,
+        raw: approval.diff,
+        searchedFiles: approval.fileOperations.map((operation) => operation.path),
+        snapshots: [],
+      });
+      setActivity((previous) => upsertCodingActivity(previous, {
+        id: `workflow-approval:${approval.approvalRequestId}`,
+        executionId: requestId,
+        phase: 'approve',
+        message: `Proposal ready for inline review · ${approval.fileOperations.length} file operation(s).`,
+      }));
+      setMessages((previous) => previous.map((message) => message.requestId === requestId
+        ? {
+            ...message,
+            content: `The proposal is ready for your review. No files have been written.\n\nProposal digest: ${approval.proposalDigest}`,
+            streaming: false,
+          }
+        : message));
+      setBusy(false);
+      setStreaming(false);
+      setErrorMessage('');
+      setStatusMessage('Review the exact proposal below. Approve to apply and verify, or reject to leave the workspace unchanged.');
+    });
+    const unsubscribeApprovalTransition = window.electronAPI?.onDeveloperInlineApprovalTransition?.(({ proposalId, snapshot }) => {
+      setProposal((current) => current && current.id === proposalId
+        ? {
+            ...current,
+            debugTrace: snapshot,
+            lifecycleState: snapshot.stage,
+          }
+        : current);
+    });
+    return () => {
+      unsubscribe?.();
+      unsubscribeApproval?.();
+      unsubscribeApprovalTransition?.();
+    };
   }, [proposal?.id, proposal?.proposalId]);
 
   const onError = useCallback((message: string) => {
@@ -605,6 +713,53 @@ export function useCodingAgentController({
     setConversationStates((previous) => upsertCodingConversationState(previous, sessionState));
   }, [appliedPatchLog, conversationId, lastProvider, messages, projectRoot, proposal]);
 
+  const updateExecutionSettings = (next: Partial<CodingExecutionSettings>) => {
+    const updated = { ...executionSettings, ...next };
+    if (!writeCodingExecutionSettings(updated)) {
+      onError('Coding execution settings could not be saved because browser storage is unavailable or full.');
+      return;
+    }
+    setExecutionSettings(updated);
+  };
+
+  const synchronizeBrokerProject = async () => {
+    if (!projectRoot) {
+      setBrokerStatus('unavailable');
+      onError('Select and attach a workspace before synchronizing the trusted broker.');
+      return;
+    }
+    setBrokerStatus('syncing');
+    try {
+      let attached: { status?: string };
+      if (window.electronAPI?.attachDeveloperProject) {
+        attached = await window.electronAPI.attachDeveloperProject(projectRoot);
+      } else {
+        const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectRoot }),
+        });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          throw new Error(typeof payload?.detail === 'string' ? payload.detail : `Project sync returned HTTP ${response.status}.`);
+        }
+        attached = await response.json();
+      }
+      if (attached.status !== 'PROJECT_ATTACHED') throw new Error('The workspace is not attached.');
+      const discovery = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/broker`);
+      if (!discovery.ok) {
+        const payload = await discovery.json().catch(() => ({}));
+        const detail = payload?.detail;
+        throw new Error(typeof detail?.message === 'string' ? detail.message : typeof detail === 'string' ? detail : `Broker discovery returned HTTP ${discovery.status}.`);
+      }
+      setBrokerStatus('ready');
+      onStatus('The attached workspace is synchronized with the trusted broker.');
+    } catch (error) {
+      setBrokerStatus('unavailable');
+      onError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
   const sendMessage = async (
     overrideQuestion?: string,
     repairAttempt = 0,
@@ -727,6 +882,15 @@ export function useCodingAgentController({
 
 
     const classification = classifyCodingRequestIntent(question);
+    const requiresBrowserBrokerWorkflow = !window.electronAPI?.executeDeveloperWorkflow
+      && shouldRequireDeveloperWorkflowForAttachedProject({
+        intent: classification.intent,
+        requestText: question,
+        hasAttachedProject: Boolean(currentProjectRoot),
+        hasDeveloperWorkflowBridge: false,
+        isResumingProviderTask: Boolean(resumeProviderTask),
+        hasRepairContext: Boolean(repairContext),
+      });
     let implementationHandoffRequestId: string | null = null;
     let implementationHandoffPlan: WorkflowHandoffPlan | null = null;
 
@@ -747,7 +911,7 @@ export function useCodingAgentController({
     if (!resumeProviderTask
       && !repairContext
       && (continuationToken || classification.intent === 'AUTONOMOUS_WORKFLOW_TASK')
-      && window.electronAPI?.executeDeveloperWorkflow) {
+      && (window.electronAPI?.executeDeveloperWorkflow || requiresBrowserBrokerWorkflow)) {
       if (workflowExecutionInProgressRef.current) return;
       workflowExecutionInProgressRef.current = true;
       if (!continuationToken) {
@@ -761,6 +925,8 @@ export function useCodingAgentController({
       setInput('');
       activeActivityExecutionRef.current = requestId;
       activeWorkflowRequestRef.current = requestId;
+      const workflowAbortController = new AbortController();
+      workflowAbortControllerRef.current = workflowAbortController;
       setStreaming(true);
       setBusy(true);
 
@@ -772,13 +938,129 @@ export function useCodingAgentController({
           message: 'Starting the authorized autonomous coding workflow.',
         }));
 
-        const result = await window.electronAPI.executeDeveloperWorkflow({
-          userRequest: question,
-          scope: currentScope,
-          workflowRequestId: requestId,
-          continuationToken,
-          autoRepairEnabled: autoRepairChoice,
-          maxRepairAttempts: 2,
+        const result = window.electronAPI?.executeDeveloperWorkflow
+          && executionSettings.executionMode === 'inline_review'
+          ? await window.electronAPI.executeDeveloperWorkflow({
+            userRequest: question,
+            scope: currentScope,
+            workflowRequestId: requestId,
+            continuationToken,
+            autoRepairEnabled: autoRepairChoice,
+            maxRepairAttempts: 2,
+          })
+          : await executeTrustedBrokerWorkflow(
+            question,
+            currentScope,
+            workflowAbortController.signal,
+            (approval: TrustedBrokerPendingApproval, actions: TrustedBrokerApprovalActions, snapshot?: NonNullable<TrustedBrokerPendingApproval['transitions']>[number]) => {
+              if (snapshot) {
+                setProposal((current) => current && current.proposalId === approval.proposalId
+                  ? { ...current, debugTrace: snapshot, lifecycleState: snapshot.stage }
+                  : current);
+                return;
+              }
+              const operations = approval.fileOperations;
+              browserBrokerApprovalRef.current = {
+                taskId: approval.taskId,
+                proposalId: approval.proposalId,
+                proposalDigest: approval.proposalDigest,
+                actions,
+              };
+              setDeleteConfirmed(false);
+              setProposal({
+                id: approval.taskId,
+                proposalId: approval.proposalId,
+                proposalDigest: approval.proposalDigest,
+                debugTrace: approval.envelope?.debugTrace || {
+                  stage: 'AWAITING_INLINE_APPROVAL',
+                  verificationStatus: 'NOT_STARTED',
+                },
+                browserBroker: true,
+                deleteConfirmationRequired: approval.deleteConfirmationRequired,
+                requestId,
+                state: 'awaiting_approval',
+                lifecycleState: 'AWAITING_APPROVAL',
+                files: operations.map((operation) => ({
+                  path: operation.path,
+                  sourcePath: operation.sourcePath || undefined,
+                  operation: isDeveloperDiffOperation(operation.operation)
+                    ? operation.operation
+                    : 'modify',
+                  lines: (operation.content || '').split(/\r?\n/).map((line) => (
+                    operation.operation === 'delete' || operation.operation === 'delete_directory'
+                      ? `-${line}`
+                      : `+${line}`
+                  )),
+                })),
+                raw: approval.diff,
+                searchedFiles: [],
+                snapshots: [],
+                verification: null,
+                outcome: null,
+                error: null,
+              });
+              setActivity((previous) => upsertCodingActivity(previous, {
+                event: 'activity_event',
+                activityId: `${approval.taskId}:browser-approval`,
+                executionId: requestId,
+                taskId: approval.taskId,
+                proposalId: approval.proposalId,
+                action: { tool: 'proposal_create', target: 'browser proposal review' },
+                activityType: 'PROPOSAL',
+                status: 'COMPLETED',
+                result: {
+                  executionStatus: 'AWAITING_APPROVAL',
+                  paths: operations.map((operation) => operation.path),
+                  executed: false,
+                },
+                timestamp: new Date().toISOString(),
+              }));
+              setMessages((previous) => previous.map((message) => message.requestId === requestId
+                ? {
+                    ...message,
+                    content: `Proposal ${approval.proposalId} is ready for review. No files have been written.\n\nProposal digest: ${approval.proposalDigest}`,
+                    streaming: false,
+                  }
+                : message));
+              setBusy(false);
+              setStreaming(false);
+              onStatus('Review the exact broker proposal and approve it to apply and verify, or reject it to leave the workspace unchanged.');
+            },
+            {
+              projectRoot: currentProjectRoot,
+              executionMode: executionSettings.executionMode,
+              autoAuthorizeAttachedProject: executionSettings.autoAuthorizeAttachedProject,
+            },
+          );
+
+        browserBrokerApprovalRef.current = null;
+        setProposal((current) => {
+          if (!current?.browserBroker || current.requestId !== requestId) return current;
+          const rejected = result.outcome === 'APPROVAL_REJECTED' || result.outcome === 'CANCELLED';
+          return {
+            ...current,
+            state: rejected ? 'cancelled' : result.outcome === 'SUCCESS' ? 'completed' : 'failed',
+            lifecycleState: rejected ? 'CANCELLED' : result.outcome === 'SUCCESS' ? 'COMPLETED' : 'FAILED',
+            verification: result.outcome === 'SUCCESS'
+              ? { status: result.codeVerified === true ? 'PASS' : 'NOT_ESTABLISHED' }
+              : current.verification,
+            outcome: result.outcome,
+            error: result.outcome === 'SUCCESS' || rejected ? null : String(result.error || result.message || result.outcome),
+          };
+        });
+        setProposal((current) => {
+          if (!current?.workflowApproval || current.requestId !== requestId) return current;
+          const rejected = ['APPROVAL_REJECTED', 'CANCELLED'].includes(result.outcome);
+          return {
+            ...current,
+            state: rejected ? 'cancelled' : result.outcome === 'SUCCESS' ? 'completed' : 'failed',
+            lifecycleState: rejected ? 'CANCELLED' : result.outcome === 'SUCCESS' ? 'COMPLETED' : 'FAILED',
+            verification: result.outcome === 'SUCCESS'
+              ? { status: result.codeVerified === true ? 'PASS' : 'NOT_ESTABLISHED' }
+              : current.verification,
+            outcome: result.outcome,
+            error: result.outcome === 'SUCCESS' || rejected ? null : String(result.error || result.message || result.outcome),
+          };
         });
 
         let outcomeContent = '';
@@ -885,10 +1167,32 @@ export function useCodingAgentController({
         return;
       } finally {
         if (activeWorkflowRequestRef.current === requestId) activeWorkflowRequestRef.current = null;
+        if (workflowAbortControllerRef.current === workflowAbortController) {
+          workflowAbortControllerRef.current = null;
+        }
         workflowExecutionInProgressRef.current = false;
         setBusy(false);
         setStreaming(false);
       }
+    }
+
+    if (shouldRequireDeveloperWorkflowForAttachedProject({
+      intent: classification.intent,
+      requestText: question,
+      hasAttachedProject: Boolean(currentProjectRoot),
+      hasDeveloperWorkflowBridge: typeof window.electronAPI?.executeDeveloperWorkflow === 'function',
+      isResumingProviderTask: Boolean(resumeProviderTask),
+      hasRepairContext: Boolean(repairContext),
+    })) {
+      const message = 'This actionable request is attached to a project, but this browser session cannot run the approved file-materialization workflow. Open the project in the AI Help Agent desktop app to create and verify files. No files were changed.';
+      setMessages((previous) => [
+        ...previous,
+        { role: 'user', content: question },
+        { role: 'assistant', content: message, streaming: false, requestId: crypto.randomUUID() },
+      ]);
+      setInput('');
+      onStatus('Project changes require the desktop Developer workflow; no provider chat was started.');
+      return;
     }
 
     const requestId = implementationHandoffRequestId || crypto.randomUUID();
@@ -1577,6 +1881,57 @@ export function useCodingAgentController({
   };
 
   const approveProposal = async () => {
+    if (proposal?.workflowApproval) {
+      if (!window.electronAPI?.decideDeveloperWorkflowApproval) return;
+      const requiresDeleteConfirmation = proposal.workflowApproval.deleteConfirmationRequired;
+      if (requiresDeleteConfirmation && !deleteConfirmed) return;
+      setBusy(true);
+      setProposal((current) => current && current.id === proposal.id
+        ? { ...current, state: 'applying', lifecycleState: 'APPLYING' }
+        : current);
+      try {
+        await window.electronAPI.decideDeveloperWorkflowApproval({
+          approvalRequestId: proposal.workflowApproval.requestId,
+          proposalId: proposal.proposalId || proposal.id || '',
+          proposalDigest: proposal.workflowApproval.proposalDigest,
+          approved: true,
+          deleteConfirmed,
+        });
+        onStatus('Inline approval recorded; applying the exact proposal and running verification.');
+      } catch (error) {
+        setBusy(false);
+        setProposal((current) => current && current.id === proposal.id
+          ? { ...current, state: 'awaiting_approval', lifecycleState: 'AWAITING_APPROVAL' }
+          : current);
+        onError(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    if (proposal?.browserBroker) {
+      const pendingApproval = browserBrokerApprovalRef.current;
+      if (!pendingApproval
+        || pendingApproval.taskId !== proposal.id
+        || pendingApproval.proposalId !== proposal.proposalId
+        || pendingApproval.proposalDigest !== proposal.proposalDigest) return;
+      const requiresDeleteConfirmation = proposal.deleteConfirmationRequired || proposal.files.some((file) => (
+        file.operation === 'delete' || file.operation === 'delete_directory'
+      ));
+      if (requiresDeleteConfirmation && !deleteConfirmed) return;
+      setBusy(true);
+      setProposal((current) => current && current.id === proposal.id ? { ...current, state: 'applying', lifecycleState: 'APPLYING' } : current);
+      try {
+        await pendingApproval.actions.approve(requiresDeleteConfirmation);
+        onStatus('Browser approval recorded by the trusted broker; applying and verifying the approved proposal.');
+      } catch (error) {
+        setProposal((current) => current && current.id === proposal.id
+          ? { ...current, state: 'awaiting_approval', lifecycleState: 'AWAITING_APPROVAL' }
+          : current);
+        onError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     if (!proposal?.id || !window.electronAPI) return;
     const proposalId = proposal.id;
     const executionId = proposal.requestId || proposalId;
@@ -1626,6 +1981,51 @@ export function useCodingAgentController({
   };
 
   const rejectProposal = async () => {
+    if (proposal?.workflowApproval) {
+      if (!window.electronAPI?.decideDeveloperWorkflowApproval) return;
+      setBusy(true);
+      setProposal((current) => current && current.id === proposal.id
+        ? { ...current, state: 'cancelled', lifecycleState: 'CANCELLED' }
+        : current);
+      try {
+        await window.electronAPI.decideDeveloperWorkflowApproval({
+          approvalRequestId: proposal.workflowApproval.requestId,
+          proposalId: proposal.proposalId || proposal.id || '',
+          proposalDigest: proposal.workflowApproval.proposalDigest,
+          approved: false,
+          deleteConfirmed: false,
+        });
+        onStatus('Proposal rejected; no project files were written.');
+      } catch (error) {
+        setBusy(false);
+        setProposal((current) => current && current.id === proposal.id
+          ? { ...current, state: 'awaiting_approval', lifecycleState: 'AWAITING_APPROVAL' }
+          : current);
+        onError(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    if (proposal?.browserBroker) {
+      const pendingApproval = browserBrokerApprovalRef.current;
+      if (!pendingApproval
+        || pendingApproval.taskId !== proposal.id
+        || pendingApproval.proposalId !== proposal.proposalId
+        || pendingApproval.proposalDigest !== proposal.proposalDigest) return;
+      setBusy(true);
+      try {
+        await pendingApproval.actions.reject();
+        browserBrokerApprovalRef.current = null;
+        setProposal((current) => current && current.id === proposal.id
+          ? { ...current, state: 'cancelled', lifecycleState: 'CANCELLED' }
+          : current);
+        onStatus('Proposal rejected; the broker will leave the workspace unchanged.');
+      } catch (error) {
+        onError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     if (!proposal?.id || !window.electronAPI) return;
     const proposalId = proposal.id;
     const executionId = proposal.requestId || proposalId;
@@ -1825,6 +2225,12 @@ export function useCodingAgentController({
   };
 
   const cancelActiveRequest = () => {
+    const workflowAbortController = workflowAbortControllerRef.current;
+    if (workflowAbortController && !window.electronAPI?.executeDeveloperWorkflow) {
+      workflowAbortController.abort();
+      onStatus('Cancellation requested for the browser desktop-broker workflow.');
+      return;
+    }
     const workflowRequestId = activeWorkflowRequestRef.current;
     if (workflowRequestId && window.electronAPI?.cancelDeveloperWorkflow) {
       void window.electronAPI.cancelDeveloperWorkflow(workflowRequestId).then((accepted) => {
@@ -1988,10 +2394,13 @@ export function useCodingAgentController({
   return {
     workspace: {
       messages, input, projectRoot, projectStatus: projectLifecycleState, projectCandidates,
+      executionSettings, brokerStatus,
+      onExecutionSettingsChange: updateExecutionSettings,
+      onSynchronizeBroker: () => void synchronizeBrokerProject(),
       onSelectCandidate: (candidate: string) => void attachProjectByPath(candidate),
       onAttachProjectByPath: (targetPath: string) => void attachProjectByPath(targetPath),
       directory, path, filePath, fileContent, searchQuery, searchResults,
-      proposal, autoRepairChoice, activity, busy, streaming, errorMessage, statusMessage, taskStatus,
+      proposal, autoRepairChoice, deleteConfirmed, activity, busy, streaming, errorMessage, statusMessage, taskStatus,
       workflowCanResume,
       providerRecovery,
       onResumeProviderTask: continueAfterProviderRecovery,
@@ -2004,6 +2413,7 @@ export function useCodingAgentController({
       onClearProject: () => void clearProject(), onListDirectory: () => void listDirectory(),
       onReadFile: (requestedPath?: string) => void readFile(requestedPath), onSearch: () => void searchCode(),
       onApproveProposal: () => void approveProposal(), onAutoRepairChange: setAutoRepairChoice,
+      onDeleteConfirmationChange: setDeleteConfirmed,
       onRejectProposal: () => void rejectProposal(),
       onApplyProposal: () => void applyProposal(), onUndoProposal: () => void undoProposal(),
       onRequestRepair: requestVerificationRepair,

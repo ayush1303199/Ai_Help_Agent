@@ -616,6 +616,44 @@ npm run test:developer-gates
 npm run test:developer-lifecycle
 ```
 
+Run the isolated Electron Coding Agent workflow checks:
+
+```bash
+npm run test:electron-e2e
+npm run test:electron-e2e-cancel
+npm run test:electron-broker-e2e
+npm run test:electron-broker-e2e-cancel
+```
+
+Each command starts a separate Electron process with its own temporary user
+data, empty project workspace, backend, Vite server, and loopback-only ports;
+it does not attach to an already-running desktop instance. The default scenario
+uses a test-only adapter to approve one validated proposal, while the cancel
+scenario cancels through the preload bridge before apply. Both use an
+unconfigured provider, do not execute generated project code, and remove only
+the temporary root created by the harness. These checks verify Electron and
+the real renderer/preload/IPC workflow, not live-provider behavior.
+
+Browser-only Coding Agent project creation uses a dynamically assigned
+loopback broker started by Electron. Electron registers only opaque project
+handles and root hashes; the browser discovers the registered handle through
+the authenticated backend, receives a short-lived lease, and must obtain the
+native desktop approval for the exact proposal before the existing Developer
+Agent applies and verifies files. The browser never submits a trusted
+filesystem path or an approval flag. Run the broker contract and backend
+discovery checks with:
+
+```bash
+npm run test:trusted-broker
+```
+
+These broker threat tests use a deterministic test delegate and do not make a
+provider request. The Electron workflow commands above remain the
+real-renderer/preload/IPC integration checks. The broker Electron scenarios
+exercise the browser-fetch transport and actual broker-to-Developer-Agent
+materialization path with the same isolated workspace and test-only approval
+adapter.
+
 Run the General Agent checks:
 
 ```bash

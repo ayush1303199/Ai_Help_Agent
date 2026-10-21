@@ -180,11 +180,11 @@ try {
   const proposalApplyHandler = mainSource.indexOf("ipcMain.handle('developer:proposal-apply'");
   const devServerHandler = mainSource.indexOf("ipcMain.handle('developer:dev-server-manage'");
   assert.ok(toolHandler >= 0
-    && mainSource.indexOf('developerFiles.runVerification(script, event.sender.id)', toolHandler) > toolHandler);
+    && mainSource.indexOf('terminalRunner.runCheck(script, event.sender.id)', toolHandler) > toolHandler);
   assert.ok(directVerificationHandler >= 0
-    && mainSource.indexOf('developerFiles.runVerification(script, event.sender.id)', directVerificationHandler) > directVerificationHandler);
+    && mainSource.indexOf('terminalRunner.runCheck(script, event.sender.id)', directVerificationHandler) > directVerificationHandler);
   assert.ok(proposalApplyHandler >= 0
-    && mainSource.indexOf('runCheck: (script) => developerFiles.runVerification', proposalApplyHandler) > proposalApplyHandler);
+    && mainSource.indexOf('runCheck: (script) => terminalRunner.runCheck', proposalApplyHandler) > proposalApplyHandler);
   assert.ok(devServerHandler >= 0
     && mainSource.indexOf('developerAgent.manageDevServer', devServerHandler) > devServerHandler);
 

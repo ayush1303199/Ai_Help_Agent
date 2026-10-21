@@ -18,11 +18,31 @@ const importMetaEnv: Record<string, string | undefined> = (
     : {}
 );
 
+const configuredServices = {
+  ...defaults.services,
+  http: {
+    ...defaults.services.http,
+    baseUrl: configuredUrl(importMetaEnv.VITE_API_URL, defaults.services.http.baseUrl),
+  },
+  websocket: {
+    ...defaults.services.websocket,
+    baseUrl: configuredUrl(importMetaEnv.VITE_WS_URL, defaults.services.websocket.baseUrl),
+  },
+  codingWebsocket: {
+    ...defaults.services.codingWebsocket,
+    baseUrl: configuredUrl(importMetaEnv.VITE_CODING_WS_URL, defaults.services.codingWebsocket.baseUrl),
+  },
+  devServer: {
+    ...defaults.services.devServer,
+    port: configuredNumber(importMetaEnv.VITE_DEV_SERVER_PORT, defaults.services.devServer.port),
+  },
+};
+
 export const runtimeConfig = {
-  httpUrl: configuredUrl(importMetaEnv.VITE_API_URL, defaults.services.http.baseUrl),
-  wsUrl: configuredUrl(importMetaEnv.VITE_WS_URL, defaults.services.websocket.baseUrl),
-  codingWsUrl: configuredUrl(importMetaEnv.VITE_CODING_WS_URL, defaults.services.codingWebsocket.baseUrl),
-  services: defaults.services,
+  httpUrl: configuredServices.http.baseUrl,
+  wsUrl: configuredServices.websocket.baseUrl,
+  codingWsUrl: configuredServices.codingWebsocket.baseUrl,
+  services: configuredServices,
   limits: {
     maxChatHistoryMessages: configuredNumber(importMetaEnv.VITE_MAX_CHAT_HISTORY_MESSAGES, defaults.client.limits.maxChatHistoryMessages),
     maxChatMessageChars: configuredNumber(importMetaEnv.VITE_MAX_CHAT_MESSAGE_CHARS, defaults.client.limits.maxChatMessageChars),

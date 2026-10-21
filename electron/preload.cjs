@@ -87,11 +87,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
   applyDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-apply', id),
   executeDeveloperWorkflow: (payload) => ipcRenderer.invoke('developer:workflow-execute', payload),
   cancelDeveloperWorkflow: (requestId) => ipcRenderer.invoke('developer:workflow-cancel', requestId),
+  decideDeveloperWorkflowApproval: (decision) => ipcRenderer.invoke('developer:workflow-approval-decision', decision),
   onDeveloperActivity: (callback) => {
     if (typeof callback !== 'function') return () => {};
     const listener = (_event, activity) => callback(activity);
     ipcRenderer.on('developer:activity', listener);
     return () => ipcRenderer.removeListener('developer:activity', listener);
+  },
+  onDeveloperWorkflowApprovalPending: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, approval) => callback(approval);
+    ipcRenderer.on('developer:workflow-approval-pending', listener);
+    return () => ipcRenderer.removeListener('developer:workflow-approval-pending', listener);
+  },
+  onDeveloperInlineApprovalTransition: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, transition) => callback(transition);
+    ipcRenderer.on('developer:inline-approval-transition', listener);
+    return () => ipcRenderer.removeListener('developer:inline-approval-transition', listener);
   },
   undoDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-undo', id),
   getDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-get', id),
