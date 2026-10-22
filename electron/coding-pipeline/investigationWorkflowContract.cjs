@@ -1348,8 +1348,16 @@ function analyzeTaskRequirements(userRequest) {
     'No regressions in surrounding modules',
   ];
 
+  const hasConcreteCreationDirective = /\b(?:build|create|implement|scaffold|generate|add|update|modify)\b[^.!?\r\n]{0,160}\b(?:feature|endpoint|route|api|model|schema|page|component|form|service|application|project|system|module)\b/i.test(text);
+  const startsWithDiagnosticInquiry = /^\s*(?:(?:please\s+)?(?:investigate|diagnose|debug|audit|trace|explain)\b|why\b|how\b|what\s+(?:happened|caused|is\s+wrong)\b|find\s+(?:the\s+)?(?:cause|root\s+cause)\b)/i.test(text);
+  const isCompositeActionList = /^\s*(?:implement|complete|handle)\s*:/i.test(text)
+    && (text.match(/^\s*[-*]\s+\S.+$/gm) || []).length >= 3;
+  const isActionableCreationRequest = hasConcreteCreationDirective
+    && !startsWithDiagnosticInquiry
+    && !isCompositeActionList;
   const isBugFix = /\b(?:fix|repair|patch|debug|bug|issue|defect|error|trace|fail|failing|failed|broken)\b/i.test(text);
-  const isModular = !isBugFix && /\b(?:modular|clean\s+architecture|full-?stack|fullstack|multi-layer|separate\s+files?|build\s+(?:a\s+)?complete|scaffold|setup\s+project|create\s+project|new\s+feature|add\s+feature)\b/i.test(text);
+  const isModular = isActionableCreationRequest
+    || (!isBugFix && /\b(?:modular|clean\s+architecture|full-?stack|fullstack|multi-layer|separate\s+files?|build\s+(?:a\s+)?complete|scaffold|setup\s+project|create\s+project|new\s+feature|add\s+feature)\b/i.test(text));
 
   return {
     explicitRequirements,
@@ -1369,6 +1377,7 @@ function analyzeTaskRequirements(userRequest) {
     clarificationPrompt: null,
     inventedAssumptions: false,
     isModular,
+    isActionableCreationRequest,
   };
 }
 
@@ -2117,6 +2126,8 @@ function buildWorkflowReceipt({
   approvedProposal = null,
   appliedDiffScope = null,
   verificationReport = null,
+  integrationVerification = null,
+  hermeticVerification = null,
   worktreeIntegrity = null,
   rolledBack = false,
 }) {
@@ -2147,9 +2158,68 @@ function buildWorkflowReceipt({
       status: verificationReport.status || (verificationReport.ok ? 'PASSED' : 'FAILED'),
       ok: Boolean(verificationReport.ok),
       executed: Boolean(verificationReport.executed),
+      verificationMode: verificationReport.verificationMode || 'UNKNOWN',
       exitCode: Number.isInteger(verificationReport.exitCode) ? verificationReport.exitCode : null,
       verificationEvidence: Array.isArray(verificationReport.verificationEvidence) ? verificationReport.verificationEvidence : [],
       failureDiagnostics: verificationReport.failureDiagnostics || null,
+      hostExecution: verificationReport.hostExecution && typeof verificationReport.hostExecution === 'object'
+        ? {
+            status: String(verificationReport.hostExecution.status || 'UNKNOWN'),
+            reason: verificationReport.hostExecution.reason || null,
+          }
+        : null,
+      integrationVerification: integrationVerification ? {
+        status: integrationVerification.isValid !== true
+          ? 'INCOMPLETE'
+          : integrationVerification.verificationModes?.includes('LIVE_PROBE')
+            ? integrationVerification.verificationModes.includes('STATIC_WIRING')
+              ? 'STATIC_AND_LIVE_VERIFIED'
+              : 'LIVE_REACHABILITY_VERIFIED'
+            : integrationVerification.verificationModes?.includes('STATIC_WIRING')
+              ? 'STATIC_WIRING_VERIFIED'
+              : 'NOT_REQUIRED',
+        liveProbePerformed: integrationVerification.verificationModes?.includes('LIVE_PROBE') === true,
+        verificationModes: Array.isArray(integrationVerification.verificationModes)
+          ? [...integrationVerification.verificationModes]
+          : [],
+        routeMounts: Array.isArray(integrationVerification.routeMounts)
+          ? integrationVerification.routeMounts.map((route) => ({
+              method: route.method,
+              path: route.path,
+              verificationType: route.verificationType,
+              status: route.status,
+            }))
+          : [],
+        rejectionReason: integrationVerification.rejectionReason || null,
+        hermeticVerification: integrationVerification.hermeticVerification
+          ? {
+              status: integrationVerification.hermeticVerification.status || 'UNKNOWN',
+              passed: Number(integrationVerification.hermeticVerification.passed) || 0,
+              total: Number(integrationVerification.hermeticVerification.total) || 0,
+              gates: Array.isArray(integrationVerification.hermeticVerification.gates)
+                ? integrationVerification.hermeticVerification.gates.map((gate) => ({
+                    id: String(gate.id || 'UNKNOWN'),
+                    passed: gate.passed === true,
+                    evidence: gate.evidence ?? null,
+                  }))
+                : [],
+            }
+          : null,
+      } : null,
+      hermeticVerification: hermeticVerification
+        ? {
+            status: hermeticVerification.status || 'UNKNOWN',
+            passed: Number(hermeticVerification.passed) || 0,
+            total: Number(hermeticVerification.total) || 0,
+            gates: Array.isArray(hermeticVerification.gates)
+              ? hermeticVerification.gates.map((gate) => ({
+                  id: String(gate.id || 'UNKNOWN'),
+                  passed: gate.passed === true,
+                  evidence: gate.evidence ?? null,
+                }))
+              : [],
+          }
+        : null,
     } : null,
     worktreeIntegrity: worktreeIntegrity ? {
       preserved: worktreeIntegrity.preserved !== false,

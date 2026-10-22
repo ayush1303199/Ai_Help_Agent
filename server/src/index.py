@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus, urlparse
 
 from dotenv import load_dotenv
@@ -88,7 +88,12 @@ _logger = logging.getLogger(__name__)
 CODING_AUTH_TOKEN = os.getenv("AI_CODING_AUTH_TOKEN") or secrets.token_urlsafe(32)
 CODING_MUTATION_HANDSHAKE_SECRET = os.getenv("AI_CODING_MUTATION_HANDSHAKE_SECRET") or ""
 _trusted_desktop_broker_lock = threading.RLock()
-_trusted_desktop_broker_state: Dict[str, Any] = {"endpoint": None, "projects": [], "sessions": {}}
+_trusted_desktop_broker_state: Dict[str, Any] = {
+    "endpoint": None,
+    "projects": [],
+    "sessions": {},
+    "browserSessions": {},
+}
 _renderer_host = str((SERVICES.get("devServer") or {}).get("host") or "127.0.0.1")
 _renderer_port = int((SERVICES.get("devServer") or {}).get("port") or 3000)
 TRUSTED_RENDERER_ORIGINS = {
@@ -111,7 +116,13 @@ app.add_middleware(
     allow_origins=sorted(TRUSTED_RENDERER_ORIGINS),
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["Content-Type", "X-Coding-Auth", "X-Coding-Browser-Access"],
+    allow_headers=[
+        "Content-Type",
+        "X-Coding-Auth",
+        "X-Coding-Browser-Access",
+        "X-Coding-Browser-Session",
+        "X-Coding-Mutation-Proof",
+    ],
 )
 
 
@@ -1123,17 +1134,107 @@ def _is_coding_sensitive(rel_path: str) -> bool:
     return False
 
 
+def _browser_session_identity(request: Request) -> str:
+    origin = request.headers.get("origin")
+    client_host = request.client.host if request.client else ""
+    browser_session_id = request.headers.get("x-coding-browser-session", "").strip()
+    if (
+        client_host not in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
+        or origin not in TRUSTED_RENDERER_ORIGINS
+        or not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            browser_session_id,
+            re.I,
+        )
+    ):
+        raise HTTPException(status_code=403, detail="The local Coding browser session is invalid.")
+    return browser_session_id
+
+
+def _bind_browser_session_to_root(
+    request: Request,
+    root_hash: str,
+    *,
+    project_root: Optional[str] = None,
+    allow_rebind: bool = False,
+) -> Optional[str]:
+    browser_session_id = request.headers.get("x-coding-browser-session", "").strip()
+    if not browser_session_id:
+        return None
+    _browser_session_identity(request)
+    with _trusted_desktop_broker_lock:
+        sessions = _trusted_desktop_broker_state.setdefault("browserSessions", {})
+        existing = sessions.get(browser_session_id)
+        bound_root_hash = existing.get("rootHash") if isinstance(existing, dict) else existing
+        if bound_root_hash and not hmac.compare_digest(bound_root_hash, root_hash) and not allow_rebind:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "BROKER_BROWSER_SESSION_MISMATCH",
+                    "message": "This browser session is bound to a different attached workspace.",
+                },
+            )
+        sessions[browser_session_id] = {
+            "rootHash": root_hash,
+            "projectRoot": project_root or (
+                existing.get("projectRoot") if isinstance(existing, dict) else None
+            ),
+        }
+    return browser_session_id
+
+
 @app.get("/api/coding/project-state")
-def get_coding_project_state_endpoint() -> Dict[str, Any]:
-    return get_backend_project_state()
+def get_coding_project_state_endpoint(request: Request) -> Dict[str, Any]:
+    if request.headers.get("origin") in TRUSTED_RENDERER_ORIGINS:
+        browser_session_id = _browser_session_identity(request)
+        with _trusted_desktop_broker_lock:
+            browser_sessions = _trusted_desktop_broker_state.get("browserSessions")
+            session = (
+                browser_sessions.get(browser_session_id)
+                if isinstance(browser_sessions, dict)
+                else None
+            )
+        if not isinstance(session, dict) or not session.get("projectRoot"):
+            return {"projectRoot": None, "status": "PROJECT_NOT_ATTACHED", "attached": False}
+        root = session["projectRoot"]
+        root_hash = _canonical_project_root_hash(root)
+        try:
+            is_directory = Path(root).is_dir()
+        except OSError:
+            is_directory = False
+        is_registered = bool(_registered_projects_for_root(root_hash))
+        if not is_directory:
+            return {"projectRoot": None, "status": "PROJECT_MISSING", "attached": False}
+        if not is_registered or not hmac.compare_digest(session.get("rootHash", ""), root_hash):
+            return {"projectRoot": None, "status": "PROJECT_NOT_ATTACHED", "attached": False}
+        return {
+            "projectRoot": root,
+            "status": "PROJECT_ATTACHED",
+            "attached": True,
+        }
+    state = get_backend_project_state()
+    return state
 
 
 @app.get("/api/coding/acceptance-preflight")
-def get_coding_acceptance_preflight() -> Dict[str, Any]:
+def get_coding_acceptance_preflight(request: Request) -> Dict[str, Any]:
     """Read readiness state without running project commands or changing files."""
     import sys
 
-    project_state = get_backend_project_state()
+    broker_project_bound = False
+    if request.headers.get("origin") in TRUSTED_RENDERER_ORIGINS:
+        try:
+            _, browser_binding = _browser_project_binding(request)
+            broker_project_bound = True
+            project_state = {
+                "status": "PROJECT_ATTACHED",
+                "projectRoot": browser_binding["projectRoot"],
+                "attached": True,
+            }
+        except HTTPException:
+            project_state = {"status": "PROJECT_NOT_ATTACHED", "projectRoot": None, "attached": False}
+    else:
+        project_state = get_backend_project_state()
     active_provider = registry.get_active_provider()
     provider_configured = bool(
         active_provider
@@ -1202,7 +1303,7 @@ def get_coding_acceptance_preflight() -> Dict[str, Any]:
         "projectAttached": project_attached,
         "projectStatus": project_state.get("status", "PROJECT_STATUS_UNAVAILABLE"),
         "projectRoot": project_state.get("projectRoot"),
-        "projectIdentity": "NOT_VERIFIED",
+        "projectIdentity": "BROKER_VERIFIED" if broker_project_bound else "NOT_VERIFIED",
         "canInspectProject": project_attached,
         "sandbox": {
             "available": False,
@@ -1217,7 +1318,9 @@ def get_coding_acceptance_preflight() -> Dict[str, Any]:
 
 
 @app.post("/api/coding/project-state")
-def set_coding_project_state_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
+def set_coding_project_state_endpoint(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    if not hmac.compare_digest(request.headers.get("x-coding-auth", ""), CODING_AUTH_TOKEN):
+        raise HTTPException(status_code=403, detail="Only the trusted local application may change backend project state.")
     project_root = payload.get("projectRoot")
     return set_backend_project_state(str(project_root) if project_root else None)
 
@@ -1294,19 +1397,59 @@ async def attach_coding_project_endpoint(payload: Dict[str, Any], request: Reque
     p = Path(project_root)
     if not p.is_dir():
         raise HTTPException(status_code=400, detail="projectRoot does not exist or is not a directory.")
-    res = set_backend_project_state(str(p.resolve()))
-    try:
-        UNIVERSAL_INDEX.scan_and_update(str(p.resolve()), max_files=200)
-    except Exception:
-        pass
+    canonical_root = str(p.resolve())
     origin = request.headers.get("origin")
     if origin in TRUSTED_RENDERER_ORIGINS:
+        _browser_session_identity(request)
         await _synchronize_trusted_desktop_broker(origin)
-    return res
+        root_hash = _canonical_project_root_hash(canonical_root)
+        with _trusted_desktop_broker_lock:
+            endpoint = _trusted_desktop_broker_state.get("endpoint")
+            registered = list(_trusted_desktop_broker_state.get("projects", []))
+        if not endpoint:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "BROKER_UNAVAILABLE",
+                    "message": "The trusted desktop broker is not running. Select the workspace in the trusted desktop app before using browser mode.",
+                },
+            )
+        if not any(
+            isinstance(item, dict) and hmac.compare_digest(item.get("rootHash", ""), root_hash)
+            for item in registered
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "BROKER_PROJECT_UNAUTHORIZED",
+                    "message": "This workspace has not been authorized by the trusted desktop app. A browser-supplied path cannot authorize workspace access.",
+                },
+            )
+        _bind_browser_session_to_root(
+            request,
+            root_hash,
+            project_root=canonical_root,
+            allow_rebind=True,
+        )
+        return {
+            "projectRoot": canonical_root,
+            "status": "PROJECT_ATTACHED",
+            "attached": True,
+        }
+    if not hmac.compare_digest(request.headers.get("x-coding-auth", ""), CODING_AUTH_TOKEN):
+        raise HTTPException(status_code=403, detail="Only the trusted local application may attach backend project state.")
+    return set_backend_project_state(canonical_root)
 
 
 @app.post("/api/coding/project-clear")
-def clear_coding_project_endpoint() -> Dict[str, Any]:
+def clear_coding_project_endpoint(request: Request) -> Dict[str, Any]:
+    if request.headers.get("origin") in TRUSTED_RENDERER_ORIGINS:
+        browser_session_id = _browser_session_identity(request)
+        with _trusted_desktop_broker_lock:
+            _trusted_desktop_broker_state.setdefault("browserSessions", {}).pop(browser_session_id, None)
+        return {"projectRoot": None, "status": "PROJECT_DETACHED", "attached": False}
+    if not hmac.compare_digest(request.headers.get("x-coding-auth", ""), CODING_AUTH_TOKEN):
+        raise HTTPException(status_code=403, detail="Only the trusted local application may clear backend project state.")
     return set_backend_project_state(None)
 
 
@@ -1315,6 +1458,98 @@ def _canonical_project_root_hash(project_root: str) -> str:
     if os.name == "nt":
         canonical = canonical.lower()
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _registered_projects_for_root(root_hash: str) -> List[Dict[str, str]]:
+    with _trusted_desktop_broker_lock:
+        return [
+            {"projectId": item["projectId"], "rootHash": item["rootHash"]}
+            for item in _trusted_desktop_broker_state.get("projects", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("projectId"), str)
+            and isinstance(item.get("rootHash"), str)
+            and hmac.compare_digest(item["rootHash"], root_hash)
+        ]
+
+
+def _browser_project_binding(request: Request) -> Tuple[str, Dict[str, Any]]:
+    browser_session_id = _browser_session_identity(request)
+    with _trusted_desktop_broker_lock:
+        session = _trusted_desktop_broker_state.setdefault("browserSessions", {}).get(browser_session_id)
+    if not isinstance(session, dict) or not isinstance(session.get("projectRoot"), str):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "BROKER_PROJECT_UNAUTHORIZED",
+                "message": "This browser session has no workspace authorized by the trusted desktop app.",
+            },
+        )
+    root = session["projectRoot"]
+    root_hash = _canonical_project_root_hash(root)
+    if not hmac.compare_digest(str(session.get("rootHash") or ""), root_hash):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "BROKER_PROJECT_UNAUTHORIZED", "message": "The browser workspace authorization is stale."},
+        )
+    try:
+        if not Path(root).is_dir():
+            raise OSError("not a directory")
+    except OSError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "BROKER_PROJECT_UNAUTHORIZED", "message": "The authorized workspace is no longer accessible."},
+        ) from error
+    projects = _registered_projects_for_root(root_hash)
+    if not projects:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "BROKER_PROJECT_UNAUTHORIZED",
+                "message": "The trusted desktop app no longer authorizes this workspace.",
+            },
+        )
+    return browser_session_id, {
+        "projectRoot": root,
+        "rootHash": root_hash,
+        "projects": projects,
+    }
+
+
+async def _check_trusted_broker_health(endpoint: str, origin: str) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0), follow_redirects=False) as client:
+            response = await client.get(
+                f"{endpoint}/v1/health",
+                headers={"Origin": origin},
+            )
+    except httpx.RequestError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "BROKER_UNAVAILABLE",
+                "message": "The trusted desktop broker is registered but cannot be reached.",
+            },
+        ) from error
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "BROKER_HEALTH_CHECK_FAILED",
+                "message": f"The trusted desktop broker health check returned HTTP {response.status_code}.",
+            },
+        )
+    try:
+        health = response.json()
+    except ValueError as error:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "BROKER_HEALTH_INVALID", "message": "The trusted broker returned an invalid health response."},
+        ) from error
+    if not isinstance(health, dict) or health.get("ready") is not True:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "BROKER_UNAVAILABLE", "message": "The trusted desktop broker is not ready."},
+        )
 
 
 async def _synchronize_trusted_desktop_broker(origin: str) -> None:
@@ -1393,32 +1628,19 @@ async def get_trusted_desktop_broker(request: Request) -> Dict[str, Any]:
     if not is_loopback or origin not in TRUSTED_RENDERER_ORIGINS:
         raise HTTPException(status_code=403, detail="Trusted desktop broker discovery is available only to the configured local renderer.")
     await _synchronize_trusted_desktop_broker(origin)
-    state = get_backend_project_state()
-    if state.get("status") != "PROJECT_ATTACHED" or not state.get("projectRoot"):
-        raise HTTPException(status_code=409, detail="Attach the authorized project before requesting broker access.")
-    active_root_hash = _canonical_project_root_hash(state["projectRoot"])
+    _, binding = _browser_project_binding(request)
     with _trusted_desktop_broker_lock:
-        projects = [
-            {"projectId": item["projectId"]}
-            for item in _trusted_desktop_broker_state.get("projects", [])
-            if hmac.compare_digest(item["rootHash"], active_root_hash)
-        ]
         endpoint = _trusted_desktop_broker_state.get("endpoint")
-    if not endpoint or not projects:
-        code = "BROKER_UNAVAILABLE" if not endpoint else "BROKER_PROJECT_NOT_REGISTERED"
-        message = (
-            "No trusted desktop broker is registered with the coding backend."
-            if not endpoint
-            else "The attached workspace has not yet synchronized with the trusted desktop broker."
-        )
+    if not endpoint:
         raise HTTPException(
             status_code=503,
             detail={
-                "code": code,
-                "message": message,
+                "code": "BROKER_UNAVAILABLE",
+                "message": "No trusted desktop broker is registered with the coding backend.",
             },
         )
-    return {"projects": projects}
+    await _check_trusted_broker_health(endpoint, origin)
+    return {"projects": [{"projectId": item["projectId"]} for item in binding["projects"]]}
 
 
 async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResponse:
@@ -1451,10 +1673,8 @@ async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResp
         raise HTTPException(status_code=400, detail="Broker request must be a JSON object.")
 
     await _synchronize_trusted_desktop_broker(origin)
-    state = get_backend_project_state()
-    if state.get("status") != "PROJECT_ATTACHED" or not state.get("projectRoot"):
-        raise HTTPException(status_code=409, detail="Attach the authorized project before requesting broker access.")
-    active_root_hash = _canonical_project_root_hash(state["projectRoot"])
+    browser_session_id, binding = _browser_project_binding(request)
+    active_root_hash = binding["rootHash"]
     with _trusted_desktop_broker_lock:
         endpoint = _trusted_desktop_broker_state.get("endpoint")
         registered = list(_trusted_desktop_broker_state.get("projects", []))
@@ -1465,7 +1685,9 @@ async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResp
                 sessions.pop(session_id, None)
         active_projects = {
             item["projectId"]: item for item in registered
-            if hmac.compare_digest(item["rootHash"], active_root_hash)
+            if isinstance(item, dict)
+            and isinstance(item.get("rootHash"), str)
+            and hmac.compare_digest(item["rootHash"], active_root_hash)
         }
     if not endpoint:
         raise HTTPException(
@@ -1501,6 +1723,14 @@ async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResp
             raise HTTPException(
                 status_code=403,
                 detail={"code": "BROKER_SESSION_UNAUTHORIZED", "message": "The broker session is unknown or expired."},
+            )
+        if session.get("browserSessionId") != browser_session_id:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "BROKER_BROWSER_SESSION_MISMATCH",
+                    "message": "The broker lease belongs to a different local browser session.",
+                },
             )
         project_id = session["projectId"]
         if route in {"workflows", "approval", "approval_decision"} and project_id not in active_projects:
@@ -1558,7 +1788,11 @@ async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResp
         except ValueError as error:
             raise HTTPException(status_code=502, detail="The trusted desktop broker issued an invalid lease expiration.") from error
         with _trusted_desktop_broker_lock:
-            sessions[session_id] = {"projectId": project_id, "expiresAt": expiration}
+            sessions[session_id] = {
+                "projectId": project_id,
+                "expiresAt": expiration,
+                "browserSessionId": browser_session_id,
+            }
     elif route == "release" and upstream.status_code == 200:
         with _trusted_desktop_broker_lock:
             sessions.pop(payload.get("brokerSessionId"), None)
@@ -1685,7 +1919,15 @@ def _find_projects_by_signatures(
 
 
 @app.post("/api/coding/project-discover")
-def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
+def discover_coding_project_endpoint(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    if request.headers.get("origin") in TRUSTED_RENDERER_ORIGINS:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "TRUSTED_PROJECT_SELECTION_REQUIRED",
+                "message": "Browser folder discovery cannot authorize a workspace. Select the folder in the trusted desktop app, then attach its registered workspace in the browser.",
+            },
+        )
     import tempfile
     name = str(payload.get("name") or "").strip()
     path_hint = str(payload.get("path") or "").strip()
@@ -1717,7 +1959,6 @@ def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
         p = Path(path_hint)
         if p.is_dir():
             canonical = str(p.resolve())
-            set_backend_project_state(canonical)
             return {"matches": [canonical], "projectRoot": canonical, "status": "PROJECT_ATTACHED"}
 
     target_name = name.lower()
@@ -1858,18 +2099,29 @@ def discover_coding_project_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     matches = [m[2] for m in scored_matches]
     project_root = _select_unambiguous_project_candidate(scored_matches)
 
-    if project_root:
-        set_backend_project_state(project_root)
     status = "PROJECT_ATTACHED" if project_root else ("MULTIPLE_MATCHES" if len(matches) > 1 else "NO_MATCH")
     return {"matches": matches[:10], "projectRoot": project_root, "status": status}
 
 
 @app.get("/api/coding/directory")
-def list_coding_directory_endpoint(path: str = ".", scope: str = ".") -> List[Dict[str, str]]:
-    return _list_coding_directory(path, scope)
+def list_coding_directory_endpoint(request: Request, path: str = ".", scope: str = ".") -> List[Dict[str, Any]]:
+    root = _resolve_coding_project_root(request=request)
+    return _list_coding_directory(path, scope, str(root))
 
 
-def _resolve_coding_project_root(project_root: Optional[str] = None) -> Path:
+def _resolve_coding_project_root(
+    project_root: Optional[str] = None,
+    request: Optional[Request] = None,
+) -> Path:
+    if request and request.headers.get("origin") in TRUSTED_RENDERER_ORIGINS:
+        _, binding = _browser_project_binding(request)
+        authorized_root = binding["projectRoot"]
+        if project_root and _canonical_project_root_hash(project_root) != binding["rootHash"]:
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "BROKER_PROJECT_UNAUTHORIZED", "message": "The requested project differs from this browser session's authorized workspace."},
+            )
+        project_root = authorized_root
     if project_root is None:
         state = get_backend_project_state()
         project_root = state.get("projectRoot") if state.get("attached") else None
@@ -1900,7 +2152,7 @@ def _list_coding_directory(
     path: str = ".",
     scope: str = ".",
     project_root: Optional[str] = None,
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     root = _resolve_coding_project_root(project_root)
     clean = path.replace("\\", "/").strip().lstrip("./")
     target = (root / clean).resolve() if clean else root
@@ -1916,19 +2168,28 @@ def _list_coding_directory(
     for item in target.iterdir():
         if item.name.lower() in CODING_IGNORED_NAMES or _is_coding_sensitive(item.name):
             continue
-        entries.append({"name": item.name, "type": "directory" if item.is_dir() else "file"})
+        is_directory = item.is_dir()
+        entry: Dict[str, Any] = {"name": item.name, "type": "directory" if is_directory else "file"}
+        if not is_directory:
+            try:
+                entry["size"] = item.stat().st_size
+            except OSError as error:
+                raise HTTPException(status_code=400, detail=f"Unable to inspect workspace entry: {item.name}") from error
+        entries.append(entry)
     entries.sort(key=lambda x: (x["type"] != "directory", x["name"].lower()))
     return entries
 
 
 @app.get("/api/coding/list-directory")
-def list_coding_directory_get_endpoint(path: str = ".", scope: str = ".") -> List[Dict[str, str]]:
-    return _list_coding_directory(path, scope)
+def list_coding_directory_get_endpoint(request: Request, path: str = ".", scope: str = ".") -> List[Dict[str, Any]]:
+    root = _resolve_coding_project_root(request=request)
+    return _list_coding_directory(path, scope, str(root))
 
 
 @app.get("/api/coding/read-file")
-def read_coding_file_endpoint(path: str, scope: str = ".") -> Dict[str, Any]:
-    return _read_coding_file(path, scope)
+def read_coding_file_endpoint(request: Request, path: str, scope: str = ".") -> Dict[str, Any]:
+    root = _resolve_coding_project_root(request=request)
+    return _read_coding_file(path, scope, str(root))
 
 
 def _read_coding_file(
@@ -2023,8 +2284,9 @@ def _read_coding_file(
 
 
 @app.get("/api/coding/search-code")
-def search_coding_code_endpoint(query: str, scope: str = ".") -> Dict[str, Any]:
-    return _search_coding_code(query, scope)
+def search_coding_code_endpoint(request: Request, query: str, scope: str = ".") -> Dict[str, Any]:
+    root = _resolve_coding_project_root(request=request)
+    return _search_coding_code(query, scope, str(root))
 
 
 CODING_SEARCH_MAX_FILES = 2000
@@ -2246,8 +2508,8 @@ def _search_coding_code(
 
 
 @app.get("/api/coding/search-symbols")
-def search_coding_symbols_endpoint(query: str, limit: int = 15) -> Dict[str, Any]:
-    root = _resolve_coding_project_root()
+def search_coding_symbols_endpoint(request: Request, query: str, limit: int = 15) -> Dict[str, Any]:
+    root = _resolve_coding_project_root(request=request)
     syms = UNIVERSAL_INDEX.search_symbols(query, limit=limit, project_root=str(root))
     return {"query": query, "symbols": SecretProtector.redact_data(syms)}
 

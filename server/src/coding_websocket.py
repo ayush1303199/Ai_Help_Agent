@@ -2869,12 +2869,69 @@ def detect_evidence_contradictions(session_data: Dict[str, Any]) -> List[Dict[st
 
 CODING_TASK_STORE = TaskSessionStore()
 
+_backend_project_state_path = Path(
+    os.getenv(
+        "AI_CODING_PROJECT_STATE_PATH",
+        Path.home() / ".ai-help-agent" / "coding-project-state.json",
+    )
+)
 
 _active_backend_project: Dict[str, Any] = {
     "projectRoot": None,
     "status": "PROJECT_NOT_ATTACHED",
     "updatedAt": 0,
 }
+
+
+def _restore_backend_project_state() -> None:
+    try:
+        stored = json.loads(_backend_project_state_path.read_text(encoding="utf-8"))
+        if not isinstance(stored, dict) or stored.get("authorizationSource") != "trusted_local_application":
+            return
+        root = stored.get("projectRoot")
+        if not isinstance(root, str) or not root.strip():
+            return
+        _active_backend_project["projectRoot"] = root
+        _active_backend_project["updatedAt"] = float(stored.get("updatedAt") or 0)
+        try:
+            project_stat = os.stat(root)
+        except OSError as error:
+            _active_backend_project["status"] = (
+                "PROJECT_MISSING"
+                if error.errno in {errno.ENOENT, errno.ENOTDIR}
+                else "PROJECT_INACCESSIBLE"
+            )
+        else:
+            _active_backend_project["status"] = (
+                "PROJECT_ATTACHED" if stat.S_ISDIR(project_stat.st_mode) else "PROJECT_MISSING"
+            )
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+        logger.warning("Persisted Coding project state could not be restored: %s", type(error).__name__)
+
+
+def _persist_backend_project_state() -> None:
+    try:
+        _backend_project_state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = _backend_project_state_path.with_name(
+            f"{_backend_project_state_path.name}.{os.getpid()}.tmp"
+        )
+        temporary_path.write_text(
+            json.dumps({
+                "projectRoot": _active_backend_project.get("projectRoot"),
+                "updatedAt": _active_backend_project.get("updatedAt", 0),
+                "authorizationSource": "trusted_local_application",
+            }),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, _backend_project_state_path)
+    except OSError as error:
+        logger.warning("Coding project state could not be persisted: %s", type(error).__name__)
+
+
+_restore_backend_project_state()
+
 _active_coding_request_contexts: Dict[str, Dict[str, Any]] = {}
 _active_coding_request_contexts_lock = threading.RLock()
 
@@ -2963,6 +3020,13 @@ def set_backend_project_state(project_root: Any) -> Dict[str, Any]:
         _active_backend_project["projectRoot"] = None
         _active_backend_project["status"] = "PROJECT_DETACHED"
     _active_backend_project["updatedAt"] = time.time()
+    if _active_backend_project.get("projectRoot"):
+        _persist_backend_project_state()
+    else:
+        try:
+            _backend_project_state_path.unlink(missing_ok=True)
+        except OSError as error:
+            logger.warning("Cleared Coding project state could not be removed: %s", type(error).__name__)
     return get_backend_project_state()
 
 

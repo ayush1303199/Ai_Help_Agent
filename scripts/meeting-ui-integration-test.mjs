@@ -4,20 +4,57 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { JSDOM } from 'jsdom';
 import { createServer } from 'vite';
 
-const vite = await createServer({
-  appType: 'custom',
-  logLevel: 'error',
-  server: { middlewareMode: true },
-});
+const ssrEntryPoints = [
+  '/src/features/meeting/MeetingAssistantWorkspace.tsx',
+  '/src/ui/AnswerSessionView.tsx',
+  '/src/ui/answerMarkdown.tsx',
+  '/src/features/history/ChatHistoryModal.tsx',
+  '/src/history/historyService.ts',
+];
+let vite;
+
+async function waitForSsrReadiness(server) {
+  const warmup = Promise.all(ssrEntryPoints.map(async (url) => {
+    const result = await server.environments.ssr.transformRequest(url);
+    if (!result) throw new Error(`Vite SSR warm-up returned no transform for ${url}.`);
+  }));
+  let timeout;
+  try {
+    await Promise.race([
+      warmup,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('Vite SSR warm-up did not finish within 180 seconds.')), 180_000);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 try {
+  vite = await createServer({
+    appType: 'custom',
+    logLevel: 'error',
+    server: {
+      host: '127.0.0.1',
+      port: 0,
+      strictPort: false,
+      middlewareMode: true,
+      hmr: false,
+      watch: { ignored: ['**'] },
+      warmup: { ssrFiles: ssrEntryPoints.map((url) => url.slice(1)) },
+    },
+  });
+  await waitForSsrReadiness(vite);
+
   const { MeetingAssistantWorkspace } = await vite.ssrLoadModule(
-    '/src/features/meeting/MeetingAssistantWorkspace.tsx',
+    ssrEntryPoints[0],
   );
-  const { AnswerSessionView } = await vite.ssrLoadModule('/src/ui/AnswerSessionView.tsx');
-  const { renderAnswerMarkdown } = await vite.ssrLoadModule('/src/ui/answerMarkdown.tsx');
-  const { ChatHistoryModal } = await vite.ssrLoadModule('/src/features/history/ChatHistoryModal.tsx');
-  const { pruneHistorySessions, readHistory } = await vite.ssrLoadModule('/src/history/historyService.ts');
+  const { AnswerSessionView } = await vite.ssrLoadModule(ssrEntryPoints[1]);
+  const { renderAnswerMarkdown } = await vite.ssrLoadModule(ssrEntryPoints[2]);
+  const { ChatHistoryModal } = await vite.ssrLoadModule(ssrEntryPoints[3]);
+  const { pruneHistorySessions, readHistory } = await vite.ssrLoadModule(ssrEntryPoints[4]);
   const previousLocalStorage = globalThis.localStorage;
   const storedValues = new Map([
     ['chat-history', '[]'],
@@ -541,5 +578,5 @@ try {
 
   console.log('Meeting UI integration tests passed (rendering and click-driven capture, cancel, and history flows).');
 } finally {
-  await vite.close();
+  await vite?.close();
 }

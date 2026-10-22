@@ -33,6 +33,8 @@ export interface CodingActivityResult {
   evidenceIds?: string[];
   exitCode?: number | null;
   command?: string;
+  stdout?: string;
+  stderr?: string;
   executed?: boolean;
 }
 
@@ -69,6 +71,7 @@ export interface CodingActivityMessage {
   executionId: string;
   phase: string;
   message: string;
+  timestamp?: string;
   plan?: Record<string, unknown>;
 }
 
@@ -184,6 +187,8 @@ export function parseCodingActivityEvent(value: unknown): CodingActivityEvent | 
     if (evidenceIds) result.evidenceIds = evidenceIds;
     result.databaseType = boundedString(rawResult.databaseType, 80);
     result.executionStatus = boundedString(rawResult.executionStatus, 80);
+    result.stdout = boundedString(rawResult.stdout, 4000);
+    result.stderr = boundedString(rawResult.stderr, 4000);
     if (['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(String(rawResult.evidenceState))) {
       result.evidenceState = rawResult.evidenceState as CodingActivityResult['evidenceState'];
     }

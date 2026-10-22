@@ -12,6 +12,15 @@ const backendUrl = new URL(process.env.AI_HELP_AGENT_TEST_BACKEND_URL);
 assert.equal(backendUrl.hostname, '127.0.0.1', 'Integration tests require the isolated loopback backend.');
 assert.notEqual(backendUrl.port, '3001', 'Integration tests must not target the live backend port.');
 const backendBaseUrl = backendUrl.origin;
+const runtimeSettings = JSON.parse(
+  await fs.readFile(new URL('../src/config/runtimeSettings.json', import.meta.url), 'utf8'),
+);
+const trustedRendererOrigin = `http://127.0.0.1:${runtimeSettings.services.devServer.port}`;
+const appAuthHeaders = {
+  'Content-Type': 'application/json',
+  'X-Coding-Auth': process.env.AI_CODING_AUTH_TOKEN || '',
+};
+assert.ok(appAuthHeaders['X-Coding-Auth'], 'The isolated test app must receive its ephemeral backend token.');
 
 console.log('[TEST-MATRIX] Starting 10-point Verification Matrix for Coding Agent Project Attachment & Failure Elimination...');
 
@@ -53,22 +62,20 @@ try {
   console.log('  -> TEST 1 PASSED: Electron native picker attaches project.');
 
   // =========================================================================
-  // TEST 2: Browser Directory Picker & Discovery [INTEGRATION/E2E]
+  // TEST 2: Browser Directory Discovery Must Not Authorize a Workspace [SECURITY]
   // =========================================================================
   console.log('[TEST 2] Browser Directory Discovery Bridge (/api/coding/project-discover)...');
   const discoverRes = await fetch(`${backendBaseUrl}/api/coding/project-discover`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { ...appAuthHeaders, Origin: trustedRendererOrigin },
     body: JSON.stringify({
       name: 'sample-ecommerce',
       signatures: ['package.json', 'models', discoveryMarker],
     }),
   });
-  assert.equal(discoverRes.ok, true, 'project-discover endpoint must return HTTP 200');
-  const discoveryData = await discoverRes.json();
-  assert.equal(discoveryData.status, 'PROJECT_ATTACHED');
-  assert.equal(discoveryData.projectRoot.toLowerCase(), projectPath.toLowerCase());
-  console.log('  -> TEST 2 PASSED: Browser project discovery located and attached project.');
+  assert.equal(discoverRes.status, 403, 'Browser folder discovery must not authorize a workspace.');
+  assert.equal((await discoverRes.json()).detail.code, 'TRUSTED_PROJECT_SELECTION_REQUIRED');
+  console.log('  -> TEST 2 PASSED: Browser discovery cannot authorize a workspace.');
 
   // =========================================================================
   // TEST 3: Project Attachment Contract [INTEGRATION]
@@ -76,7 +83,7 @@ try {
   console.log('[TEST 3] Project Attachment Contract (/api/coding/project-attach & developerFiles.attachProject)...');
   const attachRes = await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: appAuthHeaders,
     body: JSON.stringify({ projectRoot: projectPath }),
   });
   assert.equal(attachRes.ok, true);
@@ -88,7 +95,7 @@ try {
   const electronAttach = await developerFiles.attachProject(projectPath, 102);
   assert.equal(electronAttach.status, 'PROJECT_ATTACHED');
   assert.equal(electronAttach.projectRoot.toLowerCase(), projectPath.toLowerCase());
-  console.log('  -> TEST 3 PASSED: Both HTTP and Electron attachment contracts satisfied.');
+  console.log('  -> TEST 3 PASSED: Trusted app and Electron attachment contracts satisfied.');
 
   // =========================================================================
   // TEST 4: Project State Synchronization [INTEGRATION/BUSINESS]
@@ -120,7 +127,10 @@ try {
   // TEST 6: Project Detach [INTEGRATION/BUSINESS]
   // =========================================================================
   console.log('[TEST 6] Project Detach & Refusal of Project Operations...');
-  const clearRes = await fetch(`${backendBaseUrl}/api/coding/project-clear`, { method: 'POST' });
+  const clearRes = await fetch(`${backendBaseUrl}/api/coding/project-clear`, {
+    method: 'POST',
+    headers: { 'X-Coding-Auth': appAuthHeaders['X-Coding-Auth'] },
+  });
   assert.equal(clearRes.ok, true);
   const clearedState = await clearRes.json();
   assert.equal(clearedState.status, 'PROJECT_DETACHED');
@@ -134,7 +144,7 @@ try {
   // Re-attach for subsequent tests
   await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: appAuthHeaders,
     body: JSON.stringify({ projectRoot: projectPath }),
   });
 
@@ -146,7 +156,7 @@ try {
   await fs.mkdir(missingDirPath, { recursive: true });
   await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: appAuthHeaders,
     body: JSON.stringify({ projectRoot: missingDirPath }),
   });
   // Delete the directory from disk
@@ -159,7 +169,7 @@ try {
   // Re-attach projectPath
   await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: appAuthHeaders,
     body: JSON.stringify({ projectRoot: projectPath }),
   });
 

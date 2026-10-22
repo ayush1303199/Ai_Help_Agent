@@ -163,7 +163,17 @@ const broker = new TrustedLocalDesktopBroker({
 
 try {
   const endpoint = await broker.start();
+  const health = await fetch(new URL('/v1/health', endpoint), {
+    headers: { Origin: origin },
+  });
+  assert.equal(health.status, 200);
+  assert.deepEqual(await health.json(), { ready: true });
   const registrationA = await broker.registerProject({ root: workspaceA, registrationOwnerId: 11001 });
+  assert.deepEqual(
+    await broker.registerProject({ root: workspaceA, registrationOwnerId: 11001 }),
+    registrationA,
+    'Synchronizing an unchanged project must preserve its opaque authorization identity.',
+  );
   const registrationB = await broker.registerProject({ root: workspaceB, registrationOwnerId: 11002 });
 
   const forgedProject = await post(endpoint, origin, '/v1/sessions', {

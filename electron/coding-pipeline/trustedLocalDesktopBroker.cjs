@@ -135,12 +135,16 @@ class TrustedLocalDesktopBroker {
       throw brokerError('BROKER_PROJECT_UNAUTHORIZED', 'Registered project root must be a directory.', 403);
     }
     const existing = this.projectsByOwner.get(registrationOwnerId);
+    const rootHash = hashProjectRoot(canonicalRoot);
+    if (existing && existing.rootHash === rootHash) {
+      return { projectId: existing.projectId, rootHash: existing.rootHash };
+    }
     if (existing) this.projects.delete(existing.projectId);
     const project = {
       projectId: crypto.randomUUID(),
       registrationOwnerId,
       root: canonicalRoot,
-      rootHash: hashProjectRoot(canonicalRoot),
+      rootHash,
     };
     this.projects.set(project.projectId, project);
     this.projectsByOwner.set(registrationOwnerId, project);
@@ -498,6 +502,7 @@ class TrustedLocalDesktopBroker {
     const pending = {
       proposalId: approval.proposalId,
       proposalDigest: approval.proposalDigest,
+      workflowRequestId: lease.workflowRequestId,
       envelope: approval.envelope,
       approvalNonce: approval.approvalNonce,
       taskId: approval.taskId,
@@ -532,6 +537,7 @@ class TrustedLocalDesktopBroker {
       taskId: pending.taskId,
       proposalId: pending.proposalId,
       proposalDigest: pending.proposalDigest,
+      workflowRequestId: pending.workflowRequestId,
       approvalNonce: pending.approvalNonce,
       deleteConfirmationRequired: pending.deleteConfirmationRequired,
       fileOperations: pending.fileOperations,
@@ -880,6 +886,10 @@ class TrustedLocalDesktopBroker {
       response.setHeader('Access-Control-Allow-Origin', new URL(origin).origin);
       response.setHeader('Vary', 'Origin');
       const url = new URL(request.url, this.endpoint);
+      if (request.method === 'GET' && url.pathname === '/v1/health') {
+        this.sendJson(response, 200, { ready: Boolean(this.server?.listening) });
+        return;
+      }
       if (request.method === 'POST' && url.pathname === '/v1/synchronize') {
         const body = await this.readJson(request);
         this.assertAllowedKeys(body, []);

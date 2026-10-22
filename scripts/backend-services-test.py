@@ -269,6 +269,18 @@ class ProviderSecretVaultTests(unittest.TestCase):
 class CodingAcceptancePreflightEndpointTests(unittest.TestCase):
     def test_browser_preflight_reports_live_prerequisites_without_enabling_execution(self):
         import index
+        from starlette.requests import Request
+
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/coding/acceptance-preflight",
+            "headers": [],
+            "client": ("127.0.0.1", 43210),
+            "server": ("127.0.0.1", 3001),
+            "scheme": "http",
+            "query_string": b"",
+        })
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             registry = ProviderRegistry(str(Path(temporary_directory) / "provider-config.json"))
@@ -276,7 +288,7 @@ class CodingAcceptancePreflightEndpointTests(unittest.TestCase):
                 index, "get_backend_project_state",
                 return_value={"status": "PROJECT_NOT_ATTACHED", "projectRoot": None},
             ):
-                missing = index.get_coding_acceptance_preflight()
+                missing = index.get_coding_acceptance_preflight(request)
 
             provider = registry.add_provider(
                 "groq",
@@ -288,7 +300,7 @@ class CodingAcceptancePreflightEndpointTests(unittest.TestCase):
                 index, "get_backend_project_state",
                 return_value={"status": "PROJECT_ATTACHED", "projectRoot": "C:\\dynamic-project"},
             ):
-                configured = index.get_coding_acceptance_preflight()
+                configured = index.get_coding_acceptance_preflight(request)
 
         self.assertIn("project_missing", {item["code"] for item in missing["blockers"]})
         self.assertFalse(missing["canRunProjectCommands"])
@@ -11934,7 +11946,6 @@ class CodingRequestAuthenticationTests(unittest.TestCase):
             authenticated = client.get(
                 "/api/coding/project-state",
                 headers={
-                    "Origin": trusted_origin,
                     "X-Coding-Auth": index.CODING_AUTH_TOKEN,
                 },
             )

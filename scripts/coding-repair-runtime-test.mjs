@@ -1,10 +1,27 @@
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { createElement, act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { flushSync } from 'react-dom';
 import { JSDOM } from 'jsdom';
 import { createServer } from 'vite';
+
+const workspaceSource = await readFile(new URL('../src/features/coding/CodingAgentWorkspace.tsx', import.meta.url), 'utf8');
+const explorerSource = await readFile(new URL('../src/features/coding/ProjectFileTreeExplorer.tsx', import.meta.url), 'utf8');
+const terminalSource = await readFile(new URL('../src/features/coding/WorkspaceTerminalPanel.tsx', import.meta.url), 'utf8');
+const terminalHookSource = await readFile(new URL('../src/features/coding/useWorkspaceTerminal.ts', import.meta.url), 'utf8');
+const workspaceApiSource = await readFile(new URL('../src/features/coding/workspaceProjectApi.ts', import.meta.url), 'utf8');
+assert.match(workspaceSource, /<ProjectFileTreeExplorer/);
+assert.match(workspaceSource, /<WorkspaceTerminalPanel/);
+assert.match(explorerSource, /loadWorkspaceFileTree/);
+assert.match(explorerSource, /Select a file to preview it/);
+assert.match(workspaceApiSource, /listWorkspaceDirectory/);
+assert.match(workspaceApiSource, /readWorkspaceFile/);
+for (const command of ['tree', 'cat', 'status', 'verify-routes', 'resync-broker', 'clear']) {
+  assert.ok(terminalHookSource.includes(`name === '${command}'`), `Safe terminal command ${command} should be supported.`);
+}
+assert.doesNotMatch(terminalHookSource, /child_process|execSync|spawnSync/);
 
 const projectRoot = 'C:\\repair-runtime-project';
 const original = 'console.log("original");\n';
@@ -32,11 +49,18 @@ globalThis.document = dom.window.document;
 globalThis.localStorage = dom.window.localStorage;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 Object.defineProperty(dom.window, 'crypto', { configurable: true, value: webcrypto });
+let brokerDiscoveryRequests = 0;
 globalThis.fetch = async (input, init) => {
   if (String(input).includes('/api/coding/project-attach')) {
+    assert.ok(new Headers(init.headers).get('X-Coding-Browser-Session'), 'Project attachment should carry a persistent browser session identity.');
     return Response.json({ status: 'PROJECT_ATTACHED', projectRoot });
   }
   if (String(input).includes('/api/coding/broker')) {
+    assert.ok(new Headers(init.headers).get('X-Coding-Browser-Session'), 'Broker discovery should carry the same browser session identity.');
+    brokerDiscoveryRequests += 1;
+    if (brokerDiscoveryRequests === 1) {
+      return Response.json({ projects: [{ projectId: '218be83a-441b-4fc9-93be-6224f1582f88' }] });
+    }
     return new Response(JSON.stringify({
       error: { code: 'BROKER_UNAVAILABLE', message: 'Trusted desktop broker is unavailable.' },
     }), {
@@ -54,6 +78,8 @@ const conversationUpdates = [];
 let applyCalls = 0;
 let conversationCount = 0;
 let initialProjectSync = false;
+let backendProjectAvailable = true;
+let reattachCalls = 0;
 let autoModeGranted = false;
 let nextDoneMessage = null;
 let proposalHandoffPlan = null;
@@ -109,7 +135,19 @@ globalThis.WebSocket = RuntimeWebSocket;
 dom.window.WebSocket = RuntimeWebSocket;
 
 window.electronAPI = {
-  getDeveloperProjectState: async () => ({ status: 'PROJECT_ATTACHED', projectRoot }),
+  getDeveloperProjectState: async () => backendProjectAvailable
+    ? ({ status: 'PROJECT_ATTACHED', projectRoot })
+    : ({ status: 'PROJECT_NOT_ATTACHED', projectRoot: null }),
+  attachDeveloperProject: async (rootPath) => {
+    assert.equal(rootPath, projectRoot);
+    reattachCalls += 1;
+    backendProjectAvailable = true;
+    return { status: 'PROJECT_ATTACHED', projectRoot };
+  },
+  clearDeveloperProject: async () => {
+    backendProjectAvailable = false;
+    return { status: 'PROJECT_DETACHED', projectRoot: null };
+  },
   listDeveloperDirectory: async () => {
     initialProjectSync = true;
     return [];
@@ -213,7 +251,28 @@ window.electronAPI = {
 };
 localStorage.setItem('ai_help_agent_coding_project_root', projectRoot);
 
-const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true } });
+const workspaceApiTransportId = '\0workspace-project-api-test-transport';
+const vite = await createServer({
+  appType: 'custom',
+  logLevel: 'error',
+  server: { middlewareMode: true },
+  plugins: [{
+    name: 'workspace-project-api-test-transport',
+    enforce: 'pre',
+    resolveId(source, importer) {
+      if (source === './codingTransport' && /[\\/]workspaceProjectApi\.ts$/.test(importer || '')) {
+        return workspaceApiTransportId;
+      }
+      return null;
+    },
+    load(id) {
+      if (id === workspaceApiTransportId) {
+        return 'export async function codingFetch() { throw new Error("HTTP fallback is not used in this Electron API test."); }';
+      }
+      return null;
+    },
+  }],
+});
 let root;
 let current;
 const waitForReact = async (predicate, message, timeoutMs = 500) => {
@@ -226,8 +285,75 @@ const waitForReact = async (predicate, message, timeoutMs = 500) => {
 };
 
 try {
+  const { loadWorkspaceFileTree, readWorkspaceFile } = await vite.ssrLoadModule(
+    '/src/features/coding/workspaceProjectApi.ts',
+  );
+  const savedListDirectory = window.electronAPI.listDeveloperDirectory;
+  const savedReadFile = window.electronAPI.readDeveloperFile;
+  const listing = {
+    '.': [{ name: 'src', type: 'directory' }],
+    src: [{ name: 'existing.ts', type: 'file', size: 12 }],
+  };
+  window.electronAPI.listDeveloperDirectory = async (relativePath = '.') => listing[relativePath] || [];
+  window.electronAPI.readDeveloperFile = async (relativePath) => ({ path: relativePath, content: 'preview content' });
+  const initialTree = await loadWorkspaceFileTree();
+  assert.deepEqual(initialTree.nodes[0].children.map((entry) => entry.path), ['src/existing.ts']);
+  listing.src.push({ name: 'created.ts', type: 'file', size: 8 });
+  const refreshedTree = await loadWorkspaceFileTree();
+  assert.deepEqual(refreshedTree.nodes[0].children.map((entry) => entry.path), ['src/existing.ts', 'src/created.ts']);
+  assert.deepEqual(await readWorkspaceFile('src/created.ts'), {
+    path: 'src/created.ts',
+    content: 'preview content',
+  });
+  const { useWorkspaceTerminal } = await vite.ssrLoadModule(
+    '/src/features/coding/useWorkspaceTerminal.ts',
+  );
+  let terminalState;
+  let brokerSyncCalls = 0;
+  const terminalRoot = createRoot(document.createElement('div'));
+  function TerminalHarness() {
+    terminalState = useWorkspaceTerminal({
+      activity: [{
+        event: 'activity_event',
+        activityId: 'static-verification',
+        executionId: 'workflow-1',
+        action: { tool: 'verify_routes' },
+        activityType: 'TOOL',
+        status: 'COMPLETED',
+        result: { executionStatus: 'STATIC_WIRING_VERIFIED', exitCode: 0, stdout: 'routes connected' },
+        timestamp: '2025-01-01T00:00:00.000Z',
+      }],
+      projectRoot,
+      projectStatus: 'PROJECT_ATTACHED',
+      brokerStatus: 'ready',
+      onSynchronizeBroker: async () => { brokerSyncCalls += 1; },
+    });
+    return null;
+  }
+  await act(async () => terminalRoot.render(createElement(TerminalHarness)));
+  assert.match(terminalState.entries[0].detail, /STATIC_WIRING_VERIFIED/);
+  assert.match(terminalState.entries[0].detail, /stdout:\nroutes connected/);
+  await act(async () => terminalState.runCommand('tree'));
+  assert.ok(terminalState.entries.some((entry) => entry.label === '[TREE]' && entry.detail.includes('src/created.ts')));
+  await act(async () => terminalState.runCommand('resync-broker'));
+  assert.equal(brokerSyncCalls, 1);
+  await act(async () => terminalState.runCommand('clear'));
+  assert.equal(terminalState.entries.length, 0);
+  await act(async () => terminalRoot.unmount());
+  window.electronAPI.listDeveloperDirectory = savedListDirectory;
+  window.electronAPI.readDeveloperFile = savedReadFile;
+
   const { useCodingAgentController } = await vite.ssrLoadModule(
     '/src/features/coding/useCodingAgentController.ts',
+  );
+  const { extractCodingProjectCandidates } = await vite.ssrLoadModule(
+    '/src/features/coding/useCodingAgentController.ts',
+  );
+  const keywordHeavyPrompt = 'Build a Router, Pending, Full-Stack, auto-calculated flow with try-catch, Next.js, Node.js, Express, MongoDB, and Tailwind.';
+  assert.deepEqual(
+    extractCodingProjectCandidates(keywordHeavyPrompt),
+    [],
+    'Technical terms in an actionable prompt must not be interpreted as project folder candidates.',
   );
   function Harness() {
     current = useCodingAgentController({
@@ -241,10 +367,13 @@ try {
   root = createRoot(document.getElementById('root'));
   act(() => flushSync(() => root.render(createElement(Harness))));
   await waitForReact(
-    () => initialProjectSync && current?.workspace?.projectRoot === projectRoot,
+    () => initialProjectSync && current?.workspace?.projectRoot === projectRoot
+      && current?.workspace?.brokerStatus === 'ready',
     'The attached project did not initialize.',
     5000,
   );
+  backendProjectAvailable = false;
+  reattachCalls = 0;
   const greenfieldPrompt = "Act as an expert Full-Stack Developer. Build a complete 'Add Order' feature using Next.js (App Router) for the frontend and Node.js with Express and MongoDB for the backend. Provide clean, modular code snippets.";
   await act(async () => {
     current.workspace.onInputChange(greenfieldPrompt);
@@ -257,6 +386,7 @@ try {
     'The unavailable browser broker was not surfaced to the user.',
     20000,
   );
+  assert.equal(reattachCalls, 1, 'The persisted project root must be re-attached before the first workflow after backend state loss.');
   assert.equal(providerRequests.length, 0, 'An attached project build request without the desktop bridge must not be sent as provider chat.');
   assert.match(
     current.workspace.messages.at(-1).content,
@@ -586,6 +716,20 @@ try {
     assert.equal(proposalRegistrations.length, 5);
   }
   console.log('Coding proposal fallback incomplete-state regressions passed.');
+
+  await act(async () => current.workspace.onClearProject());
+  await waitForReact(() => current.workspace.projectRoot === null, 'The explicit project clear did not clear the workspace.');
+  await act(async () => current.workspace.onInputChange(keywordHeavyPrompt));
+  await act(async () => current.workspace.onSendMessage());
+  await waitForReact(
+    () => current.workspace.messages.at(-1)?.content.includes('No trusted project folder is attached. Select the workspace in the trusted desktop app'),
+    'An unattached coding prompt should ask the user to select a trusted workspace instead of attempting keyword discovery.',
+  );
+  assert.equal(
+    localStorage.getItem('ai_help_agent_coding_project_root'),
+    null,
+    'Only an explicit project clear should remove the persisted workspace selection.',
+  );
 } finally {
   if (root) await act(async () => root.unmount());
   await vite.close();

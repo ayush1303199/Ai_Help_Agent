@@ -6,8 +6,12 @@ import developerFiles from '../electron/developerFiles.cjs';
 import {
   validateSafePath,
   isGreenfieldWorkspace,
+  isFullStackBuildRequest,
   discoverProjectConventions,
   deriveModularPlan,
+  repairHermeticCandidate,
+  verifyHermeticEngineeringGates,
+  verifyHermeticEngineeringGatesOnDisk,
   synthesizeMultiFilePatch,
   verifyIntegrationReachability,
 } from '../electron/coding-pipeline/modularArchitectureEngine.cjs';
@@ -140,6 +144,282 @@ try {
   console.log('[TEST 4 PASSED] Required integration points are updated and verified.');
 
   // =========================================================================
+  // TEST 4A: Creation Directives with Defensive Requirements Stay Actionable on Populated Workspaces
+  // =========================================================================
+  const populatedCreationDir = path.join(testRoot, 'populated-creation-app');
+  await fs.mkdir(path.join(populatedCreationDir, 'src'), { recursive: true });
+  await fs.writeFile(
+    path.join(populatedCreationDir, 'package.json'),
+    JSON.stringify({ name: 'populated-creation-app', version: '1.0.0' }),
+    'utf8',
+  );
+  await fs.writeFile(
+    path.join(populatedCreationDir, 'index.js'),
+    'const existingBehavior = true;\nmodule.exports = { existingBehavior };\n',
+    'utf8',
+  );
+  await fs.writeFile(path.join(populatedCreationDir, 'src', 'existing.js'), 'module.exports = 1;\n', 'utf8');
+  const populatedCreationSessionId = 'session-v12-populated-creation';
+  createSession(populatedCreationSessionId, ownerId);
+  let populatedCreationApprovalCount = 0;
+  const populatedCreationResult = await executeAutonomousCodingWorkflow({
+    userRequest: 'Act as an expert full-stack developer. Build a complete feature with a model, POST endpoint, and form component. Include proper error handling (try-catch, status codes 201, 400, 500) and success or error messages. Workspace resolution: UPDATE_AND_INTEGRATE.',
+    root: populatedCreationDir,
+    scope: '.',
+    sessionId: populatedCreationSessionId,
+    ownerWebContentsId: ownerId,
+    requestApproval: async () => {
+      populatedCreationApprovalCount += 1;
+      return true;
+    },
+  });
+  assert.notEqual(populatedCreationResult.outcome, 'INVESTIGATION_INCOMPLETE');
+  assert.equal(populatedCreationResult.outcome, 'SUCCESS');
+  assert.equal(populatedCreationResult.codeApplied, true);
+  assert.equal(populatedCreationApprovalCount, 1, 'The populated workspace creation must reach the approved proposal flow.');
+  assert.ok(populatedCreationResult.filesModified.length > 0, 'The creation request must apply an actionable proposal.');
+  console.log('[TEST 4A PASSED] Defensive error-handling language does not divert populated workspace creation into investigation.');
+
+  // =========================================================================
+  // TEST 4B: Dynamic full-stack requests upgrade only inspected placeholder modules
+  // =========================================================================
+  const populatedStubDir = path.join(testRoot, 'populated-stub-app');
+  const stubFiles = {
+    'package.json': JSON.stringify({ name: 'populated-stub-app', type: 'commonjs' }),
+    'index.js': 'const existingBehavior = true;\nmodule.exports = { existingBehavior };\n',
+    'server.js': '',
+    'models/subscriptionSchema.js': '// TODO: define subscription fields\n',
+    'controllers/subscriptionController.js': '// TODO: handle requests\n',
+    'routes/subscriptionRoutes.js': '// TODO: register routes\n',
+    'components/SubscriptionForm.jsx': 'export default function SubscriptionForm() { return null; }\n',
+    'pages/SubscriptionPage.jsx': 'export default function SubscriptionPage() { return null; }\n',
+  };
+  for (const [relative, content] of Object.entries(stubFiles)) {
+    const target = path.join(populatedStubDir, relative);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, content.replace(/\n/g, '\r\n'), 'utf8');
+  }
+  const populatedStubPlan = await deriveModularPlan(populatedStubDir, {
+    userRequest: `Build a complete full-stack subscription feature with a frontend form and backend API.
+Create a POST endpoint /api/subscriptions.
+Fields:
+- customerName: string (required)
+- items: [{ sku: string, quantity: number, unitPrice: number }]
+- totalAmount: number
+Create a page and form component with success and error messages.`,
+  });
+  assert.equal(populatedStubPlan.isGreenfield, false);
+  assert.ok(populatedStubPlan.workspaceInspection.inspectedFiles.includes('server.js'));
+  assert.ok(populatedStubPlan.modulesToCreate.some((module) => (
+    module.path === 'models/subscriptionSchema.js' && module.operation === 'modify'
+  )));
+  assert.ok(populatedStubPlan.modulesToCreate.some((module) => (
+    module.path === 'routes/subscriptionRoutes.js' && module.operation === 'modify'
+  )));
+  assert.ok(populatedStubPlan.modulesToCreate.some((module) => (
+    module.path === 'server.js' && module.operation === 'modify'
+  )));
+  assert.match(populatedStubPlan.modulesToCreate.find((module) => module.path === 'models/subscriptionSchema.js').content, /items\[item\] must be an object/);
+  const populatedStubPatch = await synthesizeMultiFilePatch(populatedStubDir, populatedStubPlan);
+  assert.ok(populatedStubPatch.filesList.filter((file) => file.operation === 'modify').length >= 6);
+  assert.ok(populatedStubPatch.expectedSnapshots.some((snapshot) => (
+    snapshot.path === 'server.js' && snapshot.exists === true
+  )));
+  assert.ok(populatedStubPatch.rawPatch.includes('--- a/server.js'));
+  const parsedPopulatedPatch = developerAgent.parsePatch(populatedStubPatch.rawPatch);
+  const emptyServerPatch = parsedPopulatedPatch.find((operation) => operation.path === 'server.js');
+  assert.ok(emptyServerPatch, 'An existing zero-byte server entrypoint should remain a modify operation.');
+  assert.match(
+    emptyServerPatch.lines[0],
+    /^@@ -0,0 \+\d+,\d+ @@$/,
+    'A zero-byte target must use a zero-line source hunk.',
+  );
+  for (const operation of parsedPopulatedPatch) {
+    const snapshot = populatedStubPatch.expectedSnapshots.find((item) => item.path === operation.path);
+    const expectedModule = populatedStubPlan.modulesToCreate.find((module) => module.path === operation.path);
+    assert.ok(snapshot, `${operation.path} must bind to its pre-proposal disk snapshot.`);
+    assert.equal(
+      snapshot.exists,
+      operation.operation !== 'create',
+      `${operation.path} must be classified against its exact pre-proposal disk snapshot.`,
+    );
+    const expectedContent = expectedModule?.content
+      ?? populatedStubPlan.integrationPoints.find((point) => point.targetFile === operation.path)?.patchedContent;
+    let expectedOnDisk = expectedContent.replace(/\r\n/g, '\n');
+    if (snapshot.exists && snapshot.content && !/(?:\r\n|\n)$/.test(snapshot.content)) {
+      expectedOnDisk = expectedOnDisk.replace(/\n$/, '');
+    }
+    assert.equal(
+      developerAgent.applyFilePatch(snapshot.content || '', operation.lines).replace(/\r\n/g, '\n'),
+      expectedOnDisk,
+      `${operation.path} full-file operation must apply against its exact CRLF snapshot.`,
+    );
+  }
+  const duplicatePlan = {
+    ...populatedStubPlan,
+    modulesToCreate: [
+      ...populatedStubPlan.modulesToCreate,
+      { ...populatedStubPlan.modulesToCreate[0] },
+    ],
+  };
+  const deduplicatedPatch = await synthesizeMultiFilePatch(populatedStubDir, duplicatePlan);
+  assert.equal(
+    deduplicatedPatch.filesList.filter((file) => file.path === populatedStubPlan.modulesToCreate[0].path).length,
+    1,
+    'Repeated module operations for one target should stage only one coherent write.',
+  );
+  console.log('[TEST 4B PASSED] Dynamic full-stack plans inspect and snapshot existing placeholder modules as modifications.');
+
+  const partialOrderDir = path.join(testRoot, 'partial-order-stub');
+  await fs.mkdir(path.join(partialOrderDir, 'utils'), { recursive: true });
+  await fs.mkdir(path.join(partialOrderDir, 'services'), { recursive: true });
+  await fs.writeFile(
+    path.join(partialOrderDir, 'server.js'),
+    "const { executeFeature } = require('./services/featureService');\n",
+    'utf8',
+  );
+  await fs.writeFile(path.join(partialOrderDir, 'utils', 'sharedUtils.js'), 'module.exports = {};\n', 'utf8');
+  await fs.writeFile(path.join(partialOrderDir, 'services', 'featureService.js'), 'module.exports = {};\n', 'utf8');
+  const partialOrderPrompt = `Act as an expert Full-Stack Developer. Build a complete 'Add Order' feature.
+Create an Order Model/Schema and a POST endpoint /api/orders.
+Fields:
+- customerName: string (required)
+- items: [{ itemName: string, quantity: number, price: number }]
+- totalPrice: number (auto calculated)
+- status: string (default: "Pending")
+- createdAt: date
+Create a Next.js App Router page and React form component with Tailwind CSS, dynamic item rows, and success/error messages.`;
+  assert.equal(isFullStackBuildRequest(partialOrderPrompt), true);
+  const partialOrderPlan = await deriveModularPlan(partialOrderDir, { userRequest: partialOrderPrompt });
+  const partialOrderFiles = partialOrderPlan.modulesToCreate.map((module) => module.path);
+  assert.equal(partialOrderPlan.blockedReason, undefined);
+  assert.equal(partialOrderPlan.modulesToCreate.find((module) => module.path === 'server.js')?.operation, 'modify');
+  for (const requiredPath of [
+    'package.json',
+    '.env.example',
+    'README.md',
+    'config/db.js',
+    'models/Order.js',
+    'controllers/orderController.js',
+    'routes/orders.js',
+    'components/OrderForm.jsx',
+    'app/orders/page.jsx',
+  ]) {
+    assert.ok(partialOrderFiles.includes(requiredPath), `Partial full-stack workspace must include ${requiredPath}.`);
+  }
+  assert.ok(!partialOrderFiles.includes('utils/sharedUtils.js'));
+  assert.ok(!partialOrderFiles.includes('services/featureService.js'));
+  repairHermeticCandidate(partialOrderPlan);
+  const partialOrderVerification = verifyHermeticEngineeringGates(partialOrderPlan);
+  assert.equal(partialOrderVerification.status, 'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED', JSON.stringify(partialOrderVerification));
+  assert.equal(partialOrderVerification.passed, 5);
+  const partialOrderPatch = await synthesizeMultiFilePatch(partialOrderDir, partialOrderPlan);
+  assert.ok(partialOrderPatch.filesList.some((file) => file.path === 'server.js' && file.operation === 'modify'));
+  assert.ok(partialOrderPatch.filesList.some((file) => file.path === 'models/Order.js' && file.operation === 'create'));
+  console.log('[TEST 4F PASSED] Partial generic scaffolds upgrade to a prompt-grounded full-stack module set and all five hermetic gates.');
+
+  const hermeticDir = path.join(testRoot, 'hermetic-full-stack');
+  await fs.mkdir(hermeticDir, { recursive: true });
+  const hermeticPlan = await deriveModularPlan(hermeticDir, {
+    userRequest: `Build a complete order feature with a frontend form and backend API.
+Create a POST endpoint /api/orders.
+Fields:
+- customerName: string (required)
+- items: [{ itemName: string, quantity: number, price: number }]
+- totalPrice: number
+- status: string (default "Pending")
+- createdAt: string
+Create a page and form component with loading, success and error messages.
+Return status codes 201, 400, and 500.`,
+  });
+  assert.deepEqual(await fs.readdir(hermeticDir), [], 'Planning and repair must not write workspace files before approval.');
+  repairHermeticCandidate(hermeticPlan);
+  const hermeticCandidate = verifyHermeticEngineeringGates(hermeticPlan);
+  assert.equal(hermeticCandidate.status, 'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED', JSON.stringify(hermeticCandidate));
+  assert.equal(hermeticCandidate.passed, 5);
+  for (const requiredFile of ['package.json', '.env.example', 'README.md']) {
+    assert.ok(hermeticPlan.modulesToCreate.some((module) => module.path === requiredFile), `${requiredFile} must be part of the proposal.`);
+  }
+  const controllerModule = hermeticPlan.modulesToCreate.find((module) => module.responsibility === 'CORE_BUSINESS_LOGIC');
+  controllerModule.content = controllerModule.content.replace('status: 400', 'status: 422');
+  const modelModule = hermeticPlan.modulesToCreate.find((module) => module.responsibility === 'DATA_MODEL');
+  modelModule.content = modelModule.content.replace('"customerName"', '"removedField"');
+  const packageModule = hermeticPlan.modulesToCreate.find((module) => module.path === 'package.json');
+  packageModule.content = packageModule.content
+    .replace('"start": "node server.js"', '"start": "node wrong.js"')
+    .replace('"dev": "node server.js"', '"dev": "node wrong.js"');
+  repairHermeticCandidate(hermeticPlan);
+  assert.equal(
+    verifyHermeticEngineeringGates(hermeticPlan).status,
+    'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED',
+    'Pre-proposal self-healing must restore missing field/status/run-script contracts before staging.',
+  );
+  const candidatePatch = await synthesizeMultiFilePatch(hermeticDir, hermeticPlan);
+  for (const module of hermeticPlan.modulesToCreate) {
+    const target = path.join(hermeticDir, module.path);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, module.content, 'utf8');
+  }
+  assert.equal((await verifyHermeticEngineeringGatesOnDisk(hermeticDir, hermeticPlan)).passed, 5);
+  packageModule.content = packageModule.content.replace('"start": "node server.js"', '"start": "node wrong.js"');
+  await fs.writeFile(path.join(hermeticDir, 'package.json'), packageModule.content, 'utf8');
+  const diskFailure = await verifyHermeticEngineeringGatesOnDisk(hermeticDir, hermeticPlan);
+  assert.equal(diskFailure.status, 'HERMETIC_VERIFICATION_FAILED');
+  assert.equal(diskFailure.passed, 4, 'Post-apply gates must detect a bad on-disk start script.');
+  assert.ok(candidatePatch.rawPatch.includes('package.json'));
+  console.log('[TEST 4D PASSED] Five hermetic gates, package/docs/env proposals, and pre-proposal field/status repairs are verified.');
+
+  const esmDir = path.join(testRoot, 'hermetic-esm');
+  await fs.mkdir(esmDir, { recursive: true });
+  await fs.writeFile(path.join(esmDir, 'package.json'), JSON.stringify({ name: 'esm-project', type: 'module' }), 'utf8');
+  const esmPlan = await deriveModularPlan(esmDir, {
+    userRequest: `Build a full-stack catalog feature with an API form.
+Create a POST endpoint /api/catalog.
+Fields:
+- title: string (required)
+Create a form and page.`,
+  });
+  repairHermeticCandidate(esmPlan);
+  assert.equal(verifyHermeticEngineeringGates(esmPlan).passed, 5);
+  const esmPackage = JSON.parse(esmPlan.modulesToCreate.find((module) => module.path === 'package.json').content);
+  assert.equal(esmPackage.type, 'module', 'Existing package module format must be preserved.');
+  assert.match(esmPlan.modulesToCreate.find((module) => module.path === 'server.js').content, /import http from/);
+  console.log('[TEST 4E PASSED] Existing ESM package metadata is preserved with compatible generated backend modules.');
+
+  const substantivePlan = await deriveModularPlan(populatedCreationDir, {
+    userRequest: `Build a full-stack subscription feature with a form and backend API.
+Create a POST endpoint /api/subscriptions.
+Fields:
+- customerName: string (required)
+- items: [{ sku: string, quantity: number }]
+Create a page component.`,
+  });
+  assert.match(substantivePlan.blockedReason, /existing substantive modules/i);
+  assert.deepEqual(substantivePlan.modulesToCreate, []);
+  assert.ok(
+    substantivePlan.workspaceInspection.targets.some((target) => target.classification === 'SUBSTANTIVE'),
+    'The plan must expose why existing workspace files were not replaced.',
+  );
+  const keepExistingPlan = await deriveModularPlan(populatedCreationDir, {
+    userRequest: `Build a full-stack subscription feature with a form and backend API.
+Create a POST endpoint /api/subscriptions.
+Fields:
+- customerName: string (required)
+Create a page component.
+Workspace resolution: KEEP_AND_SCAFFOLD`,
+  });
+  assert.ok(
+    keepExistingPlan.modulesToCreate.some((module) => module.path.startsWith('generated/subscription/')),
+    'Keep-and-scaffold resolution must place replacement modules in an isolated generated directory.',
+  );
+  assert.equal(
+    keepExistingPlan.modulesToCreate.some((module) => module.path === 'index.js'),
+    false,
+    'Keep-and-scaffold resolution must not target the substantive existing entrypoint.',
+  );
+  console.log('[TEST 4C PASSED] Substantive existing files trigger an explicit integration clarification instead of parallel scaffolding.');
+
+  // =========================================================================
   // TEST 5: Missing or Failed File Write Prevents False Success Report
   // =========================================================================
   const missingPlan = {
@@ -153,6 +433,28 @@ try {
   assert.equal(reachabilityFailure.isValid, false, 'Missing module file must fail reachability check');
   assert.match(reachabilityFailure.rejectionReason, /ghostService\.js/);
   console.log('[TEST 5 PASSED] Missing or failed file write prevents false success report.');
+
+  const syntaxDir = path.join(testRoot, 'syntax-verification');
+  await fs.mkdir(syntaxDir, { recursive: true });
+  await fs.writeFile(path.join(syntaxDir, 'valid.js'), 'module.exports = { ready: true };\n', 'utf8');
+  await fs.writeFile(path.join(syntaxDir, 'valid.jsx'), 'export default function View() { return <main />; }\n', 'utf8');
+  const validSyntax = await verifyIntegrationReachability(syntaxDir, {
+    modulesToCreate: [{ path: 'valid.js' }, { path: 'valid.jsx' }],
+    integrationPoints: [],
+  });
+  assert.equal(validSyntax.isValid, true);
+  assert.deepEqual(
+    validSyntax.syntaxChecks.map((check) => check.status),
+    ['SYNTAX_VERIFIED', 'SYNTAX_VERIFIED'],
+  );
+  await fs.writeFile(path.join(syntaxDir, 'invalid.js'), 'function broken( {\n', 'utf8');
+  const invalidSyntax = await verifyIntegrationReachability(syntaxDir, {
+    modulesToCreate: [{ path: 'invalid.js' }],
+    integrationPoints: [],
+  });
+  assert.equal(invalidSyntax.isValid, false);
+  assert.equal(invalidSyntax.syntaxChecks[0].status, 'SYNTAX_INVALID');
+  console.log('[TEST 5A PASSED] Static syntax checks validate JavaScript and JSX without executing source.');
 
   // =========================================================================
   // TEST 6: Existing Files and Unrelated User Changes Are Preserved

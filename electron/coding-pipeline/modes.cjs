@@ -126,13 +126,37 @@ const COMPLEXITY_LEVELS = Object.freeze({
   },
 });
 
+function hasConcreteCreationDirective(text) {
+  return /\b(?:build|create|implement|scaffold|generate|add|update|modify)\b[\s\S]{0,180}\b(?:feature|endpoint|route|api|model|schema|page|component|form|service|application|project|system|module)\b/i.test(text);
+}
+
+function explicitlyRequestsNoChanges(text) {
+  return /\b(?:do\s+not|don't|dont|never)\s+(?:(?:just|only|actually|any)\s+){0,2}(?:modify|change|edit|write|apply|implement|fix|repair|patch|add|create|refactor|update|remove|delete|touch)\b/i.test(text)
+    || /\bwithout\s+(?:(?:just|only|actually|any)\s+)?(?:modifying|changing|editing|writing|applying|implementing|fixing|repairing|patching|adding|creating|refactoring|updating|removing|deleting|touching)\b/i.test(text)
+    || /\bwithout\s+making\s+(?:(?:any|code|file|source)\s+)*(?:changes?|modifications?|edits?|writes?|patches?)\b/i.test(text)
+    || /\bno\s+(?:(?:code|file|source)\s+)?(?:changes?|modifications?|edits?|writes?|patches?)\b/i.test(text);
+}
+
+function startsWithDiagnosticInquiry(text) {
+  return /^\s*(?:(?:please\s+)?(?:investigate|diagnose|debug|audit|trace|explain)\b|why\b|how\b|what\s+(?:happened|caused|is\s+wrong)\b|find\s+(?:the\s+)?(?:cause|root\s+cause)\b)/i.test(text);
+}
+
 function routeTaskMode({ goal = '', intent = '', userRequestedMode = null, explicitComplexity = null }) {
   let resolvedMode = OPERATING_MODES.AUTONOMOUS;
+  const text = `${goal} ${intent}`.trim();
+  const explicitMode = typeof userRequestedMode === 'string'
+    ? OPERATING_MODES[userRequestedMode.toUpperCase()]
+    : null;
 
-  if (userRequestedMode && OPERATING_MODES[userRequestedMode.toUpperCase()]) {
-    resolvedMode = OPERATING_MODES[userRequestedMode.toUpperCase()];
+  if (explicitMode === OPERATING_MODES.AUDIT) {
+    resolvedMode = explicitMode;
+  } else if (hasConcreteCreationDirective(text)
+    && !startsWithDiagnosticInquiry(text)
+    && !explicitlyRequestsNoChanges(text)) {
+    resolvedMode = OPERATING_MODES.AUTONOMOUS;
+  } else if (explicitMode) {
+    resolvedMode = explicitMode;
   } else {
-    const text = `${goal} ${intent}`.trim();
     const textLower = text.toLowerCase();
 
     // 1. Detect clear actionable requests first (e.g. "Fix the audit logging bug", "Implement an audit service", "Add tests for audit events")
@@ -147,6 +171,7 @@ function routeTaskMode({ goal = '', intent = '', userRequestedMode = null, expli
 
     // 3. Detect conversational explanations and questions
     const isQuestionOrExplanation = /^(?:what\s+(?:is|are|does|do|happens)|how\s+(?:does|do|can|is|are)|why\s+(?:is|does|do)|where\s+(?:is|can)|explain|describe|show\s+me|tell\s+me\s+about|help\s+me\s+understand)\b/i.test(text);
+    const isActionableCreation = hasConcreteCreationDirective(text) && !startsWithDiagnosticInquiry(text);
 
     const isExplicitNoChange = /\b(?:do\s+not|don't|dont|never)\s+(?:(?:just|only|actually|any)\s+){0,2}(?:modify|change|edit|write|apply|implement|fix|repair|patch|add|create|refactor|update|remove|delete|touch)\b/i.test(text)
       || /\bwithout\s+(?:(?:just|only|actually|any)\s+)?(?:modifying|changing|editing|writing|applying|implementing|fixing|repairing|patching|adding|creating|refactoring|updating|removing|deleting|touching)\b/i.test(text)
@@ -178,6 +203,8 @@ function routeTaskMode({ goal = '', intent = '', userRequestedMode = null, expli
       resolvedMode = OPERATING_MODES.AUDIT;
     } else if (isQuestionOrExplanation) {
       resolvedMode = OPERATING_MODES.ASK;
+    } else if (isActionableCreation) {
+      resolvedMode = OPERATING_MODES.AUTONOMOUS;
     } else if (
       textLower.includes('investigate') ||
       textLower.includes('diagnose') ||

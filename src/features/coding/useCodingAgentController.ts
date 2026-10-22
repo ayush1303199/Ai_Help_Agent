@@ -251,6 +251,8 @@ interface CodingControllerOptions {
   maxMessageChars: number;
 }
 
+type CodingBrokerStatus = 'unknown' | 'syncing' | 'ready' | 'unavailable' | 'unauthorized' | 'untrusted';
+
 export const PROJECT_NAME_BLACKLIST = new Set([
   'the', 'a', 'an', 'this', 'that', 'it', 'its', 'my', 'your', 'our', 'all', 'any',
   'faq', 'table', 'tables', 'database', 'db', 'query', 'queries', 'sql', 'mysql',
@@ -286,36 +288,17 @@ export function extractCodingProjectCandidates(request: string): string[] {
     }
   };
 
-  const explicitAfter = request.match(/(?:^|[\s"'`])([A-Za-z0-9][A-Za-z0-9._-]{1,127})\s+(?:project|repo|repository|workspace|folder|app)\b/i);
-  add(explicitAfter?.[1]);
-  const explicitBefore = request.match(/\b(?:project|repo|repository|workspace|folder|app)\s+([A-Za-z0-9][A-Za-z0-9._-]{1,127})\b/i);
-  add(explicitBefore?.[1]);
+  const explicitPaths = request.match(/(?:[A-Za-z]:[\\/]|\/)[^\r\n"'<>|?*]+/g) || [];
+  for (const path of explicitPaths) add(path);
 
-  const prepositionMatch = request.match(/\b(?:in|for|inside|under|within|on|open|select|use|switch\s+to)\s+([A-Za-z0-9][A-Za-z0-9._-]{1,127})\b/i);
-  add(prepositionMatch?.[1]);
-  const hinglishKeMein = request.match(/\b([A-Za-z0-9][A-Za-z0-9._-]{1,127})\s+(?:ke|mein|me|ka|ki)\b/i);
-  add(hinglishKeMein?.[1]);
-
-  const quoted = request.match(/[`"']([A-Za-z0-9][A-Za-z0-9._-]{1,127})[`"']/g);
-  if (quoted) {
-    for (const q of quoted) {
-      add(q.replace(/[`"']/g, ''));
-    }
-  }
-
-  const compoundNames = request.match(/\b([a-zA-Z0-9]+(?:[-_][a-zA-Z0-9]+)+)\b/g);
-  if (compoundNames) {
-    for (const name of compoundNames) {
-      add(name);
-    }
-  }
-
-  const fileNames = request.match(/\b([A-Za-z0-9_-]+\.(?:php|ts|tsx|js|jsx|py|java|go|rb|cs|rs|json|ya?ml|html|css|vue|c|cpp|h))\b/gi);
-  if (fileNames) {
-    for (const fn of fileNames) {
-      add(fn);
-    }
-  }
+  const namedWorkspace = request.match(
+    /\b(?:project|repo|repository|workspace|folder)\s+(?:named|called)?\s*["'`]([^"'`]{2,128})["'`]/i,
+  );
+  add(namedWorkspace?.[1]);
+  const explicitWorkspace = request.match(
+    /\b(?:project|repo|repository|workspace|folder)\s+(?:named|called)?\s+([A-Za-z0-9][A-Za-z0-9._-]{1,127})\b/i,
+  );
+  add(explicitWorkspace?.[1]);
 
   return candidates;
 }
@@ -382,8 +365,14 @@ export function useCodingAgentController({
   const [lastProvider, setLastProvider] = useState<{ id?: string; label?: string; model?: string; changedAt?: string } | null>(null);
   const [preferences, setPreferences] = useState<CodingPreference[]>(readCodingPreferences);
   const [executionSettings, setExecutionSettings] = useState<CodingExecutionSettings>(readCodingExecutionSettings);
-  const [brokerStatus, setBrokerStatus] = useState<'unknown' | 'syncing' | 'ready' | 'unavailable'>('unknown');
+  const [brokerStatus, setBrokerStatus] = useState<CodingBrokerStatus>('unknown');
   const [proposal, setProposal] = useState<CodingProposal | null>(null);
+  const [clarificationAction, setClarificationAction] = useState<{
+    requestId: string;
+    request: string;
+    prompt: string;
+    targets: Array<{ path: string; classification: string }>;
+  } | null>(null);
   const [deleteConfirmed, setDeleteConfirmed] = useState(false);
   const browserBrokerApprovalRef = useRef<{
     taskId: string;
@@ -525,6 +514,19 @@ export function useCodingAgentController({
       if (window.electronAPI?.getDeveloperProjectState) {
         try {
           const state = await window.electronAPI.getDeveloperProjectState();
+          const savedRoot = getSavedRoot();
+          if (state.status !== 'PROJECT_ATTACHED' && savedRoot
+            && window.electronAPI.attachDeveloperProject) {
+            const restored = await window.electronAPI.attachDeveloperProject(savedRoot);
+            if (restored.status === 'PROJECT_ATTACHED' && restored.projectRoot) {
+              setProjectRoot(restored.projectRoot);
+              setProjectLifecycleState('PROJECT_ATTACHED');
+              persistStoredProjectRoot(restored.projectRoot);
+              const listing = await window.electronAPI.listDeveloperDirectory('.');
+              if (active) setDirectory(listing);
+              return;
+            }
+          }
           if (!active) return;
           if (state.status === 'PROJECT_ATTACHED' && state.projectRoot) {
             setProjectRoot(state.projectRoot);
@@ -539,19 +541,16 @@ export function useCodingAgentController({
           } else if (state.status === 'PROJECT_MISSING') {
             setProjectRoot(null);
             setProjectLifecycleState('PROJECT_MISSING');
-            persistStoredProjectRoot(null);
             setDirectory([]);
             onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
           } else if (state.status === 'PROJECT_INACCESSIBLE') {
             setProjectRoot(null);
             setProjectLifecycleState('PROJECT_INACCESSIBLE');
-            persistStoredProjectRoot(null);
             setDirectory([]);
             onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
           } else if (state.status === 'PROJECT_DETACHED') {
             setProjectRoot(null);
             setProjectLifecycleState('PROJECT_DETACHED');
-            persistStoredProjectRoot(null);
             setDirectory([]);
           } else {
             const savedRoot = getSavedRoot();
@@ -568,13 +567,11 @@ export function useCodingAgentController({
                 } else if (attached.status === 'PROJECT_MISSING') {
                   setProjectRoot(null);
                   setProjectLifecycleState('PROJECT_MISSING');
-                  persistStoredProjectRoot(null);
                   setDirectory([]);
                   onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
                 } else if (attached.status === 'PROJECT_INACCESSIBLE') {
                   setProjectRoot(null);
                   setProjectLifecycleState('PROJECT_INACCESSIBLE');
-                  persistStoredProjectRoot(null);
                   setDirectory([]);
                   onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
                 } else {
@@ -597,7 +594,16 @@ export function useCodingAgentController({
           if (!response.ok) {
             throw new Error(`Project state request failed: HTTP ${response.status}`);
           }
-          const state = await response.json();
+          let state = await response.json();
+          const savedRoot = getSavedRoot();
+          if (state.status !== 'PROJECT_ATTACHED' && savedRoot) {
+            const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ projectRoot: savedRoot }),
+            });
+            if (attachResponse.ok) state = await attachResponse.json();
+          }
           if (state.status === 'PROJECT_ATTACHED' && state.projectRoot) {
             setProjectRoot(state.projectRoot);
             setProjectLifecycleState('PROJECT_ATTACHED');
@@ -613,18 +619,14 @@ export function useCodingAgentController({
           } else if (state.status === 'PROJECT_DETACHED') {
             setProjectRoot(null);
             setProjectLifecycleState('PROJECT_DETACHED');
-            persistStoredProjectRoot(null);
             setDirectory([]);
           } else if (state.status === 'PROJECT_MISSING') {
             setProjectRoot(null);
             setProjectLifecycleState('PROJECT_MISSING');
-            persistStoredProjectRoot(null);
             setDirectory([]);
-            onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
           } else if (state.status === 'PROJECT_INACCESSIBLE') {
             setProjectRoot(null);
             setProjectLifecycleState('PROJECT_INACCESSIBLE');
-            persistStoredProjectRoot(null);
             setDirectory([]);
             onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
           } else {
@@ -722,13 +724,14 @@ export function useCodingAgentController({
     setExecutionSettings(updated);
   };
 
-  const synchronizeBrokerProject = async () => {
+  const synchronizeBrokerProject = useCallback(async () => {
     if (!projectRoot) {
       setBrokerStatus('unavailable');
       onError('Select and attach a workspace before synchronizing the trusted broker.');
       return;
     }
     setBrokerStatus('syncing');
+    let failureStatus: CodingBrokerStatus = 'unavailable';
     try {
       let attached: { status?: string };
       if (window.electronAPI?.attachDeveloperProject) {
@@ -741,7 +744,14 @@ export function useCodingAgentController({
         });
         if (!response.ok) {
           const payload = await response.json().catch(() => ({}));
-          throw new Error(typeof payload?.detail === 'string' ? payload.detail : `Project sync returned HTTP ${response.status}.`);
+          const detail = payload?.detail;
+          const code = detail && typeof detail === 'object' ? detail.code : null;
+          const message = typeof detail === 'string'
+            ? detail
+            : detail && typeof detail.message === 'string' ? detail.message : `Project sync returned HTTP ${response.status}.`;
+          failureStatus = code === 'BROKER_PROJECT_UNAUTHORIZED' ? 'untrusted'
+            : response.status === 401 || response.status === 403 ? 'unauthorized' : 'unavailable';
+          throw new Error(message);
         }
         attached = await response.json();
       }
@@ -750,15 +760,34 @@ export function useCodingAgentController({
       if (!discovery.ok) {
         const payload = await discovery.json().catch(() => ({}));
         const detail = payload?.detail;
+        const code = detail && typeof detail === 'object' ? detail.code : null;
+        failureStatus = code === 'BROKER_PROJECT_UNAUTHORIZED' || code === 'BROKER_PROJECT_NOT_REGISTERED'
+          ? 'untrusted'
+          : discovery.status === 401 || discovery.status === 403 ? 'unauthorized' : 'unavailable';
         throw new Error(typeof detail?.message === 'string' ? detail.message : typeof detail === 'string' ? detail : `Broker discovery returned HTTP ${discovery.status}.`);
       }
       setBrokerStatus('ready');
       onStatus('The attached workspace is synchronized with the trusted broker.');
     } catch (error) {
-      setBrokerStatus('unavailable');
+      setBrokerStatus(failureStatus);
+      if (projectRoot) setProjectLifecycleState('PROJECT_UNVERIFIED');
       onError(error instanceof Error ? error.message : String(error));
     }
-  };
+  }, [onError, onStatus, projectRoot]);
+
+  useEffect(() => {
+    if (projectRoot && projectLifecycleState === 'PROJECT_ATTACHED'
+      && executionSettings.autoAuthorizeAttachedProject) {
+      void synchronizeBrokerProject();
+    } else if (!projectRoot) {
+      setBrokerStatus('unknown');
+    }
+  }, [
+    executionSettings.autoAuthorizeAttachedProject,
+    projectLifecycleState,
+    projectRoot,
+    synchronizeBrokerProject,
+  ]);
 
   const sendMessage = async (
     overrideQuestion?: string,
@@ -772,6 +801,7 @@ export function useCodingAgentController({
     let currentProjectRoot = projectRoot;
     let currentScope = path;
     const projectContinuation: string | null = null;
+    if (!currentProjectRoot) currentProjectRoot = readStoredProjectRoot();
     if (!currentProjectRoot) {
       if (window.electronAPI?.getDeveloperProjectState) {
         try {
@@ -816,7 +846,8 @@ export function useCodingAgentController({
       }
       const candidateList = projectCandidates.length > 0 && projectName ? [projectName] : extractCodingProjectCandidates(question);
       if (candidateList.length === 0) {
-        candidateList.push('*');
+        appendDiscoveryReply('No trusted project folder is attached. Select the workspace in the trusted desktop app, then attach its registered path here.');
+        return;
       }
       setBusy(true);
       try {
@@ -828,12 +859,27 @@ export function useCodingAgentController({
             if (window.electronAPI) {
               result = await window.electronAPI.discoverDeveloperProject(candidate);
             } else {
-              const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-discover`, {
+              const candidateIsPath = /[\\/]/.test(candidate) || /^[A-Za-z]:/.test(candidate);
+              if (!candidateIsPath) continue;
+              const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: candidate }),
+                body: JSON.stringify({ projectRoot: candidate }),
               });
-              if (res.ok) result = await res.json();
+              if (!res.ok) {
+                const payload = await res.json().catch(() => ({}));
+                const detail = payload?.detail;
+                throw new Error(typeof detail === 'string'
+                  ? detail
+                  : detail && typeof detail.message === 'string'
+                    ? detail.message
+                    : `Workspace authorization failed (HTTP ${res.status}).`);
+              }
+              const attached = await res.json();
+              result = {
+                projectRoot: attached.projectRoot || null,
+                matches: attached.projectRoot ? [attached.projectRoot] : [],
+              };
             }
             if (result?.projectRoot) {
               discovery = result;
@@ -854,9 +900,27 @@ export function useCodingAgentController({
             setProjectCandidates(matches);
             appendDiscoveryReply(`I found more than one project matching "${matchedCandidate || candidateList[0]}". Which one should I use?\n${matches.map((candidate, index) => `${index + 1}. ${candidate}`).join('\n')}`);
           } else {
-            appendDiscoveryReply(`Could not find a project matching "${candidateList.join(', ')}". Tell me the project folder name or choose it under Advanced > Select folder.`);
+            appendDiscoveryReply('No trusted project folder is attached. Select the workspace in the trusted desktop app, then attach its registered path here.');
           }
           return;
+        }
+        if (!window.electronAPI) {
+          const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectRoot: discovery.projectRoot }),
+          });
+          if (!attachResponse.ok) {
+            const payload = await attachResponse.json().catch(() => ({}));
+            const detail = payload?.detail;
+            const message = typeof detail === 'string'
+              ? detail
+              : detail && typeof detail.message === 'string'
+                ? detail.message
+                : `The workspace could not be authorized (HTTP ${attachResponse.status}).`;
+            appendDiscoveryReply(message);
+            return;
+          }
         }
         setProjectCandidates([]);
         currentProjectRoot = discovery.projectRoot;
@@ -871,6 +935,46 @@ export function useCodingAgentController({
         return;
       } finally {
         setBusy(false);
+      }
+    }
+
+    const savedRoot = readStoredProjectRoot();
+    if (savedRoot && currentProjectRoot === savedRoot) {
+      try {
+        let attached: { status?: string; projectRoot?: string | null };
+        if (window.electronAPI?.getDeveloperProjectState && window.electronAPI.attachDeveloperProject) {
+          const state = await window.electronAPI.getDeveloperProjectState();
+          attached = state.status === 'PROJECT_ATTACHED' && state.projectRoot === savedRoot
+            ? state
+            : await window.electronAPI.attachDeveloperProject(savedRoot);
+        } else {
+          const stateResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-state`);
+          const state = stateResponse.ok ? await stateResponse.json() : null;
+          if (state?.status === 'PROJECT_ATTACHED' && state.projectRoot === savedRoot) {
+            attached = state;
+          } else {
+            const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ projectRoot: savedRoot }),
+            });
+            if (!attachResponse.ok) {
+              const payload = await attachResponse.json().catch(() => ({}));
+              throw new Error(typeof payload?.detail === 'string' ? payload.detail : `Saved workspace re-attach failed: HTTP ${attachResponse.status}.`);
+            }
+            attached = await attachResponse.json();
+          }
+        }
+        if (attached.status !== 'PROJECT_ATTACHED' || !attached.projectRoot) {
+          throw new Error('The saved workspace is unavailable. Select an accessible workspace or clear the saved selection.');
+        }
+        currentProjectRoot = attached.projectRoot;
+        setProjectRoot(currentProjectRoot);
+        setProjectLifecycleState('PROJECT_ATTACHED');
+        persistStoredProjectRoot(currentProjectRoot);
+      } catch (error) {
+        onError(error instanceof Error ? error.message : String(error));
+        return;
       }
     }
 
@@ -1034,6 +1138,15 @@ export function useCodingAgentController({
           );
 
         browserBrokerApprovalRef.current = null;
+        if (result.outcome === 'SUCCESS' && Array.isArray(result.filesModified)) {
+          setAppliedPatchLog((previous) => [...previous, {
+            proposalId: proposal?.proposalId || proposal?.id || requestId,
+            files: result.filesModified.filter((file: unknown): file is string => typeof file === 'string'),
+            state: 'completed',
+            appliedAt: new Date().toISOString(),
+            verification: result.codeVerified === true ? 'PASS' : 'NOT_ESTABLISHED',
+          }]);
+        }
         setProposal((current) => {
           if (!current?.browserBroker || current.requestId !== requestId) return current;
           const rejected = result.outcome === 'APPROVAL_REJECTED' || result.outcome === 'CANCELLED';
@@ -1062,6 +1175,25 @@ export function useCodingAgentController({
             error: result.outcome === 'SUCCESS' || rejected ? null : String(result.error || result.message || result.outcome),
           };
         });
+
+        if (result.outcome === 'CLARIFICATION_REQUIRED') {
+          const targets = result.workspaceInspection?.targets;
+          const usableTargets = Array.isArray(targets)
+            ? targets.filter((target) => (
+                typeof target?.path === 'string' && typeof target?.classification === 'string'
+              ))
+            : [];
+          setClarificationAction(usableTargets.length > 0
+            ? {
+                requestId,
+                request: question,
+                prompt: result.clarificationPrompt || 'Choose how to handle the identified existing files.',
+                targets: usableTargets,
+              }
+            : null);
+        } else {
+          setClarificationAction(null);
+        }
 
         let outcomeContent = '';
         if (result.outcome === 'IMPLEMENTATION_REQUIRED') {
@@ -1101,7 +1233,7 @@ export function useCodingAgentController({
             : '';
           outcomeContent = `${result.message || 'The investigation is incomplete; no root cause is supported by inspected evidence.'}${continuationDetail}`;
         } else if (result.outcome === 'SUCCESS') {
-          outcomeContent = `Autonomous coding workflow completed successfully.\n\nModified files:\n${result.filesModified.map((f: string) => `- \`${f}\``).join('\n')}\n\nVerification: All checks passed (exit 0).`;
+          outcomeContent = `${result.message || 'Autonomous coding workflow completed successfully.'}\n\nModified files:\n${result.filesModified.map((f: string) => `- \`${f}\``).join('\n')}`;
           setAppliedPatchLog((previous) => [
             ...previous,
             {
@@ -1109,7 +1241,7 @@ export function useCodingAgentController({
               state: 'completed',
               appliedAt: new Date().toISOString(),
               files: result.filesModified,
-              verification: 'PASS',
+              verification: result.workflowReceipt?.verificationReport?.verificationMode || 'PASS',
             },
           ]);
         } else if (result.outcome === 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED') {
@@ -1121,7 +1253,7 @@ export function useCodingAgentController({
               state: 'blocked',
               appliedAt: new Date().toISOString(),
               files: result.filesModified,
-              verification: 'PASS',
+              verification: result.workflowReceipt?.verificationReport?.verificationMode || 'PASS',
             },
           ]);
         } else if (['VERIFICATION_UNAVAILABLE', 'VERIFICATION_BLOCKED', 'TEST_FAILED', 'APPLY_FAILED'].includes(result.outcome)) {
@@ -1160,6 +1292,12 @@ export function useCodingAgentController({
         }
       } catch (error) {
         const errorText = error instanceof Error ? error.message : String(error);
+        if (/unauthoriz|not authorized|authorization|trusted desktop app/i.test(errorText)) {
+          setBrokerStatus('untrusted');
+          setProjectLifecycleState('PROJECT_UNVERIFIED');
+        } else if (/broker|could not be reached|backend.*not reachable/i.test(errorText)) {
+          setBrokerStatus('unavailable');
+        }
         onError(errorText);
         setMessages((previous) => previous.map((message) => message.requestId === requestId
           ? { ...message, content: `Autonomous workflow error: ${errorText}`, streaming: false }
@@ -1791,14 +1929,29 @@ export function useCodingAgentController({
     if (busy || streaming) return;
     const desktopApi = window.electronAPI;
     if (!desktopApi) {
+      try {
+        const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-clear`, {
+          method: 'POST',
+        });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          const detail = payload?.detail;
+          throw new Error(typeof detail === 'string' ? detail : detail?.message || `Project detach returned HTTP ${response.status}.`);
+        }
+      } catch (error) {
+        onError(error instanceof Error ? error.message : String(error));
+        return;
+      }
       setProjectRoot(null);
       setProjectLifecycleState('NO_PROJECT');
+      setBrokerStatus('unknown');
       setProjectCandidates([]);
       setDirectory([]);
       setPath('.');
       setFileContent('');
       setFilePath('');
-      onStatus('Open the trusted desktop app to manage an attached project.');
+      persistStoredProjectRoot(null);
+      onStatus('Project detached from this browser session.');
       return;
     }
     setBusy(true);
@@ -2199,6 +2352,7 @@ export function useCodingAgentController({
     workflowContinuationRef.current = null;
     setWorkflowCanResume(false);
     setProviderRecovery(null);
+    setClarificationAction(null);
     if (proposal?.repairAvailable && proposal.id && window.electronAPI) {
       void window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id).catch((error) => {
         onError(error instanceof Error ? error.message : String(error));
@@ -2390,10 +2544,20 @@ export function useCodingAgentController({
       true,
     );
   };
+  const chooseWorkspaceResolution = (
+    resolution: 'UPDATE_AND_INTEGRATE' | 'REPLACE_TARGETS' | 'KEEP_AND_SCAFFOLD',
+  ) => {
+    if (!clarificationAction || busy || streaming) return;
+    const request = `${clarificationAction.request}\n\nWorkspace resolution: ${resolution}`;
+    setClarificationAction(null);
+    void sendMessage(request);
+  };
 
   return {
     workspace: {
       messages, input, projectRoot, projectStatus: projectLifecycleState, projectCandidates,
+      clarificationAction,
+      onChooseWorkspaceResolution: chooseWorkspaceResolution,
       executionSettings, brokerStatus,
       onExecutionSettingsChange: updateExecutionSettings,
       onSynchronizeBroker: () => void synchronizeBrokerProject(),

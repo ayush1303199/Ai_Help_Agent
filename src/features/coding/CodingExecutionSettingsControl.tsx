@@ -2,7 +2,7 @@ import type { CodingExecutionSettings } from './codingExecutionSettings';
 
 interface CodingExecutionSettingsControlProps {
   settings: CodingExecutionSettings;
-  brokerStatus: 'unknown' | 'syncing' | 'ready' | 'unavailable';
+  brokerStatus: 'unknown' | 'syncing' | 'ready' | 'unavailable' | 'unauthorized' | 'untrusted';
   disabled?: boolean;
   onChange: (settings: Partial<CodingExecutionSettings>) => void;
   onSynchronize: () => void;
@@ -20,10 +20,12 @@ export function CodingExecutionSettingsControl({
     syncing: 'Synchronizing…',
     ready: 'Ready',
     unavailable: 'Unavailable',
+    unauthorized: 'Authorization required',
+    untrusted: 'Workspace not authorized',
   }[brokerStatus];
   const statusClass = brokerStatus === 'ready'
     ? 'text-emerald-300'
-    : brokerStatus === 'unavailable'
+    : brokerStatus === 'unavailable' || brokerStatus === 'unauthorized' || brokerStatus === 'untrusted'
       ? 'text-rose-300'
       : 'text-slate-400';
 

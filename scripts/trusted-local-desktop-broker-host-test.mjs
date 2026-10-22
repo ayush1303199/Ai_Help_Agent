@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHmac, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,11 +13,13 @@ const workspaceRoot = path.join(fixtureRoot, 'workspace');
 const rejectedWorkspaceRoot = path.join(fixtureRoot, 'rejected-workspace');
 const approvedWorkspaceRoot = path.join(fixtureRoot, 'approved-workspace');
 const autonomousWorkspaceRoot = path.join(fixtureRoot, 'autonomous-workspace');
+const populatedWorkspaceRoot = path.join(fixtureRoot, 'populated-workspace');
 const runtimeSettingsPath = path.join(fixtureRoot, 'runtime-settings.json');
 const authToken = randomBytes(32).toString('base64url');
 const mutationSecret = randomBytes(32).toString('base64url');
 let registered;
 let activeWorkspaceRoot = rejectedWorkspaceRoot;
+const browserSessionBindings = new Map();
 let child;
 let childOutput = '';
 let renderer;
@@ -28,6 +30,18 @@ const backend = http.createServer(async (request, response) => {
   if (request.headers['x-coding-auth'] !== authToken) {
     response.writeHead(401).end();
   } else if (request.method === 'GET' && request.url === '/api/coding/project-state') {
+    const browserSessionId = request.headers['x-coding-browser-session'];
+    if (typeof browserSessionId === 'string') browserSessionBindings.set(browserSessionId, activeWorkspaceRoot);
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ status: 'PROJECT_ATTACHED', projectRoot: activeWorkspaceRoot }));
+  } else if (request.method === 'POST' && request.url === '/api/coding/project-attach') {
+    const browserSessionId = request.headers['x-coding-browser-session'];
+    if (typeof browserSessionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(browserSessionId)) {
+      response.writeHead(403).end();
+      return;
+    }
+    activeWorkspaceRoot = body.projectRoot;
+    browserSessionBindings.set(browserSessionId, activeWorkspaceRoot);
     response.writeHead(200, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ status: 'PROJECT_ATTACHED', projectRoot: activeWorkspaceRoot }));
   } else if (request.method === 'POST' && request.url === '/api/coding/broker/register') {
@@ -72,6 +86,7 @@ try {
   await mkdir(rejectedWorkspaceRoot);
   await mkdir(approvedWorkspaceRoot);
   await mkdir(autonomousWorkspaceRoot);
+  await mkdir(populatedWorkspaceRoot);
   renderer = http.createServer();
   const [backendPort, rendererPort] = await Promise.all([listen(backend), listen(renderer)]);
   const runtimeSettings = {
@@ -107,6 +122,36 @@ try {
   assert.equal(Object.hasOwn(registered.projects[0], 'root'), false, 'Broker registration must not publish raw workspace paths.');
 
   const origin = `http://127.0.0.1:${rendererPort}`;
+  const browserSessionId = crypto.randomUUID();
+  const attachSelectedWorkspace = async (projectRoot) => {
+    const response = await fetch(new URL('/api/coding/project-attach', `http://127.0.0.1:${backendPort}`), {
+      method: 'POST',
+      headers: {
+        'X-Coding-Auth': authToken,
+        'X-Coding-Browser-Session': browserSessionId,
+        Origin: origin,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ projectRoot }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.status, 'PROJECT_ATTACHED');
+    return body;
+  };
+  const restoredProjectState = await fetch(new URL('/api/coding/project-state', `http://127.0.0.1:${backendPort}`), {
+    headers: {
+      'X-Coding-Auth': authToken,
+      'X-Coding-Browser-Session': browserSessionId,
+      Origin: origin,
+    },
+  }).then((response) => response.json());
+  assert.equal(restoredProjectState.status, 'PROJECT_ATTACHED');
+  assert.equal(
+    browserSessionBindings.get(browserSessionId),
+    rejectedWorkspaceRoot,
+    'A reloaded local browser session should bind to the pre-attached workspace automatically.',
+  );
   const readBrokerJson = async (response, expectedStatus) => {
     const text = await response.text();
     assert.equal(response.status, expectedStatus, text);
@@ -130,26 +175,37 @@ try {
     const response = await brokerFetch('/v1/sessions', { projectId: project.projectId });
     return readBrokerJson(response, 201);
   };
-  const runDecision = async (lease, decision, executionMode = 'inline_review') => {
+  const runDecision = async (lease, decision, executionMode = 'inline_review', {
+    userRequest = null,
+    targetWorkspace = decision === 'approve' ? approvedWorkspaceRoot
+      : decision === 'autonomous' ? autonomousWorkspaceRoot : rejectedWorkspaceRoot,
+    expectEmptyBeforeApproval = true,
+    expectNoChanges = false,
+  } = {}) => {
     const binding = {
       brokerSessionId: lease.brokerSessionId,
       sessionLeaseToken: lease.sessionLeaseToken,
     };
     const workflowResponse = await brokerFetch('/v1/workflows', {
       ...binding,
-      userRequest: `Create a modular full-stack feature. POST /api/${decision}.\nFields:\n- displayName: string (required)\n- quantity: number (default=1)\nAdd a frontend form UI.`,
+      userRequest: userRequest || `Create a modular full-stack feature. POST /api/${decision}.\nFields:\n- displayName: string (required)\n- quantity: number (default=1)\nAdd a frontend form UI.`,
       scope: '.',
       executionMode,
     });
     const workflow = await readBrokerJson(workflowResponse, 200);
     if (executionMode === 'autonomous_auto_apply') {
-      assert.equal(workflow.outcome, 'SUCCESS', `Autonomous mode should apply and verify the production proposal: ${JSON.stringify(workflow)}\n${childOutput}`);
-      assert.equal(workflow.codeApplied, true, JSON.stringify(workflow));
+      assert.equal(workflow.outcome, 'SUCCESS', `Autonomous mode should complete the production workflow: ${JSON.stringify(workflow)}\n${childOutput}`);
+      assert.equal(workflow.codeApplied, !expectNoChanges, JSON.stringify(workflow));
       assert.equal(workflow.codeVerified, true, JSON.stringify(workflow));
       const createdPaths = workflow.filesModified;
-      assert.ok(createdPaths.length >= 5);
+      if (expectNoChanges) {
+        assert.equal(workflow.noChangesRequired, true, JSON.stringify(workflow));
+        assert.deepEqual(createdPaths, []);
+      } else {
+        assert.ok(createdPaths.length >= 5);
+      }
       for (const relativePath of createdPaths) {
-        const fileStat = await stat(path.join(autonomousWorkspaceRoot, ...relativePath.split('/')));
+        const fileStat = await stat(path.join(targetWorkspace, ...relativePath.split('/')));
         assert.ok(fileStat.isFile(), `Expected autonomous file ${relativePath} on disk.`);
       }
       return { result: workflow };
@@ -168,8 +224,10 @@ try {
     assert.equal(pending.envelope.approvalNonce, pending.approvalNonce);
     assert.ok(pending.envelope.fileBadges.length >= 5);
     assert.ok(pending.envelope.diffPreview.length >= 5);
-    assert.deepEqual(await readdir(decision === 'approve' ? approvedWorkspaceRoot : rejectedWorkspaceRoot), [],
-      'Staging a browser proposal must not write workspace files.');
+    if (expectEmptyBeforeApproval) {
+      assert.deepEqual(await readdir(targetWorkspace), [],
+        'Staging a browser proposal must not write workspace files.');
+    }
     const decisionResponse = await brokerFetch('/v1/workflows/approval/decision', {
       ...binding,
       proposalId: pending.proposalId,
@@ -196,7 +254,8 @@ try {
   });
 
   const previousProjectId = rejectedProject.projectId;
-  activeWorkspaceRoot = approvedWorkspaceRoot;
+  await attachSelectedWorkspace(approvedWorkspaceRoot);
+  assert.equal(browserSessionBindings.get(browserSessionId), approvedWorkspaceRoot);
   const syncResponse = await brokerFetch('/v1/synchronize', {});
   const synchronized = await readBrokerJson(syncResponse, 200);
   assert.equal(synchronized.synchronized, true);
@@ -213,16 +272,16 @@ try {
     const fileStat = await stat(path.join(approvedWorkspaceRoot, ...relativePath.split('/')));
     assert.ok(fileStat.isFile(), `Expected approved file ${relativePath} on disk.`);
   }
-  assert.ok(createdPaths.some((file) => file.endsWith('Schema.js')));
-  assert.ok(createdPaths.some((file) => file.endsWith('Controller.js')));
-  assert.ok(createdPaths.some((file) => file.endsWith('Routes.js')));
+  assert.ok(createdPaths.some((file) => /(?:^|\/)models\/[^/]+\.js$/.test(file)));
+  assert.ok(createdPaths.some((file) => /(?:^|\/)controllers\/[^/]+Controller\.js$/.test(file)));
+  assert.ok(createdPaths.some((file) => /(?:^|\/)routes\/[^/]+\.js$/.test(file)));
   assert.ok(createdPaths.includes('server.js'));
   assert.ok(createdPaths.some((file) => file.endsWith('Form.jsx')));
   await brokerFetch('/v1/sessions/release', {
     brokerSessionId: approvedLease.brokerSessionId,
     sessionLeaseToken: approvedLease.sessionLeaseToken,
   });
-  activeWorkspaceRoot = autonomousWorkspaceRoot;
+  await attachSelectedWorkspace(autonomousWorkspaceRoot);
   const autoSyncResponse = await brokerFetch('/v1/synchronize', {});
   const autoSync = await readBrokerJson(autoSyncResponse, 200);
   const autonomousProject = autoSync.projects.find((project) => project.projectId !== approvedProject.projectId);
@@ -235,6 +294,89 @@ try {
     brokerSessionId: autonomousLease.brokerSessionId,
     sessionLeaseToken: autonomousLease.sessionLeaseToken,
   });
+
+  const populatedStubs = {
+    'server.js': "const { executeFeature } = require('./services/featureService');\n",
+    'components/OrderForm.jsx': "const fields = ['title', 'description', 'status'];\nexport default function OrderForm() { return null; }\n",
+    'models/Order.js': '// TODO: define the model fields\n',
+    'routes/orders.js': '// TODO: register the route\n',
+    'controllers/orderController.js': '// TODO: handle requests\n',
+    'config/db.js': '// TODO: configure database access\n',
+    'app/orders/page.jsx': 'export default function OrderPage() { return null; }\n',
+    'utils/sharedUtils.js': 'module.exports = {};\n',
+    'services/featureService.js': 'module.exports = {};\n',
+  };
+  for (const [relativePath, source] of Object.entries(populatedStubs)) {
+    const target = path.join(populatedWorkspaceRoot, ...relativePath.split('/'));
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, source.replace(/\n/g, '\r\n'), 'utf8');
+  }
+  const populatedPrompt = `Build a complete full-stack order feature with frontend and backend integration.
+Create a POST endpoint /api/orders.
+Fields:
+- customerName: string (required)
+- items: [{ itemName: string, quantity: number, price: number }]
+- totalPrice: number (auto calculated)
+- status: string (default=Pending)
+Create a Next.js App Router page and React form component with Tailwind CSS, dynamic item rows, and validation/success/error messages.
+Workspace resolution: UPDATE_AND_INTEGRATE.`;
+  await attachSelectedWorkspace(populatedWorkspaceRoot);
+  const populatedSyncResponse = await brokerFetch('/v1/synchronize', {});
+  const populatedSync = await readBrokerJson(populatedSyncResponse, 200);
+  const populatedProject = populatedSync.projects.find((project) => project.projectId !== autonomousProject.projectId);
+  assert.ok(populatedProject, 'The broker should synchronize the populated workspace.');
+
+  const explicitLease = await acquireLease(populatedProject);
+  const explicitUpdate = await runDecision(explicitLease, 'approve', 'inline_review', {
+    userRequest: populatedPrompt,
+    targetWorkspace: populatedWorkspaceRoot,
+    expectEmptyBeforeApproval: false,
+  });
+  assert.equal(explicitUpdate.result.outcome, 'SUCCESS', `${JSON.stringify(explicitUpdate.result)}\n${childOutput}`);
+  assert.equal(explicitUpdate.result.codeApplied, true, JSON.stringify(explicitUpdate.result));
+  assert.equal(explicitUpdate.result.codeVerified, true, JSON.stringify(explicitUpdate.result));
+  assert.doesNotMatch(JSON.stringify(explicitUpdate), /Patch context does not match/);
+  for (const relativePath of [
+    'package.json',
+    '.env.example',
+    'README.md',
+    'config/db.js',
+    'models/Order.js',
+    'controllers/orderController.js',
+    'routes/orders.js',
+    'components/OrderForm.jsx',
+    'app/orders/page.jsx',
+  ]) {
+    assert.ok(explicitUpdate.result.filesModified.includes(relativePath), `Full-stack proposal must cover ${relativePath}.`);
+  }
+  assert.ok(!explicitUpdate.result.filesModified.includes('utils/sharedUtils.js'));
+  assert.ok(!explicitUpdate.result.filesModified.includes('services/featureService.js'));
+  for (const relativePath of Object.keys(populatedStubs)) {
+    const contents = await readFile(path.join(populatedWorkspaceRoot, ...relativePath.split('/')), 'utf8');
+    assert.doesNotMatch(contents, /\r(?!\n)/, `${relativePath} must retain valid newline encoding after apply.`);
+  }
+  await brokerFetch('/v1/sessions/release', {
+    brokerSessionId: explicitLease.brokerSessionId,
+    sessionLeaseToken: explicitLease.sessionLeaseToken,
+  });
+
+  const repeatLease = await acquireLease(populatedProject);
+  const repeatedUpdate = await runDecision(repeatLease, 'autonomous', 'autonomous_auto_apply', {
+    userRequest: populatedPrompt,
+    targetWorkspace: populatedWorkspaceRoot,
+    expectEmptyBeforeApproval: false,
+    expectNoChanges: true,
+  });
+  assert.equal(repeatedUpdate.result.outcome, 'SUCCESS', `${JSON.stringify(repeatedUpdate.result)}\n${childOutput}`);
+  assert.equal(repeatedUpdate.result.codeApplied, false, JSON.stringify(repeatedUpdate.result));
+  assert.equal(repeatedUpdate.result.codeVerified, true, JSON.stringify(repeatedUpdate.result));
+  assert.equal(repeatedUpdate.result.noChangesRequired, true, JSON.stringify(repeatedUpdate.result));
+  assert.doesNotMatch(JSON.stringify(repeatedUpdate), /Patch context does not match/);
+  await brokerFetch('/v1/sessions/release', {
+    brokerSessionId: repeatLease.brokerSessionId,
+    sessionLeaseToken: repeatLease.sessionLeaseToken,
+  });
+  console.log('Populated Windows-style stub workspace passed explicit approval and repeated autonomous workflows through /v1/workflows.');
   console.log('Standalone broker host integration passed (production developerAgent proposal, inline reject/approve, materialization, and verification; backend policy/registry endpoints are isolated fixtures).');
 } finally {
   if (child && child.exitCode === null) {

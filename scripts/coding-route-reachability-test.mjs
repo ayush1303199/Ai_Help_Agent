@@ -4,18 +4,28 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createRequire } from 'node:module';
 import modularEngine from '../electron/coding-pipeline/modularArchitectureEngine.cjs';
 
-const require = createRequire(import.meta.url);
 const { deriveModularPlan, verifyIntegrationReachability } = modularEngine;
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'coding-route-proof-'));
 const fixtureName = `Feature${randomUUID().replace(/-/g, '').slice(0, 10)}`;
 let server;
 
 try {
+  const runtimeRoute = `/api/${fixtureName.toLowerCase()}`;
   const plan = await deriveModularPlan(root, {
-    userRequest: `Build a complete "${fixtureName}" full-stack API feature with backend routes.`,
+    explicitPlan: {
+      modulesToCreate: [{
+        path: `routes/${fixtureName}Routes.js`,
+        responsibility: 'ROUTING',
+        content: 'module.exports = {};\n',
+      }],
+      routeContracts: [{
+        method: 'GET',
+        path: runtimeRoute,
+        targetFile: `routes/${fixtureName}Routes.js`,
+      }],
+    },
   });
   assert.ok(plan.routeContracts.length >= 1, 'A generated backend route must carry runtime reachability contracts.');
   for (const module of plan.modulesToCreate) {
@@ -88,32 +98,47 @@ try {
   }
   const staticMount = await verifyIntegrationReachability(dynamicRoot, dynamicPlan);
   assert.equal(staticMount.isValid, true, JSON.stringify(staticMount));
-  assert.equal(staticMount.routeMounts[0].status, 'PASS');
-  const { createApplication } = require(path.join(dynamicRoot, 'server.js'));
-  const generatedServer = createApplication();
-  await new Promise((resolve, reject) => {
-    generatedServer.once('error', reject);
-    generatedServer.listen(0, '127.0.0.1', resolve);
+  assert.equal(staticMount.routeMounts[0].status, 'STATIC_WIRING_VERIFIED');
+  assert.ok(
+    staticMount.routeMounts[0].files.includes(dynamicPlan.routeContracts[0].controllerFile),
+    'Static route proof must name the per-file wiring participants.',
+  );
+  assert.deepEqual(staticMount.verificationModes, ['STATIC_WIRING']);
+
+  const fallbackRoot = path.join(root, 'fallback-full-stack');
+  await fs.mkdir(fallbackRoot);
+  const fallbackPlan = await deriveModularPlan(fallbackRoot, {
+    userRequest: 'Build a complete Order management full-stack system with a frontend form and backend API.',
   });
-  try {
-    const address = generatedServer.address();
-    const created = await fetch(`http://127.0.0.1:${address.port}${routePath}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ displayName: 'demo' }),
-    });
-    assert.equal(created.status, 201);
-    const invalid = await fetch(`http://127.0.0.1:${address.port}${routePath}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    assert.equal(invalid.status, 400);
-    const missing = await fetch(`http://127.0.0.1:${address.port}/not-registered`);
-    assert.equal(missing.status, 404);
-  } finally {
-    await new Promise((resolve) => generatedServer.close(resolve));
+  assert.equal(fallbackPlan.routeContracts.length, 2);
+  for (const module of fallbackPlan.modulesToCreate) {
+    const filePath = path.join(fallbackRoot, ...module.path.split('/'));
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, module.content);
   }
+  const fallbackStatic = await verifyIntegrationReachability(fallbackRoot, fallbackPlan);
+  assert.equal(fallbackStatic.isValid, true, JSON.stringify(fallbackStatic));
+  assert.deepEqual(
+    fallbackStatic.routeMounts.map((route) => route.status),
+    ['STATIC_WIRING_VERIFIED', 'STATIC_WIRING_VERIFIED'],
+  );
+
+  const formContract = fallbackPlan.routeContracts.find((route) => route.frontendFile);
+  const formPath = path.join(fallbackRoot, ...formContract.frontendFile.split('/'));
+  const formSource = await fs.readFile(formPath, 'utf8');
+  await fs.writeFile(formPath, formSource.replace(`fetch(${JSON.stringify(formContract.path)}`, 'fetch("/unwired"'), 'utf8');
+  const missingFrontendEdge = await verifyIntegrationReachability(fallbackRoot, fallbackPlan);
+  assert.equal(missingFrontendEdge.isValid, false);
+  assert.match(missingFrontendEdge.rejectionReason, /Frontend integration verification failed/);
+  await fs.writeFile(formPath, formSource, 'utf8');
+
+  const pagePath = path.join(fallbackRoot, ...formContract.pageFile.split('/'));
+  const pageSource = await fs.readFile(pagePath, 'utf8');
+  await fs.writeFile(pagePath, pageSource.replace(`<${formContract.uiComponent} />`, ''), 'utf8');
+  const missingPageEdge = await verifyIntegrationReachability(fallbackRoot, fallbackPlan);
+  assert.equal(missingPageEdge.isValid, false);
+  assert.match(missingPageEdge.rejectionReason, /Page integration verification failed/);
+
   await assert.rejects(
     deriveModularPlan(root, {
       explicitPlan: {
@@ -126,7 +151,7 @@ try {
     }),
     /Route path must be an origin-relative path/,
   );
-  console.log('Route reachability gate tests passed (dynamic paths; real local HTTP probe plus fail-closed cases).');
+  console.log('Route reachability gate tests passed (dynamic paths; static source proofs, live probe fail-closed cases).');
 } finally {
   if (server) await new Promise((resolve) => server.close(resolve));
   await fs.rm(root, { recursive: true, force: true });

@@ -67,4 +67,27 @@ export default defineConfig(({ command }) => ({
   optimizeDeps: {
     exclude: ['lucide-react'],
   },
+  build: {
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              debugName: 'package-vendor-chunks',
+              name: (moduleId) => {
+                const packageName = moduleId.replace(/\\/g, '/')
+                  .match(/\/node_modules\/((?:@[^/]+\/)?[^/]+)/)?.[1];
+                return packageName
+                  ? `vendor-${packageName.replace(/^@/, '').replace(/\//g, '-')}`
+                  : null;
+              },
+              test: /node_modules[\\/]/,
+              minSize: 20 * 1024,
+              maxSize: 450 * 1024,
+            },
+          ],
+        },
+      },
+    },
+  },
 }));

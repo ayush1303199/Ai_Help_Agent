@@ -1413,13 +1413,228 @@ Add a frontend form with loading, success, and error states.`;
   assert.equal(greenfieldResult.outcome, 'SUCCESS', JSON.stringify(greenfieldResult));
   assert.equal(greenfieldResult.codeApplied, true, 'A syntactically mounted dynamic route plan should apply.');
   assert.equal(greenfieldResult.codeVerified, true, 'The generated route and module graph must pass verification.');
+  assert.deepEqual(greenfieldResult.integrationVerification.verificationModes, ['STATIC_WIRING']);
+  assert.equal(greenfieldResult.hermeticVerification.status, 'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED');
+  assert.equal(greenfieldResult.hermeticVerification.passed, 5);
+  assert.equal(greenfieldResult.hermeticVerification.total, 5);
+  assert.equal(greenfieldResult.hostExecution?.status, 'SKIPPED_ISOLATION_UNAVAILABLE');
+  assert.equal(
+    greenfieldResult.workflowReceipt.verificationReport.integrationVerification.liveProbePerformed,
+    false,
+    'Static source integration must not be reported as live route reachability.',
+  );
+  assert.match(greenfieldResult.message, /live route reachability was not probed/i);
   const greenfieldFiles = await listFilesRecursively(greenfieldProject);
-  assert.ok(greenfieldFiles.some((file) => file.endsWith('Schema.js')));
+  assert.ok(greenfieldFiles.includes(path.join('models', 'Order.js')));
   assert.ok(greenfieldFiles.some((file) => file.endsWith('Controller.js')));
-  assert.ok(greenfieldFiles.some((file) => file.endsWith('Routes.js')));
+  assert.ok(greenfieldFiles.includes(path.join('routes', 'orders.js')));
   assert.ok(greenfieldFiles.includes('server.js'));
   assert.ok(greenfieldFiles.some((file) => file.endsWith('Form.jsx')));
+  assert.ok(greenfieldFiles.includes('package.json'));
+  assert.ok(greenfieldFiles.includes('.env.example'));
+  assert.ok(greenfieldFiles.includes('README.md'));
+  assert.equal(greenfieldResult.workflowReceipt.verificationReport.hermeticVerification.passed, 5);
+  assert.match(greenfieldResult.message, /Approved files: .*package\.json/);
+  assert.match(greenfieldResult.message, /run `npm start` from the project root/);
+  assert.match(greenfieldResult.message, /did not run project commands/);
   console.log('TEST 19 PASSED: Dynamic full-stack schema, route, server mount, and UI modules apply and verify.');
+
+  // TEST 20: The generalized greenfield CRUD scaffold is wired without executing generated code.
+  const fallbackProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-greenfield-fallback-'));
+  projectRoots.add(fallbackProject);
+  await invokeIpc('developer:project-attach', sender, { projectRoot: fallbackProject });
+  dialogResponses.push(1);
+  const fallbackResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: `Act as an expert Full-Stack Developer. Build a complete 'Add Order' feature with a frontend form and backend API.
+Create an Order Model/Schema and a POST endpoint /api/orders with input validation.
+Include basic input validation and proper error handling (try-catch, status codes like 201, 400, 500).
+Create a page/component and display success or error toast/messages accordingly.`,
+    scope: '.',
+  });
+  assert.notEqual(fallbackResult.outcome, 'INVESTIGATION_INCOMPLETE');
+  assert.equal(fallbackResult.outcome, 'SUCCESS', JSON.stringify(fallbackResult));
+  assert.deepEqual(fallbackResult.integrationVerification.verificationModes, ['STATIC_WIRING']);
+  assert.equal(
+    fallbackResult.integrationVerification.routeMounts.some((route) => route.status !== 'STATIC_WIRING_VERIFIED'),
+    false,
+  );
+  const fallbackFiles = await listFilesRecursively(fallbackProject);
+  assert.ok(fallbackFiles.includes('server.js'));
+  const normalizedFallbackFiles = fallbackFiles.map((file) => file.split(/[\\/]/).join('/'));
+  assert.ok(normalizedFallbackFiles.includes('routes/orders.js'));
+  assert.ok(normalizedFallbackFiles.includes('components/OrderForm.jsx'));
+  assert.ok(normalizedFallbackFiles.includes('pages/OrderPage.jsx'));
+  console.log('TEST 20 PASSED: Generalized full-stack routes are statically wired and the workflow reports no live probe.');
+
+  const typoGreenfieldProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-greenfield-typo-'));
+  projectRoots.add(typoGreenfieldProject);
+  await invokeIpc('developer:project-attach', sender, { projectRoot: typoGreenfieldProject });
+  dialogResponses.push(1);
+  const typoGreenfieldResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: `ct as an expert Full-Stack Developer. Build a complete 'Add Order' feature with a frontend form and backend API.
+Create an Order Model/Schema and a POST endpoint /api/orders with input validation.
+Include basic input validation and proper error handling (try-catch, status codes like 201, 400, 500).
+Create a page/component and display success or error toast/messages accordingly.`,
+    scope: '.',
+  });
+  assert.notEqual(typoGreenfieldResult.outcome, 'INVESTIGATION_INCOMPLETE');
+  assert.equal(typoGreenfieldResult.outcome, 'SUCCESS', JSON.stringify(typoGreenfieldResult));
+  assert.equal(typoGreenfieldResult.codeApplied, true);
+  assert.ok((await listFilesRecursively(typoGreenfieldProject)).length > 0);
+  console.log('TEST 21 PASSED: Leading typo and error-handling requirements still route greenfield creation to proposal synthesis.');
+
+  const populatedCreationProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-populated-creation-'));
+  projectRoots.add(populatedCreationProject);
+  await fs.mkdir(path.join(populatedCreationProject, 'src'), { recursive: true });
+  await fs.writeFile(path.join(populatedCreationProject, 'package.json'), JSON.stringify({ name: 'existing-app' }), 'utf8');
+  await fs.writeFile(
+    path.join(populatedCreationProject, 'index.js'),
+    'const existingBehavior = true;\nmodule.exports = { existingBehavior };\n',
+    'utf8',
+  );
+  await fs.writeFile(path.join(populatedCreationProject, 'server.js'), '// TODO: connect application routes\n', 'utf8');
+  await fs.writeFile(path.join(populatedCreationProject, 'src', 'existing.js'), 'module.exports = true;\n', 'utf8');
+  const populatedFilesBefore = (await listFilesRecursively(populatedCreationProject)).sort();
+  const approvalsBeforePopulatedRequest = inlineApprovalRequests.length;
+  await invokeIpc('developer:project-attach', sender, { projectRoot: populatedCreationProject });
+  dialogResponses.push(1);
+  const populatedCreationResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: `Act as an expert full-stack developer. Build a complete feature with a model, POST endpoint, and form component.
+ Include proper error handling (try-catch, status codes 201, 400, 500), input validation, and success or error messages.`,
+    scope: '.',
+  });
+  assert.notEqual(populatedCreationResult.outcome, 'INVESTIGATION_INCOMPLETE');
+  assert.equal(populatedCreationResult.outcome, 'SUCCESS', JSON.stringify(populatedCreationResult));
+  assert.equal(populatedCreationResult.codeApplied, true);
+  assert.equal(populatedCreationResult.codeVerified, true);
+  assert.equal(populatedCreationResult.hostExecution?.status, 'SKIPPED_ISOLATION_UNAVAILABLE');
+  assert.equal(populatedCreationResult.workflowReceipt.verificationReport.verificationMode, 'STATIC_ONLY');
+  assert.doesNotMatch(populatedCreationResult.message, /all checks passed/i);
+  assert.ok(inlineApprovalRequests.length > approvalsBeforePopulatedRequest, 'The request must reach the proposal approval UI.');
+  assert.ok((await listFilesRecursively(populatedCreationProject)).length > populatedFilesBefore.length);
+  assert.match(await fs.readFile(path.join(populatedCreationProject, 'index.js'), 'utf8'), /existingBehavior/);
+  console.log('TEST 22 PASSED: Approved modular creation uses disk-backed verification without running project commands when isolation is unavailable.');
+
+  const populatedStubProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-populated-stubs-'));
+  projectRoots.add(populatedStubProject);
+  const populatedStubFiles = {
+    'package.json': JSON.stringify({ name: 'populated-stub-project', type: 'commonjs' }),
+    'index.js': 'const existingBehavior = true;\nmodule.exports = { existingBehavior };\n',
+    'server.js': '// TODO: connect application routes\n',
+    'models/subscriptionSchema.js': '// TODO: define subscription fields\n',
+    'controllers/subscriptionController.js': '// TODO: handle requests\n',
+    'routes/subscriptionRoutes.js': '// TODO: register routes\n',
+    'components/SubscriptionForm.jsx': 'export default function SubscriptionForm() { return null; }\n',
+    'pages/SubscriptionPage.jsx': 'export default function SubscriptionPage() { return null; }\n',
+  };
+  for (const [relative, content] of Object.entries(populatedStubFiles)) {
+    const target = path.join(populatedStubProject, relative);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, content, 'utf8');
+  }
+  const preservedEntrypoint = await fs.readFile(path.join(populatedStubProject, 'index.js'), 'utf8');
+  await invokeIpc('developer:project-attach', sender, { projectRoot: populatedStubProject });
+  dialogResponses.push(1);
+  const populatedStubResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: `Build a complete full-stack subscription feature with a frontend form and backend API.
+Create a POST endpoint /api/subscriptions.
+Fields:
+- customerName: string (required)
+- items: [{ sku: string, quantity: number, unitPrice: number }]
+- totalAmount: number
+Create a page and form component with success and error messages.`,
+    scope: '.',
+  });
+  assert.equal(populatedStubResult.outcome, 'SUCCESS', JSON.stringify(populatedStubResult));
+  assert.equal(populatedStubResult.codeApplied, true);
+  assert.equal(populatedStubResult.codeVerified, true);
+  assert.deepEqual(populatedStubResult.integrationVerification.verificationModes, ['STATIC_WIRING']);
+  assert.equal(populatedStubResult.workflowReceipt.verificationReport.integrationVerification.liveProbePerformed, false);
+  assert.equal(populatedStubResult.workflowReceipt.verificationReport.verificationMode, 'STATIC_ONLY');
+  assert.equal(
+    populatedStubResult.hostExecution?.status,
+    'SKIPPED_ISOLATION_UNAVAILABLE',
+    'Static verification must not claim host project commands were run when isolation is unavailable.',
+  );
+  assert.equal(await fs.readFile(path.join(populatedStubProject, 'index.js'), 'utf8'), preservedEntrypoint);
+  assert.match(await fs.readFile(path.join(populatedStubProject, 'models', 'subscriptionSchema.js'), 'utf8'), /function validate/);
+  assert.match(await fs.readFile(path.join(populatedStubProject, 'routes', 'subscriptionRoutes.js'), 'utf8'), /registerRoutes/);
+  assert.match(await fs.readFile(path.join(populatedStubProject, 'components', 'SubscriptionForm.jsx'), 'utf8'), /api\/subscriptions/);
+  console.log('TEST 23 PASSED: Approved placeholder upgrades apply and pass static wiring while host commands remain isolation-gated.');
+
+  const partialOrderProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-partial-order-scaffold-'));
+  projectRoots.add(partialOrderProject);
+  await fs.mkdir(path.join(partialOrderProject, 'utils'), { recursive: true });
+  await fs.mkdir(path.join(partialOrderProject, 'services'), { recursive: true });
+  await fs.writeFile(
+    path.join(partialOrderProject, 'server.js'),
+    "const { executeFeature } = require('./services/featureService');\n",
+    'utf8',
+  );
+  await fs.writeFile(path.join(partialOrderProject, 'utils', 'sharedUtils.js'), 'module.exports = {};\n', 'utf8');
+  await fs.writeFile(path.join(partialOrderProject, 'services', 'featureService.js'), 'module.exports = {};\n', 'utf8');
+  await invokeIpc('developer:project-attach', sender, { projectRoot: partialOrderProject });
+  dialogResponses.push(1);
+  const partialOrderResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: `Act as an expert Full-Stack Developer. Build a complete 'Add Order' feature.
+Create an Order Model/Schema and a POST endpoint /api/orders.
+Fields:
+- customerName: string (required)
+- items: [{ itemName: string, quantity: number, price: number }]
+- totalPrice: number (auto calculated)
+- status: string (default: "Pending")
+- createdAt: date
+Create a Next.js App Router page and React form component with Tailwind CSS, dynamic item rows, and success/error messages.`,
+    scope: '.',
+  });
+  assert.equal(partialOrderResult.outcome, 'SUCCESS', JSON.stringify(partialOrderResult));
+  assert.equal(partialOrderResult.codeApplied, true);
+  assert.equal(partialOrderResult.codeVerified, true);
+  assert.equal(partialOrderResult.hermeticVerification.passed, 5, JSON.stringify(partialOrderResult.hermeticVerification));
+  assert.equal(partialOrderResult.hermeticVerification.total, 5);
+  const partialOrderGenerated = await listFilesRecursively(partialOrderProject);
+  for (const requiredPath of [
+    'server.js',
+    'package.json',
+    '.env.example',
+    'README.md',
+    path.join('config', 'db.js'),
+    path.join('models', 'Order.js'),
+    path.join('controllers', 'orderController.js'),
+    path.join('routes', 'orders.js'),
+    path.join('components', 'OrderForm.jsx'),
+    path.join('app', 'orders', 'page.jsx'),
+  ]) {
+    assert.ok(partialOrderGenerated.includes(requiredPath), `Partial workspace execution must create ${requiredPath}.`);
+  }
+  assert.doesNotMatch(await fs.readFile(path.join(partialOrderProject, 'server.js'), 'utf8'), /featureService/);
+  assert.match(await fs.readFile(path.join(partialOrderProject, 'models', 'Order.js'), 'utf8'), /totalPrice/);
+  assert.match(await fs.readFile(path.join(partialOrderProject, 'models', 'Order.js'), 'utf8'), /itemName/);
+  assert.match(await fs.readFile(path.join(partialOrderProject, 'routes', 'orders.js'), 'utf8'), /\/api\/orders/);
+  assert.match(await fs.readFile(path.join(partialOrderProject, 'components', 'OrderForm.jsx'), 'utf8'), /space-y-4/);
+  console.log('TEST 23B PASSED: One-file partial workspace upgrades to the complete Order module set and verifies all five gates.');
+
+  const substantiveProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-substantive-target-'));
+  projectRoots.add(substantiveProject);
+  await fs.writeFile(path.join(substantiveProject, 'package.json'), JSON.stringify({ name: 'substantive-project' }), 'utf8');
+  await fs.writeFile(path.join(substantiveProject, 'index.js'), 'const existingBehavior = true;\nmodule.exports = { existingBehavior };\n', 'utf8');
+  const substantiveFilesBefore = (await listFilesRecursively(substantiveProject)).sort();
+  await invokeIpc('developer:project-attach', sender, { projectRoot: substantiveProject });
+  const substantiveResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: `Build a complete full-stack subscription feature with a form and backend API.
+Create a POST endpoint /api/subscriptions.
+Fields:
+- customerName: string (required)
+- items: [{ sku: string, quantity: number }]
+Create a page component.`,
+    scope: '.',
+  });
+  assert.equal(substantiveResult.outcome, 'CLARIFICATION_REQUIRED', JSON.stringify(substantiveResult));
+  assert.equal(substantiveResult.codeApplied, false);
+  assert.equal(substantiveResult.codeVerified, false);
+  assert.match(substantiveResult.clarificationPrompt, /index\.js/);
+  assert.deepEqual((await listFilesRecursively(substantiveProject)).sort(), substantiveFilesBefore);
+  console.log('TEST 24 PASSED: Substantive target files require a clear integration decision before proposal generation or writes.');
 
     console.log('Deterministic real-request IPC integration verified; relevance responses are test fixtures, not live-provider evidence.');
 } finally {

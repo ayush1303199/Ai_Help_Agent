@@ -300,7 +300,7 @@ interface Window {
     registerDeveloperMutationConnection: (connectionId: string) => Promise<{ registered: boolean }>;
     attachDeveloperProject: (projectRoot: string) => Promise<{ status: string; projectRoot: string | null; reason?: string | null }>;
     clearDeveloperProject: () => Promise<void>;
-    listDeveloperDirectory: (relativePath?: string) => Promise<Array<{ name: string; type: 'file' | 'directory' }>>;
+    listDeveloperDirectory: (relativePath?: string) => Promise<Array<{ name: string; type: 'file' | 'directory'; size?: number }>>;
     readDeveloperFile: (relativePath: string) => Promise<{ path: string; content: string }>;
     searchDeveloperCode: (query: string, scope?: string) => Promise<{ query: string; scope?: string; results: Array<{ path: string; line: number; text: string; matchType: 'filename' | 'content' | 'scope-fallback' }>; filesVisited: number; truncated: boolean }>;
     buildDeveloperIndex: () => Promise<{ capabilities: { parser: string; typeResolution: boolean; guaranteedCallGraph: boolean; supportedExtensions: string[] }; files: string[]; cacheHits: number }>;
@@ -401,6 +401,79 @@ interface Window {
       codeApplied?: boolean;
       codeVerified?: boolean;
       verificationStatus?: string;
+      hostExecution?: { status: string; reason: string | null } | null;
+      workflowReceipt?: {
+        verificationReport?: {
+          verificationMode?: string;
+          hostExecution?: { status: string; reason: string | null } | null;
+          integrationVerification?: {
+            status?: string;
+            liveProbePerformed?: boolean;
+            verificationModes?: string[];
+            hermeticVerification?: {
+              status: string;
+              passed: number;
+              total: number;
+              gates: Array<{ id: string; passed: boolean; evidence: unknown }>;
+            } | null;
+            syntaxChecks?: Array<{
+              path: string;
+              status: string;
+              parser: string | null;
+              reason: string | null;
+            }>;
+            routeMounts?: Array<{
+              method: string;
+              path: string;
+              files?: string[];
+              verificationType: string;
+              status: string;
+            }>;
+          } | null;
+          hermeticVerification?: {
+          status: string;
+          passed: number;
+          total: number;
+          gates: Array<{ id: string; passed: boolean; evidence: unknown }>;
+          } | null;
+        };
+      };
+      integrationVerification?: {
+        isValid: boolean;
+        verificationModes?: string[];
+        hermeticVerification?: {
+          status: string;
+          passed: number;
+          total: number;
+          gates: Array<{ id: string; passed: boolean; evidence: unknown }>;
+        } | null;
+        syntaxChecks?: Array<{
+          path: string;
+          status: string;
+          parser: string | null;
+          reason: string | null;
+        }>;
+        routeMounts?: Array<{
+          method: string;
+          path: string;
+          files?: string[];
+          verificationType: string;
+          status: string;
+        }>;
+        rejectionReason?: string | null;
+      } | null;
+      hermeticVerification?: {
+        status: string;
+        passed: number;
+        total: number;
+        gates: Array<{ id: string; passed: boolean; evidence: unknown }>;
+        syntaxFailures?: Array<{
+          path: string;
+          status?: string;
+          parser?: string | null;
+          reason?: string | null;
+        }>;
+      } | null;
       rollbackFailed?: boolean;
       error?: string;
       reason?: string;
@@ -448,6 +521,12 @@ interface Window {
         }>;
       };
       clarificationPrompt?: string;
+      workspaceInspection?: {
+        targets?: Array<{ path: string; classification: string }>;
+        inspectedFiles?: string[];
+        entriesScanned?: number;
+        truncated?: boolean;
+      };
       continuation?: Record<string, unknown>;
       worktreeAudit?: Record<string, unknown>;
     }>;

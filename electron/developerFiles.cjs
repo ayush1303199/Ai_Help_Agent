@@ -652,10 +652,17 @@ async function listDirectory(relativePath = '.', ownerWebContentsId) {
   const stat = await fs.stat(target);
   if (!stat.isDirectory()) throw new Error('The requested path is not a directory.');
   const entries = await fs.readdir(target, { withFileTypes: true });
-  const result = entries
+  const result = await Promise.all(entries
     .filter((entry) => !isIgnoredName(entry.name) && !isSensitivePath(entry.name))
-    .map((entry) => ({ name: entry.name, type: entry.isDirectory() ? 'directory' : 'file' }))
-    .sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
+    .map(async (entry) => {
+      const isDirectory = entry.isDirectory();
+      const item = { name: entry.name, type: isDirectory ? 'directory' : 'file' };
+      if (!isDirectory && entry.isFile()) {
+        item.size = (await fs.stat(path.join(target, entry.name))).size;
+      }
+      return item;
+    }));
+  result.sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
   await appendAudit(root, 'list_directory', relativePath, 'success');
   return result;
 }

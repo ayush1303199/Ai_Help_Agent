@@ -82,6 +82,40 @@ const patchWhitespace = [
 ];
 const patchedCrlf = agent.applyFilePatch(originalCrlf, patchWhitespace);
 assert.equal(patchedCrlf, 'first line  \r\nsecond line modified\r\nthird line\r\n', 'CRLF and trailing whitespace tolerance should be respected');
+const replacementCrlf = 'const first = true;\r\n-- preserved marker\r\nconst last = true;\r\n';
+const replacementPatch = [
+  '--- a/source.js',
+  '+++ b/source.js',
+  '@@ -1,3 +1,3 @@',
+  '-const first = true;',
+  '--- preserved marker',
+  '-const last = true;',
+  '+const first = false;',
+  '++++ preserved marker',
+  '+const last = false;',
+];
+const parsedReplacementPatch = agent.parsePatch(replacementPatch.join('\n'));
+assert.equal(parsedReplacementPatch.length, 1, 'Hunk content that resembles a file header must stay inside the current file patch.');
+assert.deepEqual(
+  agent.applyFilePatch(replacementCrlf, parsedReplacementPatch[0].lines),
+  'const first = false;\r\n+++ preserved marker\r\nconst last = false;\r\n',
+  'A CRLF full-file replacement must normalize matching context and preserve the disk newline style.',
+);
+const emptyFilePatch = [
+  '--- a/empty.js',
+  '+++ b/empty.js',
+  '@@ -0,0 +1,2 @@',
+  '+first line',
+  '+second line',
+];
+const parsedEmptyFilePatch = agent.parsePatch(emptyFilePatch.join('\n'));
+assert.equal(parsedEmptyFilePatch.length, 1);
+assert.equal(parsedEmptyFilePatch[0].operation, 'modify');
+assert.equal(
+  agent.applyFilePatch('', parsedEmptyFilePatch[0].lines),
+  'first line\nsecond line\n',
+  'A modify patch with a zero-line source hunk must add content to an existing zero-byte file.',
+);
 
 // 3. Missing target
 const missingTargetPatch = [

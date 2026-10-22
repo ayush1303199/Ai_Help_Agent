@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { runtimeConfig } from '../../config/runtimeConfig';
-import { authenticatedBackendFetch } from '../../config/backendAuth';
 import { ConfirmationDialog } from '../../ui/ConfirmationDialog';
 import { CodingAgentWorkspace } from './CodingAgentWorkspace';
 import { hasProjectContextMismatch } from './projectContext';
+import { codingFetch } from './codingTransport';
 import { useCodingAgentController } from './useCodingAgentController';
 
 export interface CodingHistoryRestoreRequest {
@@ -99,7 +99,7 @@ function normalizeCodingAcceptancePreflight(
       ? 'PROJECT_CONTEXT_MISMATCH'
       : typeof source.projectStatus === 'string' ? source.projectStatus : 'PREFLIGHT_UNVERIFIED',
     projectRoot: reportedProjectRoot,
-    projectIdentity: 'NOT_VERIFIED',
+    projectIdentity: typeof source.projectIdentity === 'string' ? source.projectIdentity : 'NOT_VERIFIED',
     canInspectProject: source.canInspectProject === true && !projectContextMismatch,
     sandbox: {
       available: false,
@@ -134,20 +134,25 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
   const [acceptancePreflight, setAcceptancePreflight] = useState<CodingAcceptancePreflight | null>(null);
   const [acceptancePreflightBusy, setAcceptancePreflightBusy] = useState(false);
   const acceptancePreflightRequest = useRef(false);
+  const acceptancePreflightPending = useRef(false);
+  const refreshAcceptancePreflightRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const lastRestoreKey = useRef<number | null>(null);
   const restoreHistoryRef = useRef(controller.restoreHistory);
   restoreHistoryRef.current = controller.restoreHistory;
   const { workspace } = controller;
 
   const refreshAcceptancePreflight = useCallback(async () => {
-    if (acceptancePreflightRequest.current) return;
+    if (acceptancePreflightRequest.current) {
+      acceptancePreflightPending.current = true;
+      return;
+    }
     acceptancePreflightRequest.current = true;
     setAcceptancePreflightBusy(true);
     try {
       const preflight: unknown = window.electronAPI?.getDeveloperAcceptancePreflight
         ? await window.electronAPI.getDeveloperAcceptancePreflight()
         : await (async () => {
-          const response = await authenticatedBackendFetch(
+          const response = await codingFetch(
             `${runtimeConfig.httpUrl}/api/coding/acceptance-preflight`,
           );
           if (!response.ok) throw new Error(`Readiness endpoint returned HTTP ${response.status}.`);
@@ -179,12 +184,23 @@ export function CodingAgentPage({ active, restoreRequest, onBusyChange }: Coding
     } finally {
       acceptancePreflightRequest.current = false;
       setAcceptancePreflightBusy(false);
+      if (acceptancePreflightPending.current) {
+        acceptancePreflightPending.current = false;
+        window.setTimeout(() => void refreshAcceptancePreflightRef.current(), 0);
+      }
     }
   }, [workspace.projectRoot]);
+  refreshAcceptancePreflightRef.current = refreshAcceptancePreflight;
 
   useEffect(() => {
     if (active) void refreshAcceptancePreflight();
-  }, [active, refreshAcceptancePreflight, workspace.projectStatus]);
+  }, [
+    active,
+    refreshAcceptancePreflight,
+    workspace.appliedPatchLog.length,
+    workspace.brokerStatus,
+    workspace.projectStatus,
+  ]);
 
   useEffect(() => {
     onBusyChange(workspace.streaming);

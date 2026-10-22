@@ -13,6 +13,8 @@ const backendUrl = new URL(process.env.AI_HELP_AGENT_TEST_BACKEND_URL);
 assert.equal(backendUrl.hostname, '127.0.0.1', 'Integration tests require the isolated loopback backend.');
 assert.notEqual(backendUrl.port, '3001', 'Integration tests must not target the live backend port.');
 const backendBaseUrl = backendUrl.origin;
+const codingAuthToken = process.env.AI_CODING_AUTH_TOKEN;
+assert.ok(codingAuthToken, 'The isolated test app must receive its ephemeral backend token.');
 const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'coding-perf-test-'));
 const projectPath = path.join(tempDir, 'ecommerce-store');
 
@@ -51,7 +53,7 @@ class Order {
   console.log('[STEP 1] Attaching project to backend (/api/coding/project-attach)...');
   const attachRes = await fetch(`${backendBaseUrl}/api/coding/project-attach`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Coding-Auth': codingAuthToken },
     body: JSON.stringify({ projectRoot: projectPath }),
   });
   assert.equal(attachRes.ok, true);

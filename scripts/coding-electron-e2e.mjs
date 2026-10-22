@@ -312,29 +312,35 @@ async function run() {
   assert.equal(path.resolve(projectState.projectRoot), workspaceRoot, 'Electron must bind this renderer to the disposable workspace.');
 
   const prompt = 'Create a small modular software project with a reusable core module, a configuration module, and an entry point that connects them. Provide clean, modular code snippets.';
-  try {
-    await waitFor(
-      () => devTools.evaluate(`document.readyState === 'complete' && document.querySelectorAll('button').length > 0`),
-      'Electron renderer UI initialization',
-    );
-  } catch (error) {
-    const rendererState = await devTools.evaluate(`({
-      readyState: document.readyState,
-      buttonCount: document.querySelectorAll('button').length,
-      body: document.body?.innerText?.slice(-2000) || '',
-      href: location.href
-    })`);
-    throw new Error(`${error.message} Renderer state: ${JSON.stringify(rendererState)}. Process output: ${JSON.stringify(outputs)}`);
+  if (!isBrokerScenario) {
+    try {
+      await waitFor(
+        () => devTools.evaluate(`document.readyState === 'complete' && document.querySelectorAll('button').length > 0`),
+        'Electron renderer UI initialization',
+      );
+    } catch (error) {
+      const rendererState = await devTools.evaluate(`({
+        readyState: document.readyState,
+        buttonCount: document.querySelectorAll('button').length,
+        body: document.body?.innerText?.slice(-2000) || '',
+        href: location.href
+      })`);
+      throw new Error(`${error.message} Renderer state: ${JSON.stringify(rendererState)}. Process output: ${JSON.stringify(outputs)}`);
+    }
   }
   let instrumentation = { developerButtonFound: false, buttonLabels: [], bodyText: '' };
   if (isBrokerScenario) {
-    const backendAttachment = await fetch(new URL('/api/coding/project-attach', apiUrl), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Coding-Auth': authToken },
-      body: JSON.stringify({ projectRoot: workspaceRoot }),
-    });
-    const attached = await backendAttachment.json();
-    assert.equal(backendAttachment.status, 200, JSON.stringify(attached));
+    const attachment = await devTools.evaluate(`(async () => {
+      const { codingFetch } = await import('/src/features/coding/codingTransport.ts');
+      const response = await codingFetch(${JSON.stringify(new URL('/api/coding/project-attach', apiUrl))}, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectRoot: ${JSON.stringify(workspaceRoot)} }),
+      });
+      return { status: response.status, payload: await response.json() };
+    })()`);
+    const attached = attachment.payload;
+    assert.equal(attachment.status, 200, JSON.stringify(attached));
     assert.equal(attached.status, 'PROJECT_ATTACHED');
     if (scenario === 'broker-recovery-once') {
       const resetRegistry = await fetch(new URL('/api/coding/broker/register', apiUrl), {
@@ -351,10 +357,16 @@ async function run() {
     const brokerStarted = await devTools.evaluate(`(async () => {
       const { executeTrustedBrokerWorkflow } = await import('/src/features/coding/codingTransport.ts');
       window.__brokerAbortController = new AbortController();
+      window.__brokerPendingApproval = null;
+      window.__brokerApprovalAction = null;
       window.__brokerWorkflowPromise = executeTrustedBrokerWorkflow(
         ${JSON.stringify(prompt)},
         '.',
         window.__brokerAbortController.signal,
+        (approval, actions) => {
+          window.__brokerPendingApproval = approval;
+          window.__brokerApprovalAction = actions.approve;
+        },
       ).then((result) => {
         window.__brokerWorkflowResult = result;
         return result;
@@ -444,34 +456,31 @@ async function run() {
       throw new Error(`${error.message} Inline decision state: ${JSON.stringify(state)}.`);
     }
   } else {
-    approvalEvidence = await waitFor(async () => {
-      const evidence = await readApprovalEvidence();
-      if (evidence) return evidence;
-      if (isBrokerScenario) {
-      const browserState = await devTools.evaluate(`({
-        error: window.__brokerWorkflowError || null,
-        result: window.__brokerWorkflowResult?.outcome || null,
-        body: document.body.innerText.slice(-1200)
-      })`);
-      if (browserState.error) {
-        const endpoint = browserState.error.match(/at (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
-        let preflight = 'not available';
-        if (endpoint) {
-          const response = await fetch(new URL('/v1/sessions', endpoint), {
-            method: 'OPTIONS',
-            headers: {
-              Origin: devServerUrl,
-              'Access-Control-Request-Method': 'POST',
-              'Access-Control-Request-Headers': 'content-type',
-            },
-          });
-          preflight = `${response.status} ${JSON.stringify(Object.fromEntries(response.headers.entries()))}`;
-        }
-        throw new Error(`Browser broker workflow failed: ${browserState.error}; preflight=${preflight}`);
-      }
-      }
-      return null;
-    }, 'proposal reaching the Electron workflow approval boundary');
+    if (isBrokerScenario) {
+      const pendingApproval = await waitFor(async () => {
+        const state = await devTools.evaluate(`({
+          error: window.__brokerWorkflowError || null,
+          approval: window.__brokerPendingApproval || null
+        })`);
+        if (state.error) throw new Error(`Browser broker workflow failed: ${state.error}`);
+        return state.approval;
+      }, 'browser broker proposal awaiting explicit approval');
+      approvalEvidence = {
+        scope: '.',
+        workflowRequestId: pendingApproval.workflowRequestId,
+        projectRoot: workspaceRoot,
+        files: pendingApproval.fileOperations.map((file) => file.path),
+        status: 'AWAITING_TEST_DECISION',
+      };
+      assert.ok(approvalEvidence.workflowRequestId, 'The browser proposal must correlate to its broker workflow request.');
+      assert.ok(approvalEvidence.files.length > 0, 'The browser proposal must contain at least one file operation.');
+    } else {
+      approvalEvidence = await waitFor(async () => {
+        const evidence = await readApprovalEvidence();
+        if (evidence) return evidence;
+        return null;
+      }, 'proposal reaching the Electron workflow approval boundary');
+    }
   }
   assert.equal(approvalEvidence.scope, '.');
   assert.ok(approvalEvidence.workflowRequestId, 'The approved workflow must be correlated to its renderer request.');
@@ -486,10 +495,21 @@ async function run() {
     assert.equal(cancelAccepted, true, 'The active workflow cancellation path must accept the request.');
   } else if (isInlineRejection) {
     cancelAccepted = approvalEvidence.status === 'TEST_REJECTED';
+  } else if (isBrokerScenario) {
+    assert.deepEqual(await fs.readdir(workspaceRoot), [], 'Broker proposals must not write files before approval.');
+    await devTools.evaluate('window.__brokerApprovalAction(false)');
+    approvalEvidence.status = 'TEST_APPROVED';
   }
 
   const result = await waitFor(readWorkflowResult, 'workflow result recorded by Electron main process', 90000);
   assert.ok(approvalEvidence, 'The isolated approval harness must observe the actual proposal decision.');
+  if (isBrokerScenario) {
+    assert.equal(
+      approvalEvidence.workflowRequestId,
+      result.workflowRequestId,
+      'The staged browser proposal must match the completed Electron workflow request.',
+    );
+  }
   assert.equal(approvalEvidence.projectRoot, workspaceRoot);
   assert.ok(approvalEvidence.files.length > 0);
 

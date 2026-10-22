@@ -142,6 +142,29 @@ interface CodingRequestState {
 }
 
 const CODING_WS_URL = runtimeConfig.codingWsUrl;
+const CODING_BROWSER_SESSION_KEY = 'coding-browser-session-v1';
+let codingBrowserSessionId: string | null = null;
+
+export function getCodingBrowserSessionId(): string {
+  if (codingBrowserSessionId) return codingBrowserSessionId;
+  try {
+    const stored = window.localStorage.getItem(CODING_BROWSER_SESSION_KEY);
+    if (stored && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(stored)) {
+      codingBrowserSessionId = stored;
+      return stored;
+    }
+  } catch {
+    // Keep a stable in-memory identity when browser storage is unavailable.
+  }
+  const generated = window.crypto?.randomUUID?.() || globalThis.crypto.randomUUID();
+  codingBrowserSessionId = generated;
+  try {
+    window.localStorage.setItem(CODING_BROWSER_SESSION_KEY, generated);
+  } catch {
+    // This identifier is also retained in memory for the current page lifetime.
+  }
+  return generated;
+}
 
 function isLocalBrowserDevelopment(): boolean {
   return !window.electronAPI
@@ -152,20 +175,41 @@ function isLocalBrowserDevelopment(): boolean {
 
 export async function codingAuthHeaders(): Promise<Record<string, string>> {
   const getToken = window.electronAPI?.getDeveloperBackendAuthToken;
+  const browserSession = getCodingBrowserSessionId();
   if (!getToken) {
-    if (isLocalBrowserDevelopment()) return {};
+    if (isLocalBrowserDevelopment()) return { 'X-Coding-Browser-Session': browserSession };
     throw new Error('Coding Agent backend access is available only through the trusted desktop application.');
   }
   const token = await getToken();
   if (!token) throw new Error('Coding Agent backend authentication is unavailable.');
-  return { 'X-Coding-Auth': token };
+  return {
+    'X-Coding-Auth': token,
+    'X-Coding-Browser-Session': browserSession,
+  };
 }
 
 export async function codingFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   const auth = await codingAuthHeaders();
   if (auth['X-Coding-Auth']) headers.set('X-Coding-Auth', auth['X-Coding-Auth']);
-  return fetch(input, { ...init, headers });
+  headers.set('X-Coding-Browser-Session', auth['X-Coding-Browser-Session']);
+  const method = (init.method || 'GET').toUpperCase();
+  const attempts = method === 'GET' ? 2 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fetch(input, { ...init, headers });
+    } catch (error) {
+      if (attempt + 1 < attempts && error instanceof TypeError) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        continue;
+      }
+      if (error instanceof TypeError) {
+        throw new Error('The Coding Agent backend is not reachable or the browser blocked the request. Check that the backend is running and its CORS origin is configured.');
+      }
+      throw error;
+    }
+  }
+  throw new Error('The Coding Agent backend request failed.');
 }
 
 type DeveloperWorkflowResult = Awaited<
@@ -176,6 +220,7 @@ export interface TrustedBrokerPendingApproval {
   taskId: string;
   proposalId: string;
   proposalDigest: string;
+  workflowRequestId: string;
   approvalNonce: string;
   deleteConfirmationRequired: boolean;
   fileOperations: Array<{
@@ -451,6 +496,7 @@ export async function executeTrustedBrokerWorkflow(
       if (!pendingApproval
         || typeof pendingApproval.taskId !== 'string'
         || typeof pendingApproval.proposalId !== 'string'
+        || typeof pendingApproval.workflowRequestId !== 'string'
         || !/^[a-f0-9]{64}$/i.test(pendingApproval.proposalDigest)
         || typeof pendingApproval.approvalNonce !== 'string'
         || !Array.isArray(pendingApproval.fileOperations)

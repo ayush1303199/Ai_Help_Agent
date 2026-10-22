@@ -58,6 +58,67 @@ const mockSupportedRelevance = async ({ findings }) => ({
 });
 
 try {
+  const creationPrompt = (opening) => `${opening} as an expert Full-Stack Developer. Build a complete 'Add Order' feature.
+Create an Order Model/Schema with customer name and item details.
+Create a POST endpoint /api/orders with input validation.
+Include basic input validation and proper error handling (try-catch, status codes like 201, 400, 500).
+Create a page/component and display success or error toast/messages accordingly.`;
+  for (const prompt of [
+    creationPrompt('Act'),
+    creationPrompt('ct'),
+  ]) {
+    const creationRequirements = analyzeTaskRequirements(prompt);
+    assert.equal(
+      creationRequirements.isModular,
+      true,
+      'Explicit feature/model/endpoint creation must outrank defensive error-handling requirements.',
+    );
+    assert.equal(
+      routeTaskMode({ goal: prompt }).mode,
+      OPERATING_MODES.AUTONOMOUS,
+      'Creation directives inside a role-prefaced request must stay actionable despite error-handling terms.',
+    );
+  }
+  assert.equal(
+    analyzeTaskRequirements('Why does the endpoint fail with an error? Find the root cause without changing files.').isModular,
+    false,
+    'Actual read-only root-cause inquiries must remain on the investigation path.',
+  );
+  assert.equal(
+    routeTaskMode({ goal: 'Why does the endpoint fail with an error? Find the root cause without changing files.' }).mode,
+    OPERATING_MODES.ASK,
+    'Root-cause questions must remain non-actionable rather than being promoted to creation.',
+  );
+  assert.equal(
+    routeTaskMode({
+      goal: 'Build a complete feature with a model and endpoint, including error handling.',
+      userRequestedMode: 'INVESTIGATE',
+    }).mode,
+    OPERATING_MODES.AUTONOMOUS,
+    'Explicit creation must not be diverted into a read-only investigation mode.',
+  );
+  assert.equal(
+    routeTaskMode({
+      goal: 'Build a complete feature with a model and endpoint, without making code changes.',
+      userRequestedMode: 'BUILD',
+    }).mode,
+    OPERATING_MODES.BUILD,
+    'An explicit no-change constraint must preserve the requested non-applying mode.',
+  );
+  assert.equal(
+    routeTaskMode({
+      goal: 'Build a complete feature with a model and endpoint.',
+      userRequestedMode: 'AUDIT',
+    }).mode,
+    OPERATING_MODES.AUDIT,
+    'AUDIT remains read-only even when the goal contains a creation directive.',
+  );
+  assert.equal(
+    analyzeTaskRequirements('Implement:\n- Persist settings.\n- Add API.\n- Add tests.').isModular,
+    false,
+    'A composite implementation handoff must not be collapsed into generic modular synthesis.',
+  );
+
   // Set up mock heterogeneous project fixtures
   const projectModular = path.join(testRoot, 'modular-app');
   const projectPython = path.join(testRoot, 'py-app');

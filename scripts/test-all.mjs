@@ -31,7 +31,7 @@ async function reserveLocalPorts(count, excludedPorts) {
   }
 }
 
-async function waitForBackendServer(url, child, expectedInstanceId, timeoutMs = 20000) {
+async function waitForBackendServer(url, child, expectedInstanceId, timeoutMs = 60000) {
   const startedAt = Date.now();
   let spawnError = null;
   child.once('error', (error) => {
@@ -129,7 +129,40 @@ const testStateDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'ai-help-agen
 const backendInstanceId = randomUUID();
 let backendChild = null;
 let backendClosed = null;
+let activeSuiteChild = null;
 let testFailure = null;
+
+function stopActiveChildren(signal) {
+  if (activeSuiteChild && activeSuiteChild.exitCode === null && activeSuiteChild.signalCode === null) {
+    activeSuiteChild.kill(signal);
+  }
+  if (backendChild && backendChild.exitCode === null && backendChild.signalCode === null) {
+    backendChild.kill(signal);
+  }
+}
+
+const handleInterrupt = () => stopActiveChildren('SIGTERM');
+process.on('SIGINT', handleInterrupt);
+process.on('SIGTERM', handleInterrupt);
+
+function runChildProcess(command, args, options) {
+  if (activeSuiteChild) {
+    return Promise.reject(new Error('A previous test process has not closed.'));
+  }
+  return new Promise((resolve) => {
+    const child = spawn(command, args, options);
+    activeSuiteChild = child;
+    let spawnError = null;
+    child.once('error', (error) => {
+      spawnError = error;
+    });
+    child.once('close', (code, signal) => {
+      if (activeSuiteChild === child) activeSuiteChild = null;
+      resolve({ code: code ?? 1, signal, error: spawnError });
+    });
+  });
+}
+
 function recordTestFailure(error) {
   testFailure = testFailure
     ? new AggregateError([testFailure, error], 'Test execution and cleanup both failed.')
@@ -141,6 +174,7 @@ try {
     new Set([3001, 3002, 3003]),
   );
   const backendBaseUrl = `http://127.0.0.1:${httpPort}`;
+  const codingAuthToken = randomUUID();
   const testEnvironment = { ...process.env };
   for (const name of Object.keys(testEnvironment)) {
     if (sensitiveEnvironmentVariable.test(name)) {
@@ -162,6 +196,7 @@ try {
   testEnvironment.AI_PROVIDER_CONFIG_PATH = path.join(testStateDirectory, 'unit-provider-config.json');
   testEnvironment.AI_HELP_AGENT_TEST_BACKEND_URL = backendBaseUrl;
   testEnvironment.PYTHON_DOTENV_DISABLED = '1';
+  testEnvironment.AI_CODING_AUTH_TOKEN = codingAuthToken;
 
   const backendEnvironment = { ...process.env };
   for (const name of Object.keys(backendEnvironment)) {
@@ -178,6 +213,7 @@ try {
     AI_PROVIDER_CONFIG_PATH: path.join(testStateDirectory, 'provider-config.json'),
     AI_HELP_AGENT_TEST_BACKEND_URL: backendBaseUrl,
     AI_HELP_AGENT_TEST_INSTANCE_ID: backendInstanceId,
+    AI_CODING_AUTH_TOKEN: codingAuthToken,
     PYTHON_DOTENV_DISABLED: '1',
     PYTHONUNBUFFERED: '1',
   });
@@ -199,18 +235,14 @@ try {
     throw new Error(`Isolated test backend failed to start at ${backendBaseUrl}.`);
   }
 
-  const backendResult = await new Promise((resolve) => {
-    const child = spawn('python', ['scripts/backend-services-test.py'], {
+  const backendResult = await runChildProcess('python', ['scripts/backend-services-test.py'], {
       stdio: 'inherit',
       windowsHide: true,
       env: testEnvironment,
     });
-    child.on('error', (error) => resolve({ code: 1, error }));
-    child.on('close', (code) => resolve({ code: code ?? 1 }));
-  });
 
   if (backendResult.code !== 0) {
-    throw new Error(`Test failed: backend-services-test.py (exit ${backendResult.code}).`);
+    throw new Error(`Test failed: backend-services-test.py (exit ${backendResult.code})${backendResult.signal ? `, signal ${backendResult.signal}` : ''}.${backendResult.error ? ` ${backendResult.error.message}` : ''}`);
   }
 
   for (const script of scriptsToRun) {
@@ -228,22 +260,34 @@ try {
         ].includes(script)
         ? ['--experimental-strip-types', path.join('scripts', script)]
         : [path.join('scripts', script)];
-    const result = await new Promise((resolve) => {
-      const child = spawn(isPythonTest ? 'python' : process.execPath, args, {
+    const result = await runChildProcess(isPythonTest ? 'python' : process.execPath, args, {
         stdio: 'inherit',
         windowsHide: true,
         env: testEnvironment,
       });
-      child.on('error', (error) => resolve({ code: 1, error }));
-      child.on('close', (code) => resolve({ code: code ?? 1 }));
-    });
     if (result.code !== 0) {
-      throw new Error(`Test failed: ${script} (exit ${result.code}).`);
+      throw new Error(`Test failed: ${script} (exit ${result.code})${result.signal ? `, signal ${result.signal}` : ''}.${result.error ? ` ${result.error.message}` : ''}`);
     }
   }
 } catch (error) {
   testFailure = error;
 } finally {
+  process.off('SIGINT', handleInterrupt);
+  process.off('SIGTERM', handleInterrupt);
+  if (activeSuiteChild && activeSuiteChild.exitCode === null && activeSuiteChild.signalCode === null) {
+    activeSuiteChild.kill('SIGTERM');
+    const suiteCloseResult = await Promise.race([
+      waitForChildClose(activeSuiteChild),
+      new Promise((resolve) => setTimeout(() => resolve(null), 5000)),
+    ]);
+    if (!suiteCloseResult) {
+      activeSuiteChild.kill('SIGKILL');
+      await Promise.race([
+        waitForChildClose(activeSuiteChild),
+        new Promise((resolve) => setTimeout(() => resolve(null), 5000)),
+      ]);
+    }
+  }
   if (backendChild && (backendChild.exitCode !== null || backendChild.signalCode !== null)) {
     recordTestFailure(new Error(
       `Isolated test backend exited before harness shutdown (code=${backendChild.exitCode}, signal=${backendChild.signalCode}).`,

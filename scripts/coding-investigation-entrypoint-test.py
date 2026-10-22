@@ -1,10 +1,15 @@
 """Production Coding Agent tool-entrypoint regression using an isolated fixture."""
 
+import asyncio
 import sys
 import tempfile
 import unittest
 import errno
+import hashlib
+import json
 from pathlib import Path
+import time
+import uuid
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -17,6 +22,105 @@ import coding_websocket as ws_mod
 
 
 class CodingInvestigationEntrypointTests(unittest.TestCase):
+    def test_broker_workflow_entrypoint_forwards_creation_requirements_unchanged(self):
+        with tempfile.TemporaryDirectory(prefix="coding-creation-entrypoint-") as temp_root:
+            project = Path(temp_root).resolve()
+            browser_session_id = str(uuid.uuid4())
+            project_id = str(uuid.uuid4())
+            broker_session_id = str(uuid.uuid4())
+            root_hash = index_mod._canonical_project_root_hash(str(project))
+            previous_state = index_mod._trusted_desktop_broker_state
+            index_mod._trusted_desktop_broker_state = {
+                "endpoint": "http://127.0.0.1:12345",
+                "projects": [{"projectId": project_id, "rootHash": root_hash}],
+                "browserSessions": {
+                    browser_session_id: {"rootHash": root_hash, "projectRoot": str(project)},
+                },
+                "sessions": {
+                    broker_session_id: {
+                        "projectId": project_id,
+                        "expiresAt": time.time() + 300,
+                        "browserSessionId": browser_session_id,
+                    },
+                },
+            }
+            forwarded = {}
+
+            class BrokerResponse:
+                status_code = 202
+
+                @staticmethod
+                def json():
+                    return {"outcome": "AWAITING_APPROVAL"}
+
+            class BrokerClient:
+                def __init__(self, **_kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return False
+
+                async def post(self, _url, *, json, headers):
+                    forwarded.update(json)
+                    return BrokerResponse()
+
+            async def synchronized(_origin):
+                return None
+
+            prompt = (
+                "Build a complete full-stack feature. Create an entity model and a POST endpoint. "
+                "Include validation and proper error handling (try-catch, status codes 201, 400, 500), "
+                "and show success or error messages."
+            )
+            try:
+                headers = [
+                    (b"origin", next(origin for origin in index_mod.TRUSTED_RENDERER_ORIGINS if origin != "null").encode()),
+                    (b"x-coding-browser-session", browser_session_id.encode()),
+                    (b"x-coding-auth", index_mod.CODING_AUTH_TOKEN.encode()),
+                    (b"content-type", b"application/json"),
+                ]
+                payload = {
+                    "brokerSessionId": broker_session_id,
+                    "sessionLeaseToken": "test-lease",
+                    "userRequest": prompt,
+                    "scope": ".",
+                    "executionMode": "inline_review",
+                }
+                body = json.dumps(payload).encode()
+
+                async def receive():
+                    return {"type": "http.request", "body": body, "more_body": False}
+
+                request = index_mod.Request(
+                    {
+                        "type": "http",
+                        "http_version": "1.1",
+                        "method": "POST",
+                        "scheme": "http",
+                        "path": "/api/coding/broker/workflows",
+                        "raw_path": b"/api/coding/broker/workflows",
+                        "query_string": b"",
+                        "headers": headers,
+                        "client": ("127.0.0.1", 54321),
+                        "server": ("127.0.0.1", 3001),
+                    },
+                    receive,
+                )
+                with patch.object(index_mod, "_synchronize_trusted_desktop_broker", synchronized), patch.object(
+                    index_mod.httpx,
+                    "AsyncClient",
+                    return_value=BrokerClient(),
+                ):
+                    response = asyncio.run(index_mod.proxy_trusted_desktop_broker("workflows", request))
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(forwarded["userRequest"], prompt)
+                self.assertEqual(json.loads(response.body)["outcome"], "AWAITING_APPROVAL")
+            finally:
+                index_mod._trusted_desktop_broker_state = previous_state
+
     def test_tool_request_discovers_and_reads_nonstandard_source_layout(self):
         with tempfile.TemporaryDirectory(prefix="coding-investigation-entrypoint-") as temp_root:
             project = Path(temp_root)

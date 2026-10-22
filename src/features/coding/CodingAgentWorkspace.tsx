@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { runtimeConfig } from '../../config/runtimeConfig';
-import type { CodingConversationState, CodingPreference } from './codingSessionStore';
+import type { CodingConversationState, CodingPatchRecord, CodingPreference } from './codingSessionStore';
 import type { CodingActivity, CodingActivityMessage, CodingProviderRecovery } from './codingTransport';
 import { InlineProposalActionCard } from './InlineProposalActionCard';
 import { CodingExecutionSettingsControl } from './CodingExecutionSettingsControl';
 import type { CodingExecutionSettings } from './codingExecutionSettings';
+import { ProjectFileTreeExplorer } from './ProjectFileTreeExplorer';
+import { WorkspaceTerminalPanel } from './WorkspaceTerminalPanel';
+import { ClarificationActionCard } from './ClarificationActionCard';
+
+type WorkspaceResolution = 'UPDATE_AND_INTEGRATE' | 'REPLACE_TARGETS' | 'KEEP_AND_SCAFFOLD';
 
 function isCodingNarration(item: CodingActivity): item is CodingActivityMessage {
   return !('event' in item);
@@ -288,8 +293,9 @@ interface CodingAgentWorkspaceProps {
   input: string;
   projectRoot: string | null;
   projectStatus?: string;
+  appliedPatchLog?: CodingPatchRecord[];
   executionSettings: CodingExecutionSettings;
-  brokerStatus: 'unknown' | 'syncing' | 'ready' | 'unavailable';
+  brokerStatus: 'unknown' | 'syncing' | 'ready' | 'unavailable' | 'unauthorized' | 'untrusted';
   onExecutionSettingsChange: (settings: Partial<CodingExecutionSettings>) => void;
   onSynchronizeBroker: () => void;
   acceptancePreflight?: {
@@ -321,6 +327,12 @@ interface CodingAgentWorkspaceProps {
   searchQuery: string;
   searchResults: SearchResult[];
   proposal: Proposal | null;
+  clarificationAction: {
+    requestId: string;
+    prompt: string;
+    targets: Array<{ path: string; classification: string }>;
+  } | null;
+  onChooseWorkspaceResolution: (resolution: WorkspaceResolution) => void;
   autoRepairChoice: boolean;
   deleteConfirmed: boolean;
   activity: CodingActivity[];
@@ -510,6 +522,7 @@ export function CodingAgentWorkspace({
   input,
   projectRoot,
   projectStatus,
+  appliedPatchLog = [],
   executionSettings,
   brokerStatus,
   onExecutionSettingsChange,
@@ -525,6 +538,8 @@ export function CodingAgentWorkspace({
   searchQuery,
   searchResults,
   proposal,
+  clarificationAction,
+  onChooseWorkspaceResolution,
   autoRepairChoice,
   deleteConfirmed,
   activity,
@@ -578,6 +593,7 @@ export function CodingAgentWorkspace({
   const proposalNeedsDecision = Boolean(proposal && ['awaiting_approval', 'approved', 'applying', 'verifying'].includes(proposal.state || ''));
   const [showAllMessages, setShowAllMessages] = useState(false);
   const [copyError, setCopyError] = useState('');
+  const [terminalOpen, setTerminalOpen] = useState(true);
   const [projectPathInput, setProjectPathInput] = useState('');
   const lastConversationId = useRef(activeConversationId);
   const olderConversationStates = conversations
@@ -643,6 +659,42 @@ export function CodingAgentWorkspace({
           </>
         )}
       </section>
+      {projectRoot && (
+        <div className="mb-4 space-y-3">
+          <ProjectFileTreeExplorer
+            projectRoot={projectRoot}
+            refreshVersion={`${projectStatus || ''}:${appliedPatchLog?.length || 0}`}
+            appliedFiles={(appliedPatchLog || [])
+              .filter((record) => record.state === 'completed')
+              .slice(-1)
+              .flatMap((record) => record.files.map((path) => ({ path })))}
+          />
+          <section className="rounded-lg border border-slate-700 bg-slate-950/30">
+            <div className="flex items-center justify-between px-3 py-2">
+              <p className="text-xs font-semibold text-slate-200">Workspace terminal</p>
+              <button
+                type="button"
+                aria-expanded={terminalOpen}
+                onClick={() => setTerminalOpen((open) => !open)}
+                className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300"
+              >
+                {terminalOpen ? 'Collapse' : 'Open'}
+              </button>
+            </div>
+            {terminalOpen && (
+              <div className="px-3 pb-3">
+                <WorkspaceTerminalPanel
+                  activity={activity}
+                  projectRoot={projectRoot}
+                  projectStatus={projectStatus}
+                  brokerStatus={brokerStatus}
+                  onSynchronizeBroker={onSynchronizeBroker}
+                />
+              </div>
+            )}
+          </section>
+        </div>
+      )}
       {!canSelectProject && (
         <p role="status" className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
           Project selection and Coding Agent access require the trusted desktop app. Open it to select a folder; browser folder picks cannot be attached.
@@ -660,6 +712,8 @@ export function CodingAgentWorkspace({
                   ? 'border border-rose-500/40 bg-rose-500/10 text-rose-300'
                   : projectStatus === 'PROJECT_DETACHED'
                   ? 'border border-amber-500/40 bg-amber-500/10 text-amber-300'
+                  : projectStatus === 'PROJECT_UNVERIFIED' || projectStatus === 'PROJECT_UNAVAILABLE'
+                  ? 'border border-amber-500/40 bg-amber-500/10 text-amber-300'
                   : 'border border-sky-500/40 bg-sky-500/10 text-sky-300'
               }`}>
                 {projectStatus}
@@ -667,7 +721,7 @@ export function CodingAgentWorkspace({
             )}
           </div>
           <p className="mt-1 truncate text-xs text-slate-400">
-            {projectRoot || (!canSelectProject ? 'Open the trusted desktop app to select a project.' : projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : projectStatus === 'ATTACHING_PROJECT' ? 'Attaching project…' : 'Mention the project folder in chat for automatic discovery, or select it under Advanced.')}
+            {projectRoot || (!canSelectProject ? 'Open the trusted desktop app to select and authorize a project.' : projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : projectStatus === 'ATTACHING_PROJECT' ? 'Attaching project…' : 'Mention the project folder in chat for automatic discovery, or select it under Advanced.')}
           </p>
           {projectRoot && <p className="mt-1 text-[11px] text-sky-300">Scope: {path || '.'}</p>}
         </div>
@@ -850,6 +904,14 @@ export function CodingAgentWorkspace({
             {message.content && <button type="button" onClick={() => { void copyMessages([message], copyKey); }} className="rounded px-1.5 py-0.5 text-[10px] text-slate-500 hover:text-sky-200" aria-label={`Copy ${message.role} message`}>{copiedItem === copyKey ? 'Copied' : 'Copy Markdown'}</button>}
           </div>
           {message.content ? <CodingMarkdown content={message.content} /> : message.streaming && <p className="text-sm leading-relaxed text-slate-300">I’m understanding the request and inspecting the relevant files…</p>}
+          {message.role === 'assistant' && clarificationAction && clarificationAction.requestId === message.requestId && (
+            <ClarificationActionCard
+              prompt={clarificationAction.prompt}
+              targets={clarificationAction.targets}
+              busy={busy || streaming}
+              onChoose={onChooseWorkspaceResolution}
+            />
+          )}
           {message.role === 'assistant' && messageIndex === messages.length - 1 && (activity.length > 0 || busy || streaming) && (() => {
             const narrationItems = activity.filter(isCodingNarration);
             const toolItems = activity.filter((item, idx, arr) => {

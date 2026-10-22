@@ -640,12 +640,24 @@ handles and root hashes; the browser discovers the registered handle through
 the authenticated backend, receives a short-lived lease, and must obtain the
 native desktop approval for the exact proposal before the existing Developer
 Agent applies and verifies files. The browser never submits a trusted
-filesystem path or an approval flag. Run the broker contract and backend
+filesystem path to the broker or an approval flag. Its attach request is
+validated against the broker's app-owned root registration. Run the broker contract and backend
 discovery checks with:
 
 ```bash
 npm run test:trusted-broker
 ```
+
+The backend keeps browser workspace authorization per persistent browser
+session; the process-global backend project state is not used as proof for a
+browser lease. A browser path can be attached only when its canonical root is
+already registered by the trusted desktop app. The standalone `server:dev`
+browser host has no native folder-picker/renderer-owner capability of its own,
+so a browser-only session cannot authorize a new folder by pasting a path; use
+the trusted desktop app to select and register it first. Broker health is
+reported separately from project authorization, and an unavailable broker
+does not grant a lease. Project command execution remains blocked unless the
+OS isolation gate is verified.
 
 These broker threat tests use a deterministic test delegate and do not make a
 provider request. The Electron workflow commands above remain the

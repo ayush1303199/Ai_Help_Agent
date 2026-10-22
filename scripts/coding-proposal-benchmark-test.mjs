@@ -497,6 +497,19 @@ try {
   assert.ok(review5.issues.some((issue) => issue.includes('Forbidden file in patch: .env')));
   assert.equal(review5.risk, 'CRITICAL');
 
+  const safeEnvExample = [
+    '--- /dev/null',
+    '+++ b/.env.example',
+    '@@ -0,0 +1,4 @@',
+    '+# Local-only placeholders',
+    '+PORT=3000',
+    '+DATABASE_URL=mongodb://127.0.0.1:27017/app_dev',
+    '+API_URL=http://127.0.0.1:3000',
+  ].join('\n');
+  assert.equal(agent.selfReviewPatch(safeEnvExample).approved, true, 'A create-only local placeholder template is allowed.');
+  const unsafeEnvExample = safeEnvExample.replace('+PORT=3000', '+API_TOKEN=secret-value');
+  assert.equal(agent.selfReviewPatch(unsafeEnvExample).approved, false, 'Credential-bearing example files remain blocked.');
+
   // Proposal Creation MUST be blocked
   await assert.rejects(
     () => agent.createProposal({
