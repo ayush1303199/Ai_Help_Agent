@@ -452,7 +452,9 @@ class TrustedLocalDesktopBroker {
       proposalDigest,
       manifestHash: proposal.manifestHash,
       scope: proposal.scope || '.',
-      paths: [...new Set(proposal.files.map((file) => file.path))],
+      paths: [...new Set(proposal.files.flatMap((file) => (
+        file.sourcePath ? [file.sourcePath, file.path] : [file.path]
+      )))],
       grantId: grant.approvalGrant,
       deleteConfirmed: decision === true || decision?.deleteConfirmed === true,
     };
@@ -552,6 +554,11 @@ class TrustedLocalDesktopBroker {
     const pending = lease.pendingApproval;
     if (!pending) return { pending: null };
     return { pending: this.serializePendingApproval(pending) };
+  }
+
+  heartbeat({ brokerSessionId, sessionLeaseToken, origin }) {
+    const lease = this.assertLease(brokerSessionId, sessionLeaseToken, origin);
+    return { expiresAt: new Date(lease.expiresAt).toISOString() };
   }
 
   async decideBrowserApproval({
@@ -833,10 +840,26 @@ class TrustedLocalDesktopBroker {
     return lease;
   }
 
+  renewLease(lease) {
+    lease.expiresAt = Date.now() + this.sessionTtlMs;
+    if (lease.expirationTimer) clearTimeout(lease.expirationTimer);
+    lease.expirationTimer = setTimeout(() => {
+      lease.cancelled = true;
+      void this.releaseLease(lease);
+    }, this.sessionTtlMs);
+    lease.expirationTimer.unref?.();
+    for (const grant of this.grants.values()) {
+      if (grant.brokerSessionId === lease.brokerSessionId && !grant.used) {
+        grant.expiresAt = lease.expiresAt;
+      }
+    }
+  }
+
   assertActiveLease(lease) {
     if (!this.isLeaseCurrent(lease)) {
       throw brokerError('BROKER_SESSION_UNAUTHORIZED', 'The broker session lease or project registration is no longer valid.');
     }
+    this.renewLease(lease);
   }
 
   isLeaseCurrent(lease) {
@@ -902,6 +925,12 @@ class TrustedLocalDesktopBroker {
         this.assertAllowedKeys(body, ['projectId']);
         const lease = await this.issueLease({ projectId: body.projectId, origin });
         this.sendJson(response, 201, lease);
+        return;
+      }
+      if (request.method === 'POST' && url.pathname === '/v1/sessions/heartbeat') {
+        const body = await this.readJson(request);
+        this.assertAllowedKeys(body, ['brokerSessionId', 'sessionLeaseToken']);
+        this.sendJson(response, 200, this.heartbeat({ ...body, origin }));
         return;
       }
       if (request.method === 'POST' && url.pathname === '/v1/workflows') {

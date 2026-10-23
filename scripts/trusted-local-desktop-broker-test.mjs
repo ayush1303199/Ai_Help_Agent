@@ -376,6 +376,23 @@ try {
   assert.equal(expiredResponse.status, 403);
   await assertNoFiles(workspaceB);
 
+  const renewableLease = await (await post(endpoint, origin, '/v1/sessions', {
+    projectId: registrationB.projectId,
+  })).json();
+  const renewableBinding = {
+    brokerSessionId: renewableLease.brokerSessionId,
+    sessionLeaseToken: renewableLease.sessionLeaseToken,
+  };
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  const firstHeartbeat = await post(endpoint, origin, '/v1/sessions/heartbeat', renewableBinding);
+  assert.equal(firstHeartbeat.status, 200);
+  const firstHeartbeatExpiry = (await firstHeartbeat.json()).expiresAt;
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  const secondHeartbeat = await post(endpoint, origin, '/v1/sessions/heartbeat', renewableBinding);
+  assert.equal(secondHeartbeat.status, 200, 'Heartbeat should extend the real broker lease beyond its original TTL.');
+  assert.ok(Date.parse((await secondHeartbeat.json()).expiresAt) > Date.parse(firstHeartbeatExpiry));
+  await broker.releaseSession({ ...renewableBinding, origin });
+
   const malformedTokenResponse = await post(endpoint, origin, '/v1/workflows', {
     brokerSessionId: lease.brokerSessionId,
     sessionLeaseToken: 'x',

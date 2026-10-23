@@ -1414,9 +1414,9 @@ Add a frontend form with loading, success, and error states.`;
   assert.equal(greenfieldResult.codeApplied, true, 'A syntactically mounted dynamic route plan should apply.');
   assert.equal(greenfieldResult.codeVerified, true, 'The generated route and module graph must pass verification.');
   assert.deepEqual(greenfieldResult.integrationVerification.verificationModes, ['STATIC_WIRING']);
-  assert.equal(greenfieldResult.hermeticVerification.status, 'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED');
-  assert.equal(greenfieldResult.hermeticVerification.passed, 5);
-  assert.equal(greenfieldResult.hermeticVerification.total, 5);
+  assert.equal(greenfieldResult.hermeticVerification.status, 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED');
+  assert.equal(greenfieldResult.hermeticVerification.passed, 9);
+  assert.equal(greenfieldResult.hermeticVerification.total, 9);
   assert.equal(greenfieldResult.hostExecution?.status, 'SKIPPED_ISOLATION_UNAVAILABLE');
   assert.equal(
     greenfieldResult.workflowReceipt.verificationReport.integrationVerification.liveProbePerformed,
@@ -1433,7 +1433,7 @@ Add a frontend form with loading, success, and error states.`;
   assert.ok(greenfieldFiles.includes('package.json'));
   assert.ok(greenfieldFiles.includes('.env.example'));
   assert.ok(greenfieldFiles.includes('README.md'));
-  assert.equal(greenfieldResult.workflowReceipt.verificationReport.hermeticVerification.passed, 5);
+  assert.equal(greenfieldResult.workflowReceipt.verificationReport.hermeticVerification.passed, 9);
   assert.match(greenfieldResult.message, /Approved files: .*package\.json/);
   assert.match(greenfieldResult.message, /run `npm start` from the project root/);
   assert.match(greenfieldResult.message, /did not run project commands/);
@@ -1480,6 +1480,11 @@ Create a page/component and display success or error toast/messages accordingly.
   assert.notEqual(typoGreenfieldResult.outcome, 'INVESTIGATION_INCOMPLETE');
   assert.equal(typoGreenfieldResult.outcome, 'SUCCESS', JSON.stringify(typoGreenfieldResult));
   assert.equal(typoGreenfieldResult.codeApplied, true);
+  assert.equal(
+    typoGreenfieldResult.taskPlan.subtasks.find((subtask) => subtask.id === 'ST-2')?.status,
+    'SKIPPED',
+    'A genuinely greenfield workspace must not fabricate source-inspection evidence.',
+  );
   assert.ok((await listFilesRecursively(typoGreenfieldProject)).length > 0);
   console.log('TEST 21 PASSED: Leading typo and error-handling requirements still route greenfield creation to proposal synthesis.');
 
@@ -1509,6 +1514,9 @@ Create a page/component and display success or error toast/messages accordingly.
   assert.equal(populatedCreationResult.codeVerified, true);
   assert.equal(populatedCreationResult.hostExecution?.status, 'SKIPPED_ISOLATION_UNAVAILABLE');
   assert.equal(populatedCreationResult.workflowReceipt.verificationReport.verificationMode, 'STATIC_ONLY');
+  const populatedSt2 = populatedCreationResult.taskPlan.subtasks.find((subtask) => subtask.id === 'ST-2');
+  assert.equal(populatedSt2?.status, 'COMPLETED');
+  assert.ok(populatedSt2.evidence.sourceEvidence.length > 0, 'A populated workspace must cite inspected source files.');
   assert.doesNotMatch(populatedCreationResult.message, /all checks passed/i);
   assert.ok(inlineApprovalRequests.length > approvalsBeforePopulatedRequest, 'The request must reach the proposal approval UI.');
   assert.ok((await listFilesRecursively(populatedCreationProject)).length > populatedFilesBefore.length);
@@ -1590,8 +1598,8 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
   assert.equal(partialOrderResult.outcome, 'SUCCESS', JSON.stringify(partialOrderResult));
   assert.equal(partialOrderResult.codeApplied, true);
   assert.equal(partialOrderResult.codeVerified, true);
-  assert.equal(partialOrderResult.hermeticVerification.passed, 5, JSON.stringify(partialOrderResult.hermeticVerification));
-  assert.equal(partialOrderResult.hermeticVerification.total, 5);
+  assert.equal(partialOrderResult.hermeticVerification.passed, 9, JSON.stringify(partialOrderResult.hermeticVerification));
+  assert.equal(partialOrderResult.hermeticVerification.total, 9);
   const partialOrderGenerated = await listFilesRecursively(partialOrderProject);
   for (const requiredPath of [
     'server.js',
@@ -1613,6 +1621,65 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
   assert.match(await fs.readFile(path.join(partialOrderProject, 'routes', 'orders.js'), 'utf8'), /\/api\/orders/);
   assert.match(await fs.readFile(path.join(partialOrderProject, 'components', 'OrderForm.jsx'), 'utf8'), /space-y-4/);
   console.log('TEST 23B PASSED: One-file partial workspace upgrades to the complete Order module set and verifies all five gates.');
+
+  const populatedFullStackProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-populated-full-stack-'));
+  projectRoots.add(populatedFullStackProject);
+  const populatedFullStackFiles = {
+    'config/db.js': "const mongoose = require('mongoose');\nmodule.exports = mongoose;\n",
+    'models/Order.js': "const mongoose = require('mongoose');\nmodule.exports = new mongoose.Schema({});\n",
+    'controllers/orderController.js': "const { missingModel } = require('../models/Order');\nmodule.exports = { missingModel };\n",
+    'routes/orders.js': "const { missingHandler } = require('../controllers/orderController');\nmodule.exports = missingHandler;\n",
+    'server.js': "const express = require('express');\nmodule.exports = express();\n",
+    'components/OrderForm.jsx': "import React, { useState } from 'react';\nexport default function OrderForm() { return null; }\n",
+    'app/orders/page.jsx': "import { MissingOrderForm } from '../../components/OrderForm.jsx';\nexport default function OrderPage() { return <MissingOrderForm />; }\n",
+    'pages/orders.js': 'export default function LegacyOrderPage() { return null; }\n',
+    'package.json': JSON.stringify({
+      name: 'legacy-order-project',
+      type: 'commonjs',
+      dependencies: { express: '^4.0.0', mongoose: '^8.0.0', react: '^18.0.0', 'react-dom': '^18.0.0' },
+    }, null, 2),
+    '.env.example': 'PORT=4300\nDATABASE_URL=mongodb://localhost/legacy\n',
+    'README.md': '# Existing order project\n',
+  };
+  for (const [relativePath, content] of Object.entries(populatedFullStackFiles)) {
+    const target = path.join(populatedFullStackProject, ...relativePath.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, content, 'utf8');
+  }
+  const retainedFullStackEnvironment = await fs.readFile(path.join(populatedFullStackProject, '.env.example'), 'utf8');
+  await invokeIpc('developer:project-attach', sender, { projectRoot: populatedFullStackProject });
+  dialogResponses.push(1);
+  const populatedFullStackResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: `Build a complete full-stack order feature with a form and backend API.
+Create a POST endpoint /api/orders.
+Fields:
+- customerName: string (required)
+- items: [{ itemName: string, quantity: number, price: number }]
+- totalPrice: number (auto calculated)
+- status: string (default=Pending)
+Create a Next.js App Router page and React form component.`,
+    scope: '.',
+  });
+  assert.equal(populatedFullStackResult.outcome, 'SUCCESS', JSON.stringify(populatedFullStackResult));
+  assert.equal(populatedFullStackResult.codeApplied, true);
+  assert.equal(populatedFullStackResult.codeVerified, true);
+  assert.equal(populatedFullStackResult.hermeticVerification?.passed, 9, JSON.stringify(populatedFullStackResult.hermeticVerification));
+  assert.equal(populatedFullStackResult.hermeticVerification?.total, 9);
+  for (const relativePath of [
+    'config/db.js',
+    'models/Order.js',
+    'controllers/orderController.js',
+    'routes/orders.js',
+    'server.js',
+    'components/OrderForm.jsx',
+    'app/orders/page.jsx',
+  ]) {
+    assert.ok(populatedFullStackResult.filesModified.includes(relativePath), `Autonomous target upgrade should modify ${relativePath}.`);
+  }
+  await assert.rejects(fs.stat(path.join(populatedFullStackProject, 'pages', 'orders.js')), { code: 'ENOENT' });
+  assert.ok((await fs.stat(path.join(populatedFullStackProject, 'legacy-pages-orders.js.txt'))).isFile());
+  assert.equal(await fs.readFile(path.join(populatedFullStackProject, '.env.example'), 'utf8'), retainedFullStackEnvironment);
+  console.log('TEST 23C PASSED: Populated full-stack targets auto-upgrade through production IPC, resolve a colliding Pages route, and pass all eight gates.');
 
   const substantiveProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-substantive-target-'));
   projectRoots.add(substantiveProject);

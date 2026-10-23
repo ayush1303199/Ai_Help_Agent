@@ -262,6 +262,24 @@ interface TrustedBrokerWorkflowResponse {
   [key: string]: unknown;
 }
 
+interface TrustedBrokerRecoveryDecision {
+  proposalDigest: string;
+  approved: boolean;
+  deleteConfirmed: boolean;
+}
+
+class TrustedBrokerRequestError extends Error {
+  status: number;
+  code: string | null;
+
+  constructor(message: string, status: number, code: string | null) {
+    super(message);
+    this.name = 'TrustedBrokerRequestError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
 function brokerErrorMessage(value: unknown, fallback: string): string {
   if (value && typeof value === 'object' && 'error' in value) {
     const error = value.error;
@@ -326,8 +344,20 @@ async function readBrokerResponse(response: Response, label: string): Promise<un
   } catch {
     throw new Error(`${label} returned an invalid response (${response.status}).`);
   }
-  if (!response.ok) throw new Error(brokerErrorMessage(payload, `${label} failed (${response.status}).`));
+  if (!response.ok) {
+    throw new TrustedBrokerRequestError(
+      brokerErrorMessage(payload, `${label} failed (${response.status}).`),
+      response.status,
+      brokerErrorCode(payload),
+    );
+  }
   return payload;
+}
+
+function isExpiredBrokerSession(error: unknown): error is TrustedBrokerRequestError {
+  return error instanceof TrustedBrokerRequestError
+    && error.code === 'BROKER_SESSION_UNAUTHORIZED'
+    && /unknown or expired|invalid or expired|lease.*expired/i.test(error.message);
 }
 
 async function brokerFetch(
@@ -358,6 +388,7 @@ export async function executeTrustedBrokerWorkflow(
     projectRoot?: string | null;
     executionMode?: CodingExecutionMode;
     autoAuthorizeAttachedProject?: boolean;
+    sessionRecoveryAttempt?: number;
   } = {},
 ): Promise<DeveloperWorkflowResult> {
   if (options.projectRoot && options.autoAuthorizeAttachedProject !== false) {
@@ -449,6 +480,18 @@ export async function executeTrustedBrokerWorkflow(
     brokerSessionId: lease.brokerSessionId,
     sessionLeaseToken: lease.sessionLeaseToken,
   };
+  const heartbeatTimer = window.setInterval(() => {
+    void brokerFetch(new URL('/api/coding/broker/sessions/heartbeat', apiBaseUrl), {
+      method: 'POST',
+      credentials: 'omit',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sessionBinding),
+    }, 'Trusted broker session heartbeat', true).then(async (response) => {
+      await readBrokerResponse(response, 'Trusted broker session heartbeat');
+    }).catch((error: unknown) => {
+      console.warn('Trusted broker session heartbeat failed; a stale lease will be recovered once on the next workflow or approval operation.', error);
+    });
+  }, 60_000);
   const workflowResponse = brokerFetch(new URL('/api/coding/broker/workflows', apiBaseUrl), {
     method: 'POST',
     credentials: 'omit',
@@ -488,9 +531,16 @@ export async function executeTrustedBrokerWorkflow(
       await requestCancellation();
       return { outcome: 'CANCELLED', phase: 'broker', filesModified: [] } as DeveloperWorkflowResult;
     }
-    let result = await workflowResponse as DeveloperWorkflowResult & {
-      approval?: TrustedBrokerPendingApproval;
-    };
+    let result: DeveloperWorkflowResult & { approval?: TrustedBrokerPendingApproval };
+    try {
+      result = await workflowResponse as DeveloperWorkflowResult & { approval?: TrustedBrokerPendingApproval };
+    } catch (error) {
+      if (!isExpiredBrokerSession(error) || (options.sessionRecoveryAttempt || 0) >= 1) throw error;
+      result = await executeTrustedBrokerWorkflow(userRequest, scope, signal, onApprovalPending, {
+        ...options,
+        sessionRecoveryAttempt: (options.sessionRecoveryAttempt || 0) + 1,
+      }) as DeveloperWorkflowResult & { approval?: TrustedBrokerPendingApproval };
+    }
     if (result.outcome === 'AWAITING_APPROVAL') {
       const pendingApproval = result.approval;
       if (!pendingApproval
@@ -545,6 +595,45 @@ export async function executeTrustedBrokerWorkflow(
           }
           resolveDecision(payload.result as DeveloperWorkflowResult);
         } catch (error) {
+          if (isExpiredBrokerSession(error) && (options.sessionRecoveryAttempt || 0) < 1 && !signal?.aborted) {
+            try {
+              const recoveryDecision: TrustedBrokerRecoveryDecision = {
+                proposalDigest: pendingApproval.proposalDigest,
+                approved,
+                deleteConfirmed,
+              };
+              const recovered = await executeTrustedBrokerWorkflow(
+                userRequest,
+                scope,
+                signal,
+                (freshApproval, freshActions, snapshot) => {
+                  if (freshApproval.proposalDigest === recoveryDecision.proposalDigest
+                    && freshApproval.deleteConfirmationRequired === pendingApproval.deleteConfirmationRequired) {
+                    const replayDecision = recoveryDecision.approved
+                      ? freshActions.approve(recoveryDecision.deleteConfirmed)
+                      : freshActions.reject();
+                    void replayDecision.catch((recoveryError: unknown) => {
+                      console.error('Trusted broker approval recovery failed for the matching proposal digest.', recoveryError);
+                    });
+                    return;
+                  }
+                  onApprovalPending?.(freshApproval, freshActions, snapshot);
+                },
+                {
+                  ...options,
+                  sessionRecoveryAttempt: (options.sessionRecoveryAttempt || 0) + 1,
+                },
+              );
+              resolveDecision(recovered);
+              return decisionResult.then(() => undefined);
+            } catch (recoveryError) {
+              const normalizedRecoveryError = recoveryError instanceof Error
+                ? recoveryError
+                : new Error(String(recoveryError));
+              rejectDecision(normalizedRecoveryError);
+              throw normalizedRecoveryError;
+            }
+          }
           const normalized = error instanceof Error ? error : new Error(String(error));
           rejectDecision(normalized);
           throw normalized;
@@ -580,6 +669,7 @@ export async function executeTrustedBrokerWorkflow(
     if (cancellationFailed) throw new Error('Cancellation could not be confirmed; the workflow result is not safe to report.');
     return result;
   } finally {
+    window.clearInterval(heartbeatTimer);
     signal?.removeEventListener('abort', onAbort);
     if (!cancellationFailed) {
       try {

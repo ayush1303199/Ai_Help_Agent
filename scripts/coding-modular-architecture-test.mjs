@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import net from 'node:net';
 import path from 'node:path';
 import developerAgent from '../electron/developerAgent.cjs';
 import developerFiles from '../electron/developerFiles.cjs';
@@ -9,6 +12,8 @@ import {
   isFullStackBuildRequest,
   discoverProjectConventions,
   deriveModularPlan,
+  runHermeticRegressionLoop,
+  runHermeticRegressionLoopWithRuntime,
   repairHermeticCandidate,
   verifyHermeticEngineeringGates,
   verifyHermeticEngineeringGatesOnDisk,
@@ -20,6 +25,7 @@ const {
   createSession,
   executeAutonomousCodingWorkflow,
 } = developerAgent;
+const runtimeRequire = createRequire(import.meta.url);
 
 const testRoot = await fs.mkdtemp(path.join(process.cwd(), '.coding-modular-test-'));
 const ownerId = 73001;
@@ -121,6 +127,7 @@ try {
   // =========================================================================
   const existingSessionId = 'session-v10-existing';
   createSession(existingSessionId, ownerId);
+  await developerFiles.attachProject(existingDir, ownerId);
 
   const existingResult = await executeAutonomousCodingWorkflow({
     userRequest: 'Implement feature service in existing project',
@@ -280,6 +287,8 @@ Create a page and form component with success and error messages.`,
   );
   await fs.writeFile(path.join(partialOrderDir, 'utils', 'sharedUtils.js'), 'module.exports = {};\n', 'utf8');
   await fs.writeFile(path.join(partialOrderDir, 'services', 'featureService.js'), 'module.exports = {};\n', 'utf8');
+  const retainedEnvironmentExample = 'PORT=3000\nDATABASE_URL=mongodb://127.0.0.1:27017/app_dev\nAPI_URL=http://127.0.0.1:3000\n';
+  await fs.writeFile(path.join(partialOrderDir, '.env.example'), retainedEnvironmentExample, 'utf8');
   const partialOrderPrompt = `Act as an expert Full-Stack Developer. Build a complete 'Add Order' feature.
 Create an Order Model/Schema and a POST endpoint /api/orders.
 Fields:
@@ -309,14 +318,21 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
   }
   assert.ok(!partialOrderFiles.includes('utils/sharedUtils.js'));
   assert.ok(!partialOrderFiles.includes('services/featureService.js'));
+  const retainedEnvironmentModule = partialOrderPlan.modulesToCreate.find((module) => module.path === '.env.example');
+  assert.equal(retainedEnvironmentModule.operation, 'reuse');
+  assert.doesNotMatch(retainedEnvironmentModule.content, /DATABASE_URL=/);
   repairHermeticCandidate(partialOrderPlan);
   const partialOrderVerification = verifyHermeticEngineeringGates(partialOrderPlan);
   assert.equal(partialOrderVerification.status, 'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED', JSON.stringify(partialOrderVerification));
-  assert.equal(partialOrderVerification.passed, 5);
+  assert.equal(partialOrderVerification.passed, 8);
+  assert.equal(partialOrderVerification.total, 8);
+  assert.ok(!(await fs.readdir(partialOrderDir)).includes('node_modules'));
   const partialOrderPatch = await synthesizeMultiFilePatch(partialOrderDir, partialOrderPlan);
   assert.ok(partialOrderPatch.filesList.some((file) => file.path === 'server.js' && file.operation === 'modify'));
   assert.ok(partialOrderPatch.filesList.some((file) => file.path === 'models/Order.js' && file.operation === 'create'));
-  console.log('[TEST 4F PASSED] Partial generic scaffolds upgrade to a prompt-grounded full-stack module set and all five hermetic gates.');
+  assert.ok(!partialOrderPatch.filesList.some((file) => file.path === '.env.example'));
+  assert.equal(await fs.readFile(path.join(partialOrderDir, '.env.example'), 'utf8'), retainedEnvironmentExample);
+  console.log('[TEST 4F PASSED] Partial generic scaffolds upgrade to a prompt-grounded full-stack module set and all eight hermetic gates.');
 
   const hermeticDir = path.join(testRoot, 'hermetic-full-stack');
   await fs.mkdir(hermeticDir, { recursive: true });
@@ -336,7 +352,67 @@ Return status codes 201, 400, and 500.`,
   repairHermeticCandidate(hermeticPlan);
   const hermeticCandidate = verifyHermeticEngineeringGates(hermeticPlan);
   assert.equal(hermeticCandidate.status, 'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED', JSON.stringify(hermeticCandidate));
-  assert.equal(hermeticCandidate.passed, 5);
+  assert.equal(hermeticCandidate.passed, 8);
+  assert.equal(hermeticCandidate.total, 8);
+  assert.deepEqual(
+    hermeticCandidate.behavioralMatrix.vectors.map((vector) => vector.id),
+    [
+      'valid-multi-item-total-defaults-and-creation',
+      'required-scalar-whitespace-rejected',
+      'empty-or-non-array-nested-collection-rejected',
+      'invalid-nested-item-values-rejected',
+      'structured-client-and-server-error-responses',
+    ],
+  );
+  assert.ok(hermeticCandidate.behavioralMatrix.vectors.every((vector) => vector.passed));
+  const runtimeCandidate = await runHermeticRegressionLoopWithRuntime(hermeticPlan, { root: hermeticDir });
+  assert.equal(runtimeCandidate.passed, 9, JSON.stringify(runtimeCandidate.gates.filter((gate) => !gate.passed)));
+  assert.equal(runtimeCandidate.total, 9);
+  assert.equal(runtimeCandidate.gates.at(-1).id, 'CANDIDATE_RUNTIME_BEHAVIOR');
+  assert.equal(runtimeCandidate.gates.at(-1).probes.length, 5);
+  assert.ok(runtimeCandidate.gates.at(-1).probes.every((probe) => probe.applicable && probe.passed));
+  assert.equal(runtimeCandidate.gates.at(-1).uiPreview.passed, true);
+  const runtimeDefectPlan = {
+    ...hermeticPlan,
+    modulesToCreate: hermeticPlan.modulesToCreate.map((module) => ({ ...module })),
+    routeContracts: hermeticPlan.routeContracts.map((route) => ({ ...route })),
+    routeSchema: JSON.parse(JSON.stringify(hermeticPlan.routeSchema)),
+  };
+  const runtimeDefectModel = runtimeDefectPlan.modulesToCreate.find((module) => module.responsibility === 'DATA_MODEL');
+  runtimeDefectModel.content = runtimeDefectModel.content.replace(
+    'function create(payload) {',
+    "function create(payload) { throw new Error('Runtime-only persistence defect.');",
+  );
+  assert.equal(verifyHermeticEngineeringGates(runtimeDefectPlan).passed, 8, 'The fixture defect must evade textual gates.');
+  const runtimeRepairMessages = [];
+  const runtimeRepair = await runHermeticRegressionLoopWithRuntime(runtimeDefectPlan, {
+    root: hermeticDir,
+    onProgress: (event) => runtimeRepairMessages.push(event.message),
+  });
+  assert.equal(runtimeRepair.passed, 9, JSON.stringify(runtimeRepair.gates.filter((gate) => !gate.passed)));
+  assert.ok(runtimeRepair.regressionLoop.repairs.some((repair) => repair.includes('models/Order.js')));
+  assert.ok(runtimeRepairMessages.some((message) => message.includes('[SELF-REPAIR]')));
+  console.log('[TEST 4H PASSED] Candidate-only runtime probes execute all five behavioral cases and repair a runtime-only model defect.');
+  const astDefectPlan = {
+    ...hermeticPlan,
+    modulesToCreate: hermeticPlan.modulesToCreate.map((module) => ({ ...module })),
+    routeContracts: hermeticPlan.routeContracts.map((route) => ({ ...route })),
+  };
+  const astDefectForm = astDefectPlan.modulesToCreate.find((module) => module.path === 'components/OrderForm.jsx');
+  astDefectForm.content = astDefectForm.content.replace('method: "POST"', 'method: "GET"');
+  assert.equal(
+    verifyHermeticEngineeringGates(astDefectPlan).gates.find((gate) => gate.id === 'CROSS_LAYER_DATA_FLOW').passed,
+    false,
+    'AST data-flow verification must reject a frontend request method that diverges from its route contract.',
+  );
+  const astRepairEvents = [];
+  const astRepair = runHermeticRegressionLoop(astDefectPlan, {
+    root: hermeticDir,
+    onProgress: (event) => astRepairEvents.push(event.message),
+  });
+  assert.equal(astRepair.passed, 8, JSON.stringify(astRepair));
+  assert.ok(astRepairEvents.some((message) => message.includes('[DEEP-THINK REPAIR PASS')));
+  assert.ok(astRepairEvents.some((message) => message.includes('CROSS_LAYER_DATA_FLOW @ components/OrderForm.jsx')));
   for (const requiredFile of ['package.json', '.env.example', 'README.md']) {
     assert.ok(hermeticPlan.modulesToCreate.some((module) => module.path === requiredFile), `${requiredFile} must be part of the proposal.`);
   }
@@ -354,20 +430,163 @@ Return status codes 201, 400, and 500.`,
     'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED',
     'Pre-proposal self-healing must restore missing field/status/run-script contracts before staging.',
   );
+  const loopPlan = {
+    ...hermeticPlan,
+    modulesToCreate: hermeticPlan.modulesToCreate.map((module) => ({ ...module })),
+    routeContracts: hermeticPlan.routeContracts.map((route) => ({ ...route })),
+  };
+  const loopServer = loopPlan.modulesToCreate.find((module) => module.path === 'server.js');
+  loopServer.content = `const unusedDependency = require('missing-v14-test-package');\n${loopServer.content}`;
+  const loopModel = loopPlan.modulesToCreate.find((module) => module.responsibility === 'DATA_MODEL');
+  loopModel.content = loopModel.content.replace(/if \(Array\.isArray\(value\["items"\]\)\) \{[\s\S]*?\n  \}/, '');
+  const failedModuleGate = verifyHermeticEngineeringGates(loopPlan, undefined, { root: hermeticDir });
+  assert.equal(
+    failedModuleGate.gates.find((gate) => gate.id === 'MODULE_AND_RUNTIME_RESOLUTION').passed,
+    false,
+    'An unguarded missing package import must fail Gate 6 before repair.',
+  );
+  const regressionEvents = [];
+  const regressionResult = runHermeticRegressionLoop(loopPlan, {
+    root: hermeticDir,
+    onProgress: (event) => regressionEvents.push(event.message),
+  });
+  assert.equal(regressionResult.passed, 8, JSON.stringify(regressionResult));
+  assert.equal(regressionResult.regressionLoop.passes, 2);
+  assert.ok(regressionResult.regressionLoop.repairs.length >= 2);
+  assert.ok(regressionEvents.some((message) => message.includes('[THINK / REGRESSION LOOP]')));
+  assert.ok(!loopServer.content.includes('missing-v14-test-package'));
+  assert.match(loopModel.content, /\.reduce\(/);
+  const badBindingPlan = {
+    ...hermeticPlan,
+    modulesToCreate: hermeticPlan.modulesToCreate.map((module) => ({ ...module })),
+    routeContracts: hermeticPlan.routeContracts.map((route) => ({ ...route })),
+  };
+  const badBindingServer = badBindingPlan.modulesToCreate.find((module) => module.path === 'server.js');
+  const badBindingModel = badBindingPlan.modulesToCreate.find((module) => module.responsibility === 'DATA_MODEL');
+  const badBindingSpecifier = `./${path.posix.relative(path.posix.dirname(badBindingServer.path), badBindingModel.path)}`;
+  badBindingServer.content = `const { missingBinding } = require(${JSON.stringify(badBindingSpecifier)});\n${badBindingServer.content}`;
+  const badBindingGate = verifyHermeticEngineeringGates(badBindingPlan, undefined, { root: hermeticDir })
+    .gates.find((gate) => gate.id === 'MODULE_AND_RUNTIME_RESOLUTION');
+  assert.equal(badBindingGate.passed, false, 'Missing named exports on relative imports must fail Gate 6.');
+  assert.match(JSON.stringify(badBindingGate.evidence), /missingBinding/);
+  console.log('[TEST 4G PASSED] Gate 6 fails closed on missing packages and bindings; the bounded regression loop repairs safe generated defects.');
   const candidatePatch = await synthesizeMultiFilePatch(hermeticDir, hermeticPlan);
   for (const module of hermeticPlan.modulesToCreate) {
     const target = path.join(hermeticDir, module.path);
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, module.content, 'utf8');
   }
-  assert.equal((await verifyHermeticEngineeringGatesOnDisk(hermeticDir, hermeticPlan)).passed, 5);
+  assert.equal((await verifyHermeticEngineeringGatesOnDisk(hermeticDir, hermeticPlan)).passed, 9);
+  const portReservation = net.createServer();
+  await new Promise((resolve, reject) => {
+    portReservation.once('error', reject);
+    portReservation.listen(0, '127.0.0.1', resolve);
+  });
+  const serverPort = portReservation.address().port;
+  await new Promise((resolve, reject) => portReservation.close((error) => (error ? reject(error) : resolve())));
+  const serverProcess = spawn(process.execPath, ['server.js'], {
+    cwd: hermeticDir,
+    env: { ...process.env, PORT: String(serverPort) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let serverOutput = '';
+  serverProcess.stdout.on('data', (chunk) => { serverOutput += chunk; });
+  serverProcess.stderr.on('data', (chunk) => { serverOutput += chunk; });
+  try {
+    const baseUrl = `http://127.0.0.1:${serverPort}`;
+    let readyResponse;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (serverProcess.exitCode !== null) break;
+      try {
+        readyResponse = await fetch(`${baseUrl}${hermeticPlan.routeContracts[0].path}`);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    assert.ok(readyResponse, `Generated server should start without node_modules. ${serverOutput}`);
+    const initialListPayload = await readyResponse.json();
+    assert.equal(readyResponse.status, 200, JSON.stringify(initialListPayload));
+    assert.deepEqual(initialListPayload.data, []);
+    const previewResponse = await fetch(baseUrl);
+    assert.equal(previewResponse.status, 200);
+    assert.match(previewResponse.headers.get('content-type') || '', /text\/html/i);
+    const previewHtml = await previewResponse.text();
+    assert.match(previewHtml, /<form>/);
+    assert.ok(previewHtml.includes(`fetch(${JSON.stringify(hermeticPlan.routeContracts[0].path)}`));
+    const createdResponse = await fetch(`${baseUrl}${hermeticPlan.routeContracts[0].path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerName: 'Sample customer',
+        items: [
+          { itemName: 'Sample item', quantity: 2, price: 3.5 },
+          { itemName: 'Second item', quantity: 1, price: 2 },
+        ],
+      }),
+    });
+    assert.equal(createdResponse.status, 201);
+    const createdRecord = (await createdResponse.json()).data;
+    assert.equal(createdRecord.totalPrice, 9);
+    assert.equal(createdRecord.status, 'Pending');
+    assert.ok(createdRecord.createdAt);
+    const invalidResponse = await fetch(`${baseUrl}${hermeticPlan.routeContracts[0].path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerName: 'Sample customer', items: 'invalid' }),
+    });
+    assert.equal(invalidResponse.status, 400);
+    const emptyItemsResponse = await fetch(`${baseUrl}${hermeticPlan.routeContracts[0].path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerName: 'Sample customer', items: [] }),
+    });
+    assert.equal(emptyItemsResponse.status, 400);
+    const whitespaceResponse = await fetch(`${baseUrl}${hermeticPlan.routeContracts[0].path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerName: '   ', items: [{ itemName: 'item', quantity: 1, price: 1 }] }),
+    });
+    assert.equal(whitespaceResponse.status, 400);
+    const invalidItemResponse = await fetch(`${baseUrl}${hermeticPlan.routeContracts[0].path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerName: 'Sample customer', items: [{ itemName: 'Valid item', quantity: 0, price: 1 }] }),
+    });
+    assert.equal(invalidItemResponse.status, 400);
+    const negativePriceResponse = await fetch(`${baseUrl}${hermeticPlan.routeContracts[0].path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerName: 'Sample customer', items: [{ itemName: 'Valid item', quantity: 1, price: -1 }] }),
+    });
+    assert.equal(negativePriceResponse.status, 400);
+    const listResponse = await fetch(`${baseUrl}${hermeticPlan.routeContracts[0].path}`);
+    assert.equal((await listResponse.json()).data.length, 1);
+    const runtimeModel = runtimeRequire(path.join(hermeticDir, hermeticPlan.routeContracts[0].modelFile));
+    const runtimeController = runtimeRequire(path.join(hermeticDir, hermeticPlan.routeContracts[0].controllerFile));
+    const originalCreate = runtimeModel.create;
+    runtimeModel.create = () => { throw new Error('simulated storage failure'); };
+    try {
+      const failureResult = await runtimeController[hermeticPlan.routeContracts[0].controllerHandler]({
+        body: { customerName: 'Valid customer', items: [{ itemName: 'Valid item', quantity: 1, price: 1 }] },
+      });
+      assert.equal(failureResult.status, 500);
+      assert.equal(typeof failureResult.body.error, 'string');
+    } finally {
+      runtimeModel.create = originalCreate;
+    }
+  } finally {
+    serverProcess.kill();
+    await new Promise((resolve) => serverProcess.once('close', resolve));
+  }
+  console.log('[TEST 4H PASSED] Generated server starts without node_modules and serves POST/GET with computed totals and validation statuses.');
   packageModule.content = packageModule.content.replace('"start": "node server.js"', '"start": "node wrong.js"');
   await fs.writeFile(path.join(hermeticDir, 'package.json'), packageModule.content, 'utf8');
   const diskFailure = await verifyHermeticEngineeringGatesOnDisk(hermeticDir, hermeticPlan);
   assert.equal(diskFailure.status, 'HERMETIC_VERIFICATION_FAILED');
-  assert.equal(diskFailure.passed, 4, 'Post-apply gates must detect a bad on-disk start script.');
+  assert.equal(diskFailure.passed, 7, 'Post-apply gates must detect a bad on-disk start script.');
   assert.ok(candidatePatch.rawPatch.includes('package.json'));
-  console.log('[TEST 4D PASSED] Five hermetic gates, package/docs/env proposals, and pre-proposal field/status repairs are verified.');
+  console.log('[TEST 4D PASSED] Eight hermetic gates, package/docs/env proposals, and pre-proposal field/status repairs are verified.');
 
   const esmDir = path.join(testRoot, 'hermetic-esm');
   await fs.mkdir(esmDir, { recursive: true });
@@ -380,11 +599,141 @@ Fields:
 Create a form and page.`,
   });
   repairHermeticCandidate(esmPlan);
-  assert.equal(verifyHermeticEngineeringGates(esmPlan).passed, 5);
+  assert.equal(verifyHermeticEngineeringGates(esmPlan).passed, 8);
   const esmPackage = JSON.parse(esmPlan.modulesToCreate.find((module) => module.path === 'package.json').content);
   assert.equal(esmPackage.type, 'module', 'Existing package module format must be preserved.');
   assert.match(esmPlan.modulesToCreate.find((module) => module.path === 'server.js').content, /import http from/);
+  const esmRuntime = await runHermeticRegressionLoopWithRuntime(esmPlan, { root: esmDir });
+  assert.equal(esmRuntime.passed, 9, JSON.stringify(esmRuntime.gates.filter((gate) => !gate.passed)));
   console.log('[TEST 4E PASSED] Existing ESM package metadata is preserved with compatible generated backend modules.');
+
+  const legacyUpgradeDir = path.join(testRoot, 'legacy-hermetic-upgrade');
+  await fs.mkdir(legacyUpgradeDir, { recursive: true });
+  const legacyEnvironmentContents = 'PORT=4300\nDATABASE_URL=mongodb://localhost/legacy\n';
+  const legacyWorkspaceFiles = {
+    'config/db.js': "const mongoose = require('mongoose');\nmodule.exports = mongoose;\n",
+    'models/Catalog.js': "const { Schema } = require('mongoose');\nmodule.exports = new Schema({});\n",
+    'controllers/catalogController.js': "const { findCatalog } = require('../models/Catalog');\nmodule.exports = { findCatalog };\n",
+    'routes/catalog.js': "const express = require('express');\nmodule.exports = express.Router();\n",
+    'server.js': "const express = require('express');\nconst app = express();\nmodule.exports = app;\n",
+    'components/CatalogForm.jsx': "import React, { useState } from 'react';\nexport default function CatalogForm() { return null; }\n",
+    'app/catalog/page.jsx': "import { MissingCatalogForm } from '../../components/CatalogForm.jsx';\nexport default function CatalogPage() { return <MissingCatalogForm />; }\n",
+    'package.json': JSON.stringify({
+      name: 'legacy-catalog',
+      type: 'commonjs',
+      scripts: { start: 'node old-server.js', dev: 'node old-server.js', test: 'echo legacy' },
+      dependencies: { express: '^4.0.0', mongoose: '^8.0.0', react: '^18.0.0', 'react-dom': '^18.0.0' },
+    }, null, 2),
+    '.env.example': legacyEnvironmentContents,
+    'README.md': '# Legacy catalog workspace\n\nRetain this documentation.\n',
+    'services/featureService.js': "const express = require('express');\nmodule.exports = express;\n",
+    'utils/sharedUtils.js': 'module.exports = {};\n',
+  };
+  for (const [relativePath, contents] of Object.entries(legacyWorkspaceFiles)) {
+    const target = path.join(legacyUpgradeDir, ...relativePath.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, contents.replace(/\n/g, '\r\n'), 'utf8');
+  }
+  const retainedLegacyEnvironment = await fs.readFile(path.join(legacyUpgradeDir, '.env.example'), 'utf8');
+  const legacyUpgradePrompt = `Build a complete full-stack catalog feature with a React form.
+Create a POST endpoint /api/catalog.
+Fields:
+- title: string (required)
+- items: [{ label: string, quantity: number, price: number }]
+- total: number (calculated)
+- status: string (default=Pending)
+Create a page and form with validation and status messages.
+Workspace resolution: UPDATE_AND_INTEGRATE.`;
+  const legacyUpgradePlan = await deriveModularPlan(legacyUpgradeDir, { userRequest: legacyUpgradePrompt });
+  assert.ok(legacyUpgradePlan.modulesToCreate.length >= 9);
+  assert.ok(legacyUpgradePlan.modulesToCreate
+    .filter((module) => module.path !== '.env.example')
+    .every((module) => module.operation === 'modify'),
+  'Each existing full-stack target must be staged as a modification.');
+  assert.equal(
+    legacyUpgradePlan.modulesToCreate.find((module) => module.path === '.env.example').operation,
+    'reuse',
+    'An existing environment example must remain read-only.',
+  );
+  const legacyServer = legacyUpgradePlan.modulesToCreate.find((module) => module.path === 'server.js');
+  const legacyModel = legacyUpgradePlan.modulesToCreate.find((module) => module.responsibility === 'DATA_MODEL');
+  const legacyPage = legacyUpgradePlan.modulesToCreate.find((module) => module.path.startsWith('app/'));
+  legacyServer.content = `const express = require('express');\nconst app = express();\n${legacyServer.content}`;
+  legacyModel.content = "const mongoose = require('mongoose');\nmodule.exports = {};\n";
+  legacyPage.content = "import { MissingCatalogForm } from '../../components/CatalogForm.jsx';\nexport default function CatalogPage() { return <MissingCatalogForm />; }\n";
+  const legacyProgress = [];
+  const legacyRepair = runHermeticRegressionLoop(legacyUpgradePlan, {
+    root: legacyUpgradeDir,
+    onProgress: (event) => legacyProgress.push(event.message),
+  });
+  assert.equal(legacyRepair.status, 'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED', JSON.stringify(legacyRepair));
+  assert.equal(legacyRepair.passed, 8);
+  assert.equal(legacyRepair.total, 8);
+  assert.ok(legacyRepair.regressionLoop.repairs.some((repair) => repair.includes('server.js')));
+  assert.ok(legacyRepair.regressionLoop.repairs.some((repair) => repair.includes(legacyModel.path)));
+  assert.ok(legacyRepair.regressionLoop.repairs.some((repair) => repair.includes(legacyPage.path)));
+  assert.ok(legacyProgress.some((message) => message.includes('MODULE_AND_RUNTIME_RESOLUTION @ server.js')));
+  assert.ok(legacyProgress.some((message) => message.includes('MODULE_AND_RUNTIME_RESOLUTION @ app/')));
+  assert.ok(legacyProgress.some((message) => message.includes('[SELF-REPAIR]')));
+  const legacyUpgradePatch = await synthesizeMultiFilePatch(legacyUpgradeDir, legacyUpgradePlan);
+  for (const targetPath of [
+    'config/db.js', 'models/Catalog.js', 'controllers/catalogController.js',
+    'routes/catalog.js', 'server.js', 'components/CatalogForm.jsx',
+    'app/catalog/page.jsx', 'package.json',
+  ]) {
+    assert.ok(legacyUpgradePatch.filesList.some((file) => file.path === targetPath && file.operation === 'modify'));
+  }
+  assert.ok(!legacyUpgradePatch.filesList.some((file) => file.path === '.env.example'));
+  for (const module of legacyUpgradePlan.modulesToCreate.filter((candidate) => candidate.operation !== 'reuse')) {
+    const target = path.join(legacyUpgradeDir, ...module.path.split('/'));
+    await fs.writeFile(target, module.content, 'utf8');
+  }
+  assert.equal(await fs.readFile(path.join(legacyUpgradeDir, '.env.example'), 'utf8'), retainedLegacyEnvironment);
+  const legacyDiskVerification = await verifyHermeticEngineeringGatesOnDisk(legacyUpgradeDir, legacyUpgradePlan);
+  assert.equal(legacyDiskVerification.status, 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED', JSON.stringify(legacyDiskVerification));
+  assert.equal(legacyDiskVerification.passed, 9, JSON.stringify(legacyDiskVerification));
+  assert.equal(legacyDiskVerification.total, 9);
+  const repeatedLegacyPlan = await deriveModularPlan(legacyUpgradeDir, { userRequest: legacyUpgradePrompt });
+  const repeatedLegacyVerification = await runHermeticRegressionLoopWithRuntime(repeatedLegacyPlan, { root: legacyUpgradeDir });
+  assert.equal(repeatedLegacyVerification.status, 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED');
+  assert.equal(repeatedLegacyVerification.passed, 9);
+  assert.equal(repeatedLegacyVerification.total, 9);
+  const repeatedLegacyPatch = await synthesizeMultiFilePatch(legacyUpgradeDir, repeatedLegacyPlan);
+  assert.ok(
+    !repeatedLegacyPatch.filesList.some((file) => file.path === 'package.json'),
+    'A repeated plan must not emit a package patch for terminal-newline-only differences.',
+  );
+  assert.ok(!(await fs.readdir(legacyUpgradeDir)).includes('node_modules'));
+  console.log('[TEST 4I PASSED] Legacy populated workspaces self-heal stale backend/frontend modules, preserve .env.example, and pass nine on-disk gates on repeat.');
+  const emptyEnvironmentDir = path.join(testRoot, 'empty-existing-environment');
+  await fs.mkdir(emptyEnvironmentDir, { recursive: true });
+  await fs.writeFile(path.join(emptyEnvironmentDir, '.env.example'), '');
+  const emptyEnvironmentPlan = await deriveModularPlan(emptyEnvironmentDir, { userRequest: legacyUpgradePrompt });
+  assert.equal(emptyEnvironmentPlan.modulesToCreate.find((module) => module.path === '.env.example').operation, 'reuse');
+  assert.equal(runHermeticRegressionLoop(emptyEnvironmentPlan, { root: emptyEnvironmentDir }).passed, 8);
+  assert.ok(!(await synthesizeMultiFilePatch(emptyEnvironmentDir, emptyEnvironmentPlan)).filesList.some((file) => file.path === '.env.example'));
+
+  const routeConflictDir = path.join(testRoot, 'next-route-conflict');
+  await fs.mkdir(path.join(routeConflictDir, 'pages'), { recursive: true });
+  await fs.writeFile(path.join(routeConflictDir, 'pages', 'catalog.jsx'), 'export default function LegacyCatalogPage() { return null; }\n');
+  const routeConflictPlan = await deriveModularPlan(routeConflictDir, {
+    userRequest: `Build a full-stack catalog feature for the Next.js App Router with an API form.
+Create a POST endpoint /api/catalog.
+Fields:
+- title: string (required)
+Create a page and form component.`,
+  });
+  assert.equal(routeConflictPlan.routeContracts[0].pageFile, 'app/catalog/page.jsx');
+  assert.deepEqual(routeConflictPlan.routeContracts[0].nextRouteConflicts, []);
+  assert.deepEqual(routeConflictPlan.routeContracts[0].legacyRouteMigrations, [{
+    sourcePath: 'pages/catalog.jsx',
+    targetPath: 'legacy-pages-catalog.jsx.txt',
+  }]);
+  const routeConflictVerification = runHermeticRegressionLoop(routeConflictPlan, { root: routeConflictDir });
+  const routeConflictGate = routeConflictVerification.gates.find((gate) => gate.id === 'CROSS_LAYER_DATA_FLOW');
+  assert.equal(routeConflictGate.passed, true);
+  assert.equal(routeConflictVerification.passed, 8);
+  assert.equal(routeConflictPlan.modulesToCreate.find((module) => module.sourcePath === 'pages/catalog.jsx')?.operation, 'rename');
 
   const substantivePlan = await deriveModularPlan(populatedCreationDir, {
     userRequest: `Build a full-stack subscription feature with a form and backend API.
@@ -417,7 +766,104 @@ Workspace resolution: KEEP_AND_SCAFFOLD`,
     false,
     'Keep-and-scaffold resolution must not target the substantive existing entrypoint.',
   );
-  console.log('[TEST 4C PASSED] Substantive existing files trigger an explicit integration clarification instead of parallel scaffolding.');
+  assert.equal(runHermeticRegressionLoop(keepExistingPlan, { root: populatedCreationDir }).passed, 8);
+
+  const resolutionFixture = path.join(testRoot, 'resolution-fixture');
+  const legacyFullStackFiles = {
+    'config/db.js': "const mongoose = require('mongoose');\nmodule.exports = mongoose;\n",
+    'models/Order.js': "const mongoose = require('mongoose');\nmodule.exports = new mongoose.Schema({});\n",
+    'controllers/orderController.js': "const { missingModel } = require('../models/Order');\nmodule.exports = { missingModel };\n",
+    'routes/orders.js': "const { missingHandler } = require('../controllers/orderController');\nmodule.exports = missingHandler;\n",
+    'server.js': "const express = require('express');\nmodule.exports = express();\n",
+    'components/OrderForm.jsx': "import React, { useState } from 'react';\nexport default function OrderForm() { return null; }\n",
+    'app/orders/page.jsx': "import { MissingOrderForm } from '../../components/OrderForm.jsx';\nexport default function OrderPage() { return <MissingOrderForm />; }\n",
+    'pages/orders.js': 'export default function LegacyOrderPage() { return null; }\n',
+    'pages/about.jsx': 'export default function AboutPage() { return null; }\n',
+    'package.json': JSON.stringify({
+      name: 'legacy-order-workspace',
+      type: 'commonjs',
+      dependencies: { express: '^4.0.0', mongoose: '^8.0.0', react: '^18.0.0', 'react-dom': '^18.0.0' },
+    }, null, 2),
+    '.env.example': 'PORT=4300\n',
+    'README.md': '# Existing order workspace\n',
+  };
+  for (const [relativePath, content] of Object.entries(legacyFullStackFiles)) {
+    const target = path.join(resolutionFixture, ...relativePath.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, content, 'utf8');
+  }
+  const resolutionPrompt = `Build a complete full-stack order feature with a form and backend API.
+Create a POST endpoint /api/orders.
+Fields:
+- customerName: string (required)
+- items: [{ itemName: string, quantity: number, price: number }]
+- totalPrice: number (auto calculated)
+- status: string (default=Pending)
+Create a Next.js App Router page and React form component.`;
+  for (const resolution of [null, 'UPDATE_AND_INTEGRATE', 'REPLACE_TARGETS', 'KEEP_AND_SCAFFOLD']) {
+    const plan = await deriveModularPlan(resolutionFixture, {
+      userRequest: `${resolutionPrompt}${resolution ? `\nWorkspace resolution: ${resolution}` : ''}`,
+    });
+    assert.equal(plan.blockedReason, undefined, `${resolution || 'autonomous'} resolution must not stop for clarification.`);
+    const verification = await runHermeticRegressionLoopWithRuntime(plan, { root: resolutionFixture });
+    assert.equal(verification.passed, 9, `${resolution || 'autonomous'} resolution should pass all gates: ${JSON.stringify(verification.gates.filter((gate) => !gate.passed))}`);
+    assert.equal(verification.total, 9);
+    assert.deepEqual(plan.routeContracts[0].nextRouteConflicts, []);
+    assert.ok(plan.modulesToCreate.some((module) => (
+      module.operation === 'rename' && module.sourcePath === 'pages/orders.js'
+    )), 'A colliding legacy Pages Router file must be preserved outside the active router.');
+    const patch = await synthesizeMultiFilePatch(resolutionFixture, plan);
+    assert.ok(patch.filesList.some((file) => (
+      file.operation === 'rename' && file.sourcePath === 'pages/orders.js'
+    )), 'The route migration must remain a snapshot-bound proposal operation.');
+    if (resolution === 'KEEP_AND_SCAFFOLD') {
+      const server = plan.modulesToCreate.find((module) => module.path === 'generated/order/server.js');
+      assert.match(server.content, /require\("\.\/config\/environment\.js"\)/);
+      assert.ok(plan.modulesToCreate.some((module) => module.path === 'generated/order/models/Order.js'));
+      assert.ok(plan.modulesToCreate.some((module) => module.path === 'generated/order/app/orders/page.jsx'));
+    } else if (resolution) {
+      for (const target of [
+        'config/db.js',
+        'models/Order.js',
+        'controllers/orderController.js',
+        'routes/orders.js',
+        'server.js',
+        'components/OrderForm.jsx',
+        'app/orders/page.jsx',
+      ]) {
+        assert.ok(plan.modulesToCreate.some((module) => module.path === target && module.operation === 'modify'));
+      }
+    } else {
+      assert.ok(plan.modulesToCreate.some((module) => module.path === 'server.js' && module.operation === 'modify'));
+    }
+  }
+  const staleDirectivePlan = await deriveModularPlan(resolutionFixture, {
+    userRequest: resolutionPrompt,
+    requirements: ['Workspace resolution: KEEP_AND_SCAFFOLD'],
+  });
+  assert.ok(
+    staleDirectivePlan.modulesToCreate.some((module) => module.path === 'server.js'),
+    'A resolution directive in extracted/historical requirements must not override the current user request.',
+  );
+  const resolutionSessionId = 'session-v15-resolution-autonomous';
+  createSession(resolutionSessionId, ownerId);
+  await developerFiles.attachProject(resolutionFixture, ownerId);
+  const autonomousUpgrade = await executeAutonomousCodingWorkflow({
+    userRequest: resolutionPrompt,
+    root: resolutionFixture,
+    scope: '.',
+    sessionId: resolutionSessionId,
+    ownerWebContentsId: ownerId,
+    requestApproval: async () => true,
+    tools: { deriveModularPlan: true },
+  });
+  assert.equal(autonomousUpgrade.outcome, 'SUCCESS', JSON.stringify(autonomousUpgrade));
+  assert.equal(autonomousUpgrade.codeApplied, true);
+  assert.equal(autonomousUpgrade.hermeticVerification?.passed, 9);
+  assert.equal(autonomousUpgrade.hermeticVerification?.total, 9);
+  await assert.rejects(fs.stat(path.join(resolutionFixture, 'pages', 'orders.js')), { code: 'ENOENT' });
+  assert.ok((await fs.stat(path.join(resolutionFixture, 'legacy-pages-orders.js.txt'))).isFile());
+  console.log('[TEST 4C PASSED] Populated full-stack workspaces auto-upgrade, preserve all resolution modes, and migrate only conflicting legacy routes.');
 
   // =========================================================================
   // TEST 5: Missing or Failed File Write Prevents False Success Report

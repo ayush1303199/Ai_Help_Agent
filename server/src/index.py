@@ -1706,6 +1706,8 @@ async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResp
         expected_keys = {"brokerSessionId", "sessionLeaseToken"}
         if route == "workflows":
             expected_keys |= {"userRequest", "scope", "executionMode"}
+        elif route == "heartbeat":
+            expected_keys = {"brokerSessionId", "sessionLeaseToken"}
         elif route == "approval_decision":
             expected_keys |= {
                 "proposalId",
@@ -1733,7 +1735,7 @@ async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResp
                 },
             )
         project_id = session["projectId"]
-        if route in {"workflows", "approval", "approval_decision"} and project_id not in active_projects:
+        if route in {"workflows", "approval", "approval_decision", "heartbeat"} and project_id not in active_projects:
             raise HTTPException(
                 status_code=409,
                 detail={"code": "BROKER_PROJECT_UNAUTHORIZED", "message": "The attached project changed before workflow execution."},
@@ -1746,6 +1748,7 @@ async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResp
 
     broker_path = {
         "sessions": "/v1/sessions",
+        "heartbeat": "/v1/sessions/heartbeat",
         "workflows": "/v1/workflows",
         "cancel": "/v1/workflows/cancel",
         "approval": "/v1/workflows/approval",
@@ -1793,6 +1796,19 @@ async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResp
                 "expiresAt": expiration,
                 "browserSessionId": browser_session_id,
             }
+    elif route == "heartbeat" and upstream.status_code == 200:
+        expires_at = response_payload.get("expiresAt") if isinstance(response_payload, dict) else None
+        if not isinstance(expires_at, str):
+            raise HTTPException(status_code=502, detail="The trusted broker returned an invalid heartbeat expiration.")
+        try:
+            expiration = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+        except ValueError as error:
+            raise HTTPException(status_code=502, detail="The trusted broker returned an invalid heartbeat expiration.") from error
+        with _trusted_desktop_broker_lock:
+            session = sessions.get(payload.get("brokerSessionId"))
+            if session:
+                session["expiresAt"] = expiration
+                session["browserSessionId"] = browser_session_id
     elif route == "release" and upstream.status_code == 200:
         with _trusted_desktop_broker_lock:
             sessions.pop(payload.get("brokerSessionId"), None)
@@ -1802,6 +1818,11 @@ async def proxy_trusted_desktop_broker(route: str, request: Request) -> JSONResp
 @app.post("/api/coding/broker/sessions")
 async def proxy_trusted_desktop_broker_session(request: Request) -> JSONResponse:
     return await proxy_trusted_desktop_broker("sessions", request)
+
+
+@app.post("/api/coding/broker/sessions/heartbeat")
+async def proxy_trusted_desktop_broker_heartbeat(request: Request) -> JSONResponse:
+    return await proxy_trusted_desktop_broker("heartbeat", request)
 
 
 @app.post("/api/coding/broker/workflows")

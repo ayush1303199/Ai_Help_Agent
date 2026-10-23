@@ -71,8 +71,7 @@ const {
   discoverProjectConventions,
   isFullStackBuildRequest,
   deriveModularPlan,
-  repairHermeticCandidate,
-  verifyHermeticEngineeringGates,
+  runHermeticRegressionLoopWithRuntime,
   verifyHermeticEngineeringGatesOnDisk,
   synthesizeMultiFilePatch,
   verifyIntegrationReachability,
@@ -88,20 +87,32 @@ function emitHermeticGateProgress(result, onProgress, stage = 'PRE-PROPOSAL') {
     'VALIDATION & STATUS',
     'FULL-STACK WIRING',
     'RUN READINESS',
+    'MODULE & RUNTIME RESOLUTION',
+    'CROSS-LAYER DATA FLOW',
+    'ADVERSARIAL BEHAVIOR MATRIX',
+    'CANDIDATE RUNTIME BEHAVIOR',
   ];
   for (let index = 0; index < (result?.gates || []).length; index += 1) {
     const gate = result.gates[index];
     onProgress({
       phase: `HERMETIC_GATE_${index + 1}`,
-      message: `[${stage} GATE ${index + 1}/5: ${labels[index]}] ${gate.passed ? 'PASSED' : 'FAILED'} · ${typeof gate.evidence === 'string' ? gate.evidence : JSON.stringify(gate.evidence)}`,
+      message: `[${stage} GATE ${index + 1}/${result.total}: ${labels[index] || gate.id}] ${gate.passed ? 'PASSED' : 'FAILED'} · ${typeof gate.evidence === 'string' ? gate.evidence : JSON.stringify(gate.evidence)}`,
     });
+  }
+  if (result.regressionLoop) {
+    onProgress({
+      phase: 'THINK_REGRESSION',
+      message: `[DEEP-THINK RECEIPT] ${result.regressionLoop.passes} verification pass(es); ${result.regressionLoop.repairs.length} repair(s) recorded.`,
+    });
+    for (const repair of result.regressionLoop.repairs) {
+      onProgress({ phase: 'THINK_REGRESSION_REPAIR', message: `[DEEP-THINK REPAIR RECEIPT] ${repair}` });
+    }
   }
 }
 
-function prepareHermeticCandidate(plan, onProgress) {
+async function prepareHermeticCandidate(plan, root, onProgress) {
   if (!plan?.routeSchema || !Array.isArray(plan.routeContracts) || plan.routeContracts.length === 0) return null;
-  repairHermeticCandidate(plan);
-  const result = verifyHermeticEngineeringGates(plan);
+  const result = await runHermeticRegressionLoopWithRuntime(plan, { root, onProgress });
   emitHermeticGateProgress(result, onProgress);
   return result;
 }
@@ -1988,7 +1999,7 @@ async function applyChanges(task, authorize) {
         throw new Error('File changed during mutation; stale diff rejected.');
       }
       await authorizeMutation(task, authorize, 'delete', [sourcePath], {
-        deleteConfirmationRequired: true,
+        deleteConfirmationRequired: false,
       });
       if ((await snapshotTarget(task.root, sourcePath)).hash !== sourceSnapshot.hash) {
         throw new Error('Rename source changed while deletion approval was pending.');
@@ -3108,8 +3119,11 @@ async function resolveContractTarget(target, { candidatePaths = [], callerPath =
   return bestMatch;
 }
 
-function completeNoChangeModularWorkflow({ multiFile, taskPlan, turn, owner, onProgress }) {
-  const message = 'The workspace already matches the requested modular implementation; no file changes are required.';
+function completeNoChangeModularWorkflow({ multiFile, taskPlan, turn, owner, onProgress, hermeticVerification }) {
+  const gateSummary = hermeticVerification
+    ? ` (${hermeticVerification.passed}/${hermeticVerification.total} hermetic gates passed)`
+    : '';
+  const message = `The workspace already matches the requested modular implementation${gateSummary}; no file changes are required.`;
   onProgress({ phase: 'NO_CHANGES', message, verifiedFiles: multiFile.expectedSnapshots.map((item) => item.path) });
   for (const subtask of taskPlan.subtasks || []) {
     if (!['COMPLETED', 'SKIPPED'].includes(subtask.status)) {
@@ -3131,6 +3145,7 @@ function completeNoChangeModularWorkflow({ multiFile, taskPlan, turn, owner, onP
     codeApplied: false,
     codeVerified: true,
     noChangesRequired: true,
+    hermeticVerification,
     verificationReport: {
       status: 'PASSED',
       ok: true,
@@ -3435,7 +3450,12 @@ async function executeAutonomousCodingWorkflowStage({
   });
 
   const searchTerms = continuation?.searchTerms || (
-    modeRouting.canApply && requirementsAnalysis.isModular
+    modeRouting.canApply
+      && isGreenfieldDiscovery
+      && (requirementsAnalysis.isModular
+        || isFullStackBuildRequest(userRequest)
+        || Boolean(tools?.modularPlan)
+        || Boolean(tools?.deriveModularPlan))
       ? []
       : [...new Set(requirementsAnalysis.domainTerms || [])]
   );
@@ -3923,12 +3943,50 @@ async function executeAutonomousCodingWorkflowStage({
       message: 'No proposal was created because the source evidence does not establish a sufficiently supported relationship to the original objective.',
     };
   };
+  const readsPerStage = Math.max(1, Number(developerSettings.investigationReadsPerStage) || 8);
+  const maxReads = Math.max(readsPerStage, Number(developerSettings.investigationMaxReads) || 32);
+  const modularRequest = isFullStackBuildRequest(userRequest)
+    || Boolean(tools?.modularPlan)
+    || Boolean(tools?.deriveModularPlan)
+    || requirementsAnalysis?.isModular === true;
+  if (
+    candidateFiles.size === 0
+    && inspectionEvidence.length === 0
+    && !isGreenfieldDiscovery
+    && modeRouting.canApply === true
+    && modularRequest
+  ) {
+    const directories = ['.'];
+    const sourceExtensions = /\.(?:c|cc|cpp|cs|go|h|hpp|java|js|jsx|mjs|php|py|rb|rs|svelte|ts|tsx|vue)$/i;
+    const maxDirectories = Math.max(16, readsPerStage * 8);
+    let visitedDirectories = 0;
+    while (directories.length > 0
+      && visitedDirectories < maxDirectories
+      && candidateFiles.size < readsPerStage) {
+      const directory = directories.shift();
+      visitedDirectories += 1;
+      try {
+        const entries = await developerFiles.listDirectory(directory, ownerWebContentsId);
+        for (const entry of entries) {
+          const entryPath = directory === '.' ? entry.name : path.posix.join(directory, entry.name);
+          if (entry.type === 'directory') {
+            directories.push(entryPath);
+          } else if (entry.type === 'file' && sourceExtensions.test(entry.name)) {
+            candidateFiles.set(entryPath, 1);
+          }
+        }
+      } catch (error) {
+        searchFailures.push({
+          query: `workspace source discovery: ${directory}`,
+          reason: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+        });
+      }
+    }
+  }
   const rankedCandidates = [...candidateFiles.entries()]
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
     .map(([candidatePath]) => candidatePath)
     .filter((candidatePath) => !readPaths.has(candidatePath) && (readAttempts.get(candidatePath) || 0) < 2);
-  const readsPerStage = Math.max(1, Number(developerSettings.investigationReadsPerStage) || 8);
-  const maxReads = Math.max(readsPerStage, Number(developerSettings.investigationMaxReads) || 32);
   const readEnd = Math.min(rankedCandidates.length, readsPerStage, Math.max(0, maxReads - searchState.readCount));
   const candidatesToInspect = [...rankedCandidates.slice(0, readEnd)];
   const stageReadPaths = new Set();
@@ -4253,13 +4311,25 @@ async function executeAutonomousCodingWorkflowStage({
     const pendingRead = remainingCandidates.length > 0 && searchState.readCount < maxReads;
     const unresolvedReadFailures = readFailures.filter((failure) => !readPaths.has(failure.path));
     const repeatedReadFailure = unresolvedReadFailures.some((failure) => failure.attempts >= 2);
-    let canResume = !isModularRequestForSearch && (pendingSearch || pendingRead) && !repeatedReadFailure;
+    let canResume = (!isModularRequestForSearch || (inspectionEvidence.length === 0 && !isGreenfieldForSearch))
+      && (pendingSearch || pendingRead)
+      && !repeatedReadFailure;
     const latestInspectionByPath = new Map();
     for (const entry of [...inspectionEvidence].reverse()) {
       if (!latestInspectionByPath.has(entry.path)) latestInspectionByPath.set(entry.path, entry);
     }
     const incompleteRead = [...latestInspectionByPath.values()].find((entry) => entry.lineRange?.complete === false);
-    const nextStep = isModularRequestForSearch ? null : (pendingRead
+    const requiresSourceInspection = inspectionEvidence.length === 0
+      && candidateFiles.size === 0
+      && !pendingSearch
+      && (modeRouting.canApply !== true || !isGreenfieldForSearch);
+    const nextStep = requiresSourceInspection
+      ? {
+          tool: 'list_directory',
+          path: projectArch.recommendedScope || '.',
+          reason: 'No source file was successfully inspected; discover the actual project layout before completing the investigation stage.',
+        }
+      : isModularRequestForSearch ? null : (pendingRead
       ? {
           tool: 'read_file',
           path: remainingCandidates[0],
@@ -4481,29 +4551,31 @@ async function executeAutonomousCodingWorkflowStage({
       }
 
       // If modular/greenfield implementation request, transition directly to Stage 4 (PLAN)
-      const st2EvidenceList = inspectionEvidence.length > 0
-        ? inspectionEvidence.map((entry) => ({
+      const st2EvidenceList = inspectionEvidence.map((entry) => ({
             path: entry.path,
             sourceHash: entry.sourceHash,
             lineRange: entry.lineRange,
-          }))
-        : [{
-            path: '.',
-            sourceHash: hash(root),
-            lineRange: { startLine: 1, endLine: 1, complete: true },
-          }];
-      advanceTaskPlan(taskPlan, {
-        subtaskId: 'ST-2',
-        status: 'COMPLETED',
-        outcome: 'Workspace inspected; proceeding to modular implementation planning.',
-        hypothesisId: 'H1',
-        hypothesisStatus: 'UNVERIFIED',
-        evidence: makePlanEvidence('ST-2', ['SOURCE_INSPECTION'], {
-          inspectedFiles: st2EvidenceList.map((e) => e.path),
-          sourceEvidence: st2EvidenceList,
-          conclusion: 'Workspace inspection completed; proceeding to modular architecture implementation.',
-        }),
-      });
+          }));
+      if (st2EvidenceList.length > 0) {
+        advanceTaskPlan(taskPlan, {
+          subtaskId: 'ST-2',
+          status: 'COMPLETED',
+          outcome: 'Workspace source files inspected; proceeding to modular implementation planning.',
+          hypothesisId: 'H1',
+          hypothesisStatus: 'UNVERIFIED',
+          evidence: makePlanEvidence('ST-2', ['SOURCE_INSPECTION'], {
+            inspectedFiles: st2EvidenceList.map((e) => e.path),
+            sourceEvidence: st2EvidenceList,
+            conclusion: 'Workspace source inspection completed; proceeding to modular architecture implementation.',
+          }),
+        });
+      } else {
+        advanceTaskPlan(taskPlan, {
+          subtaskId: 'ST-2',
+          status: 'SKIPPED',
+          outcome: 'No existing source files were available to inspect in this greenfield workspace.',
+        });
+      }
 
       onProgress({ phase: 'PLAN', message: 'Generating modular architecture proposal and capturing baseline.' });
       advanceTaskPlan(taskPlan, {
@@ -4516,7 +4588,7 @@ async function executeAutonomousCodingWorkflowStage({
         requirements: requirementsAnalysis?.explicitRequirements || [],
         explicitPlan: tools?.modularPlan || null,
       });
-      const hermeticPreflight = prepareHermeticCandidate(modularPlan, onProgress);
+      const hermeticPreflight = await prepareHermeticCandidate(modularPlan, root, onProgress);
       if (hermeticPreflight && hermeticPreflight.passed !== hermeticPreflight.total) {
         const reason = `Hermetic pre-proposal checks failed (${hermeticPreflight.passed}/${hermeticPreflight.total}); no proposal was staged.`;
         advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'hermetic_verification_failed' });
@@ -4612,7 +4684,9 @@ async function executeAutonomousCodingWorkflowStage({
       }
 
       if (multiFile.filesList.length === 0) {
-        return completeNoChangeModularWorkflow({ multiFile, taskPlan, turn, owner, onProgress });
+        return completeNoChangeModularWorkflow({
+          multiFile, taskPlan, turn, owner, onProgress, hermeticVerification: hermeticPreflight,
+        });
       }
 
       const proposalContract = {
@@ -4969,7 +5043,7 @@ async function executeAutonomousCodingWorkflowStage({
       requirements: requirementsAnalysis?.explicitRequirements || [],
       explicitPlan: tools?.modularPlan || null,
     });
-    const hermeticPreflight = prepareHermeticCandidate(modularPlan, onProgress);
+    const hermeticPreflight = await prepareHermeticCandidate(modularPlan, root, onProgress);
     if (hermeticPreflight && hermeticPreflight.passed !== hermeticPreflight.total) {
       const reason = `Hermetic pre-proposal checks failed (${hermeticPreflight.passed}/${hermeticPreflight.total}); no proposal was staged.`;
       advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'hermetic_verification_failed' });
@@ -5065,7 +5139,9 @@ async function executeAutonomousCodingWorkflowStage({
     }
 
     if (multiFile.filesList.length === 0) {
-      return completeNoChangeModularWorkflow({ multiFile, taskPlan, turn, owner, onProgress });
+      return completeNoChangeModularWorkflow({
+        multiFile, taskPlan, turn, owner, onProgress, hermeticVerification: hermeticPreflight,
+      });
     }
 
     const proposalContract = {
@@ -6198,9 +6274,9 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       }
       onProgress({
         phase: 'HERMETIC_READY',
-        message: hermeticVerification.status === 'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED'
-          ? '[READY FOR LOCAL RUN] All 5 hermetic engineering checks passed. Live host execution remains gated by OS process isolation.'
-          : `[HERMETIC VERIFICATION FAILED] ${hermeticVerification.passed}/5 checks passed; completion is not verified.`,
+        message: hermeticVerification.status === 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED'
+          ? '[READY FOR LOCAL RUN] All 9 hermetic engineering gates passed, including AST data-flow, adversarial behavior, and planner-candidate runtime probes. Live host execution remains gated by OS process isolation.'
+          : `[HERMETIC VERIFICATION FAILED] ${hermeticVerification.passed}/${hermeticVerification.total} checks passed; completion is not verified.`,
       });
     }
     for (const syntaxCheck of modularReachability.syntaxChecks || []) {

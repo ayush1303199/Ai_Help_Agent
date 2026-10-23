@@ -1,9 +1,11 @@
 'use strict';
 
 const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const vm = require('node:vm');
+const { isBuiltin } = require('node:module');
 
 let typescriptParser = null;
 try {
@@ -230,11 +232,12 @@ function cleanEntityName(name) {
 function extractRequestedRoute(text) {
   const source = String(text || '');
   const match = source.match(/\b(GET|POST|PUT|PATCH|DELETE)\s+(\/[A-Za-z0-9_/:.-]*)/i)
+    || source.match(/\b(GET|POST|PUT|PATCH|DELETE)\s+(?:API\s+)?(?:endpoint|route)\s+(?:at\s+)?(\/[A-Za-z0-9_/:.-]*)/i)
     || source.match(/(\/(?:api\/)?[A-Za-z0-9_:-]+(?:\/[A-Za-z0-9_:-]+)*)\s*(?:\((GET|POST|PUT|PATCH|DELETE)\)|[-,;:]?\s*(?:using|via|with\s+method)\s+(GET|POST|PUT|PATCH|DELETE)\b)/i);
   if (!match) return null;
   const routeFirst = match[1].startsWith('/');
   const method = (routeFirst ? match[2] || match[3] : match[1]).toUpperCase();
-  const routeValue = routeFirst ? match[1] : match[2];
+  const routeValue = routeFirst ? match[1] : match[3] || match[2];
   const routePath = validateRoutePath(routeValue.replace(/[.,;]+$/, '').replace(/\/+$/, '') || '/');
   return { method, path: routePath };
 }
@@ -265,7 +268,7 @@ function extractRequestedFields(text) {
       || (nested ? 'array' : 'string')).toLowerCase();
     const type = declaredType === 'integer' ? 'number' : declaredType;
     const metadata = `${declaration} ${line}`;
-    const defaultMatch = metadata.match(/\bdefault\s*[:=]\s*("[^"]*"|'[^']*'|true|false|null|-?\d+(?:\.\d+)?)/i);
+    const defaultMatch = metadata.match(/\bdefault(?:\s*[:=]\s*|\s+)("[^"]*"|'[^']*'|true|false|null|-?\d+(?:\.\d+)?|[A-Za-z][\w-]*)/i);
     let defaultValue = null;
     if (defaultMatch) {
       const literal = defaultMatch[1];
@@ -274,7 +277,7 @@ function extractRequestedFields(text) {
           ? literal.slice(1, -1)
           : JSON.parse(literal);
       } catch {
-        defaultValue = null;
+        defaultValue = literal;
       }
     }
     const items = nested
@@ -364,6 +367,16 @@ async function existingFile(root, relative) {
   }
 }
 
+async function existingPath(root, relative) {
+  try {
+    await fs.lstat(path.join(root, ...relative.split('/')));
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
+    throw error;
+  }
+}
+
 function matchingWorkspaceFile(files, predicate) {
   return files.find((file) => predicate(file.replace(/\\/g, '/').toLowerCase())) || null;
 }
@@ -397,26 +410,40 @@ function fieldValidationCode(fields) {
   for (const field of fields) {
     const fieldKey = JSON.stringify(field.name);
     if (field.required) {
-      lines.push(`  if (payload[${fieldKey}] === undefined || payload[${fieldKey}] === null || payload[${fieldKey}] === '') errors.push(${JSON.stringify(`${field.name} is required.`)});`);
+      if (field.type === 'string') {
+        lines.push(`  if (typeof payload[${fieldKey}] !== 'string' || payload[${fieldKey}].trim() === '') errors.push(${JSON.stringify(`${field.name} is required.`)});`);
+      } else {
+        lines.push(`  if (payload[${fieldKey}] === undefined || payload[${fieldKey}] === null || payload[${fieldKey}] === '') errors.push(${JSON.stringify(`${field.name} is required.`)});`);
+      }
     }
     if (field.type === 'array') {
       lines.push(`  if (payload[${fieldKey}] !== undefined && !Array.isArray(payload[${fieldKey}])) errors.push(${JSON.stringify(`${field.name} must be an array.`)});`);
       if (field.items?.length) {
+        lines.push(`  if (Array.isArray(payload[${fieldKey}]) && payload[${fieldKey}].length === 0) errors.push(${JSON.stringify(`${field.name} must contain at least one item.`)});`);
         lines.push(`  if (Array.isArray(payload[${fieldKey}])) payload[${fieldKey}].forEach((item, index) => {`);
         lines.push(`    if (!item || typeof item !== 'object' || Array.isArray(item)) { errors.push(${JSON.stringify(`${field.name}[item] must be an object.`)}); return; }`);
         for (const itemField of field.items) {
           const itemKey = JSON.stringify(itemField.name);
-          if (itemField.required) {
-            lines.push(`    if (item[${itemKey}] === undefined || item[${itemKey}] === null || item[${itemKey}] === '') errors.push(${JSON.stringify(`${field.name}[${itemField.name}] is required at index `)} + index + '.');`);
+          if (itemField.required || itemField.type === 'string') {
+            if (itemField.type === 'string') {
+              lines.push(`    if (typeof item[${itemKey}] !== 'string' || item[${itemKey}].trim() === '') errors.push(${JSON.stringify(`${field.name}[${itemField.name}] is required at index `)} + index + '.');`);
+            } else {
+              lines.push(`    if (item[${itemKey}] === undefined || item[${itemKey}] === null || item[${itemKey}] === '') errors.push(${JSON.stringify(`${field.name}[${itemField.name}] is required at index `)} + index + '.');`);
+            }
           }
           if (itemField.type === 'number') {
-            lines.push(`    if (item[${itemKey}] !== undefined && !Number.isFinite(Number(item[${itemKey}]))) errors.push(${JSON.stringify(`${field.name}[${itemField.name}] must be a number at index `)} + index + '.');`);
+            lines.push(`    if (item[${itemKey}] === undefined || item[${itemKey}] === null || item[${itemKey}] === '' || !Number.isFinite(Number(item[${itemKey}]))) errors.push(${JSON.stringify(`${field.name}[${itemField.name}] must be a finite number at index `)} + index + '.');`);
+            if (/(?:quantity|count|units)/i.test(itemField.name)) {
+              lines.push(`    else if (Number(item[${itemKey}]) <= 0) errors.push(${JSON.stringify(`${field.name}[${itemField.name}] must be greater than zero at index `)} + index + '.');`);
+            } else if (/(?:price|cost|amount)/i.test(itemField.name)) {
+              lines.push(`    else if (Number(item[${itemKey}]) < 0) errors.push(${JSON.stringify(`${field.name}[${itemField.name}] must not be negative at index `)} + index + '.');`);
+            }
           }
         }
         lines.push('  });');
       }
     } else if (field.type === 'number') {
-      lines.push(`  if (payload[${fieldKey}] !== undefined && payload[${fieldKey}] !== null && !Number.isFinite(Number(payload[${fieldKey}]))) errors.push(${JSON.stringify(`${field.name} must be a number.`)});`);
+      lines.push(`  if (payload[${fieldKey}] !== undefined && payload[${fieldKey}] !== null && payload[${fieldKey}] !== '' && !Number.isFinite(Number(payload[${fieldKey}]))) errors.push(${JSON.stringify(`${field.name} must be a finite number.`)});`);
     } else if (field.type === 'boolean') {
       lines.push(`  if (payload[${fieldKey}] !== undefined && typeof payload[${fieldKey}] !== 'boolean' && payload[${fieldKey}] !== 'true' && payload[${fieldKey}] !== 'false') errors.push(${JSON.stringify(`${field.name} must be a boolean.`)});`);
     }
@@ -440,10 +467,262 @@ ${itemFields.map((itemField) => `          <label><span>${itemField.name}</span>
   }).join('\n');
 }
 
+function completeFullStackFields(fields) {
+  const complete = fields.map((field) => ({ ...field, items: field.items?.map((item) => ({ ...item })) }));
+  let status = complete.find((field) => field.name.toLowerCase() === 'status');
+  const transactional = complete.some((field) => field.type === 'array' && field.items?.length)
+    && complete.some((field) => field.type === 'number' && /(?:total|amount|subtotal|sum)/i.test(field.name));
+  if (!status && transactional) {
+    status = { name: 'status', type: 'string', required: false, hasDefault: true, defaultValue: 'Pending' };
+    complete.push(status);
+  } else if (status && !status.hasDefault) {
+    status.hasDefault = true;
+    status.defaultValue = 'Pending';
+  }
+  if ((status || transactional) && !complete.some((field) => /^(?:createdAt|createdOn)$/i.test(field.name))) {
+    complete.push({ name: 'createdAt', type: 'date', required: false, hasDefault: false, defaultValue: null });
+  }
+  return complete;
+}
+
+function buildClientValidation(fields) {
+  const checks = [];
+  for (const field of fields) {
+    const fieldKey = JSON.stringify(field.name);
+    if (field.required && field.type === 'string') {
+      checks.push(`    if (typeof form[${fieldKey}] !== 'string' || form[${fieldKey}].trim() === '') clientErrors.push(${JSON.stringify(`${field.name} is required.`)});`);
+    }
+    if (field.type === 'array' && field.items?.length) {
+      checks.push(`    if (!Array.isArray(form[${fieldKey}]) || form[${fieldKey}].length === 0) clientErrors.push(${JSON.stringify(`${field.name} must contain at least one item.`)});`);
+      checks.push(`    for (const [index, item] of (Array.isArray(form[${fieldKey}]) ? form[${fieldKey}] : []).entries()) {`);
+      for (const item of field.items) {
+        const itemKey = JSON.stringify(item.name);
+        if (item.type === 'string') {
+          checks.push(`      if (typeof item[${itemKey}] !== 'string' || item[${itemKey}].trim() === '') clientErrors.push(${JSON.stringify(`${field.name}[${item.name}] is required at index `)} + index + '.');`);
+        } else if (item.type === 'number') {
+          checks.push(`      if (item[${itemKey}] === undefined || item[${itemKey}] === null || item[${itemKey}] === '' || !Number.isFinite(Number(item[${itemKey}]))) clientErrors.push(${JSON.stringify(`${field.name}[${item.name}] must be a finite number at index `)} + index + '.');`);
+          if (/(?:quantity|count|units)/i.test(item.name)) {
+            checks.push(`      else if (Number(item[${itemKey}]) <= 0) clientErrors.push(${JSON.stringify(`${field.name}[${item.name}] must be greater than zero at index `)} + index + '.');`);
+          } else if (/(?:price|cost|amount)/i.test(item.name)) {
+            checks.push(`      else if (Number(item[${itemKey}]) < 0) clientErrors.push(${JSON.stringify(`${field.name}[${item.name}] must not be negative at index `)} + index + '.');`);
+          }
+        }
+      }
+      checks.push('    }');
+    }
+  }
+  return checks.join('\n');
+}
+
+function buildComputedTotalPreview(fields) {
+  const computedTotal = fields.find((field) => (
+    field.type === 'number' && /(?:total|amount|subtotal|sum)/i.test(field.name)
+  ));
+  const lineItems = fields.find((field) => (
+    field.type === 'array'
+      && field.items?.some((item) => /(?:price|cost|amount)/i.test(item.name))
+      && field.items?.some((item) => /(?:quantity|count|units)/i.test(item.name))
+  ));
+  if (!computedTotal || !lineItems) return '';
+  const priceField = lineItems.items.find((item) => /(?:price|cost|amount)/i.test(item.name)).name;
+  const quantityField = lineItems.items.find((item) => /(?:quantity|count|units)/i.test(item.name)).name;
+  const expression = `(form[${JSON.stringify(lineItems.name)}] || []).reduce((sum, item) => sum + Number(item[${JSON.stringify(priceField)}] || 0) * Number(item[${JSON.stringify(quantityField)}] || 0), 0)`;
+  return `    <output aria-live="polite" data-calculated-total={${expression}}>{${JSON.stringify(`${computedTotal.name}: `)}}{${expression}}</output>\n`;
+}
+
+function buildStandalonePreviewHtml({ entityPascal, fields, route }) {
+  const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[character]);
+  const calculatedTotal = fields.find((field) => (
+    field.type === 'number' && /(?:total|amount|subtotal|sum)/i.test(field.name)
+  ));
+  const lineItems = fields.find((field) => (
+    field.type === 'array'
+      && field.items?.some((item) => /(?:price|cost|amount)/i.test(item.name))
+      && field.items?.some((item) => /(?:quantity|count|units)/i.test(item.name))
+  ));
+  const scalarFields = fields.filter((field) => field.type !== 'array'
+    && field.name !== calculatedTotal?.name
+    && !/^(?:id|createdAt|createdOn)$/i.test(field.name));
+  const scalarInputs = scalarFields.map((field) => {
+    const inputType = field.type === 'number' ? 'number' : field.type === 'date' ? 'date' : 'text';
+    const required = field.required ? ' required' : '';
+    const value = field.hasDefault ? ` value="${escapeHtml(field.defaultValue)}"` : '';
+    const name = escapeHtml(field.name);
+    return `<label class="field"><span>${name}</span><input name="${name}" data-scalar="${name}" type="${inputType}"${required}${value}></label>`;
+  }).join('\n');
+  const arrayInputs = fields.filter((field) => field.type === 'array').map((field) => (
+    `<fieldset class="items"><legend>${escapeHtml(field.name)}</legend><div data-array="${escapeHtml(field.name)}"></div><button class="secondary" type="button" data-add="${escapeHtml(field.name)}">Add item</button></fieldset>`
+  )).join('\n');
+  const itemFieldMetadata = Object.fromEntries(fields.filter((field) => field.type === 'array').map((field) => [
+    field.name,
+    (field.items || []).map((item) => ({ name: item.name, type: item.type })),
+  ]));
+  const initialItemMetadata = JSON.stringify(itemFieldMetadata).replace(/</g, '\\u003c');
+  const totalPreview = calculatedTotal && lineItems
+    ? `<p class="total">${calculatedTotal.name}: <output data-total>0</output></p>`
+    : '';
+  const js = `(() => {
+  const itemFields = ${initialItemMetadata};
+  const form = document.querySelector('form');
+  const toast = document.querySelector('[role="status"]');
+  const error = document.querySelector('[role="alert"]');
+  const button = form.querySelector('button[type="submit"]');
+  function addItem(name) {
+    const host = document.querySelector('[data-array="' + name + '"]');
+    const row = document.createElement('div');
+    row.className = 'item-row';
+    for (const field of itemFields[name] || []) {
+      const label = document.createElement('label');
+      label.className = 'field';
+      label.textContent = field.name;
+      const input = document.createElement('input');
+      input.type = field.type === 'number' ? 'number' : 'text';
+      input.dataset.field = field.name;
+      input.addEventListener('input', updateTotal);
+      label.append(input);
+      row.append(label);
+    }
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'secondary';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => { row.remove(); updateTotal(); });
+    row.append(remove);
+    host.append(row);
+    updateTotal();
+  }
+  function updateTotal() {
+    const output = document.querySelector('[data-total]');
+    if (!output) return;
+    const priceKey = ${JSON.stringify(lineItems?.items?.find((item) => /(?:price|cost|amount)/i.test(item.name))?.name || '')};
+    const quantityKey = ${JSON.stringify(lineItems?.items?.find((item) => /(?:quantity|count|units)/i.test(item.name))?.name || '')};
+    const host = document.querySelector('[data-array="${lineItems?.name || ''}"]');
+    output.value = host ? [...host.querySelectorAll('.item-row')].reduce((sum, row) => {
+      const price = Number(row.querySelector('[data-field="' + priceKey + '"]')?.value || 0);
+      const quantity = Number(row.querySelector('[data-field="' + quantityKey + '"]')?.value || 0);
+      return sum + price * quantity;
+    }, 0).toFixed(2) : '0.00';
+  }
+  for (const name of Object.keys(itemFields)) {
+    document.querySelector('[data-add="' + name + '"]').addEventListener('click', () => addItem(name));
+    addItem(name);
+  }
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    toast.textContent = '';
+    error.textContent = '';
+    button.disabled = true;
+    button.textContent = 'Saving...';
+    try {
+      const payload = {};
+      for (const input of form.querySelectorAll('[data-scalar]')) {
+        payload[input.dataset.scalar] = input.type === 'number' ? Number(input.value) : input.value;
+      }
+      for (const [name] of Object.entries(itemFields)) {
+        payload[name] = [...document.querySelectorAll('[data-array="' + name + '"] .item-row')].map((row) => {
+          const item = {};
+          for (const input of row.querySelectorAll('[data-field]')) {
+            item[input.dataset.field] = input.type === 'number' ? Number(input.value) : input.value;
+          }
+          return item;
+        });
+      }
+      const response = await fetch(${JSON.stringify(route.path)}, {
+        method: ${JSON.stringify(route.method)},
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || result.errors?.join(', ') || 'Request failed.');
+      toast.textContent = 'Saved successfully.';
+    } catch (cause) {
+      error.textContent = cause instanceof Error ? cause.message : 'Request failed.';
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Add ${entityPascal}';
+    }
+  });
+})();`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Add ${entityPascal}</title>
+  <style>
+    :root { color-scheme: light; font-family: ui-sans-serif, system-ui, sans-serif; background: #f1f5f9; color: #0f172a; }
+    * { box-sizing: border-box; } body { margin: 0; padding: 2rem 1rem; }
+    main { max-width: 48rem; margin: 0 auto; } .card { background: white; border: 1px solid #e2e8f0; border-radius: 1rem; padding: 1.5rem; box-shadow: 0 12px 32px #0f172a12; }
+    h1 { margin-top: 0; } .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; }
+    .field { display: grid; gap: .4rem; margin: .5rem 0; font-weight: 600; } input { width: 100%; padding: .7rem; border: 1px solid #cbd5e1; border-radius: .5rem; font: inherit; }
+    button { border: 0; border-radius: .55rem; padding: .75rem 1rem; background: #2563eb; color: white; font: inherit; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .65; cursor: wait; } .secondary { background: #e2e8f0; color: #0f172a; }
+    .items { border: 1px solid #e2e8f0; border-radius: .75rem; padding: 1rem; margin: 1rem 0; } .item-row { display: grid; grid-template-columns: repeat(auto-fit,minmax(8rem,1fr)); align-items: end; gap: .75rem; margin: .75rem 0; }
+    .total { font-size: 1.15rem; font-weight: 700; } [role="alert"] { color: #b91c1c; } [role="status"] { color: #15803d; }
+  </style>
+</head>
+<body><main><section class="card">
+  <h1>Add ${entityPascal}</h1>
+  <form><div class="grid">${scalarInputs}</div>${arrayInputs}${totalPreview}
+    <button type="submit">Add ${entityPascal}</button>
+    <p role="alert" aria-live="assertive"></p><p role="status" aria-live="polite"></p>
+  </form>
+</section></main><script>${js}</script></body>
+</html>`;
+}
+
+async function findLegacyPagesRouteConflicts(root, appPagePath) {
+  const appSegments = appPagePath.replace(/^app\//, '').split('/');
+  if (appSegments.at(-1).match(/^page\.[jt]sx?$/i)) appSegments.pop();
+  const appRoute = appSegments
+    .filter((segment) => !/^\([^)]*\)$/.test(segment))
+    .map((segment) => segment.replace(/^\[\[\.\.\..+\]\]$/, '[]').replace(/^\[\.\.\..+\]$/, '[]').replace(/^\[.+\]$/, '[]'))
+    .join('/')
+    .toLowerCase();
+  const pagesRoot = path.join(root, 'pages');
+  const conflicts = [];
+  const walk = async (directory, relative = '') => {
+    let entries;
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const childRelative = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        await walk(path.join(directory, entry.name), childRelative);
+        continue;
+      }
+      if (!entry.isFile() || !/\.[jt]sx?$/i.test(entry.name)) continue;
+      const withoutExtension = childRelative.replace(/\.[^.]+$/, '');
+      const routeSegments = withoutExtension.split('/');
+      if (['index', 'page'].includes(routeSegments.at(-1).toLowerCase())) routeSegments.pop();
+      const legacyRoute = routeSegments
+        .filter((segment) => !/^\([^)]*\)$/.test(segment))
+        .map((segment) => segment.replace(/^\[\[\.\.\..+\]\]$/, '[]').replace(/^\[\.\.\..+\]$/, '[]').replace(/^\[.+\]$/, '[]'))
+        .join('/')
+        .toLowerCase();
+      if (legacyRoute === appRoute) conflicts.push(`pages/${childRelative}`);
+    }
+  };
+  await walk(pagesRoot);
+  return conflicts.sort();
+}
+
 async function deriveRequestedFullStackPlan(root, conventions, userRequest, requirements) {
   const text = [userRequest, ...(Array.isArray(requirements) ? requirements : [])].join('\n');
   const fullStackIntent = isFullStackBuildRequest(text);
-  const resolution = text.match(/\bworkspace resolution\s*:\s*(UPDATE_AND_INTEGRATE|REPLACE_TARGETS|KEEP_AND_SCAFFOLD)\b/i)?.[1]?.toUpperCase() || null;
+  const requestedResolution = String(userRequest || '')
+    .match(/\bworkspace resolution\s*:\s*(UPDATE_AND_INTEGRATE|REPLACE_TARGETS|KEEP_AND_SCAFFOLD)\b/i)?.[1]?.toUpperCase() || null;
   let requestedRoute = extractRequestedRoute(text);
   if (!requestedRoute && (fullStackIntent || /\b(?:POST|PUT|PATCH)\s+(?:API\s+)?(?:endpoint|route)\b/i.test(text))) {
     const entity = extractEntityFromRequest(text);
@@ -454,7 +733,7 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
     const method = text.match(/\b(POST|PUT|PATCH)\s+(?:API\s+)?(?:endpoint|route)\b/i)?.[1]?.toUpperCase() || 'POST';
     requestedRoute = { method, path: validateRoutePath(`/api/${plural}`) };
   }
-  const fields = extractRequestedFields(text);
+  let fields = extractRequestedFields(text);
   if (fullStackIntent && fields.length === 0) {
     fields.push(
       { name: 'id', type: 'string', required: false, hasDefault: false, defaultValue: null },
@@ -462,6 +741,7 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
       { name: 'createdAt', type: 'date', required: false, hasDefault: false, defaultValue: null },
     );
   }
+  if (fullStackIntent) fields = completeFullStackFields(fields);
   const wantsUi = /\b(frontend|front-end|ui|form|page|component|client|react|next\.?js|vue|angular|svelte|html)\b/i.test(text);
   if (!requestedRoute || !wantsUi) {
     if (!fullStackIntent) return null;
@@ -531,11 +811,17 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
       && /form\.[jt]sx?$/.test(file)
       && file.replace(/\.[^.]+$/, '').replace(/[^a-z0-9]/g, '').includes(entityToken)
   )) || `components/${entityPascal}Form.jsx`;
-  let pagePath = matchingWorkspaceFile(inspection.files, (file) => (
-    /\.(?:[jt]sx?)$/i.test(file)
-      && (/(^|\/)(?:app|pages)\//.test(file) || /\bpage\.[jt]sx?$/.test(file))
-      && file.replace(/\.[^.]+$/, '').replace(/[^a-z0-9]/g, '').includes(entityToken)
-  )) || (isNextAppRouter ? `app/${routeResource}/page.jsx` : `pages/${entityPascal}Page.jsx`);
+  let pagePath = isNextAppRouter
+    ? matchingWorkspaceFile(inspection.files, (file) => (
+      /\.(?:[jt]sx?)$/i.test(file)
+        && /^app\//.test(file)
+        && file.replace(/\.[^.]+$/, '').replace(/[^a-z0-9]/g, '').includes(entityToken)
+    )) || `app/${routeResource}/page.jsx`
+    : matchingWorkspaceFile(inspection.files, (file) => (
+      /\.(?:[jt]sx?)$/i.test(file)
+        && (/(^|\/)pages\//.test(file) || /\bpage\.[jt]sx?$/.test(file))
+        && file.replace(/\.[^.]+$/, '').replace(/[^a-z0-9]/g, '').includes(entityToken)
+    )) || `pages/${entityPascal}Page.jsx`;
   let configPath = 'config/db.js';
   let selectedPaths = [configPath, modelPath, controllerPath, routePath, serverPath, componentPath, pagePath];
   const inspectedTargets = [];
@@ -549,6 +835,20 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
     });
     if (!isPlaceholderModule(content)) substantiveTargets.push(target);
   }
+  const hasExistingBackendTarget = substantiveTargets.some((target) => (
+    [modelPath, controllerPath, routePath, serverPath, configPath].includes(target)
+  ));
+  const hasExistingFrontendTarget = substantiveTargets.some((target) => (
+    [componentPath, pagePath].includes(target)
+  ));
+  const inferredResolution = !requestedResolution
+    && fullStackIntent
+    && substantiveTargets.length >= 3
+    && hasExistingBackendTarget
+    && hasExistingFrontendTarget
+    ? 'UPDATE_AND_INTEGRATE'
+    : null;
+  const resolution = requestedResolution || inferredResolution;
   if (substantiveTargets.length && !resolution) {
     return {
       isGreenfield: conventions.isGreenfield,
@@ -570,6 +870,7 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
       blockedReason: `The request maps to existing substantive modules (${substantiveTargets.join(', ')}). No files were changed. Choose whether to adapt these implementations in place or provide a narrower target and integration contract.`,
     };
   }
+  const appRouterPagePath = pagePath;
   if (resolution === 'KEEP_AND_SCAFFOLD') {
     const targetFallbacks = new Map([
       [modelPath, `generated/${entityCamel}/models/${path.posix.basename(modelPath)}`],
@@ -577,7 +878,9 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
       [routePath, `generated/${entityCamel}/routes/${path.posix.basename(routePath)}`],
       [serverPath, `generated/${entityCamel}/${path.posix.basename(serverPath)}`],
       [componentPath, `generated/${entityCamel}/components/${path.posix.basename(componentPath)}`],
-      [pagePath, `generated/${entityCamel}/pages/${path.posix.basename(pagePath)}`],
+      [pagePath, isNextAppRouter
+        ? `generated/${entityCamel}/app/${path.posix.relative('app', pagePath)}`
+        : `generated/${entityCamel}/pages/${path.posix.basename(pagePath)}`],
       [configPath, `generated/${entityCamel}/config/environment.js`],
     ]);
     const preservePaths = new Set(substantiveTargets);
@@ -594,6 +897,7 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
   const controllerRequire = path.posix.relative(path.posix.dirname(routePath), controllerPath).replace(/^(?!\.)/, './');
   const modelRequire = path.posix.relative(path.posix.dirname(controllerPath), modelPath).replace(/^(?!\.)/, './');
   const routeRequire = path.posix.relative(path.posix.dirname(serverPath), routePath).replace(/^(?!\.)/, './');
+  const configRequire = path.posix.relative(path.posix.dirname(serverPath), configPath).replace(/^(?!\.)/, './');
   const frontendRequire = path.posix.relative(path.posix.dirname(pagePath), componentPath).replace(/^(?!\.)/, './');
   const requiredChecks = fieldValidationCode(fields);
   const initialState = JSON.stringify(Object.fromEntries(fields.map((field) => [
@@ -609,6 +913,8 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
       && field.items?.some((item) => /(?:price|cost|amount)/i.test(item.name))
       && field.items?.some((item) => /(?:quantity|count|units)/i.test(item.name))
   ));
+  const clientValidation = buildClientValidation(fields);
+  const totalPreview = buildComputedTotalPreview(fields);
   const totalCalculation = computedTotal && lineItems
     ? `  if (Array.isArray(value[${JSON.stringify(lineItems.name)}])) {
     value[${JSON.stringify(computedTotal.name)}] = value[${JSON.stringify(lineItems.name)}].reduce((sum, item) => {
@@ -632,26 +938,65 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
     staticMountVerification: true,
     requiredStatuses: requiredContractStatuses(text, requestedRoute.method),
   };
+  const legacyRouteMigrations = [];
+  const routeConflicts = isNextAppRouter && appRouterPagePath.startsWith('app/')
+    ? await findLegacyPagesRouteConflicts(root, appRouterPagePath)
+    : [];
+  for (const conflictPath of routeConflicts) {
+    const sourcePath = validateSafePath(root, conflictPath);
+    const originalContent = await readWorkspaceFile(root, sourcePath);
+    if (originalContent === null) continue;
+    const flattenedPath = sourcePath.slice('pages/'.length).replace(/[\\/]/g, '-');
+    let destinationPath = `legacy-pages-${flattenedPath}.txt`;
+    let suffix = 1;
+    while (await existingPath(root, destinationPath)) {
+      destinationPath = `legacy-pages-${flattenedPath}-${suffix++}.txt`;
+    }
+    legacyRouteMigrations.push({
+      path: validateSafePath(root, destinationPath),
+      sourcePath,
+      responsibility: 'LEGACY_ROUTE_MIGRATION',
+      dependencies: [],
+      content: originalContent,
+      operation: 'rename',
+    });
+  }
+  routeContract.nextRouteConflicts = routeConflicts.filter((conflict) => (
+    !legacyRouteMigrations.some((migration) => migration.sourcePath === conflict)
+  ));
+  routeContract.legacyRouteMigrations = legacyRouteMigrations.map(({ sourcePath, path: targetPath }) => ({
+    sourcePath,
+    targetPath,
+  }));
   const useEsm = packageMetadata.type === 'module';
   const configContent = useEsm
-    ? `export default {\n  databaseUrl: process.env.DATABASE_URL || null,\n  port: Number(process.env.PORT) || 0,\n};\n`
-    : `'use strict';\n\nmodule.exports = {\n  databaseUrl: process.env.DATABASE_URL || null,\n  port: Number(process.env.PORT) || 0,\n};\n`;
-  const modelContent = `'use strict';\n\nconst fields = ${JSON.stringify(fields, null, 2)};\n\nfunction validate(payload) {\n  const errors = [];\n  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return { valid: false, errors: ['A JSON object is required.'] };\n${requiredChecks}\n  return { valid: errors.length === 0, errors };\n}\n\nfunction applyDefaults(payload) {\n  const value = { ...payload };\n  for (const field of fields) if (value[field.name] === undefined && field.hasDefault) value[field.name] = field.defaultValue;\n${totalCalculation}\n  return value;\n}\n\n${useEsm ? 'export { fields, validate, applyDefaults };' : 'module.exports = { fields, validate, applyDefaults };'}\n`;
+    ? `export default {\n  databaseUrl: process.env.DATABASE_URL || null,\n  port: Number(process.env.PORT) || 5000,\n};\n`
+    : `'use strict';\n\nmodule.exports = {\n  databaseUrl: process.env.DATABASE_URL || null,\n  port: Number(process.env.PORT) || 5000,\n};\n`;
+  const createdAtField = fields.find((field) => /^(?:createdAt|createdOn)$/i.test(field.name));
+  const modelContent = `'use strict';\n\nconst fields = ${JSON.stringify(fields, null, 2)};\nconst records = [];\nlet nextId = 1;\n\nfunction validate(payload) {\n  const errors = [];\n  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return { valid: false, errors: ['A JSON object is required.'] };\n${requiredChecks}\n  return { valid: errors.length === 0, errors };\n}\n\nfunction applyDefaults(payload) {\n  const value = { ...payload };\n  for (const field of fields) if (value[field.name] === undefined && field.hasDefault) value[field.name] = field.defaultValue;\n${totalCalculation}\n  return value;\n}\n\nfunction create(payload) {\n  const value = applyDefaults(payload);\n  value.id = String(nextId++);\n    ${createdAtField ? `if (value[${JSON.stringify(createdAtField.name)}] === undefined || value[${JSON.stringify(createdAtField.name)}] === null || value[${JSON.stringify(createdAtField.name)}] === '') value[${JSON.stringify(createdAtField.name)}] = new Date().toISOString();` : ''}\n  records.push(value);\n  return { ...value };\n}\n\nfunction list() {\n  return records.map((record) => ({ ...record }));\n}\n\n${useEsm ? 'export { fields, validate, applyDefaults, create, list };' : 'module.exports = { fields, validate, applyDefaults, create, list };'}\n`;
   const controllerImport = useEsm
     ? `import * as schema from ${JSON.stringify(modelRequire)};`
     : `const schema = require(${JSON.stringify(modelRequire)});`;
-  const controllerContent = `'use strict';\n\n${controllerImport}\n\nasync function handle${entityPascal}(request) {\n  try {\n    const validation = schema.validate(request.body);\n    if (!validation.valid) return { status: 400, body: { errors: validation.errors } };\n    return { status: ${requestedRoute.method === 'POST' ? 201 : 200}, body: { data: schema.applyDefaults(request.body) } };\n  } catch (error) {\n    return { status: 500, body: { error: error instanceof Error ? error.message : 'Request failed.' } };\n  }\n}\n\n${useEsm ? `export { handle${entityPascal} };` : `module.exports = { handle${entityPascal} };`}\n`;
+  let controllerContent = `'use strict';\n\n${controllerImport}\n\nasync function handle${entityPascal}(request) {\n  try {\n    const validation = schema.validate(request.body);\n    if (!validation.valid) return { status: 400, body: { errors: validation.errors } };\n    return { status: ${requestedRoute.method === 'POST' ? 201 : 200}, body: { data: schema.create(request.body) } };\n  } catch (error) {\n    return { status: 500, body: { error: error instanceof Error ? error.message : 'Request failed.' } };\n  }\n}\n\nasync function list${entityPascal}() {\n  try {\n    return { status: 200, body: { data: schema.list() } };\n  } catch (error) {\n    return { status: 500, body: { error: error instanceof Error ? error.message : 'Request failed.' } };\n  }\n}\n\n${useEsm ? `export { handle${entityPascal}, list${entityPascal} };` : `module.exports = { handle${entityPascal}, list${entityPascal} };`}\n`;
+  controllerContent = controllerContent
+    .replace(`${controllerImport}\n\nasync function`, `${controllerImport}\nconst requestedFieldContract = ${JSON.stringify(fields.map((field) => field.name), null, 2)};\n\nasync function`)
+    .replace('schema.validate(request.body)', 'schema.validate(request.body, requestedFieldContract)');
   const routeImport = useEsm
-    ? `import { handle${entityPascal} } from ${JSON.stringify(controllerRequire)};`
-    : `const { handle${entityPascal} } = require(${JSON.stringify(controllerRequire)});`;
-  const routeContent = `'use strict';\n\n${routeImport}\nconst route = { method: ${JSON.stringify(requestedRoute.method)}, path: ${JSON.stringify(requestedRoute.path)} };\n\nfunction registerRoutes(app) {\n  if (!app || typeof app.register !== 'function') throw new TypeError('A route registry is required.');\n  app.register(route.method, route.path, async (request) => handle${entityPascal}(request));\n  return [route];\n}\n\n${useEsm ? 'export { registerRoutes, route };' : 'module.exports = { registerRoutes, route };'}\n`;
+    ? `import { handle${entityPascal}, list${entityPascal} } from ${JSON.stringify(controllerRequire)};`
+    : `const { handle${entityPascal}, list${entityPascal} } = require(${JSON.stringify(controllerRequire)});`;
+  const routeContent = `'use strict';\n\n${routeImport}\nconst route = { method: ${JSON.stringify(requestedRoute.method)}, path: ${JSON.stringify(requestedRoute.path)} };\nconst collectionRoute = { method: 'GET', path: route.path };\n\nfunction registerRoutes(app) {\n  if (!app || typeof app.register !== 'function') throw new TypeError('A route registry is required.');\n  app.register(route.method, route.path, async (request) => handle${entityPascal}(request));\n  app.register(collectionRoute.method, collectionRoute.path, async () => list${entityPascal}());\n  return [route, collectionRoute];\n}\n\n${useEsm ? 'export { registerRoutes, route, collectionRoute };' : 'module.exports = { registerRoutes, route, collectionRoute };'}\n`;
   const serverImports = useEsm
-    ? `import http from 'node:http';\nimport { pathToFileURL } from 'node:url';\nimport config from ${JSON.stringify(`./${configPath}`)};\nimport { registerRoutes } from ${JSON.stringify(routeRequire)};`
-    : `const http = require('node:http');\nconst config = require(${JSON.stringify(`./${configPath}`)});\nconst { registerRoutes } = require(${JSON.stringify(routeRequire)});`;
+    ? `import http from 'node:http';\nimport { pathToFileURL } from 'node:url';\nimport config from ${JSON.stringify(configRequire)};\nimport { registerRoutes } from ${JSON.stringify(routeRequire)};`
+    : `const http = require('node:http');\nconst config = require(${JSON.stringify(configRequire)});\nconst { registerRoutes } = require(${JSON.stringify(routeRequire)});`;
+  const previewHtml = buildStandalonePreviewHtml({
+    entityPascal,
+    fields,
+    route: requestedRoute,
+  });
   const serverStartGuard = useEsm
-    ? `if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) { const server = createApplication(); server.listen(config.port, () => console.info(JSON.stringify({ status: 'listening', port: server.address().port }))); }`
-    : `if (require.main === module) { const server = createApplication(); server.listen(config.port, () => console.info(JSON.stringify({ status: 'listening', port: server.address().port }))); }`;
-  const serverContent = `${useEsm ? '' : "'use strict';\n\n"}${serverImports}\n\nfunction createApplication() {\n  const routes = new Map();\n  const app = { register(method, routePath, handler) { routes.set(method + ' ' + routePath, handler); } };\n  registerRoutes(app);\n  return http.createServer(async (request, response) => {\n    const handler = routes.get(request.method + ' ' + new URL(request.url, 'http://localhost').pathname);\n    if (!handler) { response.writeHead(404).end(); return; }\n    const chunks = [];\n    for await (const chunk of request) chunks.push(chunk);\n    let body = {};\n    if (chunks.length) { try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { response.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Invalid JSON body.' })); return; } }\n    const result = await handler({ body });\n    response.writeHead(result.status, { 'Content-Type': 'application/json' }).end(JSON.stringify(result.body));\n  });\n}\n\n${serverStartGuard}\n${useEsm ? 'export { createApplication };' : 'module.exports = { createApplication };'}\n`;
+    ? `if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) { const server = createApplication(); server.listen(config.port, '127.0.0.1', () => { const port = server.address().port; console.info('Full-Stack UI Ready: http://localhost:' + port + '/${routeResource}'); console.info('REST API Endpoint:   http://localhost:' + port + '${requestedRoute.path}'); }); }`
+    : `if (require.main === module) { const server = createApplication(); server.listen(config.port, '127.0.0.1', () => { const port = server.address().port; console.info('Full-Stack UI Ready: http://localhost:' + port + '/${routeResource}'); console.info('REST API Endpoint:   http://localhost:' + port + '${requestedRoute.path}'); }); }`;
+  const serverContent = `${useEsm ? '' : "'use strict';\n\n"}${serverImports}\n\nconst previewHtml = ${JSON.stringify(previewHtml)};\n\nfunction createApplication() {\n  const routes = new Map();\n  const app = { register(method, routePath, handler) { routes.set(method + ' ' + routePath, handler); } };\n  registerRoutes(app);\n  return http.createServer(async (request, response) => {\n    const pathname = new URL(request.url, 'http://localhost').pathname;\n    if (request.method === 'GET' && (pathname === '/' || pathname === ${JSON.stringify(`/${routeResource}`)})) {\n      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(previewHtml);\n      return;\n    }\n    const handler = routes.get(request.method + ' ' + pathname);\n    if (!handler) { response.writeHead(404).end(); return; }\n    const chunks = [];\n    for await (const chunk of request) chunks.push(chunk);\n    let body = {};\n    if (chunks.length) { try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { response.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Invalid JSON body.' })); return; } }\n    const result = await handler({ body });\n    response.writeHead(result.status, { 'Content-Type': 'application/json' }).end(JSON.stringify(result.body));\n  });\n}\n\n${serverStartGuard}\n${useEsm ? 'export { createApplication };' : 'module.exports = { createApplication };'}\n`;
   const plan = {
     isGreenfield: conventions.isGreenfield,
     language: conventions.language,
@@ -714,6 +1059,18 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
     },
     routeSchema: { entity: entityPascal, fields },
   };
+  const generatedForm = plan.modulesToCreate.find((module) => normalizePath(module.path) === normalizePath(componentPath));
+  if (generatedForm) {
+    generatedForm.content = generatedForm.content.replace(
+      "event.preventDefault(); setLoading(true); setError(''); setSuccess('');",
+      `event.preventDefault(); setError(''); setSuccess('');\n    const clientErrors = [];\n${clientValidation}\n    if (clientErrors.length) { setError(clientErrors.join(' ')); return; }\n    setLoading(true);`,
+    );
+    generatedForm.content = generatedForm.content.replace(
+      `${formFields}\n    <button`,
+      `${formFields}\n${totalPreview}    <button`,
+    );
+  }
+  plan.modulesToCreate.push(...legacyRouteMigrations);
   const existingPackage = await readWorkspaceFile(root, 'package.json');
   let generatedPackageMetadata = {};
   if (existingPackage) {
@@ -750,24 +1107,32 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
     path: '.env.example',
     responsibility: 'CONFIGURATION',
     dependencies: [],
-    content: '# Local development configuration\nPORT=3000\nDATABASE_URL=mongodb://127.0.0.1:27017/app_dev\nAPI_URL=http://127.0.0.1:3000\n',
+    content: '# Local development configuration\nPORT=5000\nDATABASE_URL=mongodb://127.0.0.1:27017/app_dev\nAPI_URL=http://127.0.0.1:5000\n',
   }, {
     path: 'README.md',
     responsibility: 'DOCUMENTATION',
     dependencies: [],
-    content: `# ${entityPascal} application\n\n## Run locally\n\nUse Node.js 18 or newer:\n\n\`\`\`sh\nnode ${serverPath}\n\`\`\`\n\nThe HTTP server binds to loopback and uses the configured \`PORT\` value (or an ephemeral port when unset). \`.env.example\` documents optional settings; the generated server does not load \`.env\` files automatically, so set environment variables in your shell when you need to override defaults. The generated HTTP service uses Node.js built-ins and does not require a dependency installation to start.\n\nThe React form source is included for integration into a React-capable frontend; it is not served or compiled by this Node.js API server.\n`,
+    content: `# ${entityPascal} application\n\n## Run locally\n\nUse Node.js 18 or newer:\n\n\`\`\`sh\nnode ${serverPath}\n\`\`\`\n\nThe HTTP server binds to loopback and uses the configured \`PORT\` value (or port 5000 by default). Open \`http://localhost:<port>/${routeResource}\` for the standalone interactive form, or use \`${requestedRoute.method} ${requestedRoute.path}\` as the JSON API. \`.env.example\` documents optional settings; the generated server does not load \`.env\` files automatically, so set environment variables in your shell when you need to override defaults. The server uses Node.js built-ins and does not require dependency installation to start. Its generated data model stores records in memory; configure durable persistence before production use.\n\nThe React form and App Router page source are also included for integration into a React-capable frontend.\n`,
   }];
   plan.modulesToCreate.push(...packagingModules);
 
   for (const module of plan.modulesToCreate) {
     module.path = validateSafePath(root, module.path);
     const exists = await existingFile(root, module.path);
-    module.operation = exists ? 'modify' : 'create';
+    if (module.operation !== 'rename') module.operation = exists ? 'modify' : 'create';
+    if (module.operation === 'rename') {
+      module.sourcePath = validateSafePath(root, module.sourcePath);
+      if (!(await existingFile(root, module.sourcePath))) {
+        throw new Error(`Legacy route changed during planning: ${module.sourcePath} no longer exists.`);
+      }
+      if (exists) throw new Error(`Legacy route archive already exists: ${module.path}.`);
+    }
     if (module.path === '.env.example' && exists) {
-      const previous = await readWorkspaceFile(root, module.path);
-      const requiredLines = module.content.split('\n').filter((line) => line && !line.startsWith('#'));
-      const additions = requiredLines.filter((line) => !String(previous).split(/\r?\n/).some((existing) => existing.startsWith(`${line.split('=')[0]}=`)));
-      module.content = `${String(previous || '').replace(/\s*$/, '')}\n${additions.join('\n')}\n`;
+      const existingEnvironmentExample = await readWorkspaceFile(root, module.path);
+      module.operation = 'reuse';
+      module.content = String(existingEnvironmentExample || '').trim()
+        ? '# Existing environment example is retained without changes.\n'
+        : '';
     }
     if (module.path === 'README.md' && exists) {
       const previous = await readWorkspaceFile(root, module.path);
@@ -780,9 +1145,13 @@ async function deriveRequestedFullStackPlan(root, conventions, userRequest, requ
       status: 'planned',
     });
   }
+  for (const module of plan.modulesToCreate) {
+    module.hermeticBaselineContent = module.content;
+  }
   plan.workspaceInspection.inspectedFiles = [...new Set([
     ...plan.workspaceInspection.inspectedFiles,
     ...plan.modulesToCreate.filter((module) => module.operation === 'modify').map((module) => module.path),
+    ...plan.modulesToCreate.filter((module) => module.operation === 'rename').map((module) => module.sourcePath),
   ])];
   return plan;
 }
@@ -1269,7 +1638,529 @@ function moduleForResponsibility(modularPlan, responsibility) {
   return modularPlan.modulesToCreate.find((module) => module.responsibility === responsibility);
 }
 
-function verifyHermeticEngineeringGates(modularPlan, fileContents = moduleContentByPath(modularPlan)) {
+function moduleExportsBinding(source, binding) {
+  if (binding === 'default') {
+    return /\bexport\s+default\b|\bmodule\.exports\s*=|\bexports\.default\s*=|\bmodule\.exports\.default\s*=/.test(source);
+  }
+  const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp([
+    `\\bexport\\s+(?:const|let|var|function|class)\\s+${escaped}\\b`,
+    `\\bexport\\s*\\{[^}]*\\b${escaped}\\b[^}]*\\}`,
+    `\\bexports\\.${escaped}\\s*=`,
+    `\\bmodule\\.exports\\.${escaped}\\s*=`,
+    `\\bmodule\\.exports\\s*=\\s*\\{[^}]*\\b${escaped}\\b`,
+  ].join('|')).test(source);
+}
+
+function moduleResolutionGate(root, modularPlan, fileContents) {
+  const backendResponsibilities = new Set([
+    'CONFIGURATION',
+    'DATA_MODEL',
+    'CORE_BUSINESS_LOGIC',
+    'ROUTING',
+    'APPLICATION_ENTRYPOINT',
+  ]);
+  const frontendModules = (modularPlan.modulesToCreate || []).filter((module) => {
+    const normalized = normalizePath(module.path);
+    return module.responsibility === 'UI_PRESENTATION'
+      || /^(?:components|app)\//i.test(normalized);
+  });
+  const modulesToResolve = (modularPlan.modulesToCreate || []).filter((module) => {
+    const normalized = normalizePath(module.path);
+    return backendResponsibilities.has(module.responsibility)
+      || frontendModules.includes(module)
+      || /^(?:server|app|index|main)\.[cm]?js$/i.test(normalized)
+      || /^(?:config|models?|controllers?|routes?|services?)\/.*\.[cm]?js$/i.test(normalized);
+  });
+  let packageMetadata = {};
+  try {
+    packageMetadata = JSON.parse(String(fileContents.get('package.json') || '{}'));
+  } catch {
+    packageMetadata = {};
+  }
+  const failures = [];
+  const resolved = [];
+  const resolveRelative = (fromPath, specifier) => {
+    const base = path.posix.normalize(path.posix.join(path.posix.dirname(fromPath), specifier));
+    const extensions = path.posix.extname(base)
+      ? ['']
+      : ['', '.js', '.cjs', '.mjs', '.json', '.jsx', '.ts', '.tsx', '/index.js', '/index.cjs', '/index.mjs'];
+    for (const suffix of extensions) {
+      const candidate = normalizePath(`${base}${suffix}`);
+      if (fileContents.has(candidate)) return { path: candidate, source: String(fileContents.get(candidate) || '') };
+      if (!root) continue;
+      try {
+        const safePath = validateSafePath(root, candidate);
+        const absolute = path.join(root, ...safePath.split('/'));
+        if (fsSync.statSync(absolute).isFile()) {
+          return { path: candidate, source: fsSync.readFileSync(absolute, 'utf8') };
+        }
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+      }
+    }
+    return null;
+  };
+  const installedPackage = (specifier) => {
+    if (!root) return false;
+    const packageParts = specifier.split('/');
+    const packageName = specifier.startsWith('@') ? packageParts.slice(0, 2).join('/') : packageParts[0];
+    try {
+      const packagePath = validateSafePath(root, path.posix.join('node_modules', packageName));
+      return fsSync.statSync(path.join(root, ...packagePath.split('/'))).isDirectory();
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
+      throw error;
+    }
+  };
+  const declaredFrontendPackage = (specifier) => {
+    const packageParts = specifier.split('/');
+    const packageName = specifier.startsWith('@') ? packageParts.slice(0, 2).join('/') : packageParts[0];
+    return Boolean(packageMetadata.dependencies?.[packageName]
+      || packageMetadata.devDependencies?.[packageName]
+      || packageMetadata.peerDependencies?.[packageName]);
+  };
+  const optionalDynamicImport = (source, specifier) => {
+    const escapedSpecifier = specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`try\\s*\\{[\\s\\S]{0,500}\\bimport\\s*\\(\\s*['"]${escapedSpecifier}['"]\\s*\\)[\\s\\S]{0,500}\\}\\s*catch\\b`).test(source);
+  };
+  const collectDependencies = (source) => {
+    const dependencies = [];
+    const importedBindings = (clause) => {
+      const bindings = [];
+      const namedBlock = clause.match(/\{([^}]*)\}/);
+      if (namedBlock) {
+        bindings.push(...namedBlock[1].split(',').map((entry) => (
+          entry.trim().split(/\s+as\s+/)[0].trim()
+        )).filter(Boolean));
+      }
+      const defaultClause = clause.replace(namedBlock?.[0] || '', '').trim();
+      if (defaultClause && !/^\*\s+as\s+/.test(defaultClause)) {
+        const defaultName = defaultClause.split(',')[0].trim();
+        if (/^[A-Za-z_$][\w$]*$/.test(defaultName)) bindings.push('default');
+      }
+      return bindings;
+    };
+    const staticImport = /\bimport\s+([\s\S]*?)\s+from\s+(['"])([^'"]+)\2\s*;?/g;
+    for (const match of source.matchAll(staticImport)) {
+      dependencies.push({ specifier: match[3], bindings: importedBindings(match[1]), dynamic: false });
+    }
+    const sideEffectImport = /\bimport\s*(['"])([^'"]+)\1\s*;?/g;
+    for (const match of source.matchAll(sideEffectImport)) {
+      dependencies.push({ specifier: match[2], bindings: [], dynamic: false });
+    }
+    const requirePattern = /\brequire\s*\(\s*(['"])([^'"]+)\1\s*\)/g;
+    for (const match of source.matchAll(requirePattern)) {
+      const before = source.slice(Math.max(0, match.index - 160), match.index);
+      const destructured = before.match(/(?:const|let|var)\s*\{\s*([^}]+)\s*\}\s*=\s*$/);
+      const assigned = before.match(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*$/);
+      const bindings = destructured
+        ? destructured[1].split(',').map((entry) => entry.trim().split(/\s*:\s*/)[0].trim()).filter(Boolean)
+        : assigned ? ['default'] : [];
+      dependencies.push({ specifier: match[2], bindings, dynamic: false });
+    }
+    const dynamicImport = /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/g;
+    for (const match of source.matchAll(dynamicImport)) {
+      dependencies.push({ specifier: match[2], bindings: [], dynamic: true });
+    }
+    return dependencies;
+  };
+  for (const module of modulesToResolve) {
+    const fromPath = normalizePath(module.path);
+    const source = String(fileContents.get(fromPath) ?? module.content ?? '');
+    const isFrontend = frontendModules.includes(module);
+    for (const dependency of collectDependencies(source)) {
+      const { specifier, bindings, dynamic } = dependency;
+      if (specifier.startsWith('.') || specifier.startsWith('/')) {
+        const target = resolveRelative(fromPath, specifier);
+        if (!target) {
+          failures.push({ path: fromPath, specifier, reason: 'Relative module target does not exist in the workspace or approved plan.' });
+          continue;
+        }
+        const missingBindings = bindings.filter((binding) => !moduleExportsBinding(target.source, binding));
+        if (missingBindings.length) {
+          failures.push({ path: fromPath, specifier, resolvedPath: target.path, reason: `Imported binding(s) are not exported: ${missingBindings.join(', ')}.` });
+        } else {
+          resolved.push({ path: fromPath, specifier, resolvedPath: target.path, status: 'RESOLVED' });
+        }
+        continue;
+      }
+      if (isBuiltin(specifier) || isBuiltin(specifier.replace(/^node:/, ''))) {
+        resolved.push({ path: fromPath, specifier, status: 'NODE_BUILTIN' });
+        continue;
+      }
+      if (installedPackage(specifier)) {
+        resolved.push({ path: fromPath, specifier, status: 'INSTALLED_PACKAGE' });
+        continue;
+      }
+      if (isFrontend && declaredFrontendPackage(specifier)) {
+        resolved.push({ path: fromPath, specifier, status: 'DECLARED_FRONTEND_PACKAGE' });
+        continue;
+      }
+      if (dynamic && optionalDynamicImport(source, specifier)) {
+        resolved.push({ path: fromPath, specifier, status: 'OPTIONAL_DYNAMIC_FALLBACK' });
+        continue;
+      }
+      failures.push({
+        path: fromPath,
+        specifier,
+        reason: root
+          ? 'External package is not installed and has no guarded dynamic fallback.'
+          : 'External package resolution cannot be confirmed without a project root.',
+      });
+    }
+  }
+  return {
+    passed: failures.length === 0,
+    evidence: failures.length === 0
+      ? `${resolved.length} backend and frontend import(s) resolve to approved files, Node.js built-ins, installed packages, declared frontend packages, or guarded optional dependencies.`
+      : failures,
+    resolved,
+    failures,
+  };
+}
+
+function effectiveModuleContents(root, modularPlan, candidateContents) {
+  const contents = new Map();
+  for (const module of modularPlan.modulesToCreate || []) {
+    const safePath = validateSafePath(root, module.path);
+    const normalizedPath = normalizePath(safePath);
+    try {
+      const diskPath = path.join(root, ...safePath.split('/'));
+      const diskStat = fsSync.lstatSync(diskPath);
+      if (diskStat.isSymbolicLink()) {
+        throw new Error(`Hermetic verification does not follow workspace symbolic links: ${safePath}.`);
+      }
+      if (diskStat.isFile()) {
+        contents.set(normalizedPath, fsSync.readFileSync(diskPath, 'utf8'));
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+    }
+  }
+  for (const [relativePath, content] of candidateContents) {
+    contents.set(normalizePath(relativePath), content);
+  }
+  return contents;
+}
+
+function createContractAst(source, filePath) {
+  if (!typescriptParser) return null;
+  const extension = path.extname(filePath).toLowerCase();
+  const scriptKind = extension === '.tsx' || extension === '.jsx'
+    ? typescriptParser.ScriptKind.TSX
+    : typescriptParser.ScriptKind.TS;
+  const ast = typescriptParser.createSourceFile(
+    filePath,
+    String(source || ''),
+    typescriptParser.ScriptTarget.Latest,
+    true,
+    scriptKind,
+  );
+  return ast.parseDiagnostics.length === 0 ? ast : null;
+}
+
+function visitContractAst(ast, visitor) {
+  if (!ast) return;
+  const visit = (node) => {
+    visitor(node);
+    typescriptParser.forEachChild(node, visit);
+  };
+  visit(ast);
+}
+
+function astPropertyName(property) {
+  if (!property?.name) return null;
+  if (typescriptParser.isIdentifier(property.name) || typescriptParser.isStringLiteral(property.name)) {
+    return property.name.text;
+  }
+  return null;
+}
+
+function astStringValue(node) {
+  return node && (typescriptParser.isStringLiteral(node) || typescriptParser.isNoSubstitutionTemplateLiteral(node))
+    ? node.text
+    : null;
+}
+
+function astRelativeImportTargets(ast, sourcePath, effectiveFiles) {
+  const specifiers = [];
+  visitContractAst(ast, (node) => {
+    if (typescriptParser.isImportDeclaration(node) && astStringValue(node.moduleSpecifier)) {
+      specifiers.push(astStringValue(node.moduleSpecifier));
+    } else if (typescriptParser.isCallExpression(node)
+      && node.expression.kind === typescriptParser.SyntaxKind.Identifier
+      && node.expression.text === 'require'
+      && node.arguments.length === 1) {
+      const specifier = astStringValue(node.arguments[0]);
+      if (specifier) specifiers.push(specifier);
+    }
+  });
+  const knownPaths = new Set([...effectiveFiles.keys()].map(normalizePath));
+  return specifiers.filter((specifier) => specifier.startsWith('.')).map((specifier) => {
+    const base = normalizePath(path.posix.join(path.posix.dirname(sourcePath), specifier));
+    const possible = [base, ...['.js', '.cjs', '.mjs', '.jsx', '.ts', '.tsx'].map((extension) => `${base}${extension}`),
+      ...['index.js', 'index.jsx', 'index.ts', 'index.tsx'].map((indexFile) => `${base}/${indexFile}`)];
+    return possible.map(normalizePath).find((candidate) => knownPaths.has(candidate)) || null;
+  }).filter(Boolean);
+}
+
+function astFunctionText(ast, functionName) {
+  if (!ast) return '';
+  let found = '';
+  visitContractAst(ast, (node) => {
+    if (found) return;
+    if ((typescriptParser.isFunctionDeclaration(node) || typescriptParser.isMethodDeclaration(node))
+      && node.name?.text === functionName) {
+      found = node.getText(ast);
+      return;
+    }
+    if (typescriptParser.isVariableDeclaration(node)
+      && node.name?.text === functionName
+      && node.initializer
+      && (typescriptParser.isArrowFunction(node.initializer) || typescriptParser.isFunctionExpression(node.initializer))) {
+      found = node.initializer.getText(ast);
+    }
+  });
+  return found;
+}
+
+function astObjectProperties(node) {
+  if (!node || !typescriptParser.isObjectLiteralExpression(node)) return new Map();
+  return new Map(node.properties
+    .filter((property) => typescriptParser.isPropertyAssignment(property))
+    .map((property) => [astPropertyName(property), property.initializer])
+    .filter(([name]) => name !== null));
+}
+
+function astObjectKeys(node) {
+  if (!node || !typescriptParser.isObjectLiteralExpression(node)) return [];
+  return node.properties
+    .filter((property) => typescriptParser.isPropertyAssignment(property))
+    .map(astPropertyName)
+    .filter(Boolean);
+}
+
+function extractAstSchemaFields(modelAst) {
+  if (!modelAst) return new Map();
+  let fieldsNode = null;
+  visitContractAst(modelAst, (node) => {
+    if (fieldsNode || !typescriptParser.isVariableDeclaration(node) || node.name?.text !== 'fields') return;
+    if (node.initializer && typescriptParser.isArrayLiteralExpression(node.initializer)) fieldsNode = node.initializer;
+  });
+  const fields = new Map();
+  for (const field of fieldsNode?.elements || []) {
+    const props = astObjectProperties(field);
+    const name = astStringValue(props.get('name'));
+    if (!name) continue;
+    const itemsNode = props.get('items');
+    const items = itemsNode && typescriptParser.isArrayLiteralExpression(itemsNode)
+      ? itemsNode.elements.map((item) => astStringValue(astObjectProperties(item).get('name'))).filter(Boolean)
+      : [];
+    fields.set(name, { items, defaultValue: astStringValue(props.get('defaultValue')), hasDefault: props.get('hasDefault')?.kind === typescriptParser.SyntaxKind.TrueKeyword });
+  }
+  return fields;
+}
+
+function verifyCrossLayerDataFlowGraph(modularPlan, effectiveFiles) {
+  const issues = [];
+  const route = (modularPlan.routeContracts || [])[0];
+  if (!route) return { passed: false, evidence: ['No route contract is available.'], edges: [] };
+  const sourceAt = (relativePath) => String(effectiveFiles.get(normalizePath(relativePath)) || '');
+  const astAt = (relativePath) => createContractAst(sourceAt(relativePath), relativePath);
+  const pageAst = astAt(route.pageFile);
+  const formAst = astAt(route.frontendFile);
+  const serverAst = astAt(route.integrationFile);
+  const routeAst = astAt(route.targetFile);
+  const controllerAst = astAt(route.controllerFile);
+  const modelAst = astAt(route.modelFile);
+  const astFilesPresent = [pageAst, formAst, serverAst, routeAst, controllerAst, modelAst].every(Boolean);
+  const edges = [];
+  if (!astFilesPresent) {
+    issues.push({ path: route.frontendFile, reason: 'AST parsing is unavailable or a required cross-layer source file is missing.' });
+  } else {
+    const pageImportsForm = astRelativeImportTargets(pageAst, route.pageFile, effectiveFiles)
+      .includes(normalizePath(route.frontendFile));
+    const formBinding = pageAst.statements
+      .filter(typescriptParser.isImportDeclaration)
+      .find((declaration) => astStringValue(declaration.moduleSpecifier)
+        && astRelativeImportTargets({ ...pageAst, statements: [declaration] }, route.pageFile, effectiveFiles)
+          .includes(normalizePath(route.frontendFile)))?.importClause?.name?.text;
+    let pageRendersForm = false;
+    visitContractAst(pageAst, (node) => {
+      if ((typescriptParser.isJsxOpeningElement(node) || typescriptParser.isJsxSelfClosingElement(node))
+        && typescriptParser.isIdentifier(node.tagName)
+        && node.tagName.text === formBinding) pageRendersForm = true;
+    });
+    if (pageImportsForm && formBinding && pageRendersForm) {
+      edges.push({ from: route.pageFile, to: route.frontendFile, evidence: 'AST import binding is rendered in JSX.' });
+    } else {
+      issues.push({ path: route.pageFile, reason: 'The App Router page does not import and render the form component through its default binding.' });
+    }
+
+    const initialForm = formAst.statements.find((statement) => typescriptParser.isVariableStatement(statement))
+      ?.declarationList.declarations.find((declaration) => declaration.name?.text === 'initialForm')?.initializer;
+    const frontendKeys = astObjectKeys(initialForm);
+    const payloadUsesForm = (() => {
+      let found = false;
+      visitContractAst(formAst, (node) => {
+        if (!typescriptParser.isCallExpression(node) || !typescriptParser.isIdentifier(node.expression)
+          || node.expression.text !== 'fetch' || astStringValue(node.arguments[0]) !== route.path) return;
+        const options = astObjectProperties(node.arguments[1]);
+        const headers = astObjectProperties(options.get('headers'));
+        const body = options.get('body');
+        const headerProperties = [...headers.entries()];
+        const hasJsonHeader = headerProperties.some(([key, value]) => (
+          key.toLowerCase() === 'content-type' && astStringValue(value) === 'application/json'
+        ));
+        const stringifiesForm = body && typescriptParser.isCallExpression(body)
+          && body.expression.getText(formAst) === 'JSON.stringify'
+          && body.arguments[0]?.getText(formAst) === 'form';
+        const optionProperties = astObjectProperties(node.arguments[1]);
+        const methodValue = astStringValue(optionProperties.get('method'));
+        if (methodValue === route.method && hasJsonHeader && stringifiesForm) found = true;
+      });
+      return found;
+    })();
+    const schemaFields = extractAstSchemaFields(modelAst);
+    const missingPayloadFields = frontendKeys.filter((key) => !schemaFields.has(key));
+    const missingFormFields = [...schemaFields.keys()].filter((key) => !frontendKeys.includes(key));
+    if (frontendKeys.length && payloadUsesForm && missingPayloadFields.length === 0 && missingFormFields.length === 0) {
+      edges.push({ from: route.frontendFile, to: route.path, evidence: `AST form state keys (${frontendKeys.join(', ')}) serialize to the declared method and JSON endpoint.` });
+    } else {
+      issues.push({ path: route.frontendFile, reason: `Frontend payload contract mismatch; fields absent from model: ${missingPayloadFields.join(', ') || 'none'}; fields absent from form: ${missingFormFields.join(', ') || 'none'}; fetch method, JSON header, and form serialization must also match.` });
+    }
+
+    const importsTarget = (ast, from, target) => astRelativeImportTargets(ast, from, effectiveFiles).includes(normalizePath(target));
+    const serverToRoute = importsTarget(serverAst, route.integrationFile, route.targetFile);
+    const routeToController = importsTarget(routeAst, route.targetFile, route.controllerFile);
+    const controllerToModel = importsTarget(controllerAst, route.controllerFile, route.modelFile);
+    let registersRoutes = false;
+    visitContractAst(serverAst, (node) => {
+      if (typescriptParser.isCallExpression(node) && node.expression.getText(serverAst) === 'registerRoutes'
+        && node.arguments[0]?.getText(serverAst) === 'app') registersRoutes = true;
+    });
+    let registersHandler = false;
+    visitContractAst(routeAst, (node) => {
+      if (typescriptParser.isCallExpression(node) && node.expression.getText(routeAst) === 'app.register') registersHandler = true;
+    });
+    const controllerText = controllerAst.getText(controllerAst);
+    const validatesBody = /schema\.validate\(\s*request\.body(?:\s*,[^)]*)?\s*\)/.test(controllerText);
+    const persistsBody = /schema\.create\(\s*request\.body\s*\)/.test(controllerText);
+    const frontendLiteralValues = new Set();
+    visitContractAst(formAst, (node) => {
+      const value = astStringValue(node);
+      if (value !== null) frontendLiteralValues.add(value);
+    });
+    const modelHasExpectedFields = [...schemaFields.entries()].length > 0
+      && [...schemaFields.entries()].every(([key, metadata]) => (
+        modularPlan.routeSchema?.fields?.some((field) => field.name === key)
+          && metadata.items.every((item) => frontendLiteralValues.has(item))
+      ));
+    if (serverToRoute && registersRoutes && routeToController && registersHandler
+      && controllerToModel && validatesBody && persistsBody && modelHasExpectedFields) {
+      edges.push(
+        { from: route.integrationFile, to: route.targetFile, evidence: 'AST server imports and invokes the route registrar.' },
+        { from: route.targetFile, to: route.controllerFile, evidence: 'AST route imports the controller and registers its handler.' },
+        { from: route.controllerFile, to: route.modelFile, evidence: 'AST controller validates and persists request.body through the model.' },
+      );
+    } else {
+      if (!serverToRoute || !registersRoutes) issues.push({ path: route.integrationFile, reason: 'AST server-to-route registration edge is missing.' });
+      if (!routeToController || !registersHandler) issues.push({ path: route.targetFile, reason: 'AST route-to-controller registration edge is missing.' });
+      if (!controllerToModel || !validatesBody || !persistsBody || !modelHasExpectedFields) {
+        issues.push({ path: route.controllerFile, reason: 'AST controller-to-model validation/persistence edge or schema field contract is missing.' });
+      }
+    }
+  }
+  for (const conflict of route.nextRouteConflicts || []) {
+    issues.push({ path: conflict, reason: `Legacy Pages Router route conflicts with App Router target ${route.pageFile}; the workspace is left unchanged until this conflict is explicitly resolved.` });
+  }
+  return { passed: issues.length === 0, evidence: issues.length ? issues : edges, edges, issues };
+}
+
+function verifyBehavioralEdgeCaseMatrix(modularPlan, effectiveFiles, controllerSource, formSource, route) {
+  const fields = modularPlan.routeSchema?.fields || [];
+  const modelPath = route?.modelFile;
+  const formPath = route?.frontendFile;
+  const modelAst = modelPath ? createContractAst(effectiveFiles.get(normalizePath(modelPath)), modelPath) : null;
+  const formAst = formPath ? createContractAst(effectiveFiles.get(normalizePath(formPath)), formPath) : null;
+  const validateBody = astFunctionText(modelAst, 'validate');
+  const defaultBody = astFunctionText(modelAst, 'applyDefaults');
+  const createBody = astFunctionText(modelAst, 'create');
+  const submitBody = astFunctionText(formAst, 'submit');
+  const vectors = [];
+  const check = (id, applicable, passed, path, reason) => vectors.push({ id, applicable, passed: !applicable || passed, path, reason });
+  const requiredScalarFields = fields.filter((field) => field.required && field.type === 'string');
+  const arrays = fields.filter((field) => field.type === 'array' && field.items?.length);
+  const numericQuantityFields = arrays.flatMap((field) => field.items
+    .filter((item) => item.type === 'number' && /(?:quantity|count|units)/i.test(item.name))
+    .map((item) => ({ field, item })));
+  const numericPriceFields = arrays.flatMap((field) => field.items
+    .filter((item) => item.type === 'number' && /(?:price|cost|amount)/i.test(item.name))
+    .map((item) => ({ field, item })));
+  const computedTotal = fields.find((field) => field.type === 'number' && /(?:total|amount|subtotal|sum)/i.test(field.name));
+  const lineItems = fields.find((field) => field.type === 'array'
+    && field.items?.some((item) => /(?:price|cost|amount)/i.test(item.name))
+    && field.items?.some((item) => /(?:quantity|count|units)/i.test(item.name)));
+  const statusField = fields.find((field) => field.name.toLowerCase() === 'status');
+  const createdAtField = fields.find((field) => /^(?:createdAt|createdOn)$/i.test(field.name));
+  const modelSchema = extractAstSchemaFields(modelAst);
+  const statusMetadata = statusField ? modelSchema.get(statusField.name) : null;
+  const createdAtMetadata = createdAtField ? modelSchema.get(createdAtField.name) : null;
+  const controllerAst = route?.controllerFile
+    ? createContractAst(effectiveFiles.get(normalizePath(route.controllerFile)), route.controllerFile)
+    : null;
+  const handlerBody = astFunctionText(controllerAst, route?.controllerHandler);
+  const formHasAccessibleError = Boolean(formAst && /role\s*=\s*["']alert["']/.test(formAst.getText(formAst)));
+  const formHasClientChecks = submitBody.includes('clientErrors') && submitBody.includes('.trim()');
+  const hasClientValidationContract = (requiredScalarFields.length === 0 && arrays.length === 0) || formHasClientChecks;
+
+  check('valid-multi-item-total-defaults-and-creation', Boolean(lineItems && computedTotal), Boolean(
+    defaultBody.includes('.reduce(')
+      && defaultBody.includes(JSON.stringify(computedTotal?.name))
+      && defaultBody.includes(JSON.stringify(lineItems?.name))
+      && statusMetadata?.hasDefault
+      && statusMetadata.defaultValue === 'Pending'
+      && Boolean(createdAtMetadata && createBody.includes('.toISOString()'))
+      && handlerBody.includes(`status: ${route?.method === 'POST' ? 201 : 200}`)
+      && formSource.includes('<output')
+      && formSource.includes('aria-live'),
+  ), modelPath, 'Two-or-more line items must calculate the total, default status, timestamp creation, and return the route success status.');
+  check('required-scalar-whitespace-rejected', requiredScalarFields.length > 0, Boolean(
+    requiredScalarFields.every((field) => validateBody.includes(`payload[${JSON.stringify(field.name)}].trim() === ''`)
+      && submitBody.includes(`form[${JSON.stringify(field.name)}].trim() === ''`)),
+  ), modelPath, 'Required scalar strings reject whitespace-only values in both client and server validation.');
+  check('empty-or-non-array-nested-collection-rejected', arrays.length > 0, Boolean(
+    arrays.every((field) => validateBody.includes(`Array.isArray(payload[${JSON.stringify(field.name)}])`)
+      && validateBody.includes(`payload[${JSON.stringify(field.name)}].length === 0`)
+      && submitBody.includes(`Array.isArray(form[${JSON.stringify(field.name)}])`)
+      && submitBody.includes('length === 0')),
+  ), modelPath, 'Nested collections reject non-array payloads and empty arrays.');
+  check('invalid-nested-item-values-rejected', arrays.length > 0, Boolean(
+    arrays.every((field) => validateBody.includes('typeof item !== \'object\'')
+      && field.items.filter((item) => item.type === 'string').every((item) => validateBody.includes(`item[${JSON.stringify(item.name)}].trim() === ''`))
+      && numericQuantityFields.filter(({ field: array }) => array.name === field.name)
+        .every(({ item }) => validateBody.includes(`Number(item[${JSON.stringify(item.name)}]) <= 0`))
+      && numericPriceFields.filter(({ field: array }) => array.name === field.name)
+        .every(({ item }) => validateBody.includes(`Number(item[${JSON.stringify(item.name)}]) < 0`))
+      && field.items.filter((item) => item.type === 'number').every((item) => validateBody.includes(`Number.isFinite(Number(item[${JSON.stringify(item.name)}]))`))),
+  ), modelPath, 'Nested strings, finite numbers, positive quantities, and non-negative prices are validated.');
+  check('structured-client-and-server-error-responses', true, Boolean(
+    handlerBody.includes('catch (error)')
+      && handlerBody.includes('status: 500')
+      && handlerBody.includes('body: { error:')
+      && handlerBody.includes('status: 400')
+      && formHasAccessibleError
+      && hasClientValidationContract,
+  ), route?.controllerFile || 'unknown', 'The client exposes validation errors accessibly and the handler returns structured 400/500 responses.');
+
+  return { passed: vectors.every((vector) => vector.passed), vectors };
+}
+
+function verifyHermeticEngineeringGates(modularPlan, fileContents = moduleContentByPath(modularPlan), options = {}) {
+  if (options.root) {
+    fileContents = effectiveModuleContents(options.root, modularPlan, fileContents);
+  }
   const syntaxFailures = [];
   for (const [relativePath, content] of fileContents) {
     if (!/\.(?:c?js|mjs|jsx|tsx?|json)$/i.test(relativePath)) continue;
@@ -1322,8 +2213,25 @@ function verifyHermeticEngineeringGates(modularPlan, fileContents = moduleConten
   )).map(({ name }) => name);
   const statuses = route?.requiredStatuses || [];
   const missingStatuses = statuses.filter((status) => !controllerSource.includes(`status: ${status}`));
+  const computedTotal = schemaFields.find((field) => (
+    field.type === 'number' && /(?:total|amount|subtotal|sum)/i.test(field.name)
+  ));
+  const lineItems = schemaFields.find((field) => (
+    field.type === 'array'
+      && field.items?.some((item) => /(?:price|cost|amount)/i.test(item.name))
+      && field.items?.some((item) => /(?:quantity|count|units)/i.test(item.name))
+  ));
+  const totalCalculationPassed = !computedTotal || !lineItems || (
+    modelSource.includes('.reduce(')
+      && modelSource.includes(JSON.stringify(computedTotal.name))
+      && modelSource.includes(JSON.stringify(lineItems.name))
+  );
   const syntaxPassed = syntaxFailures.length === 0;
-  const schemaPassed = Boolean(model && controller && form && page && fieldNames.length > 0 && missingFields.length === 0);
+  const moduleResolution = moduleResolutionGate(options.root || null, modularPlan, fileContents);
+  const dataFlow = verifyCrossLayerDataFlowGraph(modularPlan, fileContents);
+  const behavioralMatrix = verifyBehavioralEdgeCaseMatrix(modularPlan, fileContents, controllerSource, formSource, route);
+  const schemaPassed = Boolean(model && controller && form && page && fieldNames.length > 0
+    && missingFields.length === 0 && totalCalculationPassed);
   const validationPassed = Boolean(
     controllerSource.includes('try {')
       && controllerSource.includes('catch (error)')
@@ -1338,6 +2246,8 @@ function verifyHermeticEngineeringGates(modularPlan, fileContents = moduleConten
       && pageSource.includes(route.uiComponent)
       && routeSource.includes(JSON.stringify(route.path))
       && routeSource.includes(JSON.stringify(route.method))
+      && routeSource.includes("method: 'GET'")
+      && routeSource.includes('list')
       && serverSource.includes('registerRoutes(app)'),
   );
   const entryPoint = route?.integrationFile || 'server.js';
@@ -1349,16 +2259,23 @@ function verifyHermeticEngineeringGates(modularPlan, fileContents = moduleConten
       && typeof packageJson.scripts?.test === 'string'
       && packageJson.scripts.test.trim()
       && envModule
-      && String(fileContents.get('.env.example') || '').trim()
+      && (envModule.operation === 'reuse'
+        ? fileContents.has('.env.example')
+        : Boolean(String(fileContents.get('.env.example') || '').trim()))
       && readmeModule
       && String(fileContents.get('README.md') || '').trim(),
   );
   const gates = [
     { id: 'SYNTAX_AND_AST', passed: syntaxPassed, evidence: syntaxPassed ? `${fileContents.size} candidate file(s) parsed.` : syntaxFailures },
-    { id: 'SCHEMA_CONTRACT', passed: schemaPassed, evidence: schemaPassed ? `${fieldNames.length} scalar/nested field(s) present in model, controller, and form.` : { missingFields } },
+    { id: 'SCHEMA_CONTRACT', passed: schemaPassed, evidence: schemaPassed
+      ? `${fieldNames.length} scalar/nested field(s) present in model, controller, and form${computedTotal && lineItems ? '; total is calculated from line items' : ''}.`
+      : { missingFields, totalCalculationPassed } },
     { id: 'VALIDATION_AND_STATUS', passed: validationPassed, evidence: validationPassed ? `try/catch and ${statuses.join('/')} response contract found.` : { missingStatuses } },
     { id: 'FULL_STACK_WIRING', passed: wiringPassed, evidence: wiringPassed ? `${route?.method} ${route?.path} is connected to the form, page, and server.` : 'Frontend payload, page mount, or server route registration is missing.' },
     { id: 'RUN_READINESS', passed: runReadinessPassed, evidence: runReadinessPassed ? `package.json start script targets ${entryPoint}.` : packageFailure || 'package.json start/dev/test scripts do not match the server entrypoint.' },
+    { id: 'MODULE_AND_RUNTIME_RESOLUTION', passed: moduleResolution.passed, evidence: moduleResolution.evidence },
+    { id: 'CROSS_LAYER_DATA_FLOW', passed: dataFlow.passed, evidence: dataFlow.evidence },
+    { id: 'ADVERSARIAL_BEHAVIOR_MATRIX', passed: behavioralMatrix.passed, evidence: behavioralMatrix.vectors },
   ];
   return {
     status: gates.every((gate) => gate.passed) ? 'HERMETIC_CONTRACT_AND_SYNTAX_VERIFIED' : 'HERMETIC_VERIFICATION_FAILED',
@@ -1366,7 +2283,535 @@ function verifyHermeticEngineeringGates(modularPlan, fileContents = moduleConten
     total: gates.length,
     gates,
     syntaxFailures,
+    moduleResolution,
+    dataFlow,
+    behavioralMatrix,
   };
+}
+
+function transformCandidateModule(source) {
+  const namedExports = new Set();
+  let transformed = String(source || '')
+    .replace(/^\s*import\s+(\*\s+as\s+[\w$]+|\{[^}]+\}|[\w$]+)\s+from\s+(['"])([^'"]+)\2\s*;?[ \t]*$/gm, (_match, binding, _quote, specifier) => {
+      if (binding.startsWith('*')) return `const ${binding.replace(/^\*\s+as\s+/, '')} = require(${JSON.stringify(specifier)});`;
+      if (binding.startsWith('{')) return `const ${binding} = require(${JSON.stringify(specifier)});`;
+      return `const ${binding} = require(${JSON.stringify(specifier)});`;
+    })
+    .replace(/^\s*import\s+(['"])([^'"]+)\1\s*;?[ \t]*$/gm, (_match, _quote, specifier) => (
+      `require(${JSON.stringify(specifier)});`
+    ))
+    .replace(/\bimport\.meta\.url\b/g, "''")
+    .replace(/^\s*export\s+\{([^}]+)\}\s*;?[ \t]*$/gm, (_match, bindings) => {
+      for (const binding of bindings.split(',')) {
+        const parts = binding.trim().split(/\s+as\s+/);
+        if (parts[0]) namedExports.add(`${parts[0]}: ${parts[1] || parts[0]}`);
+      }
+      return '';
+    })
+    .replace(/^export\s+(?=(?:async\s+)?(?:function|class|const|let|var)\s+)(?:async\s+)?(?:function|class|const|let|var)\s+([A-Za-z_$][\w$]*)/gm, (match, name) => {
+      namedExports.add(`${name}: ${name}`);
+      return match.replace(/^export\s+/, '');
+    })
+    .replace(/\bexport\s+default\s+/g, 'module.exports = ');
+  if (namedExports.size) {
+    transformed += `\nObject.assign(module.exports, { ${[...namedExports].join(', ')} });\n`;
+  }
+  return transformed;
+}
+
+function candidateRuntimeBootstrap(serializedSources) {
+  return `
+const __candidateSources = ${serializedSources};
+const __candidateFactories = Object.create(null);
+const __candidateCache = Object.create(null);
+const __memoryFiles = new Map();
+const __normalize = (value) => {
+  const parts = [];
+  for (const part of String(value).replace(/\\\\/g, '/').split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  return parts.join('/');
+};
+const __builtins = Object.create(null);
+__builtins['node:http'] = { createServer(handler) { return { __candidateHandler: handler }; } };
+__builtins.http = __builtins['node:http'];
+__builtins['node:url'] = { pathToFileURL(value) { return { href: 'file://' + String(value) }; } };
+__builtins.url = __builtins['node:url'];
+__builtins['node:fs'] = {
+  readFileSync(file) { const key = __normalize(file); if (!__memoryFiles.has(key)) { const error = new Error('ENOENT: ' + key); error.code = 'ENOENT'; throw error; } return __memoryFiles.get(key); },
+  writeFileSync(file, value) { __memoryFiles.set(__normalize(file), String(value)); },
+  existsSync(file) { return __memoryFiles.has(__normalize(file)); },
+  mkdirSync() {},
+  promises: {
+    async readFile(file) { return __builtins['node:fs'].readFileSync(file); },
+    async writeFile(file, value) { __builtins['node:fs'].writeFileSync(file, value); },
+    async access(file) { if (!__builtins['node:fs'].existsSync(file)) { const error = new Error('ENOENT'); error.code = 'ENOENT'; throw error; } },
+  },
+};
+__builtins.fs = __builtins['node:fs'];
+__builtins['node:path'] = {
+  sep: '/',
+  join(...parts) { return __normalize(parts.join('/')); },
+  resolve(...parts) { return '/' + __normalize(parts.join('/')); },
+  dirname(value) { const key = __normalize(value); return key.includes('/') ? key.slice(0, key.lastIndexOf('/')) : '.'; },
+  basename(value) { return __normalize(value).split('/').pop(); },
+  extname(value) { const name = __normalize(value).split('/').pop(); const index = name.lastIndexOf('.'); return index < 0 ? '' : name.slice(index); },
+};
+__builtins.path = __builtins['node:path'];
+__builtins['node:crypto'] = {
+  randomUUID() { return '00000000-0000-4000-8000-000000000001'; },
+  createHash() { throw new Error('Cryptographic hashing is unavailable in hermetic runtime probes.'); },
+};
+__builtins.crypto = __builtins['node:crypto'];
+globalThis.process = Object.freeze({ env: Object.freeze(Object.create(null)), argv: Object.freeze([]) });
+globalThis.Buffer = Object.freeze({
+  concat(chunks) {
+    const value = Array.from(chunks || []).map((chunk) => String(chunk)).join('');
+    return Object.freeze({ toString() { return value; } });
+  },
+});
+globalThis.URL = class URL {
+  constructor(value, base) {
+    let address = String(value || '');
+    if (!/^[a-z][a-z0-9+.-]*:\\/\\//i.test(address)) address = String(base || 'http://localhost').replace(/\\/$/, '') + (address.startsWith('/') ? address : '/' + address);
+    const match = address.match(/^[a-z][a-z0-9+.-]*:\\/\\/[^/]*(.*)$/i);
+    this.pathname = ((match && match[1]) || '/').split('?')[0].split('#')[0] || '/';
+    this.href = address;
+  }
+};
+globalThis.console = Object.freeze({ log() {}, info() {}, warn() {}, error() {} });
+function __candidateResolve(from, specifier) {
+  if (Object.prototype.hasOwnProperty.call(__builtins, specifier)) return { builtin: specifier };
+  if (!specifier.startsWith('.')) {
+    const error = new Error('Cannot load external module: ' + specifier);
+    error.code = 'MODULE_NOT_FOUND';
+    throw error;
+  }
+  const parent = from.split('/').slice(0, -1);
+  const parts = parent.concat(specifier.split('/'));
+  const normalized = [];
+  for (const part of parts) {
+    if (!part || part === '.') continue;
+    if (part === '..') normalized.pop();
+    else normalized.push(part);
+  }
+  const base = normalized.join('/');
+  for (const candidate of [base, base + '.js', base + '.cjs', base + '.mjs', base + '.json', base + '/index.js']) {
+    if (Object.prototype.hasOwnProperty.call(__candidateFactories, candidate)
+      || Object.prototype.hasOwnProperty.call(__candidateSources, candidate)) return { path: candidate };
+  }
+  const error = new Error('Candidate module not found: ' + specifier + ' from ' + from);
+  error.code = 'MODULE_NOT_FOUND';
+  throw error;
+}
+function __candidateLoad(file) {
+  const resolved = __candidateResolve('server.js', file);
+  if (resolved.builtin) return __builtins[resolved.builtin];
+  return __candidateLoadResolved(resolved.path);
+}
+function __candidateLoadResolved(file) {
+  if (Object.prototype.hasOwnProperty.call(__candidateCache, file)) return __candidateCache[file].exports;
+  const factory = __candidateFactories[file];
+  if (!factory) {
+    const error = new Error('Candidate source was not compiled: ' + file);
+    error.code = 'MODULE_NOT_FOUND';
+    throw error;
+  }
+  const module = { exports: {}, filename: file };
+  __candidateCache[file] = module;
+  function candidateRequire(specifier) {
+    const resolved = __candidateResolve(file, String(specifier));
+    return resolved.builtin ? __builtins[resolved.builtin] : __candidateLoadResolved(resolved.path);
+  }
+  factory(candidateRequire, module, module.exports);
+  return module.exports;
+}
+globalThis.__loadCandidate = __candidateLoadResolved;
+globalThis.__dispatchCandidateRequest = async function(server, method, url, bodyJson) {
+  let statusCode = 200;
+  let headers = {};
+  let responseBody = '';
+  const request = {
+    method,
+    url,
+    async *[Symbol.asyncIterator]() { if (bodyJson) yield bodyJson; },
+  };
+  const response = {
+    writeHead(code, values = {}) { statusCode = code; headers = values; return this; },
+    end(value = '') { responseBody = String(value || ''); return this; },
+  };
+  await server.__candidateHandler(request, response);
+  return JSON.stringify({ statusCode, headers, body: responseBody });
+};
+globalThis.__modelExportsForFailure = (file) => __candidateLoadResolved(file);
+`;
+}
+
+function buildRuntimePayload(fields) {
+  const payload = {};
+  const computedTotal = fields.find((field) => (
+    field.type === 'number' && /(?:total|amount|subtotal|sum)/i.test(field.name)
+  ));
+  for (const field of fields) {
+    if (field.name === computedTotal?.name || /^(?:id|createdAt|createdOn)$/i.test(field.name)) continue;
+    if (field.type === 'array') {
+      payload[field.name] = (field.items || []).length ? [0, 1].map((row) => Object.fromEntries(
+        field.items.map((item) => {
+          if (item.type === 'number') {
+            if (/(?:quantity|count|units)/i.test(item.name)) return [item.name, row + 1];
+            if (/(?:price|cost|amount)/i.test(item.name)) return [item.name, (row + 1) * 10];
+            return [item.name, row + 1];
+          }
+          if (item.type === 'boolean') return [item.name, true];
+          return [item.name, `Sample ${row + 1}`];
+        }),
+      )) : [];
+    } else if (field.hasDefault) {
+      payload[field.name] = field.defaultValue;
+    } else if (field.type === 'number') {
+      payload[field.name] = 1;
+    } else if (field.type === 'boolean') {
+      payload[field.name] = true;
+    } else {
+      payload[field.name] = `Sample ${field.name}`;
+    }
+  }
+  return payload;
+}
+
+function normalizeRuntimeSource(content) {
+  return String(content || '').replace(/\r\n/g, '\n');
+}
+
+async function verifyCandidateRuntimeGate(modularPlan, fileContents = moduleContentByPath(modularPlan)) {
+  const route = (modularPlan.routeContracts || [])[0];
+  const gate = (passed, evidence, details = {}) => ({
+    id: 'CANDIDATE_RUNTIME_BEHAVIOR',
+    passed,
+    evidence,
+    ...details,
+  });
+  if (!route || !modularPlan.routeSchema?.fields?.length) {
+    return gate(false, 'A generated full-stack route and schema are required for runtime probes.');
+  }
+  const sourceMap = Object.create(null);
+  for (const module of modularPlan.modulesToCreate || []) {
+    const filePath = normalizePath(module.path);
+    if (!/\.(?:c?js|mjs)$/i.test(filePath)) continue;
+    if (typeof module.hermeticBaselineContent !== 'string') {
+      return gate(false, `Candidate ${filePath} has no planner-generated baseline; refusing runtime execution.`, {
+        diagnostics: [{ path: filePath, reason: 'Missing planner-generated baseline.' }],
+      });
+    }
+    const actual = fileContents.get(filePath);
+    if (typeof actual !== 'string') {
+      return gate(false, `Candidate file ${filePath} is absent from the effective workspace.`, {
+        diagnostics: [{ path: filePath, reason: 'Candidate file is absent.' }],
+      });
+    }
+    if (normalizeRuntimeSource(actual) !== normalizeRuntimeSource(module.content)) {
+      return gate(false, `Candidate file ${filePath} differs from the approved planner output; refusing runtime execution.`, {
+        diagnostics: [{ path: filePath, reason: 'Disk content does not match the approved candidate.' }],
+      });
+    }
+    sourceMap[filePath] = String(actual);
+  }
+  const context = vm.createContext(Object.create(null), {
+    codeGeneration: { strings: false, wasm: false },
+  });
+  const timeout = 1200;
+  try {
+    vm.runInContext(candidateRuntimeBootstrap(JSON.stringify(sourceMap)), context, { timeout });
+    for (const [filePath, source] of Object.entries(sourceMap)) {
+      if (!/\.(?:c?js|mjs)$/i.test(filePath)) continue;
+      const transformed = transformCandidateModule(source);
+      const factory = new vm.Script(`(function(require, module, exports) { 'use strict';\n${transformed}\n})`, {
+        filename: filePath,
+      }).runInContext(context, { timeout });
+      context.__candidateFactory = factory;
+      context.__candidateFactoryPath = filePath;
+      vm.runInContext('__candidateFactories[__candidateFactoryPath] = __candidateFactory; delete globalThis.__candidateFactory; delete globalThis.__candidateFactoryPath;', context, { timeout });
+    }
+    const server = route.integrationFile;
+    context.__candidateServerPath = normalizePath(server);
+    vm.runInContext('globalThis.__probeServer = __loadCandidate(__candidateServerPath).createApplication(); delete globalThis.__candidateServerPath;', context, { timeout });
+    const modelModule = modularPlan.modulesToCreate.find((module) => normalizePath(module.path) === normalizePath(route.modelFile));
+    if (!modelModule) return gate(false, 'The route schema module is missing from the candidate map.');
+    const payload = buildRuntimePayload(modularPlan.routeSchema.fields);
+    const payloadJson = JSON.stringify(payload);
+    const probes = [];
+    const execute = async (id, description, method, routePath, body, expectedStatus, validate, applicable = true) => {
+      if (!applicable) {
+        probes.push({ id, passed: true, applicable: false, expected: 'not applicable', actual: 'not applicable', description });
+        return null;
+      }
+      try {
+        context.__probeInput = JSON.stringify({ method, routePath, body: body === null ? '' : JSON.stringify(body) });
+        const pending = vm.runInContext(
+          '__dispatchCandidateRequest(__probeServer, JSON.parse(__probeInput).method, JSON.parse(__probeInput).routePath, JSON.parse(__probeInput).body)',
+          context,
+          { timeout },
+        );
+        let timer;
+        try {
+          const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Runtime probe timed out.')), timeout + 250);
+          });
+          const raw = await Promise.race([pending, timeoutPromise]);
+          clearTimeout(timer);
+          const actual = JSON.parse(raw);
+          const bodyValue = actual.body ? JSON.parse(actual.body) : null;
+          const passed = actual.statusCode === expectedStatus && (!validate || validate(bodyValue));
+          probes.push({ id, passed, applicable: true, expected: expectedStatus, actual: actual.statusCode, description, body: bodyValue });
+          return { ...actual, parsedBody: bodyValue };
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch (error) {
+        probes.push({ id, passed: false, applicable: true, expected: expectedStatus, actual: error.message, description });
+        return null;
+      }
+    };
+    const fields = modularPlan.routeSchema.fields;
+    const expectedSuccess = route.method === 'POST' ? 201 : 200;
+    const computedTotal = fields.find((field) => (
+      field.type === 'number' && /(?:total|amount|subtotal|sum)/i.test(field.name)
+    ));
+    const lineItems = fields.find((field) => (
+      field.type === 'array'
+        && field.items?.some((item) => /(?:price|cost|amount)/i.test(item.name))
+        && field.items?.some((item) => /(?:quantity|count|units)/i.test(item.name))
+    ));
+    const expectedTotal = lineItems
+      ? payload[lineItems.name].reduce((sum, item) => {
+        const priceKey = lineItems.items.find((itemField) => /(?:price|cost|amount)/i.test(itemField.name)).name;
+        const quantityKey = lineItems.items.find((itemField) => /(?:quantity|count|units)/i.test(itemField.name)).name;
+        return sum + Number(item[priceKey]) * Number(item[quantityKey]);
+      }, 0)
+      : null;
+    const defaultStatus = fields.find((field) => field.name.toLowerCase() === 'status' && field.hasDefault);
+    const createdAt = fields.find((field) => /^(?:createdAt|createdOn)$/i.test(field.name));
+    await execute(
+      'valid-multi-item-create',
+      'Submit a valid payload with defaults and multiple nested rows.',
+      route.method,
+      route.path,
+      payload,
+      expectedSuccess,
+      (body) => Boolean(body?.data && typeof body.data === 'object')
+        && (!computedTotal || !lineItems || Number(body.data[computedTotal.name]) === expectedTotal)
+        && (!defaultStatus || body.data[defaultStatus.name] === defaultStatus.defaultValue)
+        && (!createdAt || (typeof body.data[createdAt.name] === 'string' && Number.isFinite(Date.parse(body.data[createdAt.name])))),
+    );
+    const requiredScalar = fields.find((field) => field.required && field.type !== 'array');
+    const invalidRequiredPayload = { ...payload };
+    if (requiredScalar) invalidRequiredPayload[requiredScalar.name] = requiredScalar.type === 'string' ? '   ' : null;
+    await execute(
+      'blank-required-scalar',
+      'Reject a blank required scalar field.',
+      route.method,
+      route.path,
+      invalidRequiredPayload,
+      400,
+      null,
+      Boolean(requiredScalar),
+    );
+    const arrayField = fields.find((field) => field.type === 'array');
+    const emptyArrayPayload = { ...payload };
+    if (arrayField) emptyArrayPayload[arrayField.name] = [];
+    await execute(
+      'empty-nested-array',
+      'Reject an empty nested collection.',
+      route.method,
+      route.path,
+      emptyArrayPayload,
+      400,
+      null,
+      Boolean(arrayField),
+    );
+    const invalidNestedPayload = { ...payload };
+    const nestedArray = fields.find((field) => field.type === 'array' && field.items?.length);
+    if (nestedArray) {
+      const itemField = nestedArray.items.find((item) => item.type === 'number'
+        && /(?:quantity|count|units)/i.test(item.name))
+        || nestedArray.items.find((item) => item.type === 'number'
+          && /(?:price|cost|amount)/i.test(item.name))
+        || nestedArray.items.find((item) => item.type === 'number')
+        || nestedArray.items.find((item) => item.type === 'string');
+      if (itemField) {
+        const invalidValue = itemField.type === 'number'
+          ? /(?:quantity|count|units)/i.test(itemField.name) ? 0
+            : /(?:price|cost|amount)/i.test(itemField.name) ? -1
+              : 'not-a-number'
+          : '';
+        invalidNestedPayload[nestedArray.name] = [{
+          ...((payload[nestedArray.name] || [])[0] || {}),
+          [itemField.name]: invalidValue,
+        }];
+      }
+    }
+    await execute(
+      'invalid-nested-item',
+      'Reject invalid nested item values.',
+      route.method,
+      route.path,
+      invalidNestedPayload,
+      400,
+      null,
+      Boolean(nestedArray),
+    );
+    context.__modelPathForFailure = normalizePath(modelModule.path);
+    vm.runInContext(
+      `__modelExportsForFailure(${JSON.stringify(normalizePath(modelModule.path))}).create = function() { throw new Error('Simulated persistence failure.'); };`,
+      context,
+      { timeout },
+    );
+    await execute(
+      'persistence-failure',
+      'Return a structured server error when persistence fails.',
+      route.method,
+      route.path,
+      payload,
+      500,
+      (body) => Boolean(body && typeof body.error === 'string'),
+    );
+    let uiPreview;
+    try {
+      context.__probeInput = JSON.stringify({
+        method: 'GET',
+        routePath: '/',
+        body: '',
+      });
+      let timer;
+      try {
+        const pending = vm.runInContext(
+          '__dispatchCandidateRequest(__probeServer, JSON.parse(__probeInput).method, JSON.parse(__probeInput).routePath, JSON.parse(__probeInput).body)',
+          context,
+          { timeout },
+        );
+        const timeoutPromise = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('UI preview probe timed out.')), timeout + 250);
+        });
+        const raw = await Promise.race([pending, timeoutPromise]);
+        const response = JSON.parse(raw);
+        uiPreview = {
+          passed: response.statusCode === 200
+            && String(response.headers['Content-Type'] || '').startsWith('text/html')
+            && response.body.includes('<form')
+            && response.body.includes('<script>'),
+          statusCode: response.statusCode,
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (error) {
+      uiPreview = { passed: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    context.__probeServer = null;
+    context.__probeInput = null;
+    const failed = probes.filter((probe) => probe.applicable && !probe.passed);
+    const total = probes.length;
+    return gate(failed.length === 0 && total === 5 && uiPreview?.passed === true,
+      `${probes.filter((probe) => probe.applicable && probe.passed).length}/${probes.filter((probe) => probe.applicable).length} applicable behavioral probes passed; ${probes.filter((probe) => !probe.applicable).length} not applicable; standalone UI preview ${uiPreview?.passed ? 'passed' : 'failed'}.`,
+      {
+        probes,
+        uiPreview,
+        diagnostics: failed.flatMap((probe) => {
+          const targets = probe.id === 'valid-multi-item-create' || probe.id === 'persistence-failure'
+            ? [route.controllerFile, modelModule.path]
+            : [modelModule.path];
+          return [...new Set(targets.map(normalizePath))].map((targetPath) => ({
+            path: targetPath,
+            reason: `${probe.id}: expected ${probe.expected}, actual ${probe.actual}.`,
+          }));
+        }).concat(uiPreview?.passed ? [] : [{
+          path: normalizePath(route.integrationFile),
+          reason: `standalone-ui-preview: ${uiPreview?.error || `expected HTTP 200 HTML, actual HTTP ${uiPreview?.statusCode}.`}`,
+        }]),
+      });
+  } catch (error) {
+    return gate(false, error instanceof Error ? error.message : String(error), {
+      probes: [],
+      diagnostics: [{ path: normalizePath(route.integrationFile), reason: error instanceof Error ? error.message : String(error) }],
+    });
+  }
+}
+
+async function verifyHermeticEngineeringGatesWithRuntime(modularPlan, fileContents = moduleContentByPath(modularPlan), options = {}) {
+  const staticResult = verifyHermeticEngineeringGates(modularPlan, fileContents, options);
+  const runtimeGate = staticResult.passed === staticResult.total
+    ? await verifyCandidateRuntimeGate(modularPlan, fileContents)
+    : {
+      id: 'CANDIDATE_RUNTIME_BEHAVIOR',
+      passed: false,
+      evidence: 'Runtime probes were not executed because one or more static hermetic gates failed.',
+      probes: [],
+      diagnostics: [{ path: 'candidate', reason: 'Static hermetic checks must pass before runtime probes.' }],
+    };
+  const gates = [...staticResult.gates, runtimeGate];
+  const passed = gates.filter((gate) => gate.passed).length;
+  return {
+    ...staticResult,
+    status: passed === gates.length ? 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED' : 'HERMETIC_VERIFICATION_FAILED',
+    passed,
+    total: gates.length,
+    gates,
+    runtimeVerification: runtimeGate,
+  };
+}
+
+async function runHermeticRegressionLoopWithRuntime(modularPlan, { root, onProgress = () => {}, maxPasses = 3 } = {}) {
+  const repairs = [];
+  let result;
+  for (let pass = 1; pass <= maxPasses; pass += 1) {
+    runHermeticRegressionLoop(modularPlan, { root, onProgress, maxPasses });
+    result = await verifyHermeticEngineeringGatesWithRuntime(
+      modularPlan,
+      moduleContentByPath(modularPlan),
+      { root },
+    );
+    if (result.passed === result.total) {
+      result.regressionLoop = { passes: pass, repairs };
+      return result;
+    }
+    const runtimeGate = result.gates.find((gate) => gate.id === 'CANDIDATE_RUNTIME_BEHAVIOR');
+    for (const failure of runtimeGate?.diagnostics || []) {
+      onProgress({
+        phase: 'THINK_REGRESSION_DIAGNOSTIC',
+        message: `[THINK / REGRESSION LOOP] PASS ${pass} ${runtimeGate.id} @ ${failure.path}: ${failure.reason}`,
+      });
+    }
+    if (pass === maxPasses || !runtimeGate || runtimeGate.passed) break;
+    const before = new Map((modularPlan.modulesToCreate || []).map((module) => [module.path, module.content]));
+    const failedPaths = new Set((runtimeGate.diagnostics || []).map((failure) => normalizePath(failure.path)));
+    for (const module of modularPlan.modulesToCreate || []) {
+      if (!failedPaths.has(normalizePath(module.path))
+        || module.operation === 'reuse'
+        || typeof module.hermeticBaselineContent !== 'string') continue;
+      module.content = module.hermeticBaselineContent;
+    }
+    repairHermeticCandidate(modularPlan);
+    const changed = (modularPlan.modulesToCreate || []).filter((module) => before.get(module.path) !== module.content);
+    if (!changed.length) {
+      onProgress({
+        phase: 'THINK_REGRESSION',
+        message: `[THINK / REGRESSION LOOP] PASS ${pass} has no safe runtime repair; verification remains fail-closed.`,
+      });
+      break;
+    }
+    for (const module of changed) {
+      const message = `Repaired ${module.path} after candidate runtime probe failure.`;
+      repairs.push(message);
+      onProgress({
+        phase: 'THINK_REGRESSION_REPAIR',
+        message: `[DEEP-THINK REPAIR PASS ${pass}] [SELF-REPAIR] Upgraded ${module.path} after runtime verification.`,
+      });
+    }
+  }
+  if (result) result.regressionLoop = { passes: Math.min(maxPasses, repairs.length + 1), repairs };
+  return result;
 }
 
 function repairHermeticCandidate(modularPlan) {
@@ -1398,11 +2843,32 @@ function repairHermeticCandidate(modularPlan) {
   const model = moduleForResponsibility(modularPlan, 'DATA_MODEL');
   if (model && fields.length) {
     const serializedFields = JSON.stringify(fields, null, 2);
-    if (/const fields = [\s\S]*?;\s*function validate/.test(model.content)) {
-      model.content = model.content.replace(
-        /const fields = [\s\S]*?;\s*(?=function validate)/,
-        `const fields = ${serializedFields};\n\n`,
-      );
+    const fieldsStart = model.content.indexOf('const fields = ');
+    const fieldsEnd = fieldsStart >= 0
+      ? Math.min(
+        ...[
+          model.content.indexOf('\nconst records =', fieldsStart),
+          model.content.indexOf('\n\nfunction validate', fieldsStart),
+        ].filter((index) => index >= 0),
+      )
+      : -1;
+    if (fieldsStart >= 0 && Number.isFinite(fieldsEnd)) {
+      model.content = `${model.content.slice(0, fieldsStart)}const fields = ${serializedFields};${model.content.slice(fieldsEnd)}`;
+    }
+    const computedTotal = fields.find((field) => (
+      field.type === 'number' && /(?:total|amount|subtotal|sum)/i.test(field.name)
+    ));
+    const lineItems = fields.find((field) => (
+      field.type === 'array'
+        && field.items?.some((item) => /(?:price|cost|amount)/i.test(item.name))
+        && field.items?.some((item) => /(?:quantity|count|units)/i.test(item.name))
+    ));
+    if (computedTotal && lineItems && !model.content.includes('.reduce(')) {
+      const priceField = lineItems.items.find((item) => /(?:price|cost|amount)/i.test(item.name)).name;
+      const quantityField = lineItems.items.find((item) => /(?:quantity|count|units)/i.test(item.name)).name;
+      const applyDefaultsHeader = /function applyDefaults\(payload\)\s*\{\s*const value = \{ \.\.\.payload \};/;
+      const calculation = `function applyDefaults(payload) {\n  const value = { ...payload };\n  if (Array.isArray(value[${JSON.stringify(lineItems.name)}])) {\n    value[${JSON.stringify(computedTotal.name)}] = value[${JSON.stringify(lineItems.name)}].reduce((sum, item) => sum + Number(item[${JSON.stringify(priceField)}] || 0) * Number(item[${JSON.stringify(quantityField)}] || 0), 0);\n  }`;
+      model.content = model.content.replace(applyDefaultsHeader, calculation);
     }
   }
   const controller = moduleForResponsibility(modularPlan, 'CORE_BUSINESS_LOGIC');
@@ -1413,7 +2879,8 @@ function repairHermeticCandidate(modularPlan) {
     const handlerName = controller.content.match(/async function ([A-Za-z_$][\w$]*)\s*\(/)?.[1]
       || 'handleRequest';
     const responseStatus = route.method === 'POST' ? 201 : 200;
-    controller.content = `${useEsm ? '' : "'use strict';\n\n"}${schemaBinding}\nconst requestedFieldContract = ${JSON.stringify(fields.map((field) => field.name), null, 2)};\n\nasync function ${handlerName}(request) {\n  try {\n    const validation = schema.validate(request.body, requestedFieldContract);\n    if (!validation.valid) return { status: 400, body: { errors: validation.errors } };\n    return { status: ${responseStatus}, body: { data: schema.applyDefaults(request.body) } };\n  } catch (error) {\n    return { status: 500, body: { error: error instanceof Error ? error.message : 'Request failed.' } };\n  }\n}\n\n${useEsm ? `export { ${handlerName} };` : `module.exports = { ${handlerName} };`}\n`;
+    const listHandlerName = `list${route.entity || route.controllerHandler?.replace(/^handle/, '') || 'Records'}`;
+    controller.content = `${useEsm ? '' : "'use strict';\n\n"}${schemaBinding}\nconst requestedFieldContract = ${JSON.stringify(fields.map((field) => field.name), null, 2)};\n\nasync function ${handlerName}(request) {\n  try {\n    const validation = schema.validate(request.body, requestedFieldContract);\n    if (!validation.valid) return { status: 400, body: { errors: validation.errors } };\n    return { status: ${responseStatus}, body: { data: schema.create(request.body) } };\n  } catch (error) {\n    return { status: 500, body: { error: error instanceof Error ? error.message : 'Request failed.' } };\n  }\n}\n\nasync function ${listHandlerName}() {\n  try {\n    return { status: 200, body: { data: schema.list() } };\n  } catch (error) {\n    return { status: 500, body: { error: error instanceof Error ? error.message : 'Request failed.' } };\n  }\n}\n\n${useEsm ? `export { ${handlerName}, ${listHandlerName} };` : `module.exports = { ${handlerName}, ${listHandlerName} };`}\n`;
   }
   const form = route
     ? modularPlan.modulesToCreate.find((module) => normalizePath(module.path) === normalizePath(route.frontendFile))
@@ -1429,7 +2896,7 @@ function repairHermeticCandidate(modularPlan) {
     );
     form.content = form.content.replace(
       /(<form\b[^>]*>\s*)[\s\S]*?(\s*<button type="submit")/,
-      `$1\n${buildRequestedFormFields(fields)}\n$2`,
+      `$1\n${buildRequestedFormFields(fields)}\n${buildComputedTotalPreview(fields)}$2`,
     );
     const arrays = fields.filter((field) => field.type === 'array');
     if (arrays.length && !form.content.includes('function updateArrayField(')) {
@@ -1438,6 +2905,163 @@ function repairHermeticCandidate(modularPlan) {
     }
   }
   return modularPlan;
+}
+
+function removeUnusedMissingExternalImports(modularPlan, failures) {
+  let repaired = 0;
+  for (const failure of failures || []) {
+    const module = modularPlan.modulesToCreate.find((candidate) => normalizePath(candidate.path) === normalizePath(failure.path));
+    if (!module) continue;
+    const escaped = failure.specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const importStatement = new RegExp(`^[\\t ]*import\\s+([^\\n;]+?)\\s+from\\s+(['"])${escaped}\\2\\s*;?[\\t ]*(?:\\r?\\n|$)`, 'm');
+    const requireStatement = new RegExp(`^[\\t ]*(?:(?:const|let|var)\\s+([^=\\n]+?)\\s*=\\s*)?require\\s*\\(\\s*(['"])${escaped}\\2\\s*\\)\\s*;?[\\t ]*(?:\\r?\\n|$)`, 'm');
+    let match = module.content.match(importStatement);
+    let pattern = importStatement;
+    if (!match) {
+      match = module.content.match(requireStatement);
+      pattern = requireStatement;
+    }
+    if (!match) continue;
+    const bindings = (match[1] || '').match(/[A-Za-z_$][\w$]*/g) || [];
+    const remainingSource = module.content.replace(pattern, '');
+    if (bindings.some((binding) => new RegExp(`\\b${binding.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(remainingSource))) {
+      continue;
+    }
+    module.content = remainingSource;
+    repaired += 1;
+  }
+  return repaired;
+}
+
+function gateFailureDiagnostics(result, modularPlan) {
+  const diagnostics = [];
+  const modulePath = (responsibility) => (
+    modularPlan.modulesToCreate.find((module) => module.responsibility === responsibility)?.path || 'unknown'
+  );
+  for (const gate of result.gates || []) {
+    if (gate.passed) continue;
+    if (gate.id === 'SYNTAX_AND_AST') {
+      for (const failure of result.syntaxFailures || []) {
+        diagnostics.push({ gate: gate.id, path: failure.path, reason: failure.error || failure.message || 'JavaScript parsing failed.' });
+      }
+    } else if (gate.id === 'MODULE_AND_RUNTIME_RESOLUTION') {
+      for (const failure of result.moduleResolution?.failures || []) {
+        diagnostics.push({ gate: gate.id, path: failure.path, reason: `${failure.specifier}: ${failure.reason}` });
+      }
+    } else if (gate.id === 'SCHEMA_CONTRACT') {
+      const missingFields = gate.evidence?.missingFields || [];
+      if (missingFields.length) {
+        for (const role of ['DATA_MODEL', 'CORE_BUSINESS_LOGIC', 'UI_PRESENTATION']) {
+          diagnostics.push({ gate: gate.id, path: modulePath(role), reason: `Required field contract is missing: ${missingFields.join(', ')}.` });
+        }
+      }
+      if (gate.evidence?.totalCalculationPassed === false) {
+        diagnostics.push({ gate: gate.id, path: modulePath('DATA_MODEL'), reason: 'Computed total is not derived from the line-item fields.' });
+      }
+    } else if (gate.id === 'VALIDATION_AND_STATUS') {
+      diagnostics.push({ gate: gate.id, path: modulePath('CORE_BUSINESS_LOGIC'), reason: JSON.stringify(gate.evidence) });
+    } else if (gate.id === 'FULL_STACK_WIRING') {
+      for (const module of modularPlan.modulesToCreate.filter((candidate) => [
+        'ROUTING', 'APPLICATION_ENTRYPOINT', 'UI_PRESENTATION',
+      ].includes(candidate.responsibility))) {
+        diagnostics.push({ gate: gate.id, path: module.path, reason: String(gate.evidence) });
+      }
+    } else if (gate.id === 'RUN_READINESS') {
+      for (const target of ['package.json', '.env.example', 'README.md']) {
+        diagnostics.push({ gate: gate.id, path: target, reason: String(gate.evidence) });
+      }
+    } else if (gate.id === 'CROSS_LAYER_DATA_FLOW') {
+      for (const issue of result.dataFlow?.issues || []) {
+        diagnostics.push({ gate: gate.id, path: issue.path, reason: issue.reason });
+      }
+    } else if (gate.id === 'ADVERSARIAL_BEHAVIOR_MATRIX') {
+      for (const vector of result.behavioralMatrix?.vectors || []) {
+        if (vector.passed) continue;
+        const paths = vector.id === 'structured-client-and-server-error-responses'
+          ? [modulePath('CORE_BUSINESS_LOGIC'), modulePath('UI_PRESENTATION')]
+          : vector.id === 'required-scalar-whitespace-rejected'
+            || vector.id === 'empty-or-non-array-nested-collection-rejected'
+            || vector.id === 'invalid-nested-item-values-rejected'
+            ? [modulePath('DATA_MODEL'), modulePath('UI_PRESENTATION')]
+            : [modulePath('DATA_MODEL'), modulePath('CORE_BUSINESS_LOGIC'), modulePath('UI_PRESENTATION')];
+        for (const targetPath of paths) {
+          diagnostics.push({ gate: gate.id, path: targetPath, reason: `${vector.id}: ${vector.reason}` });
+        }
+      }
+    }
+  }
+  return diagnostics;
+}
+
+function runHermeticRegressionLoop(modularPlan, { root, onProgress = () => {}, maxPasses = 3 } = {}) {
+  const repairs = [];
+  let result;
+  for (let pass = 1; pass <= maxPasses; pass += 1) {
+    result = verifyHermeticEngineeringGates(modularPlan, moduleContentByPath(modularPlan), { root });
+    if (result.passed === result.total) {
+      result.regressionLoop = { passes: pass, repairs };
+      return result;
+    }
+    const diagnostics = gateFailureDiagnostics(result, modularPlan);
+    const failedGates = result.gates.filter((gate) => !gate.passed).map((gate) => gate.id);
+    onProgress({
+      phase: 'THINK_REGRESSION',
+      message: `[DEEP-THINK PASS ${pass}/${maxPasses}] Failed gates: ${failedGates.join(', ')}. Inspecting generated modules and applying only safe, semantics-preserving repairs.`,
+    });
+    for (const failure of diagnostics) {
+      onProgress({
+        phase: 'THINK_REGRESSION_DIAGNOSTIC',
+        message: `[THINK / REGRESSION LOOP] PASS ${pass} ${failure.gate} @ ${failure.path}: ${failure.reason}`,
+      });
+    }
+    if (pass === maxPasses) break;
+    const before = new Map((modularPlan.modulesToCreate || []).map((module) => [module.path, module.content]));
+    repairHermeticCandidate(modularPlan);
+    const dependencyRepairs = removeUnusedMissingExternalImports(modularPlan, result.moduleResolution?.failures);
+    const repairedPaths = new Set();
+    for (const failure of diagnostics) {
+      const module = modularPlan.modulesToCreate.find((candidate) => normalizePath(candidate.path) === normalizePath(failure.path));
+      if (!module || module.operation === 'reuse'
+        || typeof module.hermeticBaselineContent !== 'string'
+        || module.content === module.hermeticBaselineContent) continue;
+      const helperChangedCandidate = before.get(module.path) !== module.content;
+      const candidateWasAlreadyModified = before.get(module.path) !== module.hermeticBaselineContent;
+      const mustRestore = ['SYNTAX_AND_AST', 'MODULE_AND_RUNTIME_RESOLUTION', 'FULL_STACK_WIRING', 'CROSS_LAYER_DATA_FLOW', 'ADVERSARIAL_BEHAVIOR_MATRIX'].includes(failure.gate)
+        || (candidateWasAlreadyModified && !helperChangedCandidate);
+      if (!mustRestore) continue;
+      module.content = module.hermeticBaselineContent;
+      repairedPaths.add(module.path);
+    }
+    if (repairedPaths.size) repairHermeticCandidate(modularPlan);
+    const contentRepairs = (modularPlan.modulesToCreate || []).filter((module) => (
+      before.get(module.path) !== module.content || repairedPaths.has(module.path)
+    ));
+    if (contentRepairs.length) {
+      repairs.push(...contentRepairs.map((module) => `Repaired ${module.path} from its approved full-stack baseline.`));
+      for (const module of contentRepairs) {
+        onProgress({
+          phase: 'THINK_REGRESSION_REPAIR',
+          message: `[DEEP-THINK REPAIR PASS ${pass}] [SELF-REPAIR] Upgraded ${module.path} to the verified full-stack candidate.`,
+        });
+      }
+    }
+    if (dependencyRepairs) {
+      repairs.push(`Removed ${dependencyRepairs} unused import(s) of packages missing from the workspace.`);
+    }
+    if (!contentRepairs.length && !dependencyRepairs) {
+      onProgress({
+        phase: 'THINK_REGRESSION',
+        message: `[THINK / REGRESSION LOOP] PASS ${pass} has no safe automatic repair; verification remains fail-closed.`,
+      });
+      break;
+    }
+    onProgress({
+      phase: 'THINK_REGRESSION',
+      message: `[DEEP-THINK PASS ${pass}] Repaired ${contentRepairs.length + dependencyRepairs} issue(s); rerunning all eight gates.`,
+    });
+  }
+  result.regressionLoop = { passes: Math.min(maxPasses, repairs.length ? repairs.length + 1 : 1), repairs };
+  return result;
 }
 
 async function verifyHermeticEngineeringGatesOnDisk(root, modularPlan) {
@@ -1450,17 +3074,23 @@ async function verifyHermeticEngineeringGatesOnDisk(root, modularPlan) {
       return {
         status: 'HERMETIC_VERIFICATION_FAILED',
         passed: 0,
-        total: 5,
+        total: 9,
         gates: [{
           id: 'SYNTAX_AND_AST',
           passed: false,
           evidence: `Could not read approved file ${safePath}: ${error.message}`,
         }],
         syntaxFailures: [],
+        moduleResolution: {
+          passed: false,
+          evidence: 'Module resolution was not run because an approved file could not be read.',
+          resolved: [],
+          failures: [],
+        },
       };
     }
   }
-  return verifyHermeticEngineeringGates(modularPlan, diskContents);
+  return verifyHermeticEngineeringGatesWithRuntime(modularPlan, diskContents, { root });
 }
 
 async function synthesizeMultiFilePatch(root, modularPlan, options = {}) {
@@ -1471,6 +3101,7 @@ async function synthesizeMultiFilePatch(root, modularPlan, options = {}) {
     if (lines.at(-1) === '') lines.pop();
     return lines;
   };
+  const normalizePatchContent = (content) => splitPatchLines(content).join('\n');
   const buildFileDiff = (safePath, operation, original, target) => {
     const oldLines = operation === 'create' ? [] : splitPatchLines(original);
     const newLines = splitPatchLines(target);
@@ -1506,6 +3137,37 @@ async function synthesizeMultiFilePatch(root, modularPlan, options = {}) {
     const safePath = validateSafePath(root, mod.path);
     const operation = mod.operation || 'create';
     if (claimTarget(safePath, mod.content, operation)) continue;
+    if (operation === 'rename') {
+      const sourcePath = validateSafePath(root, mod.sourcePath);
+      if (sourcePath === safePath) throw new Error(`Rename source and target must differ: ${sourcePath}.`);
+      if (claimTarget(sourcePath, mod.content, 'rename-source')) {
+        throw new Error(`Conflicting modular operations rename the same source: ${sourcePath}.`);
+      }
+      const sourceSnapshot = await snapshotFn(root, sourcePath);
+      const targetSnapshot = await snapshotFn(root, safePath);
+      if (!sourceSnapshot.exists) {
+        throw new Error(`STALE_PROPOSAL_DRIFT: Expected rename source [${sourcePath}] is missing.`);
+      }
+      if (targetSnapshot.exists) {
+        throw new Error(`STALE_PROPOSAL_DRIFT: Rename target [${safePath}] already exists.`);
+      }
+      expectedSnapshots.push(sourceSnapshot, targetSnapshot);
+      patchParts.push([
+        `diff --git a/${sourcePath} b/${safePath}`,
+        'similarity index 100%',
+        `rename from ${sourcePath}`,
+        `rename to ${safePath}`,
+        '',
+      ].join('\n'));
+      filesList.push({
+        path: safePath,
+        sourcePath,
+        operation,
+        responsibility: mod.responsibility,
+        dependencies: mod.dependencies,
+      });
+      continue;
+    }
     const snap = await snapshotFn(root, safePath);
     if (operation === 'modify' && !snap.exists) {
       throw new Error(`STALE_PROPOSAL_DRIFT: Expected existing target [${safePath}] is missing.`);
@@ -1513,8 +3175,14 @@ async function synthesizeMultiFilePatch(root, modularPlan, options = {}) {
     if (operation === 'create' && snap.exists) {
       throw new Error(`STALE_PROPOSAL_DRIFT: New target [${safePath}] already exists.`);
     }
+    if (operation === 'reuse') {
+      if (!snap.exists) {
+        throw new Error(`STALE_PROPOSAL_DRIFT: Expected reusable target [${safePath}] is missing.`);
+      }
+      continue;
+    }
     if (operation === 'modify'
-        && String(snap.content || '').replace(/\r\n/g, '\n') === String(mod.content || '').replace(/\r\n/g, '\n')) {
+        && normalizePatchContent(snap.content || '') === normalizePatchContent(mod.content || '')) {
       continue;
     }
     expectedSnapshots.push(snap);
@@ -1535,7 +3203,7 @@ async function synthesizeMultiFilePatch(root, modularPlan, options = {}) {
     const operation = snap.exists ? 'modify' : 'create';
     if (claimTarget(safePath, point.patchedContent || '', operation)) continue;
     if (snap.exists
-        && String(snap.content || '').replace(/\r\n/g, '\n') === String(point.patchedContent || '').replace(/\r\n/g, '\n')) {
+        && normalizePatchContent(snap.content || '') === normalizePatchContent(point.patchedContent || '')) {
       continue;
     }
     expectedSnapshots.push(snap);
@@ -1842,7 +3510,11 @@ module.exports = {
   discoverProjectConventions,
   isFullStackBuildRequest,
   deriveModularPlan,
+  moduleResolutionGate,
+  runHermeticRegressionLoop,
+  runHermeticRegressionLoopWithRuntime,
   verifyHermeticEngineeringGates,
+  verifyHermeticEngineeringGatesWithRuntime,
   verifyHermeticEngineeringGatesOnDisk,
   repairHermeticCandidate,
   synthesizeMultiFilePatch,

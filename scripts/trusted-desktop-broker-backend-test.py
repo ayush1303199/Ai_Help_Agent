@@ -511,6 +511,11 @@ class TrustedDesktopBrokerBackendTests(unittest.IsolatedAsyncioTestCase):
                         "sessionLeaseToken": lease_token,
                         "expiresAt": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
                     }
+                elif self.path == "/v1/sessions/heartbeat":
+                    status = 200
+                    response = {
+                        "expiresAt": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+                    }
                 elif self.path == "/v1/workflows":
                     status = 200
                     response = {"outcome": "SUCCESS", "filesModified": []}
@@ -593,6 +598,13 @@ class TrustedDesktopBrokerBackendTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(lease_response.status_code, 201, lease_response.text)
             lease = lease_response.json()
             self.assertEqual(lease["brokerSessionId"], broker_session_id)
+            heartbeat = await self.client.post(
+                "/api/coding/broker/sessions/heartbeat",
+                headers=restored_session_headers,
+                json={"brokerSessionId": broker_session_id, "sessionLeaseToken": lease_token},
+            )
+            self.assertEqual(heartbeat.status_code, 200, heartbeat.text)
+            self.assertIn("expiresAt", heartbeat.json())
             unknown_session = await self.client.post(
                 "/api/coding/broker/workflows",
                 headers=restored_session_headers,
@@ -669,7 +681,13 @@ class TrustedDesktopBrokerBackendTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(item[0] == "/v1/synchronize" for item in forwarded))
             session_forward = next(item for item in forwarded if item[0] == "/v1/sessions")
             workflow_forward = next(item for item in forwarded if item[0] == "/v1/workflows")
+            heartbeat_forward = next(item for item in forwarded if item[0] == "/v1/sessions/heartbeat")
             self.assertEqual(session_forward[1], {"projectId": project_id})
+            self.assertEqual(
+                heartbeat_forward[1],
+                {"brokerSessionId": broker_session_id, "sessionLeaseToken": lease_token},
+            )
+            self.assertEqual(heartbeat_forward[2], self.origin)
             self.assertEqual(workflow_forward[1]["executionMode"], "inline_review")
             self.assertEqual(workflow_forward[2], self.origin)
 

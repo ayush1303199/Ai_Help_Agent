@@ -14,6 +14,7 @@ const rejectedWorkspaceRoot = path.join(fixtureRoot, 'rejected-workspace');
 const approvedWorkspaceRoot = path.join(fixtureRoot, 'approved-workspace');
 const autonomousWorkspaceRoot = path.join(fixtureRoot, 'autonomous-workspace');
 const populatedWorkspaceRoot = path.join(fixtureRoot, 'populated-workspace');
+const autonomousPopulatedWorkspaceRoot = path.join(fixtureRoot, 'autonomous-populated-workspace');
 const runtimeSettingsPath = path.join(fixtureRoot, 'runtime-settings.json');
 const authToken = randomBytes(32).toString('base64url');
 const mutationSecret = randomBytes(32).toString('base64url');
@@ -87,6 +88,7 @@ try {
   await mkdir(approvedWorkspaceRoot);
   await mkdir(autonomousWorkspaceRoot);
   await mkdir(populatedWorkspaceRoot);
+  await mkdir(autonomousPopulatedWorkspaceRoot);
   renderer = http.createServer();
   const [backendPort, rendererPort] = await Promise.all([listen(backend), listen(renderer)]);
   const runtimeSettings = {
@@ -181,6 +183,8 @@ try {
       : decision === 'autonomous' ? autonomousWorkspaceRoot : rejectedWorkspaceRoot,
     expectEmptyBeforeApproval = true,
     expectNoChanges = false,
+    minimumBadges = 5,
+    minimumDiffPreview = 5,
   } = {}) => {
     const binding = {
       brokerSessionId: lease.brokerSessionId,
@@ -222,8 +226,14 @@ try {
     assert.match(pending.envelope.proposalDigest, /^[a-f0-9]{64}$/i);
     assert.ok(pending.approvalNonce.length > 20);
     assert.equal(pending.envelope.approvalNonce, pending.approvalNonce);
-    assert.ok(pending.envelope.fileBadges.length >= 5);
-    assert.ok(pending.envelope.diffPreview.length >= 5);
+    assert.ok(
+      pending.envelope.fileBadges.length >= minimumBadges,
+      `Expected at least ${minimumBadges} proposal file badges, got ${pending.envelope.fileBadges.length}: ${JSON.stringify(pending.fileOperations)}`,
+    );
+    assert.ok(
+      pending.envelope.diffPreview.length >= minimumDiffPreview,
+      `Expected at least ${minimumDiffPreview} diff preview lines, got ${pending.envelope.diffPreview.length}.`,
+    );
     if (expectEmptyBeforeApproval) {
       assert.deepEqual(await readdir(targetWorkspace), [],
         'Staging a browser proposal must not write workspace files.');
@@ -296,13 +306,22 @@ try {
   });
 
   const populatedStubs = {
-    'server.js': "const { executeFeature } = require('./services/featureService');\n",
-    'components/OrderForm.jsx': "const fields = ['title', 'description', 'status'];\nexport default function OrderForm() { return null; }\n",
-    'models/Order.js': '// TODO: define the model fields\n',
-    'routes/orders.js': '// TODO: register the route\n',
-    'controllers/orderController.js': '// TODO: handle requests\n',
-    'config/db.js': '// TODO: configure database access\n',
-    'app/orders/page.jsx': 'export default function OrderPage() { return null; }\n',
+    'server.js': "const express = require('express');\nconst app = express();\nmodule.exports = app;\n",
+    'components/OrderForm.jsx': "import React, { useState } from 'react';\nconst fields = ['title', 'description', 'status'];\nexport default function OrderForm() { return null; }\n",
+    'models/Order.js': "const mongoose = require('mongoose');\nmodule.exports = new mongoose.Schema({});\n",
+    'routes/orders.js': "const { missingHandler } = require('../controllers/orderController');\nmodule.exports = missingHandler;\n",
+    'controllers/orderController.js': "const { missingModel } = require('../models/Order');\nmodule.exports = { missingModel };\n",
+    'config/db.js': "const mongoose = require('mongoose');\nmodule.exports = mongoose;\n",
+    'app/orders/page.jsx': "import { MissingOrderForm } from '../../components/OrderForm.jsx';\nexport default function OrderPage() { return <MissingOrderForm />; }\n",
+    'pages/orders.js': 'export default function LegacyOrderPage() { return null; }\n',
+    'package.json': JSON.stringify({
+      name: 'legacy-order-workspace',
+      type: 'commonjs',
+      scripts: { start: 'node old-server.js', dev: 'node old-server.js', test: 'echo legacy' },
+      dependencies: { express: '^4.0.0', mongoose: '^8.0.0', react: '^18.0.0', 'react-dom': '^18.0.0' },
+    }, null, 2),
+    '.env.example': 'PORT=4300\nDATABASE_URL=mongodb://localhost/legacy\n',
+    'README.md': '# Legacy workspace\n\nKeep this existing documentation.\n',
     'utils/sharedUtils.js': 'module.exports = {};\n',
     'services/featureService.js': 'module.exports = {};\n',
   };
@@ -310,7 +329,12 @@ try {
     const target = path.join(populatedWorkspaceRoot, ...relativePath.split('/'));
     await mkdir(path.dirname(target), { recursive: true });
     await writeFile(target, source.replace(/\n/g, '\r\n'), 'utf8');
+    const autonomousTarget = path.join(autonomousPopulatedWorkspaceRoot, ...relativePath.split('/'));
+    await mkdir(path.dirname(autonomousTarget), { recursive: true });
+    await writeFile(autonomousTarget, source.replace(/\n/g, '\r\n'), 'utf8');
   }
+  const retainedEnvironment = await readFile(path.join(populatedWorkspaceRoot, '.env.example'), 'utf8');
+  const retainedReadme = await readFile(path.join(populatedWorkspaceRoot, 'README.md'), 'utf8');
   const populatedPrompt = `Build a complete full-stack order feature with frontend and backend integration.
 Create a POST endpoint /api/orders.
 Fields:
@@ -319,39 +343,82 @@ Fields:
 - totalPrice: number (auto calculated)
 - status: string (default=Pending)
 Create a Next.js App Router page and React form component with Tailwind CSS, dynamic item rows, and validation/success/error messages.
-Workspace resolution: UPDATE_AND_INTEGRATE.`;
+`;
+  const updatePrompt = `${populatedPrompt}\nWorkspace resolution: UPDATE_AND_INTEGRATE.`;
+  await attachSelectedWorkspace(autonomousPopulatedWorkspaceRoot);
+  const autonomousPopulatedSync = await readBrokerJson(await brokerFetch('/v1/synchronize', {}), 200);
+  const autonomousPopulatedProject = autonomousPopulatedSync.projects.find((project) => (
+    project.projectId !== autonomousProject.projectId
+      && project.projectId !== approvedProject.projectId
+      && project.projectId !== rejectedProject.projectId
+  ));
+  assert.ok(autonomousPopulatedProject, 'The broker should synchronize the populated autonomous workspace.');
+  const autonomousPopulatedLease = await acquireLease(autonomousPopulatedProject);
+  const autonomousPopulatedUpdate = await runDecision(autonomousPopulatedLease, 'autonomous', 'autonomous_auto_apply', {
+    userRequest: populatedPrompt,
+    targetWorkspace: autonomousPopulatedWorkspaceRoot,
+    expectEmptyBeforeApproval: false,
+  });
+  assert.equal(autonomousPopulatedUpdate.result.outcome, 'SUCCESS');
+  assert.equal(autonomousPopulatedUpdate.result.hermeticVerification?.passed, 9);
+  assert.equal(autonomousPopulatedUpdate.result.hermeticVerification?.total, 9);
+  await assert.rejects(stat(path.join(autonomousPopulatedWorkspaceRoot, 'pages', 'orders.js')), { code: 'ENOENT' });
+  assert.ok((await stat(path.join(autonomousPopulatedWorkspaceRoot, 'legacy-pages-orders.js.txt'))).isFile());
+  await brokerFetch('/v1/sessions/release', {
+    brokerSessionId: autonomousPopulatedLease.brokerSessionId,
+    sessionLeaseToken: autonomousPopulatedLease.sessionLeaseToken,
+  });
   await attachSelectedWorkspace(populatedWorkspaceRoot);
   const populatedSyncResponse = await brokerFetch('/v1/synchronize', {});
   const populatedSync = await readBrokerJson(populatedSyncResponse, 200);
-  const populatedProject = populatedSync.projects.find((project) => project.projectId !== autonomousProject.projectId);
+  const populatedProject = populatedSync.projects.find((project) => (
+    project.projectId !== autonomousProject.projectId
+      && project.projectId !== approvedProject.projectId
+      && project.projectId !== rejectedProject.projectId
+  ));
   assert.ok(populatedProject, 'The broker should synchronize the populated workspace.');
 
   const explicitLease = await acquireLease(populatedProject);
   const explicitUpdate = await runDecision(explicitLease, 'approve', 'inline_review', {
-    userRequest: populatedPrompt,
+    userRequest: updatePrompt,
     targetWorkspace: populatedWorkspaceRoot,
     expectEmptyBeforeApproval: false,
   });
   assert.equal(explicitUpdate.result.outcome, 'SUCCESS', `${JSON.stringify(explicitUpdate.result)}\n${childOutput}`);
   assert.equal(explicitUpdate.result.codeApplied, true, JSON.stringify(explicitUpdate.result));
   assert.equal(explicitUpdate.result.codeVerified, true, JSON.stringify(explicitUpdate.result));
+  assert.equal(explicitUpdate.result.hermeticVerification?.status, 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED', JSON.stringify(explicitUpdate.result.hermeticVerification));
+  assert.equal(explicitUpdate.result.hermeticVerification?.passed, 9);
+  assert.equal(explicitUpdate.result.hermeticVerification?.total, 9);
+  assert.ok(explicitUpdate.pending.fileOperations.some((file) => (
+    file.operation === 'rename' && file.sourcePath === 'pages/orders.js'
+  )), 'A conflicting Pages Router file must be preserved through an approved rename.');
+  await assert.rejects(stat(path.join(populatedWorkspaceRoot, 'pages', 'orders.js')), { code: 'ENOENT' });
+  assert.ok((await stat(path.join(populatedWorkspaceRoot, 'legacy-pages-orders.js.txt'))).isFile());
   assert.doesNotMatch(JSON.stringify(explicitUpdate), /Patch context does not match/);
   for (const relativePath of [
-    'package.json',
-    '.env.example',
-    'README.md',
     'config/db.js',
     'models/Order.js',
     'controllers/orderController.js',
     'routes/orders.js',
+    'server.js',
     'components/OrderForm.jsx',
     'app/orders/page.jsx',
+    'package.json',
   ]) {
-    assert.ok(explicitUpdate.result.filesModified.includes(relativePath), `Full-stack proposal must cover ${relativePath}.`);
+    assert.ok(
+      explicitUpdate.pending.fileOperations.some((file) => file.path === relativePath && file.operation === 'modify'),
+      `Full-stack proposal must stage a snapshot-bound modification for ${relativePath}.`,
+    );
+    assert.ok(explicitUpdate.result.filesModified.includes(relativePath), `Full-stack proposal must update ${relativePath}.`);
   }
+  assert.ok(!explicitUpdate.pending.fileOperations.some((file) => file.path === '.env.example'));
+  assert.ok(!explicitUpdate.result.filesModified.includes('.env.example'));
+  assert.equal(await readFile(path.join(populatedWorkspaceRoot, '.env.example'), 'utf8'), retainedEnvironment);
+  assert.equal(await readFile(path.join(populatedWorkspaceRoot, 'README.md'), 'utf8'), retainedReadme);
   assert.ok(!explicitUpdate.result.filesModified.includes('utils/sharedUtils.js'));
   assert.ok(!explicitUpdate.result.filesModified.includes('services/featureService.js'));
-  for (const relativePath of Object.keys(populatedStubs)) {
+  for (const relativePath of Object.keys(populatedStubs).filter((file) => file !== 'pages/orders.js')) {
     const contents = await readFile(path.join(populatedWorkspaceRoot, ...relativePath.split('/')), 'utf8');
     assert.doesNotMatch(contents, /\r(?!\n)/, `${relativePath} must retain valid newline encoding after apply.`);
   }
@@ -370,12 +437,41 @@ Workspace resolution: UPDATE_AND_INTEGRATE.`;
   assert.equal(repeatedUpdate.result.outcome, 'SUCCESS', `${JSON.stringify(repeatedUpdate.result)}\n${childOutput}`);
   assert.equal(repeatedUpdate.result.codeApplied, false, JSON.stringify(repeatedUpdate.result));
   assert.equal(repeatedUpdate.result.codeVerified, true, JSON.stringify(repeatedUpdate.result));
+  assert.equal(repeatedUpdate.result.hermeticVerification?.status, 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED');
+  assert.equal(repeatedUpdate.result.hermeticVerification?.passed, 9);
+  assert.equal(repeatedUpdate.result.hermeticVerification?.total, 9);
   assert.equal(repeatedUpdate.result.noChangesRequired, true, JSON.stringify(repeatedUpdate.result));
   assert.doesNotMatch(JSON.stringify(repeatedUpdate), /Patch context does not match/);
   await brokerFetch('/v1/sessions/release', {
     brokerSessionId: repeatLease.brokerSessionId,
     sessionLeaseToken: repeatLease.sessionLeaseToken,
   });
+
+  for (const resolution of ['KEEP_AND_SCAFFOLD', 'REPLACE_TARGETS']) {
+    const resolutionLease = await acquireLease(populatedProject);
+    const result = await runDecision(resolutionLease, 'approve', 'inline_review', {
+      userRequest: `${populatedPrompt}\nWorkspace resolution: ${resolution}.`,
+      targetWorkspace: populatedWorkspaceRoot,
+      expectEmptyBeforeApproval: false,
+      minimumBadges: 1,
+      minimumDiffPreview: 1,
+    });
+    assert.equal(result.result.outcome, 'SUCCESS', `${resolution}: ${JSON.stringify(result.result)}\n${childOutput}`);
+    assert.equal(result.result.codeApplied, true);
+    assert.equal(result.result.codeVerified, true);
+    assert.equal(result.result.hermeticVerification?.passed, 9);
+    assert.equal(result.result.hermeticVerification?.total, 9);
+    assert.equal(await readFile(path.join(populatedWorkspaceRoot, '.env.example'), 'utf8'), retainedEnvironment);
+    if (resolution === 'KEEP_AND_SCAFFOLD') {
+      assert.ok(result.pending.fileOperations.some((file) => file.path === 'generated/order/server.js'));
+    } else {
+      assert.ok(result.pending.fileOperations.some((file) => file.path === 'server.js' && file.operation === 'modify'));
+    }
+    await brokerFetch('/v1/sessions/release', {
+      brokerSessionId: resolutionLease.brokerSessionId,
+      sessionLeaseToken: resolutionLease.sessionLeaseToken,
+    });
+  }
   console.log('Populated Windows-style stub workspace passed explicit approval and repeated autonomous workflows through /v1/workflows.');
   console.log('Standalone broker host integration passed (production developerAgent proposal, inline reject/approve, materialization, and verification; backend policy/registry endpoints are isolated fixtures).');
 } finally {
