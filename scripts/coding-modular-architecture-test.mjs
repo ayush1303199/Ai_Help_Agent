@@ -11,7 +11,9 @@ import {
   isGreenfieldWorkspace,
   isFullStackBuildRequest,
   discoverProjectConventions,
+  isProjectRuntimeTestRequest,
   deriveModularPlan,
+  deriveExistingProjectTestPlan,
   runHermeticRegressionLoop,
   runHermeticRegressionLoopWithRuntime,
   repairHermeticCandidate,
@@ -181,7 +183,7 @@ try {
     },
   });
   assert.notEqual(populatedCreationResult.outcome, 'INVESTIGATION_INCOMPLETE');
-  assert.equal(populatedCreationResult.outcome, 'SUCCESS');
+  assert.equal(populatedCreationResult.outcome, 'SUCCESS', JSON.stringify(populatedCreationResult.hermeticVerification));
   assert.equal(populatedCreationResult.codeApplied, true);
   assert.equal(populatedCreationApprovalCount, 1, 'The populated workspace creation must reach the approved proposal flow.');
   assert.ok(populatedCreationResult.filesModified.length > 0, 'The creation request must apply an actionable proposal.');
@@ -369,9 +371,19 @@ Return status codes 201, 400, and 500.`,
   assert.equal(runtimeCandidate.passed, 9, JSON.stringify(runtimeCandidate.gates.filter((gate) => !gate.passed)));
   assert.equal(runtimeCandidate.total, 9);
   assert.equal(runtimeCandidate.gates.at(-1).id, 'CANDIDATE_RUNTIME_BEHAVIOR');
-  assert.equal(runtimeCandidate.gates.at(-1).probes.length, 5);
+  assert.equal(runtimeCandidate.gates.at(-1).probes.length, 6);
   assert.ok(runtimeCandidate.gates.at(-1).probes.every((probe) => probe.applicable && probe.passed));
+  assert.equal(runtimeCandidate.gates.at(-1).executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  assert.equal(runtimeCandidate.gates.at(-1).host, '127.0.0.1');
+  assert.equal(runtimeCandidate.gates.at(-1).behavioralApiProbes.length, 5);
+  assert.equal(runtimeCandidate.gates.at(-1).behavioralTestSuite.status, 'EXECUTED & PASSED');
+  assert.ok(runtimeCandidate.gates.at(-1).behavioralTestSuite.assertionCount > 0);
+  assert.equal(runtimeCandidate.gates.at(-1).collectionProbe.method, 'GET');
+  assert.equal(runtimeCandidate.gates.at(-1).collectionProbe.passed, true);
   assert.equal(runtimeCandidate.gates.at(-1).uiPreview.passed, true);
+  const runtimeResource = hermeticPlan.routeContracts[0].path.split('/').filter(Boolean).at(-1);
+  assert.deepEqual(runtimeCandidate.gates.at(-1).uiPreview.paths.map((probe) => probe.path), ['/', `/${runtimeResource}`]);
+  assert.ok(runtimeCandidate.gates.at(-1).uiPreview.paths.every((probe) => probe.passed));
   const runtimeDefectPlan = {
     ...hermeticPlan,
     modulesToCreate: hermeticPlan.modulesToCreate.map((module) => ({ ...module })),
@@ -621,7 +633,12 @@ Create a form and page.`,
     'package.json': JSON.stringify({
       name: 'legacy-catalog',
       type: 'commonjs',
-      scripts: { start: 'node old-server.js', dev: 'node old-server.js', test: 'echo legacy' },
+      scripts: {
+        start: 'node old-server.js',
+        dev: 'node old-server.js',
+        test: 'echo legacy',
+        'test:existing': 'node preserved-suite.js',
+      },
       dependencies: { express: '^4.0.0', mongoose: '^8.0.0', react: '^18.0.0', 'react-dom': '^18.0.0' },
     }, null, 2),
     '.env.example': legacyEnvironmentContents,
@@ -647,9 +664,26 @@ Workspace resolution: UPDATE_AND_INTEGRATE.`;
   const legacyUpgradePlan = await deriveModularPlan(legacyUpgradeDir, { userRequest: legacyUpgradePrompt });
   assert.ok(legacyUpgradePlan.modulesToCreate.length >= 9);
   assert.ok(legacyUpgradePlan.modulesToCreate
-    .filter((module) => module.path !== '.env.example')
+    .filter((module) => module.path !== '.env.example' && module.responsibility !== 'TEST_SUITE')
     .every((module) => module.operation === 'modify'),
   'Each existing full-stack target must be staged as a modification.');
+  const generatedTestModule = legacyUpgradePlan.modulesToCreate.find((module) => module.responsibility === 'TEST_SUITE');
+  assert.equal(generatedTestModule.path, 'tests/catalog.test.js');
+  assert.equal(generatedTestModule.operation, 'create');
+  assert.match(generatedTestModule.content, /node:http/);
+  assert.equal(
+    JSON.parse(legacyUpgradePlan.modulesToCreate.find((module) => module.path === 'package.json').content).scripts.test,
+    'node tests/catalog.test.js',
+  );
+  const legacyGeneratedScripts = JSON.parse(
+    legacyUpgradePlan.modulesToCreate.find((module) => module.path === 'package.json').content,
+  ).scripts;
+  assert.equal(legacyGeneratedScripts['test:existing'], 'node preserved-suite.js');
+  assert.equal(legacyGeneratedScripts['test:existing-1'], 'echo legacy');
+  assert.match(
+    legacyUpgradePlan.modulesToCreate.find((module) => module.path === 'README.md').content,
+    /Run `npm test` to execute the zero-dependency behavioral suite/,
+  );
   assert.equal(
     legacyUpgradePlan.modulesToCreate.find((module) => module.path === '.env.example').operation,
     'reuse',
@@ -686,6 +720,7 @@ Workspace resolution: UPDATE_AND_INTEGRATE.`;
   assert.ok(!legacyUpgradePatch.filesList.some((file) => file.path === '.env.example'));
   for (const module of legacyUpgradePlan.modulesToCreate.filter((candidate) => candidate.operation !== 'reuse')) {
     const target = path.join(legacyUpgradeDir, ...module.path.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, module.content, 'utf8');
   }
   assert.equal(await fs.readFile(path.join(legacyUpgradeDir, '.env.example'), 'utf8'), retainedLegacyEnvironment);
@@ -693,6 +728,90 @@ Workspace resolution: UPDATE_AND_INTEGRATE.`;
   assert.equal(legacyDiskVerification.status, 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED', JSON.stringify(legacyDiskVerification));
   assert.equal(legacyDiskVerification.passed, 9, JSON.stringify(legacyDiskVerification));
   assert.equal(legacyDiskVerification.total, 9);
+  const generatedTestProcess = spawn(process.execPath, ['tests/catalog.test.js'], { cwd: legacyUpgradeDir, stdio: ['ignore', 'pipe', 'pipe'] });
+  let generatedTestStdout = '';
+  let generatedTestStderr = '';
+  generatedTestProcess.stdout.setEncoding('utf8');
+  generatedTestProcess.stderr.setEncoding('utf8');
+  generatedTestProcess.stdout.on('data', (chunk) => { generatedTestStdout += chunk; });
+  generatedTestProcess.stderr.on('data', (chunk) => { generatedTestStderr += chunk; });
+  const generatedTestExitCode = await new Promise((resolve, reject) => {
+    generatedTestProcess.once('error', reject);
+    generatedTestProcess.once('close', resolve);
+  });
+  assert.equal(generatedTestExitCode, 0, generatedTestStderr);
+  assert.match(generatedTestStdout, /Loopback UI, API behavior, persistence, and controller error boundary passed/);
+  for (const prompt of [
+    'test the project',
+    'test project',
+    'test my project',
+    'run tests',
+    'run the tests',
+    'test it',
+    'test app',
+    'verify the project',
+    'verify project',
+    'check if the project works',
+    'is the project working',
+    'test server.js',
+    'test api',
+    'test the my project is wroking now',
+    'st the my project is wroking now',
+    'est the project',
+  ]) {
+    assert.equal(isProjectRuntimeTestRequest(prompt), true, `${prompt} should enter the runtime test flow.`);
+  }
+  for (const prompt of [
+    'Explain how to test the project',
+    'Investigate how project test selection works',
+  ]) {
+    assert.equal(isProjectRuntimeTestRequest(prompt), false, `${prompt} must remain a normal inquiry.`);
+  }
+  const runtimeVerificationFixture = path.join(testRoot, 'existing-runtime-test-upgrade');
+  await fs.cp(legacyUpgradeDir, runtimeVerificationFixture, { recursive: true });
+  await fs.rm(path.join(runtimeVerificationFixture, 'tests'), { recursive: true, force: true });
+  await fs.mkdir(path.join(runtimeVerificationFixture, 'pages'), { recursive: true });
+  await fs.writeFile(
+    path.join(runtimeVerificationFixture, 'pages', 'catalog.js'),
+    "export default function LegacyCatalogPage() { return null; }\n",
+    'utf8',
+  );
+  const oldPackagePath = path.join(runtimeVerificationFixture, 'package.json');
+  const oldPackage = {
+    name: 'legacy-order-app',
+    version: '1.0.0',
+    type: 'commonjs',
+    scripts: {
+      start: 'node server.js',
+      dev: 'node server.js',
+      test: 'node --check server.js',
+    },
+  };
+  const legacyPackageContents = `${JSON.stringify(oldPackage, null, 2)}\n`;
+  assert.ok(Buffer.byteLength(legacyPackageContents) <= 278);
+  await fs.writeFile(oldPackagePath, legacyPackageContents.padEnd(278, ' '), 'utf8');
+  assert.equal((await fs.stat(oldPackagePath)).size, 278, 'The V18-style package manifest fixture must be exactly 278 bytes.');
+  const existingRuntimePlan = await deriveExistingProjectTestPlan(runtimeVerificationFixture);
+  assert.ok(existingRuntimePlan?.isProjectRuntimeTest);
+  assert.ok(
+    !existingRuntimePlan.modulesToCreate.some((module) => module.operation === 'rename'),
+    'A test-only request must not propose route migration or mutate an unrelated legacy Pages Router file.',
+  );
+  const runtimeSuiteModule = existingRuntimePlan.modulesToCreate.find((module) => module.responsibility === 'TEST_SUITE');
+  assert.equal(runtimeSuiteModule.path, 'tests/catalog.test.js');
+  assert.equal(runtimeSuiteModule.operation, 'create');
+  const runtimePackageModule = existingRuntimePlan.modulesToCreate.find((module) => module.path === 'package.json');
+  assert.equal(JSON.parse(runtimePackageModule.content).scripts.test, 'node tests/catalog.test.js');
+  assert.equal(JSON.parse(runtimePackageModule.content).scripts['test:existing'], 'node --check server.js');
+  const existingRuntimeVerification = await runHermeticRegressionLoopWithRuntime(existingRuntimePlan, { root: runtimeVerificationFixture });
+  assert.equal(existingRuntimeVerification.passed, 9, JSON.stringify(existingRuntimeVerification));
+  assert.equal(existingRuntimeVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  const existingRuntimePatch = await synthesizeMultiFilePatch(runtimeVerificationFixture, existingRuntimePlan);
+  assert.deepEqual(
+    existingRuntimePatch.filesList.map((file) => file.path).sort(),
+    ['package.json', 'tests/catalog.test.js'],
+  );
+  assert.ok((await fs.stat(path.join(runtimeVerificationFixture, 'pages', 'catalog.js'))).isFile());
   const repeatedLegacyPlan = await deriveModularPlan(legacyUpgradeDir, { userRequest: legacyUpgradePrompt });
   const repeatedLegacyVerification = await runHermeticRegressionLoopWithRuntime(repeatedLegacyPlan, { root: legacyUpgradeDir });
   assert.equal(repeatedLegacyVerification.status, 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED');
@@ -704,7 +823,329 @@ Workspace resolution: UPDATE_AND_INTEGRATE.`;
     'A repeated plan must not emit a package patch for terminal-newline-only differences.',
   );
   assert.ok(!(await fs.readdir(legacyUpgradeDir)).includes('node_modules'));
+  const runtimeModeSessionId = 'session-runtime-test-mode-override';
+  createSession(runtimeModeSessionId, ownerId);
+  await developerFiles.attachProject(legacyUpgradeDir, ownerId);
+  const runtimeModeOverride = await executeAutonomousCodingWorkflow({
+    userRequest: 'test the project',
+    root: legacyUpgradeDir,
+    scope: '.',
+    sessionId: runtimeModeSessionId,
+    ownerWebContentsId: ownerId,
+    continuationToken: 'stale-investigation-continuation',
+    requestApproval: async () => {
+      throw new Error('An up-to-date runtime-test request must not ask for write approval.');
+    },
+    tools: { operatingMode: 'INVESTIGATE' },
+  });
+  assert.equal(runtimeModeOverride.outcome, 'SUCCESS', JSON.stringify(runtimeModeOverride));
+  assert.equal(runtimeModeOverride.hermeticVerification?.passed, 9);
+  assert.equal(runtimeModeOverride.executionVerificationReceipt?.status, 'PASSED');
+  assert.equal(runtimeModeOverride.codeApplied, false);
   console.log('[TEST 4I PASSED] Legacy populated workspaces self-heal stale backend/frontend modules, preserve .env.example, and pass nine on-disk gates on repeat.');
+
+  const orderRuntimeFixture = path.join(testRoot, 'v17-order-runtime-upgrade');
+  await fs.mkdir(orderRuntimeFixture, { recursive: true });
+  const orderSeedRoot = path.join(testRoot, 'order-plan-source');
+  await fs.mkdir(orderSeedRoot, { recursive: true });
+  const orderSeedPlan = await deriveModularPlan(orderSeedRoot, {
+    userRequest: `Build a complete full-stack order feature with a React form.
+Create a POST endpoint /api/orders.
+Fields:
+- customerName: string (required)
+- items: [{ itemName: string, quantity: number, price: number }]
+- totalPrice: number (calculated)
+- status: string (default=Pending)
+- createdAt: string
+Create an App Router page and form component with validation.`,
+  });
+  for (const module of orderSeedPlan.modulesToCreate) {
+    if (module.responsibility === 'TEST_SUITE' || module.operation === 'rename') continue;
+    const target = path.join(orderRuntimeFixture, ...module.path.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, module.content, 'utf8');
+  }
+  const orderManifest = {
+    name: 'legacy-order-app',
+    version: '1.0.0',
+    type: 'commonjs',
+    scripts: {
+      start: 'node server.js',
+      dev: 'node server.js',
+      test: 'node --check server.js',
+    },
+  };
+  const orderManifestContents = `${JSON.stringify(orderManifest, null, 2)}\n`;
+  assert.ok(Buffer.byteLength(orderManifestContents) <= 278);
+  await fs.writeFile(
+    path.join(orderRuntimeFixture, 'package.json'),
+    orderManifestContents.padEnd(278, ' '),
+    'utf8',
+  );
+  await fs.rm(path.join(orderRuntimeFixture, 'tests'), { recursive: true, force: true });
+  const orderModelPath = path.join(orderRuntimeFixture, 'models', 'Order.js');
+  const staleOrderModel = await fs.readFile(orderModelPath, 'utf8');
+  assert.match(staleOrderModel, /return records\.map\(\(record\) => \(\{ \.\.\.record \}\)\);/);
+  await fs.writeFile(
+    orderModelPath,
+    staleOrderModel.replace('return records.map((record) => ({ ...record }));', 'return [];'),
+    'utf8',
+  );
+  const diskInferredOrderPlan = await deriveExistingProjectTestPlan(orderRuntimeFixture);
+  assert.ok(diskInferredOrderPlan?.isProjectRuntimeTest, 'A fresh test-only prompt must derive its plan from disk.');
+  assert.equal(diskInferredOrderPlan.routeSchema.entity, 'Order');
+  assert.equal(diskInferredOrderPlan.routeContracts[0].path, '/api/orders');
+  assert.deepEqual(
+    diskInferredOrderPlan.routeSchema.fields.map((field) => field.name),
+    ['customerName', 'items', 'totalPrice', 'status', 'createdAt'],
+  );
+  assert.deepEqual(
+    diskInferredOrderPlan.routeSchema.fields.find((field) => field.name === 'items').items.map((field) => field.name),
+    ['itemName', 'quantity', 'price'],
+  );
+  const scalarOrderInferenceFixture = path.join(testRoot, 'scalar-order-with-nested-form');
+  await fs.cp(orderRuntimeFixture, scalarOrderInferenceFixture, { recursive: true });
+  const scalarOrderFields = diskInferredOrderPlan.routeSchema.fields.filter((field) => field.type !== 'array');
+  const scalarOrderModel = `'use strict';\n\nconst fields = ${JSON.stringify(scalarOrderFields, null, 2)};\nconst records = [];\nlet nextId = 1;\nfunction validate(payload) {\n  const errors = [];\n  for (const field of fields) {\n    if (field.required && (payload[field.name] === undefined || payload[field.name] === null || payload[field.name] === '')) errors.push(field.name + ' is required.');\n  }\n  return { valid: errors.length === 0, errors };\n}\nfunction applyDefaults(payload) { return { ...payload }; }\nfunction create(payload) { const value = { ...applyDefaults(payload), id: String(nextId++) }; records.push(value); return { ...value }; }\nfunction list() { return records.map((record) => ({ ...record })); }\nmodule.exports = { fields, validate, applyDefaults, create, list };\n`;
+  await fs.writeFile(path.join(scalarOrderInferenceFixture, 'models', 'Order.js'), scalarOrderModel, 'utf8');
+  const inferredArrayOrderPlan = await deriveExistingProjectTestPlan(scalarOrderInferenceFixture);
+  assert.ok(inferredArrayOrderPlan?.isProjectRuntimeTest);
+  const inferredItemsField = inferredArrayOrderPlan.routeSchema.fields.find((field) => field.name === 'items');
+  assert.equal(inferredItemsField?.type, 'array');
+  assert.deepEqual(
+    inferredItemsField.items.map((field) => [field.name, field.type]),
+    [['itemName', 'string'], ['quantity', 'number'], ['price', 'number']],
+  );
+  const inferredArrayOrderVerification = await runHermeticRegressionLoopWithRuntime(
+    inferredArrayOrderPlan,
+    { root: scalarOrderInferenceFixture },
+  );
+  assert.equal(inferredArrayOrderVerification.passed, 9, JSON.stringify(inferredArrayOrderVerification));
+  assert.equal(inferredArrayOrderVerification.runtimeVerification.behavioralApiProbes.length, 5);
+  assert.ok(inferredArrayOrderVerification.runtimeVerification.behavioralApiProbes.every(
+    (probe) => probe.applicable && probe.passed,
+  ), JSON.stringify(inferredArrayOrderVerification.runtimeVerification.behavioralApiProbes));
+  const upgradeProgress = [];
+  const diskInferredOrderVerification = await runHermeticRegressionLoopWithRuntime(
+    diskInferredOrderPlan,
+    { root: orderRuntimeFixture, onProgress: (event) => upgradeProgress.push(event.message) },
+  );
+  assert.equal(diskInferredOrderVerification.status, 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED', JSON.stringify(diskInferredOrderVerification));
+  assert.equal(diskInferredOrderVerification.passed, 9);
+  const orderWorkspaceAudit = diskInferredOrderVerification.workspaceAudit;
+  assert.equal(orderWorkspaceAudit.dependencies.nodeModulesPresent, false);
+  assert.equal(orderWorkspaceAudit.environment.envExamplePresent, true);
+  assert.equal(orderWorkspaceAudit.environment.envFilePresent, false);
+  assert.match(orderWorkspaceAudit.findings.map((finding) => finding.message).join('\n'), /Missing node_modules directory/);
+  assert.match(orderWorkspaceAudit.findings.map((finding) => finding.message).join('\n'), /Backend & Test Runtime .* WILL RUN WITHOUT node_modules/);
+  assert.match(orderWorkspaceAudit.findings.map((finding) => finding.message).join('\n'), /standalone Next\.js\/React compilation is unavailable/);
+  assert.match(orderWorkspaceAudit.findings.map((finding) => finding.message).join('\n'), /Missing \.env file/);
+  assert.ok(upgradeProgress.some((message) => (
+    message.includes('CANDIDATE_RUNTIME_BEHAVIOR @ models/Order.js')
+      && message.includes('persisted-collection-list')
+  )), 'The V17 fixture should reproduce the failing persisted-list Gate 9 probe before self-repair.');
+  assert.ok(diskInferredOrderVerification.regressionLoop.repairs.some((repair) => repair.includes('models/Order.js')));
+  const orderUpgradePatch = await synthesizeMultiFilePatch(orderRuntimeFixture, diskInferredOrderPlan);
+  assert.ok(orderUpgradePatch.filesList.some((file) => file.path === 'models/Order.js' && file.operation === 'modify'));
+  assert.ok(orderUpgradePatch.filesList.some((file) => file.path === 'package.json' && file.operation === 'modify'));
+  assert.ok(orderUpgradePatch.filesList.some((file) => file.path === 'tests/order.test.js' && file.operation === 'create'));
+  for (const module of diskInferredOrderPlan.modulesToCreate.filter((candidate) => (
+    candidate.operation === 'create' || candidate.operation === 'modify'
+  ))) {
+    const target = path.join(orderRuntimeFixture, ...module.path.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, module.content, 'utf8');
+  }
+  const repeatedDiskInferredOrderPlan = await deriveExistingProjectTestPlan(orderRuntimeFixture);
+  assert.ok(repeatedDiskInferredOrderPlan?.isProjectRuntimeTest);
+  const repeatedDiskInferredOrderVerification = await runHermeticRegressionLoopWithRuntime(
+    repeatedDiskInferredOrderPlan,
+    { root: orderRuntimeFixture },
+  );
+  assert.equal(repeatedDiskInferredOrderVerification.passed, 9, JSON.stringify(repeatedDiskInferredOrderVerification));
+  assert.ok(!repeatedDiskInferredOrderVerification.workspaceAudit.findings.some((finding) => /Stale inline UI contract/.test(finding.message)));
+  assert.equal(repeatedDiskInferredOrderVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  assert.equal(repeatedDiskInferredOrderVerification.runtimeVerification.behavioralTestSuite.status, 'EXECUTED & PASSED');
+  assert.equal(repeatedDiskInferredOrderVerification.runtimeVerification.probes.filter((probe) => probe.passed).length, 6);
+  const repeatedOrderPatch = await synthesizeMultiFilePatch(orderRuntimeFixture, repeatedDiskInferredOrderPlan);
+  assert.deepEqual(repeatedOrderPatch.filesList, [], 'A second project-test run must verify live behavior without proposing changes.');
+
+  const workspaceAuditHelloFixture = path.join(testRoot, 'workspace-audit-hello');
+  await fs.cp(path.join(process.cwd(), 'scripts', 'fixtures', 'hello-runtime-workspace'), workspaceAuditHelloFixture, { recursive: true });
+  const workspaceAuditHelloPlan = await deriveExistingProjectTestPlan(workspaceAuditHelloFixture);
+  const workspaceAuditHelloVerification = await runHermeticRegressionLoopWithRuntime(
+    workspaceAuditHelloPlan,
+    { root: workspaceAuditHelloFixture },
+  );
+  assert.equal(workspaceAuditHelloVerification.passed, 9, JSON.stringify(workspaceAuditHelloVerification.gates.filter((gate) => !gate.passed)));
+  assert.ok(workspaceAuditHelloVerification.workspaceAudit.bugs.some((bug) => (
+    bug.path === 'server.js' && /embedded previewHtml/i.test(bug.description)
+  )), JSON.stringify(workspaceAuditHelloVerification.workspaceAudit));
+  assert.ok(workspaceAuditHelloVerification.workspaceAudit.syncPlan.some((item) => item.path === 'server.js' && item.action === 'REPAIR'));
+  for (const expectedSyncPath of ['routes/orders.js', 'app/orders/page.jsx', 'config/db.js']) {
+    assert.ok(workspaceAuditHelloVerification.workspaceAudit.syncPlan.some((item) => item.path === expectedSyncPath));
+  }
+  assert.ok(workspaceAuditHelloPlan.modulesToCreate.some((module) => module.path === 'server.js' && module.operation === 'modify'));
+
+  const missingDependencyFixture = path.join(testRoot, 'workspace-audit-missing-dependency');
+  await fs.cp(orderRuntimeFixture, missingDependencyFixture, { recursive: true });
+  const missingDependencyManifestPath = path.join(missingDependencyFixture, 'package.json');
+  const missingDependencyManifest = JSON.parse(await fs.readFile(missingDependencyManifestPath, 'utf8'));
+  missingDependencyManifest.dependencies = { ...(missingDependencyManifest.dependencies || {}), express: '^4.19.2' };
+  await fs.writeFile(missingDependencyManifestPath, JSON.stringify(missingDependencyManifest, null, 2), 'utf8');
+  await fs.rm(path.join(missingDependencyFixture, 'node_modules'), { recursive: true, force: true });
+  const missingDependencyPlan = await deriveExistingProjectTestPlan(missingDependencyFixture);
+  const missingDependencyVerification = await runHermeticRegressionLoopWithRuntime(
+    missingDependencyPlan,
+    { root: missingDependencyFixture },
+  );
+  assert.ok(missingDependencyVerification.workspaceAudit.findings.some((finding) => (
+    finding.message.includes('[WARN / ENV_ISSUE]')
+      && finding.message.includes('express')
+      && finding.message.includes('Missing node_modules directory')
+  )), JSON.stringify(missingDependencyVerification.workspaceAudit));
+
+  const orderTestPath = path.join(orderRuntimeFixture, 'tests', 'order.test.js');
+  const generatedOrderTest = await fs.readFile(orderTestPath, 'utf8');
+  assert.match(generatedOrderTest, /console\.log\('Loopback UI, API behavior, persistence, and controller error boundary passed\.'\);/);
+  assert.doesNotMatch(generatedOrderTest, /\[REDACTED\]/);
+  const redactedOrderTest = generatedOrderTest.replace(
+    "console.log('Loopback UI, API behavior, persistence, and controller error boundary passed.');",
+    'console.log([REDACTED] UI, API behavior, persistence, and controller error boundary.);',
+  );
+  assert.notEqual(redactedOrderTest, generatedOrderTest);
+  await fs.writeFile(orderTestPath, redactedOrderTest, 'utf8');
+  const corruptedOrderPlan = await deriveExistingProjectTestPlan(orderRuntimeFixture);
+  const repairedOrderVerification = await runHermeticRegressionLoopWithRuntime(
+    corruptedOrderPlan,
+    { root: orderRuntimeFixture },
+  );
+  assert.equal(repairedOrderVerification.passed, 9, JSON.stringify(repairedOrderVerification));
+  const repairedOrderPatch = await synthesizeMultiFilePatch(orderRuntimeFixture, corruptedOrderPlan);
+  assert.ok(repairedOrderPatch.filesList.some((file) => file.path === 'tests/order.test.js' && file.operation === 'modify'));
+  for (const module of corruptedOrderPlan.modulesToCreate.filter((candidate) => (
+    candidate.operation === 'create' || candidate.operation === 'modify'
+  ))) {
+    const target = path.join(orderRuntimeFixture, ...module.path.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, module.content, 'utf8');
+  }
+  const repairedTestPlan = await deriveExistingProjectTestPlan(orderRuntimeFixture);
+  const repairedTestVerification = await runHermeticRegressionLoopWithRuntime(
+    repairedTestPlan,
+    { root: orderRuntimeFixture },
+  );
+  assert.equal(repairedTestVerification.passed, 9, JSON.stringify(repairedTestVerification));
+  const repairedTestNoOp = await synthesizeMultiFilePatch(orderRuntimeFixture, repairedTestPlan);
+  assert.deepEqual(repairedTestNoOp.filesList, [], 'A repaired test suite must pass the next zero-operation runtime verification.');
+  console.log('[TEST 4J PASSED] Fresh test-only plans infer Order from disk, self-heal the failed list probe, and pass a no-op repeat with live loopback verification.');
+
+  const staleRootServerDir = path.join(testRoot, 'stale-root-server');
+  await fs.mkdir(staleRootServerDir, { recursive: true });
+  const staleRootFiles = {
+    ...legacyWorkspaceFiles,
+    'package.json': JSON.stringify({
+      name: 'stale-root-server',
+      type: 'commonjs',
+      scripts: { start: 'node generated/catalog/server.js', dev: 'node generated/catalog/server.js' },
+      dependencies: { react: '^18.0.0', 'react-dom': '^18.0.0' },
+    }, null, 2),
+  };
+  for (const [relativePath, contents] of Object.entries(staleRootFiles)) {
+    const target = path.join(staleRootServerDir, ...relativePath.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, contents, 'utf8');
+  }
+  const staleRootPlan = await deriveModularPlan(staleRootServerDir, { userRequest: legacyUpgradePrompt });
+  assert.equal(staleRootPlan.workspaceResolution, 'UPDATE_AND_INTEGRATE');
+  assert.equal(staleRootPlan.workspaceDoctor?.rootServerOutdated, true);
+  assert.ok(staleRootPlan.modulesToCreate.some((module) => module.path === 'server.js' && module.operation === 'modify'));
+  assert.ok(staleRootPlan.modulesToCreate.some((module) => module.path === 'package.json' && module.operation === 'modify'));
+
+  const splitBrainDir = path.join(testRoot, 'split-brain-workspace');
+  await fs.mkdir(splitBrainDir, { recursive: true });
+  const splitBrainFiles = {
+    ...legacyWorkspaceFiles,
+    'package.json': JSON.stringify({
+      name: 'split-brain-workspace',
+      type: 'commonjs',
+      scripts: { start: 'node generated/catalog/server.js', dev: 'node generated/catalog/server.js' },
+      dependencies: { react: '^18.0.0', 'react-dom': '^18.0.0' },
+    }, null, 2),
+  };
+  for (const [relativePath, contents] of Object.entries(splitBrainFiles)) {
+    const target = path.join(splitBrainDir, ...relativePath.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, contents, 'utf8');
+  }
+  await fs.mkdir(path.join(splitBrainDir, 'generated', 'catalog'), { recursive: true });
+  await fs.writeFile(path.join(splitBrainDir, 'generated', 'catalog', 'server.js'), 'module.exports = {};\n', 'utf8');
+  await fs.mkdir(path.join(splitBrainDir, 'pages'), { recursive: true });
+  const splitBrainPrompt = `Build a complete full-stack catalog feature with a React form.
+Create a POST endpoint /api/catalog.
+Fields:
+- title: string (required)
+- items: [{ label: string, quantity: number, price: number }]
+- total: number (calculated)
+- status: string (default=Pending)
+Create a page and form with validation and status messages.`;
+  const splitBrainPlan = await deriveModularPlan(splitBrainDir, { userRequest: splitBrainPrompt });
+  assert.equal(splitBrainPlan.workspaceResolution, 'UPDATE_AND_INTEGRATE');
+  assert.equal(splitBrainPlan.workspaceDoctor?.staleGeneratedShadowDetected, true);
+  for (const targetPath of [
+    'config/db.js', 'models/Catalog.js', 'controllers/catalogController.js',
+    'routes/catalog.js', 'server.js', 'components/CatalogForm.jsx',
+    'app/catalog/page.jsx', 'package.json',
+  ]) {
+    assert.ok(splitBrainPlan.modulesToCreate.some((module) => module.path === targetPath && module.operation === 'modify'),
+      `Split-brain plan must repair canonical root target ${targetPath}.`);
+  }
+  const splitBrainPackage = JSON.parse(splitBrainPlan.modulesToCreate.find((module) => module.path === 'package.json').content);
+  assert.equal(splitBrainPackage.scripts.start, 'node server.js');
+  const splitBrainDiskCheck = await verifyHermeticEngineeringGatesOnDisk(splitBrainDir, splitBrainPlan);
+  assert.ok(splitBrainDiskCheck.passed < splitBrainDiskCheck.total,
+    'The disk-first audit must reject the stale root entrypoint before a repair is applied.');
+  assert.ok(splitBrainDiskCheck.gates.some((gate) => gate.id === 'SYNTAX_AND_AST' && !gate.passed),
+    'Disk verification must reject the missing generated behavioral suite before claiming success.');
+  const splitBrainSessionId = 'session-v17-split-brain';
+  createSession(splitBrainSessionId, ownerId);
+  let splitBrainProposalCount = 0;
+  const splitBrainResult = await executeAutonomousCodingWorkflow({
+    userRequest: splitBrainPrompt,
+    root: splitBrainDir,
+    scope: '.',
+    sessionId: splitBrainSessionId,
+    ownerWebContentsId: ownerId,
+    requestApproval: async () => {
+      splitBrainProposalCount += 1;
+      return true;
+    },
+  });
+  assert.equal(splitBrainResult.outcome, 'SUCCESS', JSON.stringify(splitBrainResult));
+  assert.equal(splitBrainResult.codeApplied, true);
+  assert.equal(splitBrainResult.codeVerified, true);
+  assert.equal(splitBrainProposalCount, 1, 'The damaged root layout must produce an approved modification proposal.');
+  assert.equal(splitBrainResult.hermeticVerification?.passed, 9, JSON.stringify(splitBrainResult.hermeticVerification));
+  assert.equal(splitBrainResult.hermeticVerification?.total, 9);
+  assert.equal(splitBrainResult.executionVerificationReceipt?.gateCount, 9);
+  assert.match(splitBrainResult.message, /verified across 9\/9 hermetic gates/);
+  assert.match(splitBrainResult.message, /POST \/api\/catalog -> 201 Created — PASS/);
+  assert.match(splitBrainResult.message, /GET \/api\/catalog -> 200 OK — PASS/);
+  assert.match(splitBrainResult.message, /GET \/catalog interactive form -> 200 — PASS/);
+  assert.match(splitBrainResult.message, /npm start.*http:\/\/localhost:5000\/catalog/);
+  assert.equal(splitBrainResult.hermeticVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  assert.ok(splitBrainResult.hermeticVerification.runtimeVerification.behavioralApiProbes
+    .every((probe) => probe.passed && probe.applicable));
+  assert.ok(splitBrainResult.hermeticVerification.runtimeVerification.uiPreview.paths
+    .every((probe) => probe.passed && probe.applicable));
+  assert.ok(splitBrainResult.filesModified.includes('server.js'));
+  assert.ok(splitBrainResult.filesModified.includes('package.json'));
+  assert.equal(JSON.parse(await fs.readFile(path.join(splitBrainDir, 'package.json'), 'utf8')).scripts.start, 'node server.js');
+  assert.match(await fs.readFile(path.join(splitBrainDir, 'README.md'), 'utf8'), /npm start/);
+  assert.match(await fs.readFile(path.join(splitBrainDir, 'README.md'), 'utf8'), /no `npm install` or `node_modules` directory is needed/i);
+  assert.ok(!(await fs.readdir(splitBrainDir)).includes('node_modules'));
+  console.log('[TEST 4J PASSED] Split-brain generated/root workspaces default to approved canonical healing and pass all nine gates.');
+
   const emptyEnvironmentDir = path.join(testRoot, 'empty-existing-environment');
   await fs.mkdir(emptyEnvironmentDir, { recursive: true });
   await fs.writeFile(path.join(emptyEnvironmentDir, '.env.example'), '');

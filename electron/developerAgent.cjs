@@ -71,11 +71,13 @@ const {
   discoverProjectConventions,
   isFullStackBuildRequest,
   deriveModularPlan,
+  deriveExistingProjectTestPlan,
   runHermeticRegressionLoopWithRuntime,
   verifyHermeticEngineeringGatesOnDisk,
   synthesizeMultiFilePatch,
   verifyIntegrationReachability,
 } = require('./coding-pipeline/modularArchitectureEngine.cjs');
+const { isProjectRuntimeTestRequest } = require('./coding-pipeline/projectRuntimeTestIntent.cjs');
 const { projectProcessIsolationStatus } = require('./coding-pipeline/projectProcessIsolation.cjs');
 const developerFiles = require('./developerFiles.cjs');
 const { readProjectMetadata } = require('./developerIndex.cjs');
@@ -99,6 +101,23 @@ function emitHermeticGateProgress(result, onProgress, stage = 'PRE-PROPOSAL') {
       message: `[${stage} GATE ${index + 1}/${result.total}: ${labels[index] || gate.id}] ${gate.passed ? 'PASSED' : 'FAILED'} · ${typeof gate.evidence === 'string' ? gate.evidence : JSON.stringify(gate.evidence)}`,
     });
   }
+  const runtime = result?.runtimeVerification;
+  if (runtime?.executionMode === 'IN_PROCESS_HTTP_LOOPBACK') {
+    const apiProof = (runtime.behavioralApiProbes || [])
+      .map((probe) => `${probe.method} ${probe.routePath} ${probe.actual} ${probe.passed ? 'PASS' : 'FAIL'} (${probe.id})`)
+      .join('; ');
+    const collectionProof = runtime.collectionProbe
+      ? `${runtime.collectionProbe.method} ${runtime.collectionProbe.routePath} ${runtime.collectionProbe.actual} ${runtime.collectionProbe.passed ? 'PASS' : 'FAIL'}`
+      : 'collection GET missing';
+    const uiProof = (runtime.uiPreview?.paths || [])
+      .map((probe) => `GET ${probe.path} ${probe.statusCode || 'no status'} ${probe.passed ? 'PASS' : 'FAIL'}`)
+      .join('; ');
+    onProgress({
+      phase: 'HERMETIC_RUNTIME_PROOF',
+      message: `[${stage} LIVE LOOPBACK RECEIPT] API: ${apiProof}; list: ${collectionProof}; UI: ${uiProof}.`,
+      runtimeVerification: runtime,
+    });
+  }
   if (result.regressionLoop) {
     onProgress({
       phase: 'THINK_REGRESSION',
@@ -110,11 +129,255 @@ function emitHermeticGateProgress(result, onProgress, stage = 'PRE-PROPOSAL') {
   }
 }
 
+function summarizeHermeticFailures(verification) {
+  const failures = (verification?.gates || []).filter((gate) => gate.passed !== true);
+  return failures.flatMap((gate) => {
+    const diagnostics = Array.isArray(gate.diagnostics) ? gate.diagnostics : [];
+    return diagnostics.length
+      ? diagnostics.map((item) => `${gate.id}${item.path ? ` @ ${item.path}` : ''}: ${item.reason || item.message || JSON.stringify(item)}`)
+      : [`${gate.id}: ${typeof gate.evidence === 'string' ? gate.evidence : JSON.stringify(gate.evidence)}`];
+  }).join('; ') || 'No failed-gate diagnostics were returned.';
+}
+
+function buildHermeticExecutionReceipt(verification, route, {
+  allowNotApplicable = false,
+  candidate = false,
+} = {}) {
+  if (!verification || verification.passed !== verification.total || verification.total !== 9) return null;
+  const runtime = verification.runtimeVerification || {};
+  const applicableBehavioralProbes = Array.isArray(runtime.behavioralApiProbes)
+    ? runtime.behavioralApiProbes.filter((probe) => probe.applicable === true)
+    : [];
+  if (runtime.executionMode !== 'IN_PROCESS_HTTP_LOOPBACK'
+    || !Array.isArray(runtime.behavioralApiProbes)
+    || runtime.behavioralApiProbes.length !== 5
+    || applicableBehavioralProbes.length === 0
+    || (!allowNotApplicable && applicableBehavioralProbes.length !== runtime.behavioralApiProbes.length)
+    || !applicableBehavioralProbes.every((probe) => probe.passed === true)
+    || runtime.collectionProbe?.passed !== true
+    || runtime.behavioralTestSuite?.status !== 'EXECUTED & PASSED'
+    || runtime.behavioralTestSuite?.assertionCount < 1
+    || runtime.uiPreview?.applicable !== true
+    || !runtime.uiPreview?.passed) return null;
+  const gateLabels = [
+    'Syntax & AST',
+    'Schema contract',
+    'Validation & status',
+    'Full-stack wiring',
+    'Run readiness',
+    'Module & runtime resolution',
+    'Cross-layer data flow',
+    'Adversarial behavior matrix',
+    'In-process HTTP loopback runtime',
+  ];
+  const gateBreakdown = gateLabels.map((label, index) => `${index + 1}. ${label} — PASS`).join('\n');
+  const probeLabels = {
+    'valid-multi-item-create': `POST ${route.path} -> ${route.method === 'POST' ? 201 : 200} Created`,
+    'blank-required-scalar': 'Invalid payload (blank field) -> 400 Bad Request',
+    'empty-nested-array': 'Invalid payload (empty array) -> 400 Bad Request',
+    'invalid-nested-item': 'Invalid payload (invalid item) -> 400 Bad Request',
+    'persistence-failure': 'Error boundary -> 500 Internal Server Error',
+  };
+  const apiBreakdown = runtime.behavioralApiProbes.map((probe) => (
+    `${probeLabels[probe.id] || `${probe.method} ${probe.routePath} -> ${probe.actual}`} — ${
+      probe.applicable === true ? (probe.passed ? 'PASS' : 'FAIL') : 'N/A (not applicable to this schema)'
+    }`
+  ));
+  const collection = runtime.collectionProbe;
+  const collectionText = `GET ${route.path} -> ${collection.actual} OK — PASS (persisted record returned)`;
+  const uiRoute = `/${route.path.split('/').filter(Boolean).at(-1)}`;
+  const uiProbe = runtime.uiPreview.paths.find((probe) => probe.path === uiRoute);
+  const rootProbe = runtime.uiPreview.paths.find((probe) => probe.path === '/');
+  const workspaceAudit = verification.workspaceAudit;
+  const inspectedFiles = workspaceAudit?.inspectedFiles || [];
+  const exploredDirectories = workspaceAudit?.exploredDirectories || [];
+  const applicableProbeCount = runtime.behavioralApiProbes.filter((probe) => probe.applicable === true).length;
+  const engineeringSummary = [
+    ...(workspaceAudit?.engineeringSummary || [
+      {
+        phase: 'Workspace topology',
+        summary: inspectedFiles.length
+          ? `Read ${inspectedFiles.length} workspace file(s) and explored ${exploredDirectories.length} directory(ies).`
+          : 'No on-disk file inspection metadata was returned by the workspace audit.',
+      },
+      {
+        phase: 'Cross-file contract',
+        summary: `Verified the configured ${route.method} ${route.path} flow with the generated behavioral suite and collection probe.`,
+      },
+    ]),
+    {
+      phase: 'Live verification',
+      summary: `${verification.passed}/${verification.total} hermetic gates passed; ${applicableProbeCount} applicable API probes and ${runtime.behavioralTestSuite.assertionCount} in-process behavioral assertions passed.`,
+    },
+  ];
+  const readinessAudit = workspaceAudit
+    ? [
+        'Detected Workspace Issues & Readiness Audit:',
+        ...(workspaceAudit.findings.length
+          ? workspaceAudit.findings.map((finding) => finding.message)
+          : ['No workspace environment gaps or cross-file drift were detected in the inspected paths.']),
+        workspaceAudit.bugs.length
+          ? `Detected Bugs:\n${workspaceAudit.bugs.map((bug) => (
+              `- ${bug.path}${bug.line ? `:${bug.line}` : ''}: ${bug.description}`
+            )).join('\n')}`
+          : 'Detected Bugs: None found by the source, contract, and import checks.',
+        ...(workspaceAudit.syncPlan.length
+          ? [`Repair/sync plan:\n${workspaceAudit.syncPlan.map((item) => `- ${item.action} ${item.path}: ${item.reason}`).join('\n')}`]
+          : []),
+      ]
+    : ['Detected Workspace Issues & Readiness Audit:', 'The workspace root was unavailable; environment and workspace-wide findings were not assessed.'];
+  const uiText = `GET ${uiRoute} interactive form -> ${uiProbe?.statusCode || 'no status'} — ${uiProbe?.passed ? 'PASS' : 'FAIL'}`;
+  const rootText = `GET / -> ${rootProbe?.statusCode || 'no status'} — ${rootProbe?.passed ? 'PASS' : 'FAIL'}`;
+  const runUrl = `http://localhost:5000${uiRoute}`;
+  const routeSummary = `including in-process VM runtime execution of ${applicableBehavioralProbes.length} applicable API behavioral probes, ${runtime.behavioralTestSuite.assertionCount} behavioral test assertions, and UI route reachability at ${uiRoute} and ${route.path}`;
+  const inspectedModules = [
+    route.integrationFile,
+    route.configFile,
+    route.modelFile,
+    route.controllerFile,
+    route.targetFile,
+    route.frontendFile,
+    route.pageFile,
+    route.testFile,
+  ].filter((filePath) => typeof filePath === 'string' && filePath);
+  const engineeringDetails = [
+    'Engineering Analysis & Inspected Files:',
+    ...engineeringSummary.map((item) => `- ${item.phase}: ${item.summary}`),
+    `- Explored directories: ${exploredDirectories.length
+      ? exploredDirectories.map((directory) => `${directory.path} (${directory.entryCount} entries)`).join(', ')
+      : 'No directory enumeration details were returned.'}`,
+    ...(inspectedFiles.length
+      ? inspectedFiles.map((file) => `- Read ${file.path} (${file.lineCount} lines, ${file.byteSize} bytes)`)
+      : ['- No inspected file metadata was returned.']),
+  ];
+  const message = [
+    `The ${candidate ? 'staged project-test candidate' : 'project workspace'} was verified across 9/9 hermetic gates (${routeSummary}).`,
+    '',
+    'Execution & Verification Receipt',
+    'Hermetic gates: 9/9 PASS',
+    gateBreakdown,
+    `Module & dependency check: ${inspectedModules.join(', ')} resolved ${candidate ? 'in the candidate and' : 'on disk and'} through the approved module graph.`,
+    'API behavioral probes:',
+    ...apiBreakdown,
+    `Collection list probe: ${collectionText}`,
+    `Live UI route probe: ${uiText}`,
+    `Root UI probe: ${rootText}`,
+    `Behavioral test suite execution: \`${route.testFile}\` — EXECUTED & PASSED (in-process runtime runner).`,
+    `The verifier did not run \`npm test\`; live behavior in this receipt was executed by the in-process Gate 9 loopback harness.`,
+    `Run locally: \`npm start\` -> ${runUrl}.`,
+    'The verifier did not run npm install or spawn a project process; dependency-installation readiness is reported in the audit below.',
+    ...engineeringDetails,
+    ...readinessAudit,
+  ].join('\n');
+  return {
+    status: 'PASSED',
+    gateCount: verification.total,
+    gates: gateLabels.map((label, index) => ({ index: index + 1, label, status: 'PASS' })),
+    apiProbes: runtime.behavioralApiProbes.map((probe) => ({
+      id: probe.id,
+      method: probe.method,
+      path: probe.routePath,
+      statusCode: probe.actual,
+      applicable: probe.applicable === true,
+      passed: probe.passed,
+    })),
+    collectionProbe: {
+      method: collection.method,
+      path: collection.routePath,
+      statusCode: collection.actual,
+      passed: collection.passed,
+    },
+    uiProbes: runtime.uiPreview.paths,
+    behavioralTestSuite: runtime.behavioralTestSuite,
+    workspaceAudit,
+    detectedWorkspaceIssues: workspaceAudit?.findings || [],
+    inspectedFiles,
+    exploredDirectories,
+    engineeringSummary,
+    engineeringAnalysis: engineeringSummary,
+    runCommand: 'npm start',
+    testCommand: `node ${route.testFile}`,
+    inspectedModules,
+    runUrl,
+    message,
+  };
+}
+
 async function prepareHermeticCandidate(plan, root, onProgress) {
   if (!plan?.routeSchema || !Array.isArray(plan.routeContracts) || plan.routeContracts.length === 0) return null;
+  const diagnostics = [];
+  for (const module of plan.modulesToCreate || []) {
+    if (module.operation === 'reuse' || typeof module.content !== 'string') continue;
+    const safePath = validateSafePath(root, module.path);
+    let diskContent;
+    try {
+      diskContent = await fs.readFile(path.join(root, ...safePath.split('/')), 'utf8');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      diagnostics.push({ path: safePath, reason: 'Target file is missing from disk.' });
+      continue;
+    }
+    if (diskContent.replace(/\r\n/g, '\n') !== module.content.replace(/\r\n/g, '\n')) {
+      diagnostics.push({
+        path: safePath,
+        reason: 'Existing disk content differs from the planner candidate and must be included in the approved proposal.',
+      });
+    }
+  }
+  onProgress({
+    phase: 'WORKSPACE_DOCTOR',
+    message: diagnostics.length
+      ? `[WORKSPACE DOCTOR] Found ${diagnostics.length} missing or outdated planned target(s): ${diagnostics.map((item) => `${item.path} (${item.reason})`).join('; ')}`
+      : '[WORKSPACE DOCTOR] All planned target files match the current disk snapshot.',
+    diagnostics,
+  });
   const result = await runHermeticRegressionLoopWithRuntime(plan, { root, onProgress });
   emitHermeticGateProgress(result, onProgress);
   return result;
+}
+
+async function completeNoChangeAfterDiskVerification({ root, modularPlan, multiFile, taskPlan, turn, owner, onProgress, hermeticVerification }) {
+  const diskVerification = await verifyHermeticEngineeringGatesOnDisk(root, modularPlan);
+  emitHermeticGateProgress(diskVerification, onProgress, 'WORKSPACE DOCTOR');
+  if (diskVerification.passed !== diskVerification.total) {
+    const reason = `No-change verification refused: current disk files failed hermetic checks (${diskVerification.passed}/${diskVerification.total}). ${summarizeHermeticFailures(diskVerification)}`;
+    onProgress({
+      phase: 'WORKSPACE_DOCTOR_FAILED',
+      message: `[WORKSPACE DOCTOR] ${reason} No success status was recorded.`,
+      diagnostics: diskVerification.gates.filter((gate) => !gate.passed)
+        .flatMap((gate) => (gate.diagnostics || []).map((item) => ({
+          gate: gate.id,
+          path: item.path,
+          reason: item.reason,
+        }))),
+    });
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'hermetic_verification_failed', reason });
+    return {
+      outcome: 'HERMETIC_VERIFICATION_FAILED',
+      phase: 'VERIFY',
+      turnId: turn.turnId,
+      taskPlan,
+      hermeticVerification: diskVerification,
+      reason,
+      message: reason,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+    };
+  }
+  return completeNoChangeModularWorkflow({
+    multiFile,
+    taskPlan,
+    turn,
+    owner,
+    onProgress,
+    hermeticVerification: diskVerification || hermeticVerification,
+    executionVerificationReceipt: modularPlan.routeContracts?.[0]
+      ? buildHermeticExecutionReceipt(diskVerification, modularPlan.routeContracts[0], {
+        allowNotApplicable: modularPlan.isProjectRuntimeTest === true,
+      })
+      : null,
+  });
 }
 const { detectProject } = require('./coding-pipeline/detect/projectDetector.cjs');
 const featureOwnership = require('../server/src/coding_feature_ownership.json');
@@ -3119,11 +3382,32 @@ async function resolveContractTarget(target, { candidatePaths = [], callerPath =
   return bestMatch;
 }
 
-function completeNoChangeModularWorkflow({ multiFile, taskPlan, turn, owner, onProgress, hermeticVerification }) {
+function completeNoChangeModularWorkflow({
+  multiFile,
+  taskPlan,
+  turn,
+  owner,
+  onProgress,
+  hermeticVerification,
+  executionVerificationReceipt = null,
+}) {
+  const workspaceAudit = executionVerificationReceipt?.workspaceAudit
+    || hermeticVerification?.workspaceAudit
+    || null;
+  const inspectedFiles = executionVerificationReceipt?.inspectedFiles
+    || workspaceAudit?.inspectedFiles
+    || [];
+  const exploredDirectories = executionVerificationReceipt?.exploredDirectories
+    || workspaceAudit?.exploredDirectories
+    || [];
+  const engineeringSummary = executionVerificationReceipt?.engineeringSummary
+    || workspaceAudit?.engineeringSummary
+    || [];
   const gateSummary = hermeticVerification
     ? ` (${hermeticVerification.passed}/${hermeticVerification.total} hermetic gates passed)`
     : '';
-  const message = `The workspace already matches the requested modular implementation${gateSummary}; no file changes are required.`;
+  const message = executionVerificationReceipt?.message
+    || `The workspace already matches the requested modular implementation${gateSummary}; no file changes are required.`;
   onProgress({ phase: 'NO_CHANGES', message, verifiedFiles: multiFile.expectedSnapshots.map((item) => item.path) });
   for (const subtask of taskPlan.subtasks || []) {
     if (!['COMPLETED', 'SKIPPED'].includes(subtask.status)) {
@@ -3145,12 +3429,25 @@ function completeNoChangeModularWorkflow({ multiFile, taskPlan, turn, owner, onP
     codeApplied: false,
     codeVerified: true,
     noChangesRequired: true,
+    message,
     hermeticVerification,
+    workspaceAudit,
+    detectedWorkspaceIssues: executionVerificationReceipt?.detectedWorkspaceIssues
+      || workspaceAudit?.findings
+      || [],
+    inspectedFiles,
+    exploredDirectories,
+    engineeringSummary,
+    engineeringAnalysis: engineeringSummary,
+    executionVerificationReceipt,
     verificationReport: {
       status: 'PASSED',
       ok: true,
-      executed: false,
-      verificationMode: 'SNAPSHOT_EQUIVALENCE',
+      executed: Boolean(executionVerificationReceipt),
+      verificationMode: executionVerificationReceipt
+        ? 'IN_PROCESS_HTTP_LOOPBACK_AND_HERMETIC_GATES'
+        : 'SNAPSHOT_EQUIVALENCE',
+      executionVerificationReceipt,
       verificationEvidence: multiFile.expectedSnapshots.map((item) => ({
         path: item.path,
         exists: item.exists,
@@ -3163,13 +3460,16 @@ function completeNoChangeModularWorkflow({ multiFile, taskPlan, turn, owner, onP
       verificationReport: {
         status: 'PASSED',
         ok: true,
-        executed: false,
-        verificationMode: 'SNAPSHOT_EQUIVALENCE',
+        executed: Boolean(executionVerificationReceipt),
+        verificationMode: executionVerificationReceipt
+          ? 'IN_PROCESS_HTTP_LOOPBACK_AND_HERMETIC_GATES'
+          : 'SNAPSHOT_EQUIVALENCE',
         verificationEvidence: multiFile.expectedSnapshots.map((item) => ({
           path: item.path,
           exists: item.exists,
           hash: item.hash,
         })),
+        executionVerificationReceipt,
       },
     }),
   };
@@ -3177,7 +3477,7 @@ function completeNoChangeModularWorkflow({ multiFile, taskPlan, turn, owner, onP
 
 async function executeAutonomousCodingWorkflow(input) {
   const continuationToken = input?.continuationToken;
-  if (!continuationToken) {
+  if (!continuationToken || isProjectRuntimeTestRequest(input?.userRequest)) {
     return executeAutonomousCodingWorkflowStage(input, null);
   }
   const saved = workflowContinuations.get(continuationToken);
@@ -3277,8 +3577,11 @@ async function executeAutonomousCodingWorkflowStage({
     message: continuation ? 'Resuming the bounded investigation from saved evidence.' : 'Analyzing task requirements and ambiguity.',
   });
   const taskOperatingMode = tools?.operatingMode || null;
-  const modeRouting = continuation?.modeRouting
-    || routeTaskMode({ goal: userRequest, userRequestedMode: taskOperatingMode });
+  const isRuntimeTestRequest = isProjectRuntimeTestRequest(userRequest);
+  const modeRouting = isRuntimeTestRequest
+    ? routeTaskMode({ goal: userRequest, userRequestedMode: 'AUTONOMOUS' })
+    : continuation?.modeRouting
+      || routeTaskMode({ goal: userRequest, userRequestedMode: taskOperatingMode });
   const requirementsAnalysis = continuation?.requirementsAnalysis || analyzeTaskRequirements(userRequest);
   if (requirementsAnalysis.needsClarification) {
     const taskPlan = createTaskPlan({
@@ -3312,6 +3615,9 @@ async function executeAutonomousCodingWorkflowStage({
   const detected = continuation?.detected || await detectProject(root);
   const projectArch = continuation?.projectArch || discoverProjectArchitecture({ ...metadata, ...detected });
   const isGreenfieldDiscovery = await isGreenfieldWorkspace(root);
+  const existingRuntimeTestPlan = isRuntimeTestRequest
+    ? await deriveExistingProjectTestPlan(root)
+    : null;
   const detectedChecks = selectVerificationChecks({ ...metadata, ...detected }, [], { targetFile: userRequest });
   const selectedChecks = continuation?.selectedChecks || ((Array.isArray(tools?.checks) && tools.checks.length > 0)
     ? tools.checks
@@ -3450,6 +3756,9 @@ async function executeAutonomousCodingWorkflowStage({
   });
 
   const searchTerms = continuation?.searchTerms || (
+    isRuntimeTestRequest
+      ? []
+      :
     modeRouting.canApply
       && isGreenfieldDiscovery
       && (requirementsAnalysis.isModular
@@ -3461,6 +3770,11 @@ async function executeAutonomousCodingWorkflowStage({
   );
   const sessionSearches = continuation?.sessionSearches || [];
   const candidateFiles = continuation?.candidateFiles || new Map();
+  if (!continuation && existingRuntimeTestPlan) {
+    for (const inspectedPath of existingRuntimeTestPlan.workspaceInspection?.inspectedFiles || []) {
+      candidateFiles.set(inspectedPath, 100);
+    }
+  }
   const candidateReferences = continuation?.candidateReferences || new Map();
   const activeErrorSignals = [
     ...(requirementsAnalysis?.searchSignals?.errorFrames || []),
@@ -3943,13 +4257,19 @@ async function executeAutonomousCodingWorkflowStage({
       message: 'No proposal was created because the source evidence does not establish a sufficiently supported relationship to the original objective.',
     };
   };
-  const readsPerStage = Math.max(1, Number(developerSettings.investigationReadsPerStage) || 8);
+  const readsPerStage = Math.max(
+    isRuntimeTestRequest ? 16 : 1,
+    Number(developerSettings.investigationReadsPerStage) || 8,
+  );
   const maxReads = Math.max(readsPerStage, Number(developerSettings.investigationMaxReads) || 32);
-  const modularRequest = isFullStackBuildRequest(userRequest)
+  const modularRequest = isRuntimeTestRequest
+    || isFullStackBuildRequest(userRequest)
     || Boolean(tools?.modularPlan)
     || Boolean(tools?.deriveModularPlan)
     || requirementsAnalysis?.isModular === true;
   if (
+    !isRuntimeTestRequest
+    &&
     candidateFiles.size === 0
     && inspectionEvidence.length === 0
     && !isGreenfieldDiscovery
@@ -3968,6 +4288,10 @@ async function executeAutonomousCodingWorkflowStage({
       try {
         const entries = await developerFiles.listDirectory(directory, ownerWebContentsId);
         for (const entry of entries) {
+          if (entry.type === 'directory'
+            && ['.git', 'node_modules', 'dist', 'coverage', 'build', '.next', '.cache'].includes(entry.name.toLowerCase())) {
+            continue;
+          }
           const entryPath = directory === '.' ? entry.name : path.posix.join(directory, entry.name);
           if (entry.type === 'directory') {
             directories.push(entryPath);
@@ -4298,7 +4622,8 @@ async function executeAutonomousCodingWorkflowStage({
 
   if (confirmedDefects.length === 0) {
     const isGreenfieldForSearch = await isGreenfieldWorkspace(root);
-    const isModularRequestForSearch = isGreenfieldForSearch
+    const isModularRequestForSearch = isRuntimeTestRequest
+      || isGreenfieldForSearch
       || isFullStackBuildRequest(userRequest)
       || Boolean(tools?.modularPlan)
       || Boolean(tools?.deriveModularPlan)
@@ -4319,7 +4644,8 @@ async function executeAutonomousCodingWorkflowStage({
       if (!latestInspectionByPath.has(entry.path)) latestInspectionByPath.set(entry.path, entry);
     }
     const incompleteRead = [...latestInspectionByPath.values()].find((entry) => entry.lineRange?.complete === false);
-    const requiresSourceInspection = inspectionEvidence.length === 0
+    const requiresSourceInspection = !isRuntimeTestRequest
+      && inspectionEvidence.length === 0
       && candidateFiles.size === 0
       && !pendingSearch
       && (modeRouting.canApply !== true || !isGreenfieldForSearch);
@@ -4493,7 +4819,8 @@ async function executeAutonomousCodingWorkflowStage({
 
     if (modeRouting.canApply === true) {
       const isGreenfield = await isGreenfieldWorkspace(root);
-      const isModularRequest = isGreenfield
+      const isModularRequest = isRuntimeTestRequest
+        || isGreenfield
         || isFullStackBuildRequest(userRequest)
         || Boolean(tools?.modularPlan)
         || Boolean(tools?.deriveModularPlan)
@@ -4583,14 +4910,35 @@ async function executeAutonomousCodingWorkflowStage({
         status: 'IN_PROGRESS',
       });
 
-      const modularPlan = await deriveModularPlan(root, {
+      const modularPlan = isRuntimeTestRequest
+        ? existingRuntimeTestPlan
+        : await deriveModularPlan(root, {
         userRequest,
         requirements: requirementsAnalysis?.explicitRequirements || [],
         explicitPlan: tools?.modularPlan || null,
       });
+      if (isRuntimeTestRequest && !modularPlan) {
+        const reason = 'The workspace does not match the supported self-contained full-stack runtime contract, so the Coding Agent cannot safely execute its source in the hermetic loopback harness.';
+        advanceConversationTurn(turn.turnId, 'blocked', owner, { phase: 'runtime_verification_unsupported', reason });
+        advanceTaskPlan(taskPlan, {
+          subtaskId: 'ST-3',
+          status: 'BLOCKED',
+          outcome: reason,
+        });
+        return {
+          outcome: 'RUNTIME_VERIFICATION_UNSUPPORTED',
+          phase: 'VERIFY',
+          turnId: turn.turnId,
+          taskPlan,
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+          message: reason,
+        };
+      }
       const hermeticPreflight = await prepareHermeticCandidate(modularPlan, root, onProgress);
       if (hermeticPreflight && hermeticPreflight.passed !== hermeticPreflight.total) {
-        const reason = `Hermetic pre-proposal checks failed (${hermeticPreflight.passed}/${hermeticPreflight.total}); no proposal was staged.`;
+        const reason = `Hermetic pre-proposal checks failed (${hermeticPreflight.passed}/${hermeticPreflight.total}); no proposal was staged. ${summarizeHermeticFailures(hermeticPreflight)}`;
         advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'hermetic_verification_failed' });
         return {
           outcome: 'HERMETIC_VERIFICATION_FAILED',
@@ -4684,14 +5032,31 @@ async function executeAutonomousCodingWorkflowStage({
       }
 
       if (multiFile.filesList.length === 0) {
-        return completeNoChangeModularWorkflow({
-          multiFile, taskPlan, turn, owner, onProgress, hermeticVerification: hermeticPreflight,
+        return completeNoChangeAfterDiskVerification({
+          root,
+          modularPlan,
+          multiFile,
+          taskPlan,
+          turn,
+          owner,
+          onProgress,
+          hermeticVerification: hermeticPreflight,
         });
       }
 
       const proposalContract = {
         type: 'MODULAR_IMPLEMENTATION',
         isModular: true,
+        isProjectRuntimeTest: modularPlan.isProjectRuntimeTest === true,
+        ...(modularPlan.isProjectRuntimeTest && modularPlan.routeContracts?.[0]
+          ? {
+              executionVerificationReceipt: buildHermeticExecutionReceipt(
+                hermeticPreflight,
+                modularPlan.routeContracts[0],
+                { allowNotApplicable: true, candidate: true },
+              ),
+            }
+          : {}),
         isGreenfield: modularPlan.isGreenfield,
         workspaceInspection: modularPlan.workspaceInspection || null,
         hermeticPreflight,
@@ -5139,14 +5504,31 @@ async function executeAutonomousCodingWorkflowStage({
     }
 
     if (multiFile.filesList.length === 0) {
-      return completeNoChangeModularWorkflow({
-        multiFile, taskPlan, turn, owner, onProgress, hermeticVerification: hermeticPreflight,
+      return completeNoChangeAfterDiskVerification({
+        root,
+        modularPlan,
+        multiFile,
+        taskPlan,
+        turn,
+        owner,
+        onProgress,
+        hermeticVerification: hermeticPreflight,
       });
     }
 
     const proposalContract = {
       type: 'MODULAR_IMPLEMENTATION',
       isModular: true,
+      isProjectRuntimeTest: modularPlan.isProjectRuntimeTest === true,
+      ...(modularPlan.isProjectRuntimeTest && modularPlan.routeContracts?.[0]
+        ? {
+            executionVerificationReceipt: buildHermeticExecutionReceipt(
+              hermeticPreflight,
+              modularPlan.routeContracts[0],
+              { allowNotApplicable: true, candidate: true },
+            ),
+          }
+        : {}),
       isGreenfield: modularPlan.isGreenfield,
       workspaceInspection: modularPlan.workspaceInspection || null,
       hermeticPreflight,
@@ -5885,7 +6267,13 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
     return { allowed: false, reason: 'Proposal mutation requires approval.' };
   });
 
-  const effectiveModularPlan = modularPlan || proposalContract?.planRecord || (proposalContract?.isModular ? proposalContract : null);
+  let effectiveModularPlan = modularPlan || (proposalContract?.isModular ? proposalContract : null);
+  const isRuntimeTestWorkflow = isProjectRuntimeTestRequest(userRequest)
+    || effectiveModularPlan?.isProjectRuntimeTest === true
+    || proposalContract?.isProjectRuntimeTest === true;
+  if (isRuntimeTestWorkflow && !effectiveModularPlan?.routeContracts?.length) {
+    effectiveModularPlan = await deriveExistingProjectTestPlan(root);
+  }
   const isolationStatus = projectProcessIsolationStatus();
   const hostExecutionAllowed = !effectiveModularPlan
     || (isolationStatus.available === true && isolationStatus.verified === true);
@@ -5903,7 +6291,35 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
   let testOutcome = { status: 'NOT_RUN' };
   let modularReachability = null;
   let hermeticVerification = proposalContract?.hermeticPreflight || null;
-  const verifyRunner = typeof runCheck === 'function' && selectedChecks.length > 0 && hostExecutionAllowed
+  const verifyRunner = isRuntimeTestWorkflow && effectiveModularPlan?.routeContracts?.length
+    ? async () => {
+        onProgress({
+          phase: 'VERIFY:HERMETIC_RUNTIME',
+          message: 'Running the approved project-test request through the in-process hermetic and loopback verifier.',
+        });
+        hermeticVerification = await verifyHermeticEngineeringGatesOnDisk(root, effectiveModularPlan);
+        emitHermeticGateProgress(hermeticVerification, onProgress, 'PRE-ROLLBACK');
+        const passed = hermeticVerification.passed === hermeticVerification.total;
+        const reason = passed
+          ? null
+          : `In-process hermetic verification failed (${hermeticVerification.passed}/${hermeticVerification.total}).`;
+        testOutcome = {
+          status: passed ? 'PASS' : 'FAILED',
+          ok: passed,
+          executed: true,
+          exitCode: passed ? 0 : 1,
+          reason,
+          attempts: [{
+            ok: passed,
+            executed: true,
+            exitCode: passed ? 0 : 1,
+            check: 'IN_PROCESS_HERMETIC_RUNTIME',
+            failure: reason,
+          }],
+        };
+        return testOutcome;
+      }
+    : typeof runCheck === 'function' && selectedChecks.length > 0 && hostExecutionAllowed
     ? async () => {
         onProgress({ phase: 'TEST', message: 'Running safe verification checks.' });
         let loopResult = await runEngineeringLoop({
@@ -6095,13 +6511,19 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
             };
           }
         : (async () => {
-            testOutcome = { status: 'VERIFICATION_UNAVAILABLE', reason: 'No test runner provided or offline.' };
+            const reason = isRuntimeTestWorkflow
+              ? 'The project-test request no longer has a supported in-process runtime plan; no host project command was run.'
+              : 'No test runner provided or offline.';
+            testOutcome = {
+              status: isRuntimeTestWorkflow ? 'RUNTIME_VERIFICATION_UNSUPPORTED' : 'VERIFICATION_UNAVAILABLE',
+              reason,
+            };
             return {
               ok: false,
-              status: 'UNVERIFIED',
+              status: isRuntimeTestWorkflow ? 'FAILED' : 'UNVERIFIED',
               executed: false,
               exitCode: null,
-              reason: testOutcome.reason,
+              reason,
               attempts: [],
             };
           }));
@@ -6117,20 +6539,31 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
     const rollbackFailed = Boolean(taskState?.error?.includes('Rollback verification failed'));
     const incompleteIntegration = modularReachability?.isValid === false
       || /^Live route reachability (?:is unverified|failed):/i.test(String(testOutcome?.reason || ''));
+    const hermeticVerificationFailed = isRuntimeTestWorkflow
+      && hermeticVerification
+      && hermeticVerification.passed !== hermeticVerification.total;
+    const hermeticFailureMessage = hermeticVerificationFailed
+      ? `Project runtime verification failed (${hermeticVerification.passed}/${hermeticVerification.total} gates): ${summarizeHermeticFailures(hermeticVerification)}`
+      : null;
     const verificationStatus = wasCancelled
       ? 'CANCELLED'
       : failedDuringImplement
         ? 'NOT_RUN'
         : testOutcome.status;
     const verificationBlocked = ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(verificationStatus);
+    const runtimeVerificationUnsupported = verificationStatus === 'RUNTIME_VERIFICATION_UNSUPPORTED';
     const outcome = wasCancelled
       ? 'CANCELLED'
       : failedDuringImplement
         ? 'APPLY_FAILED'
+      : hermeticVerificationFailed
+        ? 'HERMETIC_VERIFICATION_FAILED'
         : incompleteIntegration
           ? 'INCOMPLETE_INTEGRATION'
         : verificationBlocked
           ? 'VERIFICATION_BLOCKED'
+        : runtimeVerificationUnsupported
+          ? 'RUNTIME_VERIFICATION_UNSUPPORTED'
         : (verificationStatus === 'VERIFICATION_UNAVAILABLE' || testOutcome?.status === 'VERIFICATION_UNAVAILABLE')
           ? 'VERIFICATION_UNAVAILABLE'
           : (verificationStatus === 'SKIPPED' || testOutcome?.status === 'SKIPPED')
@@ -6239,9 +6672,12 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       integrationVerification: modularReachability,
       hermeticVerification,
       workflowReceipt,
-      error: typeof testOutcome?.reason === 'string' && testOutcome.reason
+      message: hermeticFailureMessage || (typeof testOutcome?.reason === 'string' && testOutcome.reason
         ? testOutcome.reason
-        : error instanceof Error ? error.message : String(error),
+        : error instanceof Error ? error.message : String(error)),
+      error: hermeticFailureMessage || (typeof testOutcome?.reason === 'string' && testOutcome.reason
+        ? testOutcome.reason
+        : error instanceof Error ? error.message : String(error)),
     };
   }
 
@@ -6375,6 +6811,8 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
     ? 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'
     : isPassing
       ? 'SUCCESS'
+      : testOutcome.status === 'RUNTIME_VERIFICATION_UNSUPPORTED'
+        ? 'RUNTIME_VERIFICATION_UNSUPPORTED'
       : testOutcome.status === 'VERIFICATION_UNAVAILABLE'
         ? 'VERIFICATION_UNAVAILABLE'
         : 'TEST_FAILED';
@@ -6403,6 +6841,11 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
         };
       }) : []));
 
+  const executionVerificationReceipt = effectiveModularPlan?.routeContracts?.[0]
+    ? buildHermeticExecutionReceipt(hermeticVerification, effectiveModularPlan.routeContracts[0], {
+      allowNotApplicable: isRuntimeTestWorkflow,
+    })
+    : null;
   const workflowReceipt = buildWorkflowReceipt({
     outcome: outcome === 'SUCCESS' ? 'COMPLETED' : outcome,
     stagesCompleted: isPassing
@@ -6423,12 +6866,15 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       executed: Array.isArray(finalEvidence)
         && finalEvidence.some((evidence) => Number.isInteger(evidence.exitCode)),
     verificationMode: effectiveModularPlan
-      ? hostExecution?.status === 'EXECUTED' ? 'STATIC_AND_HOST_COMMANDS' : 'STATIC_ONLY'
-      : 'HOST_COMMANDS',
+    ? executionVerificationReceipt
+      ? 'IN_PROCESS_HTTP_LOOPBACK_AND_HERMETIC_GATES'
+      : hostExecution?.status === 'EXECUTED' ? 'STATIC_AND_HOST_COMMANDS' : 'STATIC_ONLY'
+    : 'HOST_COMMANDS',
       exitCode: isPassing ? 0 : (testOutcome?.exitCode ?? null),
       verificationEvidence: finalEvidence,
       failureDiagnostics: isPassing ? null : extractFailureDiagnostics(testOutcome),
       hostExecution: testOutcome.hostExecution || hostExecution,
+      executionVerificationReceipt,
     },
     integrationVerification: modularReachability,
     hermeticVerification,
@@ -6443,6 +6889,14 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
   const finalOutcome = (effectiveModularPlan && modularReachability?.isValid === false)
     ? 'INCOMPLETE_INTEGRATION'
     : outcome;
+  const localRunInstruction = effectiveModularPlan?.routeContracts?.[0]
+    ? ` Start locally: run \`npm start\` from the project root; open \`http://localhost:5000/${effectiveModularPlan.routeContracts[0].path.split('/').filter(Boolean).at(-1)}\`.`
+    : '';
+
+  const runtimeVerificationMessage = executionVerificationReceipt?.status === 'PASSED'
+    && typeof executionVerificationReceipt.message === 'string'
+    ? executionVerificationReceipt.message
+    : null;
 
   return {
     outcome: finalOutcome,
@@ -6460,12 +6914,18 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
     worktreeAudit: auditResult,
     requirements: requirementsAnalysis,
     workflowReceipt,
+    executionVerificationReceipt,
     integrationVerification: modularReachability,
     hermeticVerification,
     message: outcome === 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'
       ? 'The approved proposal was applied and verification passed, but trusted item-specific evidence did not establish that every request objective was satisfied. The task plan remains blocked.'
+      : runtimeVerificationMessage
+        ? runtimeVerificationMessage
+      : isPassing && effectiveModularPlan
+          && modularReachability?.liveProbePerformed !== true
+          ? `The approved proposal was applied and verified by available hermetic checks${hermeticVerification ? ` (${hermeticVerification.passed}/${hermeticVerification.total} gates)` : ''}; live route reachability was not probed. Approved files: ${task.files.map((file) => file.path).join(', ')}. The workflow did not run project commands${hostExecution?.reason ? ` (${hostExecution.reason})` : ''}.${localRunInstruction}`
       : isPassing && effectiveModularPlan && hostExecution?.status !== 'EXECUTED'
-        ? `The approved proposal was applied and disk-backed static checks passed${hermeticVerification ? ` (${hermeticVerification.passed}/${hermeticVerification.total} hermetic gates)` : ''}. Approved files: ${task.files.map((file) => file.path).join(', ')}. To start the API locally, run \`npm start\` from the project root; this workflow did not run project commands${hostExecution?.reason ? ` (${hostExecution.reason})` : ''}. Live route reachability was not probed.`
+          ? `The approved proposal was applied and verified by available hermetic checks${hermeticVerification ? ` (${hermeticVerification.passed}/${hermeticVerification.total} gates)` : ''}. Approved files: ${task.files.map((file) => file.path).join(', ')}. The workflow did not run project commands${hostExecution?.reason ? ` (${hostExecution.reason})` : ''}.${localRunInstruction}`
       : isPassing && modularReachability?.verificationModes?.includes('STATIC_WIRING')
         && !modularReachability.verificationModes.includes('LIVE_PROBE')
         ? 'The approved proposal was applied and static integration checks passed; live route reachability was not probed.'

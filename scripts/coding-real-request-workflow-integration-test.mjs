@@ -44,6 +44,7 @@ const dialogRequests = [];
 const dialogResponses = [];
 const inlineApprovalRequests = [];
 const inlineApprovalErrors = [];
+let deferInlineApprovalDecision = false;
 let concurrentApprovalMutation = null;
 const authorizedMutationRequests = [];
 let resolveAppQuit;
@@ -260,6 +261,7 @@ try {
   const sender = windows[0].webContents;
   electronMock.ipcRenderer.on('developer:workflow-approval-pending', (_event, approval) => {
     inlineApprovalRequests.push(approval);
+    if (deferInlineApprovalDecision) return;
     void (async () => {
       if (concurrentApprovalMutation) {
         const mutate = concurrentApprovalMutation;
@@ -1558,7 +1560,17 @@ Create a page and form component with success and error messages.`,
   assert.equal(populatedStubResult.codeVerified, true);
   assert.deepEqual(populatedStubResult.integrationVerification.verificationModes, ['STATIC_WIRING']);
   assert.equal(populatedStubResult.workflowReceipt.verificationReport.integrationVerification.liveProbePerformed, false);
-  assert.equal(populatedStubResult.workflowReceipt.verificationReport.verificationMode, 'STATIC_ONLY');
+  assert.equal(populatedStubResult.hermeticVerification?.passed, 9);
+  assert.equal(populatedStubResult.hermeticVerification?.total, 9);
+  assert.equal(populatedStubResult.executionVerificationReceipt?.status, 'PASSED');
+  assert.equal(
+    populatedStubResult.workflowReceipt.verificationReport.verificationMode,
+    'IN_PROCESS_HTTP_LOOPBACK_AND_HERMETIC_GATES',
+  );
+  assert.equal(
+    populatedStubResult.hermeticVerification.runtimeVerification.executionMode,
+    'IN_PROCESS_HTTP_LOOPBACK',
+  );
   assert.equal(
     populatedStubResult.hostExecution?.status,
     'SKIPPED_ISOLATION_UNAVAILABLE',
@@ -1568,7 +1580,7 @@ Create a page and form component with success and error messages.`,
   assert.match(await fs.readFile(path.join(populatedStubProject, 'models', 'subscriptionSchema.js'), 'utf8'), /function validate/);
   assert.match(await fs.readFile(path.join(populatedStubProject, 'routes', 'subscriptionRoutes.js'), 'utf8'), /registerRoutes/);
   assert.match(await fs.readFile(path.join(populatedStubProject, 'components', 'SubscriptionForm.jsx'), 'utf8'), /api\/subscriptions/);
-  console.log('TEST 23 PASSED: Approved placeholder upgrades apply and pass static wiring while host commands remain isolation-gated.');
+  console.log('TEST 23 PASSED: Approved placeholder upgrades pass all nine gates and in-process HTTP loopback verification while host commands remain isolation-gated.');
 
   const partialOrderProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-partial-order-scaffold-'));
   projectRoots.add(partialOrderProject);
@@ -1636,6 +1648,7 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
     'package.json': JSON.stringify({
       name: 'legacy-order-project',
       type: 'commonjs',
+      scripts: { start: 'node generated/order/server.js', dev: 'node generated/order/server.js' },
       dependencies: { express: '^4.0.0', mongoose: '^8.0.0', react: '^18.0.0', 'react-dom': '^18.0.0' },
     }, null, 2),
     '.env.example': 'PORT=4300\nDATABASE_URL=mongodb://localhost/legacy\n',
@@ -1646,6 +1659,9 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, content, 'utf8');
   }
+  const generatedLegacyServer = path.join(populatedFullStackProject, 'generated', 'order', 'server.js');
+  await fs.mkdir(path.dirname(generatedLegacyServer), { recursive: true });
+  await fs.writeFile(generatedLegacyServer, 'module.exports = {};\n', 'utf8');
   const retainedFullStackEnvironment = await fs.readFile(path.join(populatedFullStackProject, '.env.example'), 'utf8');
   await invokeIpc('developer:project-attach', sender, { projectRoot: populatedFullStackProject });
   dialogResponses.push(1);
@@ -1665,6 +1681,30 @@ Create a Next.js App Router page and React form component.`,
   assert.equal(populatedFullStackResult.codeVerified, true);
   assert.equal(populatedFullStackResult.hermeticVerification?.passed, 9, JSON.stringify(populatedFullStackResult.hermeticVerification));
   assert.equal(populatedFullStackResult.hermeticVerification?.total, 9);
+  assert.equal(populatedFullStackResult.executionVerificationReceipt?.status, 'PASSED');
+  assert.match(populatedFullStackResult.message, /verified across 9\/9 hermetic gates/);
+  assert.match(populatedFullStackResult.message, /POST \/api\/orders -> 201 Created — PASS/);
+  assert.match(populatedFullStackResult.message, /GET \/api\/orders -> 200 OK — PASS/);
+  assert.match(populatedFullStackResult.message, /GET \/orders interactive form -> 200 — PASS/);
+  assert.doesNotMatch(populatedFullStackResult.message, /Live route reachability was not probed|disk-backed static checks passed/i);
+  assert.equal(populatedFullStackResult.hermeticVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  assert.ok(populatedFullStackResult.hermeticVerification.runtimeVerification.probes
+    .some((probe) => probe.id === 'persisted-collection-list' && probe.passed));
+  assert.ok(populatedFullStackResult.hermeticVerification.runtimeVerification.probes
+    .some((probe) => probe.method === 'POST' && probe.routePath === '/api/orders' && probe.actual === 201 && probe.passed));
+  assert.ok(populatedFullStackResult.hermeticVerification.runtimeVerification.uiPreview.paths
+    .some((probe) => probe.path === '/orders' && probe.statusCode === 200 && probe.passed));
+  assert.ok(populatedFullStackResult.filesModified.includes('server.js'));
+  assert.ok(populatedFullStackResult.filesModified.includes('package.json'));
+  assert.equal(
+    JSON.parse(await fs.readFile(path.join(populatedFullStackProject, 'package.json'), 'utf8')).scripts.start,
+    'node server.js',
+  );
+  assert.equal(
+    JSON.parse(await fs.readFile(path.join(populatedFullStackProject, 'package.json'), 'utf8')).scripts.test,
+    'node tests/order.test.js',
+  );
+  assert.ok(populatedFullStackResult.filesModified.includes('tests/order.test.js'));
   for (const relativePath of [
     'config/db.js',
     'models/Order.js',
@@ -1679,7 +1719,232 @@ Create a Next.js App Router page and React form component.`,
   await assert.rejects(fs.stat(path.join(populatedFullStackProject, 'pages', 'orders.js')), { code: 'ENOENT' });
   assert.ok((await fs.stat(path.join(populatedFullStackProject, 'legacy-pages-orders.js.txt'))).isFile());
   assert.equal(await fs.readFile(path.join(populatedFullStackProject, '.env.example'), 'utf8'), retainedFullStackEnvironment);
-  console.log('TEST 23C PASSED: Populated full-stack targets auto-upgrade through production IPC, resolve a colliding Pages route, and pass all eight gates.');
+  for (const userRequest of [
+    'test the project',
+    'est the project',
+    'test the my project is wroking now',
+    'st the my project is wroking now',
+  ]) {
+    const runtimeTestResult = await invokeIpc('developer:workflow-execute', sender, {
+      userRequest,
+      scope: '.',
+    });
+    assert.equal(runtimeTestResult.outcome, 'SUCCESS', JSON.stringify(runtimeTestResult));
+    assert.equal(runtimeTestResult.codeApplied, false, 'A passing test request must not modify files.');
+    assert.equal(runtimeTestResult.hermeticVerification?.passed, 9);
+    assert.equal(runtimeTestResult.hermeticVerification?.total, 9);
+    assert.equal(runtimeTestResult.hermeticVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+    assert.equal(runtimeTestResult.executionVerificationReceipt?.status, 'PASSED');
+    assert.match(runtimeTestResult.message, /verified across 9\/9 hermetic gates/);
+    assert.match(runtimeTestResult.message, /POST \/api\/orders -> 201 Created — PASS/);
+    assert.match(runtimeTestResult.message, /GET \/api\/orders -> 200 OK — PASS/);
+    assert.match(runtimeTestResult.message, /GET \/orders interactive form -> 200 — PASS/);
+    assert.doesNotMatch(runtimeTestResult.message, /Runtime behavior is not verified|No automated tests exist beyond the syntax check|config\/db\.js.*might be missing/i);
+    assert.equal(runtimeTestResult.filesModified.length, 0);
+  }
+  const staleRuntimeTestProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-stale-runtime-tests-'));
+  projectRoots.add(staleRuntimeTestProject);
+  await fs.cp(populatedFullStackProject, staleRuntimeTestProject, { recursive: true });
+  const staleRuntimeTestPath = path.join(staleRuntimeTestProject, 'tests', 'order.test.js');
+  const validStaleRuntimeTest = await fs.readFile(staleRuntimeTestPath, 'utf8');
+  const corruptedStaleRuntimeTest = validStaleRuntimeTest.replace(
+    "console.log('Loopback UI, API behavior, persistence, and controller error boundary passed.');",
+    'console.log([REDACTED] UI, API behavior, persistence, and controller error boundary.);',
+  );
+  assert.notEqual(corruptedStaleRuntimeTest, validStaleRuntimeTest);
+  await fs.writeFile(staleRuntimeTestPath, corruptedStaleRuntimeTest, 'utf8');
+  const staleRuntimePackagePath = path.join(staleRuntimeTestProject, 'package.json');
+  const staleRuntimePackage = {
+    name: 'legacy-order-app',
+    version: '1.0.0',
+    type: 'commonjs',
+    scripts: {
+      start: 'node server.js',
+      dev: 'node server.js',
+      test: 'node --check server.js',
+    },
+  };
+  const staleRuntimePackageContents = `${JSON.stringify(staleRuntimePackage, null, 2)}\n`;
+  assert.ok(Buffer.byteLength(staleRuntimePackageContents) <= 278);
+  await fs.writeFile(staleRuntimePackagePath, staleRuntimePackageContents.padEnd(278, ' '), 'utf8');
+  assert.equal((await fs.stat(staleRuntimePackagePath)).size, 278);
+  const staleRuntimeModelPath = path.join(staleRuntimeTestProject, 'models', 'Order.js');
+  const staleRuntimeModel = await fs.readFile(staleRuntimeModelPath, 'utf8');
+  assert.match(staleRuntimeModel, /return records\.map\(\(record\) => \(\{ \.\.\.record \}\)\);/);
+  const degradedRuntimeModel = staleRuntimeModel.replace(
+    /return records\.map\(\(record\) => \(\{ \.\.\.record \}\)\);/,
+    'return [];',
+  );
+  assert.notEqual(degradedRuntimeModel, staleRuntimeModel);
+  await fs.writeFile(
+    staleRuntimeModelPath,
+    degradedRuntimeModel,
+    'utf8',
+  );
+  await invokeIpc('developer:project-attach', sender, { projectRoot: staleRuntimeTestProject });
+  dialogResponses.push(1);
+  const staleRuntimeTestResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: 'test the project',
+    scope: '.',
+  });
+  assert.equal(staleRuntimeTestResult.outcome, 'SUCCESS', JSON.stringify(staleRuntimeTestResult));
+  assert.equal(staleRuntimeTestResult.codeApplied, true);
+  assert.equal(staleRuntimeTestResult.hermeticVerification?.passed, 9);
+  assert.equal(staleRuntimeTestResult.hermeticVerification?.total, 9);
+  assert.equal(staleRuntimeTestResult.hermeticVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  assert.equal(staleRuntimeTestResult.executionVerificationReceipt?.status, 'PASSED');
+  assert.match(staleRuntimeTestResult.message, /verified across 9\/9 hermetic gates/);
+  assert.match(staleRuntimeTestResult.message, /GET \/orders interactive form -> 200 — PASS/);
+  assert.match(staleRuntimeTestResult.message, /POST \/api\/orders -> 201 Created — PASS/);
+  assert.match(staleRuntimeTestResult.message, /GET \/api\/orders -> 200 OK — PASS/);
+  assert.doesNotMatch(staleRuntimeTestResult.message, /no real test suite beyond a syntax check|No test files are present/i);
+  assert.ok(staleRuntimeTestResult.hermeticVerification.runtimeVerification.probes
+    .some((probe) => probe.method === 'POST' && probe.routePath === '/api/orders' && probe.actual === 201 && probe.passed));
+  assert.ok(staleRuntimeTestResult.hermeticVerification.runtimeVerification.probes
+    .some((probe) => probe.actual === 400 && probe.passed));
+  assert.ok(staleRuntimeTestResult.hermeticVerification.runtimeVerification.probes
+    .some((probe) => probe.actual === 500 && probe.passed));
+  assert.ok(staleRuntimeTestResult.filesModified.includes('tests/order.test.js'));
+  assert.ok(staleRuntimeTestResult.filesModified.includes('models/Order.js'), 'The legacy runtime failure must repair the implicated disk module.');
+  assert.equal(
+    JSON.parse(await fs.readFile(staleRuntimePackagePath, 'utf8')).scripts.test,
+    'node tests/order.test.js',
+  );
+  const runtimeTestFilePath = path.join(staleRuntimeTestProject, 'tests', 'order.test.js');
+  assert.ok((await fs.stat(runtimeTestFilePath)).isFile());
+  const runtimeTestSource = await fs.readFile(runtimeTestFilePath, 'utf8');
+  const redactedRuntimeTestSource = runtimeTestSource.replace(
+    "console.log('Loopback UI, API behavior, persistence, and controller error boundary passed.');",
+    'console.log([REDACTED] UI, API behavior, persistence, and controller error boundary.);',
+  );
+  assert.notEqual(redactedRuntimeTestSource, runtimeTestSource);
+  await fs.writeFile(runtimeTestFilePath, redactedRuntimeTestSource, 'utf8');
+  const originalRuntimeRunVerification = devFiles.runVerification;
+  let hostRunnerCalls = 0;
+  devFiles.runVerification = async () => {
+    hostRunnerCalls += 1;
+    return {
+      ok: false,
+      status: 'VERIFICATION_UNAVAILABLE',
+      executed: false,
+      exitCode: 127,
+      stdout: '',
+      stderr: 'Test runner binary not found on host.',
+    };
+  };
+  let repairedRuntimeTestResult;
+  let repeatedRuntimeTestResult;
+  try {
+    dialogResponses.push(1);
+    repairedRuntimeTestResult = await invokeIpc('developer:workflow-execute', sender, {
+      userRequest: 'test the project',
+      scope: '.',
+    });
+    repeatedRuntimeTestResult = await invokeIpc('developer:workflow-execute', sender, {
+      userRequest: 'est the project',
+      scope: '.',
+    });
+  } finally {
+    devFiles.runVerification = originalRuntimeRunVerification;
+  }
+  assert.equal(hostRunnerCalls, 0, 'The in-process runtime-test path must not rely on the unavailable host runner.');
+  assert.equal(repairedRuntimeTestResult.outcome, 'SUCCESS', JSON.stringify(repairedRuntimeTestResult));
+  assert.equal(repairedRuntimeTestResult.codeApplied, true);
+  assert.equal(repairedRuntimeTestResult.hermeticVerification?.passed, 9);
+  assert.equal(repairedRuntimeTestResult.executionVerificationReceipt?.status, 'PASSED');
+  assert.ok(repairedRuntimeTestResult.filesModified.includes('tests/order.test.js'));
+  const repairedRuntimeTestSource = await fs.readFile(runtimeTestFilePath, 'utf8');
+  assert.doesNotMatch(repairedRuntimeTestSource, /\[REDACTED\]/);
+  assert.match(repairedRuntimeTestSource, /Loopback UI, API behavior, persistence, and controller error boundary passed/);
+  assert.equal(repeatedRuntimeTestResult.outcome, 'SUCCESS', JSON.stringify(repeatedRuntimeTestResult));
+  assert.equal(repeatedRuntimeTestResult.codeApplied, false);
+  assert.equal(repeatedRuntimeTestResult.filesModified.length, 0);
+  assert.equal(repeatedRuntimeTestResult.hermeticVerification?.passed, 9);
+  assert.equal(repeatedRuntimeTestResult.executionVerificationReceipt?.status, 'PASSED');
+  assert.equal(repeatedRuntimeTestResult.hermeticVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+
+  const inlineRuntimeTestProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-inline-corrupt-runtime-tests-'));
+  projectRoots.add(inlineRuntimeTestProject);
+  await fs.cp(populatedFullStackProject, inlineRuntimeTestProject, { recursive: true });
+  const inlineRuntimePackagePath = path.join(inlineRuntimeTestProject, 'package.json');
+  await fs.writeFile(inlineRuntimePackagePath, staleRuntimePackageContents.padEnd(278, ' '), 'utf8');
+  const inlineRuntimeTestPath = path.join(inlineRuntimeTestProject, 'tests', 'order.test.js');
+  await fs.writeFile(inlineRuntimeTestPath, corruptedStaleRuntimeTest, 'utf8');
+  const inlineApprovalCount = inlineApprovalRequests.length;
+  await invokeIpc('developer:project-attach', sender, { projectRoot: inlineRuntimeTestProject });
+  deferInlineApprovalDecision = true;
+  const inlineRuntimeWorkflow = invokeIpc('developer:workflow-execute', sender, {
+    userRequest: 'test the project',
+    scope: '.',
+  });
+  let stagedInlineApproval;
+  try {
+    for (let attempt = 0; attempt < 100 && inlineApprovalRequests.length === inlineApprovalCount; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(inlineApprovalRequests.length > inlineApprovalCount, 'Inline review must stage the repair proposal before any disk write.');
+    stagedInlineApproval = inlineApprovalRequests.at(-1);
+    const stagedTask = devAgent.getTaskForTest(stagedInlineApproval.proposalId);
+    assert.equal(stagedTask.proposalContract.hermeticPreflight.passed, 9);
+    assert.equal(stagedTask.proposalContract.hermeticPreflight.total, 9);
+    assert.equal(
+      stagedTask.proposalContract.hermeticPreflight.runtimeVerification.executionMode,
+      'IN_PROCESS_HTTP_LOOPBACK',
+    );
+    assert.match(stagedInlineApproval.diff, /Loopback UI, API behavior, persistence, and controller error boundary passed/);
+    assert.equal(await fs.readFile(inlineRuntimeTestPath, 'utf8'), corruptedStaleRuntimeTest);
+    assert.equal(JSON.parse(await fs.readFile(inlineRuntimePackagePath, 'utf8')).scripts.test, 'node --check server.js');
+  } finally {
+    deferInlineApprovalDecision = false;
+    if (stagedInlineApproval) {
+      await invokeIpc('developer:workflow-approval-decision', sender, {
+        approvalRequestId: stagedInlineApproval.approvalRequestId,
+        proposalId: stagedInlineApproval.proposalId,
+        proposalDigest: stagedInlineApproval.proposalDigest,
+        approved: true,
+      });
+    }
+  }
+  const inlineRuntimeTestResult = await inlineRuntimeWorkflow;
+  assert.equal(inlineRuntimeTestResult.outcome, 'SUCCESS', JSON.stringify(inlineRuntimeTestResult));
+  assert.equal(inlineRuntimeTestResult.codeApplied, true);
+  assert.equal(inlineRuntimeTestResult.hermeticVerification?.passed, 9);
+  assert.equal(inlineRuntimeTestResult.executionVerificationReceipt?.status, 'PASSED');
+  assert.equal(inlineRuntimeTestResult.hermeticVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  assert.doesNotMatch(inlineRuntimeTestResult.message, /Verification runner was unavailable or offline/);
+  assert.doesNotMatch(await fs.readFile(inlineRuntimeTestPath, 'utf8'), /\[REDACTED\]/);
+  assert.equal(JSON.parse(await fs.readFile(inlineRuntimePackagePath, 'utf8')).scripts.test, 'node tests/order.test.js');
+
+  const scalarRuntimeProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-scalar-runtime-tests-'));
+  projectRoots.add(scalarRuntimeProject);
+  const scalarPlan = await devAgent.deriveModularPlan(scalarRuntimeProject, {
+    userRequest: `Build a complete full-stack 'Customer' feature with an interactive React form.
+Create a POST endpoint /api/customers.
+Fields:
+- displayName: string required
+- email: string required
+Create an application page and form component with validation and success/error messages.`,
+  });
+  assert.ok(scalarPlan.routeSchema.fields.every((field) => field.type !== 'array'));
+  for (const module of scalarPlan.modulesToCreate) {
+    if (module.operation === 'rename') continue;
+    const target = path.join(scalarRuntimeProject, ...module.path.split('/'));
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, module.content, 'utf8');
+  }
+  await invokeIpc('developer:project-attach', sender, { projectRoot: scalarRuntimeProject });
+  const scalarRuntimeResult = await invokeIpc('developer:workflow-execute', sender, {
+    userRequest: 'test the project',
+    scope: '.',
+  });
+  assert.equal(scalarRuntimeResult.outcome, 'SUCCESS', JSON.stringify(scalarRuntimeResult));
+  assert.equal(scalarRuntimeResult.codeApplied, false);
+  assert.equal(scalarRuntimeResult.hermeticVerification?.passed, 9);
+  assert.equal(scalarRuntimeResult.executionVerificationReceipt?.status, 'PASSED');
+  assert.ok(scalarRuntimeResult.executionVerificationReceipt.apiProbes.some((probe) => probe.applicable === false));
+  assert.match(scalarRuntimeResult.message, /N\/A \(not applicable to this schema\)/);
+  assert.doesNotMatch(scalarRuntimeResult.message, /empty array\) — PASS|invalid item\) — PASS/);
+  console.log('TEST 23C PASSED: Populated full-stack targets auto-upgrade, run the real loopback verifier, and generate/update the behavioral test suite through approved IPC.');
 
   const substantiveProject = await fs.mkdtemp(path.join(os.tmpdir(), 'developer-substantive-target-'));
   projectRoots.add(substantiveProject);

@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
 import { createHmac, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  deriveExistingProjectTestPlan,
+  runHermeticRegressionLoopWithRuntime,
+} from '../electron/coding-pipeline/modularArchitectureEngine.cjs';
 
 const repositoryRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'trusted-broker-host-test-'));
@@ -15,6 +19,7 @@ const approvedWorkspaceRoot = path.join(fixtureRoot, 'approved-workspace');
 const autonomousWorkspaceRoot = path.join(fixtureRoot, 'autonomous-workspace');
 const populatedWorkspaceRoot = path.join(fixtureRoot, 'populated-workspace');
 const autonomousPopulatedWorkspaceRoot = path.join(fixtureRoot, 'autonomous-populated-workspace');
+const inlineRuntimeWorkspaceRoot = path.join(fixtureRoot, 'inline-runtime-workspace');
 const runtimeSettingsPath = path.join(fixtureRoot, 'runtime-settings.json');
 const authToken = randomBytes(32).toString('base64url');
 const mutationSecret = randomBytes(32).toString('base64url');
@@ -89,6 +94,7 @@ try {
   await mkdir(autonomousWorkspaceRoot);
   await mkdir(populatedWorkspaceRoot);
   await mkdir(autonomousPopulatedWorkspaceRoot);
+  await mkdir(inlineRuntimeWorkspaceRoot);
   renderer = http.createServer();
   const [backendPort, rendererPort] = await Promise.all([listen(backend), listen(renderer)]);
   const runtimeSettings = {
@@ -185,6 +191,7 @@ try {
     expectNoChanges = false,
     minimumBadges = 5,
     minimumDiffPreview = 5,
+    minimumFilesModified = expectNoChanges ? 0 : 5,
   } = {}) => {
     const binding = {
       brokerSessionId: lease.brokerSessionId,
@@ -206,7 +213,7 @@ try {
         assert.equal(workflow.noChangesRequired, true, JSON.stringify(workflow));
         assert.deepEqual(createdPaths, []);
       } else {
-        assert.ok(createdPaths.length >= 5);
+        assert.ok(createdPaths.length >= minimumFilesModified);
       }
       for (const relativePath of createdPaths) {
         const fileStat = await stat(path.join(targetWorkspace, ...relativePath.split('/')));
@@ -222,6 +229,16 @@ try {
     assert.doesNotMatch(childOutput, /The Coding Agent renderer is unavailable for inline proposal review/);
     const pending = workflow.approval;
     assert.ok(pending, 'The workflow response must carry the staged inline proposal.');
+    if (userRequest === 'test the project') {
+      assert.equal(workflow.executionVerificationReceipt?.status, 'PASSED', JSON.stringify(workflow));
+      assert.equal(workflow.hermeticVerification?.passed, 9, JSON.stringify(workflow));
+      assert.equal(pending.executionVerificationReceipt?.status, 'PASSED', JSON.stringify(pending));
+      assert.equal(pending.hermeticVerification?.passed, 9, JSON.stringify(pending));
+      assert.match(workflow.executionVerificationReceipt.message, /staged project-test candidate/);
+      assert.match(workflow.message, /Behavioral test suite execution:.*EXECUTED & PASSED \(in-process runtime runner\)/);
+      assert.equal(workflow.codeApplied, false);
+      assert.equal(workflow.codeVerified, false);
+    }
     assert.ok(pending.envelope?.proposalId);
     assert.match(pending.envelope.proposalDigest, /^[a-f0-9]{64}$/i);
     assert.ok(pending.approvalNonce.length > 20);
@@ -333,6 +350,19 @@ try {
     await mkdir(path.dirname(autonomousTarget), { recursive: true });
     await writeFile(autonomousTarget, source.replace(/\n/g, '\r\n'), 'utf8');
   }
+  for (const root of [populatedWorkspaceRoot, autonomousPopulatedWorkspaceRoot]) {
+    const generatedServer = path.join(root, 'generated', 'order', 'server.js');
+    await mkdir(path.dirname(generatedServer), { recursive: true });
+    await writeFile(generatedServer, 'module.exports = {};\n', 'utf8');
+    const packagePath = path.join(root, 'package.json');
+    const packageMetadata = JSON.parse(await readFile(packagePath, 'utf8'));
+    packageMetadata.scripts = {
+      ...(packageMetadata.scripts || {}),
+      start: 'node generated/order/server.js',
+      dev: 'node generated/order/server.js',
+    };
+    await writeFile(packagePath, `${JSON.stringify(packageMetadata, null, 2)}\n`, 'utf8');
+  }
   const retainedEnvironment = await readFile(path.join(populatedWorkspaceRoot, '.env.example'), 'utf8');
   const retainedReadme = await readFile(path.join(populatedWorkspaceRoot, 'README.md'), 'utf8');
   const populatedPrompt = `Build a complete full-stack order feature with frontend and backend integration.
@@ -362,6 +392,27 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
   assert.equal(autonomousPopulatedUpdate.result.outcome, 'SUCCESS');
   assert.equal(autonomousPopulatedUpdate.result.hermeticVerification?.passed, 9);
   assert.equal(autonomousPopulatedUpdate.result.hermeticVerification?.total, 9);
+  assert.equal(autonomousPopulatedUpdate.result.executionVerificationReceipt?.status, 'PASSED');
+  assert.match(autonomousPopulatedUpdate.result.message, /verified across 9\/9 hermetic gates/);
+  assert.match(autonomousPopulatedUpdate.result.message, /POST \/api\/orders -> 201 Created — PASS/);
+  assert.match(autonomousPopulatedUpdate.result.message, /GET \/api\/orders -> 200 OK — PASS/);
+  assert.match(autonomousPopulatedUpdate.result.message, /GET \/orders interactive form -> 200 — PASS/);
+  assert.equal(autonomousPopulatedUpdate.result.hermeticVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  assert.ok(autonomousPopulatedUpdate.result.hermeticVerification.runtimeVerification.probes
+    .some((probe) => probe.method === 'GET' && probe.routePath === '/api/orders' && probe.actual === 200 && probe.passed));
+  assert.ok(autonomousPopulatedUpdate.result.hermeticVerification.runtimeVerification.uiPreview.paths
+    .some((probe) => probe.path === '/orders' && probe.statusCode === 200 && probe.passed));
+  assert.ok(autonomousPopulatedUpdate.result.filesModified.includes('server.js'));
+  assert.ok(autonomousPopulatedUpdate.result.filesModified.includes('package.json'));
+  assert.ok(autonomousPopulatedUpdate.result.filesModified.includes('tests/order.test.js'));
+  assert.equal(
+    JSON.parse(await readFile(path.join(autonomousPopulatedWorkspaceRoot, 'package.json'), 'utf8')).scripts.start,
+    'node server.js',
+  );
+  assert.equal(
+    JSON.parse(await readFile(path.join(autonomousPopulatedWorkspaceRoot, 'package.json'), 'utf8')).scripts.test,
+    'node tests/order.test.js',
+  );
   await assert.rejects(stat(path.join(autonomousPopulatedWorkspaceRoot, 'pages', 'orders.js')), { code: 'ENOENT' });
   assert.ok((await stat(path.join(autonomousPopulatedWorkspaceRoot, 'legacy-pages-orders.js.txt'))).isFile());
   await brokerFetch('/v1/sessions/release', {
@@ -390,6 +441,10 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
   assert.equal(explicitUpdate.result.hermeticVerification?.status, 'HERMETIC_CONTRACT_SYNTAX_AND_RUNTIME_VERIFIED', JSON.stringify(explicitUpdate.result.hermeticVerification));
   assert.equal(explicitUpdate.result.hermeticVerification?.passed, 9);
   assert.equal(explicitUpdate.result.hermeticVerification?.total, 9);
+  assert.ok(explicitUpdate.result.filesModified.includes('server.js'));
+  assert.ok(explicitUpdate.result.filesModified.includes('package.json'));
+  assert.ok(explicitUpdate.result.filesModified.includes('tests/order.test.js'));
+  assert.equal(JSON.parse(await readFile(path.join(populatedWorkspaceRoot, 'package.json'), 'utf8')).scripts.start, 'node server.js');
   assert.ok(explicitUpdate.pending.fileOperations.some((file) => (
     file.operation === 'rename' && file.sourcePath === 'pages/orders.js'
   )), 'A conflicting Pages Router file must be preserved through an approved rename.');
@@ -415,7 +470,11 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
   assert.ok(!explicitUpdate.pending.fileOperations.some((file) => file.path === '.env.example'));
   assert.ok(!explicitUpdate.result.filesModified.includes('.env.example'));
   assert.equal(await readFile(path.join(populatedWorkspaceRoot, '.env.example'), 'utf8'), retainedEnvironment);
-  assert.equal(await readFile(path.join(populatedWorkspaceRoot, 'README.md'), 'utf8'), retainedReadme);
+  const updatedReadme = await readFile(path.join(populatedWorkspaceRoot, 'README.md'), 'utf8');
+  assert.ok(updatedReadme.startsWith(retainedReadme.trimEnd()), 'Existing README content must remain intact.');
+  assert.match(updatedReadme, /## Generated local runtime/);
+  assert.match(updatedReadme, /npm start/);
+  assert.match(updatedReadme, /no `npm install` or `node_modules` directory is needed/i);
   assert.ok(!explicitUpdate.result.filesModified.includes('utils/sharedUtils.js'));
   assert.ok(!explicitUpdate.result.filesModified.includes('services/featureService.js'));
   for (const relativePath of Object.keys(populatedStubs).filter((file) => file !== 'pages/orders.js')) {
@@ -441,6 +500,12 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
   assert.equal(repeatedUpdate.result.hermeticVerification?.passed, 9);
   assert.equal(repeatedUpdate.result.hermeticVerification?.total, 9);
   assert.equal(repeatedUpdate.result.noChangesRequired, true, JSON.stringify(repeatedUpdate.result));
+  assert.ok(repeatedUpdate.result.inspectedFiles?.length, 'No-change repeat runs must return inspected file metadata at top level.');
+  assert.ok(repeatedUpdate.result.exploredDirectories?.length, 'No-change repeat runs must return explored directories at top level.');
+  assert.ok(
+    repeatedUpdate.result.engineeringAnalysis?.length || repeatedUpdate.result.engineeringSummary?.length,
+    'No-change repeat runs must return engineering analysis at top level.',
+  );
   assert.doesNotMatch(JSON.stringify(repeatedUpdate), /Patch context does not match/);
   await brokerFetch('/v1/sessions/release', {
     brokerSessionId: repeatLease.brokerSessionId,
@@ -472,6 +537,247 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
       sessionLeaseToken: resolutionLease.sessionLeaseToken,
     });
   }
+  await attachSelectedWorkspace(populatedWorkspaceRoot);
+  await readBrokerJson(await brokerFetch('/v1/synchronize', {}), 200);
+  await rm(path.join(populatedWorkspaceRoot, 'tests'), { recursive: true, force: true });
+  const brokerRuntimeManifest = {
+    name: 'legacy-order-app',
+    version: '1.0.0',
+    type: 'commonjs',
+    scripts: {
+      start: 'node server.js',
+      dev: 'node server.js',
+      test: 'node --check server.js',
+    },
+  };
+  const brokerRuntimeManifestContents = `${JSON.stringify(brokerRuntimeManifest, null, 2)}\n`;
+  assert.ok(Buffer.byteLength(brokerRuntimeManifestContents) <= 278);
+  const brokerRuntimeManifestPath = path.join(populatedWorkspaceRoot, 'package.json');
+  await writeFile(brokerRuntimeManifestPath, brokerRuntimeManifestContents.padEnd(278, ' '), 'utf8');
+  assert.equal((await stat(brokerRuntimeManifestPath)).size, 278);
+  await cp(populatedWorkspaceRoot, inlineRuntimeWorkspaceRoot, { recursive: true });
+  await rm(path.join(inlineRuntimeWorkspaceRoot, 'tests'), { recursive: true, force: true });
+  const inlineRuntimePackagePath = path.join(inlineRuntimeWorkspaceRoot, 'package.json');
+  await writeFile(inlineRuntimePackagePath, brokerRuntimeManifestContents.padEnd(278, ' '), 'utf8');
+  await attachSelectedWorkspace(inlineRuntimeWorkspaceRoot);
+  const previousRuntimeProjectId = populatedProject.projectId;
+  const inlineRuntimeSync = await readBrokerJson(await brokerFetch('/v1/synchronize', {}), 200);
+  const inlineRuntimeProject = inlineRuntimeSync.projects.find(
+    (project) => project.projectId !== previousRuntimeProjectId,
+  );
+  assert.ok(inlineRuntimeProject, 'The inline runtime-test workspace must be registered.');
+  const inlineRuntimeLease = await acquireLease(inlineRuntimeProject);
+  const inlineRuntimeResult = await runDecision(inlineRuntimeLease, 'approve', 'inline_review', {
+    userRequest: 'test the project',
+    targetWorkspace: inlineRuntimeWorkspaceRoot,
+    expectEmptyBeforeApproval: false,
+    minimumBadges: 1,
+    minimumDiffPreview: 1,
+    minimumFilesModified: 2,
+  });
+  assert.equal(inlineRuntimeResult.result.outcome, 'SUCCESS', JSON.stringify(inlineRuntimeResult.result));
+  assert.equal(inlineRuntimeResult.result.executionVerificationReceipt?.status, 'PASSED');
+  assert.equal(inlineRuntimeResult.result.hermeticVerification?.passed, 9);
+  assert.equal(inlineRuntimeResult.result.hermeticVerification?.total, 9);
+  assert.doesNotMatch(inlineRuntimeResult.result.message, /VERIFICATION_UNAVAILABLE|Verification runner was unavailable/i);
+  assert.equal(JSON.parse(await readFile(inlineRuntimePackagePath, 'utf8')).scripts.test, 'node tests/order.test.js');
+  assert.ok((await stat(path.join(inlineRuntimeWorkspaceRoot, 'tests', 'order.test.js'))).isFile());
+  assert.equal(inlineRuntimeResult.pending.executionVerificationReceipt.status, 'PASSED');
+  assert.equal(inlineRuntimeResult.pending.hermeticVerification.passed, 9);
+  assert.match(inlineRuntimeResult.pending.executionVerificationReceipt.message, /staged project-test candidate/);
+  await brokerFetch('/v1/sessions/release', {
+    brokerSessionId: inlineRuntimeLease.brokerSessionId,
+    sessionLeaseToken: inlineRuntimeLease.sessionLeaseToken,
+  });
+  const helloWorkspaceFixture = path.join(repositoryRoot, 'scripts', 'fixtures', 'hello-runtime-workspace');
+  let helloWorkspaceSource = process.env.AI_CODING_HELLO_WORKSPACE
+    || path.join(os.homedir(), 'Downloads', 'Hello');
+  let helloWorkspaceSourceExists = false;
+  try {
+    if (!(await stat(helloWorkspaceSource)).isDirectory()) {
+      throw new Error(`Hello workspace source is not a directory: ${helloWorkspaceSource}`);
+    }
+    helloWorkspaceSourceExists = true;
+  } catch (error) {
+    if (process.env.AI_CODING_HELLO_WORKSPACE) throw error;
+    if (error.code !== 'ENOENT') throw error;
+    helloWorkspaceSource = helloWorkspaceFixture;
+    await stat(helloWorkspaceSource);
+    helloWorkspaceSourceExists = true;
+  }
+  if (helloWorkspaceSourceExists) {
+    const sourceManifest = await readFile(path.join(helloWorkspaceSource, 'package.json'), 'utf8');
+    let previousHelloProjectId = inlineRuntimeProject.projectId;
+    for (const executionMode of ['inline_review', 'autonomous_auto_apply']) {
+      const helloCloneWorkspaceRoot = path.join(fixtureRoot, `hello-current-clone-${executionMode}`);
+      await cp(helloWorkspaceSource, helloCloneWorkspaceRoot, { recursive: true });
+      const cloneManifestPath = path.join(helloCloneWorkspaceRoot, 'package.json');
+      await attachSelectedWorkspace(helloCloneWorkspaceRoot);
+      const helloSync = await readBrokerJson(await brokerFetch('/v1/synchronize', {}), 200);
+      const helloProject = helloSync.projects.find((project) => project.projectId !== previousHelloProjectId);
+      assert.ok(helloProject, `The exact Hello clone must be registered for ${executionMode}.`);
+      previousHelloProjectId = helloProject.projectId;
+      const helloLease = await acquireLease(helloProject);
+      const helloWorkflow = await readBrokerJson(await brokerFetch('/v1/workflows', {
+        brokerSessionId: helloLease.brokerSessionId,
+        sessionLeaseToken: helloLease.sessionLeaseToken,
+        userRequest: 'test the project',
+        scope: '.',
+        executionMode,
+      }), 200);
+      let helloResult = helloWorkflow;
+      if (executionMode === 'inline_review' && helloWorkflow.outcome === 'AWAITING_APPROVAL') {
+        assert.equal(helloWorkflow.executionVerificationReceipt?.status, 'PASSED', JSON.stringify(helloWorkflow));
+        assert.equal(helloWorkflow.executionVerificationReceipt.behavioralTestSuite.status, 'EXECUTED & PASSED');
+        assert.equal(helloWorkflow.hermeticVerification?.passed, 9, JSON.stringify(helloWorkflow));
+        assert.match(helloWorkflow.executionVerificationReceipt.message, /staged project-test candidate/);
+        assert.match(helloWorkflow.executionVerificationReceipt.message, /EXECUTED & PASSED \(in-process runtime runner\)/);
+        assert.match(helloWorkflow.executionVerificationReceipt.message, /Detected Workspace Issues & Readiness Audit/);
+        assert.match(helloWorkflow.executionVerificationReceipt.message, /Missing node_modules directory/);
+        assert.match(helloWorkflow.executionVerificationReceipt.message, /Missing \.env file/);
+        assert.match(helloWorkflow.executionVerificationReceipt.message, /Stale inline UI contract: server\.js/);
+        assert.match(helloWorkflow.executionVerificationReceipt.message, /REPAIR server\.js/);
+        assert.match(helloWorkflow.executionVerificationReceipt.message, /REVIEW_SYNC routes\/orders\.js/);
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'package.json' && file.lineCount > 0));
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'server.js' && file.byteSize > 0));
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'config/db.js' && file.lineCount > 0));
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'models/Order.js' && file.lineCount > 0));
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'controllers/orderController.js' && file.lineCount > 0));
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'routes/orders.js' && file.lineCount > 0));
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'components/OrderForm.jsx' && file.lineCount > 0));
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'app/orders/page.jsx' && file.lineCount > 0));
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'tests/order.test.js' && file.lineCount > 0));
+        assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === '.env.example' && file.byteSize > 0));
+        assert.ok(helloWorkflow.exploredDirectories.some((directory) => directory.path === 'models'));
+        assert.ok(helloWorkflow.engineeringSummary.some((item) => item.phase === 'Runtime contract'));
+        assert.match(helloWorkflow.executionVerificationReceipt.message, /Engineering Analysis & Inspected Files:/);
+        assert.deepEqual(helloWorkflow.filesModified, []);
+        const helloDecision = await readBrokerJson(await brokerFetch('/v1/workflows/approval/decision', {
+          brokerSessionId: helloLease.brokerSessionId,
+          sessionLeaseToken: helloLease.sessionLeaseToken,
+          proposalId: helloWorkflow.approval.proposalId,
+          proposalDigest: helloWorkflow.approval.proposalDigest,
+          approvalNonce: helloWorkflow.approval.approvalNonce,
+          approved: true,
+          deleteConfirmed: false,
+        }), 200);
+        helloResult = helloDecision.result;
+      }
+      assert.equal(helloResult.outcome, 'SUCCESS', JSON.stringify(helloResult));
+      assert.equal(helloResult.executionVerificationReceipt?.status, 'PASSED', JSON.stringify(helloResult));
+      assert.equal(helloResult.executionVerificationReceipt.behavioralTestSuite.status, 'EXECUTED & PASSED');
+      assert.match(helloResult.executionVerificationReceipt.message, /Detected Workspace Issues & Readiness Audit/);
+      assert.equal(helloResult.hermeticVerification?.passed, 9, JSON.stringify(helloResult));
+      assert.match(helloResult.message, /verified across 9\/9 hermetic gates/i);
+      assert.ok(helloResult.inspectedFiles.some((file) => file.path === 'package.json' && file.lineCount > 0));
+      assert.ok(helloResult.inspectedFiles.some((file) => file.path === 'controllers/orderController.js' && file.byteSize > 0));
+      assert.ok(helloResult.exploredDirectories.some((directory) => directory.path === 'tests'));
+      assert.ok(helloResult.engineeringSummary.some((item) => item.phase === 'Live verification'));
+      assert.match(helloResult.message, /GET \/orders interactive form -> 200/);
+      assert.ok(helloResult.executionVerificationReceipt.apiProbes.some((probe) => probe.statusCode === 201 && probe.passed));
+      assert.ok(helloResult.executionVerificationReceipt.apiProbes.some((probe) => probe.statusCode === 400 && probe.passed));
+      assert.ok(helloResult.executionVerificationReceipt.apiProbes.some((probe) => probe.statusCode === 500 && probe.passed));
+      assert.equal(helloResult.executionVerificationReceipt.apiProbes.length, 5);
+      assert.ok(helloResult.executionVerificationReceipt.apiProbes.every((probe) => probe.applicable && probe.passed));
+      assert.equal(helloResult.executionVerificationReceipt.collectionProbe.statusCode, 200);
+      assert.ok(helloResult.executionVerificationReceipt.uiProbes.some((probe) => probe.path === '/' && probe.statusCode === 200));
+      assert.ok(helloResult.executionVerificationReceipt.uiProbes.some((probe) => probe.path === '/orders' && probe.statusCode === 200));
+      assert.equal(await readFile(cloneManifestPath, 'utf8'), sourceManifest);
+      assert.equal(await readFile(path.join(helloWorkspaceSource, 'package.json'), 'utf8'), sourceManifest);
+      await brokerFetch('/v1/sessions/release', {
+        brokerSessionId: helloLease.brokerSessionId,
+        sessionLeaseToken: helloLease.sessionLeaseToken,
+      });
+    }
+    console.log('Exact current Hello workspace clone passed project-test verification in inline-review and autonomous modes.');
+  }
+  await attachSelectedWorkspace(populatedWorkspaceRoot);
+  const restoredRuntimeSync = await readBrokerJson(await brokerFetch('/v1/synchronize', {}), 200);
+  const restoredRuntimeProject = restoredRuntimeSync.projects.find(
+    (project) => project.projectId !== inlineRuntimeProject.projectId,
+  );
+  assert.ok(restoredRuntimeProject, 'The autonomous runtime-test workspace must be re-registered.');
+  const initialBrokerRuntimePlan = await deriveExistingProjectTestPlan(populatedWorkspaceRoot);
+  assert.ok(initialBrokerRuntimePlan?.isProjectRuntimeTest);
+  const brokerRuntimeModelModule = initialBrokerRuntimePlan.modulesToCreate.find(
+    (module) => /(?:^|\/)models\/order\.js$/i.test(module.path),
+  );
+  assert.ok(brokerRuntimeModelModule, 'The runtime plan must include the workspace Order model.');
+  const brokerRuntimeModelPath = path.join(populatedWorkspaceRoot, ...brokerRuntimeModelModule.path.split('/'));
+  const brokerRuntimeModel = await readFile(brokerRuntimeModelPath, 'utf8');
+  assert.match(brokerRuntimeModel, /return records\.map\(\(record\) => \(\{ \.\.\.record \}\)\);/);
+  const degradedBrokerRuntimeModel = brokerRuntimeModel.replace(
+    /return records\.map\(\(record\) => \(\{ \.\.\.record \}\)\);/,
+    'return [];',
+  );
+  assert.notEqual(degradedBrokerRuntimeModel, brokerRuntimeModel);
+  await writeFile(
+    brokerRuntimeModelPath,
+    degradedBrokerRuntimeModel,
+    'utf8',
+  );
+  const directBrokerRuntimePlan = await deriveExistingProjectTestPlan(populatedWorkspaceRoot);
+  assert.ok(directBrokerRuntimePlan?.isProjectRuntimeTest);
+  assert.equal(
+    directBrokerRuntimePlan.modulesToCreate.find((module) => module.path === brokerRuntimeModelModule.path).content,
+    degradedBrokerRuntimeModel,
+  );
+  const directBrokerRuntimeVerification = await runHermeticRegressionLoopWithRuntime(
+    directBrokerRuntimePlan,
+    { root: populatedWorkspaceRoot },
+  );
+  assert.equal(directBrokerRuntimeVerification.passed, 9, JSON.stringify(directBrokerRuntimeVerification));
+  assert.ok(directBrokerRuntimeVerification.regressionLoop.repairs.some((repair) => repair.includes('models/Order.js')));
+  const brokerRuntimeLease = await acquireLease(restoredRuntimeProject);
+  const brokerRuntimeResult = await runDecision(brokerRuntimeLease, 'autonomous', 'autonomous_auto_apply', {
+    userRequest: 'test the project',
+    targetWorkspace: populatedWorkspaceRoot,
+    minimumFilesModified: 2,
+  });
+  assert.equal(brokerRuntimeResult.result.outcome, 'SUCCESS', JSON.stringify(brokerRuntimeResult.result));
+  assert.equal(brokerRuntimeResult.result.hermeticVerification?.passed, 9);
+  assert.equal(brokerRuntimeResult.result.hermeticVerification?.total, 9);
+  assert.equal(brokerRuntimeResult.result.hermeticVerification?.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  assert.equal(brokerRuntimeResult.result.executionVerificationReceipt?.status, 'PASSED');
+  assert.ok(
+    brokerRuntimeResult.result.filesModified.includes(brokerRuntimeModelModule.path),
+    `Expected the failed persisted-list module to be repaired: ${JSON.stringify({
+      filesModified: brokerRuntimeResult.result.filesModified,
+      modelAfter: (await readFile(brokerRuntimeModelPath, 'utf8')).match(/function list\(\) \{[\s\S]*?\n\}/)?.[0],
+      taskFiles: brokerRuntimeResult.result.taskPlan?.files?.map((file) => file.path),
+      probes: brokerRuntimeResult.result.hermeticVerification?.runtimeVerification?.probes,
+      repairs: brokerRuntimeResult.result.hermeticVerification?.regressionLoop?.repairs,
+    })}`,
+  );
+  assert.match(brokerRuntimeResult.result.message, /verified across 9\/9 hermetic gates/);
+  assert.match(brokerRuntimeResult.result.message, /POST \/api\/orders -> 201 Created — PASS/);
+  assert.match(brokerRuntimeResult.result.message, /GET \/orders interactive form -> 200 — PASS/);
+  assert.equal(
+    JSON.parse(await readFile(brokerRuntimeManifestPath, 'utf8')).scripts.test,
+    'node tests/order.test.js',
+  );
+  assert.ok((await stat(path.join(populatedWorkspaceRoot, 'tests', 'order.test.js'))).isFile());
+  assert.doesNotMatch(brokerRuntimeResult.result.message, /no real test suite beyond a syntax check|No test files are present/i);
+  await brokerFetch('/v1/sessions/release', {
+    brokerSessionId: brokerRuntimeLease.brokerSessionId,
+    sessionLeaseToken: brokerRuntimeLease.sessionLeaseToken,
+  });
+  const brokerRepeatLease = await acquireLease(restoredRuntimeProject);
+  const brokerRepeatResult = await runDecision(brokerRepeatLease, 'autonomous', 'autonomous_auto_apply', {
+    userRequest: 'est the project',
+    targetWorkspace: populatedWorkspaceRoot,
+    expectNoChanges: true,
+  });
+  assert.equal(brokerRepeatResult.result.outcome, 'SUCCESS', JSON.stringify(brokerRepeatResult.result));
+  assert.equal(brokerRepeatResult.result.hermeticVerification?.passed, 9);
+  assert.equal(brokerRepeatResult.result.executionVerificationReceipt?.status, 'PASSED');
+  assert.equal(brokerRepeatResult.result.hermeticVerification.runtimeVerification.executionMode, 'IN_PROCESS_HTTP_LOOPBACK');
+  assert.deepEqual(brokerRepeatResult.result.filesModified, []);
+  assert.match(brokerRepeatResult.result.message, /verified across 9\/9 hermetic gates/);
+  await brokerFetch('/v1/sessions/release', {
+    brokerSessionId: brokerRepeatLease.brokerSessionId,
+    sessionLeaseToken: brokerRepeatLease.sessionLeaseToken,
+  });
   console.log('Populated Windows-style stub workspace passed explicit approval and repeated autonomous workflows through /v1/workflows.');
   console.log('Standalone broker host integration passed (production developerAgent proposal, inline reject/approve, materialization, and verification; backend policy/registry endpoints are isolated fixtures).');
 } finally {

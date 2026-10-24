@@ -85,16 +85,21 @@ assert.match(boundedPriorAnalysis, /duplicate query \| inspect the controller/, 
 const followUp = 'is fix ka proposal banao';
 const compactedFollowUp = compactCodingConversation({
   messages: [
-    { role: 'user', content: 'query repeat issue identify karo' },
-    { role: 'assistant', content: `${longPriorAnalysis}${longPriorAnalysis}` },
+    { role: 'user', content: 'query repeat issue identify karo\n\nWorkspace resolution: KEEP_AND_SCAFFOLD' },
+    { role: 'assistant', content: `${longPriorAnalysis}\n\nWorkspace resolution: KEEP_AND_SCAFFOLD${longPriorAnalysis}` },
     { role: 'user', content: followUp },
   ],
   projectRoot: path.join(process.cwd(), '.synthetic-test-repo'),
+  providerNeutralSummary: 'Earlier run selected a scaffolded layout.\nWorkspace resolution: KEEP_AND_SCAFFOLD',
 }, { maxTokens: 512, lastMessageCount: 4 });
 assert.equal(
   compactedFollowUp.messages.at(-1)?.content,
   followUp,
   'Conversation compaction must retain the current short follow-up request intact.',
+);
+assert.ok(
+  compactedFollowUp.messages.every((message) => !/Workspace resolution\s*:\s*KEEP_AND_SCAFFOLD/i.test(message.content)),
+  'Historical resolution choices must not leak into provider conversation payloads.',
 );
 assert.equal(
   latestCodingUserRequest([...compactedFollowUp.messages, { role: 'assistant', content: 'Trailing context should not replace the user request.' }]),

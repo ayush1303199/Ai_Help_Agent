@@ -9,7 +9,12 @@ import {
   finalizeCodingActivities,
   parseCodingActivityEvent,
   upsertCodingActivity,
+  buildProjectRuntimeInspectionActivities,
   classifyCodingRequestIntent,
+  isProjectRuntimeTestRequest,
+  formatProjectRuntimeTestCompletionMessage,
+  formatProjectRuntimeTestReceiptMessage,
+  normalizeProjectRuntimeTestWorkflowResult,
   shouldRequireDeveloperWorkflowForAttachedProject,
   type CodingActivity,
   type CodingProviderRecovery,
@@ -795,8 +800,13 @@ export function useCodingAgentController({
     repairContext?: { repairToken: string; attemptNumber: number; maxAttempts: number; attemptLabel: string },
     continuationToken?: string,
     resumeProviderTask = false,
+    workspaceResolution?: 'UPDATE_AND_INTEGRATE' | 'REPLACE_TARGETS' | 'KEEP_AND_SCAFFOLD',
   ) => {
-    const question = (overrideQuestion ?? input).trim();
+    const requestText = (overrideQuestion ?? input).trim();
+    if (!workspaceResolution) setClarificationAction(null);
+    const question = workspaceResolution
+      ? `${requestText}\n\nWorkspace resolution: ${workspaceResolution}`
+      : requestText;
     if (!question || streaming || busy) return;
     let currentProjectRoot = projectRoot;
     let currentScope = path;
@@ -986,6 +996,7 @@ export function useCodingAgentController({
 
 
     const classification = classifyCodingRequestIntent(question);
+    const isRuntimeProjectTest = isProjectRuntimeTestRequest(question);
     const requiresBrowserBrokerWorkflow = !window.electronAPI?.executeDeveloperWorkflow
       && shouldRequireDeveloperWorkflowForAttachedProject({
         intent: classification.intent,
@@ -1012,9 +1023,9 @@ export function useCodingAgentController({
     }
 
     // 2. If in desktop mode with electronAPI and the intent is an actionable coding task / investigation
-    if (!resumeProviderTask
-      && !repairContext
-      && (continuationToken || classification.intent === 'AUTONOMOUS_WORKFLOW_TASK')
+    if ((!resumeProviderTask || isRuntimeProjectTest)
+      && (!repairContext || isRuntimeProjectTest)
+      && (isRuntimeProjectTest || continuationToken || classification.intent === 'AUTONOMOUS_WORKFLOW_TASK')
       && (window.electronAPI?.executeDeveloperWorkflow || requiresBrowserBrokerWorkflow)) {
       if (workflowExecutionInProgressRef.current) return;
       workflowExecutionInProgressRef.current = true;
@@ -1023,7 +1034,7 @@ export function useCodingAgentController({
         setWorkflowCanResume(false);
       }
       const requestId = crypto.randomUUID();
-      const userMessage: CodingMessage = { role: 'user', content: question };
+      const userMessage: CodingMessage = { role: 'user', content: requestText };
       const assistantMessage: CodingMessage = { role: 'assistant', content: '', streaming: true, requestId };
       setMessages((previous) => [...previous, userMessage, assistantMessage]);
       setInput('');
@@ -1042,17 +1053,17 @@ export function useCodingAgentController({
           message: 'Starting the authorized autonomous coding workflow.',
         }));
 
-        const result = window.electronAPI?.executeDeveloperWorkflow
+        const result = normalizeProjectRuntimeTestWorkflowResult(question, await (window.electronAPI?.executeDeveloperWorkflow
           && executionSettings.executionMode === 'inline_review'
-          ? await window.electronAPI.executeDeveloperWorkflow({
+          ? window.electronAPI.executeDeveloperWorkflow({
             userRequest: question,
             scope: currentScope,
             workflowRequestId: requestId,
-            continuationToken,
+            continuationToken: isRuntimeProjectTest ? undefined : continuationToken,
             autoRepairEnabled: autoRepairChoice,
             maxRepairAttempts: 2,
           })
-          : await executeTrustedBrokerWorkflow(
+          : executeTrustedBrokerWorkflow(
             question,
             currentScope,
             workflowAbortController.signal,
@@ -1119,10 +1130,33 @@ export function useCodingAgentController({
                 },
                 timestamp: new Date().toISOString(),
               }));
+              const inspectionActivities = buildProjectRuntimeInspectionActivities(requestId, {
+                outcome: 'AWAITING_APPROVAL',
+                executionVerificationReceipt: approval.executionVerificationReceipt,
+                hermeticVerification: approval.hermeticVerification,
+                inspectedFiles: approval.inspectedFiles,
+                exploredDirectories: approval.exploredDirectories,
+                engineeringSummary: approval.engineeringSummary,
+              });
+              if (inspectionActivities.length) {
+                setActivity((previous) => inspectionActivities.reduce(
+                  (current, item) => upsertCodingActivity(current, item),
+                  previous,
+                ));
+              }
               setMessages((previous) => previous.map((message) => message.requestId === requestId
                 ? {
                     ...message,
-                    content: `Proposal ${approval.proposalId} is ready for review. No files have been written.\n\nProposal digest: ${approval.proposalDigest}`,
+                    content: `Proposal ${approval.proposalId} is ready for review. No files have been written.\n\nProposal digest: ${approval.proposalDigest}${approval.executionVerificationReceipt?.status === 'PASSED' && (
+                      approval.executionVerificationReceipt.message
+                      || approval.executionVerificationReceipt.workspaceAudit
+                      || approval.hermeticVerification?.workspaceAudit
+                    )
+                      ? `\n\nCandidate verification (pre-approval):\n${formatProjectRuntimeTestReceiptMessage(
+                        approval.executionVerificationReceipt.message,
+                        approval.executionVerificationReceipt.workspaceAudit || approval.hermeticVerification?.workspaceAudit,
+                      )}`
+                      : ''}`,
                     streaming: false,
                   }
                 : message));
@@ -1135,8 +1169,17 @@ export function useCodingAgentController({
               executionMode: executionSettings.executionMode,
               autoAuthorizeAttachedProject: executionSettings.autoAuthorizeAttachedProject,
             },
-          );
+          )));
 
+        if (isRuntimeProjectTest) {
+          const inspectionActivities = buildProjectRuntimeInspectionActivities(requestId, result);
+          if (inspectionActivities.length) {
+            setActivity((previous) => inspectionActivities.reduce(
+              (current, item) => upsertCodingActivity(current, item),
+              previous,
+            ));
+          }
+        }
         browserBrokerApprovalRef.current = null;
         if (result.outcome === 'SUCCESS' && Array.isArray(result.filesModified)) {
           setAppliedPatchLog((previous) => [...previous, {
@@ -1233,7 +1276,45 @@ export function useCodingAgentController({
             : '';
           outcomeContent = `${result.message || 'The investigation is incomplete; no root cause is supported by inspected evidence.'}${continuationDetail}`;
         } else if (result.outcome === 'SUCCESS') {
-          outcomeContent = `${result.message || 'Autonomous coding workflow completed successfully.'}\n\nModified files:\n${result.filesModified.map((f: string) => `- \`${f}\``).join('\n')}`;
+          const receipt = result.executionVerificationReceipt
+            || result.verificationReport?.executionVerificationReceipt
+            || result.workflowReceipt?.verificationReport?.executionVerificationReceipt;
+          outcomeContent = isRuntimeProjectTest
+            ? formatProjectRuntimeTestCompletionMessage(
+              result.message,
+              receipt?.workspaceAudit || result.hermeticVerification?.workspaceAudit || result.workspaceAudit,
+              result.filesModified,
+              receipt?.detectedWorkspaceIssues
+                || result.hermeticVerification?.detectedWorkspaceIssues
+                || result.detectedWorkspaceIssues,
+              {
+                inspectedFiles: result.inspectedFiles?.length
+                  ? result.inspectedFiles
+                  : receipt?.inspectedFiles?.length
+                    ? receipt.inspectedFiles
+                    : result.hermeticVerification?.workspaceAudit?.inspectedFiles
+                      || result.workspaceAudit?.inspectedFiles,
+                exploredDirectories: result.exploredDirectories?.length
+                  ? result.exploredDirectories
+                  : receipt?.exploredDirectories?.length
+                    ? receipt.exploredDirectories
+                    : result.hermeticVerification?.workspaceAudit?.exploredDirectories
+                      || result.workspaceAudit?.exploredDirectories,
+                engineeringSummary: result.engineeringSummary?.length
+                  ? result.engineeringSummary
+                  : receipt?.engineeringSummary?.length
+                    ? receipt.engineeringSummary
+                    : result.hermeticVerification?.workspaceAudit?.engineeringSummary
+                      || result.workspaceAudit?.engineeringSummary,
+                engineeringAnalysis: result.engineeringAnalysis?.length
+                  ? result.engineeringAnalysis
+                  : receipt?.engineeringAnalysis?.length
+                    ? receipt.engineeringAnalysis
+                    : result.hermeticVerification?.workspaceAudit?.engineeringAnalysis
+                      || result.workspaceAudit?.engineeringAnalysis,
+              },
+            )
+            : `${result.message || 'Autonomous coding workflow completed successfully.'}\n\nModified files:\n${result.filesModified.map((f: string) => `- \`${f}\``).join('\n')}`;
           setAppliedPatchLog((previous) => [
             ...previous,
             {
@@ -1256,18 +1337,34 @@ export function useCodingAgentController({
               verification: result.workflowReceipt?.verificationReport?.verificationMode || 'PASS',
             },
           ]);
-        } else if (['VERIFICATION_UNAVAILABLE', 'VERIFICATION_BLOCKED', 'TEST_FAILED', 'APPLY_FAILED'].includes(result.outcome)) {
+        } else if ([
+          'VERIFICATION_UNAVAILABLE',
+          'VERIFICATION_BLOCKED',
+          'HERMETIC_VERIFICATION_FAILED',
+          'RUNTIME_VERIFICATION_INCOMPLETE',
+          'RUNTIME_VERIFICATION_UNSUPPORTED',
+          'TEST_FAILED',
+          'APPLY_FAILED',
+        ].includes(result.outcome)) {
           const rollbackStatus = result.rollbackFailed
             ? `Rollback could not be verified; changes may remain in: ${Array.isArray(result.filesModified) && result.filesModified.length
               ? result.filesModified.join(', ')
               : 'the approved target'}.`
-            : 'All changes were rolled back to preserve the repository.';
+            : result.rolledBack === true
+              ? 'All changes were rolled back to preserve the repository.'
+              : 'No rollback was reported; repository changes may remain.';
           if (result.outcome === 'VERIFICATION_UNAVAILABLE') {
             outcomeContent = `Verification runner was unavailable or offline. ${rollbackStatus} Completion cannot be verified.`;
           } else if (result.outcome === 'VERIFICATION_BLOCKED') {
             outcomeContent = `Verification was blocked (${result.verificationStatus || 'host evidence not established'}). ${rollbackStatus} Completion cannot be verified.`;
           } else if (result.outcome === 'TEST_FAILED') {
             outcomeContent = `Verification checks failed after applying the proposed patch. ${rollbackStatus}`;
+          } else if ([
+            'HERMETIC_VERIFICATION_FAILED',
+            'RUNTIME_VERIFICATION_INCOMPLETE',
+            'RUNTIME_VERIFICATION_UNSUPPORTED',
+          ].includes(result.outcome)) {
+            outcomeContent = `${result.message || result.error || 'Project runtime verification did not establish a passing result.'} ${rollbackStatus}`;
           } else {
             outcomeContent = result.rollbackFailed
               ? `Applying the proposed patch failed. ${rollbackStatus}`
@@ -1334,7 +1431,7 @@ export function useCodingAgentController({
     }
 
     const requestId = implementationHandoffRequestId || crypto.randomUUID();
-    const userMessage: CodingMessage = { role: 'user', content: question };
+    const userMessage: CodingMessage = { role: 'user', content: requestText };
     const assistantMessage: CodingMessage = { role: 'assistant', content: '', streaming: true, requestId };
 
     const compactedSession = compactCodingConversation({
@@ -1372,6 +1469,12 @@ export function useCodingAgentController({
       });
     }
     if (projectContinuation) conversationHistory[conversationHistory.length - 1] = { role: 'user', content: projectContinuation };
+    if (workspaceResolution) {
+      const latestMessage = conversationHistory[conversationHistory.length - 1];
+      if (latestMessage?.role === 'user') {
+        latestMessage.content = `${latestMessage.content}\n\nWorkspace resolution: ${workspaceResolution}`;
+      }
+    }
     const preferencesContext = codingPreferenceContext(preferences);
     if (preferencesContext) conversationHistory.unshift({ role: 'assistant', content: `[CODING_STYLE_PREFERENCES]\n${preferencesContext}` });
     if (!implementationHandoffRequestId) {
@@ -1688,21 +1791,21 @@ export function useCodingAgentController({
         setProjectRoot(null);
         setDirectory([]);
         setPath('.');
-        setInput(question);
+        setInput(requestText);
         userFacingError = 'The project folder could not be found on disk (PROJECT_MISSING). Select an existing folder under Advanced.';
         onError(userFacingError);
       } else if (isDetached) {
         setProjectRoot(null);
         setDirectory([]);
         setPath('.');
-        setInput(question);
+        setInput(requestText);
         userFacingError = 'The project was detached (PROJECT_DETACHED). Select a folder under Advanced, then resend your question.';
         onError(userFacingError);
       } else if (isNotAttached) {
         setProjectRoot(null);
         setDirectory([]);
         setPath('.');
-        setInput(question);
+        setInput(requestText);
         userFacingError = 'No project is currently attached to this desktop window (PROJECT_NOT_ATTACHED). Select a folder under Advanced, then resend your question.';
         onError(userFacingError);
       } else if (isStale) {
@@ -2548,9 +2651,9 @@ export function useCodingAgentController({
     resolution: 'UPDATE_AND_INTEGRATE' | 'REPLACE_TARGETS' | 'KEEP_AND_SCAFFOLD',
   ) => {
     if (!clarificationAction || busy || streaming) return;
-    const request = `${clarificationAction.request}\n\nWorkspace resolution: ${resolution}`;
+    const request = clarificationAction.request;
     setClarificationAction(null);
-    void sendMessage(request);
+    void sendMessage(request, 0, undefined, undefined, false, resolution);
   };
 
   return {

@@ -9,6 +9,7 @@ const {
   diagnosticSnapshot,
   resolveInlineApproval,
 } = require('./inlineInteractionEngine.cjs');
+const { isProjectRuntimeTestRequest } = require('./projectRuntimeTestIntent.cjs');
 
 const DEFAULT_SESSION_TTL_MS = 5 * 60 * 1000;
 const MAX_REQUEST_BYTES = 256 * 1024;
@@ -240,6 +241,7 @@ class TrustedLocalDesktopBroker {
     if (typeof userRequest !== 'string' || !userRequest.trim() || userRequest.length > 20000) {
       throw brokerError('BROKER_INVALID_REQUEST', 'A bounded actionable request is required.', 400);
     }
+    const requiresRuntimeTestReceipt = isProjectRuntimeTestRequest(userRequest);
     const normalizedScope = this.validateScope(scope);
     if (!['inline_review', 'autonomous_auto_apply'].includes(executionMode)) {
       throw brokerError('BROKER_INVALID_REQUEST', 'The requested execution mode is not supported.', 400);
@@ -269,6 +271,27 @@ class TrustedLocalDesktopBroker {
           requestApproval: (approval) => this.requestBoundApproval(lease, approval),
           authorizeMutation: (request) => this.authorizeMutation(lease, request),
         });
+        if (requiresRuntimeTestReceipt
+          && ['SUCCESS', 'COMPLETED', 'INVESTIGATION_COMPLETE'].includes(result?.outcome)
+          && result.executionVerificationReceipt?.status !== 'PASSED') {
+          const failedGates = Array.isArray(result.hermeticVerification?.gates)
+            ? result.hermeticVerification.gates.filter((gate) => gate.passed !== true)
+            : [];
+          const gateDiagnostics = failedGates.flatMap((gate) => {
+            const diagnostics = Array.isArray(gate.diagnostics) ? gate.diagnostics : [];
+            return diagnostics.length
+              ? diagnostics.map((item) => `${gate.id}${item.path ? ` @ ${item.path}` : ''}: ${item.reason || item.message || JSON.stringify(item)}`)
+              : [`${gate.id}: ${typeof gate.evidence === 'string' ? gate.evidence : JSON.stringify(gate.evidence)}`];
+          });
+          return {
+            ...result,
+            outcome: failedGates.length ? 'HERMETIC_VERIFICATION_FAILED' : 'RUNTIME_VERIFICATION_INCOMPLETE',
+            codeVerified: false,
+            message: failedGates.length
+              ? `Project runtime verification failed (${result.hermeticVerification.passed}/${result.hermeticVerification.total} gates): ${gateDiagnostics.join('; ')}`
+              : 'Project runtime verification did not return a complete passing live loopback receipt; no test success is claimed.',
+          };
+        }
         if (lease.cancelled && result?.outcome === 'APPROVAL_REJECTED') {
           return {
             ...result,
@@ -277,6 +300,31 @@ class TrustedLocalDesktopBroker {
             codeApplied: false,
             codeVerified: false,
             message: 'The browser broker workflow was cancelled before file application.',
+          };
+        }
+        if (result?.executionVerificationReceipt?.status === 'PASSED'
+          && typeof result.executionVerificationReceipt.message === 'string') {
+          return {
+            ...result,
+            workspaceAudit: result.executionVerificationReceipt.workspaceAudit
+              || result.hermeticVerification?.workspaceAudit
+              || result.workspaceAudit
+              || null,
+            detectedWorkspaceIssues: result.executionVerificationReceipt.detectedWorkspaceIssues
+              || result.hermeticVerification?.detectedWorkspaceIssues
+              || result.detectedWorkspaceIssues
+              || [],
+            inspectedFiles: result.executionVerificationReceipt.inspectedFiles?.length
+              ? result.executionVerificationReceipt.inspectedFiles
+              : result.hermeticVerification?.workspaceAudit?.inspectedFiles || [],
+            exploredDirectories: result.executionVerificationReceipt.exploredDirectories?.length
+              ? result.executionVerificationReceipt.exploredDirectories
+              : result.hermeticVerification?.workspaceAudit?.exploredDirectories || [],
+            engineeringSummary: result.executionVerificationReceipt.engineeringSummary || [],
+            engineeringAnalysis: result.executionVerificationReceipt.engineeringAnalysis
+              || result.executionVerificationReceipt.engineeringSummary
+              || [],
+            message: result.executionVerificationReceipt.message,
           };
         }
         return result;
@@ -308,8 +356,28 @@ class TrustedLocalDesktopBroker {
       filesModified: [],
       codeApplied: false,
       codeVerified: false,
+      hermeticVerification: firstResult.approval.hermeticVerification,
+      executionVerificationReceipt: firstResult.approval.executionVerificationReceipt,
+      workspaceAudit: firstResult.approval.executionVerificationReceipt?.workspaceAudit
+        || firstResult.approval.hermeticVerification?.workspaceAudit
+        || null,
+      detectedWorkspaceIssues: firstResult.approval.executionVerificationReceipt?.detectedWorkspaceIssues
+        || firstResult.approval.hermeticVerification?.detectedWorkspaceIssues
+        || [],
+      inspectedFiles: firstResult.approval.inspectedFiles?.length
+        ? firstResult.approval.inspectedFiles
+        : firstResult.approval.executionVerificationReceipt?.inspectedFiles || [],
+      exploredDirectories: firstResult.approval.exploredDirectories?.length
+        ? firstResult.approval.exploredDirectories
+        : firstResult.approval.executionVerificationReceipt?.exploredDirectories || [],
+      engineeringSummary: firstResult.approval.engineeringSummary || [],
+      engineeringAnalysis: firstResult.approval.engineeringAnalysis
+        || firstResult.approval.engineeringSummary
+        || [],
       approval: firstResult.approval,
-      message: 'The proposal is staged for inline review; no files have been written.',
+      message: firstResult.approval.executionVerificationReceipt?.status === 'PASSED'
+        ? `${firstResult.approval.executionVerificationReceipt.message}\n\nThe proposal is staged for inline review; no files have been written.`
+        : 'The proposal is staged for inline review; no files have been written.',
     };
   }
 
@@ -407,6 +475,18 @@ class TrustedLocalDesktopBroker {
       projectId: lease.projectId,
       proposalId,
       proposalDigest,
+      hermeticVerification: proposalContract?.hermeticPreflight || null,
+      executionVerificationReceipt: proposalContract?.executionVerificationReceipt || null,
+      inspectedFiles: proposalContract?.executionVerificationReceipt?.inspectedFiles
+        || proposalContract?.hermeticPreflight?.workspaceAudit?.inspectedFiles
+        || [],
+      exploredDirectories: proposalContract?.executionVerificationReceipt?.exploredDirectories
+        || proposalContract?.hermeticPreflight?.workspaceAudit?.exploredDirectories
+        || [],
+      engineeringSummary: proposalContract?.executionVerificationReceipt?.engineeringSummary || [],
+      engineeringAnalysis: proposalContract?.executionVerificationReceipt?.engineeringAnalysis
+        || proposalContract?.executionVerificationReceipt?.engineeringSummary
+        || [],
       fileOperations: proposal.files.map((file) => ({
         path: file.path,
         sourcePath: file.sourcePath || null,
@@ -519,6 +599,12 @@ class TrustedLocalDesktopBroker {
         content,
       })),
       diff: approval.diff,
+      hermeticVerification: approval.hermeticVerification,
+      executionVerificationReceipt: approval.executionVerificationReceipt,
+      inspectedFiles: approval.inspectedFiles,
+      exploredDirectories: approval.exploredDirectories,
+      engineeringSummary: approval.engineeringSummary,
+      engineeringAnalysis: approval.engineeringAnalysis,
       transitions: [
         approval.envelope.debugTrace,
         diagnosticSnapshot(approval.envelope, 'AWAITING_INLINE_APPROVAL'),
@@ -544,6 +630,12 @@ class TrustedLocalDesktopBroker {
       deleteConfirmationRequired: pending.deleteConfirmationRequired,
       fileOperations: pending.fileOperations,
       diff: pending.diff,
+      hermeticVerification: pending.hermeticVerification,
+      executionVerificationReceipt: pending.executionVerificationReceipt,
+      inspectedFiles: pending.inspectedFiles,
+      exploredDirectories: pending.exploredDirectories,
+      engineeringSummary: pending.engineeringSummary,
+      engineeringAnalysis: pending.engineeringAnalysis,
       envelope: pending.envelope,
       transitions: pending.transitions,
     };

@@ -116,6 +116,7 @@ function CodingActivityEntry({ item }: { item: CodingActivity }) {
     result?.count !== undefined ? `${result.count} results` : undefined,
     result?.rowCount !== undefined ? `${result.rowCount} rows` : undefined,
     result?.lineCount !== undefined ? `${result.lineCount} lines` : undefined,
+    result?.byteSize !== undefined ? `${result.byteSize} bytes` : undefined,
     result?.sourceContextTruncated ? 'provider context excerpted' : undefined,
     result?.databaseType,
     result?.executionStatus,
@@ -914,6 +915,13 @@ export function CodingAgentWorkspace({
           )}
           {message.role === 'assistant' && messageIndex === messages.length - 1 && (activity.length > 0 || busy || streaming) && (() => {
             const narrationItems = activity.filter(isCodingNarration);
+            const hasEngineeringEvidence = narrationItems.some((item) => (
+              item.phase === 'Workspace topology'
+              || item.phase === 'Cross-file contract'
+              || item.phase === 'Environment and drift'
+              || item.phase === 'Verification plan'
+              || item.phase === 'Live verification'
+            ));
             const toolItems = activity.filter((item, idx, arr) => {
               if (!('event' in item)) return false;
               if (idx === 0) return true;
@@ -958,12 +966,14 @@ export function CodingAgentWorkspace({
                 {narrationItems.length > 0 && (
                   <details
                     className="group rounded-lg border border-slate-800 bg-slate-950/60 transition-colors hover:border-slate-700/80"
-                    open={Boolean((busy || streaming) && !message.content)}
+                    open={hasEngineeringEvidence || Boolean((busy || streaming) && !message.content)}
                   >
                     <summary className="flex cursor-pointer select-none items-center justify-between px-3 py-2 text-xs font-medium text-slate-300 hover:text-sky-200">
                       <span className="flex items-center gap-2">
                         <span>🧠</span>
-                        <span className="font-semibold text-slate-200">Thinking Process</span>
+                        <span className="font-semibold text-slate-200">
+                          {hasEngineeringEvidence ? 'Engineering Analysis & Inspected Files' : 'Thinking Process'}
+                        </span>
                         <span className="font-normal text-[10px] text-slate-500">
                           ({narrationItems.length} {narrationItems.length === 1 ? 'step' : 'steps'})
                         </span>

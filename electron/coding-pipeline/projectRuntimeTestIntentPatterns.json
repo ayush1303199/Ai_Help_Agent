@@ -1,0 +1,9 @@
+{
+  "patterns": [
+    "^est\\s+(?:the\\s+)?(?:project|app|application|server|api|routes?)$",
+    "^(?:run\\s+(?:the\\s+)?tests?|(?:test|verify|check)\\s+(?:(?:the|my|this|our)\\s+)?(?:project|app|application|server(?:\\.js)?|api|routes?|it|this|that))(?:\\s+(?:now|please|for me|works?|working|running))?$",
+    "^check\\s+if\\s+(?:(?:the|my|this|our)\\s+)?(?:project|app|application|server|api|routes?)\\s+(?:works?|is\\s+working|is\\s+running)$",
+    "^is\\s+(?:(?:the|my|this|our)\\s+)?(?:project|app|application|server|api|routes?)\\s+(?:working|running|operational|up)$",
+    "^(?:test|st)\\s+(?:the\\s+)?my\\s+project\\b[\\s\\S]{0,60}\\b(?:working|wroking|work|now)$"
+  ]
+}

@@ -167,6 +167,13 @@ export function compactCodingMessageContent(content: string, maxChars: number) {
   return `${content.slice(0, headChars)}${marker}${tailChars ? content.slice(-tailChars) : ''}`;
 }
 
+export function stripHistoricalWorkspaceResolution(content: string) {
+  return content
+    .replace(/^[ \t]*Workspace resolution\s*:\s*(?:UPDATE_AND_INTEGRATE|REPLACE_TARGETS|KEEP_AND_SCAFFOLD)\.?[ \t]*$/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 export function compactCodingConversation(
   session: Pick<CodingConversationState, 'messages' | 'projectRoot' | 'pendingPlan' | 'appliedPatchLog' | 'providerNeutralSummary'>,
   options: { maxTokens?: number; lastMessageCount?: number } = {},
@@ -179,13 +186,20 @@ export function compactCodingConversation(
   const maxTokens = Math.max(minContextTokens, Math.min(options.maxTokens || defaultContextTokens, maxContextTokens));
   const lastMessageCount = Math.max(minRecentMessages, Math.min(options.lastMessageCount || defaultRecentMessages, maxRecentMessages));
   const estimate = (value: string) => Math.ceil(value.length / 4);
-  const rawMessages = session.messages.map((message) => ({ role: message.role, content: message.content }));
+  const latestUserIndex = session.messages.reduce(
+    (latestIndex, message, index) => message.role === 'user' ? index : latestIndex,
+    -1,
+  );
+  const rawMessages = session.messages.map((message, index) => ({
+    role: message.role,
+    content: index === latestUserIndex ? message.content : stripHistoricalWorkspaceResolution(message.content),
+  }));
   const rawTokens = rawMessages.reduce((total, message) => total + estimate(message.content), 0);
   const recent = rawMessages.slice(-lastMessageCount);
-  const summary = String(session.providerNeutralSummary || rawMessages
+  const summary = stripHistoricalWorkspaceResolution(String(session.providerNeutralSummary || rawMessages
     .slice(0, -lastMessageCount)
     .map((message) => `${message.role}: ${message.content}`)
-    .join('\n').slice(0, maxStoredContextChars) || 'No earlier Coding Agent context.');
+    .join('\n').slice(0, maxStoredContextChars) || 'No earlier Coding Agent context.'));
   const durableContext = [
     `Project root: ${session.projectRoot || 'not selected'}`,
     `Pending plan: ${JSON.stringify(session.pendingPlan || null)}`,

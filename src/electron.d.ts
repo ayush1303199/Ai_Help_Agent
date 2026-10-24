@@ -1,3 +1,19 @@
+interface DeveloperInspectedFile {
+  path: string;
+  lineCount: number;
+  byteSize: number;
+}
+
+interface DeveloperExploredDirectory {
+  path: string;
+  entryCount: number;
+}
+
+interface DeveloperEngineeringSummary {
+  phase: string;
+  summary: string;
+}
+
 interface GeneralTaskState {
   taskId: string;
   sessionId: string;
@@ -400,12 +416,118 @@ interface Window {
       filesModified: string[];
       codeApplied?: boolean;
       codeVerified?: boolean;
+      rolledBack?: boolean;
       verificationStatus?: string;
+      inspectedFiles?: DeveloperInspectedFile[];
+      exploredDirectories?: DeveloperExploredDirectory[];
+      engineeringSummary?: DeveloperEngineeringSummary[];
+      engineeringAnalysis?: DeveloperEngineeringSummary[];
+      workspaceAudit?: {
+        findings?: Array<{ message?: string } | string>;
+        bugs?: Array<{ path?: string; line?: number | null; description?: string }>;
+        syncPlan?: Array<{ path?: string; action?: string; reason?: string }>;
+        dependencies?: { declared?: string[]; nodeModulesPresent?: boolean };
+        environment?: { envExamplePresent?: boolean; envFilePresent?: boolean; jsxFiles?: string[] };
+        inspectedPaths?: string[];
+        inspectedFiles?: DeveloperInspectedFile[];
+        exploredDirectories?: DeveloperExploredDirectory[];
+        engineeringSummary?: DeveloperEngineeringSummary[];
+        engineeringAnalysis?: DeveloperEngineeringSummary[];
+      } | null;
+      detectedWorkspaceIssues?: Array<{ message?: string } | string>;
+      hermeticVerification?: {
+        passed?: number;
+        total?: number;
+        workspaceAudit?: {
+          findings?: Array<{ message?: string } | string>;
+          bugs?: Array<{ path?: string; line?: number | null; description?: string }>;
+          syncPlan?: Array<{ path?: string; action?: string; reason?: string }>;
+          dependencies?: { declared?: string[]; nodeModulesPresent?: boolean };
+          environment?: { envExamplePresent?: boolean; envFilePresent?: boolean; jsxFiles?: string[] };
+          inspectedPaths?: string[];
+          inspectedFiles?: DeveloperInspectedFile[];
+          exploredDirectories?: DeveloperExploredDirectory[];
+          engineeringSummary?: DeveloperEngineeringSummary[];
+          engineeringAnalysis?: DeveloperEngineeringSummary[];
+        } | null;
+        detectedWorkspaceIssues?: Array<{ message?: string } | string>;
+        inspectedFiles?: DeveloperInspectedFile[];
+        exploredDirectories?: DeveloperExploredDirectory[];
+        engineeringSummary?: DeveloperEngineeringSummary[];
+        engineeringAnalysis?: DeveloperEngineeringSummary[];
+      } | null;
+      executionVerificationReceipt?: {
+        status: string;
+        message: string;
+        probes?: Array<Record<string, unknown>>;
+        workspaceAudit?: {
+          findings?: Array<{ message?: string } | string>;
+          bugs?: Array<{ path?: string; line?: number | null; description?: string }>;
+          syncPlan?: Array<{ path?: string; action?: string; reason?: string }>;
+          dependencies?: { declared?: string[]; nodeModulesPresent?: boolean };
+          environment?: { envExamplePresent?: boolean; envFilePresent?: boolean; jsxFiles?: string[] };
+          inspectedPaths?: string[];
+          inspectedFiles?: DeveloperInspectedFile[];
+          exploredDirectories?: DeveloperExploredDirectory[];
+          engineeringSummary?: DeveloperEngineeringSummary[];
+          engineeringAnalysis?: DeveloperEngineeringSummary[];
+        } | null;
+        detectedWorkspaceIssues?: Array<{ message?: string } | string>;
+        inspectedFiles?: DeveloperInspectedFile[];
+        exploredDirectories?: DeveloperExploredDirectory[];
+        engineeringSummary?: DeveloperEngineeringSummary[];
+        engineeringAnalysis?: DeveloperEngineeringSummary[];
+      } | null;
+      verificationReport?: {
+        executionVerificationReceipt?: {
+          status: string;
+          message: string;
+          workspaceAudit?: {
+            findings?: Array<{ message?: string } | string>;
+            bugs?: Array<{ path?: string; line?: number | null; description?: string }>;
+            syncPlan?: Array<{ path?: string; action?: string; reason?: string }>;
+            dependencies?: { declared?: string[]; nodeModulesPresent?: boolean };
+            environment?: { envExamplePresent?: boolean; envFilePresent?: boolean; jsxFiles?: string[] };
+            inspectedPaths?: string[];
+            inspectedFiles?: DeveloperInspectedFile[];
+            exploredDirectories?: DeveloperExploredDirectory[];
+            engineeringSummary?: DeveloperEngineeringSummary[];
+            engineeringAnalysis?: DeveloperEngineeringSummary[];
+          } | null;
+          detectedWorkspaceIssues?: Array<{ message?: string } | string>;
+          inspectedFiles?: DeveloperInspectedFile[];
+          exploredDirectories?: DeveloperExploredDirectory[];
+          engineeringSummary?: DeveloperEngineeringSummary[];
+          engineeringAnalysis?: DeveloperEngineeringSummary[];
+        } | null;
+      } | null;
       hostExecution?: { status: string; reason: string | null } | null;
       workflowReceipt?: {
         verificationReport?: {
           verificationMode?: string;
           hostExecution?: { status: string; reason: string | null } | null;
+          executionVerificationReceipt?: {
+            status: string;
+            message: string;
+            probes?: Array<Record<string, unknown>>;
+            workspaceAudit?: {
+              findings?: Array<{ message?: string } | string>;
+              bugs?: Array<{ path?: string; line?: number | null; description?: string }>;
+              syncPlan?: Array<{ path?: string; action?: string; reason?: string }>;
+              dependencies?: { declared?: string[]; nodeModulesPresent?: boolean };
+              environment?: { envExamplePresent?: boolean; envFilePresent?: boolean; jsxFiles?: string[] };
+              inspectedPaths?: string[];
+              inspectedFiles?: DeveloperInspectedFile[];
+              exploredDirectories?: DeveloperExploredDirectory[];
+              engineeringSummary?: DeveloperEngineeringSummary[];
+              engineeringAnalysis?: DeveloperEngineeringSummary[];
+            } | null;
+            detectedWorkspaceIssues?: Array<{ message?: string } | string>;
+            inspectedFiles?: DeveloperInspectedFile[];
+            exploredDirectories?: DeveloperExploredDirectory[];
+            engineeringSummary?: DeveloperEngineeringSummary[];
+            engineeringAnalysis?: DeveloperEngineeringSummary[];
+          } | null;
           integrationVerification?: {
             status?: string;
             liveProbePerformed?: boolean;

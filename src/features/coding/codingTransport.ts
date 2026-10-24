@@ -1,5 +1,6 @@
 import { runtimeConfig } from '../../config/runtimeConfig.ts';
 import type { CodingExecutionMode } from './codingExecutionSettings.ts';
+import runtimeTestIntentPatterns from '../../../electron/coding-pipeline/projectRuntimeTestIntentPatterns.json' with { type: 'json' };
 import {
   parseCodingActivityEvent,
   type CodingActivity,
@@ -20,6 +21,20 @@ export type {
   CodingActivityStatus,
   CodingActivityType,
 } from './codingActivity';
+
+export function isProjectRuntimeTestRequest(requestText: string): boolean {
+  const text = String(requestText || '')
+    .trim()
+    .replace(/\s*\n+\s*Workspace resolution:\s*(?:UPDATE_AND_INTEGRATE|REPLACE_TARGETS|KEEP_AND_SCAFFOLD)\.?\s*$/i, '')
+    .trim()
+    .replace(/[.!?]+$/g, '')
+    .replace(/\s+/g, ' ');
+  if (!text) return false;
+  const command = text.replace(/^(?:(?:please|can you|could you|would you|will you)\s+)+/i, '');
+  return runtimeTestIntentPatterns.patterns.some((pattern) => (
+    new RegExp(pattern, 'i').test(command) || new RegExp(pattern, 'i').test(text)
+  ));
+}
 
 export function latestCodingUserRequest(messages: Array<{ role: 'user' | 'assistant'; content: string }>) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -231,6 +246,12 @@ export interface TrustedBrokerPendingApproval {
     content: string | null;
   }>;
   diff: string;
+  hermeticVerification?: ProjectRuntimeTestWorkflowResult['hermeticVerification'];
+  executionVerificationReceipt?: ProjectRuntimeTestWorkflowResult['executionVerificationReceipt'];
+  inspectedFiles?: ProjectRuntimeInspectedFile[];
+  exploredDirectories?: ProjectRuntimeExploredDirectory[];
+  engineeringSummary?: ProjectRuntimeEngineeringSummary[];
+  engineeringAnalysis?: ProjectRuntimeEngineeringSummary[];
   envelope?: {
     proposalId: string;
     proposalDigest: string;
@@ -254,6 +275,349 @@ export interface TrustedBrokerPendingApproval {
 export interface TrustedBrokerApprovalActions {
   approve: (deleteConfirmed: boolean) => Promise<void>;
   reject: () => Promise<void>;
+}
+
+interface ProjectRuntimeTestWorkflowResult {
+  outcome: string;
+  codeVerified?: boolean;
+  message?: string;
+  rolledBack?: boolean;
+  workspaceAudit?: ProjectRuntimeWorkspaceAudit | null;
+  detectedWorkspaceIssues?: Array<{ message?: string } | string>;
+  inspectedFiles?: ProjectRuntimeInspectedFile[];
+  exploredDirectories?: ProjectRuntimeExploredDirectory[];
+  engineeringSummary?: ProjectRuntimeEngineeringSummary[];
+  engineeringAnalysis?: ProjectRuntimeEngineeringSummary[];
+  verificationReport?: {
+    executionVerificationReceipt?: ProjectRuntimeTestWorkflowResult['executionVerificationReceipt'];
+  } | null;
+  hermeticVerification?: {
+    passed?: number;
+    total?: number;
+    workspaceAudit?: ProjectRuntimeWorkspaceAudit | null;
+    detectedWorkspaceIssues?: Array<{ message?: string } | string>;
+    inspectedFiles?: ProjectRuntimeInspectedFile[];
+    exploredDirectories?: ProjectRuntimeExploredDirectory[];
+    engineeringSummary?: ProjectRuntimeEngineeringSummary[];
+    engineeringAnalysis?: ProjectRuntimeEngineeringSummary[];
+    gates?: Array<{
+      id?: string;
+      passed?: boolean;
+      evidence?: unknown;
+      diagnostics?: Array<{ path?: string; reason?: string; message?: string }>;
+    }>;
+  } | null;
+  executionVerificationReceipt?: {
+    status?: string;
+    message?: string;
+    workspaceAudit?: ProjectRuntimeWorkspaceAudit | null;
+    detectedWorkspaceIssues?: Array<{ message?: string } | string>;
+    inspectedFiles?: ProjectRuntimeInspectedFile[];
+    exploredDirectories?: ProjectRuntimeExploredDirectory[];
+    engineeringSummary?: ProjectRuntimeEngineeringSummary[];
+    engineeringAnalysis?: ProjectRuntimeEngineeringSummary[];
+  } | null;
+  workflowReceipt?: {
+    verificationReport?: {
+      executionVerificationReceipt?: {
+        status?: string;
+        message?: string;
+        workspaceAudit?: ProjectRuntimeWorkspaceAudit | null;
+        detectedWorkspaceIssues?: Array<{ message?: string } | string>;
+        inspectedFiles?: ProjectRuntimeInspectedFile[];
+        exploredDirectories?: ProjectRuntimeExploredDirectory[];
+        engineeringSummary?: ProjectRuntimeEngineeringSummary[];
+        engineeringAnalysis?: ProjectRuntimeEngineeringSummary[];
+      } | null;
+    };
+  } | null;
+}
+
+interface ProjectRuntimeWorkspaceAudit {
+  findings?: Array<{ message?: string } | string>;
+  bugs?: Array<{ path?: string; line?: number | null; description?: string }>;
+  syncPlan?: Array<{ path?: string; action?: string; reason?: string }>;
+  dependencies?: { declared?: string[]; nodeModulesPresent?: boolean };
+  environment?: { envExamplePresent?: boolean; envFilePresent?: boolean; jsxFiles?: string[] };
+  inspectedPaths?: string[];
+  inspectedFiles?: ProjectRuntimeInspectedFile[];
+  exploredDirectories?: ProjectRuntimeExploredDirectory[];
+  engineeringSummary?: ProjectRuntimeEngineeringSummary[];
+  engineeringAnalysis?: ProjectRuntimeEngineeringSummary[];
+}
+
+interface ProjectRuntimeInspectedFile {
+  path: string;
+  lineCount: number;
+  byteSize: number;
+}
+
+interface ProjectRuntimeExploredDirectory {
+  path: string;
+  entryCount: number;
+}
+
+interface ProjectRuntimeEngineeringSummary {
+  phase: string;
+  summary: string;
+}
+
+function nonEmptyArray<T>(...values: Array<T[] | undefined>): T[] {
+  return values.find((value) => Array.isArray(value) && value.length > 0) || [];
+}
+
+function formatWorkspaceAudit(audit: ProjectRuntimeWorkspaceAudit): string {
+  const findings = (audit.findings || [])
+    .map((finding) => typeof finding === 'string' ? finding : finding.message)
+    .filter((message): message is string => typeof message === 'string' && message.trim().length > 0);
+  const bugs = (audit.bugs || []).map((bug) => (
+    `- ${bug.path || 'workspace'}${bug.line ? `:${bug.line}` : ''}: ${bug.description || 'Detected source issue.'}`
+  ));
+  const syncPlan = (audit.syncPlan || []).map((item) => (
+    `- ${item.action || 'REVIEW'} ${item.path || 'workspace'}: ${item.reason || 'Review against the workspace contract.'}`
+  ));
+  return [
+    'Detected Workspace Issues & Readiness Audit:',
+    ...(findings.length ? findings : ['No workspace environment gaps or cross-file drift were detected in the inspected paths.']),
+    bugs.length ? `Detected Bugs:\n${bugs.join('\n')}` : 'Detected Bugs: None found by the source, contract, and import checks.',
+    ...(syncPlan.length ? [`Repair/sync plan:\n${syncPlan.join('\n')}`] : []),
+  ].join('\n');
+}
+
+export function formatProjectRuntimeTestReceiptMessage(
+  message: string | undefined,
+  audit: ProjectRuntimeWorkspaceAudit | null | undefined,
+  detectedWorkspaceIssues: Array<{ message?: string } | string> | undefined = undefined,
+): string | undefined {
+  const marker = 'Detected Workspace Issues & Readiness Audit';
+  const text = typeof message === 'string' ? message : '';
+  const existingAuditStart = text.indexOf(marker);
+  let existingAudit = '';
+  let receiptBody = text;
+  if (existingAuditStart >= 0) {
+    const afterMarker = text.slice(existingAuditStart);
+    const nextReceiptLine = afterMarker.search(/\nRun locally:/);
+    const existingAuditEnd = nextReceiptLine >= 0
+      ? existingAuditStart + nextReceiptLine
+      : text.length;
+    existingAudit = text.slice(existingAuditStart, existingAuditEnd).trim();
+    receiptBody = `${text.slice(0, existingAuditStart)}${text.slice(existingAuditEnd)}`.trim();
+  }
+  const effectiveAudit = audit || (detectedWorkspaceIssues?.length
+    ? { findings: detectedWorkspaceIssues }
+    : null);
+  const auditMessage = effectiveAudit
+    ? formatWorkspaceAudit(effectiveAudit)
+    : existingAudit
+      ? `${existingAudit.replace(/^Detected Workspace Issues & Readiness Audit:?/, 'Detected Workspace Issues & Readiness Audit:')}`
+      : [
+          'Detected Workspace Issues & Readiness Audit:',
+          'Workspace audit details were not included in the verification response; environment and source findings could not be assessed.',
+        ].join('\n');
+  return [receiptBody, auditMessage].filter(Boolean).join('\n\n');
+}
+
+export function formatProjectRuntimeTestCompletionMessage(
+  message: string | undefined,
+  audit: ProjectRuntimeWorkspaceAudit | null | undefined,
+  filesModified: string[],
+  detectedWorkspaceIssues?: Array<{ message?: string } | string>,
+  engineeringEvidence?: {
+    inspectedFiles?: ProjectRuntimeInspectedFile[];
+    exploredDirectories?: ProjectRuntimeExploredDirectory[];
+    engineeringSummary?: ProjectRuntimeEngineeringSummary[];
+    engineeringAnalysis?: ProjectRuntimeEngineeringSummary[];
+  },
+): string {
+  const receipt = formatProjectRuntimeTestReceiptMessage(message, audit, detectedWorkspaceIssues);
+  const inspectedFiles = nonEmptyArray(engineeringEvidence?.inspectedFiles, audit?.inspectedFiles);
+  const exploredDirectories = nonEmptyArray(engineeringEvidence?.exploredDirectories, audit?.exploredDirectories);
+  const engineeringSummary = nonEmptyArray(
+    engineeringEvidence?.engineeringAnalysis,
+    engineeringEvidence?.engineeringSummary,
+    audit?.engineeringAnalysis,
+    audit?.engineeringSummary,
+  );
+  const inspectedDetails = [
+    'Engineering Analysis & Inspected Files:',
+    ...(engineeringSummary.length
+      ? engineeringSummary.map((item) => `- ${item.phase}: ${item.summary}`)
+      : ['- Engineering summary was not included in the workflow result.']),
+    `- Explored directories: ${exploredDirectories.length
+      ? exploredDirectories.map((directory) => `\`${directory.path}\` (${directory.entryCount} entries)`).join(', ')
+      : 'No directory enumeration details were returned.'}`,
+    ...(inspectedFiles.length
+      ? inspectedFiles.map((file) => `- Read \`${file.path}\` (${file.lineCount} lines, ${file.byteSize} bytes)`)
+      : ['- No inspected file metadata was returned.']),
+  ].join('\n');
+  const cleanModifiedFiles = [...new Set(filesModified
+    .map((file) => typeof file === 'string' ? file.trim() : '')
+    .filter((file) => file.length > 0 && !/^\[workflow\]/i.test(file) && !/[\r\n]/.test(file)))];
+  const modifiedFiles = cleanModifiedFiles.length
+    ? `Modified files:\n${cleanModifiedFiles.map((file) => `- \`${file}\``).join('\n')}`
+    : 'Modified files:\n- No repository files were modified.';
+  const receiptText = receipt || 'Project runtime verification completed.';
+  const auditStart = receiptText.indexOf('Detected Workspace Issues & Readiness Audit');
+  let receiptBody = auditStart >= 0 ? receiptText.slice(0, auditStart).trim() : receiptText;
+  const auditSection = auditStart >= 0 ? receiptText.slice(auditStart).trim() : '';
+  const existingEngineeringStart = [
+    receiptBody.indexOf('Engineering Analysis & Inspected Files:'),
+    receiptBody.indexOf('Engineering Evidence Summary'),
+  ].filter((index) => index >= 0).sort((left, right) => left - right)[0];
+  if (existingEngineeringStart !== undefined) {
+    receiptBody = receiptBody.slice(0, existingEngineeringStart).trim();
+  }
+  return [
+    receiptBody,
+    inspectedDetails,
+    auditSection,
+    modifiedFiles,
+  ].filter(Boolean).join('\n\n');
+}
+
+export function buildProjectRuntimeInspectionActivities(
+  executionId: string,
+  result: ProjectRuntimeTestWorkflowResult,
+): CodingActivity[] {
+  const reportReceipt = result.verificationReport?.executionVerificationReceipt
+    || result.workflowReceipt?.verificationReport?.executionVerificationReceipt;
+  const receipt = result.executionVerificationReceipt || reportReceipt;
+  const audit = result.workspaceAudit
+    || receipt?.workspaceAudit
+    || result.hermeticVerification?.workspaceAudit
+    || result.verificationReport?.executionVerificationReceipt?.workspaceAudit;
+  const files = nonEmptyArray(
+    result.inspectedFiles,
+    receipt?.inspectedFiles,
+    audit?.inspectedFiles,
+    result.hermeticVerification?.workspaceAudit?.inspectedFiles,
+  );
+  const directories = nonEmptyArray(
+    result.exploredDirectories,
+    receipt?.exploredDirectories,
+    audit?.exploredDirectories,
+    result.hermeticVerification?.workspaceAudit?.exploredDirectories,
+  );
+  const summary = nonEmptyArray(
+    result.engineeringAnalysis,
+    result.engineeringSummary,
+    receipt?.engineeringAnalysis,
+    receipt?.engineeringSummary,
+    audit?.engineeringAnalysis,
+    audit?.engineeringSummary,
+    result.hermeticVerification?.workspaceAudit?.engineeringAnalysis,
+    result.hermeticVerification?.workspaceAudit?.engineeringSummary,
+  );
+  const timestamp = new Date().toISOString();
+  const activities: CodingActivity[] = [
+    ...summary.map((item, index): CodingActivity => ({
+      id: `engineering-summary:${executionId}:${index}`,
+      executionId,
+      phase: item.phase,
+      message: item.summary,
+      timestamp,
+    })),
+    ...directories.map((directory, index): CodingActivity => ({
+      event: 'activity_event',
+      activityId: `workspace-directory:${executionId}:${index}:${directory.path}`,
+      executionId,
+      action: {
+        tool: 'explore_directory',
+        target: directory.path,
+        reason: 'Directory entries were enumerated during workspace verification.',
+      },
+      activityType: 'DISCOVERING_REPOSITORY',
+      status: 'COMPLETED',
+      result: { count: directory.entryCount },
+      timestamp,
+    })),
+    ...files.map((file, index): CodingActivity => ({
+      event: 'activity_event',
+      activityId: `workspace-file:${executionId}:${index}:${file.path}`,
+      executionId,
+      action: {
+        tool: 'read_file',
+        target: file.path,
+        reason: 'File contents were read from disk during workspace verification.',
+      },
+      activityType: 'READING_FILE',
+      status: 'COMPLETED',
+      result: { lineCount: file.lineCount, byteSize: file.byteSize },
+      timestamp,
+    })),
+  ];
+  return activities;
+}
+
+export function normalizeProjectRuntimeTestWorkflowResult<T extends ProjectRuntimeTestWorkflowResult>(
+  requestText: string,
+  result: T,
+): T {
+  if (!isProjectRuntimeTestRequest(requestText)) return result;
+  const receipt = result.executionVerificationReceipt
+    || result.verificationReport?.executionVerificationReceipt
+    || result.workflowReceipt?.verificationReport?.executionVerificationReceipt;
+  const workspaceAudit = receipt?.workspaceAudit
+    || result.hermeticVerification?.workspaceAudit
+    || result.workspaceAudit;
+  const detectedWorkspaceIssues = receipt?.detectedWorkspaceIssues
+    || result.hermeticVerification?.detectedWorkspaceIssues
+    || result.detectedWorkspaceIssues;
+  if (receipt) {
+    receipt.message = formatProjectRuntimeTestReceiptMessage(
+      receipt.message,
+      workspaceAudit,
+      detectedWorkspaceIssues,
+    );
+  }
+  result.inspectedFiles = nonEmptyArray(
+    result.inspectedFiles,
+    receipt?.inspectedFiles,
+    workspaceAudit?.inspectedFiles,
+    result.hermeticVerification?.workspaceAudit?.inspectedFiles,
+  );
+  result.exploredDirectories = nonEmptyArray(
+    result.exploredDirectories,
+    receipt?.exploredDirectories,
+    workspaceAudit?.exploredDirectories,
+    result.hermeticVerification?.workspaceAudit?.exploredDirectories,
+  );
+  result.engineeringAnalysis = nonEmptyArray(
+    result.engineeringAnalysis,
+    result.engineeringSummary,
+    receipt?.engineeringAnalysis,
+    receipt?.engineeringSummary,
+    workspaceAudit?.engineeringAnalysis,
+    workspaceAudit?.engineeringSummary,
+    result.hermeticVerification?.workspaceAudit?.engineeringAnalysis,
+    result.hermeticVerification?.workspaceAudit?.engineeringSummary,
+  );
+  const resultMessage = result.message || receipt?.message;
+  result.message = formatProjectRuntimeTestReceiptMessage(resultMessage, workspaceAudit, detectedWorkspaceIssues);
+  if (!['VERIFICATION_UNAVAILABLE', 'VERIFICATION_BLOCKED'].includes(result.outcome)) return result;
+  if (receipt?.status === 'PASSED' && typeof receipt.message === 'string' && receipt.message
+    && result.rolledBack !== true) {
+    result.outcome = 'SUCCESS';
+    result.codeVerified = true;
+    result.message = receipt.message;
+    return result;
+  }
+  const failedGates = result.hermeticVerification?.gates?.filter((gate) => gate.passed !== true) || [];
+  const gateDiagnostics = failedGates.flatMap((gate) => {
+    const diagnostics = gate.diagnostics || [];
+    return diagnostics.length
+      ? diagnostics.map((item) => `${gate.id || 'Hermetic gate'}${item.path ? ` @ ${item.path}` : ''}: ${item.reason || item.message || 'Failed.'}`)
+      : [`${gate.id || 'Hermetic gate'}: ${typeof gate.evidence === 'string' ? gate.evidence : 'Failed.'}`];
+  });
+  result.outcome = failedGates.length ? 'HERMETIC_VERIFICATION_FAILED' : 'RUNTIME_VERIFICATION_INCOMPLETE';
+  const originalMessage = typeof result.message === 'string' ? result.message : '';
+  const safeMessage = /verification runner.*(?:unavailable|offline)/i.test(originalMessage)
+    ? 'Project runtime verification did not return a passing in-process hermetic receipt.'
+    : originalMessage;
+  result.message = failedGates.length
+    ? `Project runtime verification failed (${result.hermeticVerification?.passed ?? 0}/${result.hermeticVerification?.total ?? failedGates.length} gates): ${gateDiagnostics.join('; ')}`
+    : `${safeMessage || 'Project runtime verification did not return a complete passing live loopback receipt.'}${result.rolledBack === true ? ' The approved changes were rolled back.' : ''}`;
+  return result;
 }
 
 interface TrustedBrokerWorkflowResponse {
@@ -1346,8 +1710,14 @@ export function shouldRequireDeveloperWorkflowForAttachedProject({
 }): boolean {
   const requestsProjectCreation = /\b(?:build|create|scaffold|bootstrap|set\s*up)\b/i.test(requestText)
     && /\b(?:new|complete|full-?stack|from\s+scratch|project|application|app)\b/i.test(requestText);
+  const requestsProjectRuntimeTest = isProjectRuntimeTestRequest(requestText);
+  if (requestsProjectRuntimeTest) {
+    return intent === 'AUTONOMOUS_WORKFLOW_TASK'
+      && hasAttachedProject
+      && !hasDeveloperWorkflowBridge;
+  }
   return intent === 'AUTONOMOUS_WORKFLOW_TASK'
-    && requestsProjectCreation
+    && (requestsProjectCreation || requestsProjectRuntimeTest)
     && hasAttachedProject
     && !hasDeveloperWorkflowBridge
     && !isResumingProviderTask
@@ -1415,6 +1785,13 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
     return {
       intent: 'QUESTION_OR_EXPLANATION',
       isActionableTask: false,
+    };
+  }
+
+  if (isProjectRuntimeTestRequest(text)) {
+    return {
+      intent: 'AUTONOMOUS_WORKFLOW_TASK',
+      isActionableTask: true,
     };
   }
 

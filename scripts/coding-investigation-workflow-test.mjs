@@ -58,6 +58,7 @@ const mockSupportedRelevance = async ({ findings }) => ({
 });
 
 try {
+  assert.ok(LEGAL_SUBTASK_TRANSITIONS.BLOCKED.includes('SKIPPED'));
   const creationPrompt = (opening) => `${opening} as an expert Full-Stack Developer. Build a complete 'Add Order' feature.
 Create an Order Model/Schema with customer name and item details.
 Create a POST endpoint /api/orders with input validation.

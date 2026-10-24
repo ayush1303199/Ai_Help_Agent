@@ -25,6 +25,7 @@ export interface CodingActivityResult {
   count?: number;
   rowCount?: number;
   lineCount?: number;
+  byteSize?: number;
   sourceContextTruncated?: boolean;
   paths?: string[];
   databaseType?: string;
@@ -170,6 +171,7 @@ export function parseCodingActivityEvent(value: unknown): CodingActivityEvent | 
     const count = nonnegativeInteger(rawResult.count);
     const rowCount = nonnegativeInteger(rawResult.rowCount);
     const lineCount = nonnegativeInteger(rawResult.lineCount);
+    const byteSize = nonnegativeInteger(rawResult.byteSize);
     const exitCode = rawResult.exitCode === null
       ? null
       : (typeof rawResult.exitCode === 'number' && Number.isInteger(rawResult.exitCode)
@@ -178,6 +180,7 @@ export function parseCodingActivityEvent(value: unknown): CodingActivityEvent | 
     if (count !== undefined) result.count = count;
     if (rowCount !== undefined) result.rowCount = rowCount;
     if (lineCount !== undefined) result.lineCount = lineCount;
+    if (byteSize !== undefined) result.byteSize = byteSize;
     if (rawResult.sourceContextTruncated === true) result.sourceContextTruncated = true;
     if (rawResult.exitCode === null || exitCode !== undefined) result.exitCode = exitCode ?? null;
     if (typeof rawResult.executed === 'boolean') result.executed = rawResult.executed;
