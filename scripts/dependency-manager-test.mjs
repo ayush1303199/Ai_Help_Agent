@@ -359,6 +359,7 @@ tokio = "1.0"
     root: installedAppDir,
     sessionId,
     ownerWebContentsId: ownerId,
+    userApproved: true,
   });
 
   assert.equal(installWorkflow.outcome, 'BLOCKED');

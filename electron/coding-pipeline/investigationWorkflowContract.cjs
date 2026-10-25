@@ -557,6 +557,31 @@ function validateProposalContract(contract, { inspectedFiles = [], verifiedFindi
   }
   const norm = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
 
+  if (contract.type === 'DEPENDENCY_INSTALL_PROPOSAL' || contract.proposalType === 'DEPENDENCY_INSTALL') {
+    if (!contract.packageManager || typeof contract.packageManager !== 'string') {
+      return { isValid: false, rejectionReason: 'Dependency proposal requires a valid packageManager string.' };
+    }
+    if (!contract.command || typeof contract.command !== 'string') {
+      return { isValid: false, rejectionReason: 'Dependency proposal requires a valid command string.' };
+    }
+    if (!Array.isArray(contract.args)) {
+      return { isValid: false, rejectionReason: 'Dependency proposal requires an args array.' };
+    }
+    if (!contract.projectRoot || typeof contract.projectRoot !== 'string') {
+      return { isValid: false, rejectionReason: 'Dependency proposal requires projectRoot string.' };
+    }
+    if (!contract.planDigest || typeof contract.planDigest !== 'string' || !/^[a-f0-9]{64}$/i.test(contract.planDigest)) {
+      return { isValid: false, rejectionReason: 'Dependency proposal requires valid 64-character sha256 planDigest.' };
+    }
+    if (!contract.expectedBehavior || typeof contract.expectedBehavior !== 'string' || !contract.expectedBehavior.trim()) {
+      return { isValid: false, rejectionReason: 'Dependency proposal requires non-empty expectedBehavior statement.' };
+    }
+    if (!contract.targetFile && (!Array.isArray(contract.files) || contract.files.length === 0)) {
+      return { isValid: false, rejectionReason: 'Dependency proposal requires targetFile or files array.' };
+    }
+    return { isValid: true };
+  }
+
   if (contract.isModular === true) {
     if (!contract.targetFile && (!Array.isArray(contract.files) || contract.files.length === 0)) {
       return { isValid: false, rejectionReason: 'Modular proposal contract requires targetFile or files array.' };
@@ -715,6 +740,7 @@ function validatePatchScope({
   existingDirtyFiles = [],
 }) {
   const norm = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
+
   const targetSet = new Set(targetFiles.map(norm));
   const touchedFiles = (modifiedFiles.length > 0 ? modifiedFiles : targetFiles).map(norm);
 
@@ -946,6 +972,7 @@ function validateApplyScope({
   }
 
   const norm = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
+
   const approvedTarget = norm(proposalContract.targetFile);
   const targets = (
     mutationTargets.length > 0

@@ -3704,6 +3704,7 @@ async function executeAutonomousCodingWorkflow(input) {
 async function executeAutonomousCodingWorkflowStage({
   userRequest,
   root: inputRoot,
+  userApproved: initialUserApproved = null,
   scope = '.',
   sessionId,
   ownerWebContentsId,
@@ -3866,15 +3867,237 @@ async function executeAutonomousCodingWorkflowStage({
   const buildDiscovery = await discoverBuildOperations(root);
   taskPlan.buildDiscovery = buildDiscovery;
 
-  const isDependencyInstallRequest = /\b(?:install|download)\s+(?:the\s+)?(?:dependencies|deps|packages?)\b/i.test(userRequest)
+  const isDependencyInstallRequest = /\b(?:install|download)\s+(?:the\s+)?(?:dependencies|deps|packages?|node_modules)\b/i.test(userRequest)
+    || /\b(?:npm|pnpm|yarn|bun)\s+(?:install|i|add)\b/i.test(userRequest)
+    || (/^(?:install|download)\b/i.test(userRequest) && !/\b(?:feature|component|route|endpoint|page|module|system)\b/i.test(userRequest))
     || (/\binstall\b/i.test(userRequest) && dependencyReport.needsInstallation);
 
   if (isDependencyInstallRequest && !isRuntimeTestRequest && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK) {
+    const hasAnyManifest = dependencyReport.hasManifest || Boolean(dependencyReport.primaryReport?.hasManifest);
+    if (!hasAnyManifest) {
+      advanceConversationTurn(turn.turnId, 'blocked', owner, {
+        phase: 'dependency_manifest_missing',
+        reason: 'No package manifest (e.g. package.json) found in project root.',
+      });
+      return {
+        outcome: 'BLOCKED',
+        phase: 'DEPENDENCY_CHECK',
+        turnId: turn.turnId,
+        taskPlan,
+        dependencyReport,
+        executionBlocked: true,
+        reason: 'No package manifest (e.g. package.json) found in project root to determine dependencies.',
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'BLOCKED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_CHECK'],
+        }),
+      };
+    }
+
+    if (!dependencyReport.needsInstallation) {
+      advanceConversationTurn(turn.turnId, 'completed', owner, {
+        phase: 'dependency_already_installed',
+      });
+      return {
+        outcome: 'COMPLETED',
+        phase: 'DEPENDENCY_CHECK',
+        status: 'ALREADY_INSTALLED',
+        turnId: turn.turnId,
+        taskPlan,
+        dependencyReport,
+        message: 'All declared dependencies are already installed and resolvable on disk.',
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: true,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'COMPLETED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_CHECK'],
+        }),
+      };
+    }
+
+    const currentTurn = () => conversationTurns.get(turn.turnId)?.state || turn.state;
+
+    if (currentTurn() === 'reading') {
+      advanceConversationTurn(turn.turnId, 'understanding', owner, { phase: 'understanding_dependencies' });
+    }
+
     onProgress({ phase: 'DEPENDENCY_PLAN', message: 'Generating dependency installation plan proposal.' });
-    const plan = createDependencyPlan({ projectRoot: root, dependencyReport });
+    const plan = continuation?.dependencyPlan || createDependencyPlan({ projectRoot: root, dependencyReport });
     taskPlan.dependencyPlan = plan;
+    const proposalContract = plan.proposalContract || createDependencyProposalContract(plan, dependencyReport);
+    taskPlan.proposalContract = proposalContract;
+
+    const proposalValidation = validateProposalContract(proposalContract);
+    if (!proposalValidation.isValid) {
+      if (['reading', 'understanding', 'proposal_ready'].includes(currentTurn())) {
+        advanceConversationTurn(turn.turnId, 'failed', owner, {
+          phase: 'proposal_validation_failed',
+          reason: proposalValidation.rejectionReason,
+        });
+      }
+      return {
+        outcome: 'REJECTED',
+        phase: 'PROPOSAL_VALIDATION',
+        turnId: turn.turnId,
+        taskPlan,
+        dependencyPlan: plan,
+        proposalContract,
+        dependencyReport,
+        reason: `Invalid dependency proposal: ${proposalValidation.rejectionReason}`,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'FAILED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+        }),
+      };
+    }
+
+    if (currentTurn() === 'understanding') {
+      advanceConversationTurn(turn.turnId, 'proposal_ready', owner, {
+        phase: 'proposal_ready',
+        proposalId: plan.planId,
+        command: plan.fullCommandString,
+      });
+    }
+
+    let userApprovedDecision = null;
+    if (initialUserApproved !== undefined && initialUserApproved !== null) {
+      userApprovedDecision = Boolean(initialUserApproved);
+    } else if (continuation?.userApproved !== undefined && continuation?.userApproved !== null) {
+      userApprovedDecision = Boolean(continuation.userApproved);
+    }
+
+    if (userApprovedDecision === null && typeof requestApproval === 'function') {
+      if (currentTurn() === 'proposal_ready') {
+        advanceConversationTurn(turn.turnId, 'awaiting_approval', owner, {
+          phase: 'awaiting_approval',
+          proposalId: plan.planId,
+        });
+      }
+      userApprovedDecision = await requestApproval({
+        taskId: plan.planId,
+        proposal: plan,
+        proposalContract,
+        isDependencyPlan: true,
+        fullCommandString: plan.fullCommandString,
+        materialSideEffects: plan.materialSideEffects,
+      });
+    }
+
+    if (isCancelled()) {
+      advanceConversationTurn(turn.turnId, 'cancelled', owner, { phase: 'cancelled_before_approval' });
+      return cancelledResult('APPROVE', plan.planId);
+    }
+
+    if (userApprovedDecision === null) {
+      if (currentTurn() === 'proposal_ready') {
+        advanceConversationTurn(turn.turnId, 'awaiting_approval', owner, {
+          phase: 'awaiting_approval',
+          proposalId: plan.planId,
+        });
+      }
+      const continuationToken = crypto.randomUUID();
+      const continuationState = {
+        root,
+        scope,
+        sessionId,
+        ownerWebContentsId,
+        userRequest,
+        requestHash: hash(String(userRequest)),
+        isDependencyInstallRequest: true,
+        turn,
+        taskPlan,
+        dependencyPlan: plan,
+        dependencyReport,
+        proposalContract,
+        userApproved: null,
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+        expiresAt: Date.now() + WORKFLOW_CONTINUATION_TTL_MS,
+        token: continuationToken,
+        running: false,
+      };
+      storeWorkflowContinuation(continuationToken, continuationState);
+      return {
+        outcome: 'APPROVAL_REQUIRED',
+        phase: 'APPROVE',
+        turnId: turn.turnId,
+        taskPlan,
+        dependencyPlan: plan,
+        proposalContract,
+        dependencyReport,
+        continuationToken,
+        continuation: {
+          status: 'AWAITING_APPROVAL',
+          token: continuationToken,
+          proposalId: plan.planId,
+          command: plan.fullCommandString,
+        },
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'APPROVAL_REQUIRED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+        }),
+      };
+    }
+
+    if (userApprovedDecision === false) {
+      if (['proposal_ready', 'awaiting_approval'].includes(currentTurn())) {
+        advanceConversationTurn(turn.turnId, 'failed', owner, {
+          phase: 'approval_rejected',
+          reason: 'Dependency installation proposal was rejected by user.',
+        });
+      }
+      return {
+        outcome: 'APPROVAL_REJECTED',
+        phase: 'APPROVE',
+        turnId: turn.turnId,
+        taskPlan,
+        dependencyPlan: plan,
+        proposalContract,
+        dependencyReport,
+        reason: 'Dependency installation proposal was rejected by user.',
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'APPROVAL_REJECTED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+        }),
+      };
+    }
+
+    if (currentTurn() === 'proposal_ready') {
+      advanceConversationTurn(turn.turnId, 'awaiting_approval', owner, {
+        phase: 'awaiting_approval',
+        proposalId: plan.planId,
+      });
+    }
+    if (currentTurn() === 'awaiting_approval') {
+      advanceConversationTurn(turn.turnId, 'approved', owner, {
+        phase: 'dependency_install_approved',
+        proposalId: plan.planId,
+      });
+    }
+    plan.approved = true;
+    proposalContract.approved = true;
+
+    if (currentTurn() === 'approved') {
+      advanceConversationTurn(turn.turnId, 'applying', owner, {
+        phase: 'dependency_install_applying',
+        command: plan.fullCommandString,
+      });
+    }
 
     const execResult = await executeDependencyPlan({ plan, ownerWebContentsId, sessionId, containerRunner });
+
     if (!execResult.ok && execResult.executionBlocked) {
       advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'dependency_install_blocked', reason: execResult.reason });
       return {
@@ -3883,6 +4106,7 @@ async function executeAutonomousCodingWorkflowStage({
         turnId: turn.turnId,
         taskPlan,
         dependencyPlan: plan,
+        proposalContract,
         dependencyReport,
         executionBlocked: true,
         reason: execResult.reason,
@@ -3897,23 +4121,56 @@ async function executeAutonomousCodingWorkflowStage({
     }
 
     if (execResult.ok) {
-      advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'dependency_install_completed' });
-      return {
-        outcome: 'COMPLETED',
-        phase: 'DEPENDENCY_INSTALL_COMPLETE',
-        turnId: turn.turnId,
-        taskPlan,
-        dependencyPlan: plan,
-        dependencyReport,
-        dependencyResult: execResult,
-        filesModified: [],
-        codeApplied: true,
-        codeVerified: true,
-        workflowReceipt: buildWorkflowReceipt({
+      advanceConversationTurn(turn.turnId, 'verifying', owner, { phase: 'dependency_install_verifying' });
+      const verification = execResult.dependencyVerification || await verifyInstalledDependencies(root);
+      if (verification.isFullyInstalled) {
+        advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'dependency_install_completed' });
+        return {
           outcome: 'COMPLETED',
-          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL'],
-        }),
-      };
+          phase: 'DEPENDENCY_INSTALL_COMPLETE',
+          status: 'INSTALLED',
+          turnId: turn.turnId,
+          taskPlan,
+          dependencyPlan: plan,
+          proposalContract,
+          dependencyReport,
+          dependencyResult: execResult,
+          dependencyVerification: verification,
+          filesModified: [],
+          codeApplied: true,
+          codeVerified: true,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'COMPLETED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL', 'VERIFY'],
+          }),
+        };
+      } else {
+        advanceConversationTurn(turn.turnId, 'failed', owner, {
+          phase: 'dependency_verification_failed',
+          reason: 'Post-install dependency verification detected unresolved dependencies.',
+        });
+        return {
+          outcome: 'FAILED',
+          phase: 'DEPENDENCY_VERIFICATION_FAILED',
+          status: 'VERIFICATION_FAILED',
+          turnId: turn.turnId,
+          taskPlan,
+          dependencyPlan: plan,
+          proposalContract,
+          dependencyReport,
+          dependencyResult: execResult,
+          dependencyVerification: verification,
+          executionBlocked: false,
+          reason: 'Dependency installation succeeded but verification detected unresolved dependencies on disk.',
+          filesModified: [],
+          codeApplied: true,
+          codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'FAILED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL'],
+          }),
+        };
+      }
     }
 
     advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'dependency_install_failed', reason: execResult.reason });
@@ -3923,6 +4180,7 @@ async function executeAutonomousCodingWorkflowStage({
       turnId: turn.turnId,
       taskPlan,
       dependencyPlan: plan,
+      proposalContract,
       dependencyReport,
       dependencyResult: execResult,
       executionBlocked: false,

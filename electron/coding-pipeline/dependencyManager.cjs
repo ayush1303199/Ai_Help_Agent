@@ -16,6 +16,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { verifyProjectAuthorization } = require('./projectDiscovery.cjs');
 const { requireProjectProcessIsolation } = require('./projectProcessIsolation.cjs');
+const { validateProposalContract } = require('./investigationWorkflowContract.cjs');
 
 const SUPPORTED_ECOSYSTEMS = Object.freeze({
   NODE: 'node',
@@ -619,6 +620,51 @@ async function discoverDependencies(projectRoot) {
  * @param {Array<string>} [options.targets] - Specific package names to install, or empty for all missing.
  * @returns {Object} Installation plan proposal.
  */
+/**
+ * Constructs a validated proposal contract from a dependency installation plan.
+ */
+function createDependencyProposalContract(plan, dependencyReport = null) {
+  if (!plan) return null;
+  const missingCount = dependencyReport?.missingCount ?? (plan.targetCount ?? plan.targets?.length ?? 0);
+  const missingNames = (plan.targets || []).map((t) => t.name).join(', ') || 'declared dependencies';
+  const manifestFile = dependencyReport?.primaryReport?.manifestPath || 'package.json';
+
+  return {
+    proposalId: plan.planId || crypto.randomUUID(),
+    type: 'DEPENDENCY_INSTALL_PROPOSAL',
+    proposalType: 'DEPENDENCY_INSTALL',
+    isModular: true,
+    targetFile: manifestFile,
+    files: [manifestFile],
+    projectRoot: plan.projectRoot,
+    packageManager: plan.packageManager,
+    command: plan.command,
+    args: plan.args,
+    fullCommandString: plan.fullCommandString,
+    targets: plan.targets || [],
+    targetCount: plan.targetCount ?? (plan.targets?.length || 0),
+    planDigest: plan.planDigest,
+    networkRequired: plan.networkRequired !== false,
+    materialSideEffects: plan.materialSideEffects || {},
+    rootCauseSummary: `Project declares dependencies in ${manifestFile} that are not installed on disk (${missingCount} missing: ${missingNames}).`,
+    expectedBehavior: `Install missing dependencies (${missingNames}) using ${plan.fullCommandString} in an isolated container environment.`,
+    status: 'PROPOSAL_READY',
+    approved: false,
+    createdAt: plan.createdAt || new Date().toISOString(),
+  };
+}
+
+/**
+ * Validates a dependency plan's proposal contract against the formal proposal validator.
+ */
+function validateDependencyProposal(plan) {
+  if (!plan) {
+    return { isValid: false, rejectionReason: 'Plan must be a non-null object.' };
+  }
+  const contract = plan.proposalContract || plan;
+  return validateProposalContract(contract);
+}
+
 function createDependencyPlan({
   projectRoot,
   dependencyReport,
@@ -695,7 +741,7 @@ function createDependencyPlan({
 
   const lockfiles = dependencyReport.primaryReport?.lockfiles || dependencyReport.lockfiles || [];
 
-  return {
+  const plan = {
     planId: crypto.randomUUID(),
     planDigest,
     projectRoot,
@@ -717,6 +763,8 @@ function createDependencyPlan({
     approved: false,
     createdAt: new Date().toISOString(),
   };
+  plan.proposalContract = createDependencyProposalContract(plan, dependencyReport);
+  return plan;
 }
 
 /**
@@ -836,4 +884,6 @@ module.exports = {
   createDependencyPlan,
   executeDependencyPlan,
   verifyInstalledDependencies,
+  createDependencyProposalContract,
+  validateDependencyProposal,
 };

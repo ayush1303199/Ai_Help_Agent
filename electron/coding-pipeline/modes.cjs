@@ -160,7 +160,7 @@ function routeTaskMode({ goal = '', intent = '', userRequestedMode = null, expli
     const textLower = text.toLowerCase();
 
     // 1. Detect clear actionable requests first (e.g. "Fix the audit logging bug", "Implement an audit service", "Add tests for audit events")
-    const isActionDirective = /^(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:fix|repair|patch|implement|add|create|refactor|update|modify|change|remove|delete|write|build|resolve)\b/i.test(text);
+    const isActionDirective = /^(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:fix|repair|patch|implement|add|create|refactor|update|modify|change|remove|delete|write|build|resolve|install|upgrade|migrate|(?:npm|pnpm|yarn|bun)\s+(?:install|i|add))\b/i.test(text);
 
     // 2. Detect explicit read-only audit requests (e.g. "Perform a read-only audit", "Audit the repository without modifying files")
     const isExplicitAudit = /^(?:run|perform|do|conduct|execute)\s+(?:an?\s+)?(?:read-only\s+|preservation\s+|security\s+)?audit\b/i.test(text)
@@ -224,7 +224,7 @@ function routeTaskMode({ goal = '', intent = '', userRequestedMode = null, expli
       resolvedMode = OPERATING_MODES.PLAN;
     } else if (textLower.includes('test only') || textLower.includes('verify only') || textLower.includes('run tests') || textLower.includes('check build')) {
       resolvedMode = OPERATING_MODES.VERIFY;
-    } else if (/\b(?:fix|implement|refactor|add|create|update|patch|resolve)\b/i.test(textLower)) {
+    } else if (/\b(?:fix|implement|refactor|add|create|update|patch|resolve|install|upgrade|migrate|(?:npm|pnpm|yarn|bun)\s+(?:install|i|add))\b/i.test(textLower)) {
       resolvedMode = OPERATING_MODES.AUTONOMOUS;
     }
   }

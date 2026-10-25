@@ -130,7 +130,7 @@ function scoreIntentCategories(text, projectContext = null, evidence = []) {
     scores[INTENT_CATEGORIES.TEST_OR_VERIFY] += 10;
   } else if (/^(?:refactor|restructure|reorganize|clean\s+up|simplify|decouple|remove|delete|eliminate|drop|change|modify|alter|adjust|switch|replace|set)\b/i.test(leadingCommand)) {
     scores[INTENT_CATEGORIES.REFACTOR] += 10;
-  } else if (/^(?:upgrade|migrate|bump|update|install)\b/i.test(leadingCommand)) {
+  } else if (/^(?:upgrade|migrate|bump|update|install|(?:npm|pnpm|yarn|bun)\s+(?:install|i|add))\b/i.test(leadingCommand)) {
     scores[INTENT_CATEGORIES.UPGRADE_OR_MIGRATE] += 10;
   } else if (/^(?:what|how|why|where|who|explain|describe|show\s+me|tell\s+me|walk\s+me)\b/i.test(leadingCommand)) {
     scores[INTENT_CATEGORIES.EXPLAIN_OR_ASK] += 10;
@@ -212,7 +212,9 @@ function scoreIntentCategories(text, projectContext = null, evidence = []) {
   // 6. UPGRADE_OR_MIGRATE signals
   const upgradePatterns = [
     /^(?:upgrade|migrate|bump)\b/i,
-    /\b(?:upgrade|bump|update|install|download)\s+(?:the\s+)?(?:dependencies|deps|packages?|libraries|version|runtime|missing\s+dependencies)\b/i,
+    /^(?:npm|pnpm|yarn|bun)\s+(?:install|i|add)\b/i,
+    /\b(?:npm|pnpm|yarn|bun)\s+(?:install|i|add)\b/i,
+    /\b(?:upgrade|bump|update|install|download)\s+(?:the\s+)?(?:node_modules|dependencies|deps|packages?|libraries|version|runtime|missing\s+dependencies)\b/i,
     /\bmigrate\s+(?:from|to|the\s+codebase|the\s+schema|the\s+database|api|the\s+api\s+routes)\b/i,
     /\b(?:upgrade|migrate)\s+[\w.-]+\s+(?:to\s+(?:v\d+|latest|version|\d+))\b/i,
     /\b(?:deprecat\w+|breaking\s+changes?\s+migration)\b/i,

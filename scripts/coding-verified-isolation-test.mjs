@@ -152,6 +152,7 @@ async function runVerifiedIsolationTests() {
       ownerWebContentsId: ownerId,
       sessionId: crypto.randomUUID(),
       root: targetRoot,
+      userApproved: true,
     });
 
     // Validates that testResult explicitly differentiates evidence categories
@@ -178,6 +179,7 @@ async function runVerifiedIsolationTests() {
       ownerWebContentsId: ownerId,
       sessionId: crypto.randomUUID(),
       root: targetRoot,
+      userApproved: true,
     });
 
     assert.equal(installResult.outcome, 'BLOCKED');
