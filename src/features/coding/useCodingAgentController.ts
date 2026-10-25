@@ -663,41 +663,37 @@ export function useCodingAgentController({
             onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
           } else {
             const savedRoot = getSavedRoot();
-            if (!savedRoot) {
-              setProjectRoot(null);
-              setProjectLifecycleState('PROJECT_UNAVAILABLE');
-              setProjectCandidates([]);
-              setDirectory([]);
-              return;
+            try {
+              const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ projectRoot: savedRoot || '' }),
+              });
+              if (!active) return;
+              if (attachResponse.ok) {
+                const attached = await attachResponse.json();
+                if (attached.projectRoot) {
+                  setProjectRoot(attached.projectRoot);
+                  setProjectLifecycleState('PROJECT_ATTACHED');
+                  persistStoredProjectRoot(attached.projectRoot);
+                  const directoryResponse = await codingFetch(
+                    `${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`,
+                  );
+                  if (directoryResponse.ok) {
+                    const listing = await directoryResponse.json();
+                    if (active) setDirectory(listing);
+                  }
+                  return;
+                }
+              }
+            } catch {
+              // Ignore auto-attach error on startup
             }
-            const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ projectRoot: savedRoot }),
-            });
-            if (!active) return;
-            if (!attachResponse.ok) {
-              setProjectRoot(null);
-              setProjectLifecycleState('NO_PROJECT');
-              setProjectCandidates([]);
-              setDirectory([]);
-              return;
-            }
-            const attached = await attachResponse.json();
-            if (!attached.projectRoot) {
-              throw new Error('Saved project attachment did not return a project path.');
-            }
-            setProjectRoot(attached.projectRoot);
-            setProjectLifecycleState('PROJECT_ATTACHED');
-            persistStoredProjectRoot(attached.projectRoot);
-            const directoryResponse = await codingFetch(
-              `${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`,
-            );
-            if (!directoryResponse.ok) {
-              throw new Error(`Project directory request failed: HTTP ${directoryResponse.status}`);
-            }
-            const listing = await directoryResponse.json();
-            if (active) setDirectory(listing);
+            setProjectRoot(null);
+            setProjectLifecycleState('NO_PROJECT');
+            setProjectCandidates([]);
+            setDirectory([]);
+            return;
           }
         } catch (error) {
           if (active) {
@@ -1863,6 +1859,31 @@ export function useCodingAgentController({
     if (busy || streaming) return;
     const desktopApi = window.electronAPI;
     if (!desktopApi) {
+      try {
+        const autoAttach = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectRoot: '' }),
+        });
+        if (autoAttach.ok) {
+          const attached = await autoAttach.json();
+          if (attached.projectRoot) {
+            setProjectRoot(attached.projectRoot);
+            setProjectLifecycleState('PROJECT_ATTACHED');
+            persistStoredProjectRoot(attached.projectRoot);
+            setProjectCandidates([]);
+            setPath('.');
+            setFileContent('');
+            setFilePath('');
+            const directoryResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
+            if (directoryResponse.ok) setDirectory(await directoryResponse.json());
+            onStatus(`Connected to project: ${attached.projectRoot}`);
+            return;
+          }
+        }
+      } catch {
+        // Fall back to folder picker if auto-attach fails
+      }
       const picker = (window as unknown as {
         showDirectoryPicker?: (options?: unknown) => Promise<{
           name: string;

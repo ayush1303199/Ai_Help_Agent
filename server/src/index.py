@@ -1396,7 +1396,11 @@ def register_coding_mutation_handshake(payload: Dict[str, Any], request: Request
 async def attach_coding_project_endpoint(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     project_root = str(payload.get("projectRoot") or "").strip()
     if not project_root:
-        raise HTTPException(status_code=400, detail="projectRoot is required.")
+        active_state = get_backend_project_state()
+        if active_state.get("attached") and active_state.get("projectRoot"):
+            project_root = str(active_state["projectRoot"]).strip()
+        else:
+            raise HTTPException(status_code=400, detail="projectRoot is required.")
     p = Path(project_root)
     if not p.is_dir():
         raise HTTPException(status_code=400, detail="projectRoot does not exist or is not a directory.")
