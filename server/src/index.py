@@ -1198,7 +1198,19 @@ def get_coding_project_state_endpoint(request: Request) -> Dict[str, Any]:
                 else None
             )
         if not isinstance(session, dict) or not session.get("projectRoot"):
-            return {"projectRoot": None, "status": "PROJECT_NOT_ATTACHED", "attached": False}
+            backend_state = get_backend_project_state()
+            active_root = backend_state.get("projectRoot")
+            registered_root = None
+            if backend_state.get("attached") and active_root:
+                root_hash = _canonical_project_root_hash(active_root)
+                if (bool(_registered_projects_for_root(root_hash)) or not _trusted_desktop_broker_state.get('projects')) and Path(active_root).is_dir():
+                    registered_root = active_root
+            return {
+                "projectRoot": None,
+                "status": "PROJECT_NOT_ATTACHED",
+                "attached": False,
+                "registeredProjectRoot": registered_root,
+            }
         root = session["projectRoot"]
         root_hash = _canonical_project_root_hash(root)
         try:

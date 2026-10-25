@@ -377,6 +377,7 @@ export function useCodingAgentController({
     try { return localStorage.getItem('coding-active-session-v1') || crypto.randomUUID(); } catch { return crypto.randomUUID(); }
   });
   const savedConversation = conversationStates.find((session) => session.id === conversationId);
+  const getSavedRoot = () => readStoredProjectRoot() || savedConversation?.projectRoot || null;
   const [messages, setMessages] = useState<CodingMessage[]>(() => savedConversation?.messages || []);
   const [activity, setActivity] = useState<CodingActivity[]>([]);
   const activeActivityExecutionRef = useRef<string | null>(null);
@@ -662,32 +663,34 @@ export function useCodingAgentController({
             setDirectory([]);
             onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
           } else {
-            const savedRoot = getSavedRoot();
-            try {
-              const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ projectRoot: savedRoot || '' }),
-              });
-              if (!active) return;
-              if (attachResponse.ok) {
-                const attached = await attachResponse.json();
-                if (attached.projectRoot) {
-                  setProjectRoot(attached.projectRoot);
-                  setProjectLifecycleState('PROJECT_ATTACHED');
-                  persistStoredProjectRoot(attached.projectRoot);
-                  const directoryResponse = await codingFetch(
-                    `${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`,
-                  );
-                  if (directoryResponse.ok) {
-                    const listing = await directoryResponse.json();
-                    if (active) setDirectory(listing);
+            const rootToAttach = state.registeredProjectRoot || getSavedRoot();
+            if (rootToAttach) {
+              try {
+                const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ projectRoot: rootToAttach }),
+                });
+                if (!active) return;
+                if (attachResponse.ok) {
+                  const attached = await attachResponse.json();
+                  if (attached.projectRoot) {
+                    setProjectRoot(attached.projectRoot);
+                    setProjectLifecycleState('PROJECT_ATTACHED');
+                    persistStoredProjectRoot(attached.projectRoot);
+                    const directoryResponse = await codingFetch(
+                      `${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`,
+                    );
+                    if (directoryResponse.ok) {
+                      const listing = await directoryResponse.json();
+                      if (active) setDirectory(listing);
+                    }
+                    return;
                   }
-                  return;
                 }
+              } catch {
+                // Ignore auto-attach error on startup
               }
-            } catch {
-              // Ignore auto-attach error on startup
             }
             setProjectRoot(null);
             setProjectLifecycleState('NO_PROJECT');
@@ -1860,29 +1863,36 @@ export function useCodingAgentController({
     const desktopApi = window.electronAPI;
     if (!desktopApi) {
       try {
-        const autoAttach = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectRoot: '' }),
-        });
-        if (autoAttach.ok) {
-          const attached = await autoAttach.json();
-          if (attached.projectRoot) {
-            setProjectRoot(attached.projectRoot);
-            setProjectLifecycleState('PROJECT_ATTACHED');
-            persistStoredProjectRoot(attached.projectRoot);
-            setProjectCandidates([]);
-            setPath('.');
-            setFileContent('');
-            setFilePath('');
-            const directoryResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
-            if (directoryResponse.ok) setDirectory(await directoryResponse.json());
-            onStatus(`Connected to project: ${attached.projectRoot}`);
-            return;
+        const stateRes = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-state`);
+        if (stateRes.ok) {
+          const stateData = await stateRes.json();
+          const candidate = stateData.registeredProjectRoot || stateData.projectRoot || getSavedRoot();
+          if (candidate) {
+            const attachRes = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ projectRoot: candidate }),
+            });
+            if (attachRes.ok) {
+              const attached = await attachRes.json();
+              if (attached.projectRoot) {
+                setProjectRoot(attached.projectRoot);
+                setProjectLifecycleState('PROJECT_ATTACHED');
+                persistStoredProjectRoot(attached.projectRoot);
+                setProjectCandidates([]);
+                setPath('.');
+                setFileContent('');
+                setFilePath('');
+                const dirResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
+                if (dirResponse.ok) setDirectory(await dirResponse.json());
+                onStatus(`Connected to project: ${attached.projectRoot}`);
+                return;
+              }
+            }
           }
         }
       } catch {
-        // Fall back to folder picker if auto-attach fails
+        // Fall back to folder picker if state check fails
       }
       const picker = (window as unknown as {
         showDirectoryPicker?: (options?: unknown) => Promise<{
@@ -1951,7 +1961,17 @@ export function useCodingAgentController({
         });
         if (!response.ok) {
           const error = await response.json().catch(() => ({}));
-          throw new Error(formatErrorMessage(error, 'Could not match the selected folder to a local project.'));
+          if (typeof window !== 'undefined' && typeof window.prompt === 'function') {
+            const manualPath = window.prompt(
+              `Browser folder discovery cannot determine the full path for "${folderName}".\n\nEnter the full folder path to attach:`,
+              getSavedRoot() || ''
+            );
+            if (manualPath && manualPath.trim()) {
+              await attachProjectByPath(manualPath.trim());
+              return;
+            }
+          }
+          throw new Error(formatErrorMessage(error, 'Could not match the selected folder to a local project. Enter its full path in Advanced > Project tools.'));
         }
         const discovery = await response.json();
         const matches = Array.isArray(discovery.matches) ? discovery.matches : [];
