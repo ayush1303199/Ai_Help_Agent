@@ -594,7 +594,15 @@ export function normalizeProjectRuntimeTestWorkflowResult<T extends ProjectRunti
   );
   const resultMessage = result.message || receipt?.message;
   result.message = formatProjectRuntimeTestReceiptMessage(resultMessage, workspaceAudit, detectedWorkspaceIssues);
-  if (!['VERIFICATION_UNAVAILABLE', 'VERIFICATION_BLOCKED'].includes(result.outcome)) return result;
+  if (result.outcome === 'VERIFICATION_BLOCKED') {
+    result.codeVerified = false;
+    const inProcessNote = receipt?.status === 'PASSED'
+      ? ' (in-process hermetic simulation passed, but live host execution was blocked by PROCESS_ISOLATION_GATE)'
+      : '';
+    result.message = `${result.message || 'Live command execution blocked by process isolation gate.'}${inProcessNote}`;
+    return result;
+  }
+  if (result.outcome !== 'VERIFICATION_UNAVAILABLE') return result;
   if (receipt?.status === 'PASSED' && typeof receipt.message === 'string' && receipt.message
     && result.rolledBack !== true) {
     result.outcome = 'SUCCESS';

@@ -894,17 +894,35 @@ def _requires_proposal(request: str) -> bool:
     return bool(WRITE_PATTERN.search(request))
 
 
+EXPLICIT_FILE_CREATION_PATTERN = re.compile(
+    r"\b(?:create|make|add|generate|touch|banao|banana|banani|bnana|bnani|bana\s+do)\s+(?:a\s+|an\s+|new\s+|ek\s+)?file\b|"
+    r"\b(?:new\s+file|create\s+file|add\s+file|make\s+file)\b|"
+    r"\b(?:ek\s+)?file(?:n)?\s*(?:bn(?:a|ana|ani)|banao|banana|banani|bana\s+do)\b|"
+    r"\bfile(?:n)?bn(?:a|ana|ani)\b",
+    re.IGNORECASE,
+)
+
+NON_FILE_CREATION_INTENT_PATTERN = re.compile(
+    r"\b(?:investigate|debug|why|trace|diagnose|audit|inspect|check|explain|describe|"
+    r"fix|repair|resolve|test|verify|run|build|compile|bundle|lint|benchmark|profile)\b|"
+    r"\b(?:dekh|batao|sudhar|sudharo|chalao|test\s+karo)\b",
+    re.IGNORECASE,
+)
+
+
 def _is_underspecified_file_creation_request(request: str) -> bool:
-    if not WRITE_PATTERN.search(str(request or "")) or _is_capability_question(request):
+    if not request or _is_capability_question(request):
         return False
-    request_text = str(request or "")
-    if not re.search(r"\bfile(?:n)?(?:bn(?:a|ana|ani))?\b", request_text, re.IGNORECASE):
+    request_text = str(request or "").strip()
+    if NON_FILE_CREATION_INTENT_PATTERN.search(request_text):
         return False
-    return not bool(re.search(
-        r"\b[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,12}\b",
-        request_text,
-        re.IGNORECASE,
-    ))
+    if not EXPLICIT_FILE_CREATION_PATTERN.search(request_text):
+        return False
+    if re.search(r"\b[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,12}\b", request_text, re.IGNORECASE):
+        return False
+    if re.search(r"\b(?:in|into|under|inside|path|directory|folder)\s+[\w/\\.-]+", request_text, re.IGNORECASE):
+        return False
+    return True
 
 
 def _file_creation_clarification_question(request: str) -> str:

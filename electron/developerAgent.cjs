@@ -4112,6 +4112,18 @@ async function executeAutonomousCodingWorkflowStage({
     reason: 'The workflow evidence confirms its lifecycle stages, but a trusted item-specific objective verifier is not established.',
   });
   const delegateWorkItems = (reason) => {
+    if (!Array.isArray(taskPlan.workItems) || taskPlan.workItems.length === 0) {
+      taskPlan.workItems = [{
+        id: 'WI-001',
+        objective: String(taskPlan.goal || userRequest || 'Implement requested changes').trim(),
+        status: 'PENDING',
+        stageId: 'ST-3',
+        dependsOn: [],
+        requiredEvidence: ['APPROVED_SCOPE_PROPOSAL', 'EXPLICIT_APPROVAL'],
+        completionCriteria: [String(taskPlan.goal || userRequest || 'Implement requested changes').trim()],
+        source: 'USER_REQUEST',
+      }];
+    }
     for (const workItem of taskPlan.workItems || []) {
       if (['COMPLETED', 'SKIPPED', 'DELEGATED', 'CANCELLED'].includes(workItem.status)) continue;
       advanceTaskPlan(taskPlan, {
@@ -4126,6 +4138,7 @@ async function executeAutonomousCodingWorkflowStage({
         },
       });
     }
+    taskPlan.status = 'HANDED_OFF';
   };
 
   // STAGE 3: INVESTIGATE
@@ -5251,6 +5264,7 @@ async function executeAutonomousCodingWorkflowStage({
           outcome: reason,
         });
         delegateWorkItems(reason);
+        taskPlan.status = 'HANDED_OFF';
         return {
           outcome: 'IMPLEMENTATION_REQUIRED',
           phase: 'PLAN',
@@ -5755,6 +5769,7 @@ async function executeAutonomousCodingWorkflowStage({
       outcome: reason,
     });
     delegateWorkItems(reason);
+    taskPlan.status = 'HANDED_OFF';
     return {
       outcome: 'IMPLEMENTATION_REQUIRED',
       phase: 'PLAN',

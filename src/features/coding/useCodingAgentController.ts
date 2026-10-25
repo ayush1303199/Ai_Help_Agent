@@ -204,7 +204,10 @@ function normalizeWorkflowVerificationCriteria(value: unknown): WorkflowHandoffW
 function validateWorkflowHandoffPlan(value: unknown): WorkflowHandoffPlan | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const plan = value as Record<string, unknown>;
-  if (plan.schemaVersion !== 2 || plan.status !== 'HANDED_OFF'
+  const rawStatus = String(plan.status || '');
+  const hasDelegatedWork = Array.isArray(plan.workItems) && plan.workItems.some((w: unknown) => Boolean(w && typeof w === 'object' && 'status' in w && (w as { status?: unknown }).status === 'DELEGATED'));
+  const status = (rawStatus === 'HANDED_OFF' || (rawStatus === 'BLOCKED' && hasDelegatedWork)) ? 'HANDED_OFF' : rawStatus;
+  if (plan.schemaVersion !== 2 || status !== 'HANDED_OFF'
     || !Array.isArray(plan.workItems) || plan.workItems.length < 1 || plan.workItems.length > 12) {
     return null;
   }
@@ -1370,6 +1373,8 @@ export function useCodingAgentController({
               ? `Applying the proposed patch failed. ${rollbackStatus}`
               : `Applying the proposed patch failed: ${result.error || 'Apply error'}. Repository remains untouched.`;
           }
+        } else if (result.outcome === 'BLOCKED') {
+          outcomeContent = `Workflow was blocked${result.phase ? ` during ${result.phase}` : ''}: ${result.reason || result.message || 'Required policy, authorization, or isolation gate was not satisfied.'}`;
         } else if (result.outcome === 'CANCELLED') {
           outcomeContent = 'The workflow was cancelled.';
         } else {
