@@ -316,6 +316,29 @@ export function extractCodingProjectName(request: string): string | null {
   return candidates[0] || null;
 }
 
+export function formatErrorMessage(payload: unknown, fallback = 'An unexpected error occurred.'): string {
+  if (!payload) return fallback;
+  if (typeof payload === 'string') return payload === '[object Object]' ? fallback : payload;
+  if (payload instanceof Error) {
+    const msg = payload.message;
+    return msg && msg !== '[object Object]' ? msg : fallback;
+  }
+  if (typeof payload === 'object') {
+    const record = payload as Record<string, unknown>;
+    const detail = record.detail;
+    if (typeof detail === 'string') return detail;
+    if (detail && typeof detail === 'object') {
+      const d = detail as Record<string, unknown>;
+      if (typeof d.message === 'string') return d.message;
+      if (typeof d.error === 'string') return d.error;
+      if (typeof d.code === 'string') return d.code;
+    }
+    if (typeof record.message === 'string') return record.message;
+    if (typeof record.error === 'string') return record.error;
+  }
+  return fallback;
+}
+
 async function hashDeveloperContent(content: string) {
   const bytes = new TextEncoder().encode(content);
   const digest = await crypto.subtle.digest('SHA-256', bytes);
@@ -496,8 +519,9 @@ export function useCodingAgentController({
     };
   }, [proposal?.id, proposal?.proposalId]);
 
-  const onError = useCallback((message: string) => {
-    setErrorMessage(message);
+  const onError = useCallback((message: unknown) => {
+    const formatted = formatErrorMessage(message);
+    setErrorMessage(formatted);
     setStatusMessage('');
   }, []);
   const onStatus = useCallback((message: string) => {
@@ -1905,8 +1929,8 @@ export function useCodingAgentController({
           body: JSON.stringify({ name: folderName, signatures }),
         });
         if (!response.ok) {
-          const error = await response.json().catch(() => ({ detail: '' }));
-          throw new Error(error.detail || 'Could not match the selected folder to a local project.');
+          const error = await response.json().catch(() => ({}));
+          throw new Error(formatErrorMessage(error, 'Could not match the selected folder to a local project.'));
         }
         const discovery = await response.json();
         const matches = Array.isArray(discovery.matches) ? discovery.matches : [];
@@ -1926,8 +1950,8 @@ export function useCodingAgentController({
           body: JSON.stringify({ projectRoot: targetPath }),
         });
         if (!attachResponse.ok) {
-          const error = await attachResponse.json().catch(() => ({ detail: '' }));
-          throw new Error(error.detail || 'Could not attach the selected project.');
+          const error = await attachResponse.json().catch(() => ({}));
+          throw new Error(formatErrorMessage(error, 'Could not attach the selected project.'));
         }
         const attached = await attachResponse.json();
         setProjectRoot(attached.projectRoot);
@@ -2014,8 +2038,8 @@ export function useCodingAgentController({
           body: JSON.stringify({ projectRoot: targetPath }),
         });
         if (!response.ok) {
-          const error = await response.json().catch(() => ({ detail: '' }));
-          throw new Error(error.detail || 'Could not attach the selected project.');
+          const error = await response.json().catch(() => ({}));
+          throw new Error(formatErrorMessage(error, 'Could not attach the selected project.'));
         }
         const attached = await response.json();
         setProjectRoot(attached.projectRoot);
@@ -2047,8 +2071,7 @@ export function useCodingAgentController({
         });
         if (!response.ok) {
           const payload = await response.json().catch(() => ({}));
-          const detail = payload?.detail;
-          throw new Error(typeof detail === 'string' ? detail : detail?.message || `Project detach returned HTTP ${response.status}.`);
+          throw new Error(formatErrorMessage(payload, `Project detach returned HTTP ${response.status}.`));
         }
       } catch (error) {
         onError(error instanceof Error ? error.message : String(error));

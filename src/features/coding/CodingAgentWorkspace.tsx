@@ -620,7 +620,11 @@ export function CodingAgentWorkspace({
 
   return (
     <>
-      {errorMessage && <p role="alert" className="mb-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{errorMessage}</p>}
+      {errorMessage && (
+        <p role="alert" className="mb-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+          {errorMessage !== '[object Object]' ? errorMessage : 'An unexpected error occurred while processing the project request.'}
+        </p>
+      )}
       {statusMessage && <p role="status" className="mb-3 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-200">{statusMessage}</p>}
       <section aria-label="Live acceptance readiness" className="mb-3 rounded-lg border border-slate-700 bg-slate-950/40 px-3 py-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
