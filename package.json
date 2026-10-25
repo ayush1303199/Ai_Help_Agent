@@ -18,6 +18,11 @@
     "build": "vite build",
     "test": "node scripts/test-all.mjs",
     "test:developer-agent": "node scripts/developer-agent-test.mjs",
+    "test:generic-intent-discovery": "node scripts/generic-intent-discovery-test.mjs",
+    "test:dependency-manager": "node scripts/dependency-manager-test.mjs",
+    "test:build-orchestrator": "node scripts/build-orchestrator-test.mjs",
+    "test:diagnostic-repair": "node scripts/diagnostic-repair-loop-test.mjs",
+    "test:sandbox-execution": "node scripts/sandbox-execution-test.mjs",
     "test:work-item-verifier": "node scripts/work-item-verification-contract-test.mjs",
     "test:coding-investigation": "node scripts/coding-investigation-workflow-test.mjs",
     "test:database-discovery": "node scripts/database-discovery-test.mjs",
@@ -88,7 +93,14 @@
     "test:general-agent-electron-browser": "node scripts/general-agent-electron-browser-test.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.app.json"
+    "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "test:workflow-coordinator": "node scripts/workflow-coordinator-test.mjs",
+    "test:durable-recovery": "node scripts/durable-workflow-recovery-test.mjs",
+    "test:worker-authorization": "node scripts/worker-authorization-test.mjs",
+    "test:isolation-provider": "node scripts/isolation-provider-verification-test.mjs",
+    "test:research-augmentation": "node scripts/read-only-research-augmentation-test.mjs",
+    "test:semantic-graph": "node scripts/semantic-project-graph-test.mjs",
+    "test:graph-integration": "node scripts/semantic-graph-workflow-integration-test.mjs"
   },
   "main": "electron/main.cjs",
   "dependencies": {

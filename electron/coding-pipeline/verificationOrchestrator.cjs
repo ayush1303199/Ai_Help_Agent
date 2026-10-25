@@ -47,10 +47,40 @@ class VerificationOrchestrator {
   }
 
   detectRegressionTargets({ modifiedFiles = [], dependencyGraph = {} }) {
+    const detailed = this.detectRegressionTargetsDetailed({ modifiedFiles, dependencyGraph });
+    return detailed.targets.map((t) => typeof t === 'string' ? t : t.file);
+  }
+
+  detectRegressionTargetsDetailed({ modifiedFiles = [], dependencyGraph = {} }) {
+    if (dependencyGraph && typeof dependencyGraph.detectAffectedFilesDetailed === 'function') {
+      return dependencyGraph.detectAffectedFilesDetailed(modifiedFiles);
+    }
+    if (dependencyGraph?.semanticGraph && typeof dependencyGraph.semanticGraph.detectAffectedFilesDetailed === 'function') {
+      return dependencyGraph.semanticGraph.detectAffectedFilesDetailed(modifiedFiles);
+    }
+    if (dependencyGraph && typeof dependencyGraph.detectAffectedFiles === 'function') {
+      const targets = dependencyGraph.detectAffectedFiles(modifiedFiles);
+      return {
+        status: 'VERIFIED',
+        targets,
+        unresolvedDependencies: [],
+        totalTargets: targets.length,
+      };
+    }
+    if (dependencyGraph?.semanticGraph && typeof dependencyGraph.semanticGraph.detectAffectedFiles === 'function') {
+      const targets = dependencyGraph.semanticGraph.detectAffectedFiles(modifiedFiles);
+      return {
+        status: 'VERIFIED',
+        targets,
+        unresolvedDependencies: [],
+        totalTargets: targets.length,
+      };
+    }
+
     const candidates = new Set();
     const normalizedModified = modifiedFiles.map((f) => f.replace(/\\/g, '/').toLowerCase());
 
-    for (const [file, deps] of Object.entries(dependencyGraph)) {
+    for (const [file, deps] of Object.entries(dependencyGraph || {})) {
       const normalizedFile = file.replace(/\\/g, '/').toLowerCase();
       const depList = Array.isArray(deps) ? deps : [];
 
@@ -62,7 +92,18 @@ class VerificationOrchestrator {
       }
     }
 
-    return Array.from(candidates);
+    const fallbackList = Array.from(candidates);
+    return {
+      status: fallbackList.length > 0 ? 'DEGRADED_FUZZY' : 'GRAPH_UNAVAILABLE',
+      targets: fallbackList.map((f) => ({
+        file: f,
+        reason: 'FUZZY_SUBSTRING_MATCH',
+        relationshipType: 'UNCERTAIN',
+        severity: 'LOW',
+      })),
+      unresolvedDependencies: [],
+      totalTargets: fallbackList.length,
+    };
   }
 
   inspectSecurityGates(patchText = '') {

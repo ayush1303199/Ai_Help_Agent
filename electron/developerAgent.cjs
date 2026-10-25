@@ -79,6 +79,153 @@ const {
 } = require('./coding-pipeline/modularArchitectureEngine.cjs');
 const { isProjectRuntimeTestRequest } = require('./coding-pipeline/projectRuntimeTestIntent.cjs');
 const { projectProcessIsolationStatus } = require('./coding-pipeline/projectProcessIsolation.cjs');
+const {
+  INTENT_CATEGORIES,
+  classifyTaskIntent,
+  extractConstraints,
+} = require('./coding-pipeline/genericIntentClassifier.cjs');
+const {
+  WORKSPACE_STATES,
+  discoverWorkspace,
+} = require('./coding-pipeline/projectDiscovery.cjs');
+const {
+  SUPPORTED_ECOSYSTEMS,
+  DEPENDENCY_STATUSES,
+  PACKAGE_MANAGERS,
+  discoverDependencies,
+  createDependencyPlan,
+  executeDependencyPlan,
+  verifyInstalledDependencies,
+} = require('./coding-pipeline/dependencyManager.cjs');
+const {
+  BUILD_OPERATIONS,
+  BUILD_OUTCOMES,
+  validateCommandSafety,
+  discoverBuildOperations,
+  checkBuildPrerequisites,
+  createBuildPlan,
+  executeBuildPlan,
+} = require('./coding-pipeline/buildOrchestrator.cjs');
+const {
+  DIAGNOSTIC_STATUSES,
+  FAILURE_CATEGORIES,
+  VERIFICATION_TIERS,
+  redactSensitiveData,
+  extractDiagnosticDetails,
+  diagnoseFailure,
+} = require('./coding-pipeline/diagnosticEngine.cjs');
+const {
+  MAX_REPAIR_ATTEMPTS,
+  REPAIR_PLAN_STATUSES,
+  createDiffPreview,
+  createRepairPlan,
+  executeRepairCycle,
+  validatePathWithinRoot,
+  rollbackAllSnapshots,
+  validateMultiFilePatchIntegrity,
+} = require('./coding-pipeline/repairPlanner.cjs');
+const {
+  ADAPTER_STATUSES,
+  DEFAULT_EXECUTION_TIMEOUT_MS,
+  MAX_EXECUTION_TIMEOUT_MS,
+  discoverEnvironmentCapabilities,
+  verifyIsolationEvidence,
+  executeInVerifiedSandbox,
+} = require('./coding-pipeline/sandboxExecutionAdapter.cjs');
+const {
+  WORKFLOW_STATES,
+  TERMINAL_STATES,
+  VALID_TRANSITIONS,
+  createStageEvidenceRecord,
+  WorkflowStateCoordinator,
+  createWorkflowCoordinator,
+} = require('./coding-pipeline/workflowStateCoordinator.cjs');
+const {
+  AUDITOR_OUTCOMES,
+  auditWorkflowCompletion,
+} = require('./coding-pipeline/completionAuditor.cjs');
+const {
+  DURABLE_SCHEMA_VERSION,
+  computeRecordDigest,
+  validateWorkflowRecord,
+  DurableWorkflowStore,
+  createDurableWorkflowStore,
+} = require('./coding-pipeline/durableWorkflowStore.cjs');
+const {
+  JOURNAL_SCHEMA_VERSION,
+  JOURNAL_EVENT_TYPES,
+  EvidenceJournal,
+  createEvidenceJournal,
+  verifyJournalIntegrity,
+  computeEntryHash,
+} = require('./coding-pipeline/evidenceJournal.cjs');
+const {
+  RECOVERY_OUTCOMES,
+  WorkflowRecoveryManager,
+  createWorkflowRecoveryManager,
+} = require('./coding-pipeline/workflowRecoveryManager.cjs');
+const {
+  WORKER_CAPABILITIES,
+  DEFAULT_GRANT_TTL_MS,
+  MAX_GRANT_TTL_MS,
+  computeGrantDigest,
+  createWorkerAuthorizationGrant,
+  validateWorkerAuthorizationGrant,
+} = require('./coding-pipeline/workerAuthorizationContract.cjs');
+const {
+  LEASE_STATES,
+  WorkerLeaseManager,
+  createWorkerLeaseManager,
+} = require('./coding-pipeline/workerLeaseManager.cjs');
+const {
+  PROVIDER_STATUSES,
+  ISOLATION_LEVELS,
+  IsolationProviderRegistry,
+  defaultRegistry: defaultIsolationRegistry,
+  createIsolationProviderRegistry,
+} = require('./coding-pipeline/isolationProviderRegistry.cjs');
+const {
+  DEFAULT_ISOLATION_POLICY,
+  verifyIsolationCapabilities,
+} = require('./coding-pipeline/isolationCapabilityVerifier.cjs');
+const {
+  WindowsSandboxProvider,
+  createWindowsSandboxProvider,
+} = require('./coding-pipeline/providers/windowsSandboxProvider.cjs');
+const {
+  ContainerProvider,
+  createContainerProvider,
+} = require('./coding-pipeline/providers/containerProvider.cjs');
+const {
+  LinuxNamespaceProvider,
+  createLinuxNamespaceProvider,
+} = require('./coding-pipeline/providers/linuxNamespaceProvider.cjs');
+const {
+  RESEARCH_EVIDENCE_TIER,
+  RESEARCH_STATUSES,
+  ALLOWLISTED_DOC_DOMAINS,
+  MAX_DOC_SIZE_BYTES,
+  DEFAULT_TIMEOUT_MS: DEFAULT_RESEARCH_TIMEOUT_MS,
+  sha256: sha256Research,
+  sanitizeDocContent,
+  isDomainAllowed: isDocDomainAllowed,
+  createResearchQuery,
+  fetchReadOnlyDocumentation,
+  LocalDocumentationStore,
+  defaultLocalStore: defaultLocalDocStore,
+  augmentDiagnosisWithResearch,
+} = require('./coding-pipeline/readOnlyResearchAugmentation.cjs');
+const {
+  RESOLUTION_STATUS,
+  resolveModuleSpecifier,
+  extractPathAliases,
+} = require('./coding-pipeline/moduleResolver.cjs');
+const {
+  GRAPH_VERSION,
+  parseModuleAstEvidence,
+  SemanticProjectGraph,
+  createSemanticProjectGraph,
+} = require('./coding-pipeline/projectGraphModel.cjs');
 const developerFiles = require('./developerFiles.cjs');
 const { readProjectMetadata } = require('./developerIndex.cjs');
 
@@ -801,7 +948,9 @@ function beginConversationTurn({ root, scope = '.', request, sessionId, ownerWeb
         taskId: turnId,
         turnId,
         expiresAt,
-        requestHash: requestDigest,
+        originalRequest: request,
+    constraints: extractConstraints(request),
+    requestHash: requestDigest,
         requestSummary: request.slice(0, 512),
         root: canonicalRoot,
         scope,
@@ -3583,10 +3732,20 @@ async function executeAutonomousCodingWorkflowStage({
     : continuation?.modeRouting
       || routeTaskMode({ goal: userRequest, userRequestedMode: taskOperatingMode });
   const requirementsAnalysis = continuation?.requirementsAnalysis || analyzeTaskRequirements(userRequest);
-  if (requirementsAnalysis.needsClarification) {
+  const workspaceDiscovery = continuation?.workspaceDiscovery
+    || await discoverWorkspace({ projectRoot: root, ownerWebContentsId, sessionId });
+  const genericIntent = continuation?.genericIntent
+    || classifyTaskIntent({
+      request: userRequest,
+      projectContext: workspaceDiscovery,
+      evidence: workspaceDiscovery?.evidence || [],
+    });
+
+  if (genericIntent.needsClarification || requirementsAnalysis.needsClarification) {
+    const prompt = genericIntent.clarificationPrompt || requirementsAnalysis.clarificationPrompt;
     const taskPlan = createTaskPlan({
       userRequest,
-      requirements: requirementsAnalysis,
+      requirements: { ...requirementsAnalysis, clarificationPrompt: prompt },
       operatingMode: modeRouting.mode,
       complexity: modeRouting.complexity,
       capabilities: {
@@ -3595,11 +3754,17 @@ async function executeAutonomousCodingWorkflowStage({
         canVerify: modeRouting.canVerify,
       },
     });
+    taskPlan.originalRequest = userRequest;
+    taskPlan.constraints = genericIntent.constraints;
+    taskPlan.intentClassification = genericIntent;
+    taskPlan.workspaceDiscovery = workspaceDiscovery;
     return {
       outcome: 'CLARIFICATION_REQUIRED',
       phase: 'UNDERSTAND',
       requirements: requirementsAnalysis,
-      clarificationPrompt: requirementsAnalysis.clarificationPrompt,
+      intentClassification: genericIntent,
+      workspaceDiscovery,
+      clarificationPrompt: prompt,
       filesModified: [],
       taskPlan,
       workflowReceipt: buildWorkflowReceipt({
@@ -3642,9 +3807,241 @@ async function executeAutonomousCodingWorkflowStage({
         || Boolean(requirementsAnalysis?.isModular),
     },
   });
+  const dependencyReport = continuation?.dependencyReport
+    || await discoverDependencies(root);
+
   const turn = continuation?.turn || beginConversationTurn({
     root, request: userRequest, sessionId, ownerWebContentsId, scope, operatingMode: modeRouting.mode,
   });
+  taskPlan.originalRequest = userRequest;
+  taskPlan.constraints = genericIntent.constraints;
+  taskPlan.intentClassification = genericIntent;
+  taskPlan.workspaceDiscovery = workspaceDiscovery;
+  taskPlan.dependencyReport = dependencyReport;
+  const buildDiscovery = await discoverBuildOperations(root);
+  taskPlan.buildDiscovery = buildDiscovery;
+
+  const isDependencyInstallRequest = /\b(?:install|download)\s+(?:the\s+)?(?:dependencies|deps|packages?)\b/i.test(userRequest)
+    || (/\binstall\b/i.test(userRequest) && dependencyReport.needsInstallation);
+
+  if (isDependencyInstallRequest && !isRuntimeTestRequest && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK) {
+    onProgress({ phase: 'DEPENDENCY_PLAN', message: 'Generating dependency installation plan proposal.' });
+    const plan = createDependencyPlan({ projectRoot: root, dependencyReport });
+    taskPlan.dependencyPlan = plan;
+
+    const execResult = await executeDependencyPlan({ plan, ownerWebContentsId, sessionId });
+    if (!execResult.ok && execResult.executionBlocked) {
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'dependency_install_blocked', reason: execResult.reason });
+      return {
+        outcome: 'BLOCKED',
+        phase: 'DEPENDENCY_INSTALL_GATE',
+        turnId: turn.turnId,
+        taskPlan,
+        dependencyPlan: plan,
+        dependencyReport,
+        executionBlocked: true,
+        reason: execResult.reason,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'BLOCKED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+        }),
+      };
+    }
+  }
+
+  if (genericIntent.primaryIntent === INTENT_CATEGORIES.EXPLAIN_OR_ASK && !isRuntimeTestRequest && modeRouting.mode !== 'AUDIT' && modeRouting.mode !== 'INVESTIGATE') {
+    onProgress({ phase: 'EXPLAIN', message: 'Analyzing project context to answer question.' });
+    advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'explanation_completed' });
+    return {
+      outcome: 'COMPLETED',
+      phase: 'EXPLAIN',
+      turnId: turn.turnId,
+      taskPlan,
+      intentClassification: genericIntent,
+      workspaceDiscovery,
+      explanation: `Discovered project context: state=${workspaceDiscovery.workspaceState}, manifests=${workspaceDiscovery.manifests.map((m) => m.name).join(', ') || 'none'}, languages=${workspaceDiscovery.languages.join(', ') || 'none'}.`,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'COMPLETED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'EXPLAIN'],
+      }),
+    };
+  }
+
+  const isExplicitBuildOrTestRequest = !isRuntimeTestRequest
+    && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK
+    && !isDependencyInstallRequest
+    && (
+      genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY
+      || /\b(?:build(?:ing)?|compile|typecheck|type-check|lint|run\s+(?:the\s+)?tests?|test\s+suite|smoke\s*test)\b/i.test(userRequest)
+    )
+    && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
+
+  if (isExplicitBuildOrTestRequest) {
+    let operation = BUILD_OPERATIONS.BUILD;
+    if (/\b(?:typecheck|type-check)\b/i.test(userRequest)) {
+      operation = BUILD_OPERATIONS.TYPECHECK;
+    } else if (/\blint\b/i.test(userRequest)) {
+      operation = BUILD_OPERATIONS.LINT;
+    } else if (/\bsmoke\b/i.test(userRequest)) {
+      operation = BUILD_OPERATIONS.SMOKE_TEST;
+    } else if (/\btests?\b/i.test(userRequest) || genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY) {
+      operation = BUILD_OPERATIONS.TEST;
+    }
+
+    onProgress({ phase: 'BUILD_PLAN', message: `Generating build orchestration plan for ${operation}.` });
+    const plan = await createBuildPlan({
+      projectRoot: root,
+      operation,
+      discoveryResult: buildDiscovery,
+      dependencyReport,
+    });
+    taskPlan.buildPlan = plan;
+
+    if (!plan.configured) {
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_not_configured', reason: plan.reason });
+      return {
+        outcome: plan.status,
+        phase: 'BUILD_PLAN',
+        turnId: turn.turnId,
+        taskPlan,
+        buildPlan: plan,
+        buildDiscovery,
+        executionBlocked: true,
+        reason: plan.reason,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: plan.status,
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN'],
+        }),
+      };
+    }
+
+    if (plan.status === 'PREREQUISITES_MISSING' || !plan.prerequisites.satisfied) {
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_prerequisites_missing', reason: plan.prerequisites.reason });
+      return {
+        outcome: 'BLOCKED',
+        phase: 'DEPENDENCY_PREREQUISITE_GATE',
+        turnId: turn.turnId,
+        taskPlan,
+        buildPlan: plan,
+        buildDiscovery,
+        dependencyReport,
+        executionBlocked: true,
+        reason: plan.prerequisites.reason,
+        missingDependencies: plan.prerequisites.missingDependencies,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'BLOCKED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_CHECK', 'BUILD_PLAN'],
+        }),
+      };
+    }
+
+    const execResult = await executeBuildPlan({ plan, ownerWebContentsId, sessionId });
+    if (!execResult.ok && execResult.executionBlocked) {
+      const diagnosis = diagnoseFailure(execResult, {
+        projectRoot: root,
+        attemptHistory: taskPlan.attemptHistory || [],
+      });
+      taskPlan.diagnosis = diagnosis;
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_execution_blocked', reason: execResult.reason });
+      return {
+        outcome: 'BLOCKED',
+        phase: 'BUILD_EXECUTION_GATE',
+        turnId: turn.turnId,
+        taskPlan,
+        buildPlan: plan,
+        buildDiscovery,
+        diagnosis,
+        executionBlocked: true,
+        reason: execResult.reason,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'BLOCKED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN'],
+        }),
+      };
+    }
+
+    if (execResult.ok) {
+      advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'build_completed' });
+      return {
+        outcome: 'COMPLETED',
+        phase: 'BUILD_VERIFICATION',
+        turnId: turn.turnId,
+        taskPlan,
+        buildPlan: plan,
+        buildDiscovery,
+        buildResult: execResult,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: true,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'COMPLETED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE'],
+        }),
+      };
+    }
+
+    const diagnosis = diagnoseFailure(execResult, {
+      projectRoot: root,
+      attemptHistory: taskPlan.attemptHistory || [],
+    });
+    taskPlan.diagnosis = diagnosis;
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_failed', reason: execResult.stderr });
+    return {
+      outcome: 'FAILED',
+      phase: 'BUILD_EXECUTE',
+      turnId: turn.turnId,
+      taskPlan,
+      buildPlan: plan,
+      buildDiscovery,
+      buildResult: execResult,
+      diagnosis,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'FAILED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE'],
+      }),
+    };
+  }
+
+  if (genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH && !isRuntimeTestRequest) {
+    onProgress({ phase: 'RUN_GATE', message: 'Evaluating process isolation policy for run request.' });
+    const blockReason = 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.';
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'launch_blocked', reason: blockReason });
+    return {
+      outcome: 'BLOCKED',
+      phase: 'RUN_OR_LAUNCH',
+      turnId: turn.turnId,
+      taskPlan,
+      intentClassification: genericIntent,
+      workspaceDiscovery,
+      executionBlocked: true,
+      reason: blockReason,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'BLOCKED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER'],
+      }),
+    };
+  }
   const cancelledResult = (phase, taskId = null) => {
     if (continuation?.token) workflowContinuations.delete(continuation.token);
     const activeStage = taskPlan.subtasks.find((item) => item.status === 'IN_PROGRESS');
@@ -7257,4 +7654,107 @@ module.exports = {
   buildWorkflowReceipt, validateWorkflowReceipt,
   validateSafePath, isGreenfieldWorkspace, discoverProjectConventions,
   deriveModularPlan, synthesizeMultiFilePatch, verifyIntegrationReachability,
+  INTENT_CATEGORIES,
+  classifyTaskIntent,
+  extractConstraints,
+  WORKSPACE_STATES,
+  discoverWorkspace,
+  SUPPORTED_ECOSYSTEMS,
+  DEPENDENCY_STATUSES,
+  PACKAGE_MANAGERS,
+  discoverDependencies,
+  createDependencyPlan,
+  executeDependencyPlan,
+  verifyInstalledDependencies,
+  BUILD_OPERATIONS,
+  BUILD_OUTCOMES,
+  validateCommandSafety,
+  discoverBuildOperations,
+  checkBuildPrerequisites,
+  createBuildPlan,
+  executeBuildPlan,
+  DIAGNOSTIC_STATUSES,
+  FAILURE_CATEGORIES,
+  VERIFICATION_TIERS,
+  redactSensitiveData,
+  extractDiagnosticDetails,
+  diagnoseFailure,
+  MAX_REPAIR_ATTEMPTS,
+  REPAIR_PLAN_STATUSES,
+  createDiffPreview,
+  createRepairPlan,
+  executeRepairCycle,
+  validatePathWithinRoot,
+  rollbackAllSnapshots,
+  validateMultiFilePatchIntegrity,
+  ADAPTER_STATUSES,
+  DEFAULT_EXECUTION_TIMEOUT_MS,
+  MAX_EXECUTION_TIMEOUT_MS,
+  discoverEnvironmentCapabilities,
+  verifyIsolationEvidence,
+  executeInVerifiedSandbox,
+  WORKFLOW_STATES,
+  TERMINAL_STATES,
+  VALID_TRANSITIONS,
+  createStageEvidenceRecord,
+  WorkflowStateCoordinator,
+  createWorkflowCoordinator,
+  AUDITOR_OUTCOMES,
+  auditWorkflowCompletion,
+  DURABLE_SCHEMA_VERSION,
+  computeRecordDigest,
+  validateWorkflowRecord,
+  DurableWorkflowStore,
+  createDurableWorkflowStore,
+  JOURNAL_SCHEMA_VERSION,
+  JOURNAL_EVENT_TYPES,
+  EvidenceJournal,
+  createEvidenceJournal,
+  verifyJournalIntegrity,
+  computeEntryHash,
+  RECOVERY_OUTCOMES,
+  WorkflowRecoveryManager,
+  createWorkflowRecoveryManager,
+  WORKER_CAPABILITIES,
+  DEFAULT_GRANT_TTL_MS,
+  MAX_GRANT_TTL_MS,
+  computeGrantDigest,
+  createWorkerAuthorizationGrant,
+  validateWorkerAuthorizationGrant,
+  LEASE_STATES,
+  WorkerLeaseManager,
+  createWorkerLeaseManager,
+  PROVIDER_STATUSES,
+  ISOLATION_LEVELS,
+  IsolationProviderRegistry,
+  defaultIsolationRegistry,
+  createIsolationProviderRegistry,
+  DEFAULT_ISOLATION_POLICY,
+  verifyIsolationCapabilities,
+  WindowsSandboxProvider,
+  createWindowsSandboxProvider,
+  ContainerProvider,
+  createContainerProvider,
+  LinuxNamespaceProvider,
+  createLinuxNamespaceProvider,
+  RESEARCH_EVIDENCE_TIER,
+  RESEARCH_STATUSES,
+  ALLOWLISTED_DOC_DOMAINS,
+  MAX_DOC_SIZE_BYTES,
+  DEFAULT_RESEARCH_TIMEOUT_MS,
+  sha256Research,
+  sanitizeDocContent,
+  isDocDomainAllowed,
+  createResearchQuery,
+  fetchReadOnlyDocumentation,
+  LocalDocumentationStore,
+  defaultLocalDocStore,
+  augmentDiagnosisWithResearch,
+  RESOLUTION_STATUS,
+  resolveModuleSpecifier,
+  extractPathAliases,
+  GRAPH_VERSION,
+  parseModuleAstEvidence,
+  SemanticProjectGraph,
+  createSemanticProjectGraph,
 };

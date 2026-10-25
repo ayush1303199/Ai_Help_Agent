@@ -3,6 +3,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { authorizeAppOwnedMutation } = require('./appOwnedPersistence.cjs');
 const { INDEX_STAGE, runIndexStage } = require('./coding-pipeline/index/indexStage.cjs');
+const { createSemanticProjectGraph } = require('./coding-pipeline/projectGraphModel.cjs');
+const { extractPathAliases } = require('./coding-pipeline/moduleResolver.cjs');
 
 const SUPPORTED = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.php', '.java', '.kt', '.go', '.rb', '.cs', '.fs', '.vb', '.rs', '.py']);
 const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo', '.cache', 'logs', 'tmp', 'temp']);
@@ -186,6 +188,27 @@ async function buildRepositoryMap(rootInput, previous = null) {
   return { root, generatedAt: new Date().toISOString(), cacheKey, ...metadata, scripts, structure, previousCacheHit: Boolean(previous && previous.cacheKey === cacheKey) };
 }
 
+async function buildSemanticProjectGraph(root, contentsMap = null, options = {}) {
+  let aliasConfig = null;
+  try {
+    const tsconfigRaw = await fs.readFile(path.join(root, 'tsconfig.json'), 'utf8');
+    aliasConfig = extractPathAliases(JSON.parse(tsconfigRaw));
+  } catch {
+    try {
+      const jsconfigRaw = await fs.readFile(path.join(root, 'jsconfig.json'), 'utf8');
+      aliasConfig = extractPathAliases(JSON.parse(jsconfigRaw));
+    } catch {
+      aliasConfig = null;
+    }
+  }
+
+  const graph = createSemanticProjectGraph(root, { aliasConfig, ...options });
+  if (contentsMap) {
+    graph.buildFromWorkspace(contentsMap);
+  }
+  return graph;
+}
+
 async function buildIndex(rootInput, previous = null) {
   const root = await fs.realpath(rootInput);
   const files = [];
@@ -205,17 +228,28 @@ async function buildIndex(rootInput, previous = null) {
   await walk(root);
   const old = previous?.files || {};
   const indexed = {};
+  const contentsMap = new Map();
   for (const absolute of files) {
     const relative = path.relative(root, absolute).replace(/\\/g, '/');
     const content = await fs.readFile(absolute, 'utf8');
+    contentsMap.set(relative, content);
     const oldEntry = old[relative];
     indexed[relative] = oldEntry?.hash === digest(content) ? oldEntry : parseSource(relative, content);
   }
+  const semanticGraph = await buildSemanticProjectGraph(root, contentsMap);
   const dependencyEdges = Object.values(indexed).flatMap((file) => file.dependencyEdges || []);
   const dependencyGraph = {
     nodes: Object.keys(indexed),
-    edges: dependencyEdges.slice(0, 2000),
-    capabilities: { staticImports: true, resolvedPaths: false, dynamicImports: false },
+    edges: semanticGraph.edges.length > 0 ? semanticGraph.edges : dependencyEdges.slice(0, 2000),
+    unresolved: semanticGraph.unresolvedReferences,
+    capabilities: {
+      staticImports: true,
+      resolvedPaths: semanticGraph.edges.length > 0,
+      dynamicImports: true,
+      reExports: true,
+      pathAliases: Boolean(semanticGraph.aliasConfig),
+    },
+    semanticGraph,
   };
   const cacheHits = files.filter((absolute) => {
     const relative = path.relative(root, absolute).replace(/\\/g, '/');
@@ -613,4 +647,5 @@ module.exports = {
   findReferences, inside, assertWithinRoot, isIgnoredName, isSensitivePath,
   configureSemanticSearch, searchSemantic, mergeSearchResults,
   INDEX_STAGE, runIndexStage,
+  buildSemanticProjectGraph,
 };
