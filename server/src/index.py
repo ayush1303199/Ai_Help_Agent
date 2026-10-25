@@ -1186,7 +1186,10 @@ def _bind_browser_session_to_root(
 @app.get("/api/coding/project-state")
 def get_coding_project_state_endpoint(request: Request) -> Dict[str, Any]:
     if request.headers.get("origin") in TRUSTED_RENDERER_ORIGINS:
-        browser_session_id = _browser_session_identity(request)
+        try:
+            browser_session_id = _browser_session_identity(request)
+        except HTTPException:
+            return {"projectRoot": None, "status": "PROJECT_NOT_ATTACHED", "attached": False}
         with _trusted_desktop_broker_lock:
             browser_sessions = _trusted_desktop_broker_state.get("browserSessions")
             session = (

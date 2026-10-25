@@ -1579,7 +1579,8 @@ app.whenReady().then(async () => {
       developerIndexCaches.delete(currentRoot);
       developerContext.invalidateContextCache(currentRoot);
     }
-    const result = await developerFiles.chooseProjectFolder(dialog, event.sender.id);
+    const parentWindow = BrowserWindow.fromWebContents(event.sender);
+    const result = await developerFiles.chooseProjectFolder(dialog, event.sender.id, parentWindow);
     if (result?.status === 'PROJECT_ATTACHED' && result.projectRoot) {
       try {
         await registerTrustedBrokerProject(event.sender.id, result.projectRoot);

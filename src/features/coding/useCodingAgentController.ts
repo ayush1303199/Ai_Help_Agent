@@ -653,7 +653,11 @@ export function useCodingAgentController({
             });
             if (!active) return;
             if (!attachResponse.ok) {
-              throw new Error(`Saved project could not be attached: HTTP ${attachResponse.status}`);
+              setProjectRoot(null);
+              setProjectLifecycleState('NO_PROJECT');
+              setProjectCandidates([]);
+              setDirectory([]);
+              return;
             }
             const attached = await attachResponse.json();
             if (!attached.projectRoot) {

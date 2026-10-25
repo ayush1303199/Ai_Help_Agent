@@ -3,7 +3,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
-const { developer: developerSettings } = require('../src/config/runtimeSettings.json');
+const { developer: developerSettings, services } = require('../src/config/runtimeSettings.json');
 const { detectProject, PROJECT_MANIFESTS, VERIFICATION_PROFILES } = require('./coding-pipeline/detect/projectDetector.cjs');
 const { maskNonCodeSource } = require('./coding-pipeline/investigationWorkflowContract.cjs');
 const {
@@ -629,22 +629,25 @@ async function resolveProjectScope(ownerWebContentsId, relativePath = '.') {
   return path.relative(resolved.root, resolved.target).replace(/\\/g, '/') || '.';
 }
 
-async function chooseProjectFolder(dialog, ownerWebContentsId) {
+async function chooseProjectFolder(dialog, ownerWebContentsId, parentWindow = null) {
   if (ownerWebContentsId === undefined) throw new Error('Developer project ownership is required.');
   const scaffoldPath = projectRoots.get(ownerWebContentsId) || authoritativeProjectRoot || process.cwd() || require('node:os').homedir();
-  const result = await dialog.showOpenDialog({
+  const options = {
     title: 'Select project folder',
     defaultPath: scaffoldPath,
     properties: ['openDirectory'],
-  });
+  };
+  const result = parentWindow && !parentWindow.isDestroyed()
+    ? await dialog.showOpenDialog(parentWindow, options)
+    : await dialog.showOpenDialog(options);
   if (result.canceled || !result.filePaths[0]) {
-    return { canceled: true, projectRoot: projectRoots.get(ownerWebContentsId) || authoritativeProjectRoot || null };
+    return { canceled: true, status: authoritativeProjectStatus, projectRoot: projectRoots.get(ownerWebContentsId) || authoritativeProjectRoot || null };
   }
   const selectedRoot = await fs.realpath(result.filePaths[0]);
   projectRoots.set(ownerWebContentsId, selectedRoot);
   projectDiscoveryMatches.delete(ownerWebContentsId);
   await setAuthoritativeProject(selectedRoot, ownerWebContentsId);
-  return { canceled: false, projectRoot: selectedRoot };
+  return { canceled: false, status: PROJECT_STATUSES.ATTACHED, projectRoot: selectedRoot };
 }
 
 async function listDirectory(relativePath = '.', ownerWebContentsId) {
@@ -1526,10 +1529,15 @@ async function getVerificationScripts(ownerWebContentsId, requested = []) {
 
 function syncProjectStateToBackend(projectRoot) {
   try {
-    const url = 'http://localhost:3001/api/coding/project-state';
+    const port = services?.http?.port || 3001;
+    const url = `http://localhost:${port}/api/coding/project-state`;
+    const authToken = process.env.AI_CODING_AUTH_TOKEN;
     fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { 'X-Coding-Auth': authToken } : {}),
+      },
       body: JSON.stringify({ projectRoot: projectRoot || null }),
     }).catch(() => undefined);
   } catch {}
