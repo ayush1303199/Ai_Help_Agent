@@ -413,6 +413,14 @@ function buildHermeticExecutionReceipt(verification, route, {
     `The verifier did not run \`npm test\`; live behavior in this receipt was executed by the in-process Gate 9 loopback harness.`,
     `Run locally: \`npm start\` -> ${runUrl}.`,
     'The verifier did not run npm install or spawn a project process; dependency-installation readiness is reported in the audit below.',
+    '',
+    'Evidence Categories Distinction:',
+    '- Source / static analysis: PASSED (Gates 1–8: Syntax & AST, Schema contract, Validation & status, Full-stack wiring, Run readiness, Module & runtime resolution, Cross-layer data flow, Adversarial behavior matrix).',
+    `- Synthetic / in-process tests: PASSED (Gate 9 in-process HTTP loopback runtime executed ${applicableProbeCount} applicable API probes, ${runtime.behavioralTestSuite.assertionCount} behavioral assertions, 2 UI preview routes).`,
+    '- Actual project test commands: NOT RUN on host (`npm test` was not spawned; command execution blocked by OS process isolation policy).',
+    '- Actual build results: NOT RUN (in-process hermetic compilation and synthetic harness only).',
+    '- Actual application runtime: NOT STARTED (live host server daemon not launched; in-process VM loopback only).',
+    '- Checks blocked or not executed: Host process execution of `npm test` and `npm install` blocked by unverified OS process isolation.',
     ...engineeringDetails,
     ...readinessAudit,
   ].join('\n');
@@ -420,6 +428,37 @@ function buildHermeticExecutionReceipt(verification, route, {
     status: 'PASSED',
     gateCount: verification.total,
     gates: gateLabels.map((label, index) => ({ index: index + 1, label, status: 'PASS' })),
+    evidenceCategories: {
+      sourceAndStaticAnalysis: {
+        status: 'PASSED',
+        gateRange: '1-8',
+        passed: 8,
+        total: 8,
+      },
+      syntheticAndInProcessProbes: {
+        status: 'PASSED',
+        gate: 9,
+        applicableProbesPassed: applicableProbeCount,
+        behavioralAssertionsPassed: runtime.behavioralTestSuite.assertionCount,
+      },
+      actualProjectTestCommands: {
+        status: 'NOT_RUN',
+        command: 'npm test',
+        reason: 'Host process execution is disabled because OS process isolation is not verified.',
+      },
+      actualBuildResults: {
+        status: 'NOT_RUN',
+        reason: 'In-process hermetic compilation used; no host build binary executed.',
+      },
+      actualApplicationRuntime: {
+        status: 'IN_PROCESS_VM_ONLY',
+        reason: 'Host server daemon not launched.',
+      },
+      checksBlockedOrNotExecuted: [
+        { check: 'npm test', reason: 'Blocked by unverified OS process isolation boundary' },
+        { check: 'npm install', reason: 'Blocked by unverified OS process isolation boundary' },
+      ],
+    },
     apiProbes: runtime.behavioralApiProbes.map((probe) => ({
       id: probe.id,
       method: probe.method,
@@ -3672,6 +3711,7 @@ async function executeAutonomousCodingWorkflowStage({
   requestApproval = null,
   tools = null,
   isCancelled = () => false,
+  continuationToken = null,
 }, continuation = null) {
   if (!sessionId || ownerWebContentsId === undefined) {
     throw new Error('Developer session ownership is required.');
@@ -3852,6 +3892,53 @@ async function executeAutonomousCodingWorkflowStage({
     }
   }
 
+  const isProjectTestOrVerifyRequest = (isRuntimeTestRequest || genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY || /\b(?:run\s+(?:the\s+)?tests?|test(?:s|ing)?|verify|verification)\b/i.test(userRequest)) && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
+
+  if (isProjectTestOrVerifyRequest && dependencyReport.needsInstallation && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK && !existingRuntimeTestPlan && !isDependencyInstallRequest) {
+    onProgress({
+      phase: 'DEPENDENCY_CHECK',
+      message: `Project dependencies declared in manifest (${(dependencyReport.missingDependencies || []).map((d) => d.name).join(', ')}) are missing on disk. Generating dependency installation plan proposal.`,
+    });
+    const plan = createDependencyPlan({ projectRoot: root, dependencyReport });
+    taskPlan.dependencyPlan = plan;
+
+    const missingList = (dependencyReport.missingDependencies || []).map((d) => d.name).join(', ');
+    const pm = plan.packageManager || dependencyReport.preferredPackageManager || 'npm';
+    const installCmd = plan.fullCommandString || `${pm} install`;
+    const isolationStatus = projectProcessIsolationStatus();
+    const reason = `Testing blocked: Project has unresolved or missing dependencies in ecosystem "${dependencyReport.primaryReport?.ecosystem || 'node'}". Dependencies (${missingList}) must be installed and verified before test execution can proceed.`;
+    const explanation = [
+      `[DEPENDENCY_PREREQUISITE_GATE] Testing blocked: Required dependencies declared in project manifest are not installed on disk.`,
+      `- Missing dependencies (${dependencyReport.missingCount}): ${missingList}`,
+      `- Ecosystem: ${dependencyReport.primaryReport?.ecosystem || 'node'} (detected via ${dependencyReport.primaryReport?.manifestPath || 'package.json'})`,
+      `- Recommended reproducible install command: \`${installCmd}\``,
+      `- Execution policy: Host command execution is blocked by the OS process isolation gate (${isolationStatus.reason || 'Windows process isolation is unverified'}).`,
+      `To proceed with testing, install the missing dependencies in an isolated environment or verify host process isolation.`,
+    ].join('\n');
+
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_prerequisites_missing', reason });
+    return {
+      outcome: 'BLOCKED',
+      phase: 'DEPENDENCY_PREREQUISITE_GATE',
+      turnId: turn.turnId,
+      taskPlan,
+      dependencyPlan: plan,
+      dependencyReport,
+      buildDiscovery,
+      executionBlocked: true,
+      reason,
+      message: explanation,
+      missingDependencies: dependencyReport.missingDependencies,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'BLOCKED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_CHECK', 'BUILD_PLAN'],
+      }),
+    };
+  }
+
   if (genericIntent.primaryIntent === INTENT_CATEGORIES.EXPLAIN_OR_ASK && !isRuntimeTestRequest && modeRouting.mode !== 'AUDIT' && modeRouting.mode !== 'INVESTIGATE') {
     onProgress({ phase: 'EXPLAIN', message: 'Analyzing project context to answer question.' });
     advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'explanation_completed' });
@@ -3873,11 +3960,12 @@ async function executeAutonomousCodingWorkflowStage({
     };
   }
 
-  const isExplicitBuildOrTestRequest = !isRuntimeTestRequest
+  const isExplicitBuildOrTestRequest = (!isRuntimeTestRequest || !existingRuntimeTestPlan)
     && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK
     && !isDependencyInstallRequest
     && (
       genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY
+      || isRuntimeTestRequest
       || /\b(?:build(?:ing)?|compile|typecheck|type-check|lint|run\s+(?:the\s+)?tests?|test\s+suite|smoke\s*test)\b/i.test(userRequest)
     )
     && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
