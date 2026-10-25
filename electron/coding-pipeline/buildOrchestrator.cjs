@@ -696,6 +696,7 @@ async function executeBuildPlan({
   ownerWebContentsId,
   sessionId,
   runner = null,
+  containerRunner = null,
 } = {}) {
   if (!plan || !ownerWebContentsId || !sessionId) {
     throw new Error('plan, ownerWebContentsId, and sessionId are required.');
@@ -741,7 +742,28 @@ async function executeBuildPlan({
     };
   }
 
-  // 4. Enforce verified operating-system process isolation boundary
+  // 4. If containerRunner is provided, execute inside verified container boundary
+  if (containerRunner && typeof containerRunner.execute === 'function') {
+    const runResult = await containerRunner.execute({
+      plan,
+      ownerWebContentsId,
+      sessionId,
+    });
+    if (!runResult.ok && runResult.executionBlocked) {
+      return {
+        ...runResult,
+        outcome: BUILD_OUTCOMES.BLOCKED,
+        reason: runResult.reason && runResult.reason.includes('verified Windows process isolation is required')
+          ? runResult.reason
+          : `Build execution is blocked: verified Windows process isolation is required before executing project build/test binaries (${runResult.reason || 'unverified container isolation'}).`,
+        artifacts: [],
+        verificationEvidence: null,
+      };
+    }
+    return runResult;
+  }
+
+  // 5. Enforce verified operating-system process isolation boundary
   try {
     requireProjectProcessIsolation(`Build operation ${plan.operation} (${plan.fullCommandString})`);
   } catch (gateErr) {

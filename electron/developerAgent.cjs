@@ -226,6 +226,10 @@ const {
   SemanticProjectGraph,
   createSemanticProjectGraph,
 } = require('./coding-pipeline/projectGraphModel.cjs');
+const {
+  ProjectContainerExecutionRunner,
+  createProjectContainerExecutionRunner,
+} = require('./coding-pipeline/projectContainerExecutionRunner.cjs');
 const developerFiles = require('./developerFiles.cjs');
 const { readProjectMetadata } = require('./developerIndex.cjs');
 
@@ -3720,6 +3724,7 @@ async function executeAutonomousCodingWorkflowStage({
   const owner = { sessionId, ownerWebContentsId };
   const fileReader = tools?.readFile || ((p, range) => developerFiles.readFile(p, ownerWebContentsId, range));
   const fileSearcher = tools?.searchCode || ((q, s) => developerFiles.searchCode(q, ownerWebContentsId, s));
+  const containerRunner = tools?.containerRunner !== undefined ? tools.containerRunner : createProjectContainerExecutionRunner();
 
   if (continuation?.proposalContract && continuation?.taskId) {
     onProgress({
@@ -3869,7 +3874,7 @@ async function executeAutonomousCodingWorkflowStage({
     const plan = createDependencyPlan({ projectRoot: root, dependencyReport });
     taskPlan.dependencyPlan = plan;
 
-    const execResult = await executeDependencyPlan({ plan, ownerWebContentsId, sessionId });
+    const execResult = await executeDependencyPlan({ plan, ownerWebContentsId, sessionId, containerRunner });
     if (!execResult.ok && execResult.executionBlocked) {
       advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'dependency_install_blocked', reason: execResult.reason });
       return {
@@ -3890,6 +3895,46 @@ async function executeAutonomousCodingWorkflowStage({
         }),
       };
     }
+
+    if (execResult.ok) {
+      advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'dependency_install_completed' });
+      return {
+        outcome: 'COMPLETED',
+        phase: 'DEPENDENCY_INSTALL_COMPLETE',
+        turnId: turn.turnId,
+        taskPlan,
+        dependencyPlan: plan,
+        dependencyReport,
+        dependencyResult: execResult,
+        filesModified: [],
+        codeApplied: true,
+        codeVerified: true,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'COMPLETED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL'],
+        }),
+      };
+    }
+
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'dependency_install_failed', reason: execResult.reason });
+    return {
+      outcome: execResult.status === 'CANCELLED' ? 'CANCELLED' : (execResult.status === 'TIMED_OUT' ? 'TIMED_OUT' : 'FAILED'),
+      phase: 'DEPENDENCY_INSTALL_FAILED',
+      turnId: turn.turnId,
+      taskPlan,
+      dependencyPlan: plan,
+      dependencyReport,
+      dependencyResult: execResult,
+      executionBlocked: false,
+      reason: execResult.reason || 'Dependency installation failed.',
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'FAILED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+      }),
+    };
   }
 
   const isProjectTestOrVerifyRequest = (isRuntimeTestRequest || genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY || /\b(?:run\s+(?:the\s+)?tests?|test(?:s|ing)?|verify|verification)\b/i.test(userRequest)) && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
@@ -4035,7 +4080,7 @@ async function executeAutonomousCodingWorkflowStage({
       };
     }
 
-    const execResult = await executeBuildPlan({ plan, ownerWebContentsId, sessionId });
+    const execResult = await executeBuildPlan({ plan, ownerWebContentsId, sessionId, containerRunner });
     if (!execResult.ok && execResult.executionBlocked) {
       const diagnosis = diagnoseFailure(execResult, {
         projectRoot: root,
@@ -7860,4 +7905,6 @@ module.exports = {
   parseModuleAstEvidence,
   SemanticProjectGraph,
   createSemanticProjectGraph,
+  ProjectContainerExecutionRunner,
+  createProjectContainerExecutionRunner,
 };

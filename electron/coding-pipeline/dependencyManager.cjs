@@ -735,6 +735,7 @@ async function executeDependencyPlan({
   plan,
   ownerWebContentsId,
   sessionId,
+  containerRunner = null,
 } = {}) {
   if (!plan || !ownerWebContentsId || !sessionId) {
     throw new Error('plan, ownerWebContentsId, and sessionId are required.');
@@ -753,7 +754,32 @@ async function executeDependencyPlan({
     };
   }
 
-  // 2. Enforce verified operating-system process isolation boundary
+  // 2. If containerRunner is provided, execute inside verified container
+  if (containerRunner && typeof containerRunner.execute === 'function') {
+    const runResult = await containerRunner.execute({
+      plan,
+      ownerWebContentsId,
+      sessionId,
+      networkMode: 'allow_package_egress',
+    });
+    if (!runResult.ok && runResult.executionBlocked) {
+      return {
+        ...runResult,
+        installed: false,
+        reason: runResult.reason && runResult.reason.includes('verified Windows process isolation is required')
+          ? runResult.reason
+          : `Dependency installation execution is blocked: verified Windows process isolation is required before executing package manager commands or lifecycle scripts (${runResult.reason || 'unverified container isolation'}).`,
+      };
+    }
+    const verification = await verifyInstalledDependencies(plan.projectRoot);
+    return {
+      ...runResult,
+      installed: runResult.ok && verification.isFullyInstalled,
+      dependencyVerification: verification,
+    };
+  }
+
+  // 3. Enforce verified operating-system process isolation boundary
   // Under milestone safety policy, unverified Windows process isolation blocks command execution
   try {
     requireProjectProcessIsolation(`Dependency installation (${plan.fullCommandString})`);

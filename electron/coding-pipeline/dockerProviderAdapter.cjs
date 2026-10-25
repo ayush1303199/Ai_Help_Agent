@@ -1021,4 +1021,5 @@ module.exports = {
   validateSyntheticStagingDirectory,
   validateObservedContainerConfiguration,
   validateDockerLaunchRequest,
+  runDockerCli,
 };
