@@ -750,8 +750,17 @@ function validatePatchScope({
   let isValid = !touchesUnrelated;
   let rejectionReason = touchesUnrelated ? 'Proposed patch touches unrelated dirty files.' : null;
 
+  // Verify all modified files are within authorized target scope
+  if (isValid && modifiedFiles.length > 0 && targetFiles.length > 0) {
+    const unapprovedModifications = touchedFiles.filter((touched) => !targetSet.has(touched));
+    if (unapprovedModifications.length > 0) {
+      isValid = false;
+      rejectionReason = `Scope violation: modified file(s) [${unapprovedModifications.join(', ')}] are not in the authorized target scope [${targetFiles.join(', ')}].`;
+    }
+  }
+
   // Verify all target files were inspected in Stage 3 if inspectedFiles is provided
-  if (isValid && Array.isArray(inspectedFiles) && inspectedFiles.length > 0) {
+  if (isValid && Array.isArray(inspectedFiles)) {
     const inspectedSet = new Set(
       inspectedFiles.map((f) => norm(typeof f === 'string' ? f : f?.path)).filter(Boolean)
     );
@@ -1222,7 +1231,7 @@ function extractEnclosingFunctionBlock(content, targetLineOrSymbol, options = {}
   };
 }
 
-function analyzeTaskRequirements(userRequest) {
+function analyzeTaskRequirements(userRequest, contextMessages = []) {
   const text = String(userRequest || '').trim();
   if (!text) {
     return {
@@ -1235,10 +1244,15 @@ function analyzeTaskRequirements(userRequest) {
     };
   }
 
+  const hasPriorContext = Array.isArray(contextMessages) && contextMessages.length > 0
+    && contextMessages.some((msg) => msg && typeof msg.content === 'string' && msg.content.trim().length > 3);
+  const isAnaphoricFix = /^(?:fix|resolve|patch|repair|address)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect)\b/i.test(text);
+
   // Detect vague requests lacking concrete target, file, symptom, or metric
   const isVague = /^(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:the\s+)?performance|fix\s+(?:the\s+)?bug|do\s+something)\s*[.!?]*$/i.test(text)
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(text) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(text));
-  if (isVague) {
+
+  if (isVague && !(isAnaphoricFix && hasPriorContext)) {
     return {
       explicitRequirements: [],
       acceptanceCriteria: [],
@@ -1256,10 +1270,15 @@ function analyzeTaskRequirements(userRequest) {
   const errorSignals = [];
   const quotedLiterals = [];
 
+  const contextText = (Array.isArray(contextMessages) && contextMessages.length > 0)
+    ? contextMessages.map((m) => (m && typeof m.content === 'string' ? m.content : '')).join('\n')
+    : '';
+  const searchCorpus = contextText ? `${text}\n${contextText}` : text;
+
   // 1. Quoted literals: "..." or '...' or `...`
   const quotePattern = /["'`](\S(?:[\s\S]*?\S)?)["'`]/g;
   let qMatch;
-  while ((qMatch = quotePattern.exec(text)) !== null) {
+  while ((qMatch = quotePattern.exec(searchCorpus)) !== null) {
     const val = qMatch[1].trim();
     if (val.length > 1 && val.length < 100) quotedLiterals.push(val);
   }
@@ -1267,14 +1286,14 @@ function analyzeTaskRequirements(userRequest) {
   // 2. Route / API endpoints: e.g. /api/v1/users, /auth/login
   const routePattern = /(?:\/[\w\-:{}]+){2,}/g;
   let rMatch;
-  while ((rMatch = routePattern.exec(text)) !== null) {
+  while ((rMatch = routePattern.exec(searchCorpus)) !== null) {
     routePaths.push(rMatch[0].trim());
   }
 
   // 3. Relative file paths with extensions or slashes (excluding leading slash routes)
   const pathPattern = /(?:[A-Za-z0-9_.-]+[/\\])+[A-Za-z0-9_.-]+\.[a-z0-9]{1,5}|\b[A-Za-z0-9_.-]+\.(?:[a-z]{1,5}|[cm]?[jt]sx?|php|py|rb|go|rs|java|kt|c|cpp|h|hpp|vue|svelte|html|css|json|ya?ml|sql|sh)\b/gi;
   let pMatch;
-  while ((pMatch = pathPattern.exec(text)) !== null) {
+  while ((pMatch = pathPattern.exec(searchCorpus)) !== null) {
     const val = pMatch[0].trim();
     if (val.length > 2 && !val.startsWith('http://') && !val.startsWith('https://')) {
       exactPaths.push(val.replace(/\\/g, '/'));
@@ -1764,6 +1783,9 @@ function createTaskPlan({
   operatingMode = 'AUTONOMOUS',
   complexity = 'DEEP',
   capabilities = {},
+  taskType = null,
+  constraints = [],
+  unresolvedQuestions = [],
 }) {
   const goal = String(userRequest || '').trim();
   const canApply = capabilities.canApply ?? ['AUTONOMOUS', 'BUILD'].includes(operatingMode);
@@ -1899,6 +1921,40 @@ function createTaskPlan({
     ],
     updatedAt: new Date().toISOString(),
   };
+
+  const resolvedTaskType = taskType || requirements?.taskType || 'INVESTIGATE_OR_DEBUG';
+  const resolvedOutcomes = Array.isArray(requirements?.requestedOutcomes) && requirements.requestedOutcomes.length > 0
+    ? requirements.requestedOutcomes
+    : (Array.isArray(requirements?.acceptanceCriteria) && requirements.acceptanceCriteria.length > 0
+      ? requirements.acceptanceCriteria
+      : [goal]);
+  const resolvedConstraints = (Array.isArray(constraints) && constraints.length > 0)
+    ? constraints
+    : (Array.isArray(requirements?.constraints) && requirements.constraints.length > 0
+      ? requirements.constraints
+      : taskPlan.constraints);
+  const resolvedUnresolved = (Array.isArray(unresolvedQuestions) && unresolvedQuestions.length > 0)
+    ? unresolvedQuestions
+    : (requirements?.unresolvedQuestions || (requirements?.needsClarification && requirements.clarificationPrompt ? [requirements.clarificationPrompt] : []));
+
+  taskPlan.userGoal = goal;
+  taskPlan.userRequest = goal;
+  taskPlan.taskType = resolvedTaskType;
+  taskPlan.requestedOutcomes = resolvedOutcomes;
+  taskPlan.constraints = resolvedConstraints;
+  taskPlan.acceptanceCriteria = Array.isArray(requirements?.acceptanceCriteria) && requirements.acceptanceCriteria.length > 0
+    ? requirements.acceptanceCriteria
+    : resolvedOutcomes;
+  taskPlan.unresolvedQuestions = resolvedUnresolved;
+  taskPlan.taskRepresentation = {
+    userGoal: goal,
+    taskType: resolvedTaskType,
+    requestedOutcomes: resolvedOutcomes,
+    constraints: resolvedConstraints,
+    acceptanceCriteria: taskPlan.acceptanceCriteria,
+    unresolvedQuestions: resolvedUnresolved,
+  };
+
   return taskPlan;
 }
 

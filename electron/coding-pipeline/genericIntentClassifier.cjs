@@ -85,7 +85,7 @@ function extractConstraints(text) {
 /**
  * Checks if a request is genuinely ambiguous or lacks necessary technical context.
  */
-function checkAmbiguity(text, projectContext = null) {
+function checkAmbiguity(text, projectContext = null, contextMessages = []) {
   const clean = String(text || '').trim();
   if (!clean) {
     return {
@@ -99,6 +99,15 @@ function checkAmbiguity(text, projectContext = null) {
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(clean) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(clean));
 
   if (isVague) {
+    const hasPriorContext = Array.isArray(contextMessages) && contextMessages.length > 0
+      && contextMessages.some((msg) => msg && typeof msg.content === 'string' && msg.content.trim().length > 3);
+    const hasPriorFindings = Array.isArray(projectContext?.priorFindings) && projectContext.priorFindings.length > 0;
+    const isAnaphoricFix = /^(?:fix|resolve|patch|repair|address)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect)\b/i.test(clean);
+
+    if (isAnaphoricFix && (hasPriorContext || hasPriorFindings)) {
+      return { needsClarification: false, clarificationPrompt: null, resolvedFromContext: true };
+    }
+
     return {
       needsClarification: true,
       clarificationPrompt: `The request "${clean}" is ambiguous. Please specify the target component, desired behavior, or error details to proceed.`,
@@ -273,14 +282,26 @@ function scoreIntentCategories(text, projectContext = null, evidence = []) {
  * @param {Array} [options.evidence] - Evidence items discovered from workspace.
  * @returns {Object} Structured classification result.
  */
-function classifyTaskIntent({ request, projectContext = null, evidence = [] } = {}) {
+function classifyTaskIntent({ request, projectContext = null, evidence = [], contextMessages = [] } = {}) {
   const originalRequest = String(request || '');
   const constraints = extractConstraints(originalRequest);
-  const ambiguity = checkAmbiguity(originalRequest, projectContext);
+  const ambiguity = checkAmbiguity(originalRequest, projectContext, contextMessages);
 
   if (ambiguity.needsClarification) {
+    const taskRepresentation = {
+      userGoal: originalRequest,
+      taskType: null,
+      requestedOutcomes: [],
+      constraints,
+      acceptanceCriteria: [],
+      unresolvedQuestions: [ambiguity.clarificationPrompt],
+    };
     return {
       primaryIntent: null,
+      taskType: null,
+      userGoal: originalRequest,
+      requestedOutcomes: [],
+      taskRepresentation,
       secondaryIntents: [],
       allIntents: [],
       confidence: 'LOW',
@@ -291,6 +312,7 @@ function classifyTaskIntent({ request, projectContext = null, evidence = [] } = 
       originalRequest,
       needsClarification: true,
       clarificationPrompt: ambiguity.clarificationPrompt,
+      unresolvedQuestions: [ambiguity.clarificationPrompt],
     };
   }
 
@@ -341,8 +363,34 @@ function classifyTaskIntent({ request, projectContext = null, evidence = [] } = 
     }
   }
 
+  const taskType = primaryIntent;
+  const requestedOutcomes = [
+    primaryIntent === INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG
+      ? (mutationRequired ? `Identify root cause and repair verified defect for "${originalRequest}"` : `Investigate root cause and report findings for "${originalRequest}"`)
+      : primaryIntent === INTENT_CATEGORIES.BUILD_OR_SCAFFOLD
+        ? `Implement requested functionality for "${originalRequest}"`
+        : primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY
+          ? `Execute verification checks and report real execution evidence for "${originalRequest}"`
+          : primaryIntent === INTENT_CATEGORIES.REFACTOR
+            ? `Refactor codebase according to constraints for "${originalRequest}"`
+            : `Analyze codebase and answer inquiry for "${originalRequest}"`
+  ];
+
+  const taskRepresentation = {
+    userGoal: originalRequest,
+    taskType,
+    requestedOutcomes,
+    constraints,
+    acceptanceCriteria: requestedOutcomes,
+    unresolvedQuestions: [],
+  };
+
   return {
     primaryIntent,
+    taskType,
+    userGoal: originalRequest,
+    requestedOutcomes,
+    taskRepresentation,
     secondaryIntents,
     allIntents,
     confidence,
@@ -353,11 +401,13 @@ function classifyTaskIntent({ request, projectContext = null, evidence = [] } = 
     originalRequest,
     needsClarification: false,
     clarificationPrompt: null,
+    unresolvedQuestions: [],
   };
 }
 
 module.exports = {
   INTENT_CATEGORIES,
+  TASK_TYPES: INTENT_CATEGORIES,
   ALL_CATEGORIES,
   extractConstraints,
   checkAmbiguity,

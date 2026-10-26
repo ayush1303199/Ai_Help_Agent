@@ -3668,6 +3668,1041 @@ function completeNoChangeModularWorkflow({
   };
 }
 
+const VERIFICATION_EVIDENCE_LEVELS = Object.freeze({
+  PASSED_REAL_EXECUTION: 'PASSED_REAL_EXECUTION',
+  PASSED_SYNTHETIC_TESTS: 'PASSED_SYNTHETIC_TESTS',
+  FAILED: 'FAILED',
+  BLOCKED: 'BLOCKED',
+  NOT_RUN: 'NOT_RUN',
+  INCONCLUSIVE: 'INCONCLUSIVE',
+});
+
+function classifyVerificationEvidenceLevel({
+  isPassing,
+  testOutcome,
+  finalEvidence = [],
+  hermeticVerification = null,
+  hostExecution = null,
+  executionBlocked = false,
+  isCancelled = false,
+  verificationUnavailable = false,
+}) {
+  if (isCancelled) return VERIFICATION_EVIDENCE_LEVELS.INCONCLUSIVE;
+  if (executionBlocked || testOutcome?.status === 'BLOCKED' || testOutcome?.executionBlocked === true) {
+    return VERIFICATION_EVIDENCE_LEVELS.BLOCKED;
+  }
+  if (verificationUnavailable || testOutcome?.status === 'VERIFICATION_UNAVAILABLE' || testOutcome?.status === 'SKIPPED') {
+    return VERIFICATION_EVIDENCE_LEVELS.NOT_RUN;
+  }
+  if (!isPassing || testOutcome?.status === 'FAILED' || testOutcome?.ok === false) {
+    return VERIFICATION_EVIDENCE_LEVELS.FAILED;
+  }
+
+  const realExecutionObserved = (hostExecution?.status === 'EXECUTED')
+    || (Array.isArray(finalEvidence) && finalEvidence.some((ev) => ev?.executed === true && Number.isInteger(ev?.exitCode) && ev?.provenance !== 'SYNTHETIC'))
+    || (testOutcome?.hostExecution?.status === 'EXECUTED');
+
+  const syntheticOrHermeticOnly = Boolean(hermeticVerification)
+    || (testOutcome?.attempts && testOutcome.attempts.some((a) => a?.check === 'static_modular_integration' || a?.synthetic === true))
+    || (!realExecutionObserved && isPassing);
+
+  if (realExecutionObserved && !syntheticOrHermeticOnly) {
+    return VERIFICATION_EVIDENCE_LEVELS.PASSED_REAL_EXECUTION;
+  }
+  if (isPassing && syntheticOrHermeticOnly) {
+    return VERIFICATION_EVIDENCE_LEVELS.PASSED_SYNTHETIC_TESTS;
+  }
+  return VERIFICATION_EVIDENCE_LEVELS.INCONCLUSIVE;
+}
+
+const CHECK_STATES = Object.freeze({
+  PASSED_REAL_EXECUTION: 'PASSED_REAL_EXECUTION',
+  PASSED_STATIC_ANALYSIS: 'PASSED_STATIC_ANALYSIS',
+  PASSED_SYNTHETIC_TESTS: 'PASSED_SYNTHETIC_TESTS',
+  FAILED: 'FAILED',
+  BLOCKED_ISOLATION: 'BLOCKED_ISOLATION',
+  APPROVAL_REQUIRED: 'APPROVAL_REQUIRED',
+  NOT_CONFIGURED: 'NOT_CONFIGURED',
+  NOT_APPLICABLE: 'NOT_APPLICABLE',
+  NOT_RUN: 'NOT_RUN',
+  INCONCLUSIVE: 'INCONCLUSIVE',
+});
+
+const PROJECT_READINESS = Object.freeze({
+  READY: 'READY',
+  READY_WITH_WARNINGS: 'READY_WITH_WARNINGS',
+  FAILED: 'FAILED',
+  BLOCKED: 'BLOCKED',
+});
+
+function buildEngineeringReport({
+  projectRoot,
+  workspaceDiscovery = null,
+  dependencyReport = null,
+  buildDiscovery = null,
+  buildPlan = null,
+  executedCommands = [],
+  diagnosis = null,
+  repairPlan = null,
+  rerunResult = null,
+  overallOutcome = 'UNKNOWN',
+  blockers = [],
+}) {
+  const rootBasename = path.basename(projectRoot || '');
+  const ecosystem = buildDiscovery?.ecosystem
+    || dependencyReport?.primaryReport?.ecosystem
+    || workspaceDiscovery?.languages?.[0]
+    || 'node';
+  const pm = dependencyReport?.preferredPackageManager
+    || dependencyReport?.primaryReport?.packageManager
+    || 'npm';
+
+  const manifests = buildDiscovery?.detectedManifests?.length
+    ? buildDiscovery.detectedManifests
+    : (workspaceDiscovery?.manifests?.map((m) => m.name || m) || ['package.json']);
+
+  const entryPoints = workspaceDiscovery?.entryPoints || [];
+
+  const depStatus = dependencyReport?.needsInstallation
+    ? 'MISSING'
+    : (dependencyReport?.hasManifest ? 'SATISFIED' : 'NOT_APPLICABLE');
+  const missingDeps = dependencyReport?.missingDependencies || [];
+
+  const discoveredOps = buildDiscovery?.availableOperations || {};
+  const discoveredCommands = {
+    test: discoveredOps[BUILD_OPERATIONS.TEST]
+      ? `${discoveredOps[BUILD_OPERATIONS.TEST].binary} ${discoveredOps[BUILD_OPERATIONS.TEST].args.join(' ')}`
+      : null,
+    build: discoveredOps[BUILD_OPERATIONS.BUILD]
+      ? `${discoveredOps[BUILD_OPERATIONS.BUILD].binary} ${discoveredOps[BUILD_OPERATIONS.BUILD].args.join(' ')}`
+      : null,
+    lint: discoveredOps[BUILD_OPERATIONS.LINT]
+      ? `${discoveredOps[BUILD_OPERATIONS.LINT].binary} ${discoveredOps[BUILD_OPERATIONS.LINT].args.join(' ')}`
+      : null,
+    typecheck: discoveredOps[BUILD_OPERATIONS.TYPECHECK]
+      ? `${discoveredOps[BUILD_OPERATIONS.TYPECHECK].binary} ${discoveredOps[BUILD_OPERATIONS.TYPECHECK].args.join(' ')}`
+      : null,
+    runtime: null,
+  };
+
+  let readiness = PROJECT_READINESS.READY;
+  const remainingBlockers = [...new Set(blockers.filter(Boolean))];
+
+  if (overallOutcome === 'BLOCKED' || overallOutcome === 'BLOCKED_ISOLATION' || overallOutcome === 'APPROVAL_REQUIRED' || overallOutcome === 'APPROVAL_REJECTED') {
+    readiness = PROJECT_READINESS.BLOCKED;
+  } else if (overallOutcome === 'TESTS_FAILED' || overallOutcome === 'FAILED') {
+    readiness = PROJECT_READINESS.FAILED;
+  } else if (overallOutcome === 'TEST_NOT_CONFIGURED' || overallOutcome === 'NOT_CONFIGURED') {
+    readiness = PROJECT_READINESS.READY_WITH_WARNINGS;
+    if (!remainingBlockers.includes('Test runner not configured in manifest')) {
+      remainingBlockers.push('Test runner not configured in manifest');
+    }
+  } else if (overallOutcome === 'COMPLETED' || overallOutcome === 'TESTS_PASSED') {
+    readiness = remainingBlockers.length > 0 ? PROJECT_READINESS.READY_WITH_WARNINGS : PROJECT_READINESS.READY;
+  }
+
+  const diagnosedDefects = diagnosis ? [{
+    category: diagnosis.failureCategory || 'UNKNOWN',
+    rootCause: diagnosis.rootCause || 'Undetermined failure',
+    affectedFiles: diagnosis.affectedFiles || [],
+    primaryLocation: diagnosis.primaryLocation || null,
+    confidence: diagnosis.confidence || 'HIGH',
+    evidenceSummary: diagnosis.evidence?.summary || diagnosis.evidence?.stderrExcerpt || '',
+  }] : [];
+
+  const proposedFixes = repairPlan?.fileChanges ? repairPlan.fileChanges.map((fc) => ({
+    targetFile: fc.filePath,
+    diff: fc.diffPreview,
+    rationale: fc.rationale,
+    approved: Boolean(repairPlan.approved),
+    applied: Boolean(repairPlan.applied),
+  })) : [];
+
+  const rerunResults = rerunResult ? [{
+    command: rerunResult.command || buildPlan?.fullCommandString || 'test',
+    exitCode: rerunResult.exitCode ?? (rerunResult.ok ? 0 : 1),
+    status: rerunResult.ok ? 'PASSED' : 'FAILED',
+    checkState: rerunResult.ok ? CHECK_STATES.PASSED_REAL_EXECUTION : CHECK_STATES.FAILED,
+    passed: Boolean(rerunResult.ok),
+    stdoutExcerpt: redactSensitiveData(String(rerunResult.stdout || '')).slice(0, 500),
+    stderrExcerpt: redactSensitiveData(String(rerunResult.stderr || '')).slice(0, 500),
+  }] : [];
+
+  const hasRealExecution = executedCommands.some((c) => c.environment === 'CONTAINER_ISOLATED' && c.exitCode !== null);
+
+  const markdownLines = [
+    '# Project Engineering Test & Verification Report',
+    '',
+    '### 1. Project Identity & Stack',
+    `- **Workspace Root**: \`${projectRoot}\``,
+    `- **Ecosystem**: ${ecosystem} (Package Manager: \`${pm}\`)`,
+    `- **Manifests**: ${manifests.map((m) => `\`${m}\``).join(', ') || 'None'}`,
+    entryPoints.length ? `- **Entry Points**: ${entryPoints.map((e) => `\`${e}\``).join(', ')}` : '',
+    '',
+    '### 2. Dependency Readiness',
+    `- **Status**: ${depStatus === 'SATISFIED' ? 'Satisfied (All dependencies resolvable on disk)' : (depStatus === 'MISSING' ? `Missing (${missingDeps.length} unresolved packages: ${missingDeps.map((d) => d.name || d).join(', ')})` : 'Not applicable')}`,
+    '',
+    '### 3. Discovered Commands',
+    `- **Test**: ${discoveredCommands.test ? `\`${discoveredCommands.test}\`` : 'Not configured'}`,
+    `- **Build**: ${discoveredCommands.build ? `\`${discoveredCommands.build}\`` : 'Not configured'}`,
+    `- **Lint**: ${discoveredCommands.lint ? `\`${discoveredCommands.lint}\`` : 'Not configured'}`,
+    `- **Typecheck**: ${discoveredCommands.typecheck ? `\`${discoveredCommands.typecheck}\`` : 'Not configured'}`,
+    '',
+    '### 4. Executed Commands & Results',
+  ];
+
+  if (executedCommands.length === 0) {
+    markdownLines.push('- *No commands executed (execution blocked before runner dispatch).*');
+  } else {
+    for (const cmd of executedCommands) {
+      markdownLines.push(`- \`${cmd.command}\` [${cmd.environment}] — **${cmd.checkState}** (Exit Code: ${cmd.exitCode !== null ? cmd.exitCode : 'N/A'})`);
+      if (cmd.stderrExcerpt && cmd.checkState !== CHECK_STATES.PASSED_REAL_EXECUTION) {
+        markdownLines.push(`  - Error: \`${cmd.stderrExcerpt.replace(/\r?\n/g, ' ').slice(0, 200)}\``);
+      }
+    }
+  }
+
+  if (diagnosedDefects.length > 0) {
+    markdownLines.push('', '### 5. Detected Defects & Diagnosis');
+    for (const defect of diagnosedDefects) {
+      markdownLines.push(`- **Category**: ${defect.category}`);
+      markdownLines.push(`- **Root Cause**: ${defect.rootCause}`);
+      if (defect.primaryLocation?.file) {
+        markdownLines.push(`- **Location**: \`${defect.primaryLocation.file}${defect.primaryLocation.line ? `:${defect.primaryLocation.line}` : ''}\``);
+      }
+    }
+  }
+
+  if (proposedFixes.length > 0) {
+    markdownLines.push('', '### 6. Proposed & Applied Fixes');
+    for (const fix of proposedFixes) {
+      markdownLines.push(`- **Target**: \`${fix.targetFile}\` (${fix.applied ? 'Applied' : (fix.approved ? 'Approved' : 'Pending Approval')})`);
+      if (fix.diff) {
+        markdownLines.push('```diff', fix.diff, '```');
+      }
+    }
+  }
+
+  if (rerunResults.length > 0) {
+    markdownLines.push('', '### 7. Rerun Verification');
+    for (const rerun of rerunResults) {
+      markdownLines.push(`- \`${rerun.command}\` — **${rerun.checkState}** (Exit Code: ${rerun.exitCode})`);
+    }
+  }
+
+  if (remainingBlockers.length > 0) {
+    markdownLines.push('', '### 8. Remaining Blockers');
+    for (const b of remainingBlockers) {
+      markdownLines.push(`- ${b}`);
+    }
+  }
+
+  markdownLines.push(
+    '',
+    `### 9. Overall Readiness: **${readiness}**`,
+    '',
+    `> **Honest Verification Boundary**: ${hasRealExecution ? 'Verified isolated container execution was performed.' : 'No live command was executed without verified isolation.'} Static analysis and synthetic tests are never represented as actual real executions.`
+  );
+
+  const markdownSummary = markdownLines.filter((l) => l !== '').join('\n');
+
+  return {
+    projectIdentity: {
+      name: rootBasename,
+      root: projectRoot,
+      ecosystem,
+      packageManager: pm,
+      manifests,
+      entryPoints,
+    },
+    dependencyReadiness: {
+      status: depStatus,
+      missingCount: missingDeps.length,
+      missingDependencies: missingDeps,
+    },
+    discoveredCommands,
+    executedCommands,
+    diagnosedDefects,
+    proposedFixes,
+    rerunResults,
+    remainingBlockers,
+    overallReadiness: readiness,
+    verificationSummary: {
+      realExecution: hasRealExecution,
+      staticAnalysis: false,
+      syntheticTests: false,
+      honestDistinction: 'All project commands are executed exclusively in a verified container isolation boundary. Host fallback and synthetic receipts are forbidden.',
+    },
+    markdownSummary,
+  };
+}
+
+async function synthesizeTargetedRepairPatch({ filePath, originalContent, diagnosis, customHandler = null }) {
+  if (typeof customHandler === 'function') {
+    const custom = await customHandler({ filePath, originalContent, diagnosis });
+    if (custom && typeof custom.replacementContent === 'string') return custom;
+  }
+  if (!diagnosis || !originalContent) return null;
+
+  const stderr = String(diagnosis.evidence?.stderrExcerpt || '');
+  const rootCause = String(diagnosis.rootCause || '');
+  const combined = `${stderr}\n${rootCause}`;
+
+  const expectMatch = combined.match(/expected\s+(?:to\s+(?:equal|be)\s+)?(?:["']([^"']+)["']|([^'",\s\r\n]+))(?:\s+OK)?['"]?\s+(?:but\s+)?(?:received|got)\s+(?:["']([^"']+)["']|([^'",\s\r\n]+))/i);
+  if (expectMatch) {
+    const expectedVal = (expectMatch[1] || expectMatch[2] || '').trim();
+    const actualVal = (expectMatch[3] || expectMatch[4] || '').trim();
+    if (expectedVal && actualVal && expectedVal !== actualVal && originalContent.includes(actualVal)) {
+      const targetLine = diagnosis.primaryLocation?.line;
+      const lines = originalContent.split(/\r?\n/);
+      if (targetLine && targetLine <= lines.length) {
+        const lineIdx = targetLine - 1;
+        if (lines[lineIdx].includes(actualVal)) {
+          lines[lineIdx] = lines[lineIdx].replace(actualVal, expectedVal);
+          return {
+            replacementContent: lines.join('\n'),
+            rationale: `Replace ${actualVal} with expected value ${expectedVal} at line ${targetLine}.`,
+          };
+        }
+      }
+      const occurrences = originalContent.split(actualVal).length - 1;
+      if (occurrences === 1) {
+        return {
+          replacementContent: originalContent.replace(actualVal, expectedVal),
+          rationale: `Replace ${actualVal} with expected value ${expectedVal}.`,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function handleTestFailureRepairAndRerun({
+  root,
+  scope,
+  sessionId,
+  ownerWebContentsId,
+  userRequest,
+  taskPlan,
+  turn,
+  owner,
+  plan,
+  operation = BUILD_OPERATIONS.TEST,
+  execResult,
+  diagnosis,
+  workspaceDiscovery,
+  dependencyReport,
+  buildDiscovery,
+  containerRunner,
+  initialUserApproved = null,
+  requestApproval = null,
+  tools = null,
+  fileReader = null,
+  onProgress = () => {},
+  depExecResult = null,
+  depPlan = null,
+  depVerification = null,
+}) {
+  const initialCommandRecord = {
+    operation,
+    command: plan.fullCommandString,
+    environment: 'CONTAINER_ISOLATED',
+    exitCode: execResult.exitCode ?? 1,
+    status: 'FAILED',
+    checkState: CHECK_STATES.FAILED,
+    stdoutExcerpt: redactSensitiveData(String(execResult.stdout || '')).slice(0, 500),
+    stderrExcerpt: redactSensitiveData(String(execResult.stderr || '')).slice(0, 500),
+    executionTimeMs: execResult.elapsedMs || 0,
+  };
+
+  let repairPlan = null;
+  try {
+    repairPlan = await createRepairPlan({
+      diagnosis,
+      projectRoot: root,
+      sourceReader: async (p) => {
+        try {
+          if (typeof fileReader === 'function') {
+            const res = await fileReader(p);
+            return typeof res === 'string' ? res : res?.content || '';
+          }
+        } catch {
+          // fallback to disk read
+        }
+        return await fs.readFile(path.resolve(root, p), 'utf8');
+      },
+      customPatchGenerator: async (opts) => synthesizeTargetedRepairPatch({
+        ...opts,
+        customHandler: typeof tools?.repairHandler === 'function' ? tools.repairHandler : null,
+      }),
+    });
+    taskPlan.repairPlan = repairPlan;
+  } catch {
+    repairPlan = null;
+  }
+
+  if (!repairPlan || repairPlan.status !== REPAIR_PLAN_STATUSES.READY) {
+    const report = buildEngineeringReport({
+      projectRoot: root,
+      workspaceDiscovery,
+      dependencyReport,
+      buildDiscovery,
+      buildPlan: plan,
+      executedCommands: [initialCommandRecord],
+      diagnosis,
+      repairPlan: null,
+      rerunResult: null,
+      overallOutcome: 'TESTS_FAILED',
+      blockers: [diagnosis.rootCause],
+    });
+    taskPlan.engineeringReport = report;
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_failed', reason: execResult.stderr });
+    return {
+      outcome: 'TESTS_FAILED',
+      phase: 'BUILD_EXECUTE',
+      status: 'TESTS_FAILED',
+      turnId: turn.turnId,
+      taskPlan,
+      buildPlan: plan,
+      buildDiscovery,
+      buildResult: execResult,
+      diagnosis,
+      repairPlan,
+      dependencyPlan: depPlan,
+      dependencyReport,
+      dependencyResult: depExecResult,
+      dependencyVerification: depVerification,
+      engineeringReport: report,
+      filesModified: [],
+      codeApplied: Boolean(depExecResult?.ok),
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'FAILED',
+        stagesCompleted: depExecResult?.ok
+          ? ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL', 'VERIFY', 'BUILD_PLAN', 'BUILD_EXECUTE']
+          : ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE'],
+      }),
+    };
+  }
+
+  const currentTurn = () => conversationTurns.get(turn.turnId)?.state || turn.state;
+  if (currentTurn() === 'reading') {
+    advanceConversationTurn(turn.turnId, 'understanding', owner, { phase: 'understanding_repair' });
+  }
+  if (currentTurn() === 'understanding') {
+    advanceConversationTurn(turn.turnId, 'proposal_ready', owner, {
+      phase: 'repair_proposal_ready',
+      proposalId: repairPlan.planId,
+    });
+  }
+
+  let userApprovedRepair = null;
+  if (initialUserApproved !== null && initialUserApproved !== undefined) {
+    userApprovedRepair = Boolean(initialUserApproved);
+  } else if (typeof requestApproval === 'function') {
+    if (currentTurn() === 'proposal_ready') {
+      advanceConversationTurn(turn.turnId, 'awaiting_approval', owner, {
+        phase: 'repair_awaiting_approval',
+        proposalId: repairPlan.planId,
+      });
+    }
+    userApprovedRepair = await requestApproval({
+      taskId: repairPlan.planId,
+      proposal: repairPlan,
+      patchScope: repairPlan.affectedFiles,
+      diff: repairPlan.fileChanges.map((c) => c.diffPreview).join('\n'),
+      isRepair: true,
+      rootCause: diagnosis.rootCause,
+      fullCommandString: plan.fullCommandString,
+    });
+  }
+
+  if (userApprovedRepair === null) {
+    const continuationToken = crypto.randomUUID();
+    const continuationState = {
+      root,
+      scope,
+      sessionId,
+      ownerWebContentsId,
+      userRequest,
+      requestHash: hash(String(userRequest)),
+      isProjectTestRepair: true,
+      operation,
+      turn,
+      taskPlan,
+      buildPlan: plan,
+      buildDiscovery,
+      dependencyReport,
+      depExecResult,
+      depPlan,
+      depVerification,
+      buildResult: execResult,
+      diagnosis,
+      repairPlan,
+      stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE', 'DIAGNOSE', 'REPAIR_PLAN'],
+      expiresAt: Date.now() + WORKFLOW_CONTINUATION_TTL_MS,
+      token: continuationToken,
+      running: false,
+    };
+    storeWorkflowContinuation(continuationToken, continuationState);
+
+    const report = buildEngineeringReport({
+      projectRoot: root,
+      workspaceDiscovery,
+      dependencyReport,
+      buildDiscovery,
+      buildPlan: plan,
+      executedCommands: [initialCommandRecord],
+      diagnosis,
+      repairPlan,
+      rerunResult: null,
+      overallOutcome: 'APPROVAL_REQUIRED',
+      blockers: ['User approval required to apply proposed repair.'],
+    });
+    taskPlan.engineeringReport = report;
+
+    if (currentTurn() === 'proposal_ready') {
+      advanceConversationTurn(turn.turnId, 'awaiting_approval', owner, {
+        phase: 'repair_awaiting_approval',
+        proposalId: repairPlan.planId,
+      });
+    }
+
+    return {
+      outcome: 'APPROVAL_REQUIRED',
+      phase: 'APPROVE',
+      turnId: turn.turnId,
+      taskPlan,
+      buildPlan: plan,
+      buildResult: execResult,
+      diagnosis,
+      repairPlan,
+      continuationToken,
+      continuation: {
+        status: 'AWAITING_APPROVAL',
+        token: continuationToken,
+        proposalId: repairPlan.planId,
+        diff: repairPlan.fileChanges.map((c) => c.diffPreview).join('\n'),
+        affectedFiles: repairPlan.affectedFiles,
+      },
+      engineeringReport: report,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'APPROVAL_REQUIRED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE', 'DIAGNOSE', 'REPAIR_PLAN'],
+      }),
+    };
+  }
+
+  if (userApprovedRepair === false) {
+    if (['proposal_ready', 'awaiting_approval'].includes(currentTurn())) {
+      advanceConversationTurn(turn.turnId, 'failed', owner, {
+        phase: 'repair_approval_rejected',
+        reason: 'Repair proposal was rejected by user.',
+      });
+    }
+    const report = buildEngineeringReport({
+      projectRoot: root,
+      workspaceDiscovery,
+      dependencyReport,
+      buildDiscovery,
+      buildPlan: plan,
+      executedCommands: [initialCommandRecord],
+      diagnosis,
+      repairPlan,
+      rerunResult: null,
+      overallOutcome: 'APPROVAL_REJECTED',
+      blockers: ['Repair proposal rejected by user. Workspace preserved without modifications.'],
+    });
+    taskPlan.engineeringReport = report;
+    return {
+      outcome: 'APPROVAL_REJECTED',
+      phase: 'APPROVE',
+      turnId: turn.turnId,
+      taskPlan,
+      buildPlan: plan,
+      buildResult: execResult,
+      diagnosis,
+      repairPlan,
+      dependencyPlan: depPlan,
+      dependencyReport,
+      dependencyResult: depExecResult,
+      dependencyVerification: depVerification,
+      reason: 'Repair proposal was rejected by user.',
+      engineeringReport: report,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'APPROVAL_REJECTED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE', 'DIAGNOSE', 'REPAIR_PLAN'],
+      }),
+    };
+  }
+
+  if (currentTurn() === 'proposal_ready') {
+    advanceConversationTurn(turn.turnId, 'awaiting_approval', owner, {
+      phase: 'repair_awaiting_approval',
+      proposalId: repairPlan.planId,
+    });
+  }
+  if (currentTurn() === 'awaiting_approval') {
+    advanceConversationTurn(turn.turnId, 'approved', owner, {
+      phase: 'repair_approved',
+      proposalId: repairPlan.planId,
+    });
+  }
+  if (currentTurn() === 'approved') {
+    advanceConversationTurn(turn.turnId, 'applying', owner, {
+      phase: 'repair_applying',
+      targets: repairPlan.affectedFiles,
+    });
+  }
+
+  await captureWorktreeBaseline(repairPlan.planId, root, repairPlan.affectedFiles);
+
+  const integrity = await validateMultiFilePatchIntegrity({
+    fileChanges: repairPlan.fileChanges,
+    projectRoot: root,
+  });
+  if (!integrity.valid) {
+    advanceConversationTurn(turn.turnId, 'failed', owner, {
+      phase: 'repair_drift_detected',
+      reason: integrity.error,
+    });
+    return {
+      outcome: 'FAILED',
+      phase: 'REPAIR_APPLY_GUARD',
+      turnId: turn.turnId,
+      taskPlan,
+      reason: integrity.error,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+    };
+  }
+
+  for (const change of repairPlan.fileChanges) {
+    const targetPath = path.resolve(root, change.filePath);
+    await fs.writeFile(targetPath, change.replacementContent, 'utf8');
+  }
+  repairPlan.applied = true;
+  repairPlan.approved = true;
+
+  advanceConversationTurn(turn.turnId, 'verifying', owner, { phase: 'repair_rerun_verifying' });
+  onProgress({ phase: 'BUILD_PLAN', message: 'Rerunning project tests after applying repair patch.' });
+  const rerunExecResult = await executeBuildPlan({
+    plan,
+    ownerWebContentsId,
+    sessionId,
+    containerRunner,
+  });
+
+  if (rerunExecResult.ok) {
+    advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'repair_completed' });
+    const report = buildEngineeringReport({
+      projectRoot: root,
+      workspaceDiscovery,
+      dependencyReport,
+      buildDiscovery,
+      buildPlan: plan,
+      executedCommands: [
+        initialCommandRecord,
+        {
+          operation: `${operation}_RERUN`,
+          command: plan.fullCommandString,
+          environment: 'CONTAINER_ISOLATED',
+          exitCode: rerunExecResult.exitCode ?? 0,
+          status: 'PASSED',
+          checkState: CHECK_STATES.PASSED_REAL_EXECUTION,
+          stdoutExcerpt: redactSensitiveData(String(rerunExecResult.stdout || '')).slice(0, 500),
+          stderrExcerpt: redactSensitiveData(String(rerunExecResult.stderr || '')).slice(0, 500),
+          executionTimeMs: rerunExecResult.elapsedMs || 0,
+        },
+      ],
+      diagnosis,
+      repairPlan,
+      rerunResult: rerunExecResult,
+      overallOutcome: 'COMPLETED',
+    });
+    taskPlan.engineeringReport = report;
+    return {
+      outcome: 'COMPLETED',
+      phase: 'BUILD_VERIFICATION',
+      status: 'TESTS_PASSED',
+      turnId: turn.turnId,
+      taskPlan,
+      buildPlan: plan,
+      buildDiscovery,
+      buildResult: execResult,
+      diagnosis,
+      repairPlan,
+      rerunResult: rerunExecResult,
+      dependencyPlan: depPlan,
+      dependencyReport,
+      dependencyResult: depExecResult,
+      dependencyVerification: depVerification,
+      engineeringReport: report,
+      filesModified: repairPlan.affectedFiles,
+      codeApplied: true,
+      codeVerified: true,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'COMPLETED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE', 'DIAGNOSE', 'REPAIR_PLAN', 'APPROVE', 'APPLY', 'BUILD_VERIFICATION'],
+      }),
+    };
+  }
+
+  await rollbackAllSnapshots(root, repairPlan.rollbackInfo.snapshots);
+  advanceConversationTurn(turn.turnId, 'failed', owner, {
+    phase: 'repair_rerun_failed',
+    reason: rerunExecResult.stderr || 'Tests failed after applying repair patch.',
+  });
+  const report = buildEngineeringReport({
+    projectRoot: root,
+    workspaceDiscovery,
+    dependencyReport,
+    buildDiscovery,
+    buildPlan: plan,
+    executedCommands: [
+      initialCommandRecord,
+      {
+        operation: `${operation}_RERUN`,
+        command: plan.fullCommandString,
+        environment: 'CONTAINER_ISOLATED',
+        exitCode: rerunExecResult.exitCode ?? 1,
+        status: 'FAILED',
+        checkState: CHECK_STATES.FAILED,
+        stdoutExcerpt: redactSensitiveData(String(rerunExecResult.stdout || '')).slice(0, 500),
+        stderrExcerpt: redactSensitiveData(String(rerunExecResult.stderr || '')).slice(0, 500),
+        executionTimeMs: rerunExecResult.elapsedMs || 0,
+      },
+    ],
+    diagnosis,
+    repairPlan,
+    rerunResult: rerunExecResult,
+    overallOutcome: 'TESTS_FAILED',
+    blockers: ['Tests failed on rerun after repair patch; changes were safely rolled back.'],
+  });
+  taskPlan.engineeringReport = report;
+  return {
+    outcome: 'TESTS_FAILED',
+    phase: 'BUILD_EXECUTE',
+    status: 'TESTS_FAILED',
+    turnId: turn.turnId,
+    taskPlan,
+    buildPlan: plan,
+    buildDiscovery,
+    buildResult: execResult,
+    diagnosis,
+    repairPlan,
+    rerunResult: rerunExecResult,
+    dependencyPlan: depPlan,
+    dependencyReport,
+    dependencyResult: depExecResult,
+    dependencyVerification: depVerification,
+    engineeringReport: report,
+    filesModified: [],
+    codeApplied: false,
+    codeVerified: false,
+    workflowReceipt: buildWorkflowReceipt({
+      outcome: 'FAILED',
+      stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE', 'DIAGNOSE', 'REPAIR_PLAN', 'APPROVE', 'APPLY', 'BUILD_VERIFICATION'],
+      rolledBack: true,
+    }),
+  };
+}
+
+async function resumeAutonomousTestRepairWorkflow({
+  root,
+  scope,
+  sessionId,
+  ownerWebContentsId,
+  userRequest,
+  continuation,
+  initialUserApproved = null,
+  requestApproval = null,
+  tools = null,
+  containerRunner = null,
+  fileReader = null,
+  onProgress = () => {},
+}) {
+  const {
+    turn,
+    taskPlan,
+    repairPlan,
+    buildPlan: plan,
+    diagnosis,
+    buildResult: execResult,
+    operation = BUILD_OPERATIONS.TEST,
+    depExecResult,
+    depPlan,
+    depVerification,
+    dependencyReport,
+    buildDiscovery,
+    workspaceDiscovery,
+  } = continuation;
+  const owner = { sessionId, ownerWebContentsId };
+
+  let userApprovedRepair = initialUserApproved !== null && initialUserApproved !== undefined
+    ? Boolean(initialUserApproved)
+    : (continuation?.userApproved !== undefined ? Boolean(continuation.userApproved) : null);
+
+  if (userApprovedRepair === null && typeof requestApproval === 'function') {
+    userApprovedRepair = await requestApproval({
+      taskId: repairPlan.planId,
+      proposal: repairPlan,
+      patchScope: repairPlan.affectedFiles,
+      diff: repairPlan.fileChanges.map((c) => c.diffPreview).join('\n'),
+      isRepair: true,
+      rootCause: diagnosis.rootCause,
+      fullCommandString: plan.fullCommandString,
+    });
+  }
+
+  const currentTurn = () => conversationTurns.get(turn.turnId)?.state || turn.state;
+  if (userApprovedRepair === false) {
+    if (['proposal_ready', 'awaiting_approval'].includes(currentTurn())) {
+      advanceConversationTurn(turn.turnId, 'failed', owner, {
+        phase: 'repair_approval_rejected',
+        reason: 'Repair proposal was rejected by user.',
+      });
+    }
+    const report = buildEngineeringReport({
+      projectRoot: root,
+      workspaceDiscovery,
+      dependencyReport,
+      buildDiscovery,
+      buildPlan: plan,
+      executedCommands: [{
+        operation,
+        command: plan.fullCommandString,
+        environment: 'CONTAINER_ISOLATED',
+        exitCode: execResult.exitCode ?? 1,
+        status: 'FAILED',
+        checkState: CHECK_STATES.FAILED,
+        stdoutExcerpt: redactSensitiveData(String(execResult.stdout || '')).slice(0, 500),
+        stderrExcerpt: redactSensitiveData(String(execResult.stderr || '')).slice(0, 500),
+        executionTimeMs: execResult.elapsedMs || 0,
+      }],
+      diagnosis,
+      repairPlan,
+      rerunResult: null,
+      overallOutcome: 'APPROVAL_REJECTED',
+      blockers: ['Repair proposal rejected by user. Workspace preserved without modifications.'],
+    });
+    taskPlan.engineeringReport = report;
+    return {
+      outcome: 'APPROVAL_REJECTED',
+      phase: 'APPROVE',
+      turnId: turn.turnId,
+      taskPlan,
+      buildPlan: plan,
+      buildResult: execResult,
+      diagnosis,
+      repairPlan,
+      reason: 'Repair proposal was rejected by user.',
+      engineeringReport: report,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'APPROVAL_REJECTED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE', 'DIAGNOSE', 'REPAIR_PLAN'],
+      }),
+    };
+  }
+
+  if (currentTurn() === 'awaiting_approval') {
+    advanceConversationTurn(turn.turnId, 'approved', owner, {
+      phase: 'repair_approved',
+      proposalId: repairPlan.planId,
+    });
+  }
+  if (currentTurn() === 'approved') {
+    advanceConversationTurn(turn.turnId, 'applying', owner, {
+      phase: 'repair_applying',
+      targets: repairPlan.affectedFiles,
+    });
+  }
+
+  await captureWorktreeBaseline(repairPlan.planId, root, repairPlan.affectedFiles);
+
+  const integrity = await validateMultiFilePatchIntegrity({
+    fileChanges: repairPlan.fileChanges,
+    projectRoot: root,
+  });
+  if (!integrity.valid) {
+    advanceConversationTurn(turn.turnId, 'failed', owner, {
+      phase: 'repair_drift_detected',
+      reason: integrity.error,
+    });
+    return {
+      outcome: 'FAILED',
+      phase: 'REPAIR_APPLY_GUARD',
+      turnId: turn.turnId,
+      taskPlan,
+      reason: integrity.error,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+    };
+  }
+
+  for (const change of repairPlan.fileChanges) {
+    const targetPath = path.resolve(root, change.filePath);
+    await fs.writeFile(targetPath, change.replacementContent, 'utf8');
+  }
+  repairPlan.applied = true;
+  repairPlan.approved = true;
+
+  advanceConversationTurn(turn.turnId, 'verifying', owner, { phase: 'repair_rerun_verifying' });
+  onProgress({ phase: 'BUILD_PLAN', message: 'Rerunning project tests after applying repair patch.' });
+  const rerunExecResult = await executeBuildPlan({
+    plan,
+    ownerWebContentsId,
+    sessionId,
+    containerRunner,
+  });
+
+  if (rerunExecResult.ok) {
+    advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'repair_completed' });
+    const report = buildEngineeringReport({
+      projectRoot: root,
+      workspaceDiscovery,
+      dependencyReport,
+      buildDiscovery,
+      buildPlan: plan,
+      executedCommands: [
+        {
+          operation,
+          command: plan.fullCommandString,
+          environment: 'CONTAINER_ISOLATED',
+          exitCode: execResult.exitCode ?? 1,
+          status: 'FAILED',
+          checkState: CHECK_STATES.FAILED,
+          stdoutExcerpt: redactSensitiveData(String(execResult.stdout || '')).slice(0, 500),
+          stderrExcerpt: redactSensitiveData(String(execResult.stderr || '')).slice(0, 500),
+          executionTimeMs: execResult.elapsedMs || 0,
+        },
+        {
+          operation: `${operation}_RERUN`,
+          command: plan.fullCommandString,
+          environment: 'CONTAINER_ISOLATED',
+          exitCode: rerunExecResult.exitCode ?? 0,
+          status: 'PASSED',
+          checkState: CHECK_STATES.PASSED_REAL_EXECUTION,
+          stdoutExcerpt: redactSensitiveData(String(rerunExecResult.stdout || '')).slice(0, 500),
+          stderrExcerpt: redactSensitiveData(String(rerunExecResult.stderr || '')).slice(0, 500),
+          executionTimeMs: rerunExecResult.elapsedMs || 0,
+        },
+      ],
+      diagnosis,
+      repairPlan,
+      rerunResult: rerunExecResult,
+      overallOutcome: 'COMPLETED',
+    });
+    taskPlan.engineeringReport = report;
+    return {
+      outcome: 'COMPLETED',
+      phase: 'BUILD_VERIFICATION',
+      status: 'TESTS_PASSED',
+      turnId: turn.turnId,
+      taskPlan,
+      buildPlan: plan,
+      buildDiscovery,
+      buildResult: execResult,
+      diagnosis,
+      repairPlan,
+      rerunResult: rerunExecResult,
+      dependencyPlan: depPlan,
+      dependencyReport,
+      dependencyResult: depExecResult,
+      dependencyVerification: depVerification,
+      engineeringReport: report,
+      filesModified: repairPlan.affectedFiles,
+      codeApplied: true,
+      codeVerified: true,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'COMPLETED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE', 'DIAGNOSE', 'REPAIR_PLAN', 'APPROVE', 'APPLY', 'BUILD_VERIFICATION'],
+      }),
+    };
+  }
+
+  await rollbackAllSnapshots(root, repairPlan.rollbackInfo.snapshots);
+  advanceConversationTurn(turn.turnId, 'failed', owner, {
+    phase: 'repair_rerun_failed',
+    reason: rerunExecResult.stderr || 'Tests failed after applying repair patch.',
+  });
+  const report = buildEngineeringReport({
+    projectRoot: root,
+    workspaceDiscovery,
+    dependencyReport,
+    buildDiscovery,
+    buildPlan: plan,
+    executedCommands: [
+      {
+        operation,
+        command: plan.fullCommandString,
+        environment: 'CONTAINER_ISOLATED',
+        exitCode: execResult.exitCode ?? 1,
+        status: 'FAILED',
+        checkState: CHECK_STATES.FAILED,
+        stdoutExcerpt: redactSensitiveData(String(execResult.stdout || '')).slice(0, 500),
+        stderrExcerpt: redactSensitiveData(String(execResult.stderr || '')).slice(0, 500),
+        executionTimeMs: execResult.elapsedMs || 0,
+      },
+      {
+        operation: `${operation}_RERUN`,
+        command: plan.fullCommandString,
+        environment: 'CONTAINER_ISOLATED',
+        exitCode: rerunExecResult.exitCode ?? 1,
+        status: 'FAILED',
+        checkState: CHECK_STATES.FAILED,
+        stdoutExcerpt: redactSensitiveData(String(rerunExecResult.stdout || '')).slice(0, 500),
+        stderrExcerpt: redactSensitiveData(String(rerunExecResult.stderr || '')).slice(0, 500),
+        executionTimeMs: rerunExecResult.elapsedMs || 0,
+      },
+    ],
+    diagnosis,
+    repairPlan,
+    rerunResult: rerunExecResult,
+    overallOutcome: 'TESTS_FAILED',
+    blockers: ['Tests failed on rerun after repair patch; changes were safely rolled back.'],
+  });
+  taskPlan.engineeringReport = report;
+  return {
+    outcome: 'TESTS_FAILED',
+    phase: 'BUILD_EXECUTE',
+    status: 'TESTS_FAILED',
+    turnId: turn.turnId,
+    taskPlan,
+    buildPlan: plan,
+    buildDiscovery,
+    buildResult: execResult,
+    diagnosis,
+    repairPlan,
+    rerunResult: rerunExecResult,
+    dependencyPlan: depPlan,
+    dependencyReport,
+    dependencyResult: depExecResult,
+    dependencyVerification: depVerification,
+    engineeringReport: report,
+    filesModified: [],
+    codeApplied: false,
+    codeVerified: false,
+    workflowReceipt: buildWorkflowReceipt({
+      outcome: 'FAILED',
+      stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE', 'DIAGNOSE', 'REPAIR_PLAN', 'APPROVE', 'APPLY', 'BUILD_VERIFICATION'],
+      rolledBack: true,
+    }),
+  };
+}
+
 async function executeAutonomousCodingWorkflow(input) {
   const continuationToken = input?.continuationToken;
   if (!continuationToken || (isProjectRuntimeTestRequest(input?.userRequest) && !workflowContinuations.has(continuationToken))) {
@@ -3691,6 +4726,7 @@ async function executeAutonomousCodingWorkflow(input) {
   try {
     const stageInput = {
       ...input,
+      contextMessages: input.contextMessages || saved.contextMessages || [],
       userRequest: input.userRequest || saved.userRequest,
       root,
       scope: input.scope || saved.scope || '.',
@@ -3719,12 +4755,29 @@ async function executeAutonomousCodingWorkflowStage({
   isCancelled = () => false,
   continuationToken = null,
   containerRunner: inputContainerRunner = null,
+  contextMessages = [],
 }, continuation = null) {
   if (!sessionId || ownerWebContentsId === undefined) {
     throw new Error('Developer session ownership is required.');
   }
   const root = await fs.realpath(inputRoot);
   const owner = { sessionId, ownerWebContentsId };
+  if (isCancelled()) {
+    return {
+      outcome: 'CANCELLED',
+      phase: 'STAGE_PREFLIGHT',
+      taskPlan: null,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      evidenceLevel: VERIFICATION_EVIDENCE_LEVELS.INCONCLUSIVE,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'CANCELLED',
+        stagesCompleted: [],
+      }),
+      message: 'The workflow was cancelled before execution.',
+    };
+  }
   const fileReader = tools?.readFile || ((p, range) => developerFiles.readFile(p, ownerWebContentsId, range));
   const fileSearcher = tools?.searchCode || ((q, s) => developerFiles.searchCode(q, ownerWebContentsId, s));
   const containerRunner = inputContainerRunner !== null
@@ -3770,6 +4823,27 @@ async function executeAutonomousCodingWorkflowStage({
     });
   }
 
+  if (continuation?.isProjectTestRepair && continuation?.repairPlan && continuation?.buildPlan) {
+    onProgress({
+      phase: 'APPROVE_RESUME',
+      message: 'Resuming approved repair execution from saved diagnostic evidence.',
+    });
+    return await resumeAutonomousTestRepairWorkflow({
+      root,
+      scope,
+      sessionId,
+      ownerWebContentsId,
+      userRequest,
+      continuation,
+      initialUserApproved,
+      requestApproval,
+      tools,
+      containerRunner,
+      fileReader,
+      onProgress,
+    });
+  }
+
   // STAGE 1: UNDERSTAND
   onProgress({
     phase: continuation ? 'INVESTIGATE_RESUME' : 'UNDERSTAND',
@@ -3781,7 +4855,7 @@ async function executeAutonomousCodingWorkflowStage({
     ? routeTaskMode({ goal: userRequest, userRequestedMode: 'AUTONOMOUS' })
     : continuation?.modeRouting
       || routeTaskMode({ goal: userRequest, userRequestedMode: taskOperatingMode });
-  const requirementsAnalysis = continuation?.requirementsAnalysis || analyzeTaskRequirements(userRequest);
+  const requirementsAnalysis = continuation?.requirementsAnalysis || analyzeTaskRequirements(userRequest, contextMessages);
   const workspaceDiscovery = continuation?.workspaceDiscovery
     || await discoverWorkspace({ projectRoot: root, ownerWebContentsId, sessionId });
   const genericIntent = continuation?.genericIntent
@@ -3789,6 +4863,7 @@ async function executeAutonomousCodingWorkflowStage({
       request: userRequest,
       projectContext: workspaceDiscovery,
       evidence: workspaceDiscovery?.evidence || [],
+      contextMessages,
     });
 
   if (genericIntent.needsClarification || requirementsAnalysis.needsClarification) {
@@ -3805,7 +4880,22 @@ async function executeAutonomousCodingWorkflowStage({
       },
     });
     taskPlan.originalRequest = userRequest;
-    taskPlan.constraints = genericIntent.constraints;
+    taskPlan.userGoal = userRequest;
+    taskPlan.taskType = genericIntent.taskType || genericIntent.primaryIntent;
+    taskPlan.requestedOutcomes = genericIntent.requestedOutcomes || [];
+    taskPlan.constraints = genericIntent.constraints || [];
+    taskPlan.acceptanceCriteria = Array.isArray(requirementsAnalysis.acceptanceCriteria) && requirementsAnalysis.acceptanceCriteria.length > 0
+      ? requirementsAnalysis.acceptanceCriteria
+      : taskPlan.requestedOutcomes;
+    taskPlan.unresolvedQuestions = genericIntent.unresolvedQuestions || [prompt];
+    taskPlan.taskRepresentation = {
+      userGoal: taskPlan.userGoal,
+      taskType: taskPlan.taskType,
+      requestedOutcomes: taskPlan.requestedOutcomes,
+      constraints: taskPlan.constraints,
+      acceptanceCriteria: taskPlan.acceptanceCriteria,
+      unresolvedQuestions: taskPlan.unresolvedQuestions,
+    };
     taskPlan.intentClassification = genericIntent;
     taskPlan.workspaceDiscovery = workspaceDiscovery;
     return {
@@ -3817,6 +4907,13 @@ async function executeAutonomousCodingWorkflowStage({
       clarificationPrompt: prompt,
       filesModified: [],
       taskPlan,
+      taskRepresentation: taskPlan.taskRepresentation,
+      userGoal: taskPlan.userGoal,
+      taskType: taskPlan.taskType,
+      requestedOutcomes: taskPlan.requestedOutcomes,
+      constraints: taskPlan.constraints,
+      unresolvedQuestions: taskPlan.unresolvedQuestions,
+      evidenceLevel: VERIFICATION_EVIDENCE_LEVELS.NOT_RUN,
       workflowReceipt: buildWorkflowReceipt({
         outcome: 'CLARIFICATION_REQUIRED',
         stagesCompleted: ['UNDERSTAND'],
@@ -3864,7 +4961,22 @@ async function executeAutonomousCodingWorkflowStage({
     root, request: userRequest, sessionId, ownerWebContentsId, scope, operatingMode: modeRouting.mode,
   });
   taskPlan.originalRequest = userRequest;
-  taskPlan.constraints = genericIntent.constraints;
+  taskPlan.userGoal = userRequest;
+  taskPlan.taskType = genericIntent.taskType || genericIntent.primaryIntent;
+  taskPlan.requestedOutcomes = genericIntent.requestedOutcomes || requirementsAnalysis.acceptanceCriteria || [userRequest];
+  taskPlan.constraints = genericIntent.constraints || [];
+  taskPlan.acceptanceCriteria = Array.isArray(requirementsAnalysis.acceptanceCriteria) && requirementsAnalysis.acceptanceCriteria.length > 0
+    ? requirementsAnalysis.acceptanceCriteria
+    : taskPlan.requestedOutcomes;
+  taskPlan.unresolvedQuestions = genericIntent.unresolvedQuestions || (requirementsAnalysis.needsClarification ? [requirementsAnalysis.clarificationPrompt] : []);
+  taskPlan.taskRepresentation = {
+    userGoal: taskPlan.userGoal,
+    taskType: taskPlan.taskType,
+    requestedOutcomes: taskPlan.requestedOutcomes,
+    constraints: taskPlan.constraints,
+    acceptanceCriteria: taskPlan.acceptanceCriteria,
+    unresolvedQuestions: taskPlan.unresolvedQuestions,
+  };
   taskPlan.intentClassification = genericIntent;
   taskPlan.workspaceDiscovery = workspaceDiscovery;
   taskPlan.dependencyReport = dependencyReport;
@@ -3886,6 +4998,7 @@ async function executeAutonomousCodingWorkflowStage({
   const isCombinedInstallAndTestRequest = (
     (isDependencyInstallRequest && isProjectTestOrVerifyRequest)
     || continuation?.isCombinedInstallAndTestRequest === true
+    || (isProjectTestOrVerifyRequest && !existingRuntimeTestPlan && dependencyReport.needsInstallation && (typeof requestApproval === 'function' || initialUserApproved !== null || continuation?.userApproved !== undefined))
   );
 
   if (isCombinedInstallAndTestRequest && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK) {
@@ -4224,6 +5337,30 @@ async function executeAutonomousCodingWorkflowStage({
     if (!testExecResult.ok && testExecResult.executionBlocked) {
       const diagnosis = diagnoseFailure(testExecResult, { projectRoot: root, attemptHistory: taskPlan.attemptHistory || [] });
       taskPlan.diagnosis = diagnosis;
+      const report = buildEngineeringReport({
+        projectRoot: root,
+        workspaceDiscovery,
+        dependencyReport,
+        buildDiscovery,
+        buildPlan: runnableTestPlan,
+        executedCommands: [{
+          operation: BUILD_OPERATIONS.TEST,
+          command: runnableTestPlan.fullCommandString,
+          environment: 'UNISOLATED_BLOCKED',
+          exitCode: null,
+          status: 'BLOCKED',
+          checkState: CHECK_STATES.BLOCKED_ISOLATION,
+          stdoutExcerpt: '',
+          stderrExcerpt: testExecResult.reason || '',
+          executionTimeMs: 0,
+        }],
+        diagnosis,
+        repairPlan: null,
+        rerunResult: null,
+        overallOutcome: 'BLOCKED',
+        blockers: [testExecResult.reason || 'Process isolation is unverified.'],
+      });
+      taskPlan.engineeringReport = report;
       advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_execution_blocked', reason: testExecResult.reason });
       return {
         outcome: 'BLOCKED',
@@ -4235,6 +5372,7 @@ async function executeAutonomousCodingWorkflowStage({
         diagnosis,
         dependencyPlan: depPlan,
         dependencyReport,
+        engineeringReport: report,
         executionBlocked: true,
         reason: testExecResult.reason,
         filesModified: [],
@@ -4250,6 +5388,29 @@ async function executeAutonomousCodingWorkflowStage({
     }
 
     if (testExecResult.ok) {
+      const report = buildEngineeringReport({
+        projectRoot: root,
+        workspaceDiscovery,
+        dependencyReport,
+        buildDiscovery,
+        buildPlan: runnableTestPlan,
+        executedCommands: [{
+          operation: BUILD_OPERATIONS.TEST,
+          command: runnableTestPlan.fullCommandString,
+          environment: 'CONTAINER_ISOLATED',
+          exitCode: testExecResult.exitCode ?? 0,
+          status: 'PASSED',
+          checkState: CHECK_STATES.PASSED_REAL_EXECUTION,
+          stdoutExcerpt: redactSensitiveData(String(testExecResult.stdout || '')).slice(0, 500),
+          stderrExcerpt: redactSensitiveData(String(testExecResult.stderr || '')).slice(0, 500),
+          executionTimeMs: testExecResult.elapsedMs || 0,
+        }],
+        diagnosis: null,
+        repairPlan: null,
+        rerunResult: null,
+        overallOutcome: 'COMPLETED',
+      });
+      taskPlan.engineeringReport = report;
       advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'build_completed' });
       return {
         outcome: 'COMPLETED',
@@ -4264,6 +5425,7 @@ async function executeAutonomousCodingWorkflowStage({
         dependencyReport,
         dependencyResult: depExecResult,
         dependencyVerification: depVerification,
+        engineeringReport: report,
         filesModified: [],
         codeApplied: Boolean(dependencyReport.needsInstallation && depExecResult?.ok),
         codeVerified: true,
@@ -4281,31 +5443,32 @@ async function executeAutonomousCodingWorkflowStage({
       attemptHistory: taskPlan.attemptHistory || [],
     });
     taskPlan.diagnosis = diagnosis;
-    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_failed', reason: testExecResult.stderr });
-    return {
-      outcome: 'TESTS_FAILED',
-      phase: 'BUILD_EXECUTE',
-      status: 'TESTS_FAILED',
-      turnId: turn.turnId,
+    return await handleTestFailureRepairAndRerun({
+      root,
+      scope,
+      sessionId,
+      ownerWebContentsId,
+      userRequest,
       taskPlan,
-      buildPlan: runnableTestPlan,
-      buildDiscovery,
-      buildResult: testExecResult,
+      turn,
+      owner,
+      plan: runnableTestPlan,
+      operation: BUILD_OPERATIONS.TEST,
+      execResult: testExecResult,
       diagnosis,
-      dependencyPlan: depPlan,
+      workspaceDiscovery,
       dependencyReport,
-      dependencyResult: depExecResult,
-      dependencyVerification: depVerification,
-      filesModified: [],
-      codeApplied: Boolean(dependencyReport.needsInstallation && depExecResult?.ok),
-      codeVerified: false,
-      workflowReceipt: buildWorkflowReceipt({
-        outcome: 'FAILED',
-        stagesCompleted: dependencyReport.needsInstallation
-          ? ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL', 'VERIFY', 'BUILD_PLAN', 'BUILD_EXECUTE']
-          : ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE'],
-      }),
-    };
+      buildDiscovery,
+      containerRunner,
+      initialUserApproved,
+      requestApproval,
+      tools,
+      fileReader,
+      onProgress,
+      depExecResult,
+      depPlan,
+      depVerification,
+    });
   }
 
   if (isDependencyInstallRequest && !isCombinedInstallAndTestRequest && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK) {
@@ -4660,6 +5823,21 @@ async function executeAutonomousCodingWorkflowStage({
       `To proceed with testing, install the missing dependencies in an isolated environment or verify host process isolation.`,
     ].join('\n');
 
+    const report = buildEngineeringReport({
+      projectRoot: root,
+      workspaceDiscovery,
+      dependencyReport,
+      buildDiscovery,
+      buildPlan: null,
+      executedCommands: [],
+      diagnosis: null,
+      repairPlan: null,
+      rerunResult: null,
+      overallOutcome: 'BLOCKED',
+      blockers: [reason],
+    });
+    taskPlan.engineeringReport = report;
+
     advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_prerequisites_missing', reason });
     return {
       outcome: 'BLOCKED',
@@ -4669,6 +5847,7 @@ async function executeAutonomousCodingWorkflowStage({
       dependencyPlan: plan,
       dependencyReport,
       buildDiscovery,
+      engineeringReport: report,
       executionBlocked: true,
       reason,
       message: explanation,
@@ -4716,6 +5895,24 @@ async function executeAutonomousCodingWorkflowStage({
     && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
 
   if (isExplicitBuildOrTestRequest) {
+    if (isCancelled()) {
+      advanceConversationTurn(turn.turnId, 'cancelled', owner, { phase: 'build_plan_cancelled' });
+      return {
+        outcome: 'CANCELLED',
+        phase: 'BUILD_PLAN',
+        turnId: turn.turnId,
+        taskPlan,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        evidenceLevel: VERIFICATION_EVIDENCE_LEVELS.INCONCLUSIVE,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'CANCELLED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER'],
+        }),
+        message: 'Build or test workflow was cancelled.',
+      };
+    }
     let operation = BUILD_OPERATIONS.BUILD;
     if (/\b(?:typecheck|type-check)\b/i.test(userRequest)) {
       operation = BUILD_OPERATIONS.TYPECHECK;
@@ -4737,6 +5934,31 @@ async function executeAutonomousCodingWorkflowStage({
     taskPlan.buildPlan = plan;
 
     if (!plan.configured) {
+      const report = buildEngineeringReport({
+        projectRoot: root,
+        workspaceDiscovery,
+        dependencyReport,
+        buildDiscovery,
+        buildPlan: plan,
+        executedCommands: [{
+          operation,
+          command: 'test',
+          environment: 'NOT_RUN',
+          exitCode: null,
+          status: 'NOT_CONFIGURED',
+          checkState: CHECK_STATES.NOT_CONFIGURED,
+          stdoutExcerpt: '',
+          stderrExcerpt: '',
+          executionTimeMs: 0,
+        }],
+        diagnosis: null,
+        repairPlan: null,
+        rerunResult: null,
+        overallOutcome: operation === BUILD_OPERATIONS.TEST && plan.status === 'NOT_CONFIGURED' ? 'TEST_NOT_CONFIGURED' : plan.status,
+        blockers: [plan.reason],
+      });
+      taskPlan.engineeringReport = report;
+
       advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_not_configured', reason: plan.reason });
       return {
         outcome: operation === BUILD_OPERATIONS.TEST && plan.status === 'NOT_CONFIGURED' ? 'TEST_NOT_CONFIGURED' : plan.status,
@@ -4745,6 +5967,7 @@ async function executeAutonomousCodingWorkflowStage({
         taskPlan,
         buildPlan: plan,
         buildDiscovery,
+        engineeringReport: report,
         executionBlocked: true,
         reason: plan.reason,
         filesModified: [],
@@ -4787,6 +6010,30 @@ async function executeAutonomousCodingWorkflowStage({
         attemptHistory: taskPlan.attemptHistory || [],
       });
       taskPlan.diagnosis = diagnosis;
+      const report = buildEngineeringReport({
+        projectRoot: root,
+        workspaceDiscovery,
+        dependencyReport,
+        buildDiscovery,
+        buildPlan: plan,
+        executedCommands: [{
+          operation,
+          command: plan.fullCommandString,
+          environment: 'UNISOLATED_BLOCKED',
+          exitCode: null,
+          status: 'BLOCKED',
+          checkState: CHECK_STATES.BLOCKED_ISOLATION,
+          stdoutExcerpt: '',
+          stderrExcerpt: execResult.reason || '',
+          executionTimeMs: 0,
+        }],
+        diagnosis,
+        repairPlan: null,
+        rerunResult: null,
+        overallOutcome: 'BLOCKED',
+        blockers: [execResult.reason || 'Process isolation is unverified.'],
+      });
+      taskPlan.engineeringReport = report;
       advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_execution_blocked', reason: execResult.reason });
       return {
         outcome: 'BLOCKED',
@@ -4796,6 +6043,7 @@ async function executeAutonomousCodingWorkflowStage({
         buildPlan: plan,
         buildDiscovery,
         diagnosis,
+        engineeringReport: report,
         executionBlocked: true,
         reason: execResult.reason,
         filesModified: [],
@@ -4809,15 +6057,40 @@ async function executeAutonomousCodingWorkflowStage({
     }
 
     if (execResult.ok) {
+      const report = buildEngineeringReport({
+        projectRoot: root,
+        workspaceDiscovery,
+        dependencyReport,
+        buildDiscovery,
+        buildPlan: plan,
+        executedCommands: [{
+          operation,
+          command: plan.fullCommandString,
+          environment: 'CONTAINER_ISOLATED',
+          exitCode: execResult.exitCode ?? 0,
+          status: 'PASSED',
+          checkState: CHECK_STATES.PASSED_REAL_EXECUTION,
+          stdoutExcerpt: redactSensitiveData(String(execResult.stdout || '')).slice(0, 500),
+          stderrExcerpt: redactSensitiveData(String(execResult.stderr || '')).slice(0, 500),
+          executionTimeMs: execResult.elapsedMs || 0,
+        }],
+        diagnosis: null,
+        repairPlan: null,
+        rerunResult: null,
+        overallOutcome: 'COMPLETED',
+      });
+      taskPlan.engineeringReport = report;
       advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'build_completed' });
       return {
         outcome: 'COMPLETED',
         phase: 'BUILD_VERIFICATION',
+        status: 'TESTS_PASSED',
         turnId: turn.turnId,
         taskPlan,
         buildPlan: plan,
         buildDiscovery,
         buildResult: execResult,
+        engineeringReport: report,
         filesModified: [],
         codeApplied: false,
         codeVerified: true,
@@ -4833,9 +6106,34 @@ async function executeAutonomousCodingWorkflowStage({
       attemptHistory: taskPlan.attemptHistory || [],
     });
     taskPlan.diagnosis = diagnosis;
+    if (operation === BUILD_OPERATIONS.TEST) {
+      return await handleTestFailureRepairAndRerun({
+        root,
+        scope,
+        sessionId,
+        ownerWebContentsId,
+        userRequest,
+        taskPlan,
+        turn,
+        owner,
+        plan,
+        operation,
+        execResult,
+        diagnosis,
+        workspaceDiscovery,
+        dependencyReport,
+        buildDiscovery,
+        containerRunner,
+        initialUserApproved,
+        requestApproval,
+        tools,
+        fileReader,
+        onProgress,
+      });
+    }
     advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_failed', reason: execResult.stderr });
     return {
-      outcome: operation === BUILD_OPERATIONS.TEST ? 'TESTS_FAILED' : 'FAILED',
+      outcome: 'FAILED',
       phase: 'BUILD_EXECUTE',
       turnId: turn.turnId,
       taskPlan,
@@ -7412,6 +8710,14 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       rolledBack: false,
     });
 
+    const taskRep = taskPlan?.taskRepresentation || {
+      userGoal: userRequest,
+      taskType: taskPlan?.taskType || 'INVESTIGATE_OR_DEBUG',
+      requestedOutcomes: taskPlan?.requestedOutcomes || [userRequest],
+      constraints: taskPlan?.constraints || [],
+      acceptanceCriteria: taskPlan?.acceptanceCriteria || [userRequest],
+      unresolvedQuestions: taskPlan?.unresolvedQuestions || [],
+    };
     return {
       outcome: 'APPROVAL_REQUIRED',
       phase: 'APPROVE',
@@ -7423,9 +8729,19 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
         token: continuationToken,
         taskId: task.taskId,
         proposalContract,
+        rawPatch,
+        patchScope,
+        objectiveRelevantDefects,
         inspectedFiles: inspectedFiles.map((f) => (typeof f === 'string' ? f : f.path)),
       },
       taskPlan,
+      taskRepresentation: taskRep,
+      userGoal: taskRep.userGoal,
+      taskType: taskRep.taskType,
+      requestedOutcomes: taskRep.requestedOutcomes,
+      constraints: taskRep.constraints,
+      unresolvedQuestions: taskRep.unresolvedQuestions,
+      evidenceLevel: VERIFICATION_EVIDENCE_LEVELS.NOT_RUN,
       proposalContract,
       proposal: proposalContract,
       findings: objectiveRelevantDefects || [],
@@ -7471,12 +8787,27 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       worktreeIntegrity: { preserved: true, unrelatedUntouched: true },
       rolledBack: false,
     });
+    const rejectedTaskRep = taskPlan?.taskRepresentation || {
+      userGoal: userRequest,
+      taskType: taskPlan?.taskType || 'INVESTIGATE_OR_DEBUG',
+      requestedOutcomes: taskPlan?.requestedOutcomes || [userRequest],
+      constraints: taskPlan?.constraints || [],
+      acceptanceCriteria: taskPlan?.acceptanceCriteria || [userRequest],
+      unresolvedQuestions: taskPlan?.unresolvedQuestions || [],
+    };
     return {
       outcome: 'APPROVAL_REJECTED',
       phase: 'APPROVE',
       taskId: task.taskId,
       turnId: turn.turnId,
       taskPlan,
+      taskRepresentation: rejectedTaskRep,
+      userGoal: rejectedTaskRep.userGoal,
+      taskType: rejectedTaskRep.taskType,
+      requestedOutcomes: rejectedTaskRep.requestedOutcomes,
+      constraints: rejectedTaskRep.constraints,
+      unresolvedQuestions: rejectedTaskRep.unresolvedQuestions,
+      evidenceLevel: VERIFICATION_EVIDENCE_LEVELS.NOT_RUN,
       proposalContract,
       patchScope,
       reason: gateResult.rejectionReason,
@@ -8143,12 +9474,44 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
     ? executionVerificationReceipt.message
     : null;
 
+  const evidenceLevel = classifyVerificationEvidenceLevel({
+    isPassing,
+    testOutcome,
+    finalEvidence,
+    hermeticVerification,
+    hostExecution,
+    executionBlocked: false,
+    isCancelled: false,
+    verificationUnavailable: testOutcome?.status === 'VERIFICATION_UNAVAILABLE',
+  });
+  if (workflowReceipt?.verificationReport) {
+    workflowReceipt.verificationReport.evidenceLevel = evidenceLevel;
+    workflowReceipt.verificationReport.whatChanged = task.files.map((f) => f.path);
+    workflowReceipt.verificationReport.whatVerified = isPassing ? (selectedChecks.length ? selectedChecks : ['modular_integration']) : [];
+    workflowReceipt.verificationReport.whatFailed = isPassing ? [] : (testOutcome?.reason ? [testOutcome.reason] : ['verification_failed']);
+    workflowReceipt.verificationReport.whatRemainsBlocked = [];
+  }
+
   return {
     outcome: finalOutcome,
     phase: isPassing ? 'AUDIT' : 'VERIFY',
     taskId: task.taskId,
     turnId: turn.turnId,
     taskPlan,
+    taskRepresentation: taskPlan?.taskRepresentation || {
+      userGoal: userRequest,
+      taskType: taskPlan?.taskType || 'INVESTIGATE_OR_DEBUG',
+      requestedOutcomes: taskPlan?.requestedOutcomes || [userRequest],
+      constraints: taskPlan?.constraints || [],
+      acceptanceCriteria: taskPlan?.acceptanceCriteria || [userRequest],
+      unresolvedQuestions: taskPlan?.unresolvedQuestions || [],
+    },
+    userGoal: taskPlan?.userGoal || userRequest,
+    taskType: taskPlan?.taskType || 'INVESTIGATE_OR_DEBUG',
+    requestedOutcomes: taskPlan?.requestedOutcomes || [userRequest],
+    constraints: taskPlan?.constraints || [],
+    unresolvedQuestions: taskPlan?.unresolvedQuestions || [],
+    evidenceLevel,
     proposalContract,
     filesModified: task.files.map((f) => f.path),
     codeApplied: true,
@@ -8608,4 +9971,10 @@ module.exports = {
   createSemanticProjectGraph,
   ProjectContainerExecutionRunner,
   createProjectContainerExecutionRunner,
+  CHECK_STATES,
+  VERIFICATION_EVIDENCE_LEVELS,
+  classifyVerificationEvidenceLevel,
+  PROJECT_READINESS,
+  buildEngineeringReport,
+  synthesizeTargetedRepairPatch,
 };
