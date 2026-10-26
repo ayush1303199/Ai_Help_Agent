@@ -15,7 +15,9 @@ let vite;
 
 async function waitForSsrReadiness(server) {
   const warmup = Promise.all(ssrEntryPoints.map(async (url) => {
-    const result = await server.environments.ssr.transformRequest(url);
+    const result = server.environments?.ssr?.transformRequest
+      ? await server.environments.ssr.transformRequest(url)
+      : await server.transformRequest(url, { ssr: true });
     if (!result) throw new Error(`Vite SSR warm-up returned no transform for ${url}.`);
   }));
   let timeout;

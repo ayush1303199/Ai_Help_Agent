@@ -11,7 +11,7 @@ import {
   upsertCodingActivity,
   buildProjectRuntimeInspectionActivities,
   classifyCodingRequestIntent,
-  isProjectRuntimeTestRequest,
+  isActionableProjectWorkflowRequest,
   formatProjectRuntimeTestCompletionMessage,
   formatProjectRuntimeTestReceiptMessage,
   normalizeProjectRuntimeTestWorkflowResult,
@@ -1026,7 +1026,7 @@ export function useCodingAgentController({
 
 
     const classification = classifyCodingRequestIntent(question);
-    const isRuntimeProjectTest = isProjectRuntimeTestRequest(question);
+    const isRuntimeProjectTest = isActionableProjectWorkflowRequest(question);
     const requiresBrowserBrokerWorkflow = !window.electronAPI?.executeDeveloperWorkflow
       && shouldRequireDeveloperWorkflowForAttachedProject({
         intent: classification.intent,

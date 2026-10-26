@@ -1,9 +1,12 @@
 {
   "patterns": [
     "^est\\s+(?:the\\s+)?(?:project|app|application|server|api|routes?)$",
-    "^(?:run\\s+(?:the\\s+)?tests?|(?:test|verify|check)\\s+(?:(?:the|my|this|our)\\s+)?(?:project|app|application|server(?:\\.js)?|api|routes?|it|this|that))(?:\\s+(?:now|please|for me|works?|working|running))?$",
-    "^check\\s+if\\s+(?:(?:the|my|this|our)\\s+)?(?:project|app|application|server|api|routes?)\\s+(?:works?|is\\s+working|is\\s+running)$",
+    "^(?:run\\s+(?:the\\s+)?tests?|(?:test|verify|check)\\s+(?:(?:the|my|this|our)\\s+)?(?:project|app|application|server(?:\\.js)?|api|routes?|it|this|that|code|repo|repository))(?:\\s+(?:now|please|for me|works?|working|running))?$",
+    "^(?:check|verify)\\s+if\\s+(?:(?:the|my|this|our)\\s+)?(?:project|app|application|server|api|routes?)\\s+(?:works?|is\\s+working|is\\s+running|passes)$",
     "^is\\s+(?:(?:the|my|this|our)\\s+)?(?:project|app|application|server|api|routes?)\\s+(?:working|running|operational|up)$",
-    "^(?:test|st)\\s+(?:the\\s+)?my\\s+project\\b[\\s\\S]{0,60}\\b(?:working|wroking|work|now)$"
+    "^(?:test|st)\\s+(?:the\\s+)?my\\s+project\\b[\\s\\S]{0,60}\\b(?:working|wroking|work|now)$",
+    "^(?:install|download)\\s+(?:the\\s+)?(?:dependencies|deps|packages?|node_modules)\\s+(?:and|then)\\s+(?:(?:run\\s+(?:the\\s+)?tests?)|(?:test\\s+(?:the\\s+)?(?:project|app|application|it)))(?:\\s+(?:now|please|for me))?$",
+    "^(?:npm|pnpm|yarn|bun)\\s+(?:install|i|add)\\s+(?:and|then)\\s+(?:(?:run\\s+(?:the\\s+)?tests?)|(?:test\\s+(?:the\\s+)?(?:project|app|application|it)))(?:\\s+(?:now|please|for me))?$",
+    "^(?:run\\s+(?:the\\s+)?tests?\\s+(?:and|then)\\s+(?:install|download)\\s+(?:the\\s+)?(?:dependencies|deps|packages?|node_modules))$"
   ]
 }

@@ -36,6 +36,17 @@ export function isProjectRuntimeTestRequest(requestText: string): boolean {
   ));
 }
 
+export function isProjectDependencyRequest(requestText: string): boolean {
+  const text = String(requestText || '').trim();
+  if (!text) return false;
+  return /\b(?:install|download)\s+(?:the\s+)?(?:dependencies|deps|packages?|node_modules)\b/i.test(text)
+    || /\b(?:npm|pnpm|yarn|bun)\s+(?:install|i|add)\b/i.test(text);
+}
+
+export function isActionableProjectWorkflowRequest(requestText: string): boolean {
+  return isProjectRuntimeTestRequest(requestText) || isProjectDependencyRequest(requestText);
+}
+
 export function latestCodingUserRequest(messages: Array<{ role: 'user' | 'assistant'; content: string }>) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index].role === 'user') return messages[index].content;
@@ -1718,14 +1729,14 @@ export function shouldRequireDeveloperWorkflowForAttachedProject({
 }): boolean {
   const requestsProjectCreation = /\b(?:build|create|scaffold|bootstrap|set\s*up)\b/i.test(requestText)
     && /\b(?:new|complete|full-?stack|from\s+scratch|project|application|app)\b/i.test(requestText);
-  const requestsProjectRuntimeTest = isProjectRuntimeTestRequest(requestText);
-  if (requestsProjectRuntimeTest) {
+  const requestsProjectAction = isActionableProjectWorkflowRequest(requestText);
+  if (requestsProjectAction) {
     return intent === 'AUTONOMOUS_WORKFLOW_TASK'
       && hasAttachedProject
       && !hasDeveloperWorkflowBridge;
   }
   return intent === 'AUTONOMOUS_WORKFLOW_TASK'
-    && (requestsProjectCreation || requestsProjectRuntimeTest)
+    && (requestsProjectCreation || requestsProjectAction)
     && hasAttachedProject
     && !hasDeveloperWorkflowBridge
     && !isResumingProviderTask
@@ -1796,7 +1807,7 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
     };
   }
 
-  if (isProjectRuntimeTestRequest(text)) {
+  if (isActionableProjectWorkflowRequest(text)) {
     return {
       intent: 'AUTONOMOUS_WORKFLOW_TASK',
       isActionableTask: true,

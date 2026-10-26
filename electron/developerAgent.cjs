@@ -3670,7 +3670,7 @@ function completeNoChangeModularWorkflow({
 
 async function executeAutonomousCodingWorkflow(input) {
   const continuationToken = input?.continuationToken;
-  if (!continuationToken || isProjectRuntimeTestRequest(input?.userRequest)) {
+  if (!continuationToken || (isProjectRuntimeTestRequest(input?.userRequest) && !workflowContinuations.has(continuationToken))) {
     return executeAutonomousCodingWorkflowStage(input, null);
   }
   const saved = workflowContinuations.get(continuationToken);
@@ -3718,6 +3718,7 @@ async function executeAutonomousCodingWorkflowStage({
   tools = null,
   isCancelled = () => false,
   continuationToken = null,
+  containerRunner: inputContainerRunner = null,
 }, continuation = null) {
   if (!sessionId || ownerWebContentsId === undefined) {
     throw new Error('Developer session ownership is required.');
@@ -3726,7 +3727,9 @@ async function executeAutonomousCodingWorkflowStage({
   const owner = { sessionId, ownerWebContentsId };
   const fileReader = tools?.readFile || ((p, range) => developerFiles.readFile(p, ownerWebContentsId, range));
   const fileSearcher = tools?.searchCode || ((q, s) => developerFiles.searchCode(q, ownerWebContentsId, s));
-  const containerRunner = tools?.containerRunner !== undefined ? tools.containerRunner : createProjectContainerExecutionRunner();
+  const containerRunner = inputContainerRunner !== null
+    ? inputContainerRunner
+    : (tools?.containerRunner !== undefined ? tools.containerRunner : createProjectContainerExecutionRunner());
 
   if (continuation?.proposalContract && continuation?.taskId) {
     onProgress({
@@ -3873,7 +3876,439 @@ async function executeAutonomousCodingWorkflowStage({
     || (/^(?:install|download)\b/i.test(userRequest) && !/\b(?:feature|component|route|endpoint|page|module|system)\b/i.test(userRequest))
     || (/\binstall\b/i.test(userRequest) && dependencyReport.needsInstallation);
 
-  if (isDependencyInstallRequest && !isRuntimeTestRequest && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK) {
+  const isProjectTestOrVerifyRequest = (
+    isRuntimeTestRequest
+    || genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY
+    || /\b(?:run\s+(?:the\s+)?tests?|test\s+(?:the\s+)?(?:project|app|code|tests?)|test\s+suite|smoke\s*test|check\s+if\s+(?:the\s+)?project\s+works?)\b/i.test(userRequest)
+    || (/\btest(?:s|ing)?\b/i.test(userRequest) && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest))
+  ) && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
+
+  const isCombinedInstallAndTestRequest = (
+    (isDependencyInstallRequest && isProjectTestOrVerifyRequest)
+    || continuation?.isCombinedInstallAndTestRequest === true
+  );
+
+  if (isCombinedInstallAndTestRequest && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK) {
+    const hasAnyManifest = dependencyReport.hasManifest || Boolean(dependencyReport.primaryReport?.hasManifest);
+    if (!hasAnyManifest) {
+      advanceConversationTurn(turn.turnId, 'blocked', owner, {
+        phase: 'dependency_manifest_missing',
+        reason: 'No package manifest (e.g. package.json) found in project root.',
+      });
+      return {
+        outcome: 'BLOCKED',
+        phase: 'DEPENDENCY_CHECK',
+        turnId: turn.turnId,
+        taskPlan,
+        dependencyReport,
+        executionBlocked: true,
+        reason: 'No package manifest (e.g. package.json) found in project root to determine dependencies.',
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'BLOCKED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_CHECK'],
+        }),
+      };
+    }
+
+    const testPlan = await createBuildPlan({
+      projectRoot: root,
+      operation: BUILD_OPERATIONS.TEST,
+      discoveryResult: buildDiscovery,
+      dependencyReport,
+    });
+    taskPlan.buildPlan = testPlan;
+
+    if (!testPlan.configured) {
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_not_configured', reason: testPlan.reason });
+      return {
+        outcome: 'TEST_NOT_CONFIGURED',
+        phase: 'BUILD_PLAN',
+        turnId: turn.turnId,
+        taskPlan,
+        buildPlan: testPlan,
+        buildDiscovery,
+        executionBlocked: true,
+        reason: testPlan.reason,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'TEST_NOT_CONFIGURED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN'],
+        }),
+      };
+    }
+
+    let depPlan = null;
+    let depProposalContract = null;
+    let depExecResult = null;
+    let depVerification = null;
+
+    if (dependencyReport.needsInstallation) {
+      const currentTurn = () => conversationTurns.get(turn.turnId)?.state || turn.state;
+      if (currentTurn() === 'reading') {
+        advanceConversationTurn(turn.turnId, 'understanding', owner, { phase: 'understanding_dependencies' });
+      }
+
+      onProgress({ phase: 'DEPENDENCY_PLAN', message: 'Generating dependency installation plan proposal.' });
+      depPlan = continuation?.dependencyPlan || createDependencyPlan({ projectRoot: root, dependencyReport });
+      taskPlan.dependencyPlan = depPlan;
+      depProposalContract = depPlan.proposalContract || createDependencyProposalContract(depPlan, dependencyReport);
+      taskPlan.proposalContract = depProposalContract;
+
+      const proposalValidation = validateProposalContract(depProposalContract);
+      if (!proposalValidation.isValid) {
+        if (['reading', 'understanding', 'proposal_ready'].includes(currentTurn())) {
+          advanceConversationTurn(turn.turnId, 'failed', owner, {
+            phase: 'proposal_validation_failed',
+            reason: proposalValidation.rejectionReason,
+          });
+        }
+        return {
+          outcome: 'REJECTED',
+          phase: 'PROPOSAL_VALIDATION',
+          turnId: turn.turnId,
+          taskPlan,
+          dependencyPlan: depPlan,
+          proposalContract: depProposalContract,
+          dependencyReport,
+          reason: `Invalid dependency proposal: ${proposalValidation.rejectionReason}`,
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'FAILED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+          }),
+        };
+      }
+
+      if (currentTurn() === 'understanding') {
+        advanceConversationTurn(turn.turnId, 'proposal_ready', owner, {
+          phase: 'proposal_ready',
+          proposalId: depPlan.planId,
+          command: depPlan.fullCommandString,
+        });
+      }
+
+      let userApprovedDecision = null;
+      if (initialUserApproved !== undefined && initialUserApproved !== null) {
+        userApprovedDecision = Boolean(initialUserApproved);
+      } else if (continuation?.userApproved !== undefined && continuation?.userApproved !== null) {
+        userApprovedDecision = Boolean(continuation.userApproved);
+      }
+
+      if (userApprovedDecision === null && typeof requestApproval === 'function') {
+        if (currentTurn() === 'proposal_ready') {
+          advanceConversationTurn(turn.turnId, 'awaiting_approval', owner, {
+            phase: 'awaiting_approval',
+            proposalId: depPlan.planId,
+          });
+        }
+        const manifestFile = dependencyReport?.primaryReport?.manifestPath || 'package.json';
+        const targetNames = (depPlan.targets || []).map((t) => `${t.name}@${t.declaredVersion || 'latest'}`).join(', ') || 'declared dependencies';
+        const planDiff = depPlan.diff || `# Dependency Installation & Test Plan\n# Command: ${depPlan.fullCommandString}\n# Follow-up: npm test\n# Target Workspace: ${root}\n# Dependencies (${depPlan.targetCount || 0}): ${targetNames}\n`;
+
+        userApprovedDecision = await requestApproval({
+          taskId: depPlan.planId,
+          proposal: depPlan,
+          proposalContract: depProposalContract,
+          patchScope: [manifestFile],
+          diff: planDiff,
+          isDependencyPlan: true,
+          fullCommandString: depPlan.fullCommandString,
+          materialSideEffects: depPlan.materialSideEffects,
+        });
+      }
+
+      if (isCancelled()) {
+        advanceConversationTurn(turn.turnId, 'cancelled', owner, { phase: 'cancelled_before_approval' });
+        return cancelledResult('APPROVE', depPlan.planId);
+      }
+
+      if (userApprovedDecision === null) {
+        if (currentTurn() === 'proposal_ready') {
+          advanceConversationTurn(turn.turnId, 'awaiting_approval', owner, {
+            phase: 'awaiting_approval',
+            proposalId: depPlan.planId,
+          });
+        }
+        const continuationToken = crypto.randomUUID();
+        const continuationState = {
+          root,
+          scope,
+          sessionId,
+          ownerWebContentsId,
+          userRequest,
+          requestHash: hash(String(userRequest)),
+          isDependencyInstallRequest: true,
+          isCombinedInstallAndTestRequest: true,
+          turn,
+          taskPlan,
+          dependencyPlan: depPlan,
+          dependencyReport,
+          proposalContract: depProposalContract,
+          userApproved: null,
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+          expiresAt: Date.now() + WORKFLOW_CONTINUATION_TTL_MS,
+          token: continuationToken,
+          running: false,
+        };
+        storeWorkflowContinuation(continuationToken, continuationState);
+        return {
+          outcome: 'APPROVAL_REQUIRED',
+          phase: 'APPROVE',
+          turnId: turn.turnId,
+          taskPlan,
+          dependencyPlan: depPlan,
+          proposalContract: depProposalContract,
+          dependencyReport,
+          continuationToken,
+          continuation: {
+            status: 'AWAITING_APPROVAL',
+            token: continuationToken,
+            proposalId: depPlan.planId,
+            command: depPlan.fullCommandString,
+          },
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'APPROVAL_REQUIRED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+          }),
+        };
+      }
+
+      if (userApprovedDecision === false) {
+        if (['proposal_ready', 'awaiting_approval'].includes(currentTurn())) {
+          advanceConversationTurn(turn.turnId, 'failed', owner, {
+            phase: 'approval_rejected',
+            reason: 'Dependency installation proposal was rejected by user.',
+          });
+        }
+        return {
+          outcome: 'APPROVAL_REJECTED',
+          phase: 'APPROVE',
+          turnId: turn.turnId,
+          taskPlan,
+          dependencyPlan: depPlan,
+          proposalContract: depProposalContract,
+          dependencyReport,
+          reason: 'Dependency installation proposal was rejected by user.',
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'APPROVAL_REJECTED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+          }),
+        };
+      }
+
+      if (currentTurn() === 'proposal_ready') {
+        advanceConversationTurn(turn.turnId, 'awaiting_approval', owner, {
+          phase: 'awaiting_approval',
+          proposalId: depPlan.planId,
+        });
+      }
+      if (currentTurn() === 'awaiting_approval') {
+        advanceConversationTurn(turn.turnId, 'approved', owner, {
+          phase: 'dependency_install_approved',
+          proposalId: depPlan.planId,
+        });
+      }
+      depPlan.approved = true;
+      depProposalContract.approved = true;
+
+      if (currentTurn() === 'approved') {
+        advanceConversationTurn(turn.turnId, 'applying', owner, {
+          phase: 'dependency_install_applying',
+          command: depPlan.fullCommandString,
+        });
+      }
+
+      depExecResult = await executeDependencyPlan({ plan: depPlan, ownerWebContentsId, sessionId, containerRunner });
+
+      if (!depExecResult.ok && depExecResult.executionBlocked) {
+        advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'dependency_install_blocked', reason: depExecResult.reason });
+        return {
+          outcome: 'BLOCKED',
+          phase: 'DEPENDENCY_INSTALL_GATE',
+          turnId: turn.turnId,
+          taskPlan,
+          dependencyPlan: depPlan,
+          proposalContract: depProposalContract,
+          dependencyReport,
+          executionBlocked: true,
+          reason: depExecResult.reason,
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'BLOCKED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+          }),
+        };
+      }
+
+      if (!depExecResult.ok) {
+        advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'dependency_install_failed', reason: depExecResult.reason });
+        return {
+          outcome: depExecResult.status === 'CANCELLED' ? 'CANCELLED' : (depExecResult.status === 'TIMED_OUT' ? 'TIMED_OUT' : 'FAILED'),
+          phase: 'DEPENDENCY_INSTALL_FAILED',
+          turnId: turn.turnId,
+          taskPlan,
+          dependencyPlan: depPlan,
+          proposalContract: depProposalContract,
+          dependencyReport,
+          dependencyResult: depExecResult,
+          executionBlocked: false,
+          reason: depExecResult.reason || 'Dependency installation failed.',
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'FAILED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN'],
+          }),
+        };
+      }
+
+      advanceConversationTurn(turn.turnId, 'verifying', owner, { phase: 'dependency_install_verifying' });
+      depVerification = depExecResult.dependencyVerification || await verifyInstalledDependencies(root);
+      if (!depVerification.isFullyInstalled) {
+        advanceConversationTurn(turn.turnId, 'failed', owner, {
+          phase: 'dependency_verification_failed',
+          reason: 'Post-install dependency verification detected unresolved dependencies.',
+        });
+        return {
+          outcome: 'FAILED',
+          phase: 'DEPENDENCY_VERIFICATION_FAILED',
+          status: 'VERIFICATION_FAILED',
+          turnId: turn.turnId,
+          taskPlan,
+          dependencyPlan: depPlan,
+          proposalContract: depProposalContract,
+          dependencyReport,
+          dependencyResult: depExecResult,
+          dependencyVerification: depVerification,
+          executionBlocked: false,
+          reason: 'Dependency installation succeeded but verification detected unresolved dependencies on disk.',
+          filesModified: [],
+          codeApplied: true,
+          codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'FAILED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL'],
+          }),
+        };
+      }
+    }
+
+    onProgress({ phase: 'BUILD_PLAN', message: 'Running project tests.' });
+    const refreshedReport = await discoverDependencies(root);
+    const runnableTestPlan = await createBuildPlan({
+      projectRoot: root,
+      operation: BUILD_OPERATIONS.TEST,
+      discoveryResult: buildDiscovery,
+      dependencyReport: refreshedReport,
+    });
+    taskPlan.buildPlan = runnableTestPlan;
+
+    const testExecResult = await executeBuildPlan({ plan: runnableTestPlan, ownerWebContentsId, sessionId, containerRunner });
+
+    if (!testExecResult.ok && testExecResult.executionBlocked) {
+      const diagnosis = diagnoseFailure(testExecResult, { projectRoot: root, attemptHistory: taskPlan.attemptHistory || [] });
+      taskPlan.diagnosis = diagnosis;
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_execution_blocked', reason: testExecResult.reason });
+      return {
+        outcome: 'BLOCKED',
+        phase: 'BUILD_EXECUTION_GATE',
+        turnId: turn.turnId,
+        taskPlan,
+        buildPlan: runnableTestPlan,
+        buildDiscovery,
+        diagnosis,
+        dependencyPlan: depPlan,
+        dependencyReport,
+        executionBlocked: true,
+        reason: testExecResult.reason,
+        filesModified: [],
+        codeApplied: Boolean(dependencyReport.needsInstallation && depExecResult?.ok),
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'BLOCKED',
+          stagesCompleted: dependencyReport.needsInstallation
+            ? ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL', 'VERIFY', 'BUILD_PLAN']
+            : ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN'],
+        }),
+      };
+    }
+
+    if (testExecResult.ok) {
+      advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'build_completed' });
+      return {
+        outcome: 'COMPLETED',
+        phase: 'BUILD_VERIFICATION',
+        status: 'TESTS_PASSED',
+        turnId: turn.turnId,
+        taskPlan,
+        buildPlan: runnableTestPlan,
+        buildDiscovery,
+        buildResult: testExecResult,
+        dependencyPlan: depPlan,
+        dependencyReport,
+        dependencyResult: depExecResult,
+        dependencyVerification: depVerification,
+        filesModified: [],
+        codeApplied: Boolean(dependencyReport.needsInstallation && depExecResult?.ok),
+        codeVerified: true,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'COMPLETED',
+          stagesCompleted: dependencyReport.needsInstallation
+            ? ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL', 'VERIFY', 'BUILD_PLAN', 'BUILD_EXECUTE']
+            : ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE'],
+        }),
+      };
+    }
+
+    const diagnosis = diagnoseFailure(testExecResult, {
+      projectRoot: root,
+      attemptHistory: taskPlan.attemptHistory || [],
+    });
+    taskPlan.diagnosis = diagnosis;
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_failed', reason: testExecResult.stderr });
+    return {
+      outcome: 'TESTS_FAILED',
+      phase: 'BUILD_EXECUTE',
+      status: 'TESTS_FAILED',
+      turnId: turn.turnId,
+      taskPlan,
+      buildPlan: runnableTestPlan,
+      buildDiscovery,
+      buildResult: testExecResult,
+      diagnosis,
+      dependencyPlan: depPlan,
+      dependencyReport,
+      dependencyResult: depExecResult,
+      dependencyVerification: depVerification,
+      filesModified: [],
+      codeApplied: Boolean(dependencyReport.needsInstallation && depExecResult?.ok),
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'FAILED',
+        stagesCompleted: dependencyReport.needsInstallation
+          ? ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL', 'VERIFY', 'BUILD_PLAN', 'BUILD_EXECUTE']
+          : ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE'],
+      }),
+    };
+  }
+
+  if (isDependencyInstallRequest && !isCombinedInstallAndTestRequest && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK) {
     const hasAnyManifest = dependencyReport.hasManifest || Boolean(dependencyReport.primaryReport?.hasManifest);
     if (!hasAnyManifest) {
       advanceConversationTurn(turn.turnId, 'blocked', owner, {
@@ -4202,9 +4637,8 @@ async function executeAutonomousCodingWorkflowStage({
     };
   }
 
-  const isProjectTestOrVerifyRequest = (isRuntimeTestRequest || genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY || /\b(?:run\s+(?:the\s+)?tests?|test(?:s|ing)?|verify|verification)\b/i.test(userRequest)) && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
 
-  if (isProjectTestOrVerifyRequest && dependencyReport.needsInstallation && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK && !existingRuntimeTestPlan && !isDependencyInstallRequest) {
+  if (isProjectTestOrVerifyRequest && !isCombinedInstallAndTestRequest && dependencyReport.needsInstallation && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK && !existingRuntimeTestPlan && !isDependencyInstallRequest) {
     onProgress({
       phase: 'DEPENDENCY_CHECK',
       message: `Project dependencies declared in manifest (${(dependencyReport.missingDependencies || []).map((d) => d.name).join(', ')}) are missing on disk. Generating dependency installation plan proposal.`,
@@ -4273,6 +4707,7 @@ async function executeAutonomousCodingWorkflowStage({
   const isExplicitBuildOrTestRequest = (!isRuntimeTestRequest || !existingRuntimeTestPlan)
     && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK
     && !isDependencyInstallRequest
+    && !isCombinedInstallAndTestRequest
     && (
       genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY
       || isRuntimeTestRequest
@@ -4304,7 +4739,7 @@ async function executeAutonomousCodingWorkflowStage({
     if (!plan.configured) {
       advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_not_configured', reason: plan.reason });
       return {
-        outcome: plan.status,
+        outcome: operation === BUILD_OPERATIONS.TEST && plan.status === 'NOT_CONFIGURED' ? 'TEST_NOT_CONFIGURED' : plan.status,
         phase: 'BUILD_PLAN',
         turnId: turn.turnId,
         taskPlan,
@@ -4400,7 +4835,7 @@ async function executeAutonomousCodingWorkflowStage({
     taskPlan.diagnosis = diagnosis;
     advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_failed', reason: execResult.stderr });
     return {
-      outcome: 'FAILED',
+      outcome: operation === BUILD_OPERATIONS.TEST ? 'TESTS_FAILED' : 'FAILED',
       phase: 'BUILD_EXECUTE',
       turnId: turn.turnId,
       taskPlan,

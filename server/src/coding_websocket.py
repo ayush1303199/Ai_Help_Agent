@@ -1358,6 +1358,12 @@ def understand_human_request(
     elif re.search(r"\b(?:show|display|list|fetch|get)\b", lower):
         action = "LIST"
         expected_output = "bounded records or requested catalog"
+    elif re.search(r"\b(?:install|download)\s+(?:the\s+)?(?:dependencies|deps|packages?|node_modules)\b", lower):
+        action = "DEPENDENCY_INSTALL"
+        expected_output = "approved dependency installation proposal"
+    elif re.search(r"\b(?:run\s+(?:the\s+)?tests?|test\s+(?:the\s+)?(?:project|app|application)|test\s+suite)\b", lower):
+        action = "TEST_EXECUTION"
+        expected_output = "project test execution and results"
     elif re.search(r"\b(?:fix|repair|change|update|modify|implement)\b", lower):
         action = "CHANGE"
         expected_output = "approved change proposal"
@@ -1476,9 +1482,9 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     elif re.search(r"\b(?:code\s+review|review\s+this|review\s+(?:the|this|a)?\s*(?:pull\s+request|pr|code|diff)|review\s+karo|review\s+karke|audit\s+karo|security\s+(?:audit|vulnerability))\b", req, re.I):
         intent = TaskIntent.CODE_REVIEW
         proposal_required = False
-    elif re.search(r"\b(?:dependency|dependencies|outdated\s+packages?|package\s+conflict|docker|dockerfile|env\b|config\b|configuration)\b", req, re.I):
+    elif re.search(r"\b(?:dependency|dependencies|outdated\s+packages?|package\s+conflict|docker|dockerfile|env\b|config\b|configuration|node_modules)\b", req, re.I):
         intent = TaskIntent.CONFIGURATION
-        proposal_required = bool(re.search(r"\b(?:fix|update|modify|change|banao)\b", req, re.I))
+        proposal_required = bool(re.search(r"\b(?:fix|update|modify|change|banao|install|download)\b", req, re.I))
     elif DATABASE_CREDENTIAL_REQUEST_PATTERN.search(req):
         intent = TaskIntent.DATABASE_CREDENTIAL_REQUEST
         proposal_required = False
@@ -1526,7 +1532,7 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     elif re.search(r"\b(?:architecture|system\s+design|module\s+boundary|repository\s+structure|directory\s+structure|how\s+is\s+the\s+repo\s+structured|entry\s+points?|layout)\b", req, re.I):
         intent = TaskIntent.ARCHITECTURE_INVESTIGATION
         proposal_required = False
-    elif re.search(r"\b(?:tests?\s+(?:are\s+)?fail(?:ing)?|failing\s+tests?|broken\s+tests?|test\s+failures?|tests?\s+chalao|run\s+tests?|tests?\s+pass)\b", req, re.I):
+    elif re.search(r"\b(?:tests?\s+(?:are\s+)?fail(?:ing)?|failing\s+tests?|broken\s+tests?|test\s+failures?|tests?\s+chalao|run\s+tests?|test\s+(?:the\s+)?(?:project|app|application)|tests?\s+pass)\b", req, re.I):
         intent = TaskIntent.TEST_FAILURE
         proposal_required = bool(re.search(r"\b(?:fix|patch|banao)\b", req, re.I))
     elif re.search(r"\b(?:refactor|clean\s*up|extract\s+method|reorganize)\b", req, re.I):
@@ -8762,7 +8768,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
     )
     has_map_evidence = _has_repository_map_evidence(semantic_task)
     require_repository_map = bool(
-        project_root
+        (project_root or scope)
         and not has_map_evidence
         and (
             _is_project_architecture_question(raw_request)
@@ -11676,6 +11682,13 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     })
 
             if consecutive_no_progress >= 2 and round_number > 0:
+                if scoped_pattern_discovery and not _has_relevant_proposal_source_evidence(semantic_task):
+                    content = _set_proposal_evidence_limitation(semantic_task)
+                    final_message = {"role": "assistant", "content": content}
+                    _persist_agent_task_state(
+                        session, semantic_task, session_id, "NEEDS_CLARIFICATION"
+                    )
+                    break
                 conversation.append({
                     "role": "system",
                     "content": (

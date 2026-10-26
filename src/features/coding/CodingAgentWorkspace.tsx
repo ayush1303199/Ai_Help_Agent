@@ -30,7 +30,7 @@ function codingActivityLabel(item: CodingActivity): string {
   }
   switch (item.activityType) {
     case 'SEARCHING': return 'Searched code';
-    case 'READING_FILE': return item.status === 'STARTED' ? 'Reading' : 'Read file';
+    case 'READING_FILE': return 'Read file';
     case 'DISCOVERING_REPOSITORY': return 'Explored directory';
     case 'INSPECTING_SYMBOL': return 'Inspected symbol';
     case 'TRACING_CALLER': return 'Traced references';
@@ -321,7 +321,7 @@ function CodingActivityTimeline({
             <span className="flex items-center gap-2">
               <span>🧠</span>
               <span className="font-semibold text-slate-200">
-                Thinking &amp; Investigation Activity
+                {hasEngineeringEvidence ? 'Engineering Analysis & Inspected Files' : 'Thinking & Investigation Activity'}
               </span>
               <span className="font-normal text-[10px] text-slate-500">
                 ({totalItems} {totalItems === 1 ? 'step' : 'steps'})
