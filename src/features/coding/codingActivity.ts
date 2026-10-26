@@ -37,6 +37,8 @@ export interface CodingActivityResult {
   stdout?: string;
   stderr?: string;
   executed?: boolean;
+  startLine?: number;
+  endLine?: number;
 }
 
 export interface CodingActivityError {
@@ -58,6 +60,9 @@ export interface CodingActivityEvent {
     target?: string;
     reason?: string;
     expectedEvidence?: string[];
+    startLine?: number;
+    endLine?: number;
+    command?: string;
   };
   activityType: CodingActivityType;
   status: CodingActivityStatus;
@@ -196,6 +201,10 @@ export function parseCodingActivityEvent(value: unknown): CodingActivityEvent | 
       result.evidenceState = rawResult.evidenceState as CodingActivityResult['evidenceState'];
     }
     result.command = boundedString(rawResult.command, 300);
+    const resultStartLine = nonnegativeInteger(rawResult.startLine) ?? nonnegativeInteger(rawResult.start_line);
+    const resultEndLine = nonnegativeInteger(rawResult.endLine) ?? nonnegativeInteger(rawResult.end_line);
+    if (resultStartLine !== undefined) result.startLine = resultStartLine;
+    if (resultEndLine !== undefined) result.endLine = resultEndLine;
   }
 
   const error = isRecord(value.error) ? {
@@ -203,11 +212,17 @@ export function parseCodingActivityEvent(value: unknown): CodingActivityEvent | 
     message: boundedString(value.error.message, 500),
   } : undefined;
   const expectedEvidence = boundedStringArray(value.action.expectedEvidence, 8, 240);
+  const actionStartLine = nonnegativeInteger(value.action.startLine) ?? nonnegativeInteger(value.action.start_line);
+  const actionEndLine = nonnegativeInteger(value.action.endLine) ?? nonnegativeInteger(value.action.end_line);
+  const actionCommand = boundedString(value.action.command, 300);
   const action = {
     tool: value.action.tool.slice(0, 120),
     target: boundedString(value.action.target, 300),
     reason: boundedString(value.action.reason, 500),
     expectedEvidence,
+    ...(actionStartLine !== undefined ? { startLine: actionStartLine } : {}),
+    ...(actionEndLine !== undefined ? { endLine: actionEndLine } : {}),
+    ...(actionCommand ? { command: actionCommand } : {}),
   };
   const timestamp = value.timestamp.slice(0, 40);
   return {
@@ -265,7 +280,12 @@ function isOlderActivity(existing: CodingActivityEvent, incoming: CodingActivity
 export function upsertCodingActivity(
   current: CodingActivity[],
   activity: CodingActivity,
+  currentExecutionId?: string,
 ): CodingActivity[] {
+
+  if (currentExecutionId && activity.executionId && activity.executionId !== currentExecutionId) {
+    return current;
+  }
   if (!('event' in activity)) {
     const existingIndex = current.findIndex(
       (item) => !('event' in item) && item.id === activity.id,
@@ -302,6 +322,7 @@ export function finalizeCodingActivities(
   executionId: string,
   status: 'UNVERIFIED',
 ): CodingActivity[] {
+
   return current.map((item) => (
     'event' in item
     && item.event === 'activity_event'

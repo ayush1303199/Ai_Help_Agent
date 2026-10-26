@@ -1537,7 +1537,7 @@ export function useCodingAgentController({
           }));
         },
         onActivity: (entry) => {
-          setActivity((previous) => upsertCodingActivity(previous, entry));
+          setActivity((previous) => upsertCodingActivity(previous, entry, requestId));
         },
         onToken: () => undefined,
         onDone: (result: CodingTransportResult) => {

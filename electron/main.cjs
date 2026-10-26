@@ -2749,6 +2749,9 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:task-patch-quality-evaluate', (_event, payload) => {
     return developerAgent.evaluatePatchQuality(payload?.diffText, payload?.modifiedFiles || [], payload?.targetScope || []);
   });
+  ipcMain.handle('developer:check-diff', (_event, payload) => {
+    return developerAgent.check_diff(payload || {});
+  });
   ipcMain.handle('developer:task-diff-review-independent', (_event, payload) => {
     return developerAgent.reviewDiffIndependently(payload?.diffText, payload?.taskGoal, payload?.modifiedFiles || []);
   });

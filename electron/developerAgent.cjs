@@ -65,6 +65,7 @@ const {
   validateWorkflowReceipt,
   extractEnclosingFunctionBlock,
 } = require('./coding-pipeline/investigationWorkflowContract.cjs');
+const { check_diff, checkDiff, DIFF_OUTCOMES } = require('./coding-pipeline/codingDiffEngine.cjs');
 const {
   validateSafePath,
   isGreenfieldWorkspace,
@@ -3980,10 +3981,16 @@ async function executeAutonomousCodingWorkflowStage({
           proposalId: plan.planId,
         });
       }
+      const manifestFile = dependencyReport?.primaryReport?.manifestPath || 'package.json';
+      const targetNames = (plan.targets || []).map((t) => `${t.name}@${t.declaredVersion || 'latest'}`).join(', ') || 'declared dependencies';
+      const planDiff = plan.diff || `# Dependency Installation Plan\n# Command: ${plan.fullCommandString}\n# Target Workspace: ${root}\n# Dependencies (${plan.targetCount || 0}): ${targetNames}\n`;
+
       userApprovedDecision = await requestApproval({
         taskId: plan.planId,
         proposal: plan,
         proposalContract,
+        patchScope: [manifestFile],
+        diff: planDiff,
         isDependencyPlan: true,
         fullCommandString: plan.fullCommandString,
         materialSideEffects: plan.materialSideEffects,
@@ -8051,6 +8058,7 @@ module.exports = {
   verifyTaskBlindness, attemptOracleDiscovery, adjudicateWorkerConflict, classifyRealityLevel,
   CLASSIFICATION_CONFIRMED, CLASSIFICATION_LIKELY, CLASSIFICATION_UNVERIFIED, CLASSIFICATION_NOT_A_BUG,
   VALID_SUBTASK_STATUSES, VALID_HYPOTHESIS_STATUSES, LEGAL_SUBTASK_TRANSITIONS, LEGAL_HYPOTHESIS_TRANSITIONS,
+  check_diff, checkDiff, DIFF_OUTCOMES,
   classifyDefect, traceExecutionFlow, validateEvidenceReport, validatePatchScope, validateProposalContract, enforceApprovalGate, validateApplyScope, extractFailureDiagnostics,
   analyzeTaskRequirements, planProgressiveSearch, discoverProjectArchitecture, executeToolWithSafeguards, manageRepairLoop,
   createTaskPlan,

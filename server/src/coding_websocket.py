@@ -2348,6 +2348,17 @@ def compute_next_best_action(session_data: Dict[str, Any], intent_info: Dict[str
                 "rationale": "Assemble compact map of source directories and entry points.",
             }
 
+    has_got_map = any(
+        t.get("name") == "get_repository_map"
+        for t in session_data.get("toolHistory", []) if isinstance(t, dict)
+    )
+    if not has_got_map and not arch.get("sourceDirectories") and not arch.get("entryPoints"):
+        return {
+            "action": "get_repository_map",
+            "target": "",
+            "rationale": "Discover the active project's source layout before selecting targeted reads.",
+        }
+
     has_listed_dir = any(
         t.get("name") in ("list_directory", "repo_browser.list_directory")
         for t in session_data.get("toolHistory", []) if isinstance(t, dict)
@@ -2418,6 +2429,194 @@ def _coding_tool_call_for_next_action(
             "arguments": json.dumps(arguments),
         },
     }
+
+
+_SAFE_EXPLORATION_TOOLS = {
+    "get_repository_map",
+    "read_file",
+    "list_directory",
+    "search_code",
+    "search_symbols",
+    "find_references",
+    "get_context",
+}
+
+
+def _is_safe_relative_path(path_str: str) -> bool:
+    if not path_str or not isinstance(path_str, str):
+        return False
+    clean = path_str.strip()
+    if not clean or "\x00" in clean:
+        return False
+    if re.match(r'^[a-zA-Z]:[/\\]', clean) or clean.startswith("\\\\"):
+        return False
+    if clean.startswith("/") or clean.startswith("\\"):
+        return False
+    norm = clean.replace("\\", "/")
+    segments = norm.split("/")
+    if any(s == ".." for s in segments):
+        return False
+    return True
+
+
+def _normalize_extracted_tool_args(canonical: str, raw_args: Any, scope: str = ".") -> Optional[Dict[str, Any]]:
+    if canonical not in _SAFE_EXPLORATION_TOOLS:
+        return None
+    args = raw_args if isinstance(raw_args, dict) else {}
+    if canonical == "get_repository_map":
+        return {}
+    elif canonical in ("read_file", "repo_browser.read_file", "repo_browser.open_file"):
+        path_val = args.get("path") or args.get("relativePath") or ""
+        path_str = str(path_val).strip()
+        if not _is_safe_relative_path(path_str):
+            return None
+        res: Dict[str, Any] = {"path": path_str}
+        if "startLine" in args and isinstance(args["startLine"], int) and args["startLine"] > 0:
+            res["startLine"] = args["startLine"]
+        if "endLine" in args and isinstance(args["endLine"], int) and args["endLine"] > 0:
+            res["endLine"] = args["endLine"]
+        return res
+    elif canonical in ("list_directory", "repo_browser.list_directory"):
+        path_val = args.get("relativePath") or args.get("path") or scope or "."
+        path_str = str(path_val).strip()
+        if path_str and not _is_safe_relative_path(path_str) and path_str != ".":
+            return None
+        return {"relativePath": path_str or "."}
+    elif canonical in ("search_code", "repo_browser.search_code", "search_symbols", "repo_browser.search_symbols"):
+        q_val = args.get("query") or args.get("name") or args.get("symbol") or ""
+        q_str = str(q_val).strip()
+        if not q_str or len(q_str) > 200:
+            return None
+        return {"query": q_str}
+    elif canonical in ("find_references", "repo_browser.find_references"):
+        s_val = args.get("symbol") or args.get("query") or ""
+        s_str = str(s_val).strip()
+        if not s_str or len(s_str) > 200:
+            return None
+        return {"symbol": s_str}
+    elif canonical == "get_context":
+        q_val = args.get("query") or args.get("text") or ""
+        q_str = str(q_val).strip()
+        if not q_str or len(q_str) > 500:
+            return None
+        res = {"query": q_str}
+        if "maxTokens" in args and isinstance(args["maxTokens"], int) and args["maxTokens"] > 0:
+            res["maxTokens"] = min(args["maxTokens"], 8000)
+        return res
+    return None
+
+
+def _extract_tool_call_from_text(
+    content: str,
+    round_number: int,
+    scope: str = ".",
+) -> Optional[Dict[str, Any]]:
+    if not content:
+        return None
+    if "{" in content:
+        start_idx = 0
+        decoder = json.JSONDecoder()
+        while True:
+            open_brace = content.find("{", start_idx)
+            if open_brace == -1:
+                break
+            try:
+                parsed, _ = decoder.raw_decode(content[open_brace:])
+                if isinstance(parsed, dict):
+                    tool_name = parsed.get("tool") or parsed.get("name") or parsed.get("function")
+                    if tool_name:
+                        canonical = resolve_tool_capability(str(tool_name))
+                        if canonical and canonical in _SAFE_EXPLORATION_TOOLS:
+                            raw_args = parsed.get("arguments") or {}
+                            norm_args = _normalize_extracted_tool_args(canonical, raw_args, scope)
+                            if norm_args is not None:
+                                return {
+                                    "id": f"extracted-{canonical}-{round_number}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": canonical,
+                                        "arguments": json.dumps(norm_args),
+                                    },
+                                }
+                start_idx = open_brace + 1
+            except Exception:
+                start_idx = open_brace + 1
+
+    for tool in sorted(_SAFE_EXPLORATION_TOOLS, key=len, reverse=True):
+        pattern = rf'\b(?:Next step:\s*)?({re.escape(tool)})\s*(\{{[^}}]*\}}|\([^)]*\))?'
+        m = re.search(pattern, content)
+        if m:
+            t_name = m.group(1)
+            raw_args = m.group(2) or "{}"
+            if raw_args.startswith("(") and raw_args.endswith(")"):
+                raw_args = "{}"
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = {}
+            canonical = resolve_tool_capability(t_name)
+            if canonical and canonical in _SAFE_EXPLORATION_TOOLS:
+                norm_args = _normalize_extracted_tool_args(canonical, args, scope)
+                if norm_args is not None:
+                    return {
+                        "id": f"extracted-{canonical}-{round_number}",
+                        "type": "function",
+                        "function": {
+                            "name": canonical,
+                            "arguments": json.dumps(norm_args),
+                        },
+                    }
+    return None
+    json_match = re.search(
+        r'\{[^{}]*?"(?:tool|name|function)"\s*:\s*"([a-zA-Z0-9_\.]+)"[^{}]*?\}',
+        content,
+    )
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(0))
+            tool_name = parsed.get("tool") or parsed.get("name") or parsed.get("function")
+            raw_args = parsed.get("arguments") or {}
+            canonical = resolve_tool_capability(str(tool_name or ""))
+            if canonical and canonical != "run_verification":
+                norm_args = _normalize_extracted_tool_args(canonical, raw_args, scope)
+                return {
+                    "id": f"extracted-{canonical}-{round_number}",
+                    "type": "function",
+                    "function": {
+                        "name": canonical,
+                        "arguments": json.dumps(norm_args),
+                    },
+                }
+        except Exception:
+            pass
+
+    allowed_candidates = [
+        t for t in TOOL_NAMES if t not in ("run_verification", "terminal.run_command", "execute_sql")
+    ]
+    for tool in sorted(allowed_candidates, key=len, reverse=True):
+        pattern = rf'\b(?:Next step:\s*)?({re.escape(tool)})\s*(\{{[^}}]*\}}|\([^)]*\))?'
+        m = re.search(pattern, content)
+        if m:
+            t_name = m.group(1)
+            raw_args = m.group(2) or "{}"
+            if raw_args.startswith("(") and raw_args.endswith(")"):
+                raw_args = "{}"
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = {}
+            canonical = resolve_tool_capability(t_name)
+            if canonical and canonical != "run_verification":
+                norm_args = _normalize_extracted_tool_args(canonical, args, scope)
+                return {
+                    "id": f"extracted-{canonical}-{round_number}",
+                    "type": "function",
+                    "function": {
+                        "name": canonical,
+                        "arguments": json.dumps(norm_args),
+                    },
+                }
+    return None
 
 
 _PROPOSAL_GENERIC_TERMS = {
@@ -4624,7 +4823,12 @@ def _resume_semantic_task(
     request_id: str,
 ) -> Dict[str, Any]:
     """Resume the same task while assigning this continuation its own turn ID."""
-    resumed = copy.deepcopy(prior_task)
+    resumed = copy.deepcopy(current_task)
+    for k, v in prior_task.items():
+        if isinstance(v, dict) and isinstance(resumed.get(k), dict):
+            resumed[k] = {**resumed[k], **copy.deepcopy(v)}
+        else:
+            resumed[k] = copy.deepcopy(v)
     resumed["turnId"] = request_id
     resumed["currentRequest"] = SecretProtector.redact_text(current_request)
     provider_recovery = resumed.get("providerRecovery")
@@ -4944,6 +5148,7 @@ def _update_task_from_tool_result(
         elif action.get("tool") == "get_repository_map":
             data = result.get("data") if isinstance(result, dict) else None
             if isinstance(data, dict):
+                arch_data = task_state.setdefault("architecture", {})
                 map_summary = {}
                 for key in (
                     "languages", "frameworks", "sourceDirectories",
@@ -4951,7 +5156,8 @@ def _update_task_from_tool_result(
                     "importantFiles",
                 ):
                     value = data.get(key)
-                    if isinstance(value, list):
+                    if isinstance(value, list) and value:
+                        arch_data[key] = value
                         map_summary[key] = [
                             SecretProtector.redact_text(str(item))[:200]
                             for item in value[:30]
@@ -5042,6 +5248,8 @@ def _update_task_from_tool_result(
                 informative_result = bool(data["content"].strip())
         elif isinstance(data, list):
             informative_result = bool(data)
+        elif isinstance(data, str):
+            informative_result = bool(data.strip())
         non_placeholder_values = (
             result.get(key)
             for key in ("databaseType", "table", "username", "database")
@@ -6703,7 +6911,14 @@ def _activity_event_payload(
     error: Any = None,
 ) -> Dict[str, Any]:
     tool = str(action.get("tool") or "unknown")
+    action_args = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
+    start_line = action.get("startLine") or action.get("start_line") or action_args.get("startLine") or action_args.get("start_line")
+    end_line = action.get("endLine") or action.get("end_line") or action_args.get("endLine") or action_args.get("end_line")
+    cmd_val = action.get("command") or action_args.get("command")
     safe_action = {
+        **({"startLine": start_line} if isinstance(start_line, int) and not isinstance(start_line, bool) and start_line >= 1 else {}),
+        **({"endLine": end_line} if isinstance(end_line, int) and not isinstance(end_line, bool) and end_line >= 1 else {}),
+        **({"command": _redact_activity_text(cmd_val, 300)} if isinstance(cmd_val, str) and cmd_val else {}),
         "tool": _redact_activity_text(tool, 120),
         "target": _activity_target_for_tool(tool, {"relativePath": action.get("target")}),
     }
@@ -6734,6 +6949,15 @@ def _activity_event_payload(
         elif isinstance(data.get("executed"), bool):
             safe_result["executed"] = data["executed"]
         if tool in ("run_verification", "terminal.run_command"):
+            cmd = data.get("command") or action.get("command") or action_args.get("command")
+            if isinstance(cmd, str) and cmd:
+                safe_result["command"] = _redact_activity_text(cmd, 300)
+            stdout = data.get("stdout")
+            stderr = data.get("stderr")
+            if isinstance(stdout, str) and stdout:
+                safe_result["stdout"] = _redact_activity_text(stdout, 4000)
+            if isinstance(stderr, str) and stderr:
+                safe_result["stderr"] = _redact_activity_text(stderr, 4000)
             executed = data.get("executed") is True
             exit_code = data.get("exitCode")
             if executed and isinstance(exit_code, int) and not isinstance(exit_code, bool):
@@ -6801,6 +7025,12 @@ def _activity_event_payload(
                 if paths:
                     safe_result["paths"] = paths
         if tool in ("read_file", "repo_browser.read_file", "repo_browser.open_file", "open_file"):
+            res_start = data.get("startLine") or data.get("start_line") or action.get("startLine") or action.get("start_line") or action_args.get("startLine") or action_args.get("start_line")
+            res_end = data.get("endLine") or data.get("end_line") or action.get("endLine") or action.get("end_line") or action_args.get("endLine") or action_args.get("end_line")
+            if isinstance(res_start, int) and not isinstance(res_start, bool) and res_start >= 1:
+                safe_result["startLine"] = res_start
+            if isinstance(res_end, int) and not isinstance(res_end, bool) and res_end >= 1:
+                safe_result["endLine"] = res_end
             content = data.get("content") if isinstance(data, dict) else None
             if isinstance(content, str):
                 line_count = data.get("sourceLineCount")
@@ -8424,7 +8654,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         semantic_task["intent"]["reasoning"] = SecretProtector.redact_text(
             selected_semantics.get("reasoningSummary") or ""
         )
-        semantic_task["hypotheses"].extend(
+        semantic_task.setdefault("hypotheses", []).extend(
             {
                 **hypothesis,
                 "statement": SecretProtector.redact_text(str(hypothesis.get("statement") or "")),
@@ -8437,7 +8667,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             if explicit_continuation
             else bool(selected_semantics.get("continuityDetected", False))
         )
-        for resource in semantic_task["resources"]:
+        for resource in semantic_task.get("resources", []):
             details = next(
                 (
                     item for item in selected_semantics.get("resourceDetails", [])
@@ -8530,13 +8760,16 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         targetless_change_request
         and intent_info.get("classified_intent") != TaskIntent.PERFORMANCE_FIX
     )
+    has_map_evidence = _has_repository_map_evidence(semantic_task)
     require_repository_map = bool(
         project_root
+        and not has_map_evidence
         and (
             _is_project_architecture_question(raw_request)
             or scoped_pattern_discovery
+            or (semantic_task.get("nextAction") or {}).get("tool") == "get_repository_map"
+            or (semantic_task.get("continuation") or {}).get("nextAction", {}).get("tool") == "get_repository_map"
         )
-        and not _has_repository_map_evidence(semantic_task)
     )
     if require_repository_map:
         map_requirement = "Inspect the attached project's repository map and architecture evidence."
@@ -8576,7 +8809,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         semantic_task["workingMemory"]["activeTarget"] = (
             semantic_task.get("resolvedTarget") or semantic_task.get("target", {}).get("resolved")
         )
-        semantic_task["workingMemory"]["activeResources"] = list(semantic_task["resolvedResources"])
+        semantic_task["workingMemory"]["activeResources"] = list(semantic_task.get("resolvedResources") or [])
         semantic_task["workingMemory"]["activeTask"] = (
             semantic_task.get("goal", {}).get("statement") or raw_request
         )
@@ -8590,8 +8823,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         "intent": semantic_task["intent"]["primary"],
         "operation": db_det.get("capability") or ("ROUTE_TO_CODE" if database_routed_to_code else "INVESTIGATE_CODE"),
         "target": semantic_task.get("resolvedTarget") or semantic_task.get("target", {}).get("resolved"),
-        "resources": semantic_task["resolvedResources"],
-        "requiredEvidence": semantic_task["requiredEvidence"],
+        "resources": semantic_task.get("resolvedResources", []),
+        "requiredEvidence": semantic_task.get("requiredEvidence", []),
         "confidence": semantic_task.get("confidence"),
         "source": semantic_task.get("sourceOfDecision"),
     })
@@ -8741,7 +8974,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 "status": "ACTIVE",
                 "evidenceIds": list(scan_action["resultEvidenceIds"]),
             })
-            semantic_task["workingMemory"]["activeResources"] = list(semantic_task["resolvedResources"])
+            semantic_task["workingMemory"]["activeResources"] = list(semantic_task.get("resolvedResources") or [])
             semantic_task["status"] = "REPLANNING"
             semantic_task["selectedAction"] = "ROUTE_TO_CODE"
             next_credential_action = _next_credential_investigation_action(
@@ -8799,7 +9032,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
     )
     CODING_TASK_STORE.emit_lifecycle_event(session_id, "INTENT_CLASSIFIED", {
         "intent": semantic_task["intent"]["primary"],
-        "resources": semantic_task["resolvedResources"],
+        "resources": semantic_task.get("resolvedResources", []),
         "proposalRequired": proposal_required,
     })
     CODING_TASK_STORE.emit_lifecycle_event(session_id, "DISCOVERY_STARTED", {"architecture": arch, "plan": plan})
@@ -10252,19 +10485,34 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                             "safe project evidence inspected so far."
                         ),
                     }
-            elif round_number == 0 and require_repository_map:
-                message = {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": f"repository-map-{request_id}",
-                        "type": "function",
-                        "function": {
-                            "name": "get_repository_map",
-                            "arguments": "{}",
-                        },
-                    }],
-                }
+            elif round_number == 0 and (
+                require_repository_map
+                or ((semantic_task.get("nextAction") or (semantic_task.get("continuation") or {}).get("nextAction") or {}).get("tool") in {
+                    "get_repository_map", "read_file", "list_directory", "search_code", "search_symbols"
+                })
+            ):
+                resumed_action = (
+                    semantic_task.get("nextAction")
+                    or (semantic_task.get("continuation") or {}).get("nextAction")
+                    or {}
+                )
+                tool_to_call = "get_repository_map" if require_repository_map else resumed_action.get("tool")
+                raw_args = resumed_action.get("arguments") if not require_repository_map else {}
+                call_args = raw_args if isinstance(raw_args, dict) else {}
+                norm_args = _normalize_extracted_tool_args(tool_to_call, call_args, scope) if tool_to_call != "get_repository_map" else {}
+                if norm_args is not None:
+                    message = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": f"auto-{tool_to_call}-{round_number}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_to_call,
+                                "arguments": json.dumps(norm_args),
+                            },
+                        }],
+                    }
             elif proposal_required and not has_relevant_source_evidence:
                 source_candidate = (
                     _proposal_source_candidate_from_directory(semantic_task)
@@ -10424,6 +10672,15 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             })
             conversation.append(message)
             calls = message.get("tool_calls") or []
+            if not calls:
+                extracted = _extract_tool_call_from_text(
+                    str(message.get("content") or ""),
+                    round_number,
+                    scope,
+                )
+                if extracted:
+                    calls = [extracted]
+                    message["tool_calls"] = calls
             if proposal_required and calls:
                 listed_candidates = {
                     candidate.casefold()
@@ -10709,10 +10966,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                             ),
                         })
                         continue
-                    raise RuntimeError(
-                        "The Coding Agent could not read relevant project source, so it cannot safely create a proposal. "
-                        "Retry the request or choose a Coding provider with working tool calling."
-                    )
+                    final_message = None
+                    break
                 is_perf_inquiry = semantic_task["intent"].get("primary") == "PERFORMANCE_ANALYSIS"
                 perf_evidence = CODING_TASK_STORE.get_performance_evidence(session_id)
                 if is_perf_inquiry and not _has_read_file_evidence(conversation) and round_number < MAX_CODING_TOOL_ROUNDS - 1:
@@ -11085,8 +11340,16 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     "resultEvidenceIds": action["resultEvidenceIds"],
                 })
                 _persist_agent_task_state(session, semantic_task, session_id)
-                is_empty_or_trivial = not serialized.strip() or serialized.strip() in (
-                    "[]", "{}", "null", '{"ok":true,"data":[]}'
+                is_data_empty = False
+                if isinstance(result, dict) and isinstance(result.get("data"), (dict, list)):
+                    if not result["data"]:
+                        is_data_empty = True
+                    elif isinstance(result["data"], dict) and not any(result["data"].values()):
+                        is_data_empty = True
+                is_empty_or_trivial = (
+                    not serialized.strip()
+                    or serialized.strip() in ("[]", "{}", "null", '{"ok":true,"data":[]}', '{"ok":true,"data":{}}')
+                    or is_data_empty
                 )
                 observation = semantic_task["observations"][-1]
                 if isinstance(result, dict) and result.get("ok") is True and not is_empty_or_trivial:
@@ -11256,6 +11519,47 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     for pf in priority_files + other_files:
                         if pf not in sess["targetFiles"]:
                             sess["targetFiles"].append(pf)
+                elif name == "get_repository_map" and isinstance(result, dict):
+                    if result.get("ok") is True:
+                        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                        sess = CODING_TASK_STORE.get_or_create(session_id, project_root=project_root, scope=scope)
+                        arch_data = semantic_task.setdefault("architecture", {})
+                        for key in ("languages", "frameworks", "sourceDirectories", "testDirectories", "entryPoints", "configFiles", "importantFiles"):
+                            val = data.get(key)
+                            if isinstance(val, list):
+                                arch_data[key] = val
+                                arch[key] = val
+                        candidates = []
+                        for ep in data.get("entryPoints") or []:
+                            if isinstance(ep, str) and ep and ep not in candidates:
+                                candidates.append(ep)
+                        for imp in data.get("importantFiles") or []:
+                            if isinstance(imp, str) and imp and imp not in candidates and not imp.endswith("/"):
+                                candidates.append(imp)
+                        for cf in data.get("configFiles") or []:
+                            if isinstance(cf, str) and cf and cf not in candidates:
+                                candidates.append(cf)
+                        has_arch_data = bool(candidates or any(arch_data.get(k) for k in ("languages", "frameworks", "sourceDirectories")))
+                        for cand in candidates:
+                            if cand not in sess["targetFiles"]:
+                                sess["targetFiles"].append(cand)
+                        if has_arch_data:
+                            CODING_TASK_STORE.emit_lifecycle_event(
+                                session_id,
+                                "EVIDENCE_CAPTURED",
+                                {"target": "repository_map", "type": "architecture"},
+                            )
+                        else:
+                            dir_target = scope or "."
+                            if not any(t.get("name") in ("list_directory", "repo_browser.list_directory") for t in sess.get("toolHistory", [])):
+                                if dir_target not in sess.get("targetDirectories", []):
+                                    sess.setdefault("targetDirectories", []).append(dir_target)
+                    else:
+                        sess = CODING_TASK_STORE.get_or_create(session_id, project_root=project_root, scope=scope)
+                        dir_target = scope or "."
+                        if not any(t.get("name") in ("list_directory", "repo_browser.list_directory") for t in sess.get("toolHistory", [])):
+                            if dir_target not in sess.get("targetDirectories", []):
+                                sess.setdefault("targetDirectories", []).append(dir_target)
                 elif name in ("list_directory", "repo_browser.list_directory") and isinstance(result, dict) and result.get("ok") is True:
                     data = result.get("data")
                     entries = []

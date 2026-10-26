@@ -21,7 +21,7 @@ function codingActivityLabel(item: CodingActivity): string {
     if (item.result?.executionStatus === 'AWAITING_APPROVAL') return 'Proposal created · awaiting approval';
     if (item.result?.executionStatus === 'APPROVED') return 'Proposal approved · apply not started';
     if (item.result?.executionStatus === 'REJECTED') return 'Proposal rejected · not applied';
-    return 'Proposal lifecycle';
+    return 'Preparing minimal diff';
   }
   if (item.activityType === 'TOOL') {
     if (item.action.tool === 'proposal_transaction') return 'Proposal transaction';
@@ -30,11 +30,17 @@ function codingActivityLabel(item: CodingActivity): string {
   }
   switch (item.activityType) {
     case 'SEARCHING': return 'Searched code';
-    case 'READING_FILE': return 'Read file';
+    case 'READING_FILE': return item.status === 'STARTED' ? 'Reading' : 'Read file';
     case 'DISCOVERING_REPOSITORY': return 'Explored directory';
     case 'INSPECTING_SYMBOL': return 'Inspected symbol';
     case 'TRACING_CALLER': return 'Traced references';
-    case 'VERIFYING': return 'Ran verification';
+    case 'VERIFYING':
+      if (item.result?.exitCode !== undefined && item.result.exitCode !== null) {
+        if (item.result.exitCode === 0) return 'Command succeeded';
+        return `Command exited with code ${item.result.exitCode}`;
+      }
+      return item.status === 'STARTED' ? 'Running verification' : 'Ran verification';
+
     case 'INSPECTING_DATABASE':
       if (item.action.tool === 'discover_database_configuration') return 'Discovering database configuration';
       if (item.action.tool === 'DATABASE_SESSION') return 'Resolving database session';
@@ -55,7 +61,13 @@ function codingActivityLabel(item: CodingActivity): string {
       if (item.action.tool === 'DATABASE_DESCRIBE_TABLE') return 'Inspecting database schema';
       if (item.action.tool === 'DATABASE_QUERY' || item.action.tool === 'execute_sql') return 'Executing database query';
       return 'Inspecting database';
-    default: return item.action.tool;
+    default:
+      if (item.action.tool === 'proposal_apply') return 'Applying approved patch';
+      if (item.action.tool === 'rollback') return 'Rolling back change';
+      if (item.result?.exitCode !== undefined && item.result.exitCode !== null && item.result.exitCode !== 0) {
+        return `Command exited with code ${item.result.exitCode}`;
+      }
+      return item.action.tool;
   }
 }
 
@@ -112,16 +124,25 @@ function CodingActivityEntry({ item }: { item: CodingActivity }) {
   }
 
   const result = item.result;
+  const startLine = item.action.startLine ?? result?.startLine;
+  const endLine = item.action.endLine ?? result?.endLine;
+  const lineRangeStr = startLine && endLine ? ` — lines ${startLine}–${endLine}` : startLine ? ` — line ${startLine}` : '';
+  const displayTarget = item.action.target
+    ? `${item.action.target}${lineRangeStr}`
+    : (result?.paths && result.paths.length === 1 && lineRangeStr)
+    ? `${result.paths[0]}${lineRangeStr}`
+    : undefined;
+  const displayCommand = item.action.command || result?.command;
+
   const details = [
     result?.count !== undefined ? `${result.count} results` : undefined,
     result?.rowCount !== undefined ? `${result.rowCount} rows` : undefined,
-    result?.lineCount !== undefined ? `${result.lineCount} lines` : undefined,
+    result?.lineCount !== undefined && !lineRangeStr ? `${result.lineCount} lines` : undefined,
     result?.byteSize !== undefined ? `${result.byteSize} bytes` : undefined,
     result?.sourceContextTruncated ? 'provider context excerpted' : undefined,
     result?.databaseType,
     result?.executionStatus,
     result?.evidenceState ? `evidence ${result.evidenceState}` : undefined,
-    result?.exitCode !== undefined && result.exitCode !== null ? `exit ${result.exitCode}` : undefined,
     result?.executed === false ? 'not executed' : result?.executed === true ? 'executed' : undefined,
     item.repairAttempt !== undefined ? `repair attempt ${item.repairAttempt}` : undefined,
   ].filter(Boolean);
@@ -133,27 +154,50 @@ function CodingActivityEntry({ item }: { item: CodingActivity }) {
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
         <span className="text-sm shrink-0" aria-hidden="true">{icon}</span>
         <span className="font-semibold text-sky-200">{codingActivityLabel(item)}</span>
-        {item.action.target && (
+        {displayTarget && (
+          <code className="rounded-md border border-slate-700/60 bg-slate-900 px-2 py-0.5 font-mono text-[11px] font-medium text-sky-300 break-all">
+            {displayTarget}
+          </code>
+        )}
+        {displayCommand && (
+          <code className="rounded-md border border-slate-700/60 bg-slate-900/90 px-2 py-0.5 font-mono text-[11px] text-amber-200 break-all">
+            $ {displayCommand}
+          </code>
+        )}
+        {!displayTarget && !displayCommand && item.action.target && (
           <code className="rounded-md border border-slate-700/60 bg-slate-900 px-2 py-0.5 font-mono text-[11px] font-medium text-sky-300 break-all">
             {item.action.target}
           </code>
         )}
       </div>
-      <span
-        className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-          item.status === 'COMPLETED'
-            ? 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-            : item.status === 'FAILED'
-            ? 'border border-rose-500/30 bg-rose-500/10 text-rose-300'
-            : item.status === 'SKIPPED'
-            ? 'border border-slate-700 bg-slate-800/60 text-slate-400'
-            : 'border border-sky-500/30 bg-sky-500/10 text-sky-300'
-        }`}
-        aria-label={status.label}
-      >
-        <span>{status.icon}</span>
-        <span>{status.label}</span>
-      </span>
+      <div className="flex items-center gap-1.5">
+        {result?.exitCode !== undefined && result.exitCode !== null && (
+          <span className={`inline-flex items-center rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold ${
+            result.exitCode === 0
+              ? 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+              : 'border border-rose-500/30 bg-rose-500/10 text-rose-300'
+          }`}>
+            exit {result.exitCode}
+          </span>
+        )}
+        <span
+          className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+            item.status === 'COMPLETED'
+              ? 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+              : item.status === 'FAILED'
+              ? 'border border-rose-500/30 bg-rose-500/10 text-rose-300'
+              : item.status === 'SKIPPED'
+              ? 'border border-slate-700 bg-slate-800/60 text-slate-400'
+              : item.status === 'BLOCKED'
+              ? 'border border-amber-500/30 bg-amber-500/10 text-amber-300'
+              : 'border border-sky-500/30 bg-sky-500/10 text-sky-300'
+          }`}
+          aria-label={status.label}
+        >
+          <span>{status.icon}</span>
+          <span>{status.label}</span>
+        </span>
+      </div>
     </div>
     {details.length > 0 && (
       <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-6 text-[10px] text-slate-400">
@@ -167,7 +211,7 @@ function CodingActivityEntry({ item }: { item: CodingActivity }) {
     {item.action.reason && (
       <p className="mt-1 pl-6 text-[10px] text-slate-500">{item.action.reason}</p>
     )}
-    {result?.paths && result.paths.length > 0 && (
+    {result?.paths && result.paths.length > 0 && !displayTarget && (
       <div className="mt-1.5 pl-6">
         <ul className="space-y-0.5 text-[10px] text-slate-400 font-mono">
           {result.paths.slice(0, 5).map((path) => (
@@ -189,10 +233,123 @@ function CodingActivityEntry({ item }: { item: CodingActivity }) {
     {item.status !== 'SKIPPED' && item.error?.message && (
       <p className="mt-1 pl-6 text-[10px] text-rose-300">{item.error.message}</p>
     )}
+    {(result?.stderr || (result?.exitCode !== undefined && result.exitCode !== 0 && result?.stdout)) && (
+      <details className="mt-1.5 pl-6 text-[10px]">
+        <summary className="cursor-pointer text-rose-300 hover:text-rose-200">
+          Inspection output
+        </summary>
+        <pre className="mt-1 max-h-36 overflow-auto rounded bg-slate-900 p-2 font-mono text-[10px] text-slate-300 border border-slate-800">
+          {result.stderr || result.stdout}
+        </pre>
+      </details>
+    )}
     {item.terminalizedLocally && (
       <p className="mt-1 pl-6 text-[10px] text-amber-300">No terminal result was received.</p>
     )}
   </div>;
+}
+
+function CodingActivityTimeline({
+  activity,
+  busy,
+  streaming,
+  content,
+}: {
+  activity: CodingActivity[];
+  busy: boolean;
+  streaming: boolean;
+  content?: string;
+}) {
+  const narrationItems = activity.filter(isCodingNarration);
+  const hasEngineeringEvidence = narrationItems.some((item) => (
+    item.phase === 'Workspace topology'
+    || item.phase === 'Cross-file contract'
+    || item.phase === 'Environment and drift'
+    || item.phase === 'Verification plan'
+    || item.phase === 'Live verification'
+  ));
+  const toolItems = activity.filter((item, idx, arr) => {
+    if (!('event' in item)) return false;
+    if (idx === 0) return true;
+    const prev = arr[idx - 1];
+    if ('event' in prev) {
+      if (item.status === 'SKIPPED' && prev.status === 'SKIPPED' &&
+          item.action.tool === prev.action.tool && item.action.target === prev.action.target) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  const totalItems = narrationItems.length + toolItems.length;
+  if (totalItems === 0 && !busy && !streaming) return null;
+
+  return (
+    <div className="mt-3 space-y-2.5">
+      {(busy || streaming) && (
+        <div className="relative overflow-hidden rounded-lg border border-sky-500/30 bg-slate-900/80 px-3 py-2 shadow-sm">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="relative flex h-2 w-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-sky-500" />
+              </span>
+              <span className="text-xs font-medium text-sky-200">
+                {streaming
+                  ? 'Generating response…'
+                  : toolItems.length > 0
+                  ? 'Investigating codebase and analyzing context…'
+                  : 'Thinking and analyzing project…'}
+              </span>
+            </div>
+            <span className="animate-wave-pulse font-mono text-[10px] uppercase tracking-wider text-sky-400/90">
+              Active
+            </span>
+          </div>
+          <div className="mt-2 h-0.5 w-full overflow-hidden rounded-full bg-slate-800">
+            <div className="h-full w-full bg-gradient-to-r from-transparent via-sky-400 to-transparent animate-wave-shimmer" />
+          </div>
+        </div>
+      )}
+
+      {totalItems > 0 && (
+        <details
+          className="group rounded-lg border border-slate-800 bg-slate-950/70 transition-colors hover:border-slate-700/80"
+          open={hasEngineeringEvidence || Boolean((busy || streaming) && !content)}
+        >
+          <summary className="flex cursor-pointer select-none items-center justify-between px-3 py-2 text-xs font-medium text-slate-300 hover:text-sky-200">
+            <span className="flex items-center gap-2">
+              <span>🧠</span>
+              <span className="font-semibold text-slate-200">
+                Thinking &amp; Investigation Activity
+              </span>
+              <span className="font-normal text-[10px] text-slate-500">
+                ({totalItems} {totalItems === 1 ? 'step' : 'steps'})
+              </span>
+            </span>
+            <span className="text-[10px] text-slate-500 transition-transform group-open:rotate-180">▼</span>
+          </summary>
+          <div className="space-y-2 border-t border-slate-800/80 p-2.5">
+            {narrationItems.map((item, idx) => (
+              <div key={`narration-${idx}`} className="flex items-start gap-2 text-[11px] text-slate-400">
+                <span className="mt-0.5 shrink-0 text-slate-500">•</span>
+                <div className="min-w-0 flex-1">
+                  {item.phase && <span className="mr-1.5 font-medium text-slate-300">[{item.phase}]</span>}
+                  <span>{item.message}</span>
+                </div>
+              </div>
+            ))}
+            {toolItems.map((item) => (
+              <CodingActivityEntry
+                key={'event' in item ? `${item.executionId}:${item.activityId}` : item.id}
+                item={item}
+              />
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
+  );
 }
 
 interface CodingMessage {
@@ -917,102 +1074,29 @@ export function CodingAgentWorkspace({
               onChoose={onChooseWorkspaceResolution}
             />
           )}
-          {message.role === 'assistant' && messageIndex === messages.length - 1 && (activity.length > 0 || busy || streaming) && (() => {
-            const narrationItems = activity.filter(isCodingNarration);
-            const hasEngineeringEvidence = narrationItems.some((item) => (
-              item.phase === 'Workspace topology'
-              || item.phase === 'Cross-file contract'
-              || item.phase === 'Environment and drift'
-              || item.phase === 'Verification plan'
-              || item.phase === 'Live verification'
-            ));
-            const toolItems = activity.filter((item, idx, arr) => {
-              if (!('event' in item)) return false;
-              if (idx === 0) return true;
-              const prev = arr[idx - 1];
-              if ('event' in prev) {
-                if (item.status === 'SKIPPED' && prev.status === 'SKIPPED' &&
-                    item.action.tool === prev.action.tool && item.action.target === prev.action.target) {
-                  return false;
-                }
-              }
-              return true;
-            });
-
-            return (
-              <div className="mt-3 space-y-2.5">
-                {(busy || streaming) && (
-                  <div className="relative overflow-hidden rounded-lg border border-sky-500/30 bg-slate-900/80 px-3 py-2 shadow-sm">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <span className="relative flex h-2 w-2">
-                          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75" />
-                          <span className="relative inline-flex h-2 w-2 rounded-full bg-sky-500" />
-                        </span>
-                        <span className="text-xs font-medium text-sky-200">
-                          {streaming
-                            ? 'Generating response…'
-                            : toolItems.length > 0
-                            ? 'Investigating codebase and analyzing context…'
-                            : 'Thinking and analyzing project…'}
-                        </span>
-                      </div>
-                      <span className="animate-wave-pulse font-mono text-[10px] uppercase tracking-wider text-sky-400/90">
-                        Active
-                      </span>
-                    </div>
-                    <div className="mt-2 h-0.5 w-full overflow-hidden rounded-full bg-slate-800">
-                      <div className="h-full w-full bg-gradient-to-r from-transparent via-sky-400 to-transparent animate-wave-shimmer" />
-                    </div>
-                  </div>
-                )}
-
-                {narrationItems.length > 0 && (
-                  <details
-                    className="group rounded-lg border border-slate-800 bg-slate-950/60 transition-colors hover:border-slate-700/80"
-                    open={hasEngineeringEvidence || Boolean((busy || streaming) && !message.content)}
-                  >
-                    <summary className="flex cursor-pointer select-none items-center justify-between px-3 py-2 text-xs font-medium text-slate-300 hover:text-sky-200">
-                      <span className="flex items-center gap-2">
-                        <span>🧠</span>
-                        <span className="font-semibold text-slate-200">
-                          {hasEngineeringEvidence ? 'Engineering Analysis & Inspected Files' : 'Thinking Process'}
-                        </span>
-                        <span className="font-normal text-[10px] text-slate-500">
-                          ({narrationItems.length} {narrationItems.length === 1 ? 'step' : 'steps'})
-                        </span>
-                      </span>
-                      <span className="text-[10px] text-slate-500 transition-transform group-open:rotate-180">▼</span>
-                    </summary>
-                    <div className="space-y-1.5 border-t border-slate-800/80 p-2.5">
-                      {narrationItems.map((item, idx) => (
-                        <div key={`narration-${idx}`} className="flex items-start gap-2 text-[11px] text-slate-400">
-                          <span className="mt-0.5 shrink-0 text-slate-500">•</span>
-                          <div className="min-w-0 flex-1">
-                            {item.phase && <span className="mr-1.5 font-medium text-slate-300">[{item.phase}]</span>}
-                            <span>{item.message}</span>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </details>
-                )}
-
-                {toolItems.length > 0 && (
-                  <div className="space-y-1.5">
-                    {toolItems.map((item) => (
-                      <CodingActivityEntry
-                        key={'event' in item ? `${item.executionId}:${item.activityId}` : item.id}
-                        item={item}
-                      />
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })()}
+          {message.role === 'assistant' && messageIndex === messages.length - 1 && (activity.length > 0 || busy || streaming) && (
+            <CodingActivityTimeline
+              activity={activity}
+              busy={busy}
+              streaming={streaming}
+              content={message.content}
+            />
+          )}
         </article>;
         })}
+        {visibleMessages.length > 0 && visibleMessages[visibleMessages.length - 1].role !== 'assistant' && (activity.length > 0 || busy || streaming) && (
+          <article className="mr-auto w-full max-w-4xl py-1">
+            <div className="mb-2 flex items-center gap-2">
+              <span aria-hidden="true" className="grid h-6 w-6 place-items-center rounded-full border border-sky-400/30 bg-sky-400/10 text-[10px] font-bold text-sky-200">AI</span>
+              <p className="text-xs font-semibold text-sky-200">Coding Agent</p>
+            </div>
+            <CodingActivityTimeline
+              activity={activity}
+              busy={busy}
+              streaming={streaming}
+            />
+          </article>
+        )}
         {showAllMessages && messages.length > 10 && (
           <button type="button" onClick={() => setShowAllMessages(false)} className="mx-auto block rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:text-sky-200">
             Collapse older messages

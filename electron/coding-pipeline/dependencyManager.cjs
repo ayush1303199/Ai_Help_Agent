@@ -741,9 +741,16 @@ function createDependencyPlan({
 
   const lockfiles = dependencyReport.primaryReport?.lockfiles || dependencyReport.lockfiles || [];
 
+  const manifestFile = dependencyReport.primaryReport?.manifestPath || 'package.json';
+  const targetNames = targetItems.map((t) => `${t.name}@${t.declaredVersion || 'latest'}`).join(', ') || 'all missing dependencies';
+  const planDiff = `# Dependency Installation Plan\n# Command: ${command} ${args.join(' ')}\n# Target Workspace: ${projectRoot}\n# Dependencies (${targetItems.length}): ${targetNames}\n`;
+  const planId = crypto.randomUUID();
+
   const plan = {
-    planId: crypto.randomUUID(),
+    planId,
+    taskId: planId,
     planDigest,
+    manifestHash: planDigest,
     projectRoot,
     packageManager: pm,
     command,
@@ -751,6 +758,16 @@ function createDependencyPlan({
     fullCommandString: `${command} ${args.join(' ')}`,
     targets: targetItems,
     targetCount: targetItems.length,
+    targetFiles: [manifestFile],
+    files: [{
+      path: manifestFile,
+      sourcePath: null,
+      operation: 'modify',
+      hash: null,
+      content: null,
+      lines: planDiff.split('\n'),
+    }],
+    diff: planDiff,
     networkRequired: true,
     materialSideEffects: {
       networkAccess: true,
