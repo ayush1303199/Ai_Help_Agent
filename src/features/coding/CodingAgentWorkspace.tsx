@@ -7,6 +7,7 @@ import { CodingExecutionSettingsControl } from './CodingExecutionSettingsControl
 import type { CodingExecutionSettings } from './codingExecutionSettings';
 import { ProjectFileTreeExplorer } from './ProjectFileTreeExplorer';
 import { WorkspaceTerminalPanel } from './WorkspaceTerminalPanel';
+import { TaskActivityPanel } from './TaskActivityPanel';
 import { ClarificationActionCard } from './ClarificationActionCard';
 
 type WorkspaceResolution = 'UPDATE_AND_INTEGRATE' | 'REPLACE_TARGETS' | 'KEEP_AND_SCAFFOLD';
@@ -752,6 +753,7 @@ export function CodingAgentWorkspace({
   const [showAllMessages, setShowAllMessages] = useState(false);
   const [copyError, setCopyError] = useState('');
   const [terminalOpen, setTerminalOpen] = useState(true);
+  const [taskActivityOpen, setTaskActivityOpen] = useState(true);
   const [projectPathInput, setProjectPathInput] = useState('');
   const lastConversationId = useRef(activeConversationId);
   const olderConversationStates = conversations
@@ -851,6 +853,30 @@ export function CodingAgentWorkspace({
                   projectStatus={projectStatus}
                   brokerStatus={brokerStatus}
                   onSynchronizeBroker={onSynchronizeBroker}
+                />
+              </div>
+            )}
+          </section>
+          <section className="rounded-lg border border-slate-700 bg-slate-950/30">
+            <div className="flex items-center justify-between px-3 py-2">
+              <div className="flex items-center gap-2">
+                <span className="h-2 w-2 rounded-full bg-sky-400 animate-pulse" />
+                <p className="text-xs font-semibold text-slate-200">Task Activity & Persistent History</p>
+              </div>
+              <button
+                type="button"
+                aria-expanded={taskActivityOpen}
+                onClick={() => setTaskActivityOpen((open) => !open)}
+                className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300 hover:border-slate-500"
+              >
+                {taskActivityOpen ? 'Collapse' : 'Open'}
+              </button>
+            </div>
+            {taskActivityOpen && (
+              <div className="px-3 pb-3">
+                <TaskActivityPanel
+                  projectRoot={projectRoot}
+                  activeTaskId={proposal?.id}
                 />
               </div>
             )}

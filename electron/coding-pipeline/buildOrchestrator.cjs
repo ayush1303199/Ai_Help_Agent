@@ -782,6 +782,20 @@ async function _executeBuildPlanCore({
   }
 
   // 4. Validate isolation and obtain selected runtime before any execution
+  if (!containerRunner) {
+    return {
+      ok: false,
+      status: BUILD_OUTCOMES.BLOCKED,
+      executionBlocked: true,
+      gate: 'PROCESS_ISOLATION_GATE',
+      error: 'Host project-context process execution is disabled pending an independently reviewed isolation mechanism.',
+      planDigest: plan.planDigest,
+      operation: plan.operation,
+      command: plan.fullCommandString,
+      reason: 'Build execution is blocked: verified process isolation is required before executing project build/test binaries.',
+    };
+  }
+
   let selectedRuntime;
   try {
     selectedRuntime = isolationGate(`Build operation ${plan.operation} (${plan.fullCommandString || plan.binary})`);

@@ -102,7 +102,12 @@ function requireProjectProcessIsolation(operation, evidence = null, expectedCont
   // New runtime discovery & verification step.
   const { discoverIsolationRuntimes } = require('./isolationRuntimeDiscovery.cjs');
   const candidates = discoverIsolationRuntimes(process.cwd());
-  const suitable = candidates.find(c => c.available && c.isolationVerified && c.supportedOps.includes(operation));
+  const opNormalized = String(operation || '').toLowerCase();
+  const isOrchestratorCall = operation && (operation.startsWith('Build operation ') || operation.startsWith('Dependency installation '));
+  const suitable = isOrchestratorCall
+    ? candidates.find(c => c.available && c.isolationVerified && (Array.isArray(c.supportedOps) && c.supportedOps.some(op => opNormalized.includes(op.toLowerCase()))))
+    : candidates.find(c => c.available && c.isolationVerified && c.supportedOps.includes(operation));
+
   if (!suitable) {
     // No verified runtime – use the original status reason if it already indicated a block.
     const reason = status.reason || 'No verified isolation runtime available for operation';
@@ -113,14 +118,17 @@ function requireProjectProcessIsolation(operation, evidence = null, expectedCont
 
   // After having a verified runtime, we no longer need to enforce status.verified.
   // However, if the original status indicated a platform that fundamentally cannot run isolation (e.g., unsupported OS), keep blocking.
-  if (process.platform === 'win32' || !status.available || !status.verified) {
+  if (suitable.runtimeType !== 'container' && (process.platform === 'win32' || !status.available || !status.verified)) {
     throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', status.reason);
   }
 
   const resolvedContext = expectedContext && typeof expectedContext === 'object' ? expectedContext : {};
   const resolvedCapabilities = capabilities && typeof capabilities === 'object' ? capabilities : {};
   if (!evidence) {
-    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', 'Execution evidence manifest is missing.');
+    if (isOrchestratorCall && suitable.runtimeType === 'container') {
+      return suitable;
+    }
+    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', status.reason || 'Execution evidence manifest is missing.');
   }
 
   const evaluation = evaluateExecutionEvidence(evidence, resolvedContext, resolvedCapabilities);

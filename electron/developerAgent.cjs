@@ -9137,13 +9137,49 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
             await apply(
               proposalId,
               loopOwner,
-              async () => ({
-                ok: true,
-                status: 'PASS',
-                executed: true,
-                exitCode: 0,
-                attempts: [{ ok: true, executed: true, exitCode: 0, check: selectedChecks[0] || 'test' }],
-              }),
+              async () => {
+                const results = [];
+                for (const check of selectedChecks) {
+                  let rawResult;
+                  try {
+                    rawResult = await runCheck(check, 2);
+                  } catch (error) {
+                    rawResult = verificationFailureFromError(error, check);
+                  }
+                  const observation = normalizeObservation(rawResult, check);
+                  results.push({
+                    ok: observation.ok === true,
+                    executed: observation.executed === true,
+                    exitCode: Number.isInteger(observation.exitCode) ? observation.exitCode : (observation.ok ? 0 : 1),
+                    check,
+                    script: check,
+                    stdout: observation.stdout || '',
+                    stderr: observation.stderr || '',
+                    failure: observation.ok ? undefined : (observation.reason || observation.error || 'Verification check failed.'),
+                    error: observation.ok ? undefined : (observation.error || undefined),
+                  });
+                  if (!observation.ok) break;
+                }
+                const failed = results.find((attempt) => !attempt.ok);
+                if (failed) {
+                  return {
+                    ok: false,
+                    status: 'CODE_FAILURE',
+                    executed: failed.executed === true,
+                    exitCode: failed.exitCode,
+                    reason: failed.failure || 'Verification failed after repair.',
+                    attempts: results,
+                    failure: failed.failure,
+                  };
+                }
+                return {
+                  ok: true,
+                  status: 'PASS',
+                  executed: true,
+                  exitCode: 0,
+                  attempts: results,
+                };
+              },
               root,
               authorizeFn
             );

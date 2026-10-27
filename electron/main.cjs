@@ -17,6 +17,7 @@ const { authorizeAppOwnedMutation } = require('./appOwnedPersistence.cjs');
 const { normalizeVerificationCriteria } = require('./coding-pipeline/workItemVerificationContract.cjs');
 const { TrustedLocalDesktopBroker } = require('./coding-pipeline/trustedLocalDesktopBroker.cjs');
 const { createInlineWorkflowApprovalBroker } = require('./coding-pipeline/inlineWorkflowApproval.cjs');
+const { taskActivityService } = require('./coding-pipeline/taskActivityService.cjs');
 const { loadElectronE2eTestMode } = require('./electronE2eTestMode.cjs');
 const {
   projectProcessIsolationStatus,
@@ -1284,6 +1285,28 @@ app.whenReady().then(async () => {
   } catch (error) {
     console.error('[DEV][JOURNAL] startup reconciliation failed:', error);
   }
+  taskActivityService.configureStorage({
+    storageRoot: app.getPath('userData'),
+    journalFile: path.join(app.getPath('userData'), 'developer-task-history.json'),
+  });
+  try {
+    await taskActivityService.loadHistory();
+  } catch (error) {
+    console.error('[TASK_ACTIVITY] startup reconciliation failed:', error);
+  }
+  taskActivityService.addListener((event, task) => {
+    if (task.ownerWebContentsId) {
+      const electronModule = require('electron');
+      const wc = electronModule?.webContents?.fromId ? electronModule.webContents.fromId(task.ownerWebContentsId) : null;
+      if (wc && !wc.isDestroyed()) {
+        wc.send('developer:task-event', {
+          taskId: task.taskId,
+          event,
+          taskStatus: task.status,
+        });
+      }
+    }
+  });
   ipcMain.handle('overlay:open', async (event) => {
     assertTrustedOverlaySender(event);
     return showOverlayWindow();
@@ -2523,6 +2546,53 @@ app.whenReady().then(async () => {
     }
     return developerAgent.cancelSession(event.sender.id);
   });
+  ipcMain.handle('developer:task-history-list', (event, query) => {
+    assertTrustedCodingRendererSender(event);
+    const owner = ownedDeveloperSession(event);
+    let projectRoot = null;
+    try {
+      if (developerFiles.hasProject(event.sender.id)) {
+        projectRoot = developerFiles.getProjectRoot(event.sender.id);
+      }
+    } catch {}
+    return taskActivityService.listTasks({
+      sessionId: owner.sessionId,
+      ownerWebContentsId: event.sender.id,
+      projectRoot: query?.projectRoot || projectRoot,
+      status: query?.status || null,
+      search: query?.search || null,
+      limit: Math.max(1, Math.min(100, Number(query?.limit) || 50)),
+      offset: Math.max(0, Number(query?.offset) || 0),
+    });
+  });
+
+  ipcMain.handle('developer:task-history-get', (event, taskId) => {
+    assertTrustedCodingRendererSender(event);
+    const owner = ownedDeveloperSession(event);
+    if (typeof taskId !== 'string' || !taskId.trim()) {
+      throw new TypeError('Invalid task ID.');
+    }
+    return taskActivityService.getTask(taskId, { owner });
+  });
+
+  ipcMain.handle('developer:task-cancel', (event, taskId) => {
+    assertTrustedCodingRendererSender(event);
+    const owner = ownedDeveloperSession(event);
+    if (typeof taskId !== 'string' || !taskId.trim()) {
+      throw new TypeError('Invalid task ID.');
+    }
+    return taskActivityService.transitionTaskState(taskId, 'CANCELLED', 'User requested cancellation', { owner });
+  });
+
+  ipcMain.handle('developer:task-kill', (event, taskId) => {
+    assertTrustedCodingRendererSender(event);
+    const owner = ownedDeveloperSession(event);
+    if (typeof taskId !== 'string' || !taskId.trim()) {
+      throw new TypeError('Invalid task ID.');
+    }
+    return taskActivityService.transitionTaskState(taskId, 'KILLED', 'Forced termination confirmed', { owner });
+  });
+
   ipcMain.handle('developer:task-pause', (event, taskId) => {
     const owner = ownedDeveloperSession(event);
     return developerAgent.pauseTask(taskId, owner);
@@ -2819,6 +2889,18 @@ app.whenReady().then(async () => {
     }
     pruneWorkflowExecutions();
     let execution = null;
+    const taskId = workflowRequestId;
+    taskActivityService.createTask({
+      taskId,
+      title: userRequest,
+      projectRoot: root,
+      sessionId: owner.sessionId,
+      ownerWebContentsId: event.sender.id,
+      correlationId: workflowRequestId,
+    });
+    try {
+      taskActivityService.transitionTaskState(workflowRequestId, 'RUNNING', 'Autonomous coding workflow initiated', { owner });
+    } catch {}
 
     let activitySeq = 0;
     const onProgress = (progress) => {
@@ -2829,10 +2911,26 @@ app.whenReady().then(async () => {
         ...progress,
         timestamp: new Date().toISOString(),
       });
+      taskActivityService.recordEvent(workflowRequestId, 'PROGRESS', {
+        phase: progress?.phase,
+        message: progress?.message,
+        operationSequence: activitySeq,
+      }, { owner });
+      if (progress?.phase) {
+        const p = String(progress.phase).toUpperCase();
+        if (['UNDERSTAND', 'DISCOVER', 'INVESTIGATE'].includes(p)) {
+          try { taskActivityService.transitionTaskState(workflowRequestId, 'INSPECTING', `Phase: ${progress.phase}`, { owner }); } catch {}
+        } else if (['APPLY', 'PATCH'].includes(p)) {
+          try { taskActivityService.transitionTaskState(workflowRequestId, 'APPLYING', `Phase: ${progress.phase}`, { owner }); } catch {}
+        } else if (['VERIFY', 'TEST', 'RETEST'].includes(p)) {
+          try { taskActivityService.transitionTaskState(workflowRequestId, 'VERIFYING', `Phase: ${progress.phase}`, { owner }); } catch {}
+        }
+      }
     };
 
     const runCheck = async (script) => {
-      return terminalRunner.runCheck(script, event.sender.id, {
+      taskActivityService.recordEvent(workflowRequestId, 'COMMAND_STARTED', { command: script }, { owner });
+      const checkRes = await terminalRunner.runCheck(script, event.sender.id, {
         scope,
         isCancelled: () => execution?.cancelRequested === true || event.sender.isDestroyed?.() === true,
       }).catch((error) => ({
@@ -2840,6 +2938,15 @@ app.whenReady().then(async () => {
         stdout: '',
         stderr: error instanceof Error ? error.message : String(error),
       }));
+      taskActivityService.recordEvent(workflowRequestId, 'COMMAND_COMPLETED', {
+        command: script,
+        exitCode: checkRes.exitCode,
+        stdout: checkRes.stdout,
+        stderr: checkRes.stderr,
+        status: checkRes.status || (checkRes.ok ? 'PASS' : 'FAIL'),
+        testResult: checkRes,
+      }, { owner });
+      return checkRes;
     };
 
     const assessFindingRelevance = async (assessment) => {
@@ -2870,13 +2977,26 @@ app.whenReady().then(async () => {
       return response.json();
     };
 
-    const requestApproval = async ({ taskId, proposal, diff, proposalContract }) => {
-      if (execution) execution.taskId = taskId;
-      if (proposal?.taskId !== taskId
-        || typeof proposal?.manifestHash !== 'string'
-        || !/^[a-f0-9]{64}$/i.test(proposal.manifestHash)
-        || !Array.isArray(proposal.targetFiles)
-        || proposal.targetFiles.length === 0
+    const requestApproval = async ({ taskId: proposalTaskId, proposal, diff, proposalContract, isRepair, patchScope }) => {
+      const proposalId = proposalTaskId || proposal?.taskId || proposal?.planId || proposal?.id || workflowRequestId;
+      if (execution) execution.taskId = proposalId;
+      const manifestHash = typeof proposal?.manifestHash === 'string' && /^[a-f0-9]{64}$/i.test(proposal.manifestHash)
+        ? proposal.manifestHash
+        : typeof proposal?.planDigest === 'string' && /^[a-f0-9]{64}$/i.test(proposal.planDigest)
+          ? proposal.planDigest
+          : crypto.createHash('sha256').update(diff || '').digest('hex');
+      const targetFiles = Array.isArray(proposal?.targetFiles) && proposal.targetFiles.length > 0
+        ? proposal.targetFiles
+        : Array.isArray(proposal?.affectedFiles) && proposal.affectedFiles.length > 0
+          ? proposal.affectedFiles
+          : Array.isArray(patchScope) && patchScope.length > 0
+            ? patchScope
+            : [];
+      if (!proposalId
+        || typeof manifestHash !== 'string'
+        || !/^[a-f0-9]{64}$/i.test(manifestHash)
+        || !Array.isArray(targetFiles)
+        || targetFiles.length === 0
         || typeof diff !== 'string'
         || !diff.trim()) {
         throw new Error('The proposed change could not be bound to a valid approval prompt.');
@@ -2902,25 +3022,33 @@ app.whenReady().then(async () => {
             hash: file.hash || null,
             content: file.content ?? null,
           }))
-        : proposal.targetFiles.map((target) => ({
-            path: target,
-            sourcePath: null,
-            operation: 'modify',
-            hash: null,
-            content: null,
-          }));
+        : Array.isArray(proposal.fileChanges)
+          ? proposal.fileChanges.map((change) => ({
+              path: change.filePath,
+              sourcePath: null,
+              operation: 'modify',
+              hash: null,
+              content: change.replacementContent ?? null,
+            }))
+          : targetFiles.map((target) => ({
+              path: target,
+              sourcePath: null,
+              operation: 'modify',
+              hash: null,
+              content: null,
+            }));
       const pending = inlineWorkflowApprovalBroker.request({
         webContents: event.sender,
         workflowRequestId,
-        proposalId: taskId,
-        proposalDigest: proposal.manifestHash,
+        proposalId,
+        proposalDigest: manifestHash,
         fileOperations,
         diff,
         sessionId: null,
-        validateSnapshots: () => developerAgent.validateTaskProposalSnapshots(
-          taskId,
-          owner,
-        ),
+        validateSnapshots: () => {
+          if (proposal?.planId || proposal?.fileChanges) return true;
+          return developerAgent.validateTaskProposalSnapshots(proposalId, owner);
+        },
         onTransition: (snapshot) => {
           if (!event.sender.isDestroyed()) {
             event.sender.send('developer:inline-approval-transition', {
@@ -2933,9 +3061,28 @@ app.whenReady().then(async () => {
           file.operation === 'delete' || file.operation === 'delete_directory'
         )),
       });
+      try { taskActivityService.transitionTaskState(workflowRequestId, 'PROPOSAL_READY', 'Proposal generated', { owner }); } catch {}
+      try { taskActivityService.transitionTaskState(workflowRequestId, 'WAITING_FOR_APPROVAL', 'Awaiting explicit user approval', { owner }); } catch {}
+      taskActivityService.recordEvent(workflowRequestId, 'APPROVAL_REQUESTED', {
+        proposalId,
+        manifestHash,
+        diff: diff.slice(0, 2000),
+        filesModified: targetFiles,
+        proposal,
+      }, { owner });
       execution.pendingApprovalRequestId = pending.approvalRequestId;
       try {
         const decision = await pending.promise;
+        taskActivityService.recordEvent(workflowRequestId, 'APPROVAL_DECISION', {
+          proposalId,
+          approved: decision.approved,
+          decision: decision.approved ? 'APPROVED' : 'REJECTED',
+        }, { owner });
+        if (decision.approved) {
+          try { taskActivityService.transitionTaskState(workflowRequestId, 'APPLYING', 'User approved proposal', { owner }); } catch {}
+        } else {
+          try { taskActivityService.transitionTaskState(workflowRequestId, 'FAILED', 'User rejected proposal', { owner }); } catch {}
+        }
         if (electronE2eTestMode && process.env.AI_CODING_E2E_INLINE_APPROVAL === '1') {
           electronE2eTestMode.recordInlineApproval({
             root,
@@ -2994,9 +3141,27 @@ app.whenReady().then(async () => {
         : null;
       execution.expiresAt = Date.now() + WORKFLOW_EXECUTION_TTL_MS;
       if (electronE2eTestMode) electronE2eTestMode.recordWorkflowResult(workflowRequestId, result);
+      if (result?.outcome === 'COMPLETED' || result?.codeVerified === true) {
+        try { taskActivityService.transitionTaskState(workflowRequestId, 'COMPLETED', result?.message || 'Workflow verified successfully', { owner }); } catch {}
+      } else if (result?.outcome === 'CANCELLED' || execution.cancelRequested) {
+        try { taskActivityService.transitionTaskState(workflowRequestId, 'CANCELLED', result?.message || 'Workflow cancelled', { owner }); } catch {}
+      } else if (result?.outcome === 'BLOCKED' || result?.status === 'BLOCKED') {
+        try { taskActivityService.transitionTaskState(workflowRequestId, 'BLOCKED', result?.message || 'Workflow blocked', { owner }); } catch {}
+      } else {
+        try { taskActivityService.transitionTaskState(workflowRequestId, 'FAILED', result?.message || 'Workflow execution or verification failed', { owner }); } catch {}
+      }
+      taskActivityService.recordEvent(workflowRequestId, 'WORKFLOW_SETTLED', {
+        outcome: result?.outcome,
+        status: result?.status,
+        codeVerified: result?.codeVerified,
+        filesModified: result?.filesModified,
+        workflowReceipt: result?.workflowReceipt,
+      }, { owner });
       return result;
     }, (error) => {
       workflowExecutions.delete(workflowRequestKey);
+      try { taskActivityService.transitionTaskState(workflowRequestId, 'FAILED', error?.message || String(error), { owner }); } catch {}
+      taskActivityService.recordEvent(workflowRequestId, 'WORKFLOW_ERROR', { error: error?.message || String(error) }, { owner });
       throw error;
     });
     return execution.promise;
@@ -3010,6 +3175,7 @@ app.whenReady().then(async () => {
     const key = `${event.sender.id}:${requestId}`;
     const execution = workflowExecutions.get(key);
     if (!execution || execution.settled) return false;
+    try { taskActivityService.transitionTaskState(requestId, 'CANCELLED', 'User requested workflow cancellation', { owner }); } catch {}
     if (execution.taskId) {
       const task = developerAgent.cancelTask(execution.taskId, owner);
       if (task.cancellationAccepted !== true) return false;

@@ -108,6 +108,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   undoDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-undo', id),
   getDeveloperProposal: (id) => ipcRenderer.invoke('developer:proposal-get', id),
+  listDeveloperTaskHistory: (query) => ipcRenderer.invoke('developer:task-history-list', query),
+  getDeveloperTaskHistory: (taskId) => ipcRenderer.invoke('developer:task-history-get', taskId),
+  cancelDeveloperTaskById: (taskId) => ipcRenderer.invoke('developer:task-cancel', taskId),
+  killDeveloperTaskById: (taskId) => ipcRenderer.invoke('developer:task-kill', taskId),
+  onDeveloperTaskEvent: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('developer:task-event', listener);
+    return () => ipcRenderer.removeListener('developer:task-event', listener);
+  },
   getDeveloperSession: () => ipcRenderer.invoke('developer:session'),
   resumeDeveloperSession: (sessionId) => ipcRenderer.invoke('developer:session-resume', sessionId),
   cancelDeveloperTask: () => ipcRenderer.invoke('developer:proposal-cancel'),

@@ -71,7 +71,30 @@ function runDockerCli(executable, args, timeoutMs = DEFAULT_DOCKER_CLI_TIMEOUT_M
   const env = { ...process.env };
   delete env.DOCKER_HOST;
   delete env.DOCKER_CONTEXT;
-  const result = spawnSync(executable, endpointArgs, {
+  let execBinary = executable;
+  let finalArgs = endpointArgs;
+
+  if (process.platform === 'win32' && executable === 'docker') {
+    let hasNative = false;
+    try {
+      const probe = spawnSync('docker', ['--version'], { stdio: 'ignore', windowsHide: true });
+      hasNative = !probe.error || probe.error.code !== 'ENOENT';
+    } catch {
+      hasNative = false;
+    }
+    if (!hasNative) {
+      execBinary = 'wsl.exe';
+      const translatedArgs = endpointArgs.map((arg) => {
+        if (typeof arg === 'string' && /^[a-zA-Z]:[\\/]/.test(arg)) {
+          return arg.replace(/^([a-zA-Z]):[\\/](.*)$/, (_, drive, rest) => `/mnt/${drive.toLowerCase()}/${rest.replace(/\\/g, '/')}`);
+        }
+        return arg;
+      });
+      finalArgs = ['-d', 'Ubuntu', '--', 'docker', ...translatedArgs];
+    }
+  }
+
+  const result = spawnSync(execBinary, finalArgs, {
     encoding,
     timeout: timeoutMs,
     maxBuffer: MAX_DOCKER_OUTPUT_BYTES,
@@ -107,7 +130,10 @@ function validateDockerEndpointPolicy({ contextName, endpoint, environment = pro
 
   const normalizedEndpoint = endpoint.trim().toLowerCase();
   if (platform === 'win32') {
-    const valid = normalizedEndpoint === 'npipe:////./pipe/docker_engine'
+    const isWslUnix = normalizedEndpoint === 'unix:///var/run/docker.sock'
+      || /^unix:\/\/\/[^?#\r\n]+$/.test(normalizedEndpoint);
+    const valid = isWslUnix
+      || normalizedEndpoint === 'npipe:////./pipe/docker_engine'
       || normalizedEndpoint === 'npipe://./pipe/docker_engine';
     return { valid, reasonCode: valid ? 'LOCAL_DOCKER_ENDPOINT' : 'DOCKER_ENDPOINT_NOT_LOCAL' };
   }
