@@ -773,7 +773,51 @@ async function executeBuildPlan({
     };
   }
 
-  // 4. If containerRunner is provided, execute inside verified container boundary
+  // 4. Validate isolation and obtain selected runtime before any execution
+let selectedRuntime;
+try {
+  selectedRuntime = requireProjectProcessIsolation(`Build operation ${plan.operation} (${plan.fullCommandString})`);
+} catch (gateErr) {
+  return {
+    ok: false,
+    status: BUILD_OUTCOMES.BLOCKED,
+    executionBlocked: true,
+    gate: 'PROCESS_ISOLATION_GATE',
+    error: gateErr.message,
+    planDigest: plan.planDigest,
+    operation: plan.operation,
+    command: plan.fullCommandString,
+    reason: 'Build execution is blocked: verified runtime is required before executing project build/test binaries.',
+  };
+}
+
+// 5. If containerRunner is provided, execute inside verified container boundary
+if (containerRunner && typeof containerRunner.execute === 'function') {
+  const runResult = await containerRunner.execute({
+    plan,
+    ownerWebContentsId,
+    sessionId,
+    isApplicationRuntime: plan.operation === BUILD_OPERATIONS.START,
+    probeEndpoints: plan.probeEndpoints || ['/'],
+    runtime: selectedRuntime,
+  });
+  if (!runResult.ok && runResult.executionBlocked) {
+    return {
+      ...runResult,
+      outcome: BUILD_OUTCOMES.BLOCKED,
+      reason: runResult.reason && runResult.reason.includes('verified Windows process isolation is required')
+        ? runResult.reason
+        : `Build execution is blocked: verified runtime is required before executing project build/test binaries (${runResult.reason || 'unverified container isolation'}).`,
+      artifacts: [],
+      verificationEvidence: null,
+    };
+  }
+  return runResult;
+}
+
+// 6. Enforce verified OS process isolation boundary (fallback for non‑container execution)
+// Runtime already validated above; proceed to host runner.
+
   if (containerRunner && typeof containerRunner.execute === 'function') {
     const runResult = await containerRunner.execute({
       plan,
@@ -798,7 +842,22 @@ async function executeBuildPlan({
 
   // 5. Enforce verified operating-system process isolation boundary
   try {
-    requireProjectProcessIsolation(`Build operation ${plan.operation} (${plan.fullCommandString})`);
+    let selectedRuntime;
+    try {
+      selectedRuntime = requireProjectProcessIsolation(`Build operation ${plan.operation} (${plan.fullCommandString})`);
+    } catch (gateErr) {
+      return {
+        ok: false,
+        status: BUILD_OUTCOMES.BLOCKED,
+        executionBlocked: true,
+        gate: 'PROCESS_ISOLATION_GATE',
+        error: gateErr.message,
+        planDigest: plan.planDigest,
+        operation: plan.operation,
+        command: plan.fullCommandString,
+        reason: 'Build execution is blocked: verified Windows process isolation is required before executing project build/test binaries.',
+      };
+    }
   } catch (gateErr) {
     return {
       ok: false,

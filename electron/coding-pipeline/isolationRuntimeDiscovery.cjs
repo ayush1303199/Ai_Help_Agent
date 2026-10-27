@@ -2,7 +2,8 @@
 // Module responsible for discovering available isolation runtimes and reporting structured evidence.
 // SPDX-License-Identifier: MIT
 
-const { execSync } = require('child_process');
+const { defaultRegistry, PROVIDER_STATUSES } = require('./isolationProviderRegistry.cjs');
+
 const path = require('path');
 const os = require('os');
 

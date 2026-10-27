@@ -130,6 +130,13 @@ function requireProjectProcessIsolation(operation, evidence = null, expectedCont
       : 'NOT_ESTABLISHED';
     throw executionGateError(label, state, state, evaluation.reason);
   }
+
+  // Return the verified runtime for callers.
+  return suitable;
+}
+
+function getSelectedRuntime() {
+  return selectedRuntime;
 }
 
 module.exports = {
@@ -138,4 +145,5 @@ module.exports = {
   projectProcessIsolationStatus,
   requireProjectProcessIsolation,
   verifyProjectProcessIsolation,
+  getSelectedRuntime,
 };

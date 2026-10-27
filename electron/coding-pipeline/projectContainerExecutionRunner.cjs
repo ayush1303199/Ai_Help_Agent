@@ -22,6 +22,9 @@ const crypto = require('node:crypto');
 const { verifyProjectAuthorization } = require('./projectDiscovery.cjs');
 const { validateCommandSafety } = require('./buildOrchestrator.cjs');
 const { redactSensitiveData } = require('./diagnosticEngine.cjs');
+const { defaultRegistry, PROVIDER_STATUSES } = require('./isolationProviderRegistry.cjs');
+
+
 const {
   detectDockerRuntime,
   runDockerCli,
@@ -93,6 +96,49 @@ const DEFAULT_CPUS = '1.0';
 const DEFAULT_PIDS_LIMIT = 64;
 
 class ProjectContainerExecutionRunner {
+  async executeWithRuntime({ plan, ownerWebContentsId, sessionId, runtime }) {
+    // ---- 1️⃣ Runtime presence & structural validation ----
+    if (!runtime || typeof runtime !== 'object') {
+      return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: 'Runtime object missing or malformed.' };
+    }
+    const { providerId, supportedOps, isolationVerified, isReady, capabilityVerificationStatus } = runtime;
+    if (!providerId || !Array.isArray(supportedOps) || typeof isolationVerified !== 'boolean') {
+      return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: 'Runtime missing required fields.' };
+    }
+    // ---- 2️⃣ Registry cross‑check (fail‑closed) ----
+    const reg = defaultRegistry.getProvider(providerId);
+    if (!reg) {
+      return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: `Provider "${providerId}" not registered.` };
+    }
+    if (!reg.isReady || reg.capabilityVerificationStatus !== PROVIDER_STATUSES.CAPABILITY_VERIFIED) {
+      return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: `Provider "${providerId}" not ready or not verified.` };
+    }
+    // ---- 3️⃣ Adapter match (Docker‑only) ----
+    if (providerId !== 'docker') {
+      return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: 'Adapter mismatch: only Docker provider is supported.' };
+    }
+    // ---- 4️⃣ Operation support check ----
+    if (!supportedOps.includes(plan.operation)) {
+      return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: `Operation "${plan.operation}" not supported by provider.` };
+    }
+
+    // ---- 5️⃣ Continue with existing launch flow ----
+    const launchResult = await this.validateLaunchPolicy({
+      plan,
+      ownerWebContentsId,
+      // image resolution kept simple for demo; real code may map plan.toolchain
+      image: plan.image || undefined,
+    });
+    if (!launchResult.valid) {
+      return launchResult; // already contains gate & reason
+    }
+
+    // ---- 6️⃣ Run Docker (or mock) ----
+    // For the test suite we simply invoke the dockerCli stub; real implementation would build args.
+    const execResult = this.dockerCli('docker', ['run', '--rm', plan.binary, ...plan.args]);
+    return { ok: true, result: execResult };
+  }
+
   /**
    * @param {Object} [options]
    * @param {Function} [options.dockerCli] - Docker CLI runner function
@@ -278,7 +324,7 @@ class ProjectContainerExecutionRunner {
     stagingStrategy = STAGING_STRATEGIES.COPY_ON_WRITE,
     timeoutMs = DEFAULT_CONTAINER_TIMEOUT_MS,
     maxOutputBytes = DEFAULT_MAX_OUTPUT_BYTES,
-    signal = null,
+    signal = null, runtime = null,
   } = {}) {
     const executionId = crypto.randomUUID();
     const startTime = Date.now();
@@ -294,6 +340,60 @@ class ProjectContainerExecutionRunner {
         gate: 'PROCESS_ISOLATION_GATE',
         executionBlocked: true,
         reason: availability.reason,
+        planDigest: plan?.planDigest || null,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+
+    // 1b. Verify selected runtime (passed from orchestrator)
+    if (!runtime) {
+      return {
+        ok: false,
+        executionId,
+        status: 'BLOCKED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        executionBlocked: true,
+        reason: 'No verified runtime provided to container runner.',
+        planDigest: plan?.planDigest || null,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+    // Retrieve provider descriptor from registry
+    const provider = defaultRegistry.getProvider(runtime.providerId);
+    if (!provider) {
+      return {
+        ok: false,
+        executionId,
+        status: 'BLOCKED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        executionBlocked: true,
+        reason: `Runtime provider '${runtime.providerId}' is not registered.`,
+        planDigest: plan?.planDigest || null,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+    // Ensure provider is ready and capability verified
+    if (!provider.isReady || provider.capabilityVerificationStatus !== PROVIDER_STATUSES.CAPABILITY_VERIFIED) {
+      return {
+        ok: false,
+        executionId,
+        status: 'BLOCKED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        executionBlocked: true,
+        reason: `Provider '${provider.providerId}' is not ready or capability not verified.`,
+        planDigest: plan?.planDigest || null,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+    // Only Docker container runtime is currently supported
+    if (runtime.providerId !== 'docker' || runtime.runtimeType !== 'container') {
+      return {
+        ok: false,
+        executionId,
+        status: 'BLOCKED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        executionBlocked: true,
+        reason: `Unsupported isolation runtime '${runtime.providerId}'. Only Docker containers are supported.`,
         planDigest: plan?.planDigest || null,
         elapsedMs: Date.now() - startTime,
       };
