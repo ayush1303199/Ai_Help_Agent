@@ -39,6 +39,7 @@ const BUILD_OUTCOMES = Object.freeze({
 
 const UNSAFE_SHELL_CHARS_REGEX = /[;&|`$><\r\n]/;
 
+
 /**
  * Validates that a binary and arguments array are structurally safe from shell injection.
  * @param {string} binary
@@ -722,12 +723,19 @@ async function createBuildPlan({
  * @param {Function} [options.runner] - Optional runner adapter for verified environments/tests.
  * @returns {Promise<Object>}
  */
-async function executeBuildPlan({
+/**
+ * Internal execution pipeline core.
+ *
+ * @param {Object} options
+ * @param {Function} isolationGate - Authoritative isolation gate function
+ */
+async function _executeBuildPlanCore({
   plan,
   ownerWebContentsId,
   sessionId,
   runner = null,
   containerRunner = null,
+  isolationGate = requireProjectProcessIsolation,
 } = {}) {
   if (!plan || !ownerWebContentsId || !sessionId) {
     throw new Error('plan, ownerWebContentsId, and sessionId are required.');
@@ -774,90 +782,9 @@ async function executeBuildPlan({
   }
 
   // 4. Validate isolation and obtain selected runtime before any execution
-let selectedRuntime;
-try {
-  selectedRuntime = requireProjectProcessIsolation(`Build operation ${plan.operation} (${plan.fullCommandString})`);
-} catch (gateErr) {
-  return {
-    ok: false,
-    status: BUILD_OUTCOMES.BLOCKED,
-    executionBlocked: true,
-    gate: 'PROCESS_ISOLATION_GATE',
-    error: gateErr.message,
-    planDigest: plan.planDigest,
-    operation: plan.operation,
-    command: plan.fullCommandString,
-    reason: 'Build execution is blocked: verified runtime is required before executing project build/test binaries.',
-  };
-}
-
-// 5. If containerRunner is provided, execute inside verified container boundary
-if (containerRunner && typeof containerRunner.execute === 'function') {
-  const runResult = await containerRunner.execute({
-    plan,
-    ownerWebContentsId,
-    sessionId,
-    isApplicationRuntime: plan.operation === BUILD_OPERATIONS.START,
-    probeEndpoints: plan.probeEndpoints || ['/'],
-    runtime: selectedRuntime,
-  });
-  if (!runResult.ok && runResult.executionBlocked) {
-    return {
-      ...runResult,
-      outcome: BUILD_OUTCOMES.BLOCKED,
-      reason: runResult.reason && runResult.reason.includes('verified Windows process isolation is required')
-        ? runResult.reason
-        : `Build execution is blocked: verified runtime is required before executing project build/test binaries (${runResult.reason || 'unverified container isolation'}).`,
-      artifacts: [],
-      verificationEvidence: null,
-    };
-  }
-  return runResult;
-}
-
-// 6. Enforce verified OS process isolation boundary (fallback for non‑container execution)
-// Runtime already validated above; proceed to host runner.
-
-  if (containerRunner && typeof containerRunner.execute === 'function') {
-    const runResult = await containerRunner.execute({
-      plan,
-      ownerWebContentsId,
-      sessionId,
-      isApplicationRuntime: plan.operation === BUILD_OPERATIONS.START,
-      probeEndpoints: plan.probeEndpoints || ['/'],
-    });
-    if (!runResult.ok && runResult.executionBlocked) {
-      return {
-        ...runResult,
-        outcome: BUILD_OUTCOMES.BLOCKED,
-        reason: runResult.reason && runResult.reason.includes('verified Windows process isolation is required')
-          ? runResult.reason
-          : `Build execution is blocked: verified Windows process isolation is required before executing project build/test binaries (${runResult.reason || 'unverified container isolation'}).`,
-        artifacts: [],
-        verificationEvidence: null,
-      };
-    }
-    return runResult;
-  }
-
-  // 5. Enforce verified operating-system process isolation boundary
+  let selectedRuntime;
   try {
-    let selectedRuntime;
-    try {
-      selectedRuntime = requireProjectProcessIsolation(`Build operation ${plan.operation} (${plan.fullCommandString})`);
-    } catch (gateErr) {
-      return {
-        ok: false,
-        status: BUILD_OUTCOMES.BLOCKED,
-        executionBlocked: true,
-        gate: 'PROCESS_ISOLATION_GATE',
-        error: gateErr.message,
-        planDigest: plan.planDigest,
-        operation: plan.operation,
-        command: plan.fullCommandString,
-        reason: 'Build execution is blocked: verified Windows process isolation is required before executing project build/test binaries.',
-      };
-    }
+    selectedRuntime = isolationGate(`Build operation ${plan.operation} (${plan.fullCommandString || plan.binary})`);
   } catch (gateErr) {
     return {
       ok: false,
@@ -868,11 +795,35 @@ if (containerRunner && typeof containerRunner.execute === 'function') {
       planDigest: plan.planDigest,
       operation: plan.operation,
       command: plan.fullCommandString,
-      reason: 'Build execution is blocked: verified Windows process isolation is required before executing project build/test binaries.',
+      reason: 'Build execution is blocked: verified process isolation is required before executing project build/test binaries.',
     };
   }
 
-  // 5. If runner is provided in verified host sandbox
+  // 5. If containerRunner is provided, execute inside verified container boundary
+  if (containerRunner && typeof containerRunner.execute === 'function') {
+    const runResult = await containerRunner.execute({
+      plan,
+      ownerWebContentsId,
+      sessionId,
+      isApplicationRuntime: plan.operation === BUILD_OPERATIONS.START,
+      probeEndpoints: plan.probeEndpoints || ['/'],
+      runtime: selectedRuntime,
+    });
+    if (!runResult.ok && runResult.executionBlocked) {
+      return {
+        ...runResult,
+        outcome: BUILD_OUTCOMES.BLOCKED,
+        reason: runResult.reason && runResult.reason.includes('verified Windows process isolation is required')
+          ? runResult.reason
+          : `Build execution is blocked: verified runtime is required before executing project build/test binaries (${runResult.reason || 'unverified container isolation'}).`,
+        artifacts: [],
+        verificationEvidence: null,
+      };
+    }
+    return runResult;
+  }
+
+  // 6. If runner is provided in verified host sandbox
   if (typeof runner === 'function') {
     const startTime = Date.now();
     try {
@@ -924,6 +875,77 @@ if (containerRunner && typeof containerRunner.execute === 'function') {
   };
 }
 
+/**
+ * Production entry point for build execution.
+ * Strictly enforces authoritative Windows process isolation.
+ * Contains ZERO injection parameters, symbols, or activation mechanisms.
+ *
+ * @param {Object} options
+ * @param {Object} options.plan
+ * @param {number} options.ownerWebContentsId
+ * @param {string} options.sessionId
+ * @param {Function} [options.runner]
+ * @param {Object} [options.containerRunner]
+ * @returns {Promise<Object>}
+ */
+async function executeBuildPlan({
+  plan,
+  ownerWebContentsId,
+  sessionId,
+  runner = null,
+  containerRunner = null,
+} = {}) {
+  return _executeBuildPlanCore({
+    plan,
+    ownerWebContentsId,
+    sessionId,
+    runner,
+    containerRunner,
+    isolationGate: requireProjectProcessIsolation,
+  });
+}
+
+/**
+ * Dedicated test harness factory for pipeline unit and contract tests.
+ * Owns dependency injection strictly inside a closed test boundary.
+ * Rejects any non-mock runner or ordinary plain object spoofing.
+ *
+ * @param {Object} options
+ * @param {Function} options.isolationGate
+ * @param {ProjectContainerExecutionRunner} options.containerRunner
+ */
+function createBuildPlanTestHarness({ isolationGate, containerRunner } = {}) {
+  const { ProjectContainerExecutionRunner } = require('./projectContainerExecutionRunner.cjs');
+  if (
+    !containerRunner ||
+    !(containerRunner instanceof ProjectContainerExecutionRunner) ||
+    containerRunner.isMockRunner !== true
+  ) {
+    throw new Error('Test harness requires an authentic ProjectContainerExecutionRunner mock instance.');
+  }
+  if (typeof isolationGate !== 'function') {
+    throw new Error('Test harness requires a valid isolation gate function.');
+  }
+
+  return {
+    executeBuildPlan: async ({
+      plan,
+      ownerWebContentsId,
+      sessionId,
+      runner = null,
+    } = {}) => {
+      return _executeBuildPlanCore({
+        plan,
+        ownerWebContentsId,
+        sessionId,
+        runner,
+        containerRunner,
+        isolationGate,
+      });
+    },
+  };
+}
+
 module.exports = {
   BUILD_OPERATIONS,
   BUILD_OUTCOMES,
@@ -932,4 +954,5 @@ module.exports = {
   checkBuildPrerequisites,
   createBuildPlan,
   executeBuildPlan,
+  createBuildPlanTestHarness,
 };

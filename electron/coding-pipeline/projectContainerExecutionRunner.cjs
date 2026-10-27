@@ -400,6 +400,78 @@ class ProjectContainerExecutionRunner {
     }
 
     // 2. Select default image by ecosystem if not specified
+    if ((provider.evidenceSource === 'synthetic-test' || runtime.evidenceSource === 'synthetic-test-seam') && !this.isMockRunner) {
+      return {
+        ok: false,
+        executionId,
+        status: 'BLOCKED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        executionBlocked: true,
+        reason: 'Synthetic test evidence rejected: non-mock production runner requires verified container environment.',
+        planDigest: plan?.planDigest || null,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+
+    // Authoritative evidence freshness validation from registry provider descriptor
+    const registryTimestamp = provider.verificationTimestamp;
+    if (registryTimestamp) {
+      const parsedRegistryTime = Date.parse(registryTimestamp);
+      if (isNaN(parsedRegistryTime) || Math.abs(Date.now() - parsedRegistryTime) > 5 * 60 * 1000) {
+        return {
+          ok: false,
+          executionId,
+          status: 'BLOCKED',
+          gate: 'PROCESS_ISOLATION_GATE',
+          executionBlocked: true,
+          reason: 'Authoritative isolation verification evidence has expired or has invalid timestamp.',
+          planDigest: plan?.planDigest || null,
+          elapsedMs: Date.now() - startTime,
+        };
+      }
+    }
+
+    if (runtime.timestamp) {
+      const parsedTime = Date.parse(runtime.timestamp);
+      if (isNaN(parsedTime) || Math.abs(Date.now() - parsedTime) > 5 * 60 * 1000) {
+        return {
+          ok: false,
+          executionId,
+          status: 'BLOCKED',
+          gate: 'PROCESS_ISOLATION_GATE',
+          executionBlocked: true,
+          reason: 'Isolation runtime verification evidence has expired or has invalid timestamp.',
+          planDigest: plan?.planDigest || null,
+          elapsedMs: Date.now() - startTime,
+        };
+      }
+    }
+
+    if (runtime.isolationVerified !== true) {
+      return {
+        ok: false,
+        executionId,
+        status: 'BLOCKED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        executionBlocked: true,
+        reason: 'Selected runtime isolation has not been verified.',
+        planDigest: plan?.planDigest || null,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+
+    if (Array.isArray(runtime.supportedOps) && !runtime.supportedOps.includes(plan.operation)) {
+      return {
+        ok: false,
+        executionId,
+        status: 'BLOCKED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        executionBlocked: true,
+        reason: `Operation '${plan.operation}' is not supported by runtime provider.`,
+        planDigest: plan?.planDigest || null,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
     const selectedImage = image || (plan.ecosystem && DEFAULT_PROJECT_IMAGES[plan.ecosystem]) || DEFAULT_PROJECT_IMAGES.node;
     const binary = plan.binary || plan.command;
 
