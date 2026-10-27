@@ -433,7 +433,93 @@ const developerFiles = require('../../developerFiles.cjs');
     );
     console.log('  -> Test 12 Passed: Restoration guaranteed across thrown exceptions.');
 
-    console.log('All V26.4 Test-Seam Unreachability and Evidence Integrity Audit Tests Passed!');
+    // =======================================================================
+    // PART 5: Production Gates & Safety Invariants Audit
+    // =======================================================================
+
+    // 13. Project Authorization Gate: unauthorized project fails closed
+    console.log('Test 13: Project authorization gate blocks unauthorized execution...');
+    let adapterCallsAuth = 0;
+    const runnerAuth = createProjectContainerExecutionRunner({
+      dockerCli: () => {
+        adapterCallsAuth++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      isMock: true,
+    });
+
+    const unauthorizedPlan = makePlan({ projectRoot: path.join(os.tmpdir(), 'unauthorized-project-root') });
+    const res13 = await executeBuildPlan({
+      plan: unauthorizedPlan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+      containerRunner: runnerAuth,
+    });
+    assert.equal(res13.ok, false);
+    assert.equal(res13.status, BUILD_OUTCOMES.BLOCKED);
+    assert.ok(res13.error.includes('Project authorization failed'));
+    assert.equal(adapterCallsAuth, 0, 'Adapter must never be called on authorization failure');
+    console.log('  -> Test 13 Passed: Unauthorized project blocked before adapter invocation.');
+
+    // 14. Command Safety Gate: dangerous shell characters fail closed
+    console.log('Test 14: Command safety gate blocks unsafe command chaining...');
+    let adapterCallsSafety = 0;
+    const runnerSafety = createProjectContainerExecutionRunner({
+      dockerCli: () => {
+        adapterCallsSafety++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      isMock: true,
+    });
+
+    const unsafePlan = makePlan({
+      binary: 'node',
+      args: ['-e', 'console.log("hello"); rm -rf /'],
+      fullCommandString: 'node -e "console.log(\\"hello\\"); rm -rf /"',
+    });
+    const res14 = await executeBuildPlan({
+      plan: unsafePlan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+      containerRunner: runnerSafety,
+    });
+    assert.equal(res14.ok, false);
+    assert.equal(res14.status, BUILD_OUTCOMES.BLOCKED);
+    assert.ok(res14.error.includes('Command safety violation'));
+    assert.equal(adapterCallsSafety, 0, 'Adapter must never be called on command safety violation');
+    console.log('  -> Test 14 Passed: Dangerous command metacharacters blocked before adapter invocation.');
+
+    // 15. Dependency Prerequisites Gate: missing prerequisites fail closed
+    console.log('Test 15: Dependency prerequisites gate blocks execution when unmet...');
+    let adapterCallsPrereq = 0;
+    const runnerPrereq = createProjectContainerExecutionRunner({
+      dockerCli: () => {
+        adapterCallsPrereq++;
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      isMock: true,
+    });
+
+    const unmetPrereqPlan = makePlan({
+      prerequisites: {
+        satisfied: false,
+        missingDependencies: [{ name: 'missing-pkg', manager: 'npm' }],
+        reason: 'Dependencies must be installed first',
+      },
+    });
+    const res15 = await executeBuildPlan({
+      plan: unmetPrereqPlan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+      containerRunner: runnerPrereq,
+    });
+    assert.equal(res15.ok, false);
+    assert.equal(res15.status, BUILD_OUTCOMES.BLOCKED);
+    assert.equal(res15.gate, 'DEPENDENCY_PREREQUISITE_GATE');
+    assert.equal(adapterCallsPrereq, 0, 'Adapter must never be called when prerequisites are missing');
+    console.log('  -> Test 15 Passed: Missing prerequisites blocked before adapter invocation.');
+
+    console.log('All V26.5 Production Isolation Boundary Audit Tests Passed!');
   } finally {
     unregisterMockDockerProvider();
     if (typeof developerFiles.clearProject === 'function') {
