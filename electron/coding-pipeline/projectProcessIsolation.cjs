@@ -113,62 +113,6 @@ function requireProjectProcessIsolation(operation, evidence = null, expectedCont
 
   // After having a verified runtime, we no longer need to enforce status.verified.
   // However, if the original status indicated a platform that fundamentally cannot run isolation (e.g., unsupported OS), keep blocking.
-  if (!status.available) {
-    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', status.reason);
-  }
-
-  const resolvedContext = expectedContext && typeof expectedContext === 'object' ? expectedContext : {};
-  const resolvedCapabilities = capabilities && typeof capabilities === 'object' ? capabilities : {};
-  if (!evidence) {
-    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', 'Execution evidence manifest is missing.');
-  }
-
-  const evaluation = evaluateExecutionEvidence(evidence, resolvedContext, resolvedCapabilities);
-  if (evaluation.state !== 'EXECUTION_AUTHORIZED') {
-    const state = ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(evaluation.state)
-      ? evaluation.state
-      : 'NOT_ESTABLISHED';
-    throw executionGateError(label, state, state, evaluation.reason);
-  }
-}
-
-  const label = typeof operation === 'string' && operation.trim()
-    ? operation.trim()
-    : 'Project command';
-  const status = projectProcessIsolationStatus();
-  if (process.platform === 'win32' || !status.available || !status.verified) {
-    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', status.reason);
-  }
-
-  // New runtime discovery & verification step.
-  const { discoverIsolationRuntimes } = require('./isolationRuntimeDiscovery.cjs');
-  const candidates = discoverIsolationRuntimes(process.cwd());
-  const suitable = candidates.find(c => c.available && c.isolationVerified && c.supportedOps.includes(operation));
-  if (!suitable) {
-    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', 'No verified isolation runtime available for operation');
-  }
-  // Cache selected runtime for downstream components.
-  selectedRuntime = suitable;
-
-  const resolvedContext = expectedContext && typeof expectedContext === 'object' ? expectedContext : {};
-  const resolvedCapabilities = capabilities && typeof capabilities === 'object' ? capabilities : {};
-  if (!evidence) {
-    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', 'Execution evidence manifest is missing.');
-  }
-
-  const evaluation = evaluateExecutionEvidence(evidence, resolvedContext, resolvedCapabilities);
-  if (evaluation.state !== 'EXECUTION_AUTHORIZED') {
-    const state = ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(evaluation.state)
-      ? evaluation.state
-      : 'NOT_ESTABLISHED';
-    throw executionGateError(label, state, state, evaluation.reason);
-  }
-}
-
-  const label = typeof operation === 'string' && operation.trim()
-    ? operation.trim()
-    : 'Project command';
-  const status = projectProcessIsolationStatus();
   if (process.platform === 'win32' || !status.available || !status.verified) {
     throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', status.reason);
   }
