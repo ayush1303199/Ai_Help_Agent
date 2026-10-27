@@ -28,7 +28,7 @@ const queuedReviews = [
   { id: 'review-1', text: 'What is JavaScript?', createdAt: '2026-09-27T00:00:00.000Z' },
   { id: 'review-2', text: 'Explain TypeScript.', createdAt: '2026-09-27T00:00:00.000Z' },
 ];
-assert.equal(writePendingTranscriptReviews(queuedReviews, 30), true);
+assert.equal(writePendingTranscriptReviews(queuedReviews, 30, reviewNow), true);
 assert.deepEqual(readPendingTranscriptReviews(30, reviewNow), { reviews: queuedReviews, error: null }, 'Pending text reviews should survive a controller reload.');
 reviewStorage.set(MEETING_TRANSCRIPT_REVIEW_STORAGE_KEY, JSON.stringify([
   ...queuedReviews,

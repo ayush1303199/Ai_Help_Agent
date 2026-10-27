@@ -26,6 +26,7 @@ const BUILD_OPERATIONS = Object.freeze({
   LINT: 'LINT',
   TEST: 'TEST',
   SMOKE_TEST: 'SMOKE_TEST',
+  START: 'START',
 });
 
 const BUILD_OUTCOMES = Object.freeze({
@@ -176,6 +177,18 @@ async function discoverBuildOperations(projectRoot) {
           evidencePath: 'package.json',
         };
       }
+      // START / APPLICATION_RUNTIME
+      const startScript = findScript(['start', 'start:dev', 'serve', 'dev']);
+      if (startScript) {
+        operations[BUILD_OPERATIONS.START] = {
+          operation: BUILD_OPERATIONS.START,
+          binary: pm,
+          args: pm === 'npm' && startScript === 'start' ? ['start'] : ['run', startScript],
+          scriptName: startScript,
+          toolchain: `node:${pm}`,
+          evidencePath: 'package.json',
+        };
+      }
     } catch {
       // JSON parse error or unreadable
     }
@@ -276,6 +289,15 @@ async function discoverBuildOperations(projectRoot) {
         evidencePath: 'Cargo.toml',
       };
     }
+    if (!operations[BUILD_OPERATIONS.START]) {
+      operations[BUILD_OPERATIONS.START] = {
+        operation: BUILD_OPERATIONS.START,
+        binary: 'cargo',
+        args: ['run'],
+        toolchain: 'rust:cargo',
+        evidencePath: 'Cargo.toml',
+      };
+    }
   }
 
   // 4. Go (go.mod)
@@ -289,6 +311,15 @@ async function discoverBuildOperations(projectRoot) {
         operation: BUILD_OPERATIONS.BUILD,
         binary: 'go',
         args: ['build', './...'],
+        toolchain: 'go:go',
+        evidencePath: 'go.mod',
+      };
+    }
+    if (!operations[BUILD_OPERATIONS.START]) {
+      operations[BUILD_OPERATIONS.START] = {
+        operation: BUILD_OPERATIONS.START,
+        binary: 'go',
+        args: ['run', '.'],
         toolchain: 'go:go',
         evidencePath: 'go.mod',
       };
@@ -748,6 +779,8 @@ async function executeBuildPlan({
       plan,
       ownerWebContentsId,
       sessionId,
+      isApplicationRuntime: plan.operation === BUILD_OPERATIONS.START,
+      probeEndpoints: plan.probeEndpoints || ['/'],
     });
     if (!runResult.ok && runResult.executionBlocked) {
       return {

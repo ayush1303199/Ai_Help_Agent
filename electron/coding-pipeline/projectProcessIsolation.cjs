@@ -39,6 +39,8 @@ function makeUnavailableStatus(
 }
 
 let currentStatus = makeUnavailableStatus();
+// Cache of selected runtime (if any) for the current process.
+let selectedRuntime = null;
 
 function projectProcessIsolationStatus(platform = process.platform) {
   if (platform !== process.platform) {
@@ -89,6 +91,80 @@ function executionGateError(operation, status, evidenceState, reason) {
 }
 
 function requireProjectProcessIsolation(operation, evidence = null, expectedContext = null, capabilities = {}) {
+  const label = typeof operation === 'string' && operation.trim()
+    ? operation.trim()
+    : 'Project command';
+  const status = projectProcessIsolationStatus();
+
+  // Initial platform/availability check – we postpone the BLOCKED decision until after discovery.
+  // If the status reports unavailable, we will still attempt runtime discovery; only if no suitable runtime is found do we block.
+
+  // New runtime discovery & verification step.
+  const { discoverIsolationRuntimes } = require('./isolationRuntimeDiscovery.cjs');
+  const candidates = discoverIsolationRuntimes(process.cwd());
+  const suitable = candidates.find(c => c.available && c.isolationVerified && c.supportedOps.includes(operation));
+  if (!suitable) {
+    // No verified runtime – use the original status reason if it already indicated a block.
+    const reason = status.reason || 'No verified isolation runtime available for operation';
+    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', reason);
+  }
+  // Cache selected runtime for downstream components.
+  selectedRuntime = suitable;
+
+  // After having a verified runtime, we no longer need to enforce status.verified.
+  // However, if the original status indicated a platform that fundamentally cannot run isolation (e.g., unsupported OS), keep blocking.
+  if (!status.available) {
+    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', status.reason);
+  }
+
+  const resolvedContext = expectedContext && typeof expectedContext === 'object' ? expectedContext : {};
+  const resolvedCapabilities = capabilities && typeof capabilities === 'object' ? capabilities : {};
+  if (!evidence) {
+    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', 'Execution evidence manifest is missing.');
+  }
+
+  const evaluation = evaluateExecutionEvidence(evidence, resolvedContext, resolvedCapabilities);
+  if (evaluation.state !== 'EXECUTION_AUTHORIZED') {
+    const state = ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(evaluation.state)
+      ? evaluation.state
+      : 'NOT_ESTABLISHED';
+    throw executionGateError(label, state, state, evaluation.reason);
+  }
+}
+
+  const label = typeof operation === 'string' && operation.trim()
+    ? operation.trim()
+    : 'Project command';
+  const status = projectProcessIsolationStatus();
+  if (process.platform === 'win32' || !status.available || !status.verified) {
+    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', status.reason);
+  }
+
+  // New runtime discovery & verification step.
+  const { discoverIsolationRuntimes } = require('./isolationRuntimeDiscovery.cjs');
+  const candidates = discoverIsolationRuntimes(process.cwd());
+  const suitable = candidates.find(c => c.available && c.isolationVerified && c.supportedOps.includes(operation));
+  if (!suitable) {
+    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', 'No verified isolation runtime available for operation');
+  }
+  // Cache selected runtime for downstream components.
+  selectedRuntime = suitable;
+
+  const resolvedContext = expectedContext && typeof expectedContext === 'object' ? expectedContext : {};
+  const resolvedCapabilities = capabilities && typeof capabilities === 'object' ? capabilities : {};
+  if (!evidence) {
+    throw executionGateError(label, 'BLOCKED', 'NOT_ESTABLISHED', 'Execution evidence manifest is missing.');
+  }
+
+  const evaluation = evaluateExecutionEvidence(evidence, resolvedContext, resolvedCapabilities);
+  if (evaluation.state !== 'EXECUTION_AUTHORIZED') {
+    const state = ['BLOCKED', 'UNCERTAIN', 'NOT_ESTABLISHED'].includes(evaluation.state)
+      ? evaluation.state
+      : 'NOT_ESTABLISHED';
+    throw executionGateError(label, state, state, evaluation.reason);
+  }
+}
+
   const label = typeof operation === 'string' && operation.trim()
     ? operation.trim()
     : 'Project command';

@@ -78,6 +78,14 @@ const {
   synthesizeMultiFilePatch,
   verifyIntegrationReachability,
 } = require('./coding-pipeline/modularArchitectureEngine.cjs');
+const {
+  TEST_EXECUTION_CATEGORIES,
+  TEST_EXECUTION_STATUSES,
+  EVIDENCE_SOURCES,
+  validateTestExecutionRecord,
+  createTestExecutionRecord,
+  evaluateProjectTestReadiness,
+} = require('./coding-pipeline/testClassification.cjs');
 const { isProjectRuntimeTestRequest } = require('./coding-pipeline/projectRuntimeTestIntent.cjs');
 const { projectProcessIsolationStatus } = require('./coding-pipeline/projectProcessIsolation.cjs');
 const {
@@ -3742,6 +3750,8 @@ function buildEngineeringReport({
   buildDiscovery = null,
   buildPlan = null,
   executedCommands = [],
+  testClassifications = [],
+  testReadiness = null,
   diagnosis = null,
   repairPlan = null,
   rerunResult = null,
@@ -3762,6 +3772,13 @@ function buildEngineeringReport({
     : (workspaceDiscovery?.manifests?.map((m) => m.name || m) || ['package.json']);
 
   const entryPoints = workspaceDiscovery?.entryPoints || [];
+
+  const readinessReport = testReadiness || (projectRoot ? evaluateProjectTestReadiness({
+    projectRoot,
+    buildDiscovery,
+    dependencyReport,
+    isolationStatus: projectProcessIsolationStatus(),
+  }) : null);
 
   const depStatus = dependencyReport?.needsInstallation
     ? 'MISSING'
@@ -3862,6 +3879,13 @@ function buildEngineeringReport({
     }
   }
 
+  if (Array.isArray(testClassifications) && testClassifications.length > 0) {
+    markdownLines.push('', '### 4b. Test Execution Classification (V24 Standard)');
+    for (const tc of testClassifications) {
+      markdownLines.push(`- **[${tc.category}]** ${tc.status} via \`${tc.evidenceSource}\`${tc.command ? ` (\`${tc.command}\`)` : ''}${tc.exitCode !== null ? ` — Exit Code: ${tc.exitCode}` : ''}`);
+    }
+  }
+
   if (diagnosedDefects.length > 0) {
     markdownLines.push('', '### 5. Detected Defects & Diagnosis');
     for (const defect of diagnosedDefects) {
@@ -3929,10 +3953,18 @@ function buildEngineeringReport({
     overallReadiness: readiness,
     verificationSummary: {
       realExecution: hasRealExecution,
-      staticAnalysis: false,
-      syntheticTests: false,
-      honestDistinction: 'All project commands are executed exclusively in a verified container isolation boundary. Host fallback and synthetic receipts are forbidden.',
+      staticAnalysis: Array.isArray(testClassifications) && testClassifications.some((c) => c.category === TEST_EXECUTION_CATEGORIES.STATIC_ANALYSIS),
+      syntheticTests: Array.isArray(testClassifications) && testClassifications.some((c) => c.category === TEST_EXECUTION_CATEGORIES.SYNTHETIC_TEST),
+      inProcessTests: Array.isArray(testClassifications) && testClassifications.some((c) => c.category === TEST_EXECUTION_CATEGORIES.IN_PROCESS_RUNTIME_TEST),
+      actualProjectTests: Array.isArray(testClassifications) && testClassifications.some((c) => c.category === TEST_EXECUTION_CATEGORIES.ACTUAL_PROJECT_TEST),
+      actualBuilds: Array.isArray(testClassifications) && testClassifications.some((c) => c.category === TEST_EXECUTION_CATEGORIES.ACTUAL_BUILD),
+      actualApplicationRuntime: Array.isArray(testClassifications) && testClassifications.some((c) => c.category === TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME),
+      testClassifications: Array.isArray(testClassifications) ? testClassifications : [],
+      testReadiness: readinessReport,
+      honestDistinction: 'Never report a synthetic test as an actual project test. Never report a successful build unless the real build command executed successfully. All actual commands require verified isolation.',
     },
+    testClassifications: Array.isArray(testClassifications) ? testClassifications : [],
+    testReadiness: readinessReport,
     markdownSummary,
   };
 }
@@ -5890,7 +5922,7 @@ async function executeAutonomousCodingWorkflowStage({
     && (
       genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY
       || isRuntimeTestRequest
-      || /\b(?:build(?:ing)?|compile|typecheck|type-check|lint|run\s+(?:the\s+)?tests?|test\s+suite|smoke\s*test)\b/i.test(userRequest)
+      || /(?:build(?:ing)?|compile|typecheck|type-check|lint|run\\s+(?:the\\s+)?tests?|test\\s+suite|smoke\\s*test|start|run\\s+(?:the\\s+)?(?:app|application|server)|launch\\s+(?:the\\s+)?(?:app|server)|application\\s+runtime)/i.test(userRequest)
     )
     && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
 
@@ -5920,6 +5952,8 @@ async function executeAutonomousCodingWorkflowStage({
       operation = BUILD_OPERATIONS.LINT;
     } else if (/\bsmoke\b/i.test(userRequest)) {
       operation = BUILD_OPERATIONS.SMOKE_TEST;
+    } else if (/\b(?:start|run\s+(?:the\s+)?app|launch\s+(?:the\s+)?(?:app|server)|application\s+runtime)\b/i.test(userRequest)) {
+      operation = BUILD_OPERATIONS.START;
     } else if (/\btests?\b/i.test(userRequest) || genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY) {
       operation = BUILD_OPERATIONS.TEST;
     }
@@ -5934,12 +5968,28 @@ async function executeAutonomousCodingWorkflowStage({
     taskPlan.buildPlan = plan;
 
     if (!plan.configured) {
+      const targetCategory = operation === BUILD_OPERATIONS.TEST
+        ? TEST_EXECUTION_CATEGORIES.ACTUAL_PROJECT_TEST
+        : operation === BUILD_OPERATIONS.BUILD
+          ? TEST_EXECUTION_CATEGORIES.ACTUAL_BUILD
+          : operation === BUILD_OPERATIONS.START
+            ? TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME
+            : TEST_EXECUTION_CATEGORIES.STATIC_ANALYSIS;
+      const tcRecord = createTestExecutionRecord({
+        category: targetCategory,
+        status: TEST_EXECUTION_STATUSES.NOT_CONFIGURED,
+        evidenceSource: EVIDENCE_SOURCES.MANIFEST_DISCOVERY,
+        command: null,
+        exitCode: null,
+        stderrSummary: plan.reason,
+      });
       const report = buildEngineeringReport({
         projectRoot: root,
         workspaceDiscovery,
         dependencyReport,
         buildDiscovery,
         buildPlan: plan,
+        testClassifications: [tcRecord],
         executedCommands: [{
           operation,
           command: 'test',
@@ -5981,6 +6031,32 @@ async function executeAutonomousCodingWorkflowStage({
     }
 
     if (plan.status === 'PREREQUISITES_MISSING' || !plan.prerequisites.satisfied) {
+      const targetCategory = operation === BUILD_OPERATIONS.TEST
+        ? TEST_EXECUTION_CATEGORIES.ACTUAL_PROJECT_TEST
+        : operation === BUILD_OPERATIONS.BUILD
+          ? TEST_EXECUTION_CATEGORIES.ACTUAL_BUILD
+          : operation === BUILD_OPERATIONS.START
+            ? TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME
+            : TEST_EXECUTION_CATEGORIES.STATIC_ANALYSIS;
+      const tcRecord = createTestExecutionRecord({
+        category: targetCategory,
+        status: TEST_EXECUTION_STATUSES.PREREQUISITES_MISSING,
+        evidenceSource: EVIDENCE_SOURCES.DEPENDENCY_GATE,
+        command: plan.fullCommandString,
+        exitCode: null,
+        stderrSummary: plan.prerequisites?.reason || 'Dependencies missing',
+      });
+      const prereqReport = buildEngineeringReport({
+        projectRoot: root,
+        workspaceDiscovery,
+        dependencyReport,
+        buildDiscovery,
+        buildPlan: plan,
+        testClassifications: [tcRecord],
+        overallOutcome: 'BLOCKED',
+        blockers: [plan.prerequisites?.reason],
+      });
+      taskPlan.engineeringReport = prereqReport;
       advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'build_prerequisites_missing', reason: plan.prerequisites.reason });
       return {
         outcome: 'BLOCKED',
@@ -6010,12 +6086,28 @@ async function executeAutonomousCodingWorkflowStage({
         attemptHistory: taskPlan.attemptHistory || [],
       });
       taskPlan.diagnosis = diagnosis;
+      const targetCategory = operation === BUILD_OPERATIONS.TEST
+        ? TEST_EXECUTION_CATEGORIES.ACTUAL_PROJECT_TEST
+        : operation === BUILD_OPERATIONS.BUILD
+          ? TEST_EXECUTION_CATEGORIES.ACTUAL_BUILD
+          : operation === BUILD_OPERATIONS.START
+            ? TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME
+            : TEST_EXECUTION_CATEGORIES.STATIC_ANALYSIS;
+      const tcRecord = createTestExecutionRecord({
+        category: targetCategory,
+        status: TEST_EXECUTION_STATUSES.BLOCKED_ISOLATION,
+        evidenceSource: EVIDENCE_SOURCES.ISOLATION_GATE,
+        command: plan.fullCommandString,
+        exitCode: null,
+        stderrSummary: execResult.reason || 'Process isolation is unverified.',
+      });
       const report = buildEngineeringReport({
         projectRoot: root,
         workspaceDiscovery,
         dependencyReport,
         buildDiscovery,
         buildPlan: plan,
+        testClassifications: [tcRecord],
         executedCommands: [{
           operation,
           command: plan.fullCommandString,
@@ -6057,12 +6149,31 @@ async function executeAutonomousCodingWorkflowStage({
     }
 
     if (execResult.ok) {
+      const targetCategory = operation === BUILD_OPERATIONS.TEST
+        ? TEST_EXECUTION_CATEGORIES.ACTUAL_PROJECT_TEST
+        : operation === BUILD_OPERATIONS.BUILD
+          ? TEST_EXECUTION_CATEGORIES.ACTUAL_BUILD
+          : operation === BUILD_OPERATIONS.START
+            ? TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME
+            : TEST_EXECUTION_CATEGORIES.STATIC_ANALYSIS;
+      const tcRecord = createTestExecutionRecord({
+        category: targetCategory,
+        status: TEST_EXECUTION_STATUSES.PASSED,
+        evidenceSource: EVIDENCE_SOURCES.CONTAINER_EXECUTION,
+        command: plan.fullCommandString,
+        exitCode: execResult.exitCode ?? 0,
+        stdoutSummary: execResult.stdout || '',
+        stderrSummary: execResult.stderr || '',
+        durationMs: execResult.elapsedMs || 0,
+        endpointProbes: execResult.endpointProbes || [],
+      });
       const report = buildEngineeringReport({
         projectRoot: root,
         workspaceDiscovery,
         dependencyReport,
         buildDiscovery,
         buildPlan: plan,
+        testClassifications: [tcRecord],
         executedCommands: [{
           operation,
           command: plan.fullCommandString,
@@ -6106,6 +6217,62 @@ async function executeAutonomousCodingWorkflowStage({
       attemptHistory: taskPlan.attemptHistory || [],
     });
     taskPlan.diagnosis = diagnosis;
+    if (operation === BUILD_OPERATIONS.START) {
+      const startupRecord = createTestExecutionRecord({
+        category: TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME,
+        status: TEST_EXECUTION_STATUSES.FAILED,
+        evidenceSource: EVIDENCE_SOURCES.CONTAINER_EXECUTION,
+        command: plan.fullCommandString,
+        exitCode: execResult.exitCode ?? 1,
+        stdoutSummary: execResult.stdout || '',
+        stderrSummary: execResult.stderr || 'Application failed to start or crashed on launch.',
+        durationMs: execResult.elapsedMs || 0,
+        endpointProbes: execResult.endpointProbes || [],
+      });
+      const startReport = buildEngineeringReport({
+        projectRoot: root,
+        workspaceDiscovery,
+        dependencyReport,
+        buildDiscovery,
+        buildPlan: plan,
+        testClassifications: [startupRecord],
+        executedCommands: [{
+          operation,
+          command: plan.fullCommandString,
+          environment: 'CONTAINER_ISOLATED',
+          exitCode: execResult.exitCode ?? 1,
+          status: 'FAILED',
+          checkState: CHECK_STATES.FAILED,
+          stdoutExcerpt: redactSensitiveData(String(execResult.stdout || '')).slice(0, 500),
+          stderrExcerpt: redactSensitiveData(String(execResult.stderr || '')).slice(0, 500),
+          executionTimeMs: execResult.elapsedMs || 0,
+        }],
+        diagnosis,
+        overallOutcome: 'FAILED',
+        blockers: [execResult.stderr || 'Application crashed on startup.'],
+      });
+      taskPlan.engineeringReport = startReport;
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'application_startup_failed', reason: execResult.stderr });
+      return {
+        outcome: 'FAILED',
+        phase: 'APPLICATION_STARTUP_FAILED',
+        turnId: turn.turnId,
+        taskPlan,
+        buildPlan: plan,
+        buildDiscovery,
+        buildResult: execResult,
+        diagnosis,
+        engineeringReport: startReport,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        testClassifications: [startupRecord],
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'FAILED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'APPLICATION_STARTUP'],
+        }),
+      };
+    }
     if (operation === BUILD_OPERATIONS.TEST) {
       return await handleTestFailureRepairAndRerun({
         root,
@@ -9977,4 +10144,10 @@ module.exports = {
   PROJECT_READINESS,
   buildEngineeringReport,
   synthesizeTargetedRepairPatch,
+  TEST_EXECUTION_CATEGORIES,
+  TEST_EXECUTION_STATUSES,
+  EVIDENCE_SOURCES,
+  validateTestExecutionRecord,
+  createTestExecutionRecord,
+  evaluateProjectTestReadiness,
 };

@@ -392,7 +392,7 @@ function traceExecutionFlow({ route, controllerFile, controllerContent, action }
  */
 function validateEvidenceReport({
   userGoal,
-  inspectedFiles = [],
+  inspectedFiles = undefined,
   claimedVerification = null,
   executionAuditLog = null,
   simulatedOutput = null,
@@ -551,7 +551,7 @@ function validateEvidenceReport({
  * Validates the structured proposal contract ensuring evidence grounding,
  * exact line ranges, root-cause link, and expected runtime behavior statements.
  */
-function validateProposalContract(contract, { inspectedFiles = [], verifiedFindings = [] } = {}) {
+function validateProposalContract(contract, { inspectedFiles = undefined, verifiedFindings = [] } = {}) {
   if (!contract || typeof contract !== 'object') {
     return { isValid: false, rejectionReason: 'Proposal contract must be a non-null object.' };
   }
@@ -731,7 +731,7 @@ function validateProposalContract(contract, { inspectedFiles = [], verifiedFindi
  */
 function validatePatchScope({
   targetFiles = [],
-  inspectedFiles = [],
+  inspectedFiles = undefined,
   verifiedFindings = [],
   proposalContract = null,
   proposedChanges = [],
