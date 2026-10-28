@@ -151,6 +151,7 @@ const {
 } = require('./coding-pipeline/workflowStateCoordinator.cjs');
 const {
   AUDITOR_OUTCOMES,
+  TASK_COMPLETION_STATES,
   auditWorkflowCompletion,
 } = require('./coding-pipeline/completionAuditor.cjs');
 const {
@@ -4735,10 +4736,66 @@ async function resumeAutonomousTestRepairWorkflow({
   };
 }
 
+function decorateAutonomousWorkflowResult(result, userRequest) {
+  if (!result || typeof result !== 'object') return result;
+  if (!result.workflowStatus || !result.taskStatus) {
+    let workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    let taskStatus = TASK_COMPLETION_STATES.TASK_COMPLETED;
+    const outcome = String(result.outcome || '').toUpperCase();
+    const reqText = String(userRequest || '');
+    const isTestOrInstall = /\b(?:test|install|npm|dependencies|verify)\b/i.test(reqText);
+    const isMutation = /\b(?:fix|implement|create|update|modify|refactor|add|remove|delete|repair)\b/i.test(reqText);
+
+    if (outcome === 'CANCELLED') {
+      workflowStatus = TASK_COMPLETION_STATES.BLOCKED;
+      taskStatus = TASK_COMPLETION_STATES.BLOCKED;
+    } else if (outcome === 'BLOCKED' || result.executionBlocked) {
+      workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+      taskStatus = TASK_COMPLETION_STATES.BLOCKED;
+    } else if (
+      outcome === 'NEEDS_APPROVAL' ||
+      outcome === 'AWAITING_APPROVAL' ||
+      outcome === 'APPROVAL_REQUIRED' ||
+      result.pendingApproval ||
+      result.continuation?.status === 'AWAITING_APPROVAL'
+    ) {
+      workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+      taskStatus = TASK_COMPLETION_STATES.NEEDS_APPROVAL;
+    } else if (outcome.includes('FAIL') || outcome.includes('CRASH')) {
+      workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+      taskStatus = TASK_COMPLETION_STATES.FAILED;
+    } else if (isTestOrInstall && (!result.codeVerified && (!result.buildResult || !result.buildResult.ok) && (!result.dependencyResult || !result.dependencyResult.ok))) {
+      workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+      taskStatus = TASK_COMPLETION_STATES.PARTIAL;
+    } else if (isMutation && (!Array.isArray(result.filesModified) || result.filesModified.length === 0)) {
+      workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+      taskStatus = TASK_COMPLETION_STATES.FAILED;
+    } else if (outcome === 'CLARIFICATION_REQUIRED' || outcome === 'UNCERTAIN') {
+      workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+      taskStatus = TASK_COMPLETION_STATES.PARTIAL;
+    } else if (outcome === 'COMPLETED' || outcome === 'SUCCESS' || outcome === 'TESTS_PASSED') {
+      workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+      taskStatus = TASK_COMPLETION_STATES.TASK_COMPLETED;
+    } else {
+      workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+      taskStatus = TASK_COMPLETION_STATES.PARTIAL;
+    }
+
+    result.workflowStatus = result.workflowStatus || workflowStatus;
+    result.taskStatus = result.taskStatus || taskStatus;
+    if (result.workflowReceipt && typeof result.workflowReceipt === 'object') {
+      result.workflowReceipt.workflowStatus = result.workflowReceipt.workflowStatus || result.workflowStatus;
+      result.workflowReceipt.taskStatus = result.workflowReceipt.taskStatus || result.taskStatus;
+    }
+  }
+  return result;
+}
+
 async function executeAutonomousCodingWorkflow(input) {
   const continuationToken = input?.continuationToken;
   if (!continuationToken || (isProjectRuntimeTestRequest(input?.userRequest) && !workflowContinuations.has(continuationToken))) {
-    return executeAutonomousCodingWorkflowStage(input, null);
+    const rawResult = await executeAutonomousCodingWorkflowStage(input, null);
+    return decorateAutonomousWorkflowResult(rawResult, input?.userRequest);
   }
   const saved = workflowContinuations.get(continuationToken);
   if (!saved || saved.expiresAt <= Date.now()) {
@@ -4764,7 +4821,8 @@ async function executeAutonomousCodingWorkflow(input) {
       scope: input.scope || saved.scope || '.',
       userApproved: input.userApproved !== undefined ? input.userApproved : saved.userApproved,
     };
-    return await executeAutonomousCodingWorkflowStage(stageInput, saved);
+    const rawResult = await executeAutonomousCodingWorkflowStage(stageInput, saved);
+    return decorateAutonomousWorkflowResult(rawResult, stageInput.userRequest);
   } finally {
     saved.running = false;
   }
@@ -10115,6 +10173,7 @@ module.exports = {
   WorkflowStateCoordinator,
   createWorkflowCoordinator,
   AUDITOR_OUTCOMES,
+  TASK_COMPLETION_STATES,
   auditWorkflowCompletion,
   DURABLE_SCHEMA_VERSION,
   computeRecordDigest,

@@ -471,6 +471,15 @@ class WorkflowStateCoordinator {
   }
 }
 
+const TASK_COMPLETION_STATES = Object.freeze({
+  WORKFLOW_COMPLETED: 'WORKFLOW_COMPLETED',
+  TASK_COMPLETED: 'TASK_COMPLETED',
+  BLOCKED: 'BLOCKED',
+  NEEDS_APPROVAL: 'NEEDS_APPROVAL',
+  FAILED: 'FAILED',
+  PARTIAL: 'PARTIAL',
+});
+
 function createWorkflowCoordinator(params) {
   return new WorkflowStateCoordinator(params);
 }
@@ -479,6 +488,7 @@ module.exports = {
   WORKFLOW_STATES,
   TERMINAL_STATES,
   VALID_TRANSITIONS,
+  TASK_COMPLETION_STATES,
   createStageEvidenceRecord,
   WorkflowStateCoordinator,
   createWorkflowCoordinator,

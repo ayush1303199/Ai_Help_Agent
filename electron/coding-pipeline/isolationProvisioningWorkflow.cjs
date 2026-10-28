@@ -173,7 +173,7 @@ function evaluateProvisioningReadiness(providerId) {
   }
 
   if (providerId === 'docker-container') {
-    const dockerCandidate = candidates.find((c) => c.providerId === 'docker' && c.evidenceSource === 'docker_cli');
+    const dockerCandidate = candidates.find((c) => c.providerId === 'docker' && (c.evidenceSource === 'docker_cli' || c.evidenceSource === 'wsl_docker_cli'));
     if (!dockerCandidate || !dockerCandidate.available) {
       return {
         providerId,

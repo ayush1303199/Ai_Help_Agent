@@ -2897,6 +2897,7 @@ __builtins['node:fs'] = {
   writeFileSync(file, value) { __memoryFiles.set(__normalize(file), String(value)); },
   existsSync(file) { return __memoryFiles.has(__normalize(file)); },
   mkdirSync() {},
+  renameSync(from, to) { const key = __normalize(from); const target = __normalize(to); if (__memoryFiles.has(key)) { __memoryFiles.set(target, __memoryFiles.get(key)); __memoryFiles.delete(key); } },
   promises: {
     async readFile(file) { return __builtins['node:fs'].readFileSync(file); },
     async writeFile(file, value) { __builtins['node:fs'].writeFileSync(file, value); },
@@ -2918,7 +2919,7 @@ __builtins['node:crypto'] = {
   createHash() { throw new Error('Cryptographic hashing is unavailable in hermetic runtime probes.'); },
 };
 __builtins.crypto = __builtins['node:crypto'];
-globalThis.process = Object.freeze({ env: Object.freeze(Object.create(null)), argv: Object.freeze([]) });
+globalThis.process = Object.freeze({ env: Object.freeze(Object.create(null)), argv: Object.freeze([]), cwd() { return '/'; }, pid: 1, platform: 'win32' });
 globalThis.structuredClone = (value) => JSON.parse(JSON.stringify(value));
 globalThis.Buffer = Object.freeze({
   from(value) {
@@ -2991,7 +2992,8 @@ function __candidateLoadResolved(file) {
     const resolved = __candidateResolve(file, String(specifier));
     return resolved.builtin ? __builtins[resolved.builtin] : __candidateLoadResolved(resolved.path);
   }
-  factory(candidateRequire, module, module.exports);
+  const dirname = file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '.';
+  factory(candidateRequire, module, module.exports, dirname, file);
   return module.exports;
 }
 globalThis.__loadCandidate = __candidateLoadResolved;
@@ -3163,7 +3165,7 @@ async function verifyCandidateRuntimeGate(modularPlan, fileContents = moduleCont
     for (const [filePath, source] of Object.entries(sourceMap)) {
       if (!/\.(?:c?js|mjs)$/i.test(filePath)) continue;
       const transformed = transformCandidateModule(source);
-      const factory = new vm.Script(`(function(require, module, exports) { 'use strict';\n${transformed}\n})`, {
+      const factory = new vm.Script(`(function(require, module, exports, __dirname, __filename) { 'use strict';\n${transformed}\n})`, {
         filename: filePath,
       }).runInContext(context, { timeout });
       context.__candidateFactory = factory;

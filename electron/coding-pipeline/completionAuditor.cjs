@@ -19,6 +19,15 @@ const AUDITOR_OUTCOMES = Object.freeze({
   UNCERTAIN: 'UNCERTAIN',
 });
 
+const TASK_COMPLETION_STATES = Object.freeze({
+  WORKFLOW_COMPLETED: 'WORKFLOW_COMPLETED',
+  TASK_COMPLETED: 'TASK_COMPLETED',
+  BLOCKED: 'BLOCKED',
+  NEEDS_APPROVAL: 'NEEDS_APPROVAL',
+  FAILED: 'FAILED',
+  PARTIAL: 'PARTIAL',
+});
+
 /**
  * Audits workflow completion against collected evidence.
  *
@@ -199,45 +208,79 @@ function auditWorkflowCompletion({
   const isBuildOrTestRequest = /\b(?:build|compile|test|typecheck|lint)\b/i.test(requestText);
   const isMutationRequest = /\b(?:fix|implement|create|update|modify|refactor|add|remove|delete|repair)\b/i.test(requestText);
 
-  // Derive Truthful Auditor Outcome
+  // Derive Truthful Auditor Outcome & Explicit Completion Semantics (Milestone V37.0)
   let outcome = AUDITOR_OUTCOMES.COMPLETED;
+  let workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+  let taskStatus = TASK_COMPLETION_STATES.TASK_COMPLETED;
   let summaryReason = '';
+
+  const isAwaitingApproval = currentState === WORKFLOW_STATES.APPROVAL_PENDING
+    || finalResult?.outcome === 'NEEDS_APPROVAL'
+    || finalResult?.outcome === 'AWAITING_APPROVAL'
+    || finalResult?.outcome === 'APPROVAL_REQUIRED'
+    || finalResult?.continuation?.status === 'AWAITING_APPROVAL'
+    || Boolean(finalResult?.pendingApproval);
 
   if (currentState === WORKFLOW_STATES.CANCELLED || finalResult?.outcome === 'CANCELLED') {
     outcome = AUDITOR_OUTCOMES.BLOCKED;
+    workflowStatus = TASK_COMPLETION_STATES.BLOCKED;
+    taskStatus = TASK_COMPLETION_STATES.BLOCKED;
     summaryReason = 'Workflow was cancelled by user or coordinator; no verified completion is claimed.';
+  } else if (isAwaitingApproval) {
+    outcome = AUDITOR_OUTCOMES.PARTIALLY_COMPLETED;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.NEEDS_APPROVAL;
+    summaryReason = 'Proposal generated and awaiting explicit user authorization.';
   } else if (currentState === WORKFLOW_STATES.BLOCKED || finalResult?.outcome === 'BLOCKED' || checksBlocked.length > 0) {
     outcome = AUDITOR_OUTCOMES.BLOCKED;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.BLOCKED;
     const block = checksBlocked[0] || { reason: finalResult?.reason || 'Workflow blocked by security gate.' };
     summaryReason = `Workflow blocked at gate ${block.gate || 'POLICY'}: ${block.reason}`;
   } else if (currentState === WORKFLOW_STATES.FAILED || finalResult?.outcome === 'FAILED' || checksFailed.length > 0) {
     outcome = AUDITOR_OUTCOMES.FAILED;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.FAILED;
     const failReason = checksFailed[0]?.reason || checksFailed[0]?.failure || finalResult?.reason || 'Stage execution or verification failed.';
     summaryReason = `Workflow failed verification: ${failReason}`;
   } else if (currentState === WORKFLOW_STATES.CLARIFICATION_REQUIRED || finalResult?.outcome === 'CLARIFICATION_REQUIRED') {
     outcome = AUDITOR_OUTCOMES.UNCERTAIN;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.PARTIAL;
     summaryReason = finalResult?.clarificationPrompt || 'Essential requirements missing; clarification required.';
   } else if (currentState === WORKFLOW_STATES.UNCERTAIN || finalResult?.outcome === 'UNCERTAIN') {
     outcome = AUDITOR_OUTCOMES.UNCERTAIN;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.PARTIAL;
     summaryReason = 'Evidence is uncertain or diagnostic output is ambiguous.';
   } else if (isMutationRequest && whatChanged.length === 0) {
     // Mutation requested but nothing modified
     outcome = AUDITOR_OUTCOMES.FAILED;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.FAILED;
     summaryReason = 'User requested file mutations, but no approved files were applied to disk.';
   } else if (isBuildOrTestRequest && checksRan.length === 0 && checksBlocked.length === 0) {
-    // Build/test requested but nothing ran
+    // Build/test requested but nothing ran (e.g. only manifest was read)
     outcome = AUDITOR_OUTCOMES.PARTIALLY_COMPLETED;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.PARTIAL;
     summaryReason = 'Build/test requested, but no verified execution was performed.';
     unverifiedCapabilities.push('Build/test commands were not executed.');
   } else if (unverifiedCapabilities.length > 0 && isMutationRequest) {
     // Code modified and statically checked, but runtime execution remains unverified
     outcome = AUDITOR_OUTCOMES.PARTIALLY_COMPLETED;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.PARTIAL;
     summaryReason = `Approved changes applied and statically verified, but runtime execution remains unverified (${unverifiedCapabilities.join('; ')}).`;
   } else if (isReadOnlyRequest) {
     outcome = AUDITOR_OUTCOMES.COMPLETED;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.TASK_COMPLETED;
     summaryReason = 'Read-only discovery and explanation completed truthfully without file mutations.';
   } else {
     outcome = AUDITOR_OUTCOMES.COMPLETED;
+    workflowStatus = TASK_COMPLETION_STATES.WORKFLOW_COMPLETED;
+    taskStatus = TASK_COMPLETION_STATES.TASK_COMPLETED;
     summaryReason = 'All requested operations and verifications were completed with verified evidence.';
   }
 
@@ -256,6 +299,8 @@ function auditWorkflowCompletion({
   return {
     workflowId: coordinator.getWorkflowId(),
     outcome,
+    workflowStatus,
+    taskStatus,
     originalRequest: requestText,
     summary: summaryReason,
     whatChanged,
@@ -275,5 +320,6 @@ function auditWorkflowCompletion({
 
 module.exports = {
   AUDITOR_OUTCOMES,
+  TASK_COMPLETION_STATES,
   auditWorkflowCompletion,
 };

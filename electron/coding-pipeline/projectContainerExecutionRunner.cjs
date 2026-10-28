@@ -157,13 +157,17 @@ class ProjectContainerExecutionRunner {
    */
   checkAvailability() {
     const runtime = this.runtimeDetector();
-    if (!runtime || !runtime.daemonAvailable) {
-      return {
-        available: false,
-        reason: 'Container runtime is unavailable: Docker daemon is not running or unverified.',
-      };
+    if (runtime && runtime.daemonAvailable) {
+      return { available: true };
     }
-    return { available: true };
+    const dockerProvider = defaultRegistry.getProvider('docker');
+    if (dockerProvider && dockerProvider.isReady && dockerProvider.availability?.isRunning) {
+      return { available: true };
+    }
+    return {
+      available: false,
+      reason: 'Container runtime is unavailable: Docker daemon is not running or unverified.',
+    };
   }
 
   /**

@@ -792,7 +792,7 @@ async function _executeBuildPlanCore({
       planDigest: plan.planDigest,
       operation: plan.operation,
       command: plan.fullCommandString,
-      reason: 'Build execution is blocked: verified process isolation is required before executing project build/test binaries.',
+      reason: `Build execution is blocked: verified ${process.platform === 'win32' ? 'Windows ' : ''}process isolation is required before executing project build/test binaries.`,
     };
   }
 
@@ -809,7 +809,7 @@ async function _executeBuildPlanCore({
       planDigest: plan.planDigest,
       operation: plan.operation,
       command: plan.fullCommandString,
-      reason: 'Build execution is blocked: verified process isolation is required before executing project build/test binaries.',
+      reason: `Build execution is blocked: verified ${process.platform === 'win32' ? 'Windows ' : ''}process isolation is required before executing project build/test binaries.`,
     };
   }
 
