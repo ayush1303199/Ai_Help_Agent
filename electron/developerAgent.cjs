@@ -211,6 +211,10 @@ const {
   createLinuxNamespaceProvider,
 } = require('./coding-pipeline/providers/linuxNamespaceProvider.cjs');
 const {
+  WslIsolationProvider,
+  createWslIsolationProvider,
+} = require('./coding-pipeline/providers/wslIsolationProvider.cjs');
+const {
   RESEARCH_EVIDENCE_TIER,
   RESEARCH_STATUSES,
   ALLOWLISTED_DOC_DOMAINS,
@@ -10211,6 +10215,8 @@ module.exports = {
   createContainerProvider,
   LinuxNamespaceProvider,
   createLinuxNamespaceProvider,
+  WslIsolationProvider,
+  createWslIsolationProvider,
   RESEARCH_EVIDENCE_TIER,
   RESEARCH_STATUSES,
   ALLOWLISTED_DOC_DOMAINS,

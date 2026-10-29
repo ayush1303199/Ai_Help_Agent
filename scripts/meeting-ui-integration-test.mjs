@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict';
+﻿import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { JSDOM } from 'jsdom';
@@ -64,7 +64,7 @@ try {
     ['meeting-chat-state', JSON.stringify([{
       question: 'What is two plus two?',
       answer: 'Four.',
-      createdAt: '2026-09-28T00:00:00.000Z',
+      createdAt: new Date(Date.now() - 60000).toISOString(),
     }])],
   ]);
   globalThis.localStorage = {
@@ -88,7 +88,7 @@ try {
     id: 'meeting-conversation-1',
     mode: 'meeting',
     title: 'Existing Meeting conversation',
-    updatedAt: '2026-09-28T00:00:00.000Z',
+    updatedAt: new Date(Date.now() - 60000).toISOString(),
     messages: [{ role: 'user', content: 'Existing question' }, { role: 'assistant', content: 'Existing answer' }],
   }]));
   assert.equal(readHistory().length, 1, 'Meeting history migration must not duplicate an existing shared entry.');
@@ -261,13 +261,13 @@ try {
       id: 'transcript-1',
       source: 'Microphone',
       text: 'What is JavaScript?',
-      createdAt: '2026-09-28T00:00:00.000Z',
+      createdAt: new Date(Date.now() - 60000).toISOString(),
     }],
     filteredTranscripts: [{
       id: 'transcript-1',
       source: 'Microphone',
       text: 'What is JavaScript?',
-      createdAt: '2026-09-28T00:00:00.000Z',
+      createdAt: new Date(Date.now() - 60000).toISOString(),
     }],
   }));
   assert.match(activeMarkup, /Stop Listening/, 'An active capture must expose its stop control.');
@@ -467,13 +467,13 @@ try {
         id: 'interaction-transcript',
         source: 'Microphone',
         text: 'What is JavaScript?',
-        createdAt: '2026-09-28T00:00:00.000Z',
+        createdAt: new Date(Date.now() - 60000).toISOString(),
       }],
       filteredTranscripts: [{
         id: 'interaction-transcript',
         source: 'Microphone',
         text: 'What is JavaScript?',
-        createdAt: '2026-09-28T00:00:00.000Z',
+        createdAt: new Date(Date.now() - 60000).toISOString(),
       }],
       answeredSegments: [{ question: 'What is JavaScript?', answer: 'A programming language.' }],
     };

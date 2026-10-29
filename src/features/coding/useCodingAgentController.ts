@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { clearAppState, writeAppState } from '../../config/appStateStorage.ts';
 import { runtimeConfig } from '../../config/runtimeConfig';
-import { createUnvalidatedSuggestion, parseUnifiedDiff, validateUnifiedFile, type DeveloperDiffFile } from './codingDiff';
+import { createUnvalidatedSuggestion, formatNoChangesMessage, parseUnifiedDiff, validateUnifiedFile, type DeveloperDiffFile } from './codingDiff';
 import {
   codingFetch,
   executeTrustedBrokerWorkflow,
@@ -1587,9 +1587,14 @@ export function useCodingAgentController({
                   if (repairContext && window.electronAPI && proposal?.id) {
                     await window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id);
                   }
-                  await transport.markTurn(turnId, 'blocked', 'no_changes', result.filesRead.length);
+                  const formatted = formatNoChangesMessage({
+                    filesRead: result.filesRead,
+                    status: result.status,
+                    agentTaskState: result.agentTaskState,
+                  });
+                  await transport.markTurn(turnId, formatted.turnState, 'no_changes', result.filesRead.length);
                   setMessages((previous) => previous.map((message) => message.requestId === requestId
-                    ? { ...message, content: 'I inspected the relevant project context, but could not identify a safe change to propose.', streaming: false }
+                    ? { ...message, content: formatted.message, streaming: false }
                     : message));
                   return;
                 }

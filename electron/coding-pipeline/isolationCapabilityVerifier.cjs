@@ -179,8 +179,8 @@ function verifyIsolationCapabilities({
   }
 
   // Windows host policy: execution disabled pending reviewed sandbox
-  if (currentPlatform === 'win32' && providerDescriptor.providerId === 'windows-sandbox-provider') {
-    blockingReasons.push('Windows project-context process execution is disabled pending an independently reviewed isolation mechanism.');
+  if (currentPlatform === 'win32' && (providerDescriptor.providerId === 'windows-sandbox-provider' || providerDescriptor.providerId === 'wsl-isolation-provider' || providerDescriptor.providerId === 'wsl')) {
+    blockingReasons.push(providerDescriptor.providerId.startsWith('wsl') ? 'WSL execution isolation is currently disabled: automated per-instance network egress denial, /mnt/c host filesystem unmounting, unprivileged worker identity, and process cleanup are not independently verified on this platform.' : 'Windows project-context process execution is disabled pending an independently reviewed isolation mechanism.');
   }
 
   if (missingCapabilities.length > 0 || blockingReasons.length > 0) {

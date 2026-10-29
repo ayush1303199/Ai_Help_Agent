@@ -98,6 +98,7 @@
     "test:durable-recovery": "node scripts/durable-workflow-recovery-test.mjs",
     "test:worker-authorization": "node scripts/worker-authorization-test.mjs",
     "test:isolation-provider": "node scripts/isolation-provider-verification-test.mjs",
+    "test:verified-isolation": "node scripts/coding-verified-isolation-test.mjs",
     "test:research-augmentation": "node scripts/read-only-research-augmentation-test.mjs",
     "test:semantic-graph": "node scripts/semantic-project-graph-test.mjs",
     "test:graph-integration": "node scripts/semantic-graph-workflow-integration-test.mjs"

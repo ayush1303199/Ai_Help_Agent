@@ -5,6 +5,7 @@ import {
   isUnifiedDiffResponse,
   parseUnifiedDiff,
   validateUnifiedFile,
+  formatNoChangesMessage,
 } from '../src/features/coding/codingDiff.ts';
 import { compactCodingConversation, compactCodingMessageContent } from '../src/features/coding/codingSessionStore.ts';
 import { adaptiveCodingIdleTimeoutMs, latestCodingUserRequest } from '../src/features/coding/codingTransport.ts';
@@ -131,5 +132,91 @@ assert.equal(
   longRequiredRequest,
   'Context compaction must preserve a long latest request and its final acceptance criterion exactly.',
 );
+
+
+// ---------------------------------------------------------------------------
+// formatNoChangesMessage 5-State Terminal Contract Tests
+// ---------------------------------------------------------------------------
+{
+  // Case 1: No defect found in inspected evidence
+  const cleanResult = formatNoChangesMessage({
+    filesRead: [{ path: 'src/calculator.js', content: 'export function add(a, b) { return a + b; }' }],
+    status: 'NO_DEFECT_FOUND',
+    agentTaskState: {
+      status: 'NO_DEFECT_FOUND',
+      nextAction: null,
+    },
+  });
+  assert.ok(cleanResult.message.includes('could not identify a safe change to propose'), 'Must preserve contract anchor.');
+  assert.ok(cleanResult.message.includes('No defects were found in the inspected evidence'), 'Must clearly state no defect found.');
+  assert.ok(cleanResult.message.includes('src/calculator.js'), 'Must name the inspected files.');
+  assert.equal(cleanResult.turnState, 'completed', 'Clean no-defect outcome should complete the turn.');
+
+  // Case 2: Insufficient evidence
+  const insufficientResult = formatNoChangesMessage({
+    filesRead: [{ path: 'package.json' }],
+    status: 'INSUFFICIENT_EVIDENCE',
+    agentTaskState: {
+      status: 'INSUFFICIENT_EVIDENCE',
+      nextAction: {
+        tool: 'search_code',
+        reason: 'Locate user status domain logic across project source files',
+        expectedEvidence: ['Implementation matching user status requirement'],
+      },
+    },
+  });
+  assert.ok(insufficientResult.message.includes('could not identify a safe change to propose'));
+  assert.ok(insufficientResult.message.includes('Evidence is insufficient to verify the requested outcome'));
+  assert.ok(insufficientResult.message.includes('Implementation matching user status requirement'), 'Must detail missing evidence.');
+  assert.ok(insufficientResult.message.includes('Locate user status domain logic across project source files'), 'Must detail next step.');
+  assert.equal(insufficientResult.turnState, 'blocked');
+
+  // Case 3: Investigation not yet complete
+  const incompleteResult = formatNoChangesMessage({
+    filesRead: [{ path: 'src/auth/service.js' }],
+    status: 'INVESTIGATION_INCOMPLETE',
+    agentTaskState: {
+      status: 'INVESTIGATION_INCOMPLETE',
+      nextAction: {
+        tool: 'read_file',
+        reason: "Read candidate target file 'src/auth/token.js' identified from user goal",
+        expectedEvidence: ['Token expiration logic'],
+      },
+    },
+  });
+  assert.ok(incompleteResult.message.includes('could not identify a safe change to propose'));
+  assert.ok(incompleteResult.message.includes('Investigation remains incomplete'));
+  assert.ok(incompleteResult.message.includes("Read candidate target file 'src/auth/token.js'"), 'Must detail unexamined candidate.');
+  assert.equal(incompleteResult.turnState, 'blocked');
+
+  // Case 4: Genuine security or approval blocker
+  const blockedResult = formatNoChangesMessage({
+    filesRead: [{ path: 'src/app.js' }],
+    status: 'BLOCKED',
+    agentTaskState: {
+      status: 'BLOCKED',
+      nextAction: {
+        tool: 'REPORT_EVIDENCE_LIMITATION',
+        reason: 'Build execution is blocked: verified Windows process isolation is required',
+      },
+    },
+  });
+  assert.ok(blockedResult.message.includes('could not identify a safe change to propose'));
+  assert.ok(blockedResult.message.includes('Progress is blocked by execution gate or approval policy'));
+  assert.ok(blockedResult.message.includes('verified Windows process isolation is required'), 'Must report blocking gate.');
+  assert.equal(blockedResult.turnState, 'blocked');
+
+  // Case 5: Confirmed defect produces valid proposal
+  const validDiff = [
+    '--- a/src/math.js',
+    '+++ b/src/math.js',
+    '@@ -1,1 +1,1 @@',
+    '-return a - b;',
+    '+return a + b;',
+  ].join('\n');
+  const parsed = parseUnifiedDiff(validDiff);
+  assert.equal(parsed.length, 1, 'Confirmed defect must parse into structured proposal');
+  assert.equal(parsed[0].path, 'src/math.js');
+}
 
 console.log('Coding unified-diff parsing, validation, and safe fallback tests passed.');

@@ -434,12 +434,17 @@ async function runStage19TestSuite() {
     await fs.mkdir(outsideRoot, { recursive: true });
     const outsideFile = path.join(outsideRoot, 'outside.js');
     await fs.writeFile(outsideFile, 'outside\n');
-    await fs.symlink(outsideRoot, path.join(escapedRoot, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
-    await assert.rejects(
-      () => guardedCoordinator.captureBaselineSnapshot('escaped-task', escapedRoot, ['linked/outside.js']),
-      /parent escapes its repository/i,
-    );
-    assert.equal(await fs.readFile(outsideFile, 'utf8'), 'outside\n');
+    try {
+      await fs.symlink(outsideRoot, path.join(escapedRoot, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+      await assert.rejects(
+        () => guardedCoordinator.captureBaselineSnapshot('escaped-task', escapedRoot, ['linked/outside.js']),
+        /parent escapes its repository/i,
+      );
+      assert.equal(await fs.readFile(outsideFile, 'utf8'), 'outside\n');
+    } catch (symlinkErr) {
+      if (symlinkErr.code !== 'EPERM') throw symlinkErr;
+      console.log('   (Skipped symlink traversal check due to unprivileged Windows environment)');
+    }
     console.log('[PASS] Multi-repo rollback rejects denied Policy Gate authorization.');
 
     // -------------------------------------------------------------

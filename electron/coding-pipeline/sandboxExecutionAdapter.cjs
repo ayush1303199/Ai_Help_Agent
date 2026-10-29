@@ -97,7 +97,7 @@ function verifyIsolationEvidence(evidence, expectedContext = {}, capabilities = 
   }
 
   // 2. Reject caller-supplied Boolean or mock sources pretending to be trusted
-  if (evidence.sandbox === true && Object.keys(evidence).length === 1) {
+  if (evidence.sandbox === true || evidence.isolationVerified === true || evidence.hostWslAccessible === true) {
     return {
       isVerified: false,
       status: ADAPTER_STATUSES.BLOCKED,
@@ -239,7 +239,19 @@ async function executeInVerifiedSandbox({
     };
   }
 
-  // 4. Isolation Evidence Verification
+  // 4. Cancellation check before starting
+  if (signal?.aborted) {
+    return {
+      ok: false,
+      executionId,
+      status: ADAPTER_STATUSES.CANCELLED,
+      reason: 'Execution was cancelled by the caller before starting.',
+      planDigest: plan.planDigest,
+      elapsedMs: Date.now() - startTime,
+    };
+  }
+
+  // 5. Isolation Evidence Verification
   const expectedContext = {
     projectRoot: path.resolve(plan.projectRoot),
     planDigest: plan.planDigest,
@@ -255,18 +267,6 @@ async function executeInVerifiedSandbox({
       reason: isolation.reason || 'Command execution blocked: verified process isolation is required.',
       planDigest: plan.planDigest,
       command: `${plan.binary} ${(plan.args || []).join(' ')}`.trim(),
-      elapsedMs: Date.now() - startTime,
-    };
-  }
-
-  // 5. Cancellation check before starting
-  if (signal?.aborted) {
-    return {
-      ok: false,
-      executionId,
-      status: ADAPTER_STATUSES.CANCELLED,
-      reason: 'Execution was cancelled by the caller before starting.',
-      planDigest: plan.planDigest,
       elapsedMs: Date.now() - startTime,
     };
   }

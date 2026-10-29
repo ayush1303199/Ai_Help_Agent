@@ -681,6 +681,12 @@ try {
       root, ownerWebContentsId, sessionId,
       raw: '--- a/linked/outside.txt\n+++ b/linked/outside.txt\n@@ -1 +1 @@\n-outside\n+changed\n',
     }), /Symlink|outside the selected project/);
+  } catch (err) {
+    if (process.platform === 'win32' && err.code === 'EPERM') {
+      // Unprivileged Windows environment cannot create symlink/junction
+    } else {
+      throw err;
+    }
   } finally {
     await fs.rm(externalRoot, { recursive: true, force: true });
   }

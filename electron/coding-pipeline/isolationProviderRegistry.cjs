@@ -44,7 +44,16 @@ class IsolationProviderRegistry {
   }
 
   getProvider(providerId) {
-    return this.providers.get(providerId) || null;
+    if (!providerId) return null;
+    const direct = this.providers.get(providerId);
+    if (direct) return direct;
+    if (providerId === 'wsl') {
+      return this.providers.get('wsl-isolation-provider') || null;
+    }
+    if (providerId === 'windows_sandbox' || providerId === 'windows-sandbox') {
+      return this.providers.get('windows-sandbox-provider') || null;
+    }
+    return null;
   }
 
   getAllProviders() {

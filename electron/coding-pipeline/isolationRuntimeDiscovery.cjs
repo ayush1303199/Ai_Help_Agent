@@ -2,7 +2,7 @@
 // Module responsible for discovering available isolation runtimes and reporting structured evidence.
 // SPDX-License-Identifier: MIT
 
-const { defaultRegistry, PROVIDER_STATUSES } = require('./isolationProviderRegistry.cjs');
+const { defaultRegistry, PROVIDER_STATUSES, ISOLATION_LEVELS } = require('./isolationProviderRegistry.cjs');
 const { execSync } = require('node:child_process');
 
 const path = require('path');
@@ -87,6 +87,58 @@ function discoverDocker() {
   };
 }
 
+function discoverWsl() {
+  const evidenceSource = 'wsl_exe';
+  const exePath1 = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'wsl.exe');
+  const exePath2 = 'C:\\Program Files\\WSL\\wsl.exe';
+  const available = require('fs').existsSync(exePath1) || require('fs').existsSync(exePath2);
+  const healthCheck = { succeeded: false, exitCode: null, stdout: '', stderr: 'WSL isolation unverified: ephemeral workspace, network deny, and process cleanup attestation required' };
+
+  try {
+    const { createWslIsolationProvider } = require('./providers/wslIsolationProvider.cjs');
+    const wslProvider = createWslIsolationProvider();
+    const descriptor = {
+      providerId: 'wsl-isolation-provider',
+      version: wslProvider.version,
+      supportedPlatforms: wslProvider.supportedPlatforms,
+      isolationLevel: process.platform === 'win32' ? (ISOLATION_LEVELS.CONTAINER || 'CONTAINER') : (ISOLATION_LEVELS.NONE || 'NONE'),
+      availability: { isInstalled: available, isRunning: false, health: available ? 'UNVERIFIED' : 'UNAVAILABLE' },
+      filesystemCapabilities: { ephemeralCopyOnWrite: false, readOnlyRoot: false, restrictedBindMounts: false, secureErasureOnExit: false },
+      processCapabilities: { independentProcessTree: true, credentialIsolation: false, userNamespaceRemapping: false, hostObservedTermination: false },
+      networkCapabilities: { defaultDenyAll: false, egressFiltering: false, isolatedNetworkNamespace: false },
+      resourceLimits: { cpuThrottlingSupported: true, memoryCapSupported: true, outputBufferingCapped: true, timeoutEnforcementSupported: true },
+      evidenceSource,
+      verificationTimestamp: nowISO(),
+      capabilityVerificationStatus: process.platform === 'win32' ? PROVIDER_STATUSES.BLOCKED : PROVIDER_STATUSES.UNSUPPORTED,
+      unverifiedRequirements: [
+        'Per-run ephemeral workspace isolation with read-only project mounts',
+        'Credential and host environment isolation',
+        'Default-deny network egress policy enforced inside guest namespace',
+        'Unprivileged worker identity binding',
+        'Host-observed process termination daemon and exit code attestation',
+        'Verified scratch directory cleanup and secure disk erasure',
+      ],
+      isReady: false,
+      blockingReasons: ['WSL execution isolation is currently unverified: network egress denial, /mnt/c host unmounting, worker identity, and cleanup attestation required.'],
+    };
+    defaultRegistry.registerProvider(descriptor);
+  } catch (_) {
+    // Fail-safe
+  }
+
+  return {
+    providerId: 'wsl',
+    runtimeType: 'wsl',
+    available,
+    healthCheck,
+    isolationVerified: false,
+    supportedOps: ['build', 'test'],
+    limitations: available ? 'WSL unverified: ephemeral workspace, network deny, and process cleanup attestation required' : 'WSL executable missing',
+    evidenceSource,
+    timestamp: nowISO(),
+  };
+}
+
 function discoverWindowsSandbox() {
   const evidenceSource = 'windows_sandbox_exe';
   const exePath = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'WindowsSandbox.exe');
@@ -156,6 +208,7 @@ function discoverIsolationRuntimes(projectRoot) {
   // Windows Sandbox – only on win32.
   if (process.platform === 'win32') {
     candidates.push(discoverWindowsSandbox());
+    candidates.push(discoverWsl());
   }
 
   // Custom providers – optional.
@@ -166,14 +219,16 @@ function discoverIsolationRuntimes(projectRoot) {
     const url = process.env.AI_HELP_AGENT_TEST_BACKEND_URL;
     const healthCheck = runCommandSafe(`curl -s -o /dev/null -w "%{http_code}" ${url}`, 3000);
     const available = healthCheck.succeeded && healthCheck.stdout.trim() === '200';
+    // Mere reachability does not equate to verified isolation
+    const isolationVerified = false;
     candidates.push({
       providerId: 'remote_backend',
       runtimeType: 'remote',
       available,
       healthCheck,
-      isolationVerified: available, // assuming remote service guarantees isolation.
+      isolationVerified,
       supportedOps: ['build', 'test', 'run'],
-      limitations: available ? '' : 'Remote endpoint unreachable',
+      limitations: available ? 'Remote endpoint reachable but isolation attestation is unverified' : 'Remote endpoint unreachable',
       evidenceSource: 'env_remote_backend',
       timestamp: nowISO(),
     });
@@ -182,4 +237,4 @@ function discoverIsolationRuntimes(projectRoot) {
   return candidates;
 }
 
-module.exports = { discoverIsolationRuntimes, runCommandSafe };
+module.exports = { discoverIsolationRuntimes, runCommandSafe, discoverWsl };

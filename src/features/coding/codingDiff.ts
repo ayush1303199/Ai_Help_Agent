@@ -156,3 +156,68 @@ export function createUnvalidatedSuggestion(content: string) {
     suggestion || 'The model returned no usable text suggestion.',
   ].join('\n');
 }
+
+export interface NoChangesContext {
+  filesRead: Array<{ path: string; content?: string }>;
+  status?: string;
+  agentTaskState?: {
+    status?: string;
+    originalRequest?: string;
+    nextAction?: {
+      tool?: string;
+      reason?: string;
+      expectedEvidence?: string[] | string;
+    } | null;
+  } | null;
+}
+
+export function formatNoChangesMessage(context: NoChangesContext): { message: string; turnState: 'completed' | 'blocked' } {
+  const status = context.status || context.agentTaskState?.status || (context.filesRead.length > 0 ? 'NO_DEFECT_FOUND' : 'INSUFFICIENT_EVIDENCE');
+  const filesList = context.filesRead.map((f) => f.path).filter(Boolean);
+  const nextAction = context.agentTaskState?.nextAction;
+  const expectedEvidence = Array.isArray(nextAction?.expectedEvidence)
+    ? nextAction.expectedEvidence.join(', ')
+    : (nextAction?.expectedEvidence || '');
+
+  if (status === 'NO_DEFECT_FOUND') {
+    const inspectedText = filesList.length > 0
+      ? ` No defects were found in the inspected evidence (${filesList.join(', ')}).`
+      : ' No defects were found in the inspected evidence.';
+    return {
+      message: `I inspected the relevant project context, but could not identify a safe change to propose.${inspectedText}`,
+      turnState: 'completed',
+    };
+  }
+
+  if (status === 'INSUFFICIENT_EVIDENCE') {
+    const missingPart = expectedEvidence ? ` Missing evidence: ${expectedEvidence}.` : '';
+    const nextStepPart = nextAction?.reason ? ` Next step: ${nextAction.reason}.` : '';
+    return {
+      message: `I inspected the relevant project context, but could not identify a safe change to propose. Evidence is insufficient to verify the requested outcome.${missingPart}${nextStepPart}`,
+      turnState: 'blocked',
+    };
+  }
+
+  if (status === 'INVESTIGATION_INCOMPLETE') {
+    const nextStepPart = nextAction?.reason ? ` Next step: ${nextAction.reason}.` : '';
+    const missingPart = expectedEvidence ? ` Expected evidence: ${expectedEvidence}.` : '';
+    return {
+      message: `I inspected the relevant project context, but could not identify a safe change to propose. Investigation remains incomplete.${nextStepPart}${missingPart}`,
+      turnState: 'blocked',
+    };
+  }
+
+  if (status === 'BLOCKED' || status === 'NEEDS_APPROVAL') {
+    const reasonPart = nextAction?.reason ? ` Reason: ${nextAction.reason}.` : '';
+    return {
+      message: `I inspected the relevant project context, but could not identify a safe change to propose. Progress is blocked by execution gate or approval policy.${reasonPart}`,
+      turnState: 'blocked',
+    };
+  }
+
+  const fileDetails = filesList.length > 0 ? ` Inspected files: ${filesList.join(', ')}.` : '';
+  return {
+    message: `I inspected the relevant project context, but could not identify a safe change to propose.${fileDetails}`,
+    turnState: 'blocked',
+  };
+}

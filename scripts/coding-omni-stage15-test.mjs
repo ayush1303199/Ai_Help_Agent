@@ -103,7 +103,7 @@ console.log('[PASS] Generic MCP Tool Adapter verified.');
 
 // 3. Operating Modes & Complexity Routing Verification
 console.log('\n--- 3. Testing Operating Modes & Complexity Routing ---');
-assert.equal(Object.keys(OPERATING_MODES).length, 6);
+assert.equal(Object.keys(OPERATING_MODES).length, 7);
 
 // Mode routing
 const askRoute = routeTaskMode({ goal: 'Explain how the token parser works' });

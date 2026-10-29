@@ -10798,10 +10798,14 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         _persist_agent_task_state(
                             session, semantic_task, session_id, "INVESTIGATION_EXHAUSTED"
                         )
+            is_no_changes_msg = bool(
+                message.get("content")
+                and re.match(r"^\s*NO_CHANGES\s*$", str(message.get("content")), re.IGNORECASE)
+            )
             if (
                 not calls
                 and proposal_required
-                and not _has_relevant_proposal_source_evidence(semantic_task)
+                and (not _has_relevant_proposal_source_evidence(semantic_task) or is_no_changes_msg)
                 and not _is_clarification_response(message.get("content"))
                 and round_number < MAX_CODING_TOOL_ROUNDS - 1
             ):
@@ -10899,6 +10903,13 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         "ACTION_REPLANNED",
                     )
             if not calls:
+                if is_no_changes_msg:
+                    if _has_relevant_proposal_source_evidence(semantic_task):
+                        semantic_task["status"] = "NO_DEFECT_FOUND"
+                    else:
+                        semantic_task["status"] = "INSUFFICIENT_EVIDENCE"
+                    final_message = message
+                    break
                 if evidence_sufficiency["unresolved"]:
                     if round_number < MAX_CODING_TOOL_ROUNDS - 1:
                         conversation.append({
@@ -12016,16 +12027,17 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 "nextAction": semantic_task.get("nextAction"),
             })
         elif not investigation_gate_blocked:
-            CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_COMPLETED", {
-                "taskId": semantic_task.get("taskId"),
-                "intent": semantic_task["intent"]["primary"],
-            })
-            semantic_task["status"] = "COMPLETED"
-            semantic_task["timestamps"]["completedAt"] = time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-            )
-            semantic_task["nextAction"] = None
-            semantic_task["nextActionName"] = None
+            if semantic_task.get("status") not in ("NO_DEFECT_FOUND", "INSUFFICIENT_EVIDENCE", "BLOCKED"):
+                CODING_TASK_STORE.emit_lifecycle_event(session_id, "TASK_COMPLETED", {
+                    "taskId": semantic_task.get("taskId"),
+                    "intent": semantic_task["intent"]["primary"],
+                })
+                semantic_task["status"] = "COMPLETED"
+                semantic_task["timestamps"]["completedAt"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                )
+                semantic_task["nextAction"] = None
+                semantic_task["nextActionName"] = None
         await _send(send_json, {
             "type": "token",
             "requestId": request_id,
@@ -12066,7 +12078,11 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     else (
                         "INVESTIGATION_COMPLETE"
                         if (is_perf_inv or is_db_inv or (not proposal_required and _has_read_file_evidence(conversation)))
-                        else ("PROPOSAL_READY" if proposal_required else "COMPLETED")
+                        else (
+                            semantic_task.get("status")
+                            if semantic_task.get("status") in ("NO_DEFECT_FOUND", "INSUFFICIENT_EVIDENCE", "BLOCKED")
+                            else ("PROPOSAL_READY" if proposal_required else "COMPLETED")
+                        )
                     )
                 )
             ),
