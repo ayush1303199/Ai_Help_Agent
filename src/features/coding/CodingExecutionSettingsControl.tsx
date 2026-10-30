@@ -75,6 +75,9 @@ export function CodingExecutionSettingsControl({
           Re-sync workspace
         </button>
       </div>
+      <p className="mt-1 text-[10px] text-slate-500">
+        Broker readiness reflects local transport connectivity; process execution remains subject to independently verified OS isolation.
+      </p>
     </section>
   );
 }

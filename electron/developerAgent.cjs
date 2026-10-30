@@ -4795,6 +4795,106 @@ function decorateAutonomousWorkflowResult(result, userRequest) {
   return result;
 }
 
+/**
+ * Evaluates whether an application start result has authoritative evidence
+ * that the application process remains alive under an approved execution supervisor.
+ *
+ * Rules (Milestone V44.16 - Provenance & Trust Boundary Hardening):
+ * 1. Plain JavaScript objects containing isAlive, PID, supervisor, expectedPid,
+ *    or matching identity strings are NOT accepted as trusted supervisor evidence.
+ * 2. Renderer, provider, mock runner, ordinary command output, or injected runner
+ *    data cannot independently establish STARTED.
+ * 3. Matching strings and field presence are not treated as authentication.
+ * 4. Existing synthetic fixtures cannot simulate production trust merely by constructing an object.
+ * 5. Until a real, independently verified host supervisor daemon exists, no runtime evidence
+ *    can establish STARTED.
+ * 6. A process that exits (exitCode !== null, including exitCode === 0) is never running.
+ * 7. Blocked commands remain BLOCKED with exitCode: null.
+ * 8. Missing startup script remains NOT_CONFIGURED.
+ */
+function evaluateApplicationRuntimeEvidence(execResult) {
+  if (!execResult || typeof execResult !== 'object') {
+    return {
+      started: false,
+      reason: 'No execution result or supervisor evidence was provided.',
+    };
+  }
+
+  // 1. A process that has already terminated (non-null exit code, e.g. exitCode === 0)
+  // must never produce STARTED.
+  if (typeof execResult.exitCode === 'number' && execResult.exitCode !== null) {
+    return {
+      started: false,
+      reason: execResult.exitCode === 0
+        ? 'Application process exited immediately with code 0; process is not running under an active supervisor.'
+        : `Application process exited with code ${execResult.exitCode}; process is not running.`,
+    };
+  }
+
+  // 2. Reject missing supervisor
+  const supervisor = execResult.supervisor || execResult.supervisorEvidence;
+  if (!supervisor || typeof supervisor !== 'object') {
+    return {
+      started: false,
+      reason: 'Supervisor evidence is missing; ongoing application runtime cannot be established.',
+    };
+  }
+
+  // 3. Process identity & PID validation: field presence or matching strings alone
+  // does not authenticate a live supervisor, but mismatch is an immediate invalidation
+  if (supervisor.expectedProcessIdentity && supervisor.processIdentity) {
+    if (supervisor.expectedProcessIdentity !== supervisor.processIdentity) {
+      return {
+        started: false,
+        reason: `Process identity mismatch: expected "${supervisor.expectedProcessIdentity}" but supervisor observed "${supervisor.processIdentity}".`,
+      };
+    }
+  }
+
+  if (supervisor.expectedPid && supervisor.pid) {
+    if (supervisor.expectedPid !== supervisor.pid) {
+      return {
+        started: false,
+        reason: `PID mismatch: expected ${supervisor.expectedPid} but supervisor observed ${supervisor.pid}.`,
+      };
+    }
+  }
+
+  const pid = execResult.pid ?? supervisor.pid;
+  if (typeof pid !== 'number' || pid <= 0 || !Number.isInteger(pid)) {
+    return {
+      started: false,
+      reason: 'Application runtime lacks a valid positive process identifier (PID).',
+    };
+  }
+
+  // 4. Trust boundary check:
+  // Plain JavaScript objects, mock/synthetic fixtures, injected runner claims, or untrusted
+  // records cannot attest live supervisor authority without an authentic verified host supervisor.
+  // Neither matching strings, field presence, nor fabricated isAlive: true establishes trust.
+  const isolationStatus = projectProcessIsolationStatus ? projectProcessIsolationStatus() : { verified: false };
+  if (!isolationStatus || !isolationStatus.verified) {
+    return {
+      started: false,
+      reason: 'Untrusted runtime evidence rejected: no independently verified host process supervisor is active, and plain JavaScript objects cannot attest live application supervision.',
+    };
+  }
+
+  // If process is not confirmed alive by the verified supervisor
+  if (supervisor.isAlive !== true && execResult.isAlive !== true) {
+    return {
+      started: false,
+      reason: 'Supervisor attests that the application process is not currently alive.',
+    };
+  }
+
+  return {
+    started: true,
+    pid,
+    supervisor,
+  };
+}
+
 async function executeAutonomousCodingWorkflow(input) {
   const continuationToken = input?.continuationToken;
   if (!continuationToken || (isProjectRuntimeTestRequest(input?.userRequest) && !workflowContinuations.has(continuationToken))) {
@@ -5021,7 +5121,7 @@ async function executeAutonomousCodingWorkflowStage({
   const detected = continuation?.detected || await detectProject(root);
   const projectArch = continuation?.projectArch || discoverProjectArchitecture({ ...metadata, ...detected });
   const isGreenfieldDiscovery = await isGreenfieldWorkspace(root);
-  const existingRuntimeTestPlan = isRuntimeTestRequest
+  const existingRuntimeTestPlan = (isRuntimeTestRequest && genericIntent.primaryIntent !== INTENT_CATEGORIES.RUN_OR_LAUNCH)
     ? await deriveExistingProjectTestPlan(root)
     : null;
   const detectedChecks = selectVerificationChecks({ ...metadata, ...detected }, [], { targetFile: userRequest });
@@ -5087,7 +5187,8 @@ async function executeAutonomousCodingWorkflowStage({
     || genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY
     || /\b(?:run\s+(?:the\s+)?tests?|test\s+(?:the\s+)?(?:project|app|code|tests?)|test\s+suite|smoke\s*test|check\s+if\s+(?:the\s+)?project\s+works?)\b/i.test(userRequest)
     || (/\btest(?:s|ing)?\b/i.test(userRequest) && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest))
-  ) && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
+  ) && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest)
+    && genericIntent.primaryIntent !== INTENT_CATEGORIES.RUN_OR_LAUNCH;
 
   const isCombinedInstallAndTestRequest = (
     (isDependencyInstallRequest && isProjectTestOrVerifyRequest)
@@ -5977,14 +6078,15 @@ async function executeAutonomousCodingWorkflowStage({
     };
   }
 
-  const isExplicitBuildOrTestRequest = (!isRuntimeTestRequest || !existingRuntimeTestPlan)
+  const isExplicitBuildOrTestRequest = (!isRuntimeTestRequest || !existingRuntimeTestPlan || genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH)
     && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK
     && !isDependencyInstallRequest
     && !isCombinedInstallAndTestRequest
     && (
       genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY
+      || genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH
       || isRuntimeTestRequest
-      || /(?:build(?:ing)?|compile|typecheck|type-check|lint|run\\s+(?:the\\s+)?tests?|test\\s+suite|smoke\\s*test|start|run\\s+(?:the\\s+)?(?:app|application|server)|launch\\s+(?:the\\s+)?(?:app|server)|application\\s+runtime)/i.test(userRequest)
+      || /(?:build(?:ing)?|compile|typecheck|type-check|lint|run\s+(?:the\s+)?tests?|test\s+suite|smoke\s*test|start|run\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|server|workspace)|launch\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|server|workspace)|application\s+runtime)/i.test(userRequest)
     )
     && !/\b(?:create|implement|write|add|refactor|modify|delete|fix|patch|scaffold|endpoint|feature)\b/i.test(userRequest);
 
@@ -6014,10 +6116,15 @@ async function executeAutonomousCodingWorkflowStage({
       operation = BUILD_OPERATIONS.LINT;
     } else if (/\bsmoke\b/i.test(userRequest)) {
       operation = BUILD_OPERATIONS.SMOKE_TEST;
-    } else if (/\b(?:start|run\s+(?:the\s+)?app|launch\s+(?:the\s+)?(?:app|server)|application\s+runtime)\b/i.test(userRequest)) {
-      operation = BUILD_OPERATIONS.START;
     } else if (/\btests?\b/i.test(userRequest) || genericIntent.primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY) {
       operation = BUILD_OPERATIONS.TEST;
+    } else if (
+      genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH
+      || /\b(?:start|launch|boot|spin\s+up)\b/i.test(userRequest)
+      || /\brun\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|server|workspace)\b/i.test(userRequest)
+      || /\bapplication\s+runtime\b/i.test(userRequest)
+    ) {
+      operation = BUILD_OPERATIONS.START;
     }
 
     onProgress({ phase: 'BUILD_PLAN', message: `Generating build orchestration plan for ${operation}.` });
@@ -6200,6 +6307,7 @@ async function executeAutonomousCodingWorkflowStage({
         engineeringReport: report,
         executionBlocked: true,
         reason: execResult.reason,
+        message: execResult.reason || 'Process isolation is unverified.',
         filesModified: [],
         codeApplied: false,
         codeVerified: false,
@@ -6211,13 +6319,131 @@ async function executeAutonomousCodingWorkflowStage({
     }
 
     if (execResult.ok) {
+      if (operation === BUILD_OPERATIONS.START) {
+        const runtimeCheck = evaluateApplicationRuntimeEvidence(execResult);
+        if (!runtimeCheck.started) {
+          const startupRecord = createTestExecutionRecord({
+            category: TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME,
+            status: TEST_EXECUTION_STATUSES.FAILED,
+            evidenceSource: execResult.evidenceSource || EVIDENCE_SOURCES.CONTAINER_EXECUTION,
+            command: plan.fullCommandString,
+            exitCode: execResult.exitCode ?? 1,
+            stdoutSummary: execResult.stdout || '',
+            stderrSummary: execResult.stderr || runtimeCheck.reason,
+            durationMs: execResult.elapsedMs || 0,
+            endpointProbes: execResult.endpointProbes || [],
+          });
+          const startReport = buildEngineeringReport({
+            projectRoot: root,
+            workspaceDiscovery,
+            dependencyReport,
+            buildDiscovery,
+            buildPlan: plan,
+            testClassifications: [startupRecord],
+            executedCommands: [{
+              operation,
+              command: plan.fullCommandString,
+              environment: 'CONTAINER_ISOLATED',
+              exitCode: execResult.exitCode ?? 1,
+              status: 'FAILED',
+              checkState: CHECK_STATES.FAILED,
+              stdoutExcerpt: redactSensitiveData(String(execResult.stdout || '')).slice(0, 500),
+              stderrExcerpt: redactSensitiveData(String(execResult.stderr || runtimeCheck.reason)).slice(0, 500),
+              executionTimeMs: execResult.elapsedMs || 0,
+            }],
+            diagnosis: null,
+            repairPlan: null,
+            rerunResult: null,
+            overallOutcome: 'FAILED',
+            blockers: [runtimeCheck.reason],
+          });
+          taskPlan.engineeringReport = startReport;
+          advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'application_startup_failed', reason: runtimeCheck.reason });
+          return {
+            outcome: 'FAILED',
+            phase: 'APPLICATION_STARTUP_FAILED',
+            turnId: turn.turnId,
+            taskPlan,
+            buildPlan: plan,
+            buildDiscovery,
+            buildResult: execResult,
+            diagnosis: null,
+            engineeringReport: startReport,
+            filesModified: [],
+            codeApplied: false,
+            codeVerified: false,
+            testClassifications: [startupRecord],
+            reason: runtimeCheck.reason,
+            message: runtimeCheck.reason,
+            workflowReceipt: buildWorkflowReceipt({
+              outcome: 'FAILED',
+              stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'APPLICATION_STARTUP'],
+            }),
+          };
+        }
+
+        const tcRecord = createTestExecutionRecord({
+          category: TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME,
+          status: TEST_EXECUTION_STATUSES.PASSED,
+          evidenceSource: EVIDENCE_SOURCES.CONTAINER_EXECUTION,
+          command: plan.fullCommandString,
+          exitCode: 0,
+          stdoutSummary: execResult.stdout || '',
+          stderrSummary: execResult.stderr || '',
+          durationMs: execResult.elapsedMs || 0,
+          endpointProbes: execResult.endpointProbes || [],
+        });
+        const report = buildEngineeringReport({
+          projectRoot: root,
+          workspaceDiscovery,
+          dependencyReport,
+          buildDiscovery,
+          buildPlan: plan,
+          testClassifications: [tcRecord],
+          executedCommands: [{
+            operation,
+            command: plan.fullCommandString,
+            environment: 'CONTAINER_ISOLATED',
+            exitCode: 0,
+            status: 'PASSED',
+            checkState: CHECK_STATES.PASSED_REAL_EXECUTION,
+            stdoutExcerpt: redactSensitiveData(String(execResult.stdout || '')).slice(0, 500),
+            stderrExcerpt: redactSensitiveData(String(execResult.stderr || '')).slice(0, 500),
+            executionTimeMs: execResult.elapsedMs || 0,
+          }],
+          diagnosis: null,
+          repairPlan: null,
+          rerunResult: null,
+          overallOutcome: 'STARTED',
+        });
+        taskPlan.engineeringReport = report;
+        advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'application_started' });
+        return {
+          outcome: 'STARTED',
+          phase: 'APPLICATION_STARTED',
+          status: 'APPLICATION_STARTED',
+          turnId: turn.turnId,
+          taskPlan,
+          buildPlan: plan,
+          buildDiscovery,
+          buildResult: execResult,
+          engineeringReport: report,
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: true,
+          pid: runtimeCheck.pid,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'STARTED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'BUILD_EXECUTE'],
+          }),
+        };
+      }
+
       const targetCategory = operation === BUILD_OPERATIONS.TEST
         ? TEST_EXECUTION_CATEGORIES.ACTUAL_PROJECT_TEST
         : operation === BUILD_OPERATIONS.BUILD
           ? TEST_EXECUTION_CATEGORIES.ACTUAL_BUILD
-          : operation === BUILD_OPERATIONS.START
-            ? TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME
-            : TEST_EXECUTION_CATEGORIES.STATIC_ANALYSIS;
+          : TEST_EXECUTION_CATEGORIES.STATIC_ANALYSIS;
       const tcRecord = createTestExecutionRecord({
         category: targetCategory,
         status: TEST_EXECUTION_STATUSES.PASSED,
@@ -10251,4 +10477,5 @@ module.exports = {
   validateTestExecutionRecord,
   createTestExecutionRecord,
   evaluateProjectTestReadiness,
+  evaluateApplicationRuntimeEvidence,
 };

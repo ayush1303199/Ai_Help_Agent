@@ -43,8 +43,23 @@ export function isProjectDependencyRequest(requestText: string): boolean {
     || /\b(?:npm|pnpm|yarn|bun)\s+(?:install|i|add)\b/i.test(text);
 }
 
+export function isProjectRunOrLaunchRequest(requestText: string): boolean {
+  const text = String(requestText || '')
+    .trim()
+    .replace(/[.!?]+$/g, '')
+    .replace(/\s+/g, ' ');
+  if (!text) return false;
+  const command = text.replace(/^(?:(?:please|can you|could you|would you|will you)\s+)+/i, '');
+  return /^(?:run|start|launch|boot|spin\s+up|execute)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace|server)(?:\s+(?:now|please|for\s+me|locally|in\s+dev(?:\s+mode)?))?$/i.test(command)
+    || /^(?:run|start|launch|boot|spin\s+up|execute)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace|server)(?:\s+(?:now|please|for\s+me|locally|in\s+dev(?:\s+mode)?))?$/i.test(text)
+    || /^(?:build\s+and\s+(?:test|run)|(?:run|start)\s+and\s+test)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace)(?:\s+(?:now|please|for\s+me))?$/i.test(command)
+    || /^(?:build\s+and\s+(?:test|run)|(?:run|start)\s+and\s+test)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace)(?:\s+(?:now|please|for\s+me))?$/i.test(text);
+}
+
 export function isActionableProjectWorkflowRequest(requestText: string): boolean {
-  return isProjectRuntimeTestRequest(requestText) || isProjectDependencyRequest(requestText);
+  return isProjectRuntimeTestRequest(requestText)
+    || isProjectRunOrLaunchRequest(requestText)
+    || isProjectDependencyRequest(requestText);
 }
 
 export function latestCodingUserRequest(messages: Array<{ role: 'user' | 'assistant'; content: string }>) {
@@ -1826,7 +1841,7 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
 
   // 5. Detect polite action directives (e.g. "Can you fix...", "Please add...", "Could you refactor...")
   // When polite framing is followed immediately by an action verb, it represents a command to execute changes.
-  const isPoliteActionDirective = /^(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate)\b/i.test(text);
+  const isPoliteActionDirective = /^(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|run|start|launch|boot|execute)\b/i.test(text);
   if (isPoliteActionDirective) {
     return {
       intent: 'AUTONOMOUS_WORKFLOW_TASK',
@@ -1835,7 +1850,7 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
   }
 
   // 6. Detect trailing questions that do not start with a direct action command
-  const startsWithDirectAction = /^(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|find\s+and\s+fix)\b/i.test(text);
+  const startsWithDirectAction = /^(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|find\s+and\s+fix|run|start|launch|boot|execute)\b/i.test(text);
   if (text.endsWith('?') && !startsWithDirectAction) {
     return {
       intent: 'QUESTION_OR_EXPLANATION',

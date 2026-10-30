@@ -129,11 +129,14 @@ function scoreIntentCategories(text, projectContext = null, evidence = []) {
 
   // Primary clause priority: check which action is introduced at the start of the prompt
   const leadingCommand = normalized.replace(/^(?:(?:can\s+you\s+|could\s+you\s+|please\s+)+)/i, '');
-  if (/^(?:build|scaffold|bootstrap|generate|create|add|implement|init|setup|write)\b/i.test(leadingCommand) || /^(?:run|execute)\s+(?:the\s+)?build\b/i.test(leadingCommand)) {
+  if (/^(?:build\s+and\s+test)\b/i.test(leadingCommand)) {
+    scores[INTENT_CATEGORIES.TEST_OR_VERIFY] += 10;
+    scores[INTENT_CATEGORIES.BUILD_OR_SCAFFOLD] += 10;
+  } else if (/^(?:build|scaffold|bootstrap|generate|create|add|implement|init|setup|write)\b/i.test(leadingCommand) || /^(?:run|execute)\s+(?:the\s+)?build\b/i.test(leadingCommand)) {
     scores[INTENT_CATEGORIES.BUILD_OR_SCAFFOLD] += 10;
   } else if (/^(?:investigate|diagnose|debug|troubleshoot|trace|find\s+(?:the\s+)?cause|fix|resolve|patch|repair|correct|ensure|guarantee|prevent|inspect|audit|examine|analyze|analyse)\b/i.test(leadingCommand)) {
     scores[INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG] += 10;
-  } else if (/^(?:start|launch|boot|spin\s+up)\b/i.test(leadingCommand)) {
+  } else if (/^(?:start|launch|boot|spin\s+up)\b/i.test(leadingCommand) || /^(?:run|execute)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace|server|dev\s+server)\b/i.test(leadingCommand)) {
     scores[INTENT_CATEGORIES.RUN_OR_LAUNCH] += 10;
   } else if (/^(?:run|execute|check|perform)\s+(?:the\s+)?(?:tests?|test\s+suite|unit\s+tests?|e2e|specs?)/i.test(leadingCommand) || /^(?:test|verify)\b/i.test(leadingCommand)) {
     scores[INTENT_CATEGORIES.TEST_OR_VERIFY] += 10;
@@ -181,6 +184,7 @@ function scoreIntentCategories(text, projectContext = null, evidence = []) {
   const runPatterns = [
     /^(?:start|launch|boot|spin\s+up)\b/i,
     /\b(?:start|launch|boot|spin\s+up)\s+(?:the\s+)?(?:dev\s+server|development\s+server|server|app|application|backend|frontend|service)\b/i,
+    /\b(?:run|start|launch|boot|execute)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|server|workspace)\b/i,
     /\b(?:run|start)\s+(?:the\s+)?(?:project|app|server)\s+(?:locally|on\s+port\s+\d+|in\s+dev\s+mode)\b/i,
     /\b(?:start\s+listening|serve\s+the\s+app)\b/i,
   ];
@@ -195,6 +199,7 @@ function scoreIntentCategories(text, projectContext = null, evidence = []) {
     /\b(?:verify|test)\s+(?:that|if|whether|the\s+build|all\s+checks|all\s+assertion)\b/i,
     /\b(?:check\s+for\s+regressions?|run\s+lint(?:er)?|typecheck|static\s+analysis)\b/i,
     /^(?:test|verify)\s+(?:this|the\s+project|the\s+module)\b/i,
+    /\b(?:build\s+and\s+test|(?:run|start)\s+and\s+test)\s+(?:(?:the|my|this|our|attached)\s+)?(?:project|app|application|workspace)\b/i,
   ];
   if (testPatterns.some((p) => p.test(normalized))) {
     scores[INTENT_CATEGORIES.TEST_OR_VERIFY] += 30;
@@ -371,6 +376,8 @@ function classifyTaskIntent({ request, projectContext = null, evidence = [], con
         ? `Implement requested functionality for "${originalRequest}"`
         : primaryIntent === INTENT_CATEGORIES.TEST_OR_VERIFY
           ? `Execute verification checks and report real execution evidence for "${originalRequest}"`
+          : primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH
+            ? `Launch application runtime and inspect project execution for "${originalRequest}"`
           : primaryIntent === INTENT_CATEGORIES.REFACTOR
             ? `Refactor codebase according to constraints for "${originalRequest}"`
             : `Analyze codebase and answer inquiry for "${originalRequest}"`

@@ -1400,8 +1400,19 @@ export function useCodingAgentController({
               ? `Applying the proposed patch failed. ${rollbackStatus}`
               : `Applying the proposed patch failed: ${result.error || 'Apply error'}. Repository remains untouched.`;
           }
-        } else if (result.outcome === 'BLOCKED') {
-          outcomeContent = `Workflow was blocked${result.phase ? ` during ${result.phase}` : ''}: ${result.reason || result.message || 'Required policy, authorization, or isolation gate was not satisfied.'}`;
+        } else if (result.outcome === 'NOT_CONFIGURED' || result.outcome === 'TEST_NOT_CONFIGURED') {
+          outcomeContent = `Startup command is not configured in the project manifest: ${result.reason || result.message || 'No supported startup script was found in package.json.'} No host or project commands were executed.`;
+        } else if (result.outcome === 'BLOCKED' || result.outcome === 'BLOCKED_ISOLATION') {
+          const rawResult = result as Record<string, unknown>;
+          const rawBuildPlan = rawResult?.buildPlan as { fullCommandString?: string } | undefined;
+          const plannedCmd = rawBuildPlan?.fullCommandString
+            ? `\n\nPlanned command: \`${rawBuildPlan.fullCommandString}\` (execution blocked by PROCESS_ISOLATION_GATE: BLOCKED; no host commands were executed)`
+            : '';
+          outcomeContent = `Workflow was blocked${result.phase ? ` during ${result.phase}` : ''}: ${result.reason || result.message || 'Required policy, authorization, or isolation gate was not satisfied.'}${plannedCmd}`;
+        } else if (result.outcome === 'STARTED') {
+          outcomeContent = `Application startup initiated: ${result.message || 'Application started successfully under verified isolation.'}`;
+        } else if (result.outcome === 'FAILED') {
+          outcomeContent = `Execution failed after starting${result.phase ? ` during ${result.phase}` : ''}: ${result.reason || result.message || 'The application or process exited with an error.'}`;
         } else if (result.outcome === 'CANCELLED') {
           outcomeContent = 'The workflow was cancelled.';
         } else {
@@ -1416,7 +1427,16 @@ export function useCodingAgentController({
           setMessages((previous) => previous.map((message) => message.requestId === requestId
             ? { ...message, content: outcomeContent, streaming: false }
             : message));
-          onStatus(`Workflow completed: ${result.outcome}`);
+          const statusMessage = result.outcome === 'COMPLETED' || result.outcome === 'SUCCESS'
+            ? `Workflow completed: ${result.outcome}`
+            : result.outcome === 'STARTED'
+              ? `Application started: ${result.outcome}`
+              : result.outcome === 'FAILED'
+                ? `Workflow failed: ${result.outcome}`
+                : result.outcome === 'NOT_CONFIGURED' || result.outcome === 'TEST_NOT_CONFIGURED'
+                  ? `Workflow not configured: ${result.outcome}`
+                  : `Workflow blocked: ${result.outcome}`;
+          onStatus(statusMessage);
           return;
         }
       } catch (error) {

@@ -2167,6 +2167,398 @@ async function runVerifiedIsolationTests() {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // 12. "Run Project" Intent Routing and Execution-Gate Honesty Regressions
+  // -------------------------------------------------------------------------
+  console.log('12. Testing "Run Project" intent routing and execution-gate honesty...');
+  {
+    const { classifyTaskIntent, INTENT_CATEGORIES } = require('../electron/coding-pipeline/genericIntentClassifier.cjs');
+    const { isProjectRuntimeTestRequest } = require('../electron/coding-pipeline/projectRuntimeTestIntent.cjs');
+
+    const executionQueries = [
+      { request: 'run the project', expectedOp: BUILD_OPERATIONS.START, expectedCmd: 'npm start' },
+      { request: 'start this application', expectedOp: BUILD_OPERATIONS.START, expectedCmd: 'npm start' },
+      { request: 'launch the attached workspace', expectedOp: BUILD_OPERATIONS.START, expectedCmd: 'npm start' },
+      { request: 'build and test this project', expectedOp: BUILD_OPERATIONS.TEST, expectedCmd: 'npm test' },
+    ];
+
+    for (const item of executionQueries) {
+      const intent = classifyTaskIntent({ request: item.request });
+      assert.equal(intent.actionable, true, `Request "${item.request}" must be recognized as an actionable task.`);
+      assert.notEqual(intent.primaryIntent, INTENT_CATEGORIES.EXPLAIN_OR_ASK, `Request "${item.request}" must not route to generic Q&A.`);
+      assert.equal(isProjectRuntimeTestRequest(item.request), true, `Request "${item.request}" must match project workflow patterns.`);
+    }
+
+    // Negative Intent Regression: Ensure non-execution queries are not falsely classified as RUN_OR_LAUNCH
+    const negativeQueries = [
+      { request: 'Explain how to run a project', expectedIntent: INTENT_CATEGORIES.EXPLAIN_OR_ASK, actionable: false },
+      { request: 'What does this project do?', expectedIntent: INTENT_CATEGORIES.EXPLAIN_OR_ASK, actionable: false },
+      { request: 'How does developerAgent implement rollback?', expectedIntent: INTENT_CATEGORIES.EXPLAIN_OR_ASK, actionable: false },
+      { request: 'Can you explain how routes work?', expectedIntent: INTENT_CATEGORIES.EXPLAIN_OR_ASK, actionable: false },
+      { request: 'Explain the difference between build and start.', expectedIntent: INTENT_CATEGORIES.EXPLAIN_OR_ASK, actionable: false },
+      { request: 'Investigate why the database connection is failing.', expectedIntent: INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG, actionable: true },
+      { request: 'Refactor the authentication module.', expectedIntent: INTENT_CATEGORIES.REFACTOR, actionable: true },
+      { request: 'Add a new endpoint for user profile.', expectedIntent: INTENT_CATEGORIES.BUILD_OR_SCAFFOLD, actionable: true },
+    ];
+    for (const neg of negativeQueries) {
+      const negIntent = classifyTaskIntent({ request: neg.request });
+      assert.notEqual(negIntent.primaryIntent, INTENT_CATEGORIES.RUN_OR_LAUNCH, `Non-execution query "${neg.request}" must not be classified as RUN_OR_LAUNCH.`);
+      assert.equal(negIntent.primaryIntent, neg.expectedIntent, `Query "${neg.request}" should have primary intent ${neg.expectedIntent}`);
+      assert.equal(negIntent.actionable, neg.actionable, `Query "${neg.request}" actionable flag should be ${neg.actionable}`);
+    }
+
+    // Project Manifest Grounding: Confirm commands are derived from actual package.json, not assumed
+    const noStartProjDir = await makeTempDir('no-start-script-test-');
+    try {
+      await fs.writeFile(path.join(noStartProjDir, 'package.json'), JSON.stringify({
+        name: 'no-start-app',
+        version: '1.0.0',
+        scripts: { test: 'node --test' },
+      }));
+      const ownerId = 304;
+      await developerFiles.attachProject(noStartProjDir, ownerId);
+      const noStartResult = await executeAutonomousCodingWorkflow({
+        userRequest: 'run the project',
+        root: noStartProjDir,
+        ownerWebContentsId: ownerId,
+        sessionId: crypto.randomUUID(),
+        onProgress: () => {},
+      });
+      assert.equal(noStartResult.outcome, 'NOT_CONFIGURED', 'Must report NOT_CONFIGURED when no start script exists.');
+      assert.notEqual(noStartResult.outcome, 'STARTED', 'Must never report STARTED when startup command is not configured.');
+      assert.notEqual(noStartResult.outcome, 'COMPLETED', 'Must never report COMPLETED when startup command is not configured.');
+      assert.equal(noStartResult.phase, 'BUILD_PLAN');
+      assert.match(noStartResult.reason, /Operation "START" is not declared or configured/);
+      assert.equal(noStartResult.buildPlan?.configured, false);
+      assert.ok(!noStartResult.buildPlan?.fullCommandString, 'Must never fabricate a startup command when not configured.');
+      assert.equal(noStartResult.codeApplied, false);
+      assert.equal(noStartResult.codeVerified, false);
+      assert.equal(noStartResult.filesModified.length, 0);
+      const noStartCmd = noStartResult.engineeringReport?.executedCommands?.[0];
+      assert.ok(noStartCmd, 'Must produce a structured command record for unconfigured startup.');
+      assert.equal(noStartCmd.status, 'NOT_CONFIGURED');
+      assert.equal(noStartCmd.environment, 'NOT_RUN');
+      assert.equal(noStartCmd.exitCode, null, 'No command was executed; exitCode must be null.');
+    } finally {
+      await fs.rm(noStartProjDir, { recursive: true, force: true });
+    }
+
+    // Custom Script Discovery: Confirm discovery of "serve" script when "start" is absent
+    const serveProjDir = await makeTempDir('serve-script-test-');
+    try {
+      await fs.writeFile(path.join(serveProjDir, 'package.json'), JSON.stringify({
+        name: 'serve-script-app',
+        version: '1.0.0',
+        scripts: { serve: 'node app.js' },
+      }));
+      await fs.writeFile(path.join(serveProjDir, 'app.js'), 'console.log("Serving");\n');
+      const ownerId = 305;
+      await developerFiles.attachProject(serveProjDir, ownerId);
+      const serveResult = await executeAutonomousCodingWorkflow({
+        userRequest: 'start this application',
+        root: serveProjDir,
+        ownerWebContentsId: ownerId,
+        sessionId: crypto.randomUUID(),
+        onProgress: () => {},
+      });
+      assert.equal(serveResult.outcome, 'BLOCKED', 'Must fail closed at execution gate.');
+      assert.equal(serveResult.phase, 'BUILD_EXECUTION_GATE');
+      assert.equal(serveResult.buildPlan?.operation, BUILD_OPERATIONS.START);
+      assert.equal(serveResult.buildPlan?.fullCommandString, 'npm run serve', 'Must discover "npm run serve" from package.json rather than assuming npm start.');
+    } finally {
+      await fs.rm(serveProjDir, { recursive: true, force: true });
+    }
+
+    const testProjectDir = await makeTempDir('run-project-intent-test-');
+    try {
+      await fs.writeFile(path.join(testProjectDir, 'package.json'), JSON.stringify({
+        name: 'test-execution-intent-app',
+        version: '1.0.0',
+        scripts: {
+          build: 'node build.js',
+          start: 'node server.js',
+          test: 'node --test',
+        },
+      }));
+      await fs.writeFile(path.join(testProjectDir, 'server.js'), 'console.log("Ready");\n');
+
+      const ownerId = 303;
+      await developerFiles.attachProject(testProjectDir, ownerId);
+
+      for (const item of executionQueries) {
+        const result = await executeAutonomousCodingWorkflow({
+          userRequest: item.request,
+          root: testProjectDir,
+          ownerWebContentsId: ownerId,
+          sessionId: crypto.randomUUID(),
+          onProgress: () => {},
+        });
+
+        assert.equal(result.outcome, 'BLOCKED', `Execution intent "${item.request}" must fail closed when isolation is unverified.`);
+        assert.notEqual(result.outcome, 'STARTED', `Execution intent "${item.request}" must never report STARTED when blocked by isolation.`);
+        assert.notEqual(result.outcome, 'COMPLETED', `Execution intent "${item.request}" must never report COMPLETED when blocked by isolation.`);
+        assert.equal(result.phase, 'BUILD_EXECUTION_GATE', `Must enter BUILD_EXECUTION_GATE instead of manual Q&A.`);
+        assert.equal(result.executionBlocked, true, 'executionBlocked flag must be true.');
+        assert.equal(result.codeVerified, false, 'Blocked workflow must never report codeVerified as true.');
+        assert.equal(result.codeApplied, false, 'Blocked workflow must never report codeApplied as true.');
+        assert.equal(result.buildPlan?.operation, item.expectedOp, `Expected operation ${item.expectedOp} for "${item.request}".`);
+        assert.equal(result.buildPlan?.fullCommandString, item.expectedCmd, `Expected command ${item.expectedCmd} for "${item.request}".`);
+
+        // Verify that the proposed command is clearly distinguished from an executed command
+        const executedCommand = result.engineeringReport?.executedCommands?.[0];
+        assert.ok(executedCommand, 'Engineering report must record the proposed command record.');
+        assert.equal(executedCommand.command, item.expectedCmd);
+        assert.equal(executedCommand.environment, 'UNISOLATED_BLOCKED', 'Proposed command environment must be marked UNISOLATED_BLOCKED.');
+        assert.equal(executedCommand.exitCode, null, 'No host process may be executed (exitCode must be null).');
+        assert.equal(executedCommand.status, 'BLOCKED');
+        assert.equal(executedCommand.checkState, 'BLOCKED_ISOLATION');
+        assert.equal(result.filesModified.length, 0, 'No files may be modified for read-only run/test plan.');
+      }
+
+      // Distinct operation semantics: build, test, and run retain distinct operation types
+      const distinctOps = [
+        { req: 'build the project', expectedOp: BUILD_OPERATIONS.BUILD, expectedCmd: 'npm run build' },
+        { req: 'run the tests', expectedOp: BUILD_OPERATIONS.TEST, expectedCmd: 'npm test' },
+        { req: 'run the project', expectedOp: BUILD_OPERATIONS.START, expectedCmd: 'npm start' },
+      ];
+      for (const opItem of distinctOps) {
+        const opResult = await executeAutonomousCodingWorkflow({
+          userRequest: opItem.req,
+          root: testProjectDir,
+          ownerWebContentsId: ownerId,
+          sessionId: crypto.randomUUID(),
+          onProgress: () => {},
+        });
+        assert.equal(opResult.buildPlan?.operation, opItem.expectedOp, `Distinct operation for "${opItem.req}" must be ${opItem.expectedOp}`);
+        assert.equal(opResult.buildPlan?.fullCommandString, opItem.expectedCmd);
+        assert.equal(opResult.outcome, 'BLOCKED');
+        assert.equal(opResult.phase, 'BUILD_EXECUTION_GATE');
+      }
+
+      // Broker Boundary & Contract Consistency:
+      // Even if a broker or IPC caller dispatches a session with connected transport,
+      // execution remains BLOCKED by PROCESS_ISOLATION_GATE, preserving identical contract structure.
+      const simulatedBrokerSession = `broker-session-${crypto.randomUUID().slice(0, 8)}`;
+      const brokerResult = await executeAutonomousCodingWorkflow({
+        userRequest: 'run the project',
+        root: testProjectDir,
+        ownerWebContentsId: ownerId,
+        sessionId: simulatedBrokerSession,
+        onProgress: () => {},
+      });
+      assert.equal(brokerResult.outcome, 'BLOCKED', 'Broker connected session must remain BLOCKED while isolation gate is closed.');
+      assert.notEqual(brokerResult.outcome, 'STARTED', 'Broker session must never report STARTED without verified isolation.');
+      assert.notEqual(brokerResult.outcome, 'COMPLETED', 'Broker session must never report COMPLETED without verified isolation.');
+      assert.equal(brokerResult.executionBlocked, true);
+      assert.equal(brokerResult.engineeringReport?.executedCommands?.[0]?.exitCode, null);
+      assert.equal(brokerResult.engineeringReport?.executedCommands?.[0]?.status, 'BLOCKED');
+      assert.equal(brokerResult.engineeringReport?.executedCommands?.[0]?.checkState, 'BLOCKED_ISOLATION');
+      // Contract shape validation:
+      assert.ok('outcome' in brokerResult);
+      assert.ok('phase' in brokerResult);
+      assert.ok('buildPlan' in brokerResult);
+      assert.ok('engineeringReport' in brokerResult);
+      assert.ok('executionBlocked' in brokerResult);
+      assert.ok('workflowReceipt' in brokerResult);
+    } finally {
+      await fs.rm(testProjectDir, { recursive: true, force: true });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 13. STARTED Outcome Runtime Evidence Correction & Trust Boundary Hardening (Milestone V44.16)
+  // [SYNTHETIC TEST] Contract behavior verified via isolated mock runner; does NOT attest live host execution.
+  // -------------------------------------------------------------------------
+  console.log('13. Testing rejection of untrusted/synthetic runtime evidence (Milestone V44.16)...');
+  {
+    const { evaluateApplicationRuntimeEvidence } = require('../electron/developerAgent.cjs');
+    const { projectProcessIsolationStatus } = require('../electron/coding-pipeline/projectProcessIsolation.cjs');
+
+    // Case 1: Plain object with all supervisor fields populated
+    // [SYNTHETIC TEST] Plain objects must not be accepted as trusted supervisor evidence
+    const plainObjectEvidence = {
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 48120,
+      supervisor: {
+        isAlive: true,
+        pid: 48120,
+        processIdentity: 'supervised-worker-app-1',
+        expectedProcessIdentity: 'supervised-worker-app-1',
+        expectedPid: 48120,
+      },
+    };
+    const plainObjResult = evaluateApplicationRuntimeEvidence(plainObjectEvidence);
+    assert.equal(plainObjResult.started, false, 'Plain object with supervisor fields must NOT produce started=true without verified supervisor.');
+    assert.match(plainObjResult.reason, /Untrusted runtime evidence rejected|no independently verified host process supervisor/i);
+
+    // Case 2: Matching PID and process identity strings
+    // [SYNTHETIC TEST] Matching strings and field presence alone must NOT grant supervisor trust
+    const matchingStringsEvidence = {
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 12345,
+      supervisor: {
+        isAlive: true,
+        pid: 12345,
+        processIdentity: 'match-proc-id',
+        expectedProcessIdentity: 'match-proc-id',
+        expectedPid: 12345,
+      },
+    };
+    const matchingStringsResult = evaluateApplicationRuntimeEvidence(matchingStringsEvidence);
+    assert.equal(matchingStringsResult.started, false, 'Matching PID and identity strings must NOT grant supervisor trust.');
+    assert.match(matchingStringsResult.reason, /Untrusted runtime evidence rejected/i);
+
+    // Case 3: Fabricated isAlive: true
+    // [SYNTHETIC TEST] Fabricated isAlive flag must not bypass supervisor trust boundary
+    const fabricatedAliveEvidence = {
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 54321,
+      supervisor: { isAlive: true, pid: 54321 },
+    };
+    const fabricatedAliveResult = evaluateApplicationRuntimeEvidence(fabricatedAliveEvidence);
+    assert.equal(fabricatedAliveResult.started, false, 'Fabricated isAlive: true must NOT produce started=true.');
+    assert.match(fabricatedAliveResult.reason, /Untrusted runtime evidence rejected/i);
+
+    // Case 4: Replayed evidence from previous execution
+    // [SYNTHETIC TEST] Replayed evidence without verified active supervisor is rejected
+    const replayedEvidence = {
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 48120,
+      supervisor: {
+        isAlive: true,
+        pid: 48120,
+        replayedNonce: 'prior-exec-nonce-999',
+      },
+    };
+    const replayedResult = evaluateApplicationRuntimeEvidence(replayedEvidence);
+    assert.equal(replayedResult.started, false, 'Replayed evidence must NOT produce started=true.');
+    assert.match(replayedResult.reason, /Untrusted runtime evidence rejected/i);
+
+    // Case 5: Evidence supplied by an injected/mock runner
+    // [SYNTHETIC TEST] Injected runner claims must fail closed
+    const mockRunnerClaim = {
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 7777,
+      isMockRunner: true,
+      supervisor: { isAlive: true, pid: 7777, source: 'mock' },
+    };
+    const mockRunnerResult = evaluateApplicationRuntimeEvidence(mockRunnerClaim);
+    assert.equal(mockRunnerResult.started, false, 'Injected mock runner claims must NOT produce started=true.');
+    assert.match(mockRunnerResult.reason, /Untrusted runtime evidence rejected/i);
+
+    // Case 6: Missing supervisor evidence
+    // [SYNTHETIC TEST] Missing supervisor evidence must fail closed
+    const missingSupervisorResult = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 48120,
+      supervisor: null,
+    });
+    assert.equal(missingSupervisorResult.started, false, 'Missing supervisor evidence must fail closed.');
+    assert.match(missingSupervisorResult.reason, /Supervisor evidence is missing/i);
+
+    // Process termination tests: premature exit with code 0 or error code
+    const exitZeroResult = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: 0,
+      isAlive: false,
+      stdout: 'App initialized and stopped immediately',
+      stderr: '',
+    });
+    assert.equal(exitZeroResult.started, false, 'Process that exits immediately with code 0 must NOT produce started=true.');
+    assert.match(exitZeroResult.reason, /exited immediately with code 0/i);
+
+    const exitNonZeroResult = evaluateApplicationRuntimeEvidence({
+      ok: false,
+      exitCode: 1,
+      isAlive: false,
+      stdout: '',
+      stderr: 'Error: Port 3000 in use',
+    });
+    assert.equal(exitNonZeroResult.started, false, 'Process with non-zero exit code must NOT produce started=true.');
+    assert.match(exitNonZeroResult.reason, /exited with code 1/i);
+
+    // Case 7: Isolation gate blocks execution
+    // Verified via executeAutonomousCodingWorkflow: unverified isolation gate strictly blocks before execution
+    const testProjDir = await makeTempDir('runtime-evidence-test-');
+    try {
+      await fs.writeFile(path.join(testProjDir, 'package.json'), JSON.stringify({
+        name: 'runtime-evidence-app',
+        version: '1.0.0',
+        scripts: { start: 'node server.js' },
+      }));
+      await fs.writeFile(path.join(testProjDir, 'server.js'), 'console.log("ready");\n');
+      const ownerId = 308;
+      await developerFiles.attachProject(testProjDir, ownerId);
+
+      const blockedResult = await executeAutonomousCodingWorkflow({
+        userRequest: 'run the project',
+        root: testProjDir,
+        ownerWebContentsId: ownerId,
+        sessionId: crypto.randomUUID(),
+        onProgress: () => {},
+      });
+      assert.equal(blockedResult.outcome, 'BLOCKED', 'Execution gate must block unisolated execution.');
+      assert.notEqual(blockedResult.outcome, 'STARTED', 'Blocked execution must never report STARTED.');
+      assert.notEqual(blockedResult.outcome, 'COMPLETED', 'Blocked execution must never report COMPLETED.');
+      assert.equal(blockedResult.executionBlocked, true);
+      assert.equal(blockedResult.engineeringReport?.executedCommands?.[0]?.exitCode, null);
+    } finally {
+      await fs.rm(testProjDir, { recursive: true, force: true });
+    }
+
+    // Case 8: No production supervisor available
+    // Confirms system isolation status verified flag is false and rejects runtime claims
+    const currentStatus = projectProcessIsolationStatus();
+    assert.equal(currentStatus.verified, false, 'Production supervisor isolation must be unverified.');
+    const unverifiedSupervisorResult = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      pid: 9999,
+      supervisor: { isAlive: true, pid: 9999 },
+    });
+    assert.equal(unverifiedSupervisorResult.started, false, 'Must reject evidence when no production supervisor is available.');
+    assert.match(unverifiedSupervisorResult.reason, /no independently verified host process supervisor/i);
+
+    // Startup script is not configured
+    const noScriptDir = await makeTempDir('no-script-test-');
+    try {
+      await fs.writeFile(path.join(noScriptDir, 'package.json'), JSON.stringify({
+        name: 'no-script-app',
+        version: '1.0.0',
+        scripts: {},
+      }));
+      const ownerId = 309;
+      await developerFiles.attachProject(noScriptDir, ownerId);
+
+      const noScriptResult = await executeAutonomousCodingWorkflow({
+        userRequest: 'run the project',
+        root: noScriptDir,
+        ownerWebContentsId: ownerId,
+        sessionId: crypto.randomUUID(),
+        onProgress: () => {},
+      });
+      assert.equal(noScriptResult.outcome, 'NOT_CONFIGURED', 'Missing startup script must return NOT_CONFIGURED.');
+      assert.notEqual(noScriptResult.outcome, 'STARTED', 'Unconfigured script must never report STARTED.');
+      assert.notEqual(noScriptResult.outcome, 'COMPLETED', 'Unconfigured script must never report COMPLETED.');
+      assert.equal(noScriptResult.executionBlocked, true);
+      assert.equal(noScriptResult.buildPlan?.configured, false);
+      assert.ok(!noScriptResult.buildPlan?.fullCommandString, 'Must not fabricate a startup command.');
+    } finally {
+      await fs.rm(noScriptDir, { recursive: true, force: true });
+    }
+  }
+
   console.log('All CODING AGENT V3 — Verified Isolated Project Execution tests passed successfully!');
 
 }

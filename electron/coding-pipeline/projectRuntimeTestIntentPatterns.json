@@ -7,6 +7,8 @@
     "^(?:test|st)\\s+(?:the\\s+)?my\\s+project\\b[\\s\\S]{0,60}\\b(?:working|wroking|work|now)$",
     "^(?:install|download)\\s+(?:the\\s+)?(?:dependencies|deps|packages?|node_modules)\\s+(?:and|then)\\s+(?:(?:run\\s+(?:the\\s+)?tests?)|(?:test\\s+(?:the\\s+)?(?:project|app|application|it)))(?:\\s+(?:now|please|for me))?$",
     "^(?:npm|pnpm|yarn|bun)\\s+(?:install|i|add)\\s+(?:and|then)\\s+(?:(?:run\\s+(?:the\\s+)?tests?)|(?:test\\s+(?:the\\s+)?(?:project|app|application|it)))(?:\\s+(?:now|please|for me))?$",
-    "^(?:run\\s+(?:the\\s+)?tests?\\s+(?:and|then)\\s+(?:install|download)\\s+(?:the\\s+)?(?:dependencies|deps|packages?|node_modules))$"
+    "^(?:run\\s+(?:the\\s+)?tests?\\s+(?:and|then)\\s+(?:install|download)\\s+(?:the\\s+)?(?:dependencies|deps|packages?|node_modules))$",
+    "^(?:run|start|launch|boot|spin\\s+up|execute)\\s+(?:(?:the|my|this|our)\\s+)?(?:attached\\s+)?(?:project|app|application|workspace|server)(?:\\s+(?:now|please|for\\s+me|locally|in\\s+dev(?:\\s+mode)?))?$",
+    "^(?:build\\s+and\\s+(?:test|run)|(?:run|start)\\s+and\\s+test)\\s+(?:(?:the|my|this|our)\\s+)?(?:attached\\s+)?(?:project|app|application|workspace)(?:\\s+(?:now|please|for\\s+me))?$"
   ]
 }

@@ -66,6 +66,9 @@ function statusBadgeClasses(status: string): string {
     case 'FAILED':
       return 'bg-rose-500/20 text-rose-300 border-rose-500/40';
     case 'BLOCKED':
+    case 'BLOCKED_ISOLATION':
+    case 'NOT_CONFIGURED':
+    case 'TEST_NOT_CONFIGURED':
       return 'bg-amber-500/20 text-amber-300 border-amber-500/40';
     case 'CANCELLED':
     case 'KILLED':
@@ -73,8 +76,10 @@ function statusBadgeClasses(status: string): string {
     case 'INTERRUPTED':
       return 'bg-purple-500/20 text-purple-300 border-purple-500/40';
     case 'WAITING_FOR_APPROVAL':
+    case 'AWAITING_APPROVAL':
       return 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40 animate-pulse';
     case 'RUNNING':
+    case 'STARTED':
     case 'APPLYING':
     case 'VERIFYING':
     case 'INSPECTING':
@@ -94,9 +99,11 @@ export function TaskActivityPanel({ projectRoot, activeTaskId, onSelectTask }: T
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [expandedEvents, setExpandedEvents] = useState<Record<number, boolean>>({});
 
+  const isIpcAvailable = typeof window !== 'undefined' && Boolean(window.electronAPI?.listDeveloperTaskHistory);
+
   const fetchTaskList = useCallback(async () => {
     if (!window.electronAPI?.listDeveloperTaskHistory) {
-      setError('Task history IPC is not available in this environment.');
+      setError('Task history IPC is not available in this environment. Persistent task records are maintained by the desktop application.');
       return;
     }
     setLoading(true);
@@ -216,7 +223,14 @@ export function TaskActivityPanel({ projectRoot, activeTaskId, onSelectTask }: T
       </div>
 
       {error && (
-        <div role="alert" className="mb-3 rounded border border-rose-500/40 bg-rose-950/40 p-2 text-xs text-rose-300">
+        <div
+          role={isIpcAvailable ? 'alert' : 'status'}
+          className={`mb-3 rounded border p-2 text-xs ${
+            isIpcAvailable
+              ? 'border-rose-500/40 bg-rose-950/40 text-rose-300'
+              : 'border-slate-700/80 bg-slate-900/60 text-slate-400'
+          }`}
+        >
           {error}
         </div>
       )}
