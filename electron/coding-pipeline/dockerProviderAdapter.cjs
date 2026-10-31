@@ -1,4 +1,4 @@
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
@@ -11,6 +11,11 @@ const {
   createResultEnvelope,
   evaluateResultEnvelope,
   normalizeTimeoutMs,
+  evaluateDockerDaemonTrust,
+  bindDockerObservationEvidence,
+  evaluateDockerObservation,
+  DOCKER_DAEMON_TRUST_STATES,
+  DOCKER_OBSERVATION_STATES,
 } = require('./executionEvidenceContract.cjs');
 const {
   createCapabilityStateMap,
@@ -112,6 +117,217 @@ function runDockerCli(executable, args, timeoutMs = DEFAULT_DOCKER_CLI_TIMEOUT_M
   };
 }
 
+function runDockerCliAsync(executable, args, timeoutMsOrOptions = DEFAULT_DOCKER_CLI_TIMEOUT_MS, maybeOptions = {}, encoding = 'utf8') {
+  const opts = typeof timeoutMsOrOptions === 'number'
+    ? { timeoutMs: timeoutMsOrOptions, ...maybeOptions }
+    : (timeoutMsOrOptions && typeof timeoutMsOrOptions === 'object' ? { ...timeoutMsOrOptions } : {});
+  const timeoutMs = normalizeTimeoutMs(opts.timeoutMs ?? DEFAULT_DOCKER_CLI_TIMEOUT_MS, {
+    defaultMs: DEFAULT_DOCKER_CLI_TIMEOUT_MS,
+    maxMs: 300_000,
+  });
+  const enc = opts.encoding || encoding || 'utf8';
+  const signal = opts.signal || null;
+  const maxBuffer = opts.maxBuffer || MAX_DOCKER_OUTPUT_BYTES;
+
+  // Pre-launch cancellation check
+  if (signal?.aborted) {
+    return Promise.resolve({
+      status: null,
+      signal: 'SIGTERM',
+      timedOut: false,
+      cancelled: true,
+      error: 'ABORT_ERR: Execution was cancelled by caller before process launch.',
+      stdout: enc === 'buffer' ? Buffer.alloc(0) : '',
+      stderr: enc === 'buffer' ? Buffer.alloc(0) : '',
+    });
+  }
+
+  const environmentOverride = Object.entries(process.env)
+    .some(([name, value]) => ['DOCKER_HOST', 'DOCKER_CONTEXT'].includes(name.toUpperCase()) && String(value || '').trim());
+  const isContextInspection = Array.isArray(args) && args[0] === 'context';
+  const endpointArgs = isContextInspection
+    ? ['--context', 'default', ...args]
+    : validatedDockerEndpoint
+      ? ['--host', validatedDockerEndpoint, ...args]
+      : null;
+
+  if (environmentOverride || executable !== 'docker' || !Array.isArray(args)
+    || args.some((arg) => typeof arg !== 'string') || !endpointArgs) {
+    return Promise.resolve({
+      status: null,
+      signal: null,
+      timedOut: false,
+      cancelled: false,
+      error: 'BLOCKED: Docker CLI invocation has no validated local endpoint or uses an endpoint override.',
+      stdout: enc === 'buffer' ? Buffer.alloc(0) : '',
+      stderr: enc === 'buffer' ? Buffer.alloc(0) : '',
+    });
+  }
+
+  const env = { ...process.env };
+  delete env.DOCKER_HOST;
+  delete env.DOCKER_CONTEXT;
+  let execBinary = executable;
+  let finalArgs = endpointArgs;
+
+  if (process.platform === 'win32' && executable === 'docker') {
+    let hasNative = false;
+    try {
+      const probe = spawnSync('docker', ['--version'], { stdio: 'ignore', windowsHide: true });
+      hasNative = !probe.error || probe.error.code !== 'ENOENT';
+    } catch {
+      hasNative = false;
+    }
+    if (!hasNative) {
+      execBinary = 'wsl.exe';
+      const translatedArgs = endpointArgs.map((arg) => {
+        if (typeof arg === 'string' && /^[a-zA-Z]:[\/]/.test(arg)) {
+          return arg.replace(/^([a-zA-Z]):[\/](.*)$/, (_, drive, rest) => `/mnt/${drive.toLowerCase()}/${rest.replace(/\\/g, '/')}`);
+        }
+        return arg;
+      });
+      finalArgs = ['-d', 'Ubuntu', '--', 'docker', ...translatedArgs];
+    }
+  }
+
+  return new Promise((resolve) => {
+    let child = null;
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timedOut = false;
+    let cancelled = false;
+    let timer = null;
+    let killed = false;
+    let finished = false;
+
+    function cleanupListeners() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (signal && onAbort) {
+        signal.removeEventListener('abort', onAbort);
+      }
+    }
+
+    function killProcess(sig = 'SIGTERM') {
+      if (killed || !child || child.killed) return;
+      killed = true;
+      try {
+        child.kill(sig);
+      } catch {
+        // ignore if already exited
+      }
+      const forceTimer = setTimeout(() => {
+        if (!finished && child && !child.killed) {
+          try {
+            child.kill('SIGKILL');
+          } catch {}
+        }
+      }, 1000);
+      forceTimer.unref?.();
+    }
+
+    function onAbort() {
+      cancelled = true;
+      killProcess('SIGTERM');
+    }
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    if (timeoutMs > 0 && timeoutMs < 0x7FFFFFFF) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        killProcess('SIGKILL');
+      }, timeoutMs);
+    }
+
+    try {
+      child = spawn(execBinary, finalArgs, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        env,
+      });
+    } catch (spawnError) {
+      cleanupListeners();
+      return resolve({
+        status: null,
+        signal: null,
+        timedOut: false,
+        cancelled: false,
+        error: `SPAWN_ERROR: ${spawnError.code || 'PROCESS_ERROR'}: ${spawnError.message}`,
+        stdout: enc === 'buffer' ? Buffer.alloc(0) : '',
+        stderr: enc === 'buffer' ? Buffer.alloc(0) : '',
+      });
+    }
+
+    child.on('error', (err) => {
+      cleanupListeners();
+      if (finished) return;
+      finished = true;
+      resolve({
+        status: null,
+        signal: null,
+        timedOut: false,
+        cancelled,
+        error: `PROCESS_ERROR: ${err.code || 'ERROR'}: ${err.message}`,
+        stdout: enc === 'buffer' ? Buffer.concat(stdoutChunks) : Buffer.concat(stdoutChunks).toString(enc),
+        stderr: enc === 'buffer' ? Buffer.concat(stderrChunks) : Buffer.concat(stderrChunks).toString(enc),
+      });
+    });
+
+    if (child.stdout) {
+      child.stdout.on('data', (chunk) => {
+        if (stdoutBytes < maxBuffer) {
+          stdoutChunks.push(chunk);
+          stdoutBytes += chunk.length;
+        }
+      });
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', (chunk) => {
+        if (stderrBytes < maxBuffer) {
+          stderrChunks.push(chunk);
+          stderrBytes += chunk.length;
+        }
+      });
+    }
+
+    child.on('close', (code, sig) => {
+      cleanupListeners();
+      if (finished) return;
+      finished = true;
+
+      const rawStdoutBuf = Buffer.concat(stdoutChunks);
+      const rawStderrBuf = Buffer.concat(stderrChunks);
+      const out = enc === 'buffer' ? rawStdoutBuf : rawStdoutBuf.toString(enc);
+      const err = enc === 'buffer' ? rawStderrBuf : rawStderrBuf.toString(enc);
+
+      let errorMsg = null;
+      if (timedOut) {
+        errorMsg = 'ETIMEDOUT: Docker CLI execution timed out.';
+      } else if (cancelled) {
+        errorMsg = 'ABORT_ERR: Docker CLI execution was cancelled by caller.';
+      }
+
+      resolve({
+        status: code,
+        signal: sig || (cancelled ? 'SIGTERM' : (timedOut ? 'SIGKILL' : null)),
+        timedOut,
+        cancelled,
+        error: errorMsg,
+        stdout: out,
+        stderr: err,
+      });
+    });
+  });
+}
+
 function validateDockerEndpointPolicy({ contextName, endpoint, environment = process.env, platform = process.platform } = {}) {
   if (!environment || typeof environment !== 'object' || Array.isArray(environment)) {
     return { valid: false, reasonCode: 'DOCKER_ENVIRONMENT_INVALID' };
@@ -129,6 +345,9 @@ function validateDockerEndpointPolicy({ contextName, endpoint, environment = pro
   }
 
   const normalizedEndpoint = endpoint.trim().toLowerCase();
+  if (normalizedEndpoint.startsWith('tcp://') || normalizedEndpoint.startsWith('http://') || normalizedEndpoint.startsWith('https://')) {
+    return { valid: false, reasonCode: 'DOCKER_TCP_ENDPOINT_UNAUTHENTICATED' };
+  }
   if (platform === 'win32') {
     const isWslUnix = normalizedEndpoint === 'unix:///var/run/docker.sock'
       || /^unix:\/\/\/[^?#\r\n]+$/.test(normalizedEndpoint);
@@ -196,6 +415,7 @@ function inspectDockerHost(options = {}) {
     hasDockerCli: false,
     runtimeAvailable: false,
     independentlyVerified: false,
+    daemonTrust: 'NOT_ESTABLISHED',
     serverVersion: null,
     operatingSystem: null,
     architecture: null,
@@ -245,6 +465,7 @@ function inspectDockerHost(options = {}) {
     hasDockerCli,
     runtimeAvailable: daemonAvailable,
     independentlyVerified: false,
+    daemonTrust: 'NOT_ESTABLISHED',
     serverVersion: serverVersion || null,
     operatingSystem: infoData?.OperatingSystem || null,
     architecture: infoData?.Architecture || null,
@@ -818,6 +1039,68 @@ function getDockerCapabilities(config = {}) {
     outputCap: false,
     cancellation: false,
     cleanupEvidence: runtime.cleanupEvidence,
+    capabilityEvidence: {
+      readOnlyRootfs: {
+        name: 'readOnlyRootfs',
+        evidenceSource: 'docker_cli_config',
+        evidenceClass: 'CALLER_CONFIGURATION',
+        daemonState: 'DAEMON_REPORTED',
+        kernelEnforcement: 'NOT_VERIFIED',
+        verificationMethod: 'CONFIGURATION_ONLY',
+        verificationState: 'NOT_VERIFIED',
+        limitation: 'Configured via --read-only; runtime write restriction not independently attested.',
+      },
+      egressFiltering: {
+        name: 'egressFiltering',
+        evidenceSource: 'docker_network_config',
+        evidenceClass: 'CALLER_CONFIGURATION',
+        daemonState: 'DAEMON_REPORTED',
+        kernelEnforcement: 'NOT_VERIFIED',
+        verificationMethod: 'CONFIGURATION_ONLY',
+        verificationState: 'NOT_VERIFIED',
+        limitation: 'Bridge network mode does not enforce default-deny egress filtering.',
+      },
+      resourceLimits: {
+        name: 'resourceLimits',
+        evidenceSource: 'docker_cgroup_config',
+        evidenceClass: 'CALLER_CONFIGURATION',
+        daemonState: 'DAEMON_REPORTED',
+        kernelEnforcement: 'NOT_VERIFIED',
+        verificationMethod: 'CONFIGURATION_ONLY',
+        verificationState: 'NOT_VERIFIED',
+        limitation: 'CPU, memory, and PID flags configured in launch arguments without cgroup enforcement verification.',
+      },
+      filesystemIsolation: {
+        name: 'filesystemIsolation',
+        evidenceSource: 'docker_bind_mount_config',
+        evidenceClass: 'CALLER_CONFIGURATION',
+        daemonState: 'DAEMON_REPORTED',
+        kernelEnforcement: 'NOT_VERIFIED',
+        verificationMethod: 'CONFIGURATION_ONLY',
+        verificationState: 'NOT_VERIFIED',
+        limitation: 'Workspace staging directory and bind mounts configured without cryptographic isolation attestation.',
+      },
+      containerCleanup: {
+        name: 'containerCleanup',
+        evidenceSource: 'docker_cli_teardown',
+        evidenceClass: 'PROVIDER_REPORTED',
+        daemonState: 'DAEMON_REPORTED',
+        kernelEnforcement: 'NOT_VERIFIED',
+        verificationMethod: 'CONFIGURATION_ONLY',
+        verificationState: 'NOT_VERIFIED',
+        limitation: 'Docker CLI termination does not independently prove container workload has stopped.',
+      },
+      runtimeSupervisor: {
+        name: 'runtimeSupervisor',
+        evidenceSource: 'docker_daemon',
+        evidenceClass: 'DAEMON_REPORTED',
+        daemonState: 'DAEMON_REPORTED',
+        kernelEnforcement: 'NOT_VERIFIED',
+        verificationMethod: 'NONE',
+        verificationState: 'NOT_VERIFIED',
+        limitation: 'Docker availability does not imply a trusted application process supervisor.',
+      },
+    },
   };
 }
 
@@ -1048,4 +1331,10 @@ module.exports = {
   validateObservedContainerConfiguration,
   validateDockerLaunchRequest,
   runDockerCli,
+  runDockerCliAsync,
+  evaluateDockerDaemonTrust,
+  bindDockerObservationEvidence,
+  evaluateDockerObservation,
+  DOCKER_DAEMON_TRUST_STATES,
+  DOCKER_OBSERVATION_STATES,
 };

@@ -65,16 +65,24 @@ class IsolationProviderRegistry {
   }
 
   _normalizeDescriptor(raw) {
+    const rawStatus = raw.capabilityVerificationStatus;
+    const isAttested = Boolean(raw.authenticatedAttestation || raw._authenticatedAttestation);
+    // Unauthenticated callers cannot register an unverified provider directly as CAPABILITY_VERIFIED or READY
+    let safeStatus = rawStatus || PROVIDER_STATUSES.UNKNOWN;
+    if ((safeStatus === PROVIDER_STATUSES.CAPABILITY_VERIFIED || safeStatus === PROVIDER_STATUSES.READY) && !isAttested) {
+      safeStatus = PROVIDER_STATUSES.BLOCKED;
+    }
+
     return Object.freeze({
       providerId: String(raw.providerId),
       version: String(raw.version || '0.0.0'),
-      supportedPlatforms: Array.isArray(raw.supportedPlatforms) ? [...raw.supportedPlatforms] : [process.platform],
+      supportedPlatforms: Object.freeze(Array.isArray(raw.supportedPlatforms) ? [...raw.supportedPlatforms] : [process.platform]),
       isolationLevel: raw.isolationLevel || ISOLATION_LEVELS.NONE,
-      availability: {
+      availability: Object.freeze({
         isInstalled: Boolean(raw.availability?.isInstalled),
         isRunning: Boolean(raw.availability?.isRunning),
         health: String(raw.availability?.health || 'UNKNOWN'),
-      },
+      }),
       filesystemCapabilities: Object.freeze({
         ephemeralCopyOnWrite: Boolean(raw.filesystemCapabilities?.ephemeralCopyOnWrite),
         readOnlyRoot: Boolean(raw.filesystemCapabilities?.readOnlyRoot),
@@ -100,10 +108,10 @@ class IsolationProviderRegistry {
       }),
       evidenceSource: raw.evidenceSource ? String(raw.evidenceSource) : null,
       verificationTimestamp: raw.verificationTimestamp ? String(raw.verificationTimestamp) : null,
-      capabilityVerificationStatus: raw.capabilityVerificationStatus || PROVIDER_STATUSES.UNKNOWN,
-      unverifiedRequirements: Array.isArray(raw.unverifiedRequirements) ? [...raw.unverifiedRequirements] : [],
+      capabilityVerificationStatus: safeStatus,
+      unverifiedRequirements: Object.freeze(Array.isArray(raw.unverifiedRequirements) ? [...raw.unverifiedRequirements] : []),
       isReady: false, // Default fail-closed: discovery never sets isReady = true automatically
-      blockingReasons: Array.isArray(raw.blockingReasons) ? [...raw.blockingReasons] : ['Provider capability has not been independently verified.'],
+      blockingReasons: Object.freeze(Array.isArray(raw.blockingReasons) ? [...raw.blockingReasons] : ['Provider capability has not been independently verified.']),
     });
   }
 }

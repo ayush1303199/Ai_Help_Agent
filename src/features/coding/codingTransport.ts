@@ -359,9 +359,31 @@ interface ProjectRuntimeTestWorkflowResult {
   } | null;
 }
 
-interface ProjectRuntimeWorkspaceAudit {
-  findings?: Array<{ message?: string } | string>;
-  bugs?: Array<{ path?: string; line?: number | null; description?: string }>;
+export interface ProjectRuntimeWorkspaceFinding {
+  message?: string;
+  severity?: string;
+  source?: string;
+  paths?: string[];
+  evidence?: unknown;
+  status?: string;
+}
+
+export interface ProjectRuntimeWorkspaceBug {
+  path?: string;
+  line?: number | null;
+  description?: string;
+  severity?: string;
+  source?: string;
+  evidence?: unknown;
+  status?: string;
+}
+
+export interface ProjectRuntimeWorkspaceAudit {
+  status?: string;
+  reason?: string;
+  incomplete?: boolean;
+  findings?: Array<ProjectRuntimeWorkspaceFinding | string>;
+  bugs?: Array<ProjectRuntimeWorkspaceBug>;
   syncPlan?: Array<{ path?: string; action?: string; reason?: string }>;
   dependencies?: { declared?: string[]; nodeModulesPresent?: boolean };
   environment?: { envExamplePresent?: boolean; envFilePresent?: boolean; jsxFiles?: string[] };
@@ -392,19 +414,90 @@ function nonEmptyArray<T>(...values: Array<T[] | undefined>): T[] {
   return values.find((value) => Array.isArray(value) && value.length > 0) || [];
 }
 
-function formatWorkspaceAudit(audit: ProjectRuntimeWorkspaceAudit): string {
-  const findings = (audit.findings || [])
-    .map((finding) => typeof finding === 'string' ? finding : finding.message)
-    .filter((message): message is string => typeof message === 'string' && message.trim().length > 0);
-  const bugs = (audit.bugs || []).map((bug) => (
-    `- ${bug.path || 'workspace'}${bug.line ? `:${bug.line}` : ''}: ${bug.description || 'Detected source issue.'}`
-  ));
-  const syncPlan = (audit.syncPlan || []).map((item) => (
+export function formatWorkspaceFinding(
+  finding: ProjectRuntimeWorkspaceFinding | string,
+): string {
+  if (typeof finding === 'string') return finding;
+  const parts: string[] = [];
+  if (finding.severity && !finding.message?.toUpperCase().includes(finding.severity.toUpperCase())) {
+    parts.push(`[${finding.severity.toUpperCase()}]`);
+  }
+  if (finding.source && !finding.message?.includes(finding.source)) {
+    parts.push(`(${finding.source})`);
+  }
+  if (finding.message) {
+    parts.push(finding.message);
+  }
+  if (finding.paths && Array.isArray(finding.paths) && finding.paths.length > 0 && !finding.message?.includes(finding.paths[0])) {
+    parts.push(`(Paths: ${finding.paths.join(', ')})`);
+  }
+  if (finding.status) {
+    parts.push(`[Status: ${finding.status}]`);
+  }
+  if (finding.evidence) {
+    const evidenceStr = typeof finding.evidence === 'string'
+      ? finding.evidence
+      : JSON.stringify(finding.evidence);
+    parts.push(`(Evidence: ${evidenceStr})`);
+  }
+  return parts.join(' ').trim() || 'Unspecified workspace finding.';
+}
+
+export function formatWorkspaceBug(
+  bug: ProjectRuntimeWorkspaceBug,
+): string {
+  const loc = `${bug.path || 'workspace'}${bug.line ? `:${bug.line}` : ''}`;
+  const severity = bug.severity ? `[${bug.severity.toUpperCase()}] ` : '';
+  const source = bug.source ? `(${bug.source}) ` : '';
+  const desc = bug.description || 'Detected source issue.';
+  const status = bug.status ? ` [Status: ${bug.status}]` : '';
+  const evidence = bug.evidence
+    ? ` (Evidence: ${typeof bug.evidence === 'string' ? bug.evidence : JSON.stringify(bug.evidence)})`
+    : '';
+  return `- ${severity}${source}${loc}: ${desc}${status}${evidence}`;
+}
+
+export function formatWorkspaceAudit(audit: ProjectRuntimeWorkspaceAudit): string {
+  if (audit.status === 'AUDIT_UNAVAILABLE') {
+    return [
+      'Workspace Audit: AUDIT_UNAVAILABLE',
+      audit.reason || 'Workspace audit was not executed or audit details were not included in the verification response; environment and source findings could not be assessed.',
+    ].join('\n');
+  }
+
+  if (audit.status === 'INCOMPLETE' || audit.incomplete === true) {
+    const rawFindings = Array.isArray(audit.findings) ? audit.findings : [];
+    const findings = rawFindings
+      .map(formatWorkspaceFinding)
+      .filter((msg) => msg.trim().length > 0);
+    return [
+      'Workspace Audit: INCOMPLETE',
+      audit.reason || 'Workspace audit was incomplete; environment and source findings may be partial.',
+      ...(findings.length ? findings.map((f) => f.startsWith('-') ? f : `- ${f}`) : []),
+    ].join('\n');
+  }
+
+  const rawFindings = Array.isArray(audit.findings) ? audit.findings : [];
+  const findings = rawFindings
+    .map(formatWorkspaceFinding)
+    .filter((message) => message.trim().length > 0);
+  const rawBugs = Array.isArray(audit.bugs) ? audit.bugs : [];
+  const bugs = rawBugs.map(formatWorkspaceBug);
+  const rawSyncPlan = Array.isArray(audit.syncPlan) ? audit.syncPlan : [];
+  const syncPlan = rawSyncPlan.map((item) => (
     `- ${item.action || 'REVIEW'} ${item.path || 'workspace'}: ${item.reason || 'Review against the workspace contract.'}`
   ));
+
+  const hasIssues = findings.length > 0 || bugs.length > 0 || audit.status === 'ISSUES_FOUND';
+  const header = hasIssues
+    ? 'Detected Workspace Issues & Readiness Audit:'
+    : 'Workspace Audit: NO_BLOCKING_ISSUES';
+
   return [
-    'Detected Workspace Issues & Readiness Audit:',
-    ...(findings.length ? findings : ['No workspace environment gaps or cross-file drift were detected in the inspected paths.']),
+    header,
+    ...(findings.length
+      ? findings.map((f) => f.startsWith('-') ? f : `- ${f}`)
+      : ['No workspace environment gaps or cross-file drift were detected in the inspected paths.']),
     bugs.length ? `Detected Bugs:\n${bugs.join('\n')}` : 'Detected Bugs: None found by the source, contract, and import checks.',
     ...(syncPlan.length ? [`Repair/sync plan:\n${syncPlan.join('\n')}`] : []),
   ].join('\n');
@@ -416,8 +509,16 @@ export function formatProjectRuntimeTestReceiptMessage(
   detectedWorkspaceIssues: Array<{ message?: string } | string> | undefined = undefined,
 ): string | undefined {
   const marker = 'Detected Workspace Issues & Readiness Audit';
+  const altMarker1 = 'Workspace Audit: NO_BLOCKING_ISSUES';
+  const altMarker2 = 'Workspace Audit: AUDIT_UNAVAILABLE';
+  const altMarker3 = 'Workspace Audit: INCOMPLETE';
+
   const text = typeof message === 'string' ? message : '';
-  const existingAuditStart = text.indexOf(marker);
+  let existingAuditStart = text.indexOf(marker);
+  if (existingAuditStart < 0) existingAuditStart = text.indexOf(altMarker1);
+  if (existingAuditStart < 0) existingAuditStart = text.indexOf(altMarker2);
+  if (existingAuditStart < 0) existingAuditStart = text.indexOf(altMarker3);
+
   let existingAudit = '';
   let receiptBody = text;
   if (existingAuditStart >= 0) {
@@ -435,9 +536,9 @@ export function formatProjectRuntimeTestReceiptMessage(
   const auditMessage = effectiveAudit
     ? formatWorkspaceAudit(effectiveAudit)
     : existingAudit
-      ? `${existingAudit.replace(/^Detected Workspace Issues & Readiness Audit:?/, 'Detected Workspace Issues & Readiness Audit:')}`
+      ? existingAudit
       : [
-          'Detected Workspace Issues & Readiness Audit:',
+          'Workspace Audit: AUDIT_UNAVAILABLE',
           'Workspace audit details were not included in the verification response; environment and source findings could not be assessed.',
         ].join('\n');
   return [receiptBody, auditMessage].filter(Boolean).join('\n\n');
@@ -618,7 +719,13 @@ export function normalizeProjectRuntimeTestWorkflowResult<T extends ProjectRunti
     result.hermeticVerification?.workspaceAudit?.engineeringAnalysis,
     result.hermeticVerification?.workspaceAudit?.engineeringSummary,
   );
-  const resultMessage = result.message || receipt?.message;
+  if (workspaceAudit) {
+    result.workspaceAudit = workspaceAudit;
+  }
+  if (detectedWorkspaceIssues) {
+    result.detectedWorkspaceIssues = detectedWorkspaceIssues;
+  }
+  const resultMessage = result.message || (result as { reason?: string }).reason || receipt?.message;
   result.message = formatProjectRuntimeTestReceiptMessage(resultMessage, workspaceAudit, detectedWorkspaceIssues);
   if (result.outcome === 'VERIFICATION_BLOCKED') {
     result.codeVerified = false;

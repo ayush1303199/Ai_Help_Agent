@@ -1412,7 +1412,15 @@ export function useCodingAgentController({
         } else if (result.outcome === 'STARTED') {
           outcomeContent = `Application startup initiated: ${result.message || 'Application started successfully under verified isolation.'}`;
         } else if (result.outcome === 'FAILED') {
-          outcomeContent = `Execution failed after starting${result.phase ? ` during ${result.phase}` : ''}: ${result.reason || result.message || 'The application or process exited with an error.'}`;
+          const rawResult = result as Record<string, unknown>;
+          const rawBuildResult = rawResult?.buildResult as { stderr?: string; reason?: string } | undefined;
+          const failureDetail = result.reason
+            || (result.message && !result.message.startsWith('Workspace Audit:') && !result.message.startsWith('Detected Workspace Issues') ? result.message : '')
+            || rawBuildResult?.stderr
+            || rawBuildResult?.reason
+            || (result.message ? result.message.split('\n\n')[0] : '')
+            || 'The application or process exited with an error.';
+          outcomeContent = `Execution failed after starting${result.phase ? ` during ${result.phase}` : ''}: ${failureDetail}`;
         } else if (result.outcome === 'CANCELLED') {
           outcomeContent = 'The workflow was cancelled.';
         } else {

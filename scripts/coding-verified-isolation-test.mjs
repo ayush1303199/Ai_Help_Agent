@@ -2530,6 +2530,137 @@ async function runVerifiedIsolationTests() {
     assert.equal(unverifiedSupervisorResult.started, false, 'Must reject evidence when no production supervisor is available.');
     assert.match(unverifiedSupervisorResult.reason, /no independently verified host process supervisor/i);
 
+    // -------------------------------------------------------------------------
+    // V44.18: Decouple Process Isolation Verification from Runtime Supervisor Trust
+    // [SYNTHETIC TEST] Contract behavior verified via isolated mock runner; does NOT attest live host execution.
+    // -------------------------------------------------------------------------
+    const { projectProcessSupervisorStatus } = require('../electron/coding-pipeline/projectProcessIsolation.cjs');
+
+    // Confirm that the independent supervisor contract is unavailable/unverified by default
+    const currentSupervisorStatus = projectProcessSupervisorStatus();
+    assert.equal(currentSupervisorStatus.available, false, 'Runtime supervisor must be unavailable in production.');
+    assert.equal(currentSupervisorStatus.verified, false, 'Runtime supervisor must be unverified in production.');
+
+    // 1. Isolation unverified, supervisor unverified
+    const decCase1 = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 61001,
+      supervisor: { isAlive: true, pid: 61001 },
+    }, { isolationStatus: { verified: false, available: false } });
+    assert.equal(decCase1.started, false, 'Case 1: Isolation unverified + supervisor unverified must NOT produce started=true.');
+    assert.match(decCase1.reason, /operating system process isolation is unverified|no independently verified host process supervisor/i);
+
+    // 2. Isolation verified, supervisor unavailable
+    const decCase2 = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 61002,
+      supervisor: { isAlive: true, pid: 61002 },
+    }, { isolationStatus: { verified: true, available: true } });
+    assert.equal(decCase2.started, false, 'Case 2: Isolation verified + supervisor unavailable must NOT produce started=true.');
+    assert.match(decCase2.reason, /process isolation verification does not authenticate application runtime supervision|no independently verified host process supervisor/i);
+    assert.equal(decCase2.isolationVerified, true);
+    assert.equal(decCase2.supervisorVerified, false);
+
+    // 3. Isolation verified, fabricated supervisor object
+    const decCase3 = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 61003,
+      supervisor: {
+        isAlive: true,
+        pid: 61003,
+        name: 'FabricatedSupervisorDaemon',
+        trusted: true,
+        attestation: 'fake-signature',
+      },
+    }, { isolationStatus: { verified: true, available: true } });
+    assert.equal(decCase3.started, false, 'Case 3: Isolation verified + fabricated supervisor object must NOT produce started=true.');
+    assert.match(decCase3.reason, /process isolation verification does not authenticate application runtime supervision|no independently verified host process supervisor/i);
+
+    // 4. Isolation verified, fabricated PID and matching identity strings
+    const decCase4 = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 61004,
+      supervisor: {
+        isAlive: true,
+        pid: 61004,
+        expectedPid: 61004,
+        processIdentity: 'identical-proc-uuid-999',
+        expectedProcessIdentity: 'identical-proc-uuid-999',
+      },
+    }, { isolationStatus: { verified: true, available: true } });
+    assert.equal(decCase4.started, false, 'Case 4: Isolation verified + matching identity strings must NOT produce started=true.');
+    assert.match(decCase4.reason, /process isolation verification does not authenticate application runtime supervision|no independently verified host process supervisor/i);
+
+    // 5. Isolation verified, injected/mock runner claims
+    const decCase5 = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 61005,
+      isMockRunner: true,
+      supervisor: {
+        isAlive: true,
+        pid: 61005,
+        source: 'mock',
+      },
+    }, { isolationStatus: { verified: true, available: true } });
+    assert.equal(decCase5.started, false, 'Case 5: Isolation verified + mock runner claims must NOT produce started=true.');
+    assert.match(decCase5.reason, /process isolation verification does not authenticate application runtime supervision|mock or replayed supervisor evidence/i);
+
+    // 6. Isolation verified, replayed supervisor evidence
+    const decCase6 = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 61006,
+      supervisor: {
+        isAlive: true,
+        pid: 61006,
+        replayedNonce: 'prior-nonce-777',
+      },
+    }, { isolationStatus: { verified: true, available: true } });
+    assert.equal(decCase6.started, false, 'Case 6: Isolation verified + replayed evidence must NOT produce started=true.');
+    assert.match(decCase6.reason, /process isolation verification does not authenticate application runtime supervision|mock or replayed supervisor evidence/i);
+
+    // 7. Supervisor evidence supplied without an independently trusted producer
+    const decCase7 = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 61007,
+      supervisor: {
+        isAlive: true,
+        pid: 61007,
+        producer: 'untrusted-runner-guest-payload',
+      },
+      supervisorStatus: {
+        available: true,
+        verified: true, // Caller/runner attempting to supply supervisorStatus directly
+      },
+    }, { isolationStatus: { verified: true, available: true } });
+    assert.equal(decCase7.started, false, 'Case 7: Runner-supplied supervisorStatus must NOT bypass independent contract.');
+    assert.match(decCase7.reason, /process isolation verification does not authenticate application runtime supervision|no independently verified host process supervisor/i);
+    assert.equal(decCase7.supervisorVerified, false);
+
+    // 8. Both conditions unavailable
+    const decCase8 = evaluateApplicationRuntimeEvidence({
+      ok: true,
+      exitCode: null,
+      isAlive: true,
+      pid: 61008,
+      supervisor: { isAlive: true, pid: 61008 },
+    }, { isolationStatus: { verified: false, available: false } });
+    assert.equal(decCase8.started, false, 'Case 8: Both conditions unavailable must NOT produce started=true.');
+    assert.match(decCase8.reason, /operating system process isolation is unverified|no independently verified host process supervisor/i);
+
     // Startup script is not configured
     const noScriptDir = await makeTempDir('no-script-test-');
     try {
@@ -2557,6 +2688,1311 @@ async function runVerifiedIsolationTests() {
     } finally {
       await fs.rm(noScriptDir, { recursive: true, force: true });
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // 14. Testing Docker Root Filesystem Hardening & Guaranteed Cleanup (Milestone V44.23)
+  // -------------------------------------------------------------------------
+  console.log('14. Testing Docker Root Filesystem Hardening & Guaranteed Cleanup (Milestone V44.23)...');
+  {
+    const { DEFAULT_TMPFS_CONFIG, validateContainerRunArgs, ProjectContainerExecutionRunner } = require('../electron/coding-pipeline/projectContainerExecutionRunner.cjs');
+    assert.equal(DEFAULT_TMPFS_CONFIG, '/tmp:rw,noexec,nosuid,nodev,size=64m');
+    assert.throws(() => validateContainerRunArgs(['run']), /missing required --read-only/);
+    assert.throws(() => validateContainerRunArgs(['run', '--read-only']), /missing required --tmpfs/);
+    assert.equal(validateContainerRunArgs(['run', '--read-only', '--tmpfs', DEFAULT_TMPFS_CONFIG]), true);
+
+    // Verify runner produces isolation evidence reflecting readOnlyRoot and bounded tmpfs
+    const mockRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: (bin, args) => {
+        if (args && args[0] === 'ps') return { status: 0, stdout: '', stderr: '' };
+        return { status: 0, stdout: 'PASS', stderr: '' };
+      },
+      isMock: true,
+    });
+    const tempRoot = await makeTempDir('v44-23-iso-');
+    await fs.writeFile(path.join(tempRoot, 'package.json'), JSON.stringify({ name: 'iso-test', scripts: { test: 'node -e "process.exit(0)"' } }));
+    const ownerId = 4423;
+    await developerFiles.attachProject(tempRoot, ownerId);
+    const plan = await createBuildPlan({ projectRoot: tempRoot, operation: BUILD_OPERATIONS.TEST });
+    const res = await mockRunner.execute({ plan, ownerWebContentsId: ownerId, sessionId: crypto.randomUUID() });
+    assert.equal(res.ok, true);
+    assert.equal(res.cleanupStatus, 'HOST_VERIFIED_CLEANED');
+    assert.equal(res.isolationEvidence.readOnlyRoot, true);
+    assert.equal(res.isolationEvidence.tmpfsMount, DEFAULT_TMPFS_CONFIG);
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // 15. Testing Asynchronous Docker Execution & Real In-Flight Cancellation (Milestone V44.24)
+  // -------------------------------------------------------------------------
+  console.log('15. Testing Asynchronous Docker Execution & Real In-Flight Cancellation (Milestone V44.24)...');
+  {
+    const { runDockerCliAsync } = require('../electron/coding-pipeline/dockerProviderAdapter.cjs');
+    const { ProjectContainerExecutionRunner } = require('../electron/coding-pipeline/projectContainerExecutionRunner.cjs');
+
+    assert.equal(typeof runDockerCliAsync, 'function', 'runDockerCliAsync must be exported');
+
+    // Pre-launch cancellation
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const abortRes = await runDockerCliAsync('docker', ['run', 'alpine'], { signal: ctrl.signal });
+    assert.equal(abortRes.cancelled, true);
+    assert.equal(abortRes.signal, 'SIGTERM');
+    assert.match(abortRes.error, /cancelled by caller before process launch/i);
+
+    // Runner default uses runDockerCliAsync
+    const runner = new ProjectContainerExecutionRunner();
+    assert.equal(runner.dockerCli, runDockerCliAsync);
+    assert.equal(runner.isMockRunner, false);
+
+    // Fail-closed gate preservation: runner without verified runtime blocks execution
+    const tempRoot = await makeTempDir('v44-24-gate-');
+    await fs.writeFile(path.join(tempRoot, 'package.json'), JSON.stringify({ name: 'gate-test', scripts: { test: 'node -e "process.exit(0)"' } }));
+    const ownerId = 4425;
+    await developerFiles.attachProject(tempRoot, ownerId);
+    const plan = await createBuildPlan({ projectRoot: tempRoot, operation: BUILD_OPERATIONS.TEST });
+
+    const blockedRes = await runner.execute({ plan, ownerWebContentsId: ownerId, sessionId: crypto.randomUUID() });
+    assert.equal(blockedRes.ok, false);
+    assert.equal(blockedRes.status, 'BLOCKED');
+    assert.equal(blockedRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.equal(blockedRes.executionBlocked, true);
+
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // 16. Testing Trustworthy Docker Capability Discovery & Provenance (Milestone V44.25)
+  // -------------------------------------------------------------------------
+  console.log('16. Testing Trustworthy Docker Capability Discovery & Provenance (Milestone V44.25)...');
+  {
+    const { discoverDocker } = require('../electron/coding-pipeline/isolationRuntimeDiscovery.cjs');
+    const { ContainerProvider } = require('../electron/coding-pipeline/providers/containerProvider.cjs');
+    const { defaultRegistry } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+    const { ProjectContainerExecutionRunner, DEFAULT_TMPFS_CONFIG, validateContainerRunArgs } = require('../electron/coding-pipeline/projectContainerExecutionRunner.cjs');
+    const { projectProcessSupervisorStatus, projectProcessIsolationStatus } = require('../electron/coding-pipeline/projectProcessIsolation.cjs');
+
+    // 16.1: Docker CLI available but daemon unavailable
+    const cliOnlyMock = (cmd) => {
+      if (cmd.includes('--version')) return { succeeded: true, exitCode: 0, stdout: 'Docker version 28.3.2, build 5335920', stderr: '' };
+      return { succeeded: false, exitCode: 1, stdout: '', stderr: 'error during connect: daemon not running' };
+    };
+    const cliOnlyCandidate = discoverDocker({ commandRunner: cliOnlyMock });
+    assert.equal(cliOnlyCandidate.available, true, 'CLI availability must be true when docker --version succeeds');
+    assert.equal(cliOnlyCandidate.healthCheck.succeeded, false, 'Daemon probe must be false when daemon not responding');
+    assert.equal(cliOnlyCandidate.isolationVerified, false, 'Isolation must NOT be verified when daemon is down');
+    const regCliOnly = defaultRegistry.getProvider('docker');
+    assert.equal(regCliOnly.isReady, false, 'Provider must not be ready when daemon unavailable');
+    assert.equal(regCliOnly.capabilityVerificationStatus, 'BLOCKED');
+
+    // 16.2: Docker daemon available and hello-world successful -> isolationVerified MUST STILL BE FALSE
+    const daemonOkMock = (cmd) => {
+      if (cmd.includes('--version')) return { succeeded: true, exitCode: 0, stdout: 'Docker version 28.3.2, build 5335920', stderr: '' };
+      if (cmd.includes('hello-world')) return { succeeded: true, exitCode: 0, stdout: 'Hello from Docker!', stderr: '' };
+      return { succeeded: true, exitCode: 0, stdout: '', stderr: '' };
+    };
+    const daemonOkCandidate = discoverDocker({ commandRunner: daemonOkMock });
+    assert.equal(daemonOkCandidate.available, true);
+    assert.equal(daemonOkCandidate.healthCheck.succeeded, true, 'hello-world probe succeeded');
+    assert.equal(daemonOkCandidate.isolationVerified, false, 'hello-world success must NEVER verify security isolation');
+    const regDaemonOk = defaultRegistry.getProvider('docker');
+    assert.equal(regDaemonOk.isReady, false, 'Docker must not be marked isReady: true merely because hello-world succeeded');
+    assert.equal(regDaemonOk.capabilityVerificationStatus, 'BLOCKED');
+    assert.ok(regDaemonOk.blockingReasons.some(r => r.includes('availability probe does not establish runtime security verification')));
+
+    // 16.3: Successful probe does not verify unrelated security capabilities
+    assert.equal(daemonOkCandidate.capabilities.readOnlyRootfs.verificationState, 'NOT_VERIFIED');
+    assert.equal(daemonOkCandidate.capabilities.egressFiltering.verificationState, 'NOT_VERIFIED');
+    assert.equal(daemonOkCandidate.capabilities.resourceLimits.verificationState, 'NOT_VERIFIED');
+    assert.equal(daemonOkCandidate.capabilities.filesystemIsolation.verificationState, 'NOT_VERIFIED');
+    assert.equal(daemonOkCandidate.capabilities.containerCleanup.verificationState, 'NOT_VERIFIED');
+    assert.equal(daemonOkCandidate.capabilities.runtimeSupervisor.verificationState, 'NOT_VERIFIED');
+
+    assert.equal(regDaemonOk.filesystemCapabilities.readOnlyRoot, false);
+    assert.equal(regDaemonOk.networkCapabilities.egressFiltering, false);
+    assert.equal(regDaemonOk.resourceLimits.memoryCapSupported, false);
+    assert.equal(regDaemonOk.resourceLimits.cpuThrottlingSupported, false);
+    assert.equal(regDaemonOk.processCapabilities.independentProcessTree, false);
+
+    // 16.4: Configured --read-only is configuration evidence, not runtime enforcement
+    const tempDir = await makeTempDir('v44-25-audit-');
+    await fs.writeFile(path.join(tempDir, 'package.json'), JSON.stringify({ name: 'audit-test', scripts: { test: 'node -e "process.exit(0)"' } }));
+    const ownerId = 4426;
+    await developerFiles.attachProject(tempDir, ownerId);
+    const plan = await createBuildPlan({ projectRoot: tempDir, operation: BUILD_OPERATIONS.TEST });
+
+    const mockRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: (bin, args) => {
+        if (args && args[0] === 'ps') return { status: 0, stdout: '', stderr: '' };
+        return { status: 0, stdout: 'test-pass', stderr: '' };
+      },
+      isMock: true,
+    });
+    const runResult = await mockRunner.execute({ plan, ownerWebContentsId: ownerId, sessionId: crypto.randomUUID() });
+    assert.equal(runResult.ok, true);
+    assert.equal(runResult.isolationEvidence.readOnlyRoot, true, 'Configuration evidence preserved');
+    assert.equal(runResult.isolationEvidence.capabilityEvidence.readOnlyRootfs.configured, true);
+    assert.equal(runResult.isolationEvidence.capabilityEvidence.readOnlyRootfs.runtimeEnforcement, 'NOT_VERIFIED');
+    assert.equal(runResult.isolationEvidence.capabilityEvidence.readOnlyRootfs.verificationMethod, 'CLI_FLAG_CONFIGURATION');
+
+    // 16.5: --network=bridge does not imply egress filtering
+    assert.equal(runResult.isolationEvidence.capabilityEvidence.networkMode.egressFiltering, 'NOT_VERIFIED');
+    assert.match(runResult.isolationEvidence.capabilityEvidence.networkMode.limitation, /egress/i);
+
+    // 16.6: CPU, memory, and PID arguments do not prove cgroup enforcement
+    assert.equal(runResult.isolationEvidence.capabilityEvidence.resourceLimits.cgroupEnforcement, 'NOT_VERIFIED');
+    assert.match(runResult.isolationEvidence.capabilityEvidence.resourceLimits.limitation, /cgroup/i);
+
+    // 16.7: Synthetic evidence cannot establish production verification
+    const containerProvider = new ContainerProvider();
+    const syntheticEvidence = {
+      providerId: 'container-isolation-provider',
+      provenance: 'synthetic-test',
+      isMock: true,
+      trustClass: 'UNTRUSTED',
+      daemonCertSha256: 'a'.repeat(64),
+      containerAttestationDigest: 'b'.repeat(64),
+    };
+    const synthRes = containerProvider.verifyEvidence(syntheticEvidence);
+    assert.equal(synthRes.verified, false);
+    assert.equal(synthRes.status, 'BLOCKED');
+    assert.match(synthRes.reason, /synthetic or mock container evidence cannot establish production runtime verification/i);
+
+    // 16.8: Missing runtime evidence remains NOT_VERIFIED
+    const missingEvRes = containerProvider.verifyEvidence({});
+    assert.equal(missingEvRes.verified, false);
+    assert.equal(missingEvRes.status, 'BLOCKED');
+    assert.match(missingEvRes.reason, /lacks verified daemon certificate or attestation digest/i);
+
+    // 16.9: Existing V44.23 rootfs/tmpfs argument checks remain intact
+    assert.throws(() => validateContainerRunArgs(['run']), /missing required --read-only/);
+    assert.throws(() => validateContainerRunArgs(['run', '--read-only']), /missing required --tmpfs/);
+    assert.equal(validateContainerRunArgs(['run', '--read-only', '--tmpfs', DEFAULT_TMPFS_CONFIG]), true);
+
+    // 16.10: Existing V44.24 asynchronous cancellation and cleanup behavior remains intact
+    const preAbortCtrl = new AbortController();
+    preAbortCtrl.abort();
+    const { runDockerCliAsync } = require('../electron/coding-pipeline/dockerProviderAdapter.cjs');
+    const abortCliRes = await runDockerCliAsync('docker', ['run', 'alpine'], { signal: preAbortCtrl.signal });
+    assert.equal(abortCliRes.cancelled, true);
+    assert.equal(abortCliRes.signal, 'SIGTERM');
+
+    // 16.11: Existing fail-closed isolation and supervisor gates remain intact
+    const isoStatus = projectProcessIsolationStatus();
+    assert.equal(isoStatus.available, false);
+    assert.equal(isoStatus.verified, false);
+    const supStatus = projectProcessSupervisorStatus();
+    assert.equal(supStatus.available, false);
+    assert.equal(supStatus.verified, false);
+
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // 17. Testing End-to-End Isolation Capability Enforcement (Milestone V44.26)
+  // -------------------------------------------------------------------------
+  console.log('17. Testing End-to-End Isolation Capability Enforcement (Milestone V44.26)...');
+  {
+    const { ProjectContainerExecutionRunner } = require('../electron/coding-pipeline/projectContainerExecutionRunner.cjs');
+    const { ContainerProvider } = require('../electron/coding-pipeline/providers/containerProvider.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+    const { requireProjectProcessIsolation } = require('../electron/coding-pipeline/projectProcessIsolation.cjs');
+
+    // 17.1: Docker available but isolation unverified -> fail-closed execution gate with zero host execution
+    assert.throws(
+      () => requireProjectProcessIsolation('test', 'c:/dummy'),
+      (err) => {
+        assert.equal(err.code, 'PROJECT_EXECUTION_BLOCKED');
+        assert.equal(err.executionBlocked, true);
+        assert.equal(err.executionStatus, 'BLOCKED');
+        return true;
+      }
+    );
+
+    // 17.2: executeWithRuntime called directly with isolationVerified: false returns PROCESS_ISOLATION_GATE
+    const unverifiedRuntime = {
+      providerId: 'docker',
+      runtimeType: 'container',
+      isolationVerified: false,
+      supportedOps: ['test'],
+      isReady: false,
+      capabilityVerificationStatus: 'BLOCKED',
+    };
+    const realRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      isMock: false,
+    });
+    const execWithRuntimeRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: unverifiedRuntime,
+    });
+    assert.equal(execWithRuntimeRes.ok, false);
+    assert.equal(execWithRuntimeRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.match(execWithRuntimeRes.reason, /isolation is unverified/i);
+
+    // 17.3: ProjectContainerExecutionRunner.execute() called directly with unverified runtime -> returns BLOCKED
+    const execDirectRes = await realRunner.execute({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: unverifiedRuntime,
+    });
+    assert.equal(execDirectRes.ok, false);
+    assert.equal(execDirectRes.status, 'BLOCKED');
+    assert.equal(execDirectRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.equal(execDirectRes.executionBlocked, true);
+    assert.match(execDirectRes.reason, /isolation attestation has not been established/i);
+
+    // 17.4: Non-mock runner rejects untrusted/synthetic evidence sources
+    for (const src of ['synthetic', 'mock', 'untrusted-caller-input', 'simulated']) {
+      const synthRes = await realRunner.execute({
+        plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+        ownerWebContentsId: 9999,
+        sessionId: 'sess-1',
+        runtime: {
+          providerId: 'docker',
+          runtimeType: 'container',
+          isolationVerified: true,
+          supportedOps: ['test'],
+          evidenceSource: src,
+        },
+      });
+      assert.equal(synthRes.ok, false);
+      assert.equal(synthRes.status, 'BLOCKED');
+      assert.equal(synthRes.gate, 'PROCESS_ISOLATION_GATE');
+      assert.match(synthRes.reason, /synthetic test evidence rejected/i);
+    }
+
+    // 17.5-17.10: Specific capability policies verified fail-closed
+    const baseDescriptor = {
+      providerId: 'test-container-provider',
+      supportedPlatforms: [process.platform],
+      isReady: false,
+      capabilityVerificationStatus: PROVIDER_STATUSES.UNKNOWN,
+      filesystemCapabilities: { readOnlyRoot: false, restrictedBindMounts: false },
+      networkCapabilities: { egressFiltering: false },
+      resourceLimits: { memoryCapSupported: false, cpuThrottlingSupported: false, timeoutEnforcementSupported: true },
+      processCapabilities: { hostObservedTermination: false, runtimeSupervisorVerified: false },
+    };
+
+    // 17.5: requireReadOnlyRootfs
+    const resReadOnly = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      requestedPolicy: { requireReadOnlyRootfs: true },
+    });
+    assert.ok(resReadOnly.missingCapabilities.includes('read_only_rootfs'));
+    assert.equal(resReadOnly.ready, false);
+
+    // 17.6: requireEgressFiltering
+    const resEgress = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      requestedPolicy: { requireEgressFiltering: true },
+    });
+    assert.ok(resEgress.missingCapabilities.includes('egress_filtering'));
+    assert.equal(resEgress.ready, false);
+
+    // 17.7: requireCgroupLimits
+    const resCgroups = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      requestedPolicy: { requireCgroupLimits: true },
+    });
+    assert.ok(resCgroups.missingCapabilities.includes('cgroup_resource_limits'));
+    assert.equal(resCgroups.ready, false);
+
+    // 17.8: requireFilesystemIsolation
+    const resFsIso = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      requestedPolicy: { requireFilesystemIsolation: true },
+    });
+    assert.ok(resFsIso.missingCapabilities.includes('restricted_bind_mounts'));
+    assert.equal(resFsIso.ready, false);
+
+    // 17.9: requireCleanupAttestation
+    const resCleanup = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      requestedPolicy: { requireCleanupAttestation: true },
+    });
+    assert.ok(resCleanup.missingCapabilities.includes('cleanup_attestation'));
+    assert.equal(resCleanup.ready, false);
+
+    // 17.10: requireRuntimeSupervisor
+    const resSupervisor = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      requestedPolicy: { requireRuntimeSupervisor: true },
+    });
+    assert.ok(resSupervisor.missingCapabilities.includes('runtime_supervisor'));
+    assert.equal(resSupervisor.ready, false);
+
+    // 17.11: Caller-supplied verified: true rejected fail-closed
+    const callerSuppliedRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { verified: true },
+    });
+    assert.equal(callerSuppliedRes.ready, false);
+    assert.equal(callerSuppliedRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.match(callerSuppliedRes.reason, /caller-supplied boolean flag/i);
+
+    const containerProvider = new ContainerProvider();
+    const cpRes = containerProvider.verifyEvidence({ verified: true });
+    assert.equal(cpRes.verified, false);
+    assert.equal(cpRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.match(cpRes.reason, /caller-supplied boolean flag/i);
+  }
+
+  // -------------------------------------------------------------------------
+  // 18. Testing Adversarial Isolation Gate Bypass & Protections (Milestone V44.27)
+  // -------------------------------------------------------------------------
+  console.log('18. Testing Adversarial Isolation Gate Bypass & Protections (Milestone V44.27)...');
+  {
+    const { ProjectContainerExecutionRunner } = require('../electron/coding-pipeline/projectContainerExecutionRunner.cjs');
+    const { ContainerProvider } = require('../electron/coding-pipeline/providers/containerProvider.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { PROVIDER_STATUSES, IsolationProviderRegistry } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+    const { discoverIsolationRuntimes } = require('../electron/coding-pipeline/isolationRuntimeDiscovery.cjs');
+
+    discoverIsolationRuntimes();
+
+    const realRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      isMock: false,
+    });
+
+    // 18.A: Direct execution bypass attempts fail-closed
+    // 18.A.1: Unregistered provider
+    const unregRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: { providerId: 'non-existent-prov', supportedOps: ['test'], isolationVerified: true },
+    });
+    assert.equal(unregRes.ok, false);
+    assert.equal(unregRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.match(unregRes.reason, /not registered/i);
+
+    // 18.A.2: Registered but not ready provider
+    const notReadyRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: { providerId: 'docker', supportedOps: ['test'], isolationVerified: true },
+    });
+    assert.equal(notReadyRes.ok, false);
+    assert.equal(notReadyRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.match(notReadyRes.reason, /not ready or not verified/i);
+
+    // 18.B: Forged evidence rejection
+    const baseDescriptor = {
+      providerId: 'docker',
+      supportedPlatforms: [process.platform],
+      isReady: false,
+      capabilityVerificationStatus: PROVIDER_STATUSES.UNKNOWN,
+      filesystemCapabilities: { readOnlyRoot: true, restrictedBindMounts: true },
+      networkCapabilities: { egressFiltering: true },
+      resourceLimits: { memoryCapSupported: true, cpuThrottlingSupported: true, timeoutEnforcementSupported: true },
+      processCapabilities: { hostObservedTermination: true, runtimeSupervisorVerified: true },
+    };
+
+    const forgedIndep = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { independentlyVerified: true },
+    });
+    assert.equal(forgedIndep.ready, false);
+    assert.equal(forgedIndep.status, PROVIDER_STATUSES.BLOCKED);
+    assert.match(forgedIndep.reason, /caller-supplied boolean flag/i);
+
+    const cp = new ContainerProvider();
+    assert.equal(cp.verifyEvidence({ independentlyVerified: true }).verified, false);
+
+    // 18.C: Stale, future-dated, and context-mismatched evidence rejection
+    const futureRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { evidenceTimestamp: new Date(Date.now() + 1000000).toISOString() },
+    });
+    assert.equal(futureRes.ready, false);
+    assert.match(futureRes.reason, /future-dated/i);
+
+    const staleRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { evidenceTimestamp: new Date(Date.now() - 600000).toISOString() },
+      context: { maxEvidenceAgeMs: 300000 },
+    });
+    assert.equal(staleRes.ready, false);
+    assert.match(staleRes.reason, /stale/i);
+
+    const mismatchRootRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { projectRoot: 'c:/other/project' },
+      context: { projectRoot: 'c:/intended/project' },
+    });
+    assert.equal(mismatchRootRes.ready, false);
+    assert.match(mismatchRootRes.reason, /project root mismatch/i);
+
+    const mismatchSessRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { sessionId: 'sess-a' },
+      context: { sessionId: 'sess-b' },
+    });
+    assert.equal(mismatchSessRes.ready, false);
+    assert.match(mismatchSessRes.reason, /session binding mismatch/i);
+
+    const mismatchNonceRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { nonce: 'nonce-a' },
+      context: { nonce: 'nonce-b' },
+    });
+    assert.equal(mismatchNonceRes.ready, false);
+    assert.match(mismatchNonceRes.reason, /nonce mismatch/i);
+
+    // 18.D: Provider descriptor mutation & deep freezing
+    const testRegistry = new IsolationProviderRegistry();
+    const desc = testRegistry.registerProvider({
+      providerId: 'test-prov',
+      capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+    });
+    assert.equal(desc.capabilityVerificationStatus, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(desc.isReady, false);
+    assert.ok(Object.isFrozen(desc));
+    assert.ok(Object.isFrozen(desc.availability));
+    assert.ok(Object.isFrozen(desc.blockingReasons));
+    assert.ok(Object.isFrozen(desc.supportedPlatforms));
+
+    // 18.E: Policy conflict & strictness
+    const conflictRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      requestedPolicy: { requireEgressFiltering: true },
+      policy: { requireEgressFiltering: false },
+    });
+    assert.equal(conflictRes.ready, false);
+    assert.equal(conflictRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.match(conflictRes.reason, /conflicting policy specifications/i);
+
+    // 18.G: Cleanup failures & absence verification
+    const failingQueryRunner = new ProjectContainerExecutionRunner({
+      dockerCli: () => ({ status: 1, error: 'Daemon connection reset', stdout: '', stderr: 'error' }),
+      isMock: false,
+    });
+    const cleanupQueryFail = await failingQueryRunner._verifyCleanup('test-label');
+    assert.equal(cleanupQueryFail.cleaned, false);
+    assert.equal(cleanupQueryFail.status, 'CLEANUP_FAILED');
+
+    let callCount = 0;
+    const failingConfirmRunner = new ProjectContainerExecutionRunner({
+      dockerCli: (bin, args) => {
+        callCount++;
+        if (args[0] === 'ps' && callCount === 1) return { status: 0, stdout: 'cont-1', stderr: '' };
+        if (args[0] === 'rm') return { status: 0, stdout: '', stderr: '' };
+        if (args[0] === 'ps' && callCount === 3) return { status: 1, error: 'Network error', stdout: '', stderr: 'err' };
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      isMock: false,
+    });
+    const cleanupConfirmFail = await failingConfirmRunner._verifyCleanup('test-label');
+    assert.equal(cleanupConfirmFail.cleaned, false);
+    assert.equal(cleanupConfirmFail.status, 'CLEANUP_FAILED');
+
+    const missingLabelRes = await realRunner._verifyCleanup('');
+    assert.equal(missingLabelRes.cleaned, false);
+    assert.equal(missingLabelRes.status, 'CLEANUP_FAILED');
+  }
+
+  // -------------------------------------------------------------------------
+  // 19. Cryptographic Evidence Schema & Signature Verification Contract (Milestone V44.29)
+  // -------------------------------------------------------------------------
+  console.log('19. Testing Cryptographic Evidence Schema & Signature Verification Contract (Milestone V44.29)...');
+  {
+    const evidenceContract = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+    const {
+      CURRENT_ATTESTATION_SCHEMA_VERSION,
+      SUPPORTED_SIGNATURE_ALGORITHMS,
+      canonicalizeJson,
+      createAttestationPayload,
+      signAttestationPayload,
+      verifyAttestationSignature,
+      validateExecutionEvidenceManifest,
+    } = evidenceContract;
+
+    const baseDescriptor = {
+      providerId: 'docker-container-provider',
+      supportedPlatforms: ['win32', 'linux', 'darwin'],
+      isReady: true,
+      processCapabilities: { independentProcessTree: true, credentialIsolation: true },
+      networkCapabilities: { defaultDenyAll: true },
+      filesystemCapabilities: { ephemeralCopyOnWrite: true },
+      resourceLimits: { timeoutEnforcementSupported: true },
+    };
+
+    // 19.A: RFC 8785 Canonicalization determinism
+    const objA = { b: 2, a: 1, c: { y: 'test', x: true } };
+    const objB = { c: { x: true, y: 'test' }, a: 1, b: 2 };
+    assert.equal(canonicalizeJson(objA), canonicalizeJson(objB));
+    assert.equal(canonicalizeJson(objA), '{"a":1,"b":2,"c":{"x":true,"y":"test"}}');
+    assert.equal(canonicalizeJson(0), '0');
+    assert.equal(canonicalizeJson(-0), '0');
+    assert.throws(() => canonicalizeJson(Infinity), /non-finite/i);
+
+    // 19.B: Multi-algorithm support (ed25519, es256, rsa-pss-sha256)
+    const keyPairs = {
+      ed25519: crypto.generateKeyPairSync('ed25519'),
+      es256: crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' }),
+      'rsa-pss-sha256': crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }),
+    };
+
+    const trustStore = {
+      keys: new Map(),
+      getPublicKey(issuerId, keyId) {
+        return this.keys.get(`${issuerId}:${keyId}`) || null;
+      },
+    };
+
+    for (const [algo, kp] of Object.entries(keyPairs)) {
+      const pubPem = kp.publicKey.export({ type: 'spki', format: 'pem' });
+      trustStore.keys.set(`test-issuer:${algo}-key`, pubPem);
+
+      const payload = createAttestationPayload({
+        issuerId: 'test-issuer',
+        keyId: `${algo}-key`,
+        algorithm: algo,
+      });
+
+      const signed = signAttestationPayload({
+        payload,
+        privateKey: kp.privateKey,
+        algorithm: algo,
+        keyId: `${algo}-key`,
+        issuerId: 'test-issuer',
+      });
+
+      const result = verifyAttestationSignature({
+        attestation: signed,
+        trustStore,
+        expectedContext: { runId: payload.runId, sessionId: payload.sessionId },
+      });
+
+      assert.equal(result.state, 'AUTHENTICATED');
+      assert.equal(result.valid, true);
+      assert.equal(result.reasonCode, 'SIGNATURE_VERIFIED');
+    }
+
+    // 19.C: Unsigned / missing trust root fails closed
+    const edKeyPair = keyPairs.ed25519;
+    const edPayload = createAttestationPayload({ issuerId: 'test-issuer', keyId: 'ed-key', algorithm: 'ed25519' });
+    const edSigned = signAttestationPayload({
+      payload: edPayload,
+      privateKey: edKeyPair.privateKey,
+      algorithm: 'ed25519',
+      keyId: 'ed-key',
+      issuerId: 'test-issuer',
+    });
+
+    // Empty trust store -> TRUST_ROOT_NOT_ESTABLISHED
+    const emptyTrustRes = verifyAttestationSignature({
+      attestation: edSigned,
+      trustStore: {},
+    });
+    assert.equal(emptyTrustRes.state, 'BLOCKED');
+    assert.equal(emptyTrustRes.reasonCode, 'TRUST_ROOT_NOT_ESTABLISHED');
+
+    // Envelope / payload issuer mismatch -> ISSUER_ID_MISMATCH
+    const mismatchedIssuerSigned = { ...edSigned, issuerId: 'mismatched-authority' };
+    const mismatchedIssuerRes = verifyAttestationSignature({
+      attestation: mismatchedIssuerSigned,
+      trustStore,
+    });
+    assert.equal(mismatchedIssuerRes.state, 'BLOCKED');
+    assert.equal(mismatchedIssuerRes.reasonCode, 'ISSUER_ID_MISMATCH');
+
+    // Unknown issuer in payload and envelope -> TRUST_ROOT_NOT_ESTABLISHED
+    const unknownIssuerPayload = createAttestationPayload({ issuerId: 'unknown-authority', keyId: 'ed-key', algorithm: 'ed25519' });
+    const unknownIssuerSigned = signAttestationPayload({
+      payload: unknownIssuerPayload,
+      privateKey: edKeyPair.privateKey,
+      algorithm: 'ed25519',
+      keyId: 'ed-key',
+      issuerId: 'unknown-authority',
+    });
+    const unknownIssuerRes = verifyAttestationSignature({
+      attestation: unknownIssuerSigned,
+      trustStore,
+    });
+    assert.equal(unknownIssuerRes.state, 'BLOCKED');
+    assert.equal(unknownIssuerRes.reasonCode, 'TRUST_ROOT_NOT_ESTABLISHED');
+
+    // 19.D: Self-signed / caller-supplied key rejection
+    const selfSignedRes = verifyAttestationSignature({
+      attestation: {
+        ...edSigned,
+        publicKey: edKeyPair.publicKey.export({ type: 'spki', format: 'pem' }),
+      },
+      trustStore,
+    });
+    assert.equal(selfSignedRes.state, 'BLOCKED');
+    assert.equal(selfSignedRes.reasonCode, 'SELF_SIGNED_KEY_REJECTED');
+
+    // 19.E: Payload tampering detection
+    const tamperedPayload = { ...edSigned.payload, runId: 'tampered-run-id' };
+    const tamperedRes = verifyAttestationSignature({
+      attestation: { ...edSigned, payload: tamperedPayload },
+      trustStore: { getPublicKey: () => edKeyPair.publicKey },
+    });
+    assert.equal(tamperedRes.state, 'BLOCKED');
+    assert.equal(tamperedRes.reasonCode, 'SIGNATURE_VERIFICATION_FAILED');
+
+    // 19.F: Unsupported algorithm
+    const unsupportedAlgoRes = verifyAttestationSignature({
+      attestation: { ...edSigned, algorithm: 'none' },
+      trustStore,
+    });
+    assert.equal(unsupportedAlgoRes.state, 'BLOCKED');
+    assert.equal(unsupportedAlgoRes.reasonCode, 'UNSUPPORTED_ALGORITHM');
+
+    // 19.G: Malformed public key
+    const malformedKeyRes = verifyAttestationSignature({
+      attestation: edSigned,
+      trustStore: { getPublicKey: () => '--- NOT A VALID PEM ---' },
+    });
+    assert.equal(malformedKeyRes.state, 'BLOCKED');
+    assert.equal(malformedKeyRes.reasonCode, 'MALFORMED_PUBLIC_KEY');
+
+    // 19.H: Malformed signature
+    const malformedSigRes = verifyAttestationSignature({
+      attestation: { ...edSigned, signature: 'not_a_hex_signature' },
+      trustStore: { getPublicKey: () => edKeyPair.publicKey },
+    });
+    assert.equal(malformedSigRes.state, 'BLOCKED');
+    assert.equal(malformedSigRes.reasonCode, 'MALFORMED_SIGNATURE');
+
+    // 19.I: Context bindings mismatch (runId, sessionId, nonce, policyDigest, etc.)
+    const mismatchRes = verifyAttestationSignature({
+      attestation: edSigned,
+      trustStore: { getPublicKey: () => edKeyPair.publicKey },
+      expectedContext: { runId: 'different-run-id' },
+    });
+    assert.equal(mismatchRes.state, 'BLOCKED');
+    assert.equal(mismatchRes.reasonCode, 'CONTEXT_BINDING_MISMATCH');
+
+    // 19.J: Expiration & future dating
+    const expiredPayload = createAttestationPayload({
+      issuerId: 'test-issuer',
+      keyId: 'ed-key',
+      algorithm: 'ed25519',
+      issuedAt: new Date(Date.now() - 100000).toISOString(),
+      expiresAt: new Date(Date.now() - 50000).toISOString(),
+    });
+    const expiredSigned = signAttestationPayload({
+      payload: expiredPayload,
+      privateKey: edKeyPair.privateKey,
+      keyId: 'ed-key',
+      issuerId: 'test-issuer',
+    });
+    const expiredRes = verifyAttestationSignature({
+      attestation: expiredSigned,
+      trustStore: { getPublicKey: () => edKeyPair.publicKey },
+    });
+    assert.equal(expiredRes.state, 'BLOCKED');
+    assert.equal(expiredRes.reasonCode, 'EVIDENCE_EXPIRED');
+
+    const futurePayload = createAttestationPayload({
+      issuerId: 'test-issuer',
+      keyId: 'ed-key',
+      algorithm: 'ed25519',
+      issuedAt: new Date(Date.now() + 200000).toISOString(),
+      expiresAt: new Date(Date.now() + 500000).toISOString(),
+    });
+    const futureSigned = signAttestationPayload({
+      payload: futurePayload,
+      privateKey: edKeyPair.privateKey,
+      keyId: 'ed-key',
+      issuerId: 'test-issuer',
+    });
+    const futureRes = verifyAttestationSignature({
+      attestation: futureSigned,
+      trustStore: { getPublicKey: () => edKeyPair.publicKey },
+    });
+    assert.equal(futureRes.state, 'BLOCKED');
+    assert.equal(futureRes.reasonCode, 'EVIDENCE_FUTURE_DATED');
+
+    // 19.K: Replay protection via consumed nonces
+    const consumedNonces = new Set();
+    const replayPayload = createAttestationPayload({
+      issuerId: 'test-issuer',
+      keyId: 'ed-key',
+      algorithm: 'ed25519',
+    });
+    const replaySigned = signAttestationPayload({
+      payload: replayPayload,
+      privateKey: edKeyPair.privateKey,
+      keyId: 'ed-key',
+      issuerId: 'test-issuer',
+    });
+    const firstUse = verifyAttestationSignature({
+      attestation: replaySigned,
+      trustStore: { getPublicKey: () => edKeyPair.publicKey },
+      expectedContext: { consumedNonces },
+    });
+    assert.equal(firstUse.state, 'AUTHENTICATED');
+    const secondUse = verifyAttestationSignature({
+      attestation: replaySigned,
+      trustStore: { getPublicKey: () => edKeyPair.publicKey },
+      expectedContext: { consumedNonces },
+    });
+    assert.equal(secondUse.state, 'BLOCKED');
+    assert.equal(secondUse.reasonCode, 'NONCE_REPLAYED');
+
+    // 19.L: Capability Verifier gate integration
+    // When signed attestation is passed, verifier validates signature against trustStore.
+    // In production (no trustStore), verifyIsolationCapabilities returns BLOCKED with TRUST_ROOT_NOT_ESTABLISHED.
+    const verifierProdRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { attestation: edSigned },
+      context: { runId: edPayload.runId },
+    });
+    assert.equal(verifierProdRes.ready, false);
+    assert.equal(verifierProdRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(verifierProdRes.reasonCode, 'TRUST_ROOT_NOT_ESTABLISHED');
+
+    // Even with a valid signature from test trustStore, real provider execution gate remains BLOCKED
+    const realContainerDesc = await new ContainerProvider().discoverCapabilities();
+    const verifierTestRes = verifyIsolationCapabilities({
+      providerDescriptor: realContainerDesc,
+      evidence: { attestation: edSigned },
+      context: {
+        runId: edPayload.runId,
+        trustStore: { getPublicKey: () => edKeyPair.publicKey },
+      },
+    });
+    assert.equal(verifierTestRes.ready, false);
+    assert.equal(verifierTestRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.ok(verifierTestRes.blockingReasons.length > 0);
+  }
+
+  // -------------------------------------------------------------------------
+  // 20. Out-of-Process Evidence Issuer Boundary & Service Contract (Milestone V44.30)
+  // -------------------------------------------------------------------------
+  console.log('20. Testing Out-of-Process Evidence Issuer Boundary & Service Contract (Milestone V44.30)...');
+  {
+    const {
+      ISSUER_SERVICE_STATES,
+      ISSUER_TRUST_DOMAINS,
+      EVIDENCE_FACT_ORIGINS,
+      evaluateIssuerServiceBoundary,
+      collectEvidenceFacts,
+      validateIssuerRequest,
+      issueAttestation,
+      authorizeExecution,
+      verifyAttestationSignature,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+
+    const randomDigest = () => crypto.randomBytes(32).toString('hex');
+
+    const baseDescriptor = {
+      providerId: 'docker-container-provider',
+      supportedPlatforms: ['win32', 'linux', 'darwin'],
+      isReady: true,
+      processCapabilities: { independentProcessTree: true, credentialIsolation: true },
+      networkCapabilities: { defaultDenyAll: true },
+      filesystemCapabilities: { ephemeralCopyOnWrite: true },
+      resourceLimits: { timeoutEnforcementSupported: true },
+    };
+
+    // Helper: Valid synthetic issuer service descriptor
+    const validSyntheticService = {
+      serviceId: 'synthetic-test-issuer',
+      isSyntheticTestService: true,
+      hasIndependentOsIdentity: true,
+      hasIsolatedIpcChannel: true,
+      hasProtectedKeyStorage: true,
+      isAuthenticated: true,
+      isAvailable: true,
+      domain: ISSUER_TRUST_DOMAINS.ISOLATED_HOST_SERVICE,
+    };
+
+    // 20.A: Ordinary child process is rejected as NOT_A_SECURITY_BOUNDARY
+    const childProcessCheck = evaluateIssuerServiceBoundary({
+      serviceId: 'spawned-child-service',
+      isOrdinaryChildProcess: true,
+      runsInUserDesktopSession: true,
+    });
+    assert.equal(childProcessCheck.state, ISSUER_SERVICE_STATES.NOT_TRUSTED);
+    assert.equal(childProcessCheck.isTrustedBoundary, false);
+    assert.equal(childProcessCheck.reasonCode, 'NOT_A_SECURITY_BOUNDARY');
+
+    // 20.B: Renderer or Provider impersonating issuer domain is rejected
+    const rendererDomainCheck = evaluateIssuerServiceBoundary({
+      serviceId: 'renderer-fake-service',
+      domain: ISSUER_TRUST_DOMAINS.ELECTRON_RENDERER,
+      hasIndependentOsIdentity: true,
+      hasIsolatedIpcChannel: true,
+      hasProtectedKeyStorage: true,
+    });
+    assert.equal(rendererDomainCheck.state, ISSUER_SERVICE_STATES.NOT_TRUSTED);
+    assert.equal(rendererDomainCheck.reasonCode, 'DOMAIN_CANNOT_ISSUE');
+
+    const providerDomainCheck = evaluateIssuerServiceBoundary({
+      serviceId: 'provider-fake-service',
+      domain: ISSUER_TRUST_DOMAINS.PROVIDER_ADAPTER,
+      hasIndependentOsIdentity: true,
+      hasIsolatedIpcChannel: true,
+      hasProtectedKeyStorage: true,
+    });
+    assert.equal(providerDomainCheck.state, ISSUER_SERVICE_STATES.NOT_TRUSTED);
+    assert.equal(providerDomainCheck.reasonCode, 'DOMAIN_CANNOT_ISSUE');
+
+    // 20.C: Missing OS security boundary (no independent OS identity/IPC/storage)
+    const missingBoundaryCheck = evaluateIssuerServiceBoundary({
+      serviceId: 'unprotected-service',
+      hasIndependentOsIdentity: false,
+      hasIsolatedIpcChannel: false,
+      hasProtectedKeyStorage: false,
+    });
+    assert.equal(missingBoundaryCheck.state, ISSUER_SERVICE_STATES.NOT_TRUSTED);
+    assert.equal(missingBoundaryCheck.reasonCode, 'OS_BOUNDARY_INSUFFICIENT');
+
+    // 20.D: Service availability & crash failure semantics
+    const unavailCheck = evaluateIssuerServiceBoundary({
+      ...validSyntheticService,
+      isAvailable: false,
+    });
+    assert.equal(unavailCheck.state, ISSUER_SERVICE_STATES.UNAVAILABLE);
+    assert.equal(unavailCheck.reasonCode, 'ISSUER_UNAVAILABLE');
+
+    const crashCheck = evaluateIssuerServiceBoundary({
+      ...validSyntheticService,
+      isCrashed: true,
+    });
+    assert.equal(crashCheck.state, ISSUER_SERVICE_STATES.UNAVAILABLE);
+    assert.equal(crashCheck.reasonCode, 'SERVICE_CRASHED');
+
+    // 20.E: Revoked service
+    const revokedCheck = evaluateIssuerServiceBoundary({
+      ...validSyntheticService,
+      isRevoked: true,
+    });
+    assert.equal(revokedCheck.state, ISSUER_SERVICE_STATES.REVOKED);
+    assert.equal(revokedCheck.reasonCode, 'ISSUER_REVOKED');
+
+    // 20.F: Production service reports INDEPENDENT_ISSUER_NOT_IMPLEMENTED
+    const prodServiceCheck = evaluateIssuerServiceBoundary({
+      serviceId: 'production-host-issuer',
+      isProductionService: true,
+      isSyntheticTestService: false,
+      hasIndependentOsIdentity: true,
+      hasIsolatedIpcChannel: true,
+      hasProtectedKeyStorage: true,
+      isAuthenticated: true,
+      isAvailable: true,
+    });
+    assert.equal(prodServiceCheck.state, ISSUER_SERVICE_STATES.NOT_CONFIGURED);
+    assert.equal(prodServiceCheck.reasonCode, 'INDEPENDENT_ISSUER_NOT_IMPLEMENTED');
+
+    // 20.G: Request validation: Renderer requesting issuance directly is rejected
+    const validRequest = {
+      requestId: crypto.randomUUID(),
+      requestTimestamp: new Date().toISOString(),
+      nonce: crypto.randomUUID(),
+      sessionId: 'sess-test-1',
+      runId: 'run-test-1',
+      grantId: crypto.randomUUID(),
+      projectIdentityDigest: randomDigest(),
+      policyDigest: randomDigest(),
+      verificationPlanDigest: randomDigest(),
+      providerId: 'docker-container-provider',
+      runtimeId: 'docker-runc',
+      requestedCapabilities: ['processIsolation', 'networkDeny'],
+      claimsToVerify: {},
+      callerAuthorization: {
+        sourceDomain: ISSUER_TRUST_DOMAINS.ELECTRON_MAIN,
+        isAuthorized: true,
+      },
+    };
+
+    const rendererRequestCheck = validateIssuerRequest({
+      request: {
+        ...validRequest,
+        requestId: crypto.randomUUID(),
+        nonce: crypto.randomUUID(),
+        callerAuthorization: { sourceDomain: ISSUER_TRUST_DOMAINS.ELECTRON_RENDERER, isAuthorized: true },
+      },
+      serviceDescriptor: validSyntheticService,
+    });
+    assert.equal(rendererRequestCheck.state, 'BLOCKED');
+    assert.equal(rendererRequestCheck.reasonCode, 'UNTRUSTED_CALLER_DOMAIN');
+
+    // 20.H: Request validation: Unauthenticated request
+    const unauthRequestCheck = validateIssuerRequest({
+      request: {
+        ...validRequest,
+        requestId: crypto.randomUUID(),
+        nonce: crypto.randomUUID(),
+        callerAuthorization: { sourceDomain: ISSUER_TRUST_DOMAINS.ELECTRON_MAIN, isAuthorized: false },
+      },
+      serviceDescriptor: validSyntheticService,
+    });
+    assert.equal(unauthRequestCheck.state, 'BLOCKED');
+    assert.equal(unauthRequestCheck.reasonCode, 'UNAUTHORIZED_REQUEST');
+
+    // 20.I: Request validation: Caller-forged credentials rejected
+    const forgedIssuerCheck = validateIssuerRequest({
+      request: { ...validRequest, requestId: crypto.randomUUID(), nonce: crypto.randomUUID(), issuerId: 'attacker-issuer' },
+      serviceDescriptor: validSyntheticService,
+    });
+    assert.equal(forgedIssuerCheck.state, 'BLOCKED');
+    assert.equal(forgedIssuerCheck.reasonCode, 'CALLER_FORGED_ISSUER_IDENTITY');
+
+    const forgedSigCheck = validateIssuerRequest({
+      request: { ...validRequest, requestId: crypto.randomUUID(), nonce: crypto.randomUUID(), signature: 'forged' },
+      serviceDescriptor: validSyntheticService,
+    });
+    assert.equal(forgedSigCheck.state, 'BLOCKED');
+    assert.equal(forgedSigCheck.reasonCode, 'CALLER_FORGED_SIGNATURE');
+
+    const forgedPubkeyCheck = validateIssuerRequest({
+      request: { ...validRequest, requestId: crypto.randomUUID(), nonce: crypto.randomUUID(), publicKey: 'forged-pubkey' },
+      serviceDescriptor: validSyntheticService,
+    });
+    assert.equal(forgedPubkeyCheck.state, 'BLOCKED');
+    assert.equal(forgedPubkeyCheck.reasonCode, 'SELF_SIGNED_KEY_REJECTED');
+
+    // 20.J: Replay protection on request and nonce
+    const activeNonces = new Set();
+    const req1 = { ...validRequest, requestId: crypto.randomUUID(), nonce: crypto.randomUUID() };
+    const res1 = validateIssuerRequest({ request: req1, serviceDescriptor: validSyntheticService, activeNonces });
+    assert.equal(res1.state, 'VALID');
+    assert.equal(res1.reasonCode, 'REQUEST_VALIDATED');
+
+    const replayRes = validateIssuerRequest({ request: req1, serviceDescriptor: validSyntheticService, activeNonces });
+    assert.equal(replayRes.state, 'BLOCKED');
+    assert.equal(replayRes.reasonCode, 'REPLAY_DETECTED');
+
+    // 20.K: Context binding substitution rejection
+    const contextSubReq = { ...validRequest, requestId: crypto.randomUUID(), nonce: crypto.randomUUID(), runId: 'substituted-run' };
+    const contextSubRes = validateIssuerRequest({
+      request: contextSubReq,
+      serviceDescriptor: validSyntheticService,
+      expectedContext: { runId: 'original-run' },
+    });
+    assert.equal(contextSubRes.state, 'BLOCKED');
+    assert.equal(contextSubRes.reasonCode, 'CONTEXT_BINDING_MISMATCH');
+
+    // 20.L: Evidence collection and fact origins separation
+    const facts = collectEvidenceFacts({
+      callerClaims: { processIsolation: true },
+      providerClaims: { networkDeny: true },
+      hostObservations: { processIsolation: true },
+      kernelObservations: { networkDeny: true },
+    });
+    assert.equal(facts.length, 4);
+    assert.equal(facts[0].origin, EVIDENCE_FACT_ORIGINS.CALLER_CONFIGURATION);
+    assert.equal(facts[1].origin, EVIDENCE_FACT_ORIGINS.PROVIDER_REPORTED);
+    assert.equal(facts[2].origin, EVIDENCE_FACT_ORIGINS.HOST_OBSERVED);
+    assert.equal(facts[3].origin, EVIDENCE_FACT_ORIGINS.KERNEL_ENFORCED);
+
+    // 20.M: Issuance fails closed on unverified runtime claims (caller claims only)
+    const validReqForIssuance = { ...validRequest, requestId: crypto.randomUUID(), nonce: crypto.randomUUID() };
+    const validatedOutcome = validateIssuerRequest({
+      request: validReqForIssuance,
+      serviceDescriptor: validSyntheticService,
+    });
+    assert.equal(validatedOutcome.state, 'VALID');
+
+    const callerOnlyFacts = [
+      { fact: 'processIsolation', value: true, origin: EVIDENCE_FACT_ORIGINS.CALLER_CONFIGURATION },
+      { fact: 'networkDeny', value: true, origin: EVIDENCE_FACT_ORIGINS.PROVIDER_REPORTED },
+    ];
+    const unverifiedIssuance = issueAttestation({
+      validatedRequestResult: validatedOutcome,
+      observedFacts: callerOnlyFacts,
+      serviceDescriptor: validSyntheticService,
+    });
+    assert.equal(unverifiedIssuance.status, 'ISSUANCE_FAILED');
+    assert.equal(unverifiedIssuance.errorCode, 'UNVERIFIED_RUNTIME_FACTS');
+
+    // 20.N: Synthetic issuance with host-observed facts and test signing key succeeds
+    const testKeyPair = crypto.generateKeyPairSync('ed25519');
+    const verifiedFacts = [
+      { fact: 'processIsolation', value: true, origin: EVIDENCE_FACT_ORIGINS.HOST_OBSERVED },
+      { fact: 'networkDeny', value: true, origin: EVIDENCE_FACT_ORIGINS.KERNEL_ENFORCED },
+    ];
+    const issuanceOutcome = issueAttestation({
+      validatedRequestResult: validatedOutcome,
+      observedFacts: verifiedFacts,
+      serviceDescriptor: validSyntheticService,
+      signingKeyContext: {
+        privateKey: testKeyPair.privateKey,
+        keyId: 'test-key-1',
+        algorithm: 'ed25519',
+      },
+    });
+    assert.equal(issuanceOutcome.status, 'ISSUED');
+    assert.ok(issuanceOutcome.attestationEnvelope);
+
+    // 20.O: Final execution authorization gate remains BLOCKED with zero fallback
+    const trustStore = {
+      getPublicKey: (issuer, key) => (key === 'test-key-1' ? testKeyPair.publicKey : null),
+    };
+    const attestationVerificationResult = verifyAttestationSignature({
+      attestation: issuanceOutcome.attestationEnvelope,
+      trustStore,
+      expectedContext: {
+        runId: validReqForIssuance.runId,
+        sessionId: validReqForIssuance.sessionId,
+      },
+    });
+    assert.equal(attestationVerificationResult.valid, true);
+
+    const authResult = authorizeExecution({
+      attestationVerificationResult,
+      serviceDescriptor: validSyntheticService,
+      providerDescriptor: baseDescriptor,
+      osEnforcementEvidence: { kernelEnforced: false }, // Not verified on Windows
+    });
+    assert.equal(authResult.state, 'BLOCKED');
+    assert.equal(authResult.reasonCode, 'OS_ENFORCEMENT_NOT_VERIFIED');
+
+    // 20.P: Caller-supplied issuerService in evidence rejected by verifier
+    const callerSuppliedIssuerRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { issuerService: validSyntheticService },
+    });
+    assert.equal(callerSuppliedIssuerRes.ready, false);
+    assert.equal(callerSuppliedIssuerRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(callerSuppliedIssuerRes.reasonCode, 'CALLER_FORGED_ISSUER_SERVICE');
+  }
+
+  // -------------------------------------------------------------------------
+  // 21. [V44.31] Docker Host Observation & Daemon Trust Boundary
+  // -------------------------------------------------------------------------
+  console.log('21. [V44.31] Testing Docker host observation, daemon trust boundary & kernel enforcement separation...');
+  {
+    const {
+      DOCKER_DAEMON_TRUST_STATES,
+      DOCKER_OBSERVATION_STATES,
+      evaluateDockerDaemonTrust,
+      bindDockerObservationEvidence,
+      evaluateDockerObservation,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { validateDockerEndpointPolicy } = require('../electron/coding-pipeline/dockerProviderAdapter.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+
+    const baseDescriptor = {
+      providerId: 'docker',
+      supportedPlatforms: ['win32', 'linux', 'darwin'],
+      isReady: true,
+      capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+      availability: { isRunning: true },
+      capabilities: {},
+    };
+
+    const validObservation = {
+      daemonId: 'daemon-uuid-1',
+      endpoint: 'npipe:////./pipe/docker_engine',
+      containerId: 'container-64hex-abc',
+      containerCreationIdentity: 'creation-digest-1',
+      executionId: 'exec-1',
+      projectId: 'proj-1',
+      sessionId: 'sess-1',
+      grantId: 'grant-1',
+      policyDigest: 'policy-digest-1',
+      planDigest: 'plan-digest-1',
+      observationTimestamp: new Date().toISOString(),
+      nonce: crypto.randomUUID(),
+      networkMode: 'none',
+      configuredReadOnly: true,
+      daemonReportedReadOnly: true,
+      memoryLimitBytes: 536870912,
+      mounts: [],
+    };
+
+    // 21.A: Unauthenticated Docker endpoint (TCP endpoint without TLS)
+    const tcpPolicyCheck = validateDockerEndpointPolicy({
+      contextName: 'default',
+      endpoint: 'tcp://127.0.0.1:2375',
+      environment: {},
+      platform: 'win32',
+    });
+    assert.equal(tcpPolicyCheck.valid, false);
+    assert.equal(tcpPolicyCheck.reasonCode, 'DOCKER_TCP_ENDPOINT_UNAUTHENTICATED');
+
+    const tcpTrust = evaluateDockerDaemonTrust({
+      endpoint: 'tcp://127.0.0.1:2375',
+      endpointCert: { tlsEnabled: false },
+    });
+    assert.equal(tcpTrust.isTrusted, false);
+    assert.equal(tcpTrust.trustState, DOCKER_DAEMON_TRUST_STATES.TLS_UNVERIFIED);
+    assert.equal(tcpTrust.reasonCode, 'TLS_UNVERIFIED');
+
+    // 21.B: Endpoint substitution rejected
+    const subTrust = evaluateDockerDaemonTrust({
+      endpoint: 'npipe:////./pipe/docker_engine',
+      callerOverrides: { hasOverride: true, DOCKER_HOST: 'tcp://evil.remote:2375' },
+    });
+    assert.equal(subTrust.isTrusted, false);
+    assert.equal(subTrust.trustState, DOCKER_DAEMON_TRUST_STATES.ENDPOINT_UNTRUSTED);
+    assert.equal(subTrust.reasonCode, 'ENDPOINT_SUBSTITUTION_REJECTED');
+
+    // 21.C: Untrusted daemon certificate on TCP endpoint
+    const uncertTrust = evaluateDockerDaemonTrust({
+      endpoint: 'tcp://127.0.0.1:2376',
+      endpointCert: { tlsEnabled: true, cert: 'self-signed-cert' },
+      trustStore: { verifyCertificate: () => false },
+    });
+    assert.equal(uncertTrust.isTrusted, false);
+    assert.equal(uncertTrust.trustState, DOCKER_DAEMON_TRUST_STATES.CERTIFICATE_UNTRUSTED);
+    assert.equal(uncertTrust.reasonCode, 'CERTIFICATE_UNTRUSTED');
+
+    // 21.D: Caller-supplied daemon trust rejected
+    const forgedDaemonRes = verifyIsolationCapabilities({
+      providerDescriptor: baseDescriptor,
+      evidence: { daemonTrust: 'VERIFIED' },
+    });
+    assert.equal(forgedDaemonRes.ready, false);
+    assert.equal(forgedDaemonRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(forgedDaemonRes.reasonCode, 'CALLER_FORGED_DAEMON_TRUST');
+
+    // 21.E: Forged container identity in observation binding rejected
+    const forgedContainerObs = {
+      ...validObservation,
+      nonce: crypto.randomUUID(),
+      containerId: 'attacker-container-id',
+    };
+    const forgedContainerRes = bindDockerObservationEvidence({
+      observation: forgedContainerObs,
+      expectedBindings: { containerId: 'container-64hex-abc' },
+    });
+    assert.equal(forgedContainerRes.valid, false);
+    assert.equal(forgedContainerRes.reasonCode, 'FORGED_CONTAINER_IDENTITY');
+
+    // 21.F: Configuration mistaken for enforcement alone does not prove kernel enforcement
+    const configOnlyObs = {
+      ...validObservation,
+      nonce: crypto.randomUUID(),
+      configuredReadOnly: true,
+      daemonReportedReadOnly: false,
+    };
+    const configOnlyEval = evaluateDockerObservation({
+      observation: configOnlyObs,
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+      mountEvidence: { kernelEnforcedReadOnly: false },
+    });
+    assert.equal(configOnlyEval.readOnlyRootfs, DOCKER_OBSERVATION_STATES.NOT_CONFIGURED);
+    assert.notEqual(configOnlyEval.readOnlyRootfs, DOCKER_OBSERVATION_STATES.KERNEL_ENFORCED);
+
+    // 21.G: Daemon-reported state mistaken for kernel state
+    const daemonInspectEval = evaluateDockerObservation({
+      observation: { ...validObservation, nonce: crypto.randomUUID() },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+      mountEvidence: null,
+    });
+    assert.equal(daemonInspectEval.readOnlyRootfs, DOCKER_OBSERVATION_STATES.DAEMON_REPORTED);
+    assert.equal(daemonInspectEval.kernelEnforcement, 'NOT_VERIFIED');
+
+    // 21.H: Missing cgroup controllers fails closed
+    const cgroupMissingEval = evaluateDockerObservation({
+      observation: { ...validObservation, nonce: crypto.randomUUID() },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+      cgroupEvidence: { cgroupControllersMissing: true },
+    });
+    assert.equal(cgroupMissingEval.state, DOCKER_OBSERVATION_STATES.VERIFICATION_FAILED);
+    assert.equal(cgroupMissingEval.reasonCode, 'CGROUP_CONTROLLERS_MISSING');
+    assert.equal(cgroupMissingEval.gateStatus, 'BLOCKED');
+
+    // 21.I: Conflicting cgroup observations (memory.max mismatch)
+    const cgroupConflictEval = evaluateDockerObservation({
+      observation: { ...validObservation, nonce: crypto.randomUUID(), memoryLimitBytes: 536870912 },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+      cgroupEvidence: { effectiveMemoryMax: 1073741824, controllersAvailable: true },
+    });
+    assert.equal(cgroupConflictEval.state, DOCKER_OBSERVATION_STATES.VERIFICATION_FAILED);
+    assert.equal(cgroupConflictEval.reasonCode, 'CGROUP_OBSERVATION_CONFLICT');
+
+    // 21.J: Network bridge mode mistaken for verified egress filtering fails closed
+    const bridgeEval = evaluateDockerObservation({
+      observation: { ...validObservation, nonce: crypto.randomUUID(), networkMode: 'bridge' },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+    });
+    assert.equal(bridgeEval.state, DOCKER_OBSERVATION_STATES.VERIFICATION_FAILED);
+    assert.equal(bridgeEval.reasonCode, 'NETWORK_EGRESS_UNVERIFIED');
+
+    // 21.K: Cleanup query failure does not confirm removal
+    const cleanupQueryFailEval = evaluateDockerObservation({
+      observation: { ...validObservation, nonce: crypto.randomUUID() },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+      cleanupEvidence: { queryFailed: true },
+    });
+    assert.equal(cleanupQueryFailEval.state, DOCKER_OBSERVATION_STATES.VERIFICATION_FAILED);
+    assert.equal(cleanupQueryFailEval.reasonCode, 'CLEANUP_QUERY_FAILED');
+
+    // 21.L: Container absence reported by daemon without process termination proof (orphan detected)
+    const orphanEval = evaluateDockerObservation({
+      observation: { ...validObservation, nonce: crypto.randomUUID() },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+      cleanupEvidence: { daemonAbsenceConfirmed: true, hostProcessesRemaining: 2 },
+    });
+    assert.equal(orphanEval.state, DOCKER_OBSERVATION_STATES.VERIFICATION_FAILED);
+    assert.equal(orphanEval.reasonCode, 'ORPHAN_PROCESS_DETECTED');
+
+    // 21.M: Stale observation rejected
+    const staleObs = {
+      ...validObservation,
+      nonce: crypto.randomUUID(),
+      observationTimestamp: new Date(Date.now() - 120000).toISOString(),
+    };
+    const staleRes = bindDockerObservationEvidence({
+      observation: staleObs,
+      maxObservationAgeMs: 60000,
+    });
+    assert.equal(staleRes.valid, false);
+    assert.equal(staleRes.reasonCode, 'OBSERVATION_STALE');
+
+    // 21.N: Cross-project evidence substitution rejected
+    const crossProjObs = {
+      ...validObservation,
+      nonce: crypto.randomUUID(),
+      projectId: 'other-project-id',
+    };
+    const crossProjRes = bindDockerObservationEvidence({
+      observation: crossProjObs,
+      expectedBindings: { projectId: 'proj-1' },
+    });
+    assert.equal(crossProjRes.valid, false);
+    assert.equal(crossProjRes.reasonCode, 'CROSS_PROJECT_EVIDENCE_SUBSTITUTION');
+
+    // 21.O: Caller-forged INDEPENDENTLY_VERIFIED rejected
+    const forgedVerifiedObs = {
+      ...validObservation,
+      nonce: crypto.randomUUID(),
+      independentlyVerified: true,
+    };
+    const forgedVerifiedRes = bindDockerObservationEvidence({
+      observation: forgedVerifiedObs,
+    });
+    assert.equal(forgedVerifiedRes.valid, false);
+    assert.equal(forgedVerifiedRes.reasonCode, 'CALLER_FORGED_OBSERVATION_STATE');
+
+    // 21.P: Missing observation fails closed
+    const missingObsEval = evaluateDockerObservation({ observation: null });
+    assert.equal(missingObsEval.state, DOCKER_OBSERVATION_STATES.NOT_CONFIGURED);
+    assert.equal(missingObsEval.gateStatus, 'BLOCKED');
+
+    // 21.Q: Overall evaluation in production reports DOCKER_DAEMON_TRUST NOT_ESTABLISHED and gate BLOCKED
+    const prodEval = evaluateDockerObservation({
+      observation: { ...validObservation, nonce: crypto.randomUUID() },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+    });
+    assert.equal(prodEval.daemonTrust, DOCKER_DAEMON_TRUST_STATES.NOT_ESTABLISHED);
+    assert.equal(prodEval.kernelEnforcement, 'NOT_VERIFIED');
+    assert.equal(prodEval.gate, 'PROCESS_ISOLATION_GATE');
+    assert.equal(prodEval.gateStatus, 'BLOCKED');
+    assert.equal(prodEval.isVerified, false);
   }
 
   console.log('All CODING AGENT V3 — Verified Isolated Project Execution tests passed successfully!');

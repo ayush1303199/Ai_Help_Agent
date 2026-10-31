@@ -28,37 +28,40 @@ class ContainerProvider {
         health: 'UNVERIFIED',
       },
       filesystemCapabilities: {
-        ephemeralCopyOnWrite: true,
-        readOnlyRoot: true,
-        restrictedBindMounts: true,
-        secureErasureOnExit: true,
+        ephemeralCopyOnWrite: false,
+        readOnlyRoot: false,
+        restrictedBindMounts: false,
+        secureErasureOnExit: false,
       },
       processCapabilities: {
-        independentProcessTree: true,
-        credentialIsolation: true,
-        userNamespaceRemapping: true,
-        hostObservedTermination: true,
+        independentProcessTree: false,
+        credentialIsolation: false,
+        userNamespaceRemapping: false,
+        hostObservedTermination: false,
       },
       networkCapabilities: {
-        defaultDenyAll: true,
-        egressFiltering: true,
-        isolatedNetworkNamespace: true,
+        defaultDenyAll: false,
+        egressFiltering: false,
+        isolatedNetworkNamespace: false,
       },
       resourceLimits: {
-        cpuThrottlingSupported: true,
-        memoryCapSupported: true,
-        outputBufferingCapped: true,
-        timeoutEnforcementSupported: true,
+        cpuThrottlingSupported: false,
+        memoryCapSupported: false,
+        outputBufferingCapped: false,
+        timeoutEnforcementSupported: false,
       },
       evidenceSource: 'CONTAINER_SOCKET_PROBE',
       verificationTimestamp: new Date().toISOString(),
-      capabilityVerificationStatus: PROVIDER_STATUSES.UNKNOWN,
+      capabilityVerificationStatus: PROVIDER_STATUSES.BLOCKED,
+      daemonTrust: 'NOT_ESTABLISHED',
       unverifiedRequirements: [
         'Authenticated mutual TLS or local pipe to container daemon',
         'Cryptographic daemon attestation certificate',
+        'Kernel cgroups v2 controller enforcement',
+        'Host-observed network namespace or egress firewall verification',
       ],
       isReady: false,
-      blockingReasons: ['Container daemon authentication and attestation have not been established.'],
+      blockingReasons: ['Container daemon authentication and attestation have not been established.', 'Runtime security capabilities (filesystem, egress, cgroups) are unverified.'],
     };
   }
 
@@ -71,11 +74,21 @@ class ContainerProvider {
       };
     }
 
-    if (evidence.sandbox === true || evidence.isolationVerified === true) {
+    if (evidence.sandbox === true || evidence.isolationVerified === true || evidence.verified === true || evidence.independentlyVerified === true || evidence.kernelEnforced === true || evidence.daemonTrust === 'VERIFIED' || evidence.isTrustedDaemon === true) {
       return {
         verified: false,
         status: PROVIDER_STATUSES.BLOCKED,
         reason: 'Caller-supplied Boolean flag ("sandbox: true") rejected as unverified.',
+      };
+    }
+
+    const provenance = String(evidence.provenance || '').toLowerCase();
+    if (evidence.isMock === true || evidence.trustClass === 'UNTRUSTED' || ['mock', 'synthetic', 'synthetic-test', 'simulated'].includes(provenance)) {
+      return {
+        verified: false,
+        status: PROVIDER_STATUSES.BLOCKED,
+        reason: 'Synthetic or mock container evidence cannot establish production runtime verification.',
+        blockingReasons: ['Synthetic evidence rejected for production isolation verification.'],
       };
     }
 

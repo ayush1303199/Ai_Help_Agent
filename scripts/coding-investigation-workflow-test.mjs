@@ -7,6 +7,7 @@ import { buildRepositoryMap } from '../electron/developerIndex.cjs';
 import { detectProject } from '../electron/coding-pipeline/detect/projectDetector.cjs';
 import { maskNonCodeSource, extractEnclosingFunctionBlock, generateSymbolVariants } from '../electron/coding-pipeline/investigationWorkflowContract.cjs';
 import { routeTaskMode, OPERATING_MODES } from '../electron/coding-pipeline/modes.cjs';
+import { classifyTaskIntent, INTENT_CATEGORIES } from '../electron/coding-pipeline/genericIntentClassifier.cjs';
 
 const {
   CLASSIFICATION_CONFIRMED,
@@ -2994,7 +2995,242 @@ end
 
   console.log('[TEST] Scenario 62 passed: Proposal contract structural scope & source grounding validation verified.');
 
-  console.log('All 62 Project-Agnostic Coding Investigation Workflow scenarios verified successfully on production interfaces.');
+  // SCENARIO 63: Complete Request-to-Validated-Diff Sequence (Consolidated from V22/V23)
+  {
+    const fixtureFiles = {
+      'package.json': JSON.stringify({
+        name: 'user-service',
+        version: '1.0.0',
+        scripts: { test: 'node test.js' },
+      }, null, 2),
+      'src/userService.js': `function getUserStatus(user) {
+  if (!user) {
+    return 'UNKNOWN';
+  }
+  // BUG: Direct property access throws TypeError when account is null
+  return user.account.status;
+}
+
+module.exports = { getUserStatus };
+`,
+    };
+
+    const ws = await fs.mkdtemp(path.join(testRoot, 'v23-ws-'));
+    for (const [relPath, fContent] of Object.entries(fixtureFiles)) {
+      const full = path.join(ws, relPath);
+      await fs.mkdir(path.dirname(full), { recursive: true });
+      await fs.writeFile(full, fContent, 'utf8');
+    }
+    const originalContent = fixtureFiles['src/userService.js'];
+
+    const readOperations = [];
+    const userRequest = 'Investigate and fix TypeError in src/userService.js when account is null';
+
+    const result = await developerAgent.executeAutonomousCodingWorkflow({
+      userRequest,
+      root: ws,
+      sessionId: 'v23-integration-session',
+      ownerWebContentsId: 2301,
+      requestApproval: null,
+      assessFindingRelevance: async ({ findings }) => ({
+        findings: findings.map((f) => ({
+          findingId: f.findingId,
+          decision: 'SUPPORTED',
+          relationship: 'The missing account null check directly triggers the reported TypeError in getUserStatus.',
+          evidenceIds: [f.sourceEvidenceId],
+          contradictionEvidenceIds: [],
+          unresolvedAssumptions: [],
+          provenance: 'VERIFIED_CODE_EVIDENCE',
+        })),
+      }),
+      tools: {
+        readFile: async (p, range) => {
+          readOperations.push({ path: p, range });
+          const diskContent = await fs.readFile(path.join(ws, p), 'utf8');
+          return {
+            content: diskContent,
+            lineRange: { startLine: 1, endLine: 10, totalLines: 10, complete: true },
+          };
+        },
+        searchCode: async () => ({
+          results: [{ path: 'src/userService.js', score: 100 }],
+        }),
+        proposePatch: async ({ originalContent: orig }) => orig.replace(
+          "  return user.account.status;",
+          "  return user.account ? user.account.status : 'INACTIVE';"
+        ),
+        findDefects: async ({ filePath }) => [{
+          filePath,
+          lines: '6',
+          symbol: 'getUserStatus',
+          codeSnippet: 'return user.account.status;',
+          controlFlow: 'Unchecked property access on nullable account object',
+          expected: "return user.account ? user.account.status : 'INACTIVE';",
+          observed: 'return user.account.status;',
+          evidenceType: 'STATIC_INSPECTION_CONFIRMED',
+        }],
+      },
+    });
+
+    assert.equal(result.userGoal, userRequest);
+    assert.equal(result.taskPlan.userGoal, userRequest);
+    assert.equal(result.taskType, 'INVESTIGATE_OR_DEBUG');
+    assert.ok(readOperations.length > 0, 'fileReader must be invoked on authoritative files');
+    assert.equal(readOperations[0].path.replace(/\\/g, '/'), 'src/userService.js');
+    assert.ok(result.continuation.rawPatch, 'A unified diff must be generated');
+    assert.ok(result.continuation.patchScope.targetFiles.includes('src/userService.js'));
+    assert.equal(result.outcome, 'APPROVAL_REQUIRED');
+    assert.equal(result.phase, 'APPROVE');
+    const diskContentAfter = await fs.readFile(path.join(ws, 'src/userService.js'), 'utf8');
+    assert.equal(diskContentAfter, originalContent, 'Workspace file must remain completely unmodified before approval');
+    assert.equal(result.evidenceLevel, 'NOT_RUN');
+    console.log('[TEST] Scenario 63 passed: Request-to-Validated-Diff sequence verified.');
+  }
+
+  // SCENARIO 64: Negative and Safety Validation Cases (Consolidated from V22/V23)
+  {
+    // 64a. Ambiguous request with no context
+    const ambResult = classifyTaskIntent({ request: 'make things better' });
+    assert.equal(ambResult.needsClarification, true);
+    assert.equal(ambResult.actionable, false);
+
+    // 64b. Follow-up request with referent in prior context
+    const contextMessages = [
+      { role: 'user', content: 'Investigate crash in src/controllers/order.js on line 55' },
+      { role: 'assistant', content: 'Identified bug in src/controllers/order.js: order.items is undefined' },
+    ];
+    const followUp = classifyTaskIntent({
+      request: 'fix the bug',
+      contextMessages,
+    });
+    assert.equal(followUp.needsClarification, false);
+    assert.equal(followUp.taskType, 'INVESTIGATE_OR_DEBUG');
+
+    const requirements = analyzeTaskRequirements('fix the bug', contextMessages);
+    assert.equal(requirements.needsClarification, false);
+    assert.ok(requirements.searchSignals.exactPaths.includes('src/controllers/order.js'));
+
+    // 64c. Follow-up request with NO established referent
+    const followUpOrphan = classifyTaskIntent({
+      request: 'fix the bug',
+      contextMessages: [],
+    });
+    assert.equal(followUpOrphan.needsClarification, true);
+
+    // 64d. Missing or unreadable authoritative source files
+    const failingRead = async () => {
+      const err = new Error('ENOENT: no such file or directory');
+      err.code = 'ENOENT';
+      throw err;
+    };
+    const toolOutcome = await executeToolWithSafeguards({
+      toolName: 'read_file',
+      toolFn: failingRead,
+      maxRetries: 1,
+    });
+    assert.equal(toolOutcome.success, false);
+    assert.equal(toolOutcome.failurePreserved, true);
+
+    // 64e. Patch containing an unauthorized file
+    const validation = validatePatchScope({
+      targetFiles: ['src/allowed.js'],
+      inspectedFiles: ['src/allowed.js'],
+      modifiedFiles: ['src/allowed.js', 'src/forbidden.js'],
+      existingDirtyFiles: [],
+    });
+    assert.equal(validation.isValid, false);
+    assert.ok(validation.rejectionReason.includes('not in the authorized target scope'));
+
+    // 64f. Stale source / uninspected file
+    const uninspected = validatePatchScope({
+      targetFiles: ['src/uninspected.js'],
+      inspectedFiles: ['src/inspected.js'],
+      modifiedFiles: ['src/uninspected.js'],
+    });
+    assert.equal(uninspected.isValid, false);
+    assert.ok(uninspected.rejectionReason.includes('touches uninspected file(s)'));
+
+    // 64g. Approval rejection produces zero mutations
+    const rejWs = await fs.mkdtemp(path.join(testRoot, 'v23-rej-'));
+    await fs.writeFile(path.join(rejWs, 'config.json'), '{"port": 8080}\n', 'utf8');
+    const rejResult = await developerAgent.executeAutonomousCodingWorkflow({
+      userRequest: 'Change port in config.json to 9090',
+      root: rejWs,
+      sessionId: 'v23-rejection-test',
+      ownerWebContentsId: 2307,
+      requestApproval: async () => false,
+      assessFindingRelevance: async ({ findings }) => ({
+        findings: findings.map((f) => ({
+          findingId: f.findingId,
+          decision: 'SUPPORTED',
+          relationship: 'Relevant config update',
+          evidenceIds: [f.sourceEvidenceId],
+          contradictionEvidenceIds: [],
+          unresolvedAssumptions: [],
+          provenance: 'TEST',
+        })),
+      }),
+      tools: {
+        readFile: async (p) => ({ content: await fs.readFile(path.join(rejWs, p), 'utf8') }),
+        searchCode: async () => ({ results: [{ path: 'config.json', score: 100 }] }),
+        proposePatch: async ({ originalContent: orig }) => orig.replace('8080', '9090'),
+        findDefects: async () => [{
+          filePath: 'config.json',
+          lines: '1',
+          symbol: 'port',
+          codeSnippet: '8080',
+          expected: '9090',
+          observed: '8080',
+        }],
+      },
+    });
+    assert.equal(rejResult.outcome, 'APPROVAL_REJECTED');
+    const rejDisk = await fs.readFile(path.join(rejWs, 'config.json'), 'utf8');
+    assert.equal(rejDisk, '{"port": 8080}\n');
+
+    // 64h. Cancellation before mutation
+    const cancelWs = await fs.mkdtemp(path.join(testRoot, 'v23-cancel-'));
+    await fs.writeFile(path.join(cancelWs, 'app.js'), 'console.log("running");\n', 'utf8');
+    const cancelResult = await developerAgent.executeAutonomousCodingWorkflow({
+      userRequest: 'Update app.js',
+      root: cancelWs,
+      sessionId: 'v23-cancel-test',
+      ownerWebContentsId: 2308,
+      isCancelled: () => true,
+    });
+    assert.equal(cancelResult.outcome, 'CANCELLED');
+    assert.equal(cancelResult.filesModified.length, 0);
+
+    // 64i. Mocked test result cannot be mislabeled as real execution
+    const mockedResult = developerAgent.classifyVerificationEvidenceLevel({
+      isPassing: true,
+      testOutcome: { status: 'PASS', ok: true, attempts: [{ check: 'static_modular_integration', synthetic: true }] },
+      finalEvidence: [],
+      hermeticVerification: { passed: 9, total: 9 },
+    });
+    assert.equal(mockedResult, developerAgent.VERIFICATION_EVIDENCE_LEVELS.PASSED_SYNTHETIC_TESTS);
+    assert.notEqual(mockedResult, developerAgent.VERIFICATION_EVIDENCE_LEVELS.PASSED_REAL_EXECUTION);
+
+    // 64j. Unavailable isolation runtime blocks target execution
+    const isoWs = await fs.mkdtemp(path.join(testRoot, 'v23-iso-'));
+    await fs.writeFile(path.join(isoWs, 'package.json'), JSON.stringify({ name: 'unisolated-pkg', scripts: { test: 'node -e "process.exit(0)"' } }));
+    const isoResult = await developerAgent.executeAutonomousCodingWorkflow({
+      userRequest: 'test the project',
+      root: isoWs,
+      sessionId: 'v23-isolation-test',
+      ownerWebContentsId: 2310,
+      containerRunner: {
+        isAvailable: async () => false,
+        execute: async () => { throw new Error('Host execution forbidden'); },
+      },
+    });
+    assert.equal(isoResult.executionBlocked, true);
+    assert.ok(['BLOCKED', 'BLOCKED_ISOLATION'].includes(isoResult.outcome));
+
+    console.log('[TEST] Scenario 64 passed: Request-to-Validated-Diff negative & safety boundaries verified.');
+  }
+
+  console.log('All 64 Project-Agnostic Coding Investigation Workflow scenarios verified successfully on production interfaces.');
 } finally {
   developerFiles.releaseProject(ownerId);
   await fs.rm(testRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });

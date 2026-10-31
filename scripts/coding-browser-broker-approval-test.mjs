@@ -10,6 +10,8 @@ import {
   classifyCodingRequestIntent,
   isProjectRuntimeTestRequest,
   formatProjectRuntimeTestCompletionMessage,
+  formatProjectRuntimeTestReceiptMessage,
+  formatWorkspaceAudit,
   normalizeProjectRuntimeTestWorkflowResult,
   shouldRequireDeveloperWorkflowForAttachedProject,
 } from '../src/features/coding/codingTransport.ts';
@@ -706,6 +708,110 @@ await assert.rejects(
   /backend is not reachable or the browser blocked the request/i,
   'Network failures should be surfaced with actionable context rather than raw Failed to fetch.',
 );
+
+// -------------------------------------------------------------------------
+// Milestone V44.19: Fix Missing Workspace Audit Evidence in Verification Responses
+// [SYNTHETIC TEST] Contract behavior verified via synthetic transport fixtures;
+// does NOT attest live workspace verification.
+// -------------------------------------------------------------------------
+console.log('Testing Milestone V44.19: Workspace Audit Evidence in Verification Responses...');
+
+// 1. Audit completed with findings
+const auditWithFindings = {
+  status: 'ISSUES_FOUND',
+  findings: [
+    { severity: 'WARN', source: 'config/db.js', message: 'Database connection timeout too low.', status: 'DETECTED', paths: ['config/db.js'] },
+    '[WARN] Deprecated dependency "request" referenced.',
+  ],
+  bugs: [
+    { path: 'routes/api.js', line: 42, description: 'Missing error handler.', severity: 'ERROR', source: 'linter' },
+  ],
+  syncPlan: [
+    { action: 'UPDATE', path: 'config/db.js', reason: 'Increase connection timeout.' },
+  ],
+};
+const formattedWithFindings = formatWorkspaceAudit(auditWithFindings);
+assert.match(formattedWithFindings, /Detected Workspace Issues & Readiness Audit:/);
+assert.match(formattedWithFindings, /\[WARN\] \(config\/db\.js\) Database connection timeout too low\..*\[Status: DETECTED\]/);
+assert.match(formattedWithFindings, /- \[ERROR\] \(linter\) routes\/api\.js:42: Missing error handler\./);
+assert.match(formattedWithFindings, /Repair\/sync plan:\n- UPDATE config\/db\.js: Increase connection timeout\./);
+
+// 2. Audit completed with no findings
+const auditWithNoFindings = {
+  status: 'NO_BLOCKING_ISSUES',
+  findings: [],
+  bugs: [],
+  syncPlan: [],
+};
+const formattedNoFindings = formatWorkspaceAudit(auditWithNoFindings);
+assert.match(formattedNoFindings, /Workspace Audit: NO_BLOCKING_ISSUES/);
+assert.match(formattedNoFindings, /No workspace environment gaps or cross-file drift were detected in the inspected paths\./);
+assert.match(formattedNoFindings, /Detected Bugs: None found by the source, contract, and import checks\./);
+assert.doesNotMatch(formattedNoFindings, /AUDIT_UNAVAILABLE/);
+
+// 3. Audit unavailable
+const auditUnavailable = {
+  status: 'AUDIT_UNAVAILABLE',
+  reason: 'Workspace audit was not executed for this run/launch operation.',
+};
+const formattedUnavailable = formatWorkspaceAudit(auditUnavailable);
+assert.match(formattedUnavailable, /Workspace Audit: AUDIT_UNAVAILABLE/);
+assert.match(formattedUnavailable, /Workspace audit was not executed for this run\/launch operation\./);
+assert.doesNotMatch(formattedUnavailable, /Detected Workspace Issues & Readiness Audit:/);
+
+// 4. Audit response missing (audit is null / undefined)
+const formattedMissing = formatProjectRuntimeTestReceiptMessage('Execution finished.', null);
+assert.match(formattedMissing, /Execution finished\./);
+assert.match(formattedMissing, /Workspace Audit: AUDIT_UNAVAILABLE/);
+assert.match(formattedMissing, /Workspace audit details were not included in the verification response/);
+assert.doesNotMatch(formattedMissing, /Detected Workspace Issues & Readiness Audit:/);
+
+// 5. Malformed audit response (non-array findings, empty object)
+const malformedAudit = {
+  findings: 'not an array',
+  bugs: null,
+};
+const formattedMalformed = formatWorkspaceAudit(malformedAudit);
+assert.match(formattedMalformed, /No workspace environment gaps or cross-file drift were detected/);
+assert.match(formattedMalformed, /Detected Bugs: None found/);
+
+// 6. Audit details lost during serialization (missing top-level audit restored from receipt)
+const rawResultWithAuditInReceipt = {
+  outcome: 'SUCCESS',
+  message: 'Verification passed.',
+  executionVerificationReceipt: {
+    message: 'Receipt body.',
+    workspaceAudit: auditWithFindings,
+  },
+};
+const normalizedResult = normalizeProjectRuntimeTestWorkflowResult('run the project', rawResultWithAuditInReceipt);
+assert.ok(normalizedResult.workspaceAudit, 'Workspace audit must be preserved on result even if only in receipt.');
+assert.equal(normalizedResult.workspaceAudit.status, 'ISSUES_FOUND');
+assert.match(normalizedResult.message, /Detected Workspace Issues & Readiness Audit:/);
+assert.match(normalizedResult.message, /Database connection timeout too low\./);
+
+// 7. Audit details preserved through verification response
+const resultWithDirectAudit = {
+  outcome: 'SUCCESS',
+  message: 'Direct verification passed.',
+  workspaceAudit: auditWithFindings,
+};
+const normalizedDirect = normalizeProjectRuntimeTestWorkflowResult('run the project', resultWithDirectAudit);
+assert.equal(normalizedDirect.workspaceAudit, auditWithFindings, 'Direct workspaceAudit must be preserved.');
+assert.match(normalizedDirect.message, /Database connection timeout too low\./);
+
+// 8. UI correctly distinguishes confirmed findings from unavailable evidence
+const startupFailedUnavailableResult = {
+  outcome: 'FAILED',
+  phase: 'APPLICATION_STARTUP_FAILED',
+  reason: 'Port 3000 already in use.',
+  workspaceAudit: { status: 'AUDIT_UNAVAILABLE' },
+};
+const normalizedStartupFailed = normalizeProjectRuntimeTestWorkflowResult('run the project', startupFailedUnavailableResult);
+assert.match(normalizedStartupFailed.message, /Port 3000 already in use\./);
+assert.match(normalizedStartupFailed.message, /Workspace Audit: AUDIT_UNAVAILABLE/);
+// Crucial: Must NEVER treat missing audit data as a detected workspace issue!
+assert.doesNotMatch(normalizedStartupFailed.message, /Detected Workspace Issues & Readiness Audit:\s*Workspace audit details were not included/);
 
 browser.window.close();
 console.log('Browser broker approval transport test passed (mocked backend responses; broker materialization is covered separately).');

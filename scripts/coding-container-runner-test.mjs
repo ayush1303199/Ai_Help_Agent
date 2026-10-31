@@ -14,7 +14,13 @@ const {
   NETWORK_POLICIES,
   DEFAULT_PROJECT_IMAGES,
   APPROVED_BASE_IMAGES,
+  DEFAULT_TMPFS_CONFIG,
+  validateContainerRunArgs,
 } = require('../electron/coding-pipeline/projectContainerExecutionRunner.cjs');
+
+const {
+  runDockerCliAsync,
+} = require('../electron/coding-pipeline/dockerProviderAdapter.cjs');
 
 const {
   BUILD_OPERATIONS,
@@ -358,6 +364,10 @@ async function runContainerRunnerTests() {
     assert.ok(runArgs.includes('--cpus=1.0'), 'Must enforce bounded CPU');
     assert.ok(runArgs.includes('--pids-limit=64'), 'Must enforce process limit');
     assert.ok(runArgs.includes('--workdir=/workspace'), 'Must set isolated workdir');
+    assert.ok(runArgs.includes('--read-only'), 'Must enforce read-only root filesystem');
+    assert.ok(runArgs.includes('--tmpfs'), 'Must configure tmpfs');
+    const tmpfsIdx = runArgs.indexOf('--tmpfs');
+    assert.equal(runArgs[tmpfsIdx + 1], DEFAULT_TMPFS_CONFIG, 'Must configure bounded /tmp storage');
     assert.ok(runArgs.some((a) => a.startsWith('--label=ai-help-agent-execution-id=')), 'Must tag container with execution ID');
   }
 
@@ -709,6 +719,859 @@ async function runContainerRunnerTests() {
     } else {
       console.log('Target C:\\Users\\Admin\\Downloads\\Hello not found on disk, skipping live check.');
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // 14. [MOCKED_DOCKER_CLI] Docker Rootfs Hardening & Guaranteed Cleanup (Milestone V44.23)
+  // -------------------------------------------------------------------------
+  console.log('14. [V44.23] Testing read-only rootfs, bounded tmpfs, and guaranteed cleanup on every outcome...');
+  {
+    const projectDir = await makeTempDir('v44-23-test-');
+    await fs.writeFile(path.join(projectDir, 'package.json'), JSON.stringify({
+      name: 'v44-23-fixture',
+      scripts: { test: 'node -e "process.exit(0)"' },
+    }));
+    const ownerId = 423;
+    await developerFiles.attachProject(projectDir, ownerId);
+
+    const plan = await createBuildPlan({
+      projectRoot: projectDir,
+      operation: BUILD_OPERATIONS.TEST,
+      dependencyReport: { needsInstallation: false, findings: [] },
+    });
+
+    // 14a. Argument validation
+    assert.throws(() => validateContainerRunArgs(['run', '--rm']), /missing required --read-only/);
+    assert.throws(() => validateContainerRunArgs(['run', '--rm', '--read-only']), /missing required --tmpfs/);
+    assert.throws(() => validateContainerRunArgs(['run', '--rm', '--read-only', '--tmpfs', '/tmp:rw']), /Invalid --tmpfs configuration/);
+    assert.equal(validateContainerRunArgs(['run', '--rm', '--read-only', '--tmpfs', DEFAULT_TMPFS_CONFIG]), true);
+
+    // 14b. Cleanup guaranteed on success
+    let cleanupCalls = 0;
+    const mockSuccessCli = (...callArgs) => {
+      const args = getArgs(callArgs);
+      if (args[0] === 'ps') {
+        cleanupCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      return { status: 0, stdout: 'ok', stderr: '' };
+    };
+    const successRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockSuccessCli,
+      isMock: true,
+    });
+    const successRes = await successRunner.execute({ plan, ownerWebContentsId: ownerId, sessionId: crypto.randomUUID() });
+    assert.equal(successRes.ok, true);
+    assert.equal(successRes.status, 'PASSED');
+    assert.equal(successRes.cleanupStatus, 'HOST_VERIFIED_CLEANED');
+    assert.ok(cleanupCalls >= 1, 'Cleanup must be called on success');
+    assert.equal(successRes.isolationEvidence.readOnlyRoot, true);
+    assert.equal(successRes.isolationEvidence.tmpfsMount, DEFAULT_TMPFS_CONFIG);
+
+    // 14c. Cleanup guaranteed on non-zero exit
+    cleanupCalls = 0;
+    const mockFailCli = (...callArgs) => {
+      const args = getArgs(callArgs);
+      if (args[0] === 'ps') {
+        cleanupCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      return { status: 2, stdout: '', stderr: 'test error' };
+    };
+    const failRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockFailCli,
+      isMock: true,
+    });
+    const failRes = await failRunner.execute({ plan, ownerWebContentsId: ownerId, sessionId: crypto.randomUUID() });
+    assert.equal(failRes.ok, false);
+    assert.equal(failRes.status, 'FAILED');
+    assert.equal(failRes.cleanupStatus, 'HOST_VERIFIED_CLEANED');
+    assert.ok(cleanupCalls >= 1, 'Cleanup must be called on non-zero exit');
+
+    // 14d. Cleanup guaranteed on timeout
+    cleanupCalls = 0;
+    const mockTimeoutCli = (...callArgs) => {
+      const args = getArgs(callArgs);
+      if (args[0] === 'ps') {
+        cleanupCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      return { status: null, timedOut: true, stdout: '', stderr: 'timed out' };
+    };
+    const timeoutRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockTimeoutCli,
+      isMock: true,
+    });
+    const timeoutRes = await timeoutRunner.execute({ plan, ownerWebContentsId: ownerId, sessionId: crypto.randomUUID() });
+    assert.equal(timeoutRes.ok, false);
+    assert.equal(timeoutRes.status, 'TIMED_OUT');
+    assert.equal(timeoutRes.cleanupStatus, 'HOST_VERIFIED_CLEANED');
+    assert.ok(cleanupCalls >= 1, 'Cleanup must be called on timeout');
+
+    // 14e. Cleanup guaranteed on unexpected thrown exception
+    cleanupCalls = 0;
+    const mockThrowCli = (...callArgs) => {
+      const args = getArgs(callArgs);
+      if (args[0] === 'ps') {
+        cleanupCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      throw new Error('Unexpected container execution failure');
+    };
+    const throwRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockThrowCli,
+      isMock: true,
+    });
+    const throwRes = await throwRunner.execute({ plan, ownerWebContentsId: ownerId, sessionId: crypto.randomUUID() });
+    assert.equal(throwRes.ok, false);
+    assert.equal(throwRes.status, 'FAILED');
+    assert.equal(throwRes.cleanupStatus, 'HOST_VERIFIED_CLEANED');
+    assert.equal(throwRes.originalError, 'Unexpected container execution failure');
+    assert.ok(cleanupCalls >= 1, 'Cleanup must run in catch/finally on unexpected exception');
+
+    // 14f. Truthful reporting when cleanup fails after an exception
+    const mockDoubleFailCli = (...callArgs) => {
+      const args = getArgs(callArgs);
+      if (args[0] === 'ps') {
+        return { status: 0, stdout: 'lingering-cid\n', stderr: '' };
+      }
+      if (args[0] === 'rm') {
+        return { status: 1, stdout: '', stderr: 'rm failure' };
+      }
+      throw new Error('Primary execution exploded');
+    };
+    const doubleFailRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockDoubleFailCli,
+      isMock: true,
+    });
+    const doubleFailRes = await doubleFailRunner.execute({ plan, ownerWebContentsId: ownerId, sessionId: crypto.randomUUID() });
+    assert.equal(doubleFailRes.ok, false);
+    assert.equal(doubleFailRes.status, 'CLEANUP_FAILED');
+    assert.equal(doubleFailRes.cleanupFailed, true);
+    assert.equal(doubleFailRes.originalError, 'Primary execution exploded');
+    assert.match(doubleFailRes.reason, /Primary execution exploded/);
+    assert.match(doubleFailRes.reason, /container cleanup verification failed/);
+
+    await fs.rm(projectDir, { recursive: true, force: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // 15. [V44.24] Testing Asynchronous Docker Execution & Real In-Flight Cancellation
+  // -------------------------------------------------------------------------
+  console.log('15. [V44.24] Testing asynchronous Docker execution, real in-flight cancellation, and process lifecycle...');
+  {
+    const projectDir = await makeTempDir('v44-24-async-test-');
+    await fs.writeFile(path.join(projectDir, 'package.json'), JSON.stringify({
+      name: 'async-cancel-fixture',
+      scripts: { test: 'node -e "process.exit(0)"' },
+    }));
+    const ownerId = 4424;
+    await developerFiles.attachProject(projectDir, ownerId);
+    const plan = await createBuildPlan({
+      projectRoot: projectDir,
+      operation: BUILD_OPERATIONS.TEST,
+      dependencyReport: { needsInstallation: false, findings: [] },
+    });
+
+    // 15a. Default constructor configures runDockerCliAsync
+    const defaultRunner = new ProjectContainerExecutionRunner();
+    assert.equal(defaultRunner.dockerCli, runDockerCliAsync, 'Default dockerCli must be runDockerCliAsync');
+    assert.equal(defaultRunner.isMockRunner, false, 'Default runner must not be classified as mock runner');
+
+    // 15b. Direct runDockerCliAsync pre-launch cancellation
+    const preAbortController = new AbortController();
+    preAbortController.abort();
+    const preAbortRes = await runDockerCliAsync('docker', ['run', 'alpine'], { signal: preAbortController.signal });
+    assert.equal(preAbortRes.cancelled, true);
+    assert.equal(preAbortRes.status, null);
+    assert.equal(preAbortRes.signal, 'SIGTERM');
+    assert.match(preAbortRes.error, /cancelled by caller before process launch/i);
+
+    // 15c. Duplicate abort calls do not throw or produce unhandled errors
+    preAbortController.abort();
+    preAbortController.abort();
+
+    // 15d. Real in-flight cancellation on container runner
+    let inFlightCleanupCalls = 0;
+    let inFlightProcessCancelled = false;
+    const abortController = new AbortController();
+
+    const mockInFlightCli = async (bin, args, timeoutMs, opts = {}) => {
+      const callArgs = Array.isArray(args) ? args : [];
+      if (callArgs[0] === 'ps') {
+        inFlightCleanupCalls++;
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (callArgs[0] === 'run') {
+        const sig = opts.signal;
+        return new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            resolve({ status: 0, stdout: 'completed normally', stderr: '' });
+          }, 5000);
+
+          if (sig) {
+            sig.addEventListener('abort', () => {
+              clearTimeout(timer);
+              inFlightProcessCancelled = true;
+              resolve({
+                status: null,
+                signal: 'SIGTERM',
+                timedOut: false,
+                cancelled: true,
+                error: 'ABORT_ERR: Docker CLI execution was cancelled by caller.',
+                stdout: '',
+                stderr: '',
+              });
+            }, { once: true });
+          }
+        });
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+
+    const inFlightRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockInFlightCli,
+      isMock: true,
+    });
+
+    // Trigger execution and abort mid-flight
+    const executePromise = inFlightRunner.execute({
+      plan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+      signal: abortController.signal,
+    });
+
+    // Abort after 20ms while in-flight
+    await new Promise((r) => setTimeout(r, 20));
+    abortController.abort();
+
+    const cancelResult = await executePromise;
+    assert.equal(cancelResult.ok, false);
+    assert.equal(cancelResult.status, 'CANCELLED');
+    assert.equal(cancelResult.cleanupStatus, 'HOST_VERIFIED_CLEANED');
+    assert.equal(inFlightProcessCancelled, true, 'Active in-flight child execution must receive abort');
+    assert.ok(inFlightCleanupCalls >= 1, 'Cleanup verification must be triggered after cancellation');
+    assert.match(cancelResult.reason, /cancelled by caller/i);
+
+    // 15e. In-flight cancellation with failed container cleanup
+    const abortController2 = new AbortController();
+    const mockCancelCleanupFailCli = async (bin, args, timeoutMs, opts = {}) => {
+      const callArgs = Array.isArray(args) ? args : [];
+      if (callArgs[0] === 'ps') {
+        return { status: 0, stdout: 'stuck-container-xyz\n', stderr: '' };
+      }
+      if (callArgs[0] === 'rm') {
+        return { status: 1, stdout: '', stderr: 'rm failure: container busy' };
+      }
+      if (callArgs[0] === 'run') {
+        return new Promise((resolve) => {
+          opts.signal?.addEventListener('abort', () => {
+            resolve({
+              status: null,
+              signal: 'SIGTERM',
+              timedOut: false,
+              cancelled: true,
+              error: 'ABORT_ERR: Cancelled by caller.',
+              stdout: '',
+              stderr: '',
+            });
+          }, { once: true });
+        });
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+
+    const cancelFailRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockCancelCleanupFailCli,
+      isMock: true,
+    });
+
+    const executePromise2 = cancelFailRunner.execute({
+      plan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+      signal: abortController2.signal,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    abortController2.abort();
+
+    const cancelFailResult = await executePromise2;
+    assert.equal(cancelFailResult.ok, false);
+    assert.equal(cancelFailResult.status, 'CLEANUP_FAILED');
+    assert.equal(cancelFailResult.cleanupFailed, true);
+    assert.match(cancelFailResult.reason, /cancelled by caller/i);
+    assert.match(cancelFailResult.reason, /container cleanup verification failed/i);
+
+    // 15f. Asynchronous timeout handling and process termination
+    let timeoutCleanupCalled = false;
+    const mockTimeoutCli = async (bin, args, timeoutMs, opts = {}) => {
+      const callArgs = Array.isArray(args) ? args : [];
+      if (callArgs[0] === 'ps') {
+        timeoutCleanupCalled = true;
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (callArgs[0] === 'run') {
+        return {
+          status: null,
+          signal: 'SIGKILL',
+          timedOut: true,
+          cancelled: false,
+          error: 'ETIMEDOUT: Docker CLI execution timed out.',
+          stdout: '',
+          stderr: 'Execution timed out',
+        };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+
+    const timeoutRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockTimeoutCli,
+      isMock: true,
+    });
+
+    const timeoutResult = await timeoutRunner.execute({
+      plan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+    });
+    assert.equal(timeoutResult.ok, false);
+    assert.equal(timeoutResult.status, 'TIMED_OUT');
+    assert.equal(timeoutResult.cleanupStatus, 'HOST_VERIFIED_CLEANED');
+    assert.ok(timeoutCleanupCalled, 'Cleanup verification must be triggered after timeout');
+
+    // 15g. Asynchronous non-zero exit code capture
+    const mockNonZeroCli = async (bin, args) => {
+      const callArgs = Array.isArray(args) ? args : [];
+      if (callArgs[0] === 'ps') return { status: 0, stdout: '', stderr: '' };
+      if (callArgs[0] === 'run') {
+        return {
+          status: 42,
+          signal: null,
+          timedOut: false,
+          cancelled: false,
+          error: null,
+          stdout: 'Standard output before error',
+          stderr: 'Process failed with exit code 42',
+        };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+
+    const nonZeroRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockNonZeroCli,
+      isMock: true,
+    });
+
+    const nonZeroResult = await nonZeroRunner.execute({
+      plan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+    });
+    assert.equal(nonZeroResult.ok, false);
+    assert.equal(nonZeroResult.status, 'FAILED');
+    assert.equal(nonZeroResult.exitCode, 42);
+    assert.equal(nonZeroResult.cleanupStatus, 'HOST_VERIFIED_CLEANED');
+    assert.match(nonZeroResult.stderr, /exit code 42/);
+
+    // 15h. Asynchronous spawn error handling
+    const mockSpawnErrorCli = async (bin, args) => {
+      const callArgs = Array.isArray(args) ? args : [];
+      if (callArgs[0] === 'ps') return { status: 0, stdout: '', stderr: '' };
+      return {
+        status: null,
+        signal: null,
+        timedOut: false,
+        cancelled: false,
+        error: 'SPAWN_ERROR: ENOENT: spawn docker ENOENT',
+        stdout: '',
+        stderr: 'spawn docker ENOENT',
+      };
+    };
+
+    const spawnErrorRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: mockSpawnErrorCli,
+      isMock: true,
+    });
+
+    const spawnErrorResult = await spawnErrorRunner.execute({
+      plan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+    });
+    assert.equal(spawnErrorResult.ok, false);
+    assert.equal(spawnErrorResult.status, 'FAILED');
+    assert.match(spawnErrorResult.reason, /ENOENT/i);
+    assert.equal(spawnErrorResult.cleanupStatus, 'HOST_VERIFIED_CLEANED');
+
+    await fs.rm(projectDir, { recursive: true, force: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // 16. [V44.25] Testing Truthful Docker Capability Discovery & Configuration vs Runtime Evidence
+  // -------------------------------------------------------------------------
+  console.log('16. [V44.25] Testing truthful Docker capability discovery and configuration vs runtime evidence...');
+  {
+    const projectDir = await makeTempDir('v44-25-runner-test-');
+    await fs.writeFile(path.join(projectDir, 'package.json'), JSON.stringify({
+      name: 'v44-25-fixture',
+      scripts: { test: 'node -e "process.exit(0)"' },
+    }));
+    const ownerId = 4427;
+    await developerFiles.attachProject(projectDir, ownerId);
+    const plan = await createBuildPlan({
+      projectRoot: projectDir,
+      operation: BUILD_OPERATIONS.TEST,
+      dependencyReport: { needsInstallation: false, findings: [] },
+    });
+
+    const mockRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: (bin, args) => {
+        if (args && args[0] === 'ps') return { status: 0, stdout: '', stderr: '' };
+        return { status: 0, stdout: 'pass', stderr: '' };
+      },
+      isMock: true,
+    });
+
+    const execRes = await mockRunner.execute({
+      plan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+    });
+
+    assert.equal(execRes.ok, true);
+    assert.equal(execRes.isolationEvidence.readOnlyRoot, true, 'Configuration --read-only must be recorded');
+    assert.equal(execRes.isolationEvidence.tmpfsMount, DEFAULT_TMPFS_CONFIG, 'Configuration --tmpfs must be recorded');
+
+    // Capability provenance
+    const capEvidence = execRes.isolationEvidence.capabilityEvidence;
+    assert.ok(capEvidence, 'isolationEvidence must contain structured capabilityEvidence');
+    assert.equal(capEvidence.readOnlyRootfs.configured, true);
+    assert.equal(capEvidence.readOnlyRootfs.runtimeEnforcement, 'NOT_VERIFIED');
+    assert.equal(capEvidence.readOnlyRootfs.verificationMethod, 'CLI_FLAG_CONFIGURATION');
+    assert.equal(capEvidence.networkMode.egressFiltering, 'NOT_VERIFIED');
+    assert.equal(capEvidence.resourceLimits.cgroupEnforcement, 'NOT_VERIFIED');
+    assert.equal(capEvidence.temporaryStorage.runtimeEnforcement, 'NOT_VERIFIED');
+
+    await fs.rm(projectDir, { recursive: true, force: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // 17. [V44.26] Testing End-to-End Isolation Capability Enforcement and Execution Gate Blocking
+  // -------------------------------------------------------------------------
+  console.log('17. [V44.26] Testing end-to-end isolation capability enforcement and execution gate blocking...');
+  {
+    const { ContainerProvider } = require('../electron/coding-pipeline/providers/containerProvider.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+
+    const realRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      isMock: false,
+    });
+
+    const unverifiedRuntime = {
+      providerId: 'docker',
+      runtimeType: 'container',
+      isolationVerified: false,
+      supportedOps: ['test'],
+      isReady: false,
+      capabilityVerificationStatus: 'BLOCKED',
+    };
+
+    // 17.1: executeWithRuntime blocks unverified runtime fail-closed
+    const execWithRuntimeRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: unverifiedRuntime,
+    });
+    assert.equal(execWithRuntimeRes.ok, false);
+    assert.equal(execWithRuntimeRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.match(execWithRuntimeRes.reason, /isolation is unverified/i);
+
+    // 17.2: Direct execute blocks unverified runtime fail-closed
+    const execDirectRes = await realRunner.execute({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: unverifiedRuntime,
+    });
+    assert.equal(execDirectRes.ok, false);
+    assert.equal(execDirectRes.status, 'BLOCKED');
+    assert.equal(execDirectRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.match(execDirectRes.reason, /isolation attestation has not been established/i);
+
+    // 17.3: Untrusted provenance sources blocked fail-closed on non-mock runner
+    for (const src of ['synthetic', 'mock', 'untrusted-caller-input', 'simulated']) {
+      const res = await realRunner.execute({
+        plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+        ownerWebContentsId: 9999,
+        sessionId: 'sess-1',
+        runtime: {
+          providerId: 'docker',
+          runtimeType: 'container',
+          isolationVerified: true,
+          supportedOps: ['test'],
+          evidenceSource: src,
+        },
+      });
+      assert.equal(res.ok, false);
+      assert.equal(res.status, 'BLOCKED');
+      assert.equal(res.gate, 'PROCESS_ISOLATION_GATE');
+      assert.match(res.reason, /synthetic test evidence rejected/i);
+    }
+
+    // 17.4: Verification policies require genuine capabilities and reject forged flags
+    const baseDescriptor = {
+      providerId: 'test-container-provider',
+      supportedPlatforms: [process.platform],
+      isReady: false,
+      capabilityVerificationStatus: PROVIDER_STATUSES.UNKNOWN,
+      filesystemCapabilities: { readOnlyRoot: false, restrictedBindMounts: false },
+      networkCapabilities: { egressFiltering: false },
+      resourceLimits: { memoryCapSupported: false, cpuThrottlingSupported: false, timeoutEnforcementSupported: true },
+      processCapabilities: { hostObservedTermination: false, runtimeSupervisorVerified: false },
+    };
+
+    assert.ok(verifyIsolationCapabilities({ providerDescriptor: baseDescriptor, requestedPolicy: { requireReadOnlyRootfs: true } }).missingCapabilities.includes('read_only_rootfs'));
+    assert.ok(verifyIsolationCapabilities({ providerDescriptor: baseDescriptor, requestedPolicy: { requireEgressFiltering: true } }).missingCapabilities.includes('egress_filtering'));
+    assert.ok(verifyIsolationCapabilities({ providerDescriptor: baseDescriptor, requestedPolicy: { requireCgroupLimits: true } }).missingCapabilities.includes('cgroup_resource_limits'));
+    assert.ok(verifyIsolationCapabilities({ providerDescriptor: baseDescriptor, requestedPolicy: { requireFilesystemIsolation: true } }).missingCapabilities.includes('restricted_bind_mounts'));
+    assert.ok(verifyIsolationCapabilities({ providerDescriptor: baseDescriptor, requestedPolicy: { requireCleanupAttestation: true } }).missingCapabilities.includes('cleanup_attestation'));
+    assert.ok(verifyIsolationCapabilities({ providerDescriptor: baseDescriptor, requestedPolicy: { requireRuntimeSupervisor: true } }).missingCapabilities.includes('runtime_supervisor'));
+
+    const callerSuppliedRes = verifyIsolationCapabilities({ providerDescriptor: baseDescriptor, evidence: { verified: true } });
+    assert.equal(callerSuppliedRes.ready, false);
+    assert.equal(callerSuppliedRes.status, PROVIDER_STATUSES.BLOCKED);
+
+    const cp = new ContainerProvider();
+    assert.equal(cp.verifyEvidence({ verified: true }).verified, false);
+  }
+
+  // -------------------------------------------------------------------------
+  // 18. [V44.27] Testing Adversarial Bypass Rejection, False-Cleanup Prevention & In-Flight Cancellation
+  // -------------------------------------------------------------------------
+  console.log('18. [V44.27] Testing adversarial bypass rejection, false-cleanup prevention & in-flight cancellation...');
+  {
+    const realRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      isMock: false,
+    });
+
+    // 18.1: executeWithRuntime blocks unregistered provider fail-closed
+    const unregRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: { providerId: 'unregistered', supportedOps: ['test'], isolationVerified: true },
+    });
+    assert.equal(unregRes.ok, false);
+    assert.equal(unregRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.match(unregRes.reason, /not registered/i);
+
+    // 18.2: executeWithRuntime blocks untrusted provenance and forged flags
+    const forgeRuntimeRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: { providerId: 'docker', supportedOps: ['test'], isolationVerified: true, evidenceSource: 'synthetic' },
+    });
+    assert.equal(forgeRuntimeRes.ok, false);
+    assert.equal(forgeRuntimeRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.match(forgeRuntimeRes.reason, /synthetic or untrusted runtime evidence rejected/i);
+
+    // 18.3: Cleanup query failure must never report false cleanup success
+    const failRunner = new ProjectContainerExecutionRunner({
+      dockerCli: () => ({ status: 1, error: 'CLI failed', stdout: '', stderr: 'err' }),
+      isMock: false,
+    });
+    const clRes = await failRunner._verifyCleanup('test-label');
+    assert.equal(clRes.cleaned, false);
+    assert.equal(clRes.status, 'CLEANUP_FAILED');
+    assert.match(clRes.error, /err|failed to query container status/i);
+
+    // 18.4: Empty or invalid cleanup label fails closed
+    const emptyLabel = await realRunner._verifyCleanup('   ');
+    assert.equal(emptyLabel.cleaned, false);
+    assert.equal(emptyLabel.status, 'CLEANUP_FAILED');
+  }
+
+  // -------------------------------------------------------------------------
+  // 19. [V44.29] Cryptographic Attestation Verification & Tamper Detection
+  // -------------------------------------------------------------------------
+  console.log('19. [V44.29] Testing cryptographic attestation verification & tamper detection...');
+  {
+    const {
+      createAttestationPayload,
+      signAttestationPayload,
+      verifyAttestationSignature,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const pubPem = publicKey.export({ type: 'spki', format: 'pem' });
+    const trustStore = {
+      getPublicKey: (issuer, key) => (issuer === 'auth-1' && key === 'key-1' ? pubPem : null),
+    };
+
+    const payload = createAttestationPayload({
+      issuerId: 'auth-1',
+      keyId: 'key-1',
+      algorithm: 'ed25519',
+    });
+    const signed = signAttestationPayload({
+      payload,
+      privateKey,
+      keyId: 'key-1',
+      issuerId: 'auth-1',
+    });
+
+    // 19.1: Valid signature with trust store succeeds
+    const okRes = verifyAttestationSignature({ attestation: signed, trustStore });
+    assert.equal(okRes.valid, true);
+    assert.equal(okRes.state, 'AUTHENTICATED');
+
+    // 19.2: Tampered payload fails verification
+    const badPayload = { ...signed.payload, nonce: crypto.randomUUID() };
+    const badRes = verifyAttestationSignature({ attestation: { ...signed, payload: badPayload }, trustStore });
+    assert.equal(badRes.state, 'BLOCKED');
+    assert.equal(badRes.reasonCode, 'SIGNATURE_VERIFICATION_FAILED');
+
+    // 19.3: Self-supplied public key is rejected
+    const selfRes = verifyAttestationSignature({ attestation: { ...signed, publicKey: pubPem }, trustStore });
+    assert.equal(selfRes.state, 'BLOCKED');
+    assert.equal(selfRes.reasonCode, 'SELF_SIGNED_KEY_REJECTED');
+
+    // 19.4: Container runner rejects unauthenticated attestation
+    const realRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      isMock: false,
+    });
+    const unauthExecRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: {
+        providerId: 'docker',
+        supportedOps: ['test'],
+        attestation: { ...signed, signature: 'bad_sig' },
+      },
+    });
+    assert.equal(unauthExecRes.ok, false);
+    assert.equal(unauthExecRes.gate, 'PROCESS_ISOLATION_GATE');
+  }
+
+  // -------------------------------------------------------------------------
+  // 20. [V44.30] Out-of-Process Issuer Service Contract & Boundary Rejection
+  // -------------------------------------------------------------------------
+  console.log('20. [V44.30] Testing out-of-process issuer service contract & boundary rejection...');
+  {
+    const {
+      ISSUER_SERVICE_STATES,
+      ISSUER_TRUST_DOMAINS,
+      evaluateIssuerServiceBoundary,
+      validateIssuerRequest,
+      issueAttestation,
+      authorizeExecution,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+
+    // 20.1: Ordinary child process or in-session process is rejected as boundary
+    const childRes = evaluateIssuerServiceBoundary({
+      serviceId: 'docker-helper-child',
+      isOrdinaryChildProcess: true,
+      runsInUserDesktopSession: true,
+    });
+    assert.equal(childRes.isTrustedBoundary, false);
+    assert.equal(childRes.reasonCode, 'NOT_A_SECURITY_BOUNDARY');
+
+    // 20.2: Provider adapter claiming to be issuer is rejected
+    const provRes = evaluateIssuerServiceBoundary({
+      serviceId: 'docker-provider',
+      domain: ISSUER_TRUST_DOMAINS.PROVIDER_ADAPTER,
+      hasIndependentOsIdentity: true,
+      hasIsolatedIpcChannel: true,
+      hasProtectedKeyStorage: true,
+    });
+    assert.equal(provRes.isTrustedBoundary, false);
+    assert.equal(provRes.reasonCode, 'DOMAIN_CANNOT_ISSUE');
+
+    // 20.3: Container runner rejects caller-supplied issuer service descriptor
+    const realRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      isMock: false,
+    });
+    const fakeIssuerExecRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: {
+        providerId: 'docker',
+        supportedOps: ['test'],
+        issuerService: { serviceId: 'forged-service', isTrusted: true },
+      },
+    });
+    assert.equal(fakeIssuerExecRes.ok, false);
+    assert.equal(fakeIssuerExecRes.gate, 'PROCESS_ISOLATION_GATE');
+
+    // 20.4: Production authorization remains unconditionally BLOCKED
+    const authDecision = authorizeExecution({
+      attestationVerificationResult: { state: 'AUTHENTICATED' },
+      serviceDescriptor: { isProductionService: true },
+      providerDescriptor: { providerId: 'docker' },
+      osEnforcementEvidence: { kernelEnforced: false },
+    });
+    assert.equal(authDecision.state, 'BLOCKED');
+    assert.equal(authDecision.reasonCode, 'ISSUER_TRUST_BOUNDARY_NOT_ESTABLISHED');
+  }
+
+  // -------------------------------------------------------------------------
+  // 21. [V44.31] Docker Runtime Observation, Daemon Trust Boundary & Runner Gates
+  // -------------------------------------------------------------------------
+  console.log('21. [V44.31] Testing Docker runtime observation, daemon trust boundary & runner enforcement gates...');
+  {
+    const {
+      DOCKER_DAEMON_TRUST_STATES,
+      DOCKER_OBSERVATION_STATES,
+      evaluateDockerDaemonTrust,
+      evaluateDockerObservation,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+
+    const realRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      isMock: false,
+    });
+
+    // 21.1: Runner rejects caller-supplied daemonTrust: 'VERIFIED' or kernelEnforced: true
+    const forgedTrustRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: {
+        providerId: 'docker',
+        supportedOps: ['test'],
+        daemonTrust: 'VERIFIED',
+      },
+    });
+    assert.equal(forgedTrustRes.ok, false);
+    assert.equal(forgedTrustRes.gate, 'PROCESS_ISOLATION_GATE');
+
+    const forgedKernelRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: {
+        providerId: 'docker',
+        supportedOps: ['test'],
+        kernelEnforced: true,
+      },
+    });
+    assert.equal(forgedKernelRes.ok, false);
+    assert.equal(forgedKernelRes.gate, 'PROCESS_ISOLATION_GATE');
+
+    // 21.2: Runner rejects Docker observation with bridge networking or unverified egress
+    const bridgeObsResult = verifyIsolationCapabilities({
+      providerDescriptor: {
+        providerId: 'docker',
+        supportedPlatforms: ['win32', 'linux', 'darwin'],
+        isReady: true,
+        capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+      },
+      evidence: {
+        dockerObservation: {
+          daemonId: 'daemon-uuid-1',
+          endpoint: 'npipe:////./pipe/docker_engine',
+          containerId: 'container-abc',
+          containerCreationIdentity: 'creation-1',
+          executionId: 'exec-1',
+          projectId: 'proj-1',
+          sessionId: 'sess-1',
+          grantId: 'grant-1',
+          policyDigest: 'policy-1',
+          planDigest: 'plan-1',
+          observationTimestamp: new Date().toISOString(),
+          nonce: crypto.randomUUID(),
+          networkMode: 'bridge',
+          mounts: [],
+        },
+      },
+      context: { projectId: 'proj-1', executionId: 'exec-1', sessionId: 'sess-1', containerId: 'container-abc' },
+    });
+    assert.equal(bridgeObsResult.ready, false);
+    assert.equal(bridgeObsResult.status, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(bridgeObsResult.reasonCode, 'NETWORK_EGRESS_UNVERIFIED');
+
+    // 21.3: Runner rejects Docker observation with conflicting cgroups or missing controllers
+    const cgroupConflictResult = verifyIsolationCapabilities({
+      providerDescriptor: {
+        providerId: 'docker',
+        supportedPlatforms: ['win32', 'linux', 'darwin'],
+        isReady: true,
+        capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+      },
+      evidence: {
+        dockerObservation: {
+          daemonId: 'daemon-uuid-1',
+          endpoint: 'npipe:////./pipe/docker_engine',
+          containerId: 'container-abc',
+          containerCreationIdentity: 'creation-1',
+          executionId: 'exec-1',
+          projectId: 'proj-1',
+          sessionId: 'sess-1',
+          grantId: 'grant-1',
+          policyDigest: 'policy-1',
+          planDigest: 'plan-1',
+          observationTimestamp: new Date().toISOString(),
+          nonce: crypto.randomUUID(),
+          networkMode: 'none',
+          memoryLimitBytes: 536870912,
+          mounts: [],
+        },
+        cgroupEvidence: { effectiveMemoryMax: 1073741824, controllersAvailable: true },
+      },
+      context: { projectId: 'proj-1', executionId: 'exec-1', sessionId: 'sess-1', containerId: 'container-abc' },
+    });
+    assert.equal(cgroupConflictResult.ready, false);
+    assert.equal(cgroupConflictResult.status, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(cgroupConflictResult.reasonCode, 'CGROUP_OBSERVATION_CONFLICT');
+
+    // 21.4: Runner execution authorization fails closed with zero host execution fallback when daemon trust is NOT_ESTABLISHED
+    const unverifiedObservation = {
+      daemonId: 'daemon-uuid-1',
+      endpoint: 'npipe:////./pipe/docker_engine',
+      containerId: 'container-abc',
+      containerCreationIdentity: 'creation-1',
+      executionId: 'exec-1',
+      projectId: 'proj-1',
+      sessionId: 'sess-1',
+      grantId: 'grant-1',
+      policyDigest: 'policy-1',
+      planDigest: 'plan-1',
+      observationTimestamp: new Date().toISOString(),
+      nonce: crypto.randomUUID(),
+      networkMode: 'none',
+      mounts: [],
+    };
+    const evalOutcome = evaluateDockerObservation({
+      observation: unverifiedObservation,
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+    });
+    assert.equal(evalOutcome.daemonTrust, DOCKER_DAEMON_TRUST_STATES.NOT_ESTABLISHED);
+    assert.equal(evalOutcome.kernelEnforcement, 'NOT_VERIFIED');
+    assert.equal(evalOutcome.gate, 'PROCESS_ISOLATION_GATE');
+    assert.equal(evalOutcome.gateStatus, 'BLOCKED');
   }
 
   console.log('All CODING AGENT V7 — Container Runner Security & Integration Audit tests passed successfully!');

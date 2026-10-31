@@ -147,10 +147,19 @@ function getSelectedRuntime() {
   return selectedRuntime;
 }
 
+function projectProcessSupervisorStatus() {
+  return Object.freeze({
+    available: false,
+    verified: false,
+    reason: 'Application runtime supervisor is unavailable; no trusted host process supervisor is active or configured to monitor ongoing process liveness.',
+  });
+}
+
 module.exports = {
   evaluateExecutionEvidence,
   markProjectProcessIsolationUnavailable,
   projectProcessIsolationStatus,
+  projectProcessSupervisorStatus,
   requireProjectProcessIsolation,
   verifyProjectProcessIsolation,
   getSelectedRuntime,

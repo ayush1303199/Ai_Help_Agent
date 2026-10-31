@@ -87,7 +87,10 @@ const {
   evaluateProjectTestReadiness,
 } = require('./coding-pipeline/testClassification.cjs');
 const { isProjectRuntimeTestRequest } = require('./coding-pipeline/projectRuntimeTestIntent.cjs');
-const { projectProcessIsolationStatus } = require('./coding-pipeline/projectProcessIsolation.cjs');
+const {
+  projectProcessIsolationStatus,
+  projectProcessSupervisorStatus,
+} = require('./coding-pipeline/projectProcessIsolation.cjs');
 const {
   INTENT_CATEGORIES,
   classifyTaskIntent,
@@ -390,7 +393,7 @@ function buildHermeticExecutionReceipt(verification, route, {
           ? [`Repair/sync plan:\n${workspaceAudit.syncPlan.map((item) => `- ${item.action} ${item.path}: ${item.reason}`).join('\n')}`]
           : []),
       ]
-    : ['Detected Workspace Issues & Readiness Audit:', 'The workspace root was unavailable; environment and workspace-wide findings were not assessed.'];
+    : ['Workspace Audit: AUDIT_UNAVAILABLE', 'The workspace root was unavailable; environment and workspace-wide findings were not assessed.'];
   const uiText = `GET ${uiRoute} interactive form -> ${uiProbe?.statusCode || 'no status'} — ${uiProbe?.passed ? 'PASS' : 'FAIL'}`;
   const rootText = `GET / -> ${rootProbe?.statusCode || 'no status'} — ${rootProbe?.passed ? 'PASS' : 'FAIL'}`;
   const runUrl = `http://localhost:5000${uiRoute}`;
@@ -4812,7 +4815,7 @@ function decorateAutonomousWorkflowResult(result, userRequest) {
  * 7. Blocked commands remain BLOCKED with exitCode: null.
  * 8. Missing startup script remains NOT_CONFIGURED.
  */
-function evaluateApplicationRuntimeEvidence(execResult) {
+function evaluateApplicationRuntimeEvidence(execResult, options = {}) {
   if (!execResult || typeof execResult !== 'object') {
     return {
       started: false,
@@ -4868,15 +4871,39 @@ function evaluateApplicationRuntimeEvidence(execResult) {
     };
   }
 
-  // 4. Trust boundary check:
-  // Plain JavaScript objects, mock/synthetic fixtures, injected runner claims, or untrusted
-  // records cannot attest live supervisor authority without an authentic verified host supervisor.
-  // Neither matching strings, field presence, nor fabricated isAlive: true establishes trust.
-  const isolationStatus = projectProcessIsolationStatus ? projectProcessIsolationStatus() : { verified: false };
+  // 4. Condition 1: Operating System Process Isolation Verification
+  // Validates execution boundary containment only. Never authenticates runtime supervisor evidence.
+  const isolationStatus = options?.isolationStatus || (projectProcessIsolationStatus ? projectProcessIsolationStatus() : { verified: false });
   if (!isolationStatus || !isolationStatus.verified) {
     return {
       started: false,
-      reason: 'Untrusted runtime evidence rejected: no independently verified host process supervisor is active, and plain JavaScript objects cannot attest live application supervision.',
+      isolationVerified: false,
+      supervisorVerified: false,
+      reason: 'Untrusted runtime evidence rejected: no independently verified host process supervisor is active, and operating system process isolation is unverified.',
+    };
+  }
+
+  // 5. Condition 2: Application Runtime Supervisor Verification
+  // Must originate strictly from the independent production supervisor contract,
+  // NOT from runner claims, plain objects, or arbitrary caller input.
+  const supervisorStatus = projectProcessSupervisorStatus ? projectProcessSupervisorStatus() : { verified: false };
+  if (!supervisorStatus || !supervisorStatus.verified) {
+    return {
+      started: false,
+      isolationVerified: true,
+      supervisorVerified: false,
+      supervisorUnavailable: true,
+      reason: 'Untrusted runtime evidence rejected: no independently verified host process supervisor is active, and process isolation verification does not authenticate application runtime supervision.',
+    };
+  }
+
+  // 6. Check for mock/synthetic runner or replayed evidence
+  if (execResult.isMockRunner || supervisor.source === 'mock' || supervisor.replayedNonce) {
+    return {
+      started: false,
+      isolationVerified: true,
+      supervisorVerified: false,
+      reason: 'Untrusted runtime evidence rejected: mock or replayed supervisor evidence cannot establish application runtime.',
     };
   }
 
@@ -6322,6 +6349,69 @@ async function executeAutonomousCodingWorkflowStage({
       if (operation === BUILD_OPERATIONS.START) {
         const runtimeCheck = evaluateApplicationRuntimeEvidence(execResult);
         if (!runtimeCheck.started) {
+          if (runtimeCheck.supervisorUnavailable && execResult.exitCode === null) {
+            const tcRecord = createTestExecutionRecord({
+              category: TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME,
+              status: TEST_EXECUTION_STATUSES.BLOCKED_ISOLATION,
+              evidenceSource: EVIDENCE_SOURCES.ISOLATION_GATE,
+              command: plan.fullCommandString,
+              exitCode: null,
+              stderrSummary: runtimeCheck.reason,
+            });
+            const report = buildEngineeringReport({
+              projectRoot: root,
+              workspaceDiscovery,
+              dependencyReport,
+              buildDiscovery,
+              buildPlan: plan,
+              testClassifications: [tcRecord],
+              executedCommands: [{
+                operation,
+                command: plan.fullCommandString,
+                environment: 'CONTAINER_ISOLATED',
+                exitCode: null,
+                status: 'BLOCKED',
+                checkState: CHECK_STATES.BLOCKED_ISOLATION,
+                stdoutExcerpt: '',
+                stderrExcerpt: redactSensitiveData(String(runtimeCheck.reason || '')).slice(0, 500),
+                executionTimeMs: 0,
+              }],
+              diagnosis: null,
+              repairPlan: null,
+              rerunResult: null,
+              overallOutcome: 'BLOCKED',
+              blockers: [runtimeCheck.reason],
+            });
+            taskPlan.engineeringReport = report;
+            advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'supervisor_unavailable', reason: runtimeCheck.reason });
+            return {
+              outcome: 'BLOCKED',
+              phase: 'SUPERVISOR_UNAVAILABLE',
+              turnId: turn.turnId,
+              taskPlan,
+              buildPlan: plan,
+              buildDiscovery,
+              buildResult: execResult,
+              diagnosis: null,
+              engineeringReport: report,
+              executionBlocked: true,
+              filesModified: [],
+              codeApplied: false,
+              codeVerified: false,
+              testClassifications: [tcRecord],
+              reason: runtimeCheck.reason,
+              message: runtimeCheck.reason,
+              workspaceAudit: {
+                status: 'AUDIT_UNAVAILABLE',
+                reason: 'Workspace audit was not executed during application startup verification.',
+              },
+              workflowReceipt: buildWorkflowReceipt({
+                outcome: 'BLOCKED',
+                stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN'],
+              }),
+            };
+          }
+
           const startupRecord = createTestExecutionRecord({
             category: TEST_EXECUTION_CATEGORIES.ACTUAL_APPLICATION_RUNTIME,
             status: TEST_EXECUTION_STATUSES.FAILED,
@@ -6375,6 +6465,10 @@ async function executeAutonomousCodingWorkflowStage({
             testClassifications: [startupRecord],
             reason: runtimeCheck.reason,
             message: runtimeCheck.reason,
+            workspaceAudit: {
+              status: 'AUDIT_UNAVAILABLE',
+              reason: 'Workspace audit was not executed during application startup verification.',
+            },
             workflowReceipt: buildWorkflowReceipt({
               outcome: 'FAILED',
               stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'APPLICATION_STARTUP'],
@@ -6540,7 +6634,8 @@ async function executeAutonomousCodingWorkflowStage({
         blockers: [execResult.stderr || 'Application crashed on startup.'],
       });
       taskPlan.engineeringReport = startReport;
-      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'application_startup_failed', reason: execResult.stderr });
+      const failReason = execResult.stderr || execResult.reason || 'Application crashed on startup.';
+      advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'application_startup_failed', reason: failReason });
       return {
         outcome: 'FAILED',
         phase: 'APPLICATION_STARTUP_FAILED',
@@ -6555,6 +6650,12 @@ async function executeAutonomousCodingWorkflowStage({
         codeApplied: false,
         codeVerified: false,
         testClassifications: [startupRecord],
+        reason: failReason,
+        message: failReason,
+        workspaceAudit: {
+          status: 'AUDIT_UNAVAILABLE',
+          reason: 'Workspace audit was not executed during application startup verification.',
+        },
         workflowReceipt: buildWorkflowReceipt({
           outcome: 'FAILED',
           stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'BUILD_PLAN', 'APPLICATION_STARTUP'],
@@ -10016,6 +10117,15 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
     executionVerificationReceipt,
     integrationVerification: modularReachability,
     hermeticVerification,
+    workspaceAudit: executionVerificationReceipt?.workspaceAudit
+      || hermeticVerification?.workspaceAudit
+      || {
+        status: 'AUDIT_UNAVAILABLE',
+        reason: 'Workspace audit was not executed during proposal verification.',
+      },
+    detectedWorkspaceIssues: executionVerificationReceipt?.detectedWorkspaceIssues
+      || hermeticVerification?.workspaceAudit?.findings
+      || [],
     message: outcome === 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED'
       ? 'The approved proposal was applied and verification passed, but trusted item-specific evidence did not establish that every request objective was satisfied. The task plan remains blocked.'
       : runtimeVerificationMessage
@@ -10478,4 +10588,5 @@ module.exports = {
   createTestExecutionRecord,
   evaluateProjectTestReadiness,
   evaluateApplicationRuntimeEvidence,
+  projectProcessSupervisorStatus,
 };

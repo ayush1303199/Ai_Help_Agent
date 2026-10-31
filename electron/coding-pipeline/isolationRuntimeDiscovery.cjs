@@ -38,50 +38,143 @@ function nowISO() {
  * Discover Docker runtime.
  * @returns {object} candidate description.
  */
-function discoverDocker() {
+function discoverDocker(options = {}) {
+  const runner = typeof options.commandRunner === 'function' ? options.commandRunner : runCommandSafe;
   const evidenceSource = 'docker_cli';
-  let versionCheck = runCommandSafe('docker --version', 2000);
+  let versionCheck = runner('docker --version', 2000);
   let isWslBridge = false;
   if (!versionCheck.succeeded && process.platform === 'win32') {
-    versionCheck = runCommandSafe('wsl -d Ubuntu -- docker --version', 10000);
+    versionCheck = runner('wsl -d Ubuntu -- docker --version', 10000);
     if (versionCheck.succeeded) {
       isWslBridge = true;
     }
   }
-  const available = versionCheck.succeeded;
+  const available = Boolean(versionCheck.succeeded);
   const healthCmd = isWslBridge ? 'wsl -d Ubuntu -- docker run --rm hello-world' : 'docker run --rm hello-world';
   const healthCheck = available
-    ? runCommandSafe(healthCmd, 12000)
+    ? runner(healthCmd, 12000)
     : { succeeded: false, exitCode: null, stdout: '', stderr: 'docker not found' };
-  const isolationVerified = healthCheck.succeeded;
-  if (isolationVerified) {
-    const verifiedDescriptor = {
-      providerId: 'docker',
-      version: versionCheck.stdout ? versionCheck.stdout.trim() : '28.3.2',
-      supportedPlatforms: ['win32', 'linux', 'darwin'],
-      isolationLevel: 'CONTAINER',
-      availability: { isInstalled: true, isRunning: true, health: 'HEALTHY' },
-      filesystemCapabilities: { ephemeralCopyOnWrite: true, readOnlyRoot: true, restrictedBindMounts: true, secureErasureOnExit: true },
-      processCapabilities: { independentProcessTree: true, credentialIsolation: true, userNamespaceRemapping: true, hostObservedTermination: true },
-      networkCapabilities: { defaultDenyAll: true, egressFiltering: true, isolatedNetworkNamespace: true },
-      resourceLimits: { cpuThrottlingSupported: true, memoryCapSupported: true, outputBufferingCapped: true, timeoutEnforcementSupported: true },
+
+  // Milestone V44.25: Availability probe (hello-world) proves CLI/daemon responsiveness only.
+  // It MUST NEVER be reported as runtime security verification.
+  const isolationVerified = false;
+  const isRunning = Boolean(healthCheck.succeeded);
+  const health = isRunning ? 'HEALTHY' : (available ? 'DAEMON_UNAVAILABLE' : 'UNAVAILABLE');
+
+  const capabilities = {
+    readOnlyRootfs: {
+      name: 'readOnlyRootfs',
       evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
-      verificationTimestamp: nowISO(),
-      capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
-      isReady: true,
-      blockingReasons: [],
-      supportedOps: ['build', 'test', 'run', 'BUILD', 'TEST', 'START'],
-    };
-    defaultRegistry.providers.set('docker', Object.freeze(verifiedDescriptor));
-  }
+      verificationMethod: 'NONE',
+      verificationState: 'NOT_VERIFIED',
+      limitation: 'Availability probe (hello-world) does not test read-only rootfs enforcement.',
+    },
+    egressFiltering: {
+      name: 'egressFiltering',
+      evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
+      verificationMethod: 'NONE',
+      verificationState: 'NOT_VERIFIED',
+      limitation: 'Bridge network configuration does not enforce default-deny egress filtering.',
+    },
+    resourceLimits: {
+      name: 'resourceLimits',
+      evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
+      verificationMethod: 'NONE',
+      verificationState: 'NOT_VERIFIED',
+      limitation: 'Cgroup memory, CPU, and PID limits lack runtime enforcement verification.',
+    },
+    filesystemIsolation: {
+      name: 'filesystemIsolation',
+      evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
+      verificationMethod: 'NONE',
+      verificationState: 'NOT_VERIFIED',
+      limitation: 'Workspace staging directory and bind mounts lack cryptographic isolation attestation.',
+    },
+    containerCleanup: {
+      name: 'containerCleanup',
+      evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
+      verificationMethod: 'NONE',
+      verificationState: 'NOT_VERIFIED',
+      limitation: 'Docker CLI termination does not prove container workload has stopped.',
+    },
+    runtimeSupervisor: {
+      name: 'runtimeSupervisor',
+      evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
+      verificationMethod: 'NONE',
+      verificationState: 'NOT_VERIFIED',
+      limitation: 'Docker availability does not imply a trusted application process supervisor.',
+    },
+  };
+
+  const descriptor = {
+    providerId: 'docker',
+    version: versionCheck.stdout ? versionCheck.stdout.trim() : (available ? 'available' : 'unknown'),
+    supportedPlatforms: ['win32', 'linux', 'darwin'],
+    isolationLevel: 'CONTAINER',
+    availability: {
+      isInstalled: available,
+      isRunning,
+      health,
+      availabilityProbePassed: isRunning,
+    },
+    filesystemCapabilities: {
+      ephemeralCopyOnWrite: false,
+      readOnlyRoot: false,
+      restrictedBindMounts: false,
+      secureErasureOnExit: false,
+    },
+    processCapabilities: {
+      independentProcessTree: false,
+      credentialIsolation: false,
+      userNamespaceRemapping: false,
+      hostObservedTermination: false,
+    },
+    networkCapabilities: {
+      defaultDenyAll: false,
+      egressFiltering: false,
+      isolatedNetworkNamespace: false,
+    },
+    resourceLimits: {
+      cpuThrottlingSupported: false,
+      memoryCapSupported: false,
+      outputBufferingCapped: false,
+      timeoutEnforcementSupported: false,
+    },
+    capabilities,
+    evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
+    verificationTimestamp: nowISO(),
+    daemonTrust: 'NOT_ESTABLISHED',
+    capabilityVerificationStatus: PROVIDER_STATUSES.BLOCKED,
+    isReady: false,
+    blockingReasons: [
+      'Docker availability probe does not establish runtime security verification.',
+      'Read-only root filesystem enforcement has not been independently verified at runtime.',
+      'Network egress filtering is unverified; bridge network mode does not enforce default-deny egress.',
+      'Cgroup resource limits (CPU, memory, PIDs) lack runtime enforcement evidence.',
+      'Host-observed container cleanup and runtime supervision are unverified.',
+    ],
+    unverifiedRequirements: [
+      'Runtime verification of read-only root filesystem enforcement',
+      'Independent verification of network egress filtering policy',
+      'Cgroup quota enforcement attestation',
+      'Host-observed container termination and absence verification',
+      'Runtime supervisor liveness attestation',
+    ],
+    supportedOps: ['build', 'test', 'run', 'BUILD', 'TEST', 'START'],
+  };
+  defaultRegistry.registerProvider(descriptor);
+
   return {
     providerId: 'docker',
     runtimeType: 'container',
     available,
     healthCheck,
-    isolationVerified,
+    isolationVerified: false,
     supportedOps: ['build', 'test', 'run', 'BUILD', 'TEST', 'START'],
-    limitations: available && !isolationVerified ? 'Health check failed – isolation not verified' : '',
+    limitations: available
+      ? 'Docker availability probe does not establish runtime security verification: read-only rootfs, network egress filtering, cgroups, and container cleanup remain unverified.'
+      : 'Docker CLI not found or daemon not running',
+    capabilities,
     evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
     timestamp: nowISO(),
   };
@@ -199,11 +292,11 @@ function discoverCustomProviders() {
  * @param {string} projectRoot Absolute path to the project root.
  * @returns {Array<object>} List of candidate runtime objects.
  */
-function discoverIsolationRuntimes(projectRoot) {
+function discoverIsolationRuntimes(projectRoot, options = {}) {
   // The implementation does not touch the project files; it only inspects the host environment.
   const candidates = [];
   // Docker – universally applicable.
-  candidates.push(discoverDocker());
+  candidates.push(discoverDocker(options));
 
   // Windows Sandbox – only on win32.
   if (process.platform === 'win32') {
@@ -237,4 +330,4 @@ function discoverIsolationRuntimes(projectRoot) {
   return candidates;
 }
 
-module.exports = { discoverIsolationRuntimes, runCommandSafe, discoverWsl };
+module.exports = { discoverIsolationRuntimes, runCommandSafe, discoverWsl, discoverDocker };

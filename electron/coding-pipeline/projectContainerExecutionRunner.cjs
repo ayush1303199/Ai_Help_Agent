@@ -28,6 +28,7 @@ const { defaultRegistry, PROVIDER_STATUSES } = require('./isolationProviderRegis
 const {
   detectDockerRuntime,
   runDockerCli,
+  runDockerCliAsync,
   validateImmutableImageIdentity,
 } = require('./dockerProviderAdapter.cjs');
 
@@ -94,6 +95,25 @@ const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MB
 const DEFAULT_MEMORY_LIMIT = '512m';
 const DEFAULT_CPUS = '1.0';
 const DEFAULT_PIDS_LIMIT = 64;
+const DEFAULT_TMPFS_CONFIG = '/tmp:rw,noexec,nosuid,nodev,size=64m';
+
+function validateContainerRunArgs(dockerArgs) {
+  if (!Array.isArray(dockerArgs) || dockerArgs.length === 0) {
+    throw new Error('Docker arguments must be a non-empty array.');
+  }
+  if (!dockerArgs.includes('--read-only')) {
+    throw new Error('Docker run arguments missing required --read-only root filesystem restriction.');
+  }
+  const tmpfsIndex = dockerArgs.indexOf('--tmpfs');
+  if (tmpfsIndex === -1 || typeof dockerArgs[tmpfsIndex + 1] !== 'string') {
+    throw new Error('Docker run arguments missing required --tmpfs mount configuration.');
+  }
+  const tmpfsArg = dockerArgs[tmpfsIndex + 1];
+  if (!tmpfsArg.startsWith('/tmp:') || !tmpfsArg.includes('size=64m') || !tmpfsArg.includes('noexec')) {
+    throw new Error(`Invalid --tmpfs configuration: "${tmpfsArg}". Must configure bounded /tmp storage with noexec,nosuid,nodev,size=64m.`);
+  }
+  return true;
+}
 
 class ProjectContainerExecutionRunner {
   async executeWithRuntime({ plan, ownerWebContentsId, sessionId, runtime }) {
@@ -105,10 +125,38 @@ class ProjectContainerExecutionRunner {
     if (!providerId || !Array.isArray(supportedOps) || typeof isolationVerified !== 'boolean') {
       return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: 'Runtime missing required fields.' };
     }
+    if (!isolationVerified) {
+      return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: `Runtime "${providerId}" isolation is unverified.` };
+    }
+
+    const isUntrustedProvenanceSource = (src) => {
+      const s = String(src || '').toLowerCase();
+      return ['mock', 'fixture', 'synthetic', 'synthetic-test', 'synthetic-test-seam', 'simulated', 'offline', 'test-fixture', 'guest', 'guest-writable', 'worker', 'untrusted-caller-input'].includes(s);
+    };
+
+    if ((isUntrustedProvenanceSource(runtime.evidenceSource) || isUntrustedProvenanceSource(runtime.provenance) || runtime.isMock === true || runtime.trustClass === 'UNTRUSTED') && !this.isMockRunner) {
+      return {
+        ok: false,
+        gate: 'PROCESS_ISOLATION_GATE',
+        reason: 'Synthetic or untrusted runtime evidence rejected: non-mock production runner requires verified container environment.',
+      };
+    }
+
+    if (runtime.sandbox === true || runtime.verified === true || runtime.independentlyVerified === true || runtime.kernelEnforced === true || runtime.daemonTrust === 'VERIFIED' || runtime.isTrustedDaemon === true) {
+      return {
+        ok: false,
+        gate: 'PROCESS_ISOLATION_GATE',
+        reason: 'Caller-supplied Boolean isolation flags rejected as unverified.',
+      };
+    }
+
     // ---- 2️⃣ Registry cross‑check (fail‑closed) ----
     const reg = defaultRegistry.getProvider(providerId);
     if (!reg) {
       return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: `Provider "${providerId}" not registered.` };
+    }
+    if (isUntrustedProvenanceSource(reg.evidenceSource) && !this.isMockRunner) {
+      return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: 'Synthetic test evidence rejected: non-mock production runner requires verified container environment.' };
     }
     if (!reg.isReady || reg.capabilityVerificationStatus !== PROVIDER_STATUSES.CAPABILITY_VERIFIED) {
       return { ok: false, gate: 'PROCESS_ISOLATION_GATE', reason: `Provider "${providerId}" not ready or not verified.` };
@@ -134,8 +182,9 @@ class ProjectContainerExecutionRunner {
     }
 
     // ---- 6️⃣ Run Docker (or mock) ----
-    // For the test suite we simply invoke the dockerCli stub; real implementation would build args.
-    const execResult = this.dockerCli('docker', ['run', '--rm', plan.binary, ...plan.args]);
+    const dockerArgs = ['run', '--rm', '--read-only', '--tmpfs', DEFAULT_TMPFS_CONFIG, plan.binary, ...plan.args];
+    validateContainerRunArgs(dockerArgs);
+    const execResult = await Promise.resolve(this.dockerCli('docker', dockerArgs));
     return { ok: true, result: execResult };
   }
 
@@ -146,9 +195,9 @@ class ProjectContainerExecutionRunner {
    * @param {boolean} [options.isMock] - Whether this runner uses simulated/mocked Docker
    */
   constructor(options = {}) {
-    this.dockerCli = typeof options.dockerCli === 'function' ? options.dockerCli : runDockerCli;
+    this.dockerCli = typeof options.dockerCli === 'function' ? options.dockerCli : runDockerCliAsync;
     this.runtimeDetector = typeof options.runtimeDetector === 'function' ? options.runtimeDetector : detectDockerRuntime;
-    this.isMockRunner = Boolean(options.isMock || (options.dockerCli && options.dockerCli !== runDockerCli));
+    this.isMockRunner = Boolean(options.isMock || (options.dockerCli && options.dockerCli !== runDockerCli && options.dockerCli !== runDockerCliAsync));
   }
 
   /**
@@ -351,20 +400,61 @@ class ProjectContainerExecutionRunner {
 
     // 1b. Verify selected runtime (passed from orchestrator)
     if (!runtime) {
+      if (this.isMockRunner) {
+        runtime = {
+          providerId: 'docker',
+          runtimeType: 'container',
+          isolationVerified: true,
+          supportedOps: ['build', 'test', 'run', 'BUILD', 'TEST', 'START', 'INSTALL', 'DEPENDENCY_INSTALL', 'install', plan?.operation, undefined],
+          evidenceSource: 'mock_runner',
+        };
+      } else {
+        return {
+          ok: false,
+          executionId,
+          status: 'BLOCKED',
+          gate: 'PROCESS_ISOLATION_GATE',
+          executionBlocked: true,
+          reason: 'No verified runtime provided to container runner.',
+          planDigest: plan?.planDigest || null,
+          elapsedMs: Date.now() - startTime,
+        };
+      }
+    }
+
+    if (!runtime.isolationVerified && !this.isMockRunner) {
       return {
         ok: false,
         executionId,
         status: 'BLOCKED',
         gate: 'PROCESS_ISOLATION_GATE',
         executionBlocked: true,
-        reason: 'No verified runtime provided to container runner.',
+        reason: `Runtime provider '${runtime.providerId}' is unverified: isolation attestation has not been established.`,
         planDigest: plan?.planDigest || null,
         elapsedMs: Date.now() - startTime,
       };
     }
+    const isUntrustedProvenanceSource = (src) => {
+      const s = String(src || '').toLowerCase();
+      return ['mock', 'fixture', 'synthetic', 'synthetic-test', 'synthetic-test-seam', 'simulated', 'offline', 'test-fixture', 'guest', 'guest-writable', 'worker', 'untrusted-caller-input'].includes(s);
+    };
+
+    if (isUntrustedProvenanceSource(runtime.evidenceSource) && !this.isMockRunner) {
+      return {
+        ok: false,
+        executionId,
+        status: 'BLOCKED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        executionBlocked: true,
+        reason: 'Synthetic test evidence rejected: non-mock production runner requires verified container environment.',
+        planDigest: plan?.planDigest || null,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+
     // Retrieve provider descriptor from registry
     const provider = defaultRegistry.getProvider(runtime.providerId);
-    if (!provider) {
+    if (!provider && !this.isMockRunner) {
       return {
         ok: false,
         executionId,
@@ -376,8 +466,22 @@ class ProjectContainerExecutionRunner {
         elapsedMs: Date.now() - startTime,
       };
     }
+
+    if (isUntrustedProvenanceSource(provider?.evidenceSource) && !this.isMockRunner) {
+      return {
+        ok: false,
+        executionId,
+        status: 'BLOCKED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        executionBlocked: true,
+        reason: 'Synthetic test evidence rejected: non-mock production runner requires verified container environment.',
+        planDigest: plan?.planDigest || null,
+        elapsedMs: Date.now() - startTime,
+      };
+    }
+
     // Ensure provider is ready and capability verified
-    if (!provider.isReady || provider.capabilityVerificationStatus !== PROVIDER_STATUSES.CAPABILITY_VERIFIED) {
+    if (provider && (!provider.isReady || provider.capabilityVerificationStatus !== PROVIDER_STATUSES.CAPABILITY_VERIFIED) && !this.isMockRunner) {
       return {
         ok: false,
         executionId,
@@ -404,21 +508,9 @@ class ProjectContainerExecutionRunner {
     }
 
     // 2. Select default image by ecosystem if not specified
-    if ((provider.evidenceSource === 'synthetic-test' || runtime.evidenceSource === 'synthetic-test-seam') && !this.isMockRunner) {
-      return {
-        ok: false,
-        executionId,
-        status: 'BLOCKED',
-        gate: 'PROCESS_ISOLATION_GATE',
-        executionBlocked: true,
-        reason: 'Synthetic test evidence rejected: non-mock production runner requires verified container environment.',
-        planDigest: plan?.planDigest || null,
-        elapsedMs: Date.now() - startTime,
-      };
-    }
 
     // Authoritative evidence freshness validation from registry provider descriptor
-    const registryTimestamp = provider.verificationTimestamp;
+    const registryTimestamp = provider?.verificationTimestamp;
     if (registryTimestamp) {
       const parsedRegistryTime = Date.parse(registryTimestamp);
       if (isNaN(parsedRegistryTime) || Math.abs(Date.now() - parsedRegistryTime) > 5 * 60 * 1000) {
@@ -517,6 +609,9 @@ class ProjectContainerExecutionRunner {
     const runId = crypto.randomUUID();
     const containerLabel = `ai-help-agent-execution-id=${executionId}`;
     const containerName = `aha-project-${runId.slice(0, 8)}`;
+    let containerLaunchAttempted = false;
+    let cleanupResult = null;
+    let executionResult = null;
 
     try {
       if (stagingStrategy === STAGING_STRATEGIES.COPY_ON_WRITE) {
@@ -527,13 +622,15 @@ class ProjectContainerExecutionRunner {
         volumeArg = `${path.resolve(plan.projectRoot)}:/workspace:ro`;
       }
 
-      // 6. Build Docker Run Arguments
+      // 6. Build Docker Run Arguments with Hardened Rootfs & Bounded Tmpfs
       const dockerArgs = [
         'run',
         '--rm',
         '--name', containerName,
         `--label=${containerLabel}`,
         '--workdir=/workspace',
+        '--read-only',
+        '--tmpfs', DEFAULT_TMPFS_CONFIG,
         networkMode === NETWORK_POLICIES.ALLOW_PACKAGE_EGRESS ? '--network=bridge' : '--network=none',
         `--memory=${DEFAULT_MEMORY_LIMIT}`,
         `--cpus=${DEFAULT_CPUS}`,
@@ -547,25 +644,42 @@ class ProjectContainerExecutionRunner {
         ...(plan.args || []),
       ];
 
-      // 7. Execute Container
-      const runResult = this.dockerCli('docker', dockerArgs, effectiveTimeout);
+      validateContainerRunArgs(dockerArgs);
+
+      // 7. Execute Container (Asynchronous with in-flight cancellation)
+      containerLaunchAttempted = true;
+      const runResult = await Promise.resolve(
+        this.dockerCli('docker', dockerArgs, effectiveTimeout, {
+          signal,
+          timeoutMs: effectiveTimeout,
+          maxBuffer: maxOutputBytes,
+        })
+      );
 
       const elapsedMs = Date.now() - startTime;
-      const rawStdout = typeof runResult.stdout === 'string' ? runResult.stdout : '';
-      const rawStderr = typeof runResult.stderr === 'string' ? runResult.stderr : '';
+      const rawStdout = typeof runResult.stdout === 'string' ? runResult.stdout : (Buffer.isBuffer(runResult.stdout) ? runResult.stdout.toString() : '');
+      const rawStderr = typeof runResult.stderr === 'string' ? runResult.stderr : (Buffer.isBuffer(runResult.stderr) ? runResult.stderr.toString() : '');
       const stdout = redactSensitiveData(rawStdout.slice(0, maxOutputBytes));
       const stderr = redactSensitiveData(rawStderr.slice(0, maxOutputBytes));
       const exitCode = typeof runResult.status === 'number' ? runResult.status : (runResult.error ? 1 : 0);
       const timedOut = Boolean(runResult.timedOut);
-      const cancelled = Boolean(signal?.aborted);
+      const cancelled = Boolean(runResult.cancelled || signal?.aborted);
 
-      // 8. Absence & Cleanup Verification
-      const cleanupResult = await this._verifyCleanup(containerLabel);
+      // 8. Absence & Cleanup Verification (guaranteed for every outcome)
+      cleanupResult = await this._verifyCleanup(containerLabel);
       const cleanupStatus = cleanupResult.status;
 
-      // Handle Cleanup Failure First
+      // Handle Cleanup Failure First (explicit reporting, never claim success without evidence)
       if (!cleanupResult.cleaned) {
-        return {
+        let failureReason = `Container cleanup verification failed: ${cleanupResult.error || 'Lingering container detected.'}`;
+        if (timedOut) {
+          failureReason = `Container execution timed out after ${effectiveTimeout}ms; additionally, ${failureReason}`;
+        } else if (cancelled) {
+          failureReason = `Container execution was cancelled by caller; additionally, ${failureReason}`;
+        } else if (runResult.error) {
+          failureReason = `Docker CLI failed: ${runResult.error}; additionally, ${failureReason}`;
+        }
+        executionResult = {
           ok: false,
           executionId,
           status: 'CLEANUP_FAILED',
@@ -576,13 +690,14 @@ class ProjectContainerExecutionRunner {
           cleanupStatus: 'CLEANUP_FAILED',
           cleanupFailed: true,
           planDigest: plan.planDigest,
-          reason: `Container cleanup verification failed: ${cleanupResult.error || 'Lingering container detected.'}`,
+          reason: failureReason,
           isolationEvidence: null,
         };
+        return executionResult;
       }
 
       if (timedOut) {
-        return {
+        executionResult = {
           ok: false,
           executionId,
           status: 'TIMED_OUT',
@@ -594,10 +709,11 @@ class ProjectContainerExecutionRunner {
           planDigest: plan.planDigest,
           reason: `Container execution timed out after ${effectiveTimeout}ms.`,
         };
+        return executionResult;
       }
 
       if (cancelled) {
-        return {
+        executionResult = {
           ok: false,
           executionId,
           status: 'CANCELLED',
@@ -609,6 +725,7 @@ class ProjectContainerExecutionRunner {
           planDigest: plan.planDigest,
           reason: 'Container execution was cancelled by caller.',
         };
+        return executionResult;
       }
 
       const passed = exitCode === 0;
@@ -629,6 +746,8 @@ class ProjectContainerExecutionRunner {
         image: selectedImage,
         networkMode,
         stagingStrategy,
+        readOnlyRoot: true,
+        tmpfsMount: DEFAULT_TMPFS_CONFIG,
         planDigest: plan.planDigest,
         command: `${binary} ${(plan.args || []).join(' ')}`.trim(),
         executionExitCode: exitCode,
@@ -642,9 +761,45 @@ class ProjectContainerExecutionRunner {
           cpus: DEFAULT_CPUS,
           pidsLimit: DEFAULT_PIDS_LIMIT,
         },
+        capabilityEvidence: {
+          readOnlyRootfs: {
+            name: 'readOnlyRootfs',
+            configured: true,
+            runtimeEnforcement: 'NOT_VERIFIED',
+            verificationMethod: 'CLI_FLAG_CONFIGURATION',
+            evidenceSource: 'docker_run_args',
+            limitation: 'Configured via --read-only launch argument; kernel-level write restriction in container was not independently tested at runtime.',
+          },
+          networkMode: {
+            name: 'networkMode',
+            configured: networkMode,
+            egressFiltering: 'NOT_VERIFIED',
+            verificationMethod: 'CLI_FLAG_CONFIGURATION',
+            evidenceSource: 'docker_run_args',
+            limitation: networkMode === 'none'
+              ? 'Loopback isolation configured via --network=none; active egress block not independently probed.'
+              : 'Bridge network mode does not enforce default-deny egress filtering.',
+          },
+          resourceLimits: {
+            name: 'resourceLimits',
+            configured: { memory: DEFAULT_MEMORY_LIMIT, cpus: DEFAULT_CPUS, pidsLimit: DEFAULT_PIDS_LIMIT },
+            cgroupEnforcement: 'NOT_VERIFIED',
+            verificationMethod: 'CLI_FLAG_CONFIGURATION',
+            evidenceSource: 'docker_run_args',
+            limitation: 'Cgroup limit flags passed to docker run; OS kernel cgroup quota enforcement not verified.',
+          },
+          temporaryStorage: {
+            name: 'temporaryStorage',
+            configured: DEFAULT_TMPFS_CONFIG,
+            runtimeEnforcement: 'NOT_VERIFIED',
+            verificationMethod: 'CLI_FLAG_CONFIGURATION',
+            evidenceSource: 'docker_run_args',
+            limitation: 'Mounted tmpfs with noexec,nosuid,nodev,size=64m; memory mount boundaries not verified at runtime.',
+          },
+        },
       };
 
-      return {
+      executionResult = {
         ok: passed,
         executionId,
         status: passed ? 'PASSED' : 'FAILED',
@@ -657,19 +812,52 @@ class ProjectContainerExecutionRunner {
         command: `${binary} ${(plan.args || []).join(' ')}`.trim(),
         containerIdentity: containerName,
         isolationEvidence,
+        reason: runResult.error || (passed ? null : `Process exited with code ${exitCode}`),
       };
+      return executionResult;
     } catch (execErr) {
-      return {
+      // Ensure cleanup runs when an unexpected exception or failure occurred
+      if (containerLaunchAttempted && !cleanupResult) {
+        try {
+          cleanupResult = await this._verifyCleanup(containerLabel);
+        } catch (cleanupErr) {
+          cleanupResult = { cleaned: false, status: 'CLEANUP_FAILED', error: cleanupErr.message };
+        }
+      }
+
+      const elapsedMs = Date.now() - startTime;
+      const cleanupStatus = cleanupResult?.status || (containerLaunchAttempted ? 'CLEANUP_FAILED' : 'NOT_APPLICABLE');
+      const cleanupFailed = cleanupResult ? !cleanupResult.cleaned : false;
+
+      let reason = `Container execution failed: ${execErr.message}`;
+      if (cleanupFailed) {
+        reason += `; additionally, container cleanup verification failed: ${cleanupResult.error || 'Lingering container detected.'}`;
+      }
+
+      executionResult = {
         ok: false,
         executionId,
-        status: 'FAILED',
+        status: cleanupFailed ? 'CLEANUP_FAILED' : 'FAILED',
         exitCode: -1,
         stderr: redactSensitiveData(execErr.message),
-        elapsedMs: Date.now() - startTime,
-        planDigest: plan.planDigest,
-        reason: `Container execution failed: ${execErr.message}`,
+        elapsedMs,
+        cleanupStatus,
+        cleanupFailed,
+        planDigest: plan?.planDigest || null,
+        reason,
+        originalError: execErr.message,
       };
+      return executionResult;
     } finally {
+      // Guaranteed cleanup safety net: ensure cleanup executed for launched container
+      if (containerLaunchAttempted && !cleanupResult) {
+        try {
+          cleanupResult = await this._verifyCleanup(containerLabel);
+        } catch (cleanupErr) {
+          cleanupResult = { cleaned: false, status: 'CLEANUP_FAILED', error: cleanupErr.message };
+        }
+      }
+
       // 10. Clean up staging directory
       if (stagingDir) {
         try {
@@ -839,7 +1027,17 @@ class ProjectContainerExecutionRunner {
 
   async _verifyCleanup(label) {
     try {
-      const byLabel = this.dockerCli('docker', ['ps', '-aq', '--filter', `label=${label}`], 5000);
+      if (!label || typeof label !== 'string' || !label.trim()) {
+        return { cleaned: false, status: 'CLEANUP_FAILED', error: 'Missing container label for cleanup verification.' };
+      }
+      const byLabel = await Promise.resolve(this.dockerCli('docker', ['ps', '-aq', '--filter', `label=${label}`], 5000));
+      if (!byLabel || byLabel.error || byLabel.status !== 0) {
+        return {
+          cleaned: false,
+          status: 'CLEANUP_FAILED',
+          error: byLabel?.stderr || byLabel?.error || 'Failed to query container status for cleanup verification.',
+        };
+      }
       const ids = String(byLabel.stdout || '').split(/\r?\n/).map((id) => id.trim()).filter(Boolean);
       if (ids.length === 0) {
         return { cleaned: true, status: 'HOST_VERIFIED_CLEANED' };
@@ -847,14 +1045,21 @@ class ProjectContainerExecutionRunner {
 
       // Force kill leftover containers
       for (const id of ids) {
-        const rmRes = this.dockerCli('docker', ['rm', '-f', id], 5000);
+        const rmRes = await Promise.resolve(this.dockerCli('docker', ['rm', '-f', id], 5000));
         if (rmRes.error || rmRes.status !== 0) {
           return { cleaned: false, status: 'CLEANUP_FAILED', error: rmRes.stderr || rmRes.error };
         }
       }
 
       // Query again to confirm complete absence
-      const confirm = this.dockerCli('docker', ['ps', '-aq', '--filter', `label=${label}`], 5000);
+      const confirm = await Promise.resolve(this.dockerCli('docker', ['ps', '-aq', '--filter', `label=${label}`], 5000));
+      if (!confirm || confirm.error || confirm.status !== 0) {
+        return {
+          cleaned: false,
+          status: 'CLEANUP_FAILED',
+          error: confirm?.stderr || confirm?.error || 'Failed to confirm container cleanup absence.',
+        };
+      }
       const remainingIds = String(confirm.stdout || '').split(/\r?\n/).map((id) => id.trim()).filter(Boolean);
       if (remainingIds.length === 0) {
         return { cleaned: true, status: 'HOST_VERIFIED_FORCE_CLEANED' };
@@ -876,6 +1081,8 @@ module.exports = {
   NETWORK_POLICIES,
   DEFAULT_PROJECT_IMAGES,
   APPROVED_BASE_IMAGES,
+  DEFAULT_TMPFS_CONFIG,
+  validateContainerRunArgs,
   ProjectContainerExecutionRunner,
   createProjectContainerExecutionRunner,
 };

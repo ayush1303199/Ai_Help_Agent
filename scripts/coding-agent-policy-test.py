@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -156,6 +157,263 @@ class CodingAgentPolicyTests(unittest.TestCase):
             "If any condition is unproven, keep the code",
             intelligence.CODING_ENGINEERING_POLICY,
         )
+
+
+    # -------------------------------------------------------------------------
+    # Tool Extraction, Path Traversal Security & Evidence Integrity (Consolidated from V15)
+    # -------------------------------------------------------------------------
+    def test_valid_extracted_tool_calls(self):
+        """Valid exploration tool calls suggested in text are extracted with sanitized arguments."""
+        cases = [
+            ("Next step: get_repository_map {}", "get_repository_map", {}),
+            ('Please check read_file {"path": "src/index.js"}', "read_file", {"path": "src/index.js"}),
+            ('search_code {"query": "authentication"}', "search_code", {"query": "authentication"}),
+            ('list_directory {"relativePath": "components"}', "list_directory", {"relativePath": "components"}),
+            ('find_references {"symbol": "handleAuth"}', "find_references", {"symbol": "handleAuth"}),
+            ('{"tool": "read_file", "arguments": {"path": "server.js", "startLine": 1, "endLine": 50}}', "read_file", {"path": "server.js", "startLine": 1, "endLine": 50}),
+        ]
+        for text, expected_tool, expected_args in cases:
+            extracted = websocket._extract_tool_call_from_text(text, round_number=0, scope=".")
+            self.assertIsNotNone(extracted, f"Failed to extract valid call from: {text}")
+            self.assertEqual(extracted["function"]["name"], expected_tool)
+            self.assertEqual(json.loads(extracted["function"]["arguments"]), expected_args)
+
+    def test_invalid_and_path_traversal_tool_calls_rejected(self):
+        """Path traversal, absolute paths, and empty arguments must be rejected and return None."""
+        dangerous_texts = [
+            'read_file {"path": "../../etc/passwd"}',
+            'read_file {"path": "..\\..\\Windows\\System32"}',
+            'read_file {"path": "dir/../../../secret.txt"}',
+            'read_file {"path": "C:\\Windows\\System32\\cmd.exe"}',
+            'read_file {"path": "/etc/shadow"}',
+            'read_file {"path": "\\\\remote\\share\\file.txt"}',
+            'read_file {"path": ""}',
+            'read_file {"path": "   "}',
+            'search_code {"query": ""}',
+            'find_references {"symbol": ""}',
+            'read_file {"path": "test\x00.js"}',
+        ]
+        for text in dangerous_texts:
+            extracted = websocket._extract_tool_call_from_text(text, round_number=0, scope=".")
+            self.assertIsNone(extracted, f"Dangerous or invalid call was not rejected: {text}")
+
+    def test_unauthorized_tools_cannot_be_extracted_from_text(self):
+        """Terminal execution, verification runs, SQL, and unknown tools MUST NOT be extracted from text."""
+        forbidden_texts = [
+            'Next step: terminal.run_command {"command": "rm -rf /"}',
+            'Next step: run_verification {"script": "npm test"}',
+            'Next step: execute_sql {"sql": "DROP TABLE users"}',
+            'Next step: delete_file {"path": "server.js"}',
+            'Next step: write_file {"path": "server.js", "content": "hack"}',
+            '{"tool": "run_verification", "arguments": {"script": "npm test"}}',
+            '{"tool": "terminal.run_command", "arguments": {"command": "whoami"}}',
+            '{"tool": "execute_sql", "arguments": {"sql": "SELECT 1"}}',
+        ]
+        for text in forbidden_texts:
+            extracted = websocket._extract_tool_call_from_text(text, round_number=0, scope=".")
+            self.assertIsNone(extracted, f"Forbidden tool was extracted: {text}")
+
+    def test_malformed_arguments_handled_cleanly(self):
+        """Malformed JSON or non-dict argument formats are safely ignored without raising exceptions."""
+        malformed = [
+            'Next step: read_file {not valid json}',
+            'Next step: read_file ("unsupported syntax")',
+            'Next step: read_file 12345',
+            'read_file [1, 2, 3]',
+        ]
+        for text in malformed:
+            extracted = websocket._extract_tool_call_from_text(text, round_number=0, scope=".")
+            self.assertIsNone(extracted, f"Malformed text produced unexpected extraction: {text}")
+
+    def test_successful_repository_map_dispatch_and_consumption(self):
+        """A valid repository-map result is consumed into session targetFiles and semantic task architecture."""
+        session_id = "test-session-map-consume"
+        project_root = "/test/project"
+        sess = websocket.CODING_TASK_STORE.get_or_create(session_id, project_root=project_root, scope=".")
+        sess["targetFiles"] = []
+
+        action = {
+            "actionId": "act-map-consume",
+            "tool": "get_repository_map",
+            "arguments": {},
+        }
+        semantic_task = {
+            "taskId": "task-map-consume",
+            "actions": [action],
+            "architecture": {},
+            "timestamps": {},
+        }
+        result = {
+            "ok": True,
+            "data": {
+                "languages": ["typescript", "javascript"],
+                "frameworks": ["express"],
+                "entryPoints": ["server.js"],
+                "sourceDirectories": ["src", "controllers"],
+                "configFiles": ["package.json"],
+                "importantFiles": ["server.js", "package.json"],
+            },
+        }
+
+        websocket._update_task_from_tool_result(
+            semantic_task,
+            action,
+            result,
+            json.dumps(result),
+            session_id,
+        )
+
+        self.assertEqual(action["status"], "SUCCESS")
+        self.assertTrue(websocket._has_repository_map_evidence(semantic_task))
+        self.assertEqual(semantic_task["architecture"].get("languages"), ["typescript", "javascript"])
+        self.assertIn("server.js", semantic_task["architecture"].get("entryPoints", []))
+
+    def test_empty_repository_map_does_not_claim_architecture_progress(self):
+        """Empty or trivial repository map responses do not establish architecture evidence."""
+        action = {
+            "actionId": "act-map-empty",
+            "tool": "get_repository_map",
+            "arguments": {},
+        }
+        semantic_task = {
+            "taskId": "task-map-empty",
+            "actions": [action],
+            "architecture": {},
+            "timestamps": {},
+        }
+        empty_result = {
+            "ok": True,
+            "data": {
+                "languages": [],
+                "frameworks": [],
+                "entryPoints": [],
+                "sourceDirectories": [],
+                "configFiles": [],
+                "importantFiles": [],
+            },
+        }
+
+        websocket._update_task_from_tool_result(
+            semantic_task,
+            action,
+            empty_result,
+            json.dumps(empty_result),
+            "sess-empty-map",
+        )
+
+        self.assertFalse(websocket._has_repository_map_evidence(semantic_task))
+
+    def test_failed_repository_map_recorded_as_failed_action(self):
+        """Failed repository map response records FAILED status and no architecture evidence."""
+        action = {
+            "actionId": "act-map-err",
+            "tool": "get_repository_map",
+            "arguments": {},
+        }
+        semantic_task = {
+            "taskId": "task-map-err",
+            "actions": [action],
+            "architecture": {},
+            "timestamps": {},
+        }
+        fail_result = {
+            "ok": False,
+            "error": "Timeout reading workspace repository map.",
+        }
+
+        websocket._update_task_from_tool_result(
+            semantic_task,
+            action,
+            fail_result,
+            json.dumps(fail_result),
+            "sess-fail-map",
+        )
+
+        self.assertEqual(action["status"], "FAILED")
+        self.assertFalse(websocket._has_repository_map_evidence(semantic_task))
+
+    def test_source_read_failure_after_successful_map(self):
+        """When read_file fails after a map, the failure is recorded honestly and does not count as source evidence."""
+        session_id = "test-session-read-fail"
+        action = {
+            "actionId": "act-read-fail",
+            "tool": "read_file",
+            "arguments": {"path": "server.js"},
+        }
+        semantic_task = {
+            "taskId": "task-read-fail",
+            "actions": [action],
+            "evidence": [],
+            "timestamps": {},
+        }
+        fail_result = {
+            "ok": False,
+            "error": 'File "server.js" was not found in the project.',
+        }
+
+        websocket._update_task_from_tool_result(
+            semantic_task,
+            action,
+            fail_result,
+            json.dumps(fail_result),
+            session_id,
+        )
+
+        self.assertEqual(action["status"], "FAILED")
+        self.assertFalse(websocket._has_read_file_evidence([
+            {"role": "tool", "tool_call_id": "call-1", "content": json.dumps(fail_result)}
+        ]))
+
+    def test_duplicate_no_progress_calls_break_loop_honestly(self):
+        """Verify that classify_tool_result_status identifies empty and error results."""
+        empty_res = {"ok": True, "data": []}
+        err_res = {"ok": False, "error": "Not found"}
+        self.assertEqual(websocket.classify_tool_result_status(empty_res), websocket.ToolResultStatus.SUCCESS)
+        self.assertEqual(websocket.classify_tool_result_status(err_res), websocket.ToolResultStatus.NOT_FOUND)
+
+    def test_tool_suggestion_vs_dispatch_vs_result_evidence(self):
+        """A textual suggestion creates no evidence; only a successful executed tool result creates evidence."""
+        session_id = "test-distinction-session"
+        action = {
+            "actionId": "act-dist-1",
+            "tool": "read_file",
+            "arguments": {"path": "server.js"},
+        }
+        semantic_task = {
+            "taskId": "task-dist-1",
+            "actions": [action],
+            "evidence": [],
+            "observations": [],
+            "workingMemory": {"completedInvestigations": [], "failedInvestigations": []},
+            "timestamps": {},
+        }
+
+        # 1. Text suggestion alone: evidence count is 0
+        self.assertEqual(len(semantic_task["evidence"]), 0)
+
+        # 2. Failed dispatch result: evidence count remains 0
+        fail_result = {"ok": False, "error": "file not found"}
+        websocket._update_task_from_tool_result(
+            semantic_task,
+            action,
+            fail_result,
+            json.dumps(fail_result),
+            session_id,
+        )
+        self.assertEqual(len(semantic_task["evidence"]), 0)
+        self.assertEqual(action["status"], "FAILED")
+
+        # 3. Successful tool result: evidence is generated
+        success_result = {"ok": True, "data": "const port = 3000;\napp.listen(port);\n"}
+        websocket._update_task_from_tool_result(
+            semantic_task,
+            action,
+            success_result,
+            json.dumps(success_result),
+            session_id,
+        )
+        self.assertEqual(action["status"], "SUCCESS")
+        self.assertTrue(len(semantic_task["evidence"]) > 0)
 
 
 class CodingWebSocketContractTests(unittest.IsolatedAsyncioTestCase):

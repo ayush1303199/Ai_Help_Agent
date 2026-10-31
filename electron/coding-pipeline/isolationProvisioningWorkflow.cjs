@@ -189,8 +189,8 @@ function evaluateProvisioningReadiness(providerId) {
         providerId,
         ready: false,
         status: PROVISIONING_STATUSES.ISOLATION_NOT_ESTABLISHED,
-        reason: 'Docker is available but container isolation health check failed.',
-        unmetPrerequisites: ['docker run --rm health check verification'],
+        reason: 'Docker is available, but runtime security isolation is unverified: read-only rootfs enforcement, egress filtering, and cgroup limits lack authoritative attestation.',
+        unmetPrerequisites: ['Authoritative container isolation verification (rootfs, egress, cgroup attestation)'],
         plan,
       };
     }
