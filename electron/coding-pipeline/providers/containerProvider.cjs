@@ -54,6 +54,14 @@ class ContainerProvider {
       verificationTimestamp: new Date().toISOString(),
       capabilityVerificationStatus: PROVIDER_STATUSES.BLOCKED,
       daemonTrust: 'NOT_ESTABLISHED',
+      kernelResourceEnforcement: 'NOT_VERIFIED',
+      readOnlyFilesystemEnforcement: 'NOT_VERIFIED',
+      independentObserver: 'NOT_IMPLEMENTED',
+      observerIdentityAuthentication: 'NOT_VERIFIED',
+      ipcPeerAuthentication: 'NOT_VERIFIED',
+      windowsNamedPipeSecurity: 'NOT_VERIFIED',
+      ipcClientAuthentication: 'NOT_VERIFIED',
+      osProcessIdentity: 'NOT_VERIFIED',
       unverifiedRequirements: [
         'Authenticated mutual TLS or local pipe to container daemon',
         'Cryptographic daemon attestation certificate',
@@ -74,7 +82,7 @@ class ContainerProvider {
       };
     }
 
-    if (evidence.sandbox === true || evidence.isolationVerified === true || evidence.verified === true || evidence.independentlyVerified === true || evidence.kernelEnforced === true || evidence.daemonTrust === 'VERIFIED' || evidence.isTrustedDaemon === true) {
+    if (evidence.sandbox === true || evidence.isolationVerified === true || evidence.verified === true || evidence.independentlyVerified === true || evidence.kernelEnforced === true || evidence.daemonTrust === 'VERIFIED' || evidence.isTrustedDaemon === true || evidence.observerAuthenticated === true || evidence.trustedObserver === true || evidence.windowsPipeVerified === true || evidence.osProcessIdentityVerified === true) {
       return {
         verified: false,
         status: PROVIDER_STATUSES.BLOCKED,

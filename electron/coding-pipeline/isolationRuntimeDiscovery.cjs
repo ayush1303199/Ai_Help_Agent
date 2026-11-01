@@ -144,6 +144,14 @@ function discoverDocker(options = {}) {
     evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
     verificationTimestamp: nowISO(),
     daemonTrust: 'NOT_ESTABLISHED',
+    kernelResourceEnforcement: 'NOT_VERIFIED',
+    readOnlyFilesystemEnforcement: 'NOT_VERIFIED',
+    independentObserver: 'NOT_IMPLEMENTED',
+    observerIdentityAuthentication: 'NOT_VERIFIED',
+    ipcPeerAuthentication: 'NOT_VERIFIED',
+    windowsNamedPipeSecurity: 'NOT_VERIFIED',
+    ipcClientAuthentication: 'NOT_VERIFIED',
+    osProcessIdentity: 'NOT_VERIFIED',
     capabilityVerificationStatus: PROVIDER_STATUSES.BLOCKED,
     isReady: false,
     blockingReasons: [
@@ -177,6 +185,13 @@ function discoverDocker(options = {}) {
     capabilities,
     evidenceSource: isWslBridge ? 'wsl_docker_cli' : evidenceSource,
     timestamp: nowISO(),
+    independentObserver: 'NOT_IMPLEMENTED',
+    observerIdentityAuthentication: 'NOT_VERIFIED',
+    ipcPeerAuthentication: 'NOT_VERIFIED',
+    windowsNamedPipeSecurity: 'NOT_VERIFIED',
+    ipcClientAuthentication: 'NOT_VERIFIED',
+    osProcessIdentity: 'NOT_VERIFIED',
+    capabilityVerificationStatus: PROVIDER_STATUSES.BLOCKED,
   };
 }
 
@@ -229,6 +244,13 @@ function discoverWsl() {
     limitations: available ? 'WSL unverified: ephemeral workspace, network deny, and process cleanup attestation required' : 'WSL executable missing',
     evidenceSource,
     timestamp: nowISO(),
+    independentObserver: 'NOT_IMPLEMENTED',
+    observerIdentityAuthentication: 'NOT_VERIFIED',
+    ipcPeerAuthentication: 'NOT_VERIFIED',
+    windowsNamedPipeSecurity: 'NOT_VERIFIED',
+    ipcClientAuthentication: 'NOT_VERIFIED',
+    osProcessIdentity: 'NOT_VERIFIED',
+    capabilityVerificationStatus: PROVIDER_STATUSES.BLOCKED,
   };
 }
 
@@ -248,6 +270,13 @@ function discoverWindowsSandbox() {
     limitations: available ? 'Verification not performed' : 'Executable missing',
     evidenceSource,
     timestamp: nowISO(),
+    independentObserver: 'NOT_IMPLEMENTED',
+    observerIdentityAuthentication: 'NOT_VERIFIED',
+    ipcPeerAuthentication: 'NOT_VERIFIED',
+    windowsNamedPipeSecurity: 'NOT_VERIFIED',
+    ipcClientAuthentication: 'NOT_VERIFIED',
+    osProcessIdentity: 'NOT_VERIFIED',
+    capabilityVerificationStatus: PROVIDER_STATUSES.BLOCKED,
   };
 }
 
@@ -278,6 +307,13 @@ function discoverCustomProviders() {
           limitations: isolationVerified ? '' : 'Isolation not verified',
           evidenceSource,
           timestamp: nowISO(),
+    independentObserver: 'NOT_IMPLEMENTED',
+    observerIdentityAuthentication: 'NOT_VERIFIED',
+    ipcPeerAuthentication: 'NOT_VERIFIED',
+    windowsNamedPipeSecurity: 'NOT_VERIFIED',
+    ipcClientAuthentication: 'NOT_VERIFIED',
+    osProcessIdentity: 'NOT_VERIFIED',
+    capabilityVerificationStatus: PROVIDER_STATUSES.BLOCKED,
         });
       }
     }
@@ -324,6 +360,13 @@ function discoverIsolationRuntimes(projectRoot, options = {}) {
       limitations: available ? 'Remote endpoint reachable but isolation attestation is unverified' : 'Remote endpoint unreachable',
       evidenceSource: 'env_remote_backend',
       timestamp: nowISO(),
+    independentObserver: 'NOT_IMPLEMENTED',
+    observerIdentityAuthentication: 'NOT_VERIFIED',
+    ipcPeerAuthentication: 'NOT_VERIFIED',
+    windowsNamedPipeSecurity: 'NOT_VERIFIED',
+    ipcClientAuthentication: 'NOT_VERIFIED',
+    osProcessIdentity: 'NOT_VERIFIED',
+    capabilityVerificationStatus: PROVIDER_STATUSES.BLOCKED,
     });
   }
 

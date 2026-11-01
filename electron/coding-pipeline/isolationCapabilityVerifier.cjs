@@ -145,6 +145,45 @@ function verifyIsolationCapabilities({
       };
     }
 
+    if (evidence.kernelEnforced === true || evidence.verificationState === 'KERNEL_ENFORCED') {
+      return {
+        status: PROVIDER_STATUSES.BLOCKED,
+        ready: false,
+        reason: 'Caller-supplied kernel enforcement status rejected as unverified.',
+        blockingReasons: ['Kernel enforcement cannot be asserted by caller.'],
+        reasonCode: 'CALLER_FORGED_KERNEL_ENFORCEMENT',
+      };
+    }
+
+    if (evidence.kernelObservation && typeof evidence.kernelObservation === 'object') {
+      const { evaluateHostKernelEnforcement } = require('./executionEvidenceContract.cjs');
+      const evalKernel = evaluateHostKernelEnforcement({
+        kernelObservation: evidence.kernelObservation,
+        cgroupObservation: evidence.cgroupObservation || evidence.kernelObservation.cgroupObservation,
+        mountObservation: evidence.mountObservation || evidence.kernelObservation.mountObservation,
+        daemonInspect: evidence.daemonInspect,
+        expectedBindings: {
+          projectId: context.projectId || context.projectIdentityDigest,
+          executionId: context.executionId,
+          sessionId: context.sessionId,
+          containerId: context.containerId,
+          mountNamespaceId: context.mountNamespaceId,
+        },
+        expectedPolicy: policy,
+        activeNonces: context.consumedNonces,
+      });
+
+      if (evalKernel.gateStatus === 'BLOCKED' || !evalKernel.valid) {
+        return {
+          status: PROVIDER_STATUSES.BLOCKED,
+          ready: false,
+          reason: evalKernel.reason,
+          blockingReasons: [evalKernel.reason],
+          reasonCode: evalKernel.reasonCode,
+        };
+      }
+    }
+
     if (evidence.dockerObservation && typeof evidence.dockerObservation === 'object') {
       const { evaluateDockerObservation } = require('./executionEvidenceContract.cjs');
       const evalObs = evaluateDockerObservation({
@@ -226,13 +265,34 @@ function verifyIsolationCapabilities({
         reasonCode: 'ATTESTATION_REQUIRED',
       };
     }
-    if (evidence.sandbox === true || evidence.isolationVerified === true || evidence.verified === true || evidence.independentlyVerified === true) {
+    if (evidence.sandbox === true || evidence.isolationVerified === true || evidence.verified === true || evidence.independentlyVerified === true || evidence.kernelEnforced === true || evidence.observerAuthenticated === true || evidence.windowsPipeVerified === true || evidence.osProcessIdentityVerified === true) {
       return {
         status: PROVIDER_STATUSES.BLOCKED,
         ready: false,
-        reason: 'Caller-supplied Boolean flag ("sandbox: true", "isolationVerified: true", "verified: true", or "independentlyVerified: true") rejected as unverified.',
+        reason: 'Caller-supplied Boolean flag ("sandbox: true", "isolationVerified: true", "verified: true", "independentlyVerified: true", "kernelEnforced: true", or "observerAuthenticated: true") rejected as unverified.',
+        reasonCode: 'CALLER_FORGED_OBSERVER_IDENTITY',
         blockingReasons: ['Self-asserted caller flags are not accepted as authoritative evidence.'],
       };
+    }
+
+    if (evidence.observerDescriptor) {
+      const { authenticateObserver } = require('./executionEvidenceContract.cjs');
+      const authResult = authenticateObserver({
+        observerDescriptor: evidence.observerDescriptor,
+        peerCredentials: evidence.peerCredentials,
+        ipcChannel: evidence.ipcChannel,
+        processContext: evidence.processContext,
+        isSyntheticTest: evidence.isSyntheticTest === true,
+      });
+      if (!authResult.isAuthenticated) {
+        return {
+          status: PROVIDER_STATUSES.BLOCKED,
+          ready: false,
+          reason: authResult.reason || 'Observer authentication failed.',
+          blockingReasons: [authResult.reason || 'Observer authentication failed.'],
+          reasonCode: authResult.reasonCode,
+        };
+      }
     }
 
     if (evidence.isMock === true || evidence.trustClass === 'UNTRUSTED') {

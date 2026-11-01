@@ -3995,6 +3995,841 @@ async function runVerifiedIsolationTests() {
     assert.equal(prodEval.isVerified, false);
   }
 
+  // -------------------------------------------------------------------------
+  // 22. [V44.32] Host Kernel Enforcement Observer — Cgroups & Read-Only Filesystem
+  // -------------------------------------------------------------------------
+  console.log('22. [V44.32] Testing host kernel enforcement observer, cgroups v2 & read-only mount telemetry...');
+  {
+    const {
+      KERNEL_OBSERVATION_STATES,
+      validateCgroupV2Enforcement,
+      validateReadOnlyMountEnforcement,
+      evaluateHostKernelEnforcement,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+
+    const baseDescriptor = {
+      providerId: 'docker',
+      supportedPlatforms: ['win32', 'linux', 'darwin'],
+      isReady: true,
+      capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+      availability: { isRunning: true },
+      capabilities: {},
+    };
+
+    const validCgroupObservation = {
+      cgroupVersion: 2,
+      isCgroupV2: true,
+      cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+      controllers: ['cpu', 'memory', 'pids'],
+      cpuMax: '50000 100000',
+      memoryMax: '536870912',
+      pidsMax: '64',
+    };
+
+    const validMountObservation = {
+      mountNamespaceId: 'mnt:[4026532456]',
+      mounts: [
+        { destination: '/', target: '/', flags: ['ro', 'nodev', 'noexec'], readOnly: true },
+        { destination: '/workspace', target: '/workspace', flags: ['ro'], readOnly: true, isBindMount: true },
+        { destination: '/tmp', target: '/tmp', flags: ['rw', 'noexec', 'nosuid', 'nodev'], readOnly: false },
+      ],
+    };
+
+    const validKernelObservation = {
+      evidenceSource: 'host_kernel_telemetry',
+      verificationMethod: 'CGROUP_V2_AND_MOUNTINFO_PROBE',
+      containerId: 'container-abc-123',
+      cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+      mountNamespaceId: 'mnt:[4026532456]',
+      projectId: 'proj-1',
+      executionId: 'exec-1',
+      policyDigest: 'policy-digest-1',
+      verificationPlanDigest: 'plan-digest-1',
+      observationTimestamp: new Date().toISOString(),
+      nonce: crypto.randomUUID(),
+      verificationState: 'HOST_OBSERVED',
+      observerAuthentication: 'AUTHENTICATED',
+      hasIndependentSecurityPrincipal: true,
+      cgroupObservation: validCgroupObservation,
+      mountObservation: validMountObservation,
+    };
+
+    // 22.1: Missing cgroup v2 hierarchy
+    const v1Res = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, cgroupVersion: 1, isCgroupV2: false },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(v1Res.valid, false);
+    assert.equal(v1Res.reasonCode, 'CGROUP_V2_HIERARCHY_MISSING');
+
+    // 22.2: Missing CPU controller
+    const noCpuRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, controllers: ['memory', 'pids'] },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(noCpuRes.valid, false);
+    assert.equal(noCpuRes.reasonCode, 'CPU_CONTROLLER_MISSING');
+
+    // 22.3: Missing memory controller
+    const noMemRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, controllers: ['cpu', 'pids'] },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(noMemRes.valid, false);
+    assert.equal(noMemRes.reasonCode, 'MEMORY_CONTROLLER_MISSING');
+
+    // 22.4: Missing PID controller
+    const noPidsRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, controllers: ['cpu', 'memory'] },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(noPidsRes.valid, false);
+    assert.equal(noPidsRes.reasonCode, 'PIDS_CONTROLLER_MISSING');
+
+    // 22.5: Unlimited CPU quota when policy requires limits
+    const unlimCpuRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, cpuMax: 'max 100000' },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(unlimCpuRes.valid, false);
+    assert.equal(unlimCpuRes.reasonCode, 'UNEXPECTED_UNLIMITED_CPU');
+
+    // 22.6: Unlimited memory limit when policy requires limits
+    const unlimMemRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, memoryMax: 'max' },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(unlimMemRes.valid, false);
+    assert.equal(unlimMemRes.reasonCode, 'UNEXPECTED_UNLIMITED_MEMORY');
+
+    // 22.7: Unlimited PID limit when policy requires limits
+    const unlimPidsRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, pidsMax: 'max' },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(unlimPidsRes.valid, false);
+    assert.equal(unlimPidsRes.reasonCode, 'UNEXPECTED_UNLIMITED_PIDS');
+
+    // 22.8: Malformed cgroup values (CPU, memory, PID)
+    const malformedCpuRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, cpuMax: 'invalid-cpu-format' },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(malformedCpuRes.valid, false);
+    assert.equal(malformedCpuRes.reasonCode, 'CPU_MAX_MALFORMED');
+
+    const malformedMemRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, memoryMax: 'not-a-number' },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(malformedMemRes.valid, false);
+    assert.equal(malformedMemRes.reasonCode, 'MEMORY_MAX_MALFORMED');
+
+    const malformedPidsRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, pidsMax: '-10' },
+      expectedPolicy: { requireResourceLimits: true },
+    });
+    assert.equal(malformedPidsRes.valid, false);
+    assert.equal(malformedPidsRes.reasonCode, 'PIDS_MAX_MALFORMED');
+
+    // 22.9: Wrong container cgroup identity
+    const wrongCgroupRes = validateCgroupV2Enforcement({
+      cgroupObservation: { ...validCgroupObservation, cgroupPath: '/sys/fs/cgroup/docker/different-container-id/' },
+      expectedContainerId: 'container-abc-123',
+    });
+    assert.equal(wrongCgroupRes.valid, false);
+    assert.equal(wrongCgroupRes.reasonCode, 'CGROUP_PATH_MISMATCH');
+
+    // 22.10: Stale observation rejected
+    const staleObsRes = evaluateHostKernelEnforcement({
+      kernelObservation: {
+        ...validKernelObservation,
+        nonce: crypto.randomUUID(),
+        observationTimestamp: new Date(Date.now() - 120000).toISOString(),
+      },
+      maxObservationAgeMs: 60000,
+    });
+    assert.equal(staleObsRes.valid, false);
+    assert.equal(staleObsRes.reasonCode, 'STALE_OBSERVATION');
+
+    // 22.11: Cross-project observation substitution rejected
+    const crossProjRes = evaluateHostKernelEnforcement({
+      kernelObservation: {
+        ...validKernelObservation,
+        nonce: crypto.randomUUID(),
+        projectId: 'attacker-project-id',
+      },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+    });
+    assert.equal(crossProjRes.valid, false);
+    assert.equal(crossProjRes.reasonCode, 'CROSS_PROJECT_OBSERVATION_SUBSTITUTION');
+
+    // 22.12: Daemon/host observation conflict
+    const daemonConflictRes = evaluateHostKernelEnforcement({
+      kernelObservation: { ...validKernelObservation, nonce: crypto.randomUUID() },
+      daemonInspect: {
+        HostConfig: {
+          Memory: 1073741824,
+          ReadonlyRootfs: true,
+        },
+      },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+    });
+    assert.equal(daemonConflictRes.valid, false);
+    assert.equal(daemonConflictRes.reasonCode, 'DAEMON_HOST_OBSERVATION_CONFLICT');
+
+    // 22.13: Caller-forged kernel enforcement rejected
+    const forgedKernelObs = {
+      ...validKernelObservation,
+      nonce: crypto.randomUUID(),
+      kernelEnforced: true,
+    };
+    const forgedKernelRes = evaluateHostKernelEnforcement({
+      kernelObservation: forgedKernelObs,
+    });
+    assert.equal(forgedKernelRes.valid, false);
+    assert.equal(forgedKernelRes.reasonCode, 'CALLER_FORGED_KERNEL_ENFORCEMENT');
+
+    // 22.14: Writable root filesystem rejected
+    const writableRootRes = validateReadOnlyMountEnforcement({
+      mountObservation: {
+        mountNamespaceId: 'mnt:[4026532456]',
+        mounts: [
+          { destination: '/', target: '/', flags: ['rw'], readOnly: false },
+        ],
+      },
+    });
+    assert.equal(writableRootRes.valid, false);
+    assert.equal(writableRootRes.reasonCode, 'WRITABLE_ROOT_FILESYSTEM');
+
+    // 22.15: Writable bind mount rejected
+    const writableBindRes = validateReadOnlyMountEnforcement({
+      mountObservation: {
+        mountNamespaceId: 'mnt:[4026532456]',
+        mounts: [
+          { destination: '/', target: '/', flags: ['ro'], readOnly: true },
+          { destination: '/src', target: '/src', flags: ['rw'], readOnly: false, isBindMount: true },
+        ],
+      },
+    });
+    assert.equal(writableBindRes.valid, false);
+    assert.equal(writableBindRes.reasonCode, 'WRITABLE_BIND_MOUNT_DETECTED');
+
+    // 22.16: Unexpected writable volume rejected
+    const writableVolRes = validateReadOnlyMountEnforcement({
+      mountObservation: {
+        mountNamespaceId: 'mnt:[4026532456]',
+        mounts: [
+          { destination: '/', target: '/', flags: ['ro'], readOnly: true },
+          { destination: '/data', target: '/data', flags: ['rw'], readOnly: false, isVolume: true },
+        ],
+      },
+    });
+    assert.equal(writableVolRes.valid, false);
+    assert.equal(writableVolRes.reasonCode, 'WRITABLE_VOLUME_DETECTED');
+
+    // 22.17: Mount namespace mismatch rejected
+    const nsMismatchRes = validateReadOnlyMountEnforcement({
+      mountObservation: {
+        mountNamespaceId: 'mnt:[9999999999]',
+        mounts: [
+          { destination: '/', target: '/', flags: ['ro'], readOnly: true },
+        ],
+      },
+      expectedMountNamespaceId: 'mnt:[4026532456]',
+    });
+    assert.equal(nsMismatchRes.valid, false);
+    assert.equal(nsMismatchRes.reasonCode, 'MOUNT_NAMESPACE_MISMATCH');
+
+    // 22.18: Missing independent observer authentication fails closed
+    const unauthObserverRes = evaluateHostKernelEnforcement({
+      kernelObservation: {
+        ...validKernelObservation,
+        nonce: crypto.randomUUID(),
+        observerAuthentication: 'UNAUTHENTICATED',
+        hasIndependentSecurityPrincipal: false,
+      },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+    });
+    assert.equal(unauthObserverRes.valid, false);
+    assert.equal(unauthObserverRes.reasonCode, 'INDEPENDENT_OBSERVER_NOT_AUTHENTICATED');
+    assert.equal(unauthObserverRes.kernelEnforcement, 'NOT_VERIFIED');
+    assert.equal(unauthObserverRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.equal(unauthObserverRes.gateStatus, 'BLOCKED');
+  }
+
+  // -------------------------------------------------------------------------
+  // 23. Authenticated Host Observer — Trust Boundary & Evidence Collection (V44.33)
+  // -------------------------------------------------------------------------
+  console.log('23. Testing Authenticated Host Observer Trust Boundary & Evidence Collection (V44.33)...');
+  {
+    const {
+      OBSERVER_IDENTITY_SOURCES,
+      OBSERVER_AUTHENTICATION_STATES,
+      OBSERVER_CONTEXT_BINDING_FIELDS,
+      authenticateObserver,
+      validateObservationContext,
+      verifyObservationFreshness,
+      evaluateHostKernelEnforcement,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+
+    const validObserverDescriptor = {
+      observerId: 'obs-system-daemon-1',
+      identitySource: OBSERVER_IDENTITY_SOURCES.INDEPENDENT_AUTHENTICATED_OBSERVER,
+      executablePath: '/usr/libexec/ai-help-agent/observer-daemon',
+      pid: 9999,
+      parentPid: 1,
+      isAlive: true,
+      lastHeartbeat: new Date().toISOString(),
+    };
+
+    const validPeerCredentials = {
+      authenticated: true,
+      peerPid: 9999,
+      peerUid: 0,
+      protocol: 'SO_PEERCRED',
+    };
+
+    const validIpcChannel = {
+      channelType: 'unix_domain_socket',
+      restrictedAcl: true,
+    };
+
+    // 23.1: Caller-forged observer identity rejected
+    for (const forgedFlag of ['observerAuthenticated', 'authenticated', 'independentlyVerified', 'kernelEnforced']) {
+      const res = authenticateObserver({
+        observerDescriptor: {
+          ...validObserverDescriptor,
+          [forgedFlag]: true,
+        },
+        peerCredentials: validPeerCredentials,
+        ipcChannel: validIpcChannel,
+        isSyntheticTest: true,
+      });
+      assert.equal(res.isAuthenticated, false);
+      assert.equal(res.state, OBSERVER_AUTHENTICATION_STATES.CALLER_FORGED);
+      assert.equal(res.reasonCode, 'CALLER_FORGED_OBSERVER_IDENTITY');
+    }
+
+    // 23.2: Caller-forged kernel enforcement rejected in evaluateHostKernelEnforcement
+    const forgedKernelRes = evaluateHostKernelEnforcement({
+      kernelObservation: {
+        evidenceSource: 'host_kernel_telemetry',
+        verificationMethod: 'CGROUP_V2_AND_MOUNTINFO_PROBE',
+        containerId: 'container-abc-123',
+        cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+        mountNamespaceId: 'mnt:[4026532456]',
+        projectId: 'proj-1',
+        executionId: 'exec-1',
+        policyDigest: 'policy-digest-1',
+        verificationPlanDigest: 'plan-digest-1',
+        observationTimestamp: new Date().toISOString(),
+        nonce: crypto.randomUUID(),
+        verificationState: 'HOST_OBSERVED',
+        observerAuthenticated: true,
+      },
+    });
+    assert.equal(forgedKernelRes.valid, false);
+    assert.equal(forgedKernelRes.reasonCode, 'CALLER_FORGED_KERNEL_ENFORCEMENT');
+
+    // 23.3: Unauthenticated IPC peer rejected
+    const unauthPeerRes = authenticateObserver({
+      observerDescriptor: validObserverDescriptor,
+      peerCredentials: { authenticated: false, peerPid: 9999 },
+      ipcChannel: validIpcChannel,
+      isSyntheticTest: true,
+    });
+    assert.equal(unauthPeerRes.isAuthenticated, false);
+    assert.equal(unauthPeerRes.state, OBSERVER_AUTHENTICATION_STATES.PEER_UNAUTHENTICATED);
+    assert.equal(unauthPeerRes.reasonCode, 'IPC_PEER_UNAUTHENTICATED');
+
+    // 23.4: Invalid observer process identity (same process as runner) rejected
+    const sameProcRes = authenticateObserver({
+      observerDescriptor: {
+        ...validObserverDescriptor,
+        pid: process.pid,
+      },
+      peerCredentials: { authenticated: true, peerPid: process.pid },
+      ipcChannel: validIpcChannel,
+      processContext: { currentPid: process.pid },
+      isSyntheticTest: true,
+    });
+    assert.equal(sameProcRes.isAuthenticated, false);
+    assert.equal(sameProcRes.reasonCode, 'IN_PROCESS_OBSERVER_REJECTED');
+
+    // 23.5: Wrong parent-child relationship (child process of runner) rejected
+    const childProcRes = authenticateObserver({
+      observerDescriptor: {
+        ...validObserverDescriptor,
+        parentPid: process.pid,
+      },
+      peerCredentials: validPeerCredentials,
+      ipcChannel: validIpcChannel,
+      processContext: { currentPid: process.pid },
+      isSyntheticTest: true,
+    });
+    assert.equal(childProcRes.isAuthenticated, false);
+    assert.equal(childProcRes.reasonCode, 'CHILD_PROCESS_OBSERVER_REJECTED');
+
+    // 23.6: Cross-project evidence reuse rejected
+    const validObsContext = {
+      projectId: 'proj-1',
+      projectRoot: process.cwd(),
+      sessionId: 'sess-1',
+      executionId: 'exec-1',
+      containerId: 'container-abc-123',
+      cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+      mountNamespaceId: 'mnt:[4026532456]',
+      grantId: 'grant-1',
+      policyDigest: 'a'.repeat(64),
+      verificationPlanDigest: 'b'.repeat(64),
+      observedAt: new Date().toISOString(),
+      observerNonce: crypto.randomUUID(),
+    };
+
+    const crossProjectRes = validateObservationContext({
+      observation: {
+        ...validObsContext,
+        projectId: 'attacker-project-id',
+      },
+      expectedBindings: {
+        projectId: 'proj-1',
+        projectRoot: process.cwd(),
+        sessionId: 'sess-1',
+      },
+    });
+    assert.equal(crossProjectRes.valid, false);
+    assert.equal(crossProjectRes.reasonCode, 'CROSS_PROJECT_EVIDENCE_REUSE');
+
+    // 23.7: Cross-session evidence reuse rejected
+    const crossSessionRes = validateObservationContext({
+      observation: {
+        ...validObsContext,
+        sessionId: 'old-session-id',
+      },
+      expectedBindings: {
+        projectId: 'proj-1',
+        projectRoot: process.cwd(),
+        sessionId: 'sess-1',
+      },
+    });
+    assert.equal(crossSessionRes.valid, false);
+    assert.equal(crossSessionRes.reasonCode, 'CROSS_SESSION_EVIDENCE_REUSE');
+
+    // 23.8: Stale observation rejected
+    const staleFreshRes = verifyObservationFreshness({
+      observedAt: new Date(Date.now() - 120000).toISOString(),
+      maxObservationAgeMs: 60000,
+      nonce: crypto.randomUUID(),
+    });
+    assert.equal(staleFreshRes.fresh, false);
+    assert.equal(staleFreshRes.reasonCode, 'OBSERVATION_STALE');
+
+    // 23.9: Future timestamp rejected
+    const futureFreshRes = verifyObservationFreshness({
+      observedAt: new Date(Date.now() + 60000).toISOString(),
+      maxObservationAgeMs: 60000,
+      nonce: crypto.randomUUID(),
+    });
+    assert.equal(futureFreshRes.fresh, false);
+    assert.equal(futureFreshRes.reasonCode, 'OBSERVATION_FUTURE_DATED');
+
+    // 23.10: Replayed nonce rejected
+    const nonceSet = new Set();
+    const testNonce = crypto.randomUUID();
+    const nonceRes1 = verifyObservationFreshness({
+      observedAt: new Date().toISOString(),
+      nonce: testNonce,
+      activeNonces: nonceSet,
+    });
+    assert.equal(nonceRes1.fresh, true);
+    const nonceRes2 = verifyObservationFreshness({
+      observedAt: new Date().toISOString(),
+      nonce: testNonce,
+      activeNonces: nonceSet,
+    });
+    assert.equal(nonceRes2.fresh, false);
+    assert.equal(nonceRes2.reasonCode, 'REPLAY_DETECTED');
+
+    // 23.11: Missing context binding rejected
+    for (const field of OBSERVER_CONTEXT_BINDING_FIELDS) {
+      const incompleteObs = { ...validObsContext };
+      delete incompleteObs[field];
+      const missingFieldRes = validateObservationContext({
+        observation: incompleteObs,
+        expectedBindings: { projectId: 'proj-1' },
+      });
+      assert.equal(missingFieldRes.valid, false);
+      assert.equal(missingFieldRes.reasonCode, 'MISSING_CONTEXT_BINDING_FIELD');
+    }
+
+    // 23.12: Conflicting daemon and host observations rejected in evaluateHostKernelEnforcement
+    const conflictRes = evaluateHostKernelEnforcement({
+      kernelObservation: {
+        evidenceSource: 'host_kernel_telemetry',
+        verificationMethod: 'CGROUP_V2_AND_MOUNTINFO_PROBE',
+        containerId: 'container-abc-123',
+        cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+        mountNamespaceId: 'mnt:[4026532456]',
+        projectId: 'proj-1',
+        executionId: 'exec-1',
+        policyDigest: 'policy-digest-1',
+        verificationPlanDigest: 'plan-digest-1',
+        observationTimestamp: new Date().toISOString(),
+        nonce: crypto.randomUUID(),
+        verificationState: 'HOST_OBSERVED',
+        cgroupObservation: {
+          cgroupVersion: 2,
+          isCgroupV2: true,
+          cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+          controllers: ['cpu', 'memory', 'pids'],
+          cpuMax: '50000 100000',
+          memoryMax: '536870912',
+          pidsMax: '64',
+        },
+        mountObservation: {
+          mountNamespaceId: 'mnt:[4026532456]',
+          mounts: [{ destination: '/', target: '/', flags: ['ro'], readOnly: true }],
+        },
+      },
+      daemonInspect: {
+        HostConfig: {
+          Memory: 1073741824,
+          ReadonlyRootfs: true,
+        },
+      },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+    });
+    assert.equal(conflictRes.valid, false);
+    assert.equal(conflictRes.reasonCode, 'DAEMON_HOST_OBSERVATION_CONFLICT');
+
+    // 23.13: Observer termination / stale heartbeat rejected
+    const termRes = authenticateObserver({
+      observerDescriptor: {
+        ...validObserverDescriptor,
+        isAlive: false,
+        terminated: true,
+      },
+      peerCredentials: validPeerCredentials,
+      ipcChannel: validIpcChannel,
+      isSyntheticTest: true,
+    });
+    assert.equal(termRes.isAuthenticated, false);
+    assert.equal(termRes.reasonCode, 'OBSERVER_PROCESS_TERMINATED');
+
+    const staleHbRes = authenticateObserver({
+      observerDescriptor: {
+        ...validObserverDescriptor,
+        lastHeartbeat: new Date(Date.now() - 30000).toISOString(),
+        maxHeartbeatAgeMs: 5000,
+      },
+      peerCredentials: validPeerCredentials,
+      ipcChannel: validIpcChannel,
+      isSyntheticTest: true,
+    });
+    assert.equal(staleHbRes.isAuthenticated, false);
+    assert.equal(staleHbRes.reasonCode, 'OBSERVER_HEARTBEAT_STALE');
+
+    // 23.14: Observer descriptor missing / unavailable
+    const missingDescRes = authenticateObserver({
+      observerDescriptor: null,
+      isSyntheticTest: true,
+    });
+    assert.equal(missingDescRes.isAuthenticated, false);
+    assert.equal(missingDescRes.reasonCode, 'OBSERVER_DESCRIPTOR_MISSING');
+
+    // 23.15: Valid synthetic evidence without authenticated identity fails closed in production
+    const prodRes = authenticateObserver({
+      observerDescriptor: validObserverDescriptor,
+      peerCredentials: validPeerCredentials,
+      ipcChannel: validIpcChannel,
+      isSyntheticTest: false,
+    });
+    assert.equal(prodRes.isAuthenticated, false);
+    assert.equal(prodRes.state, OBSERVER_AUTHENTICATION_STATES.NOT_IMPLEMENTED);
+    assert.equal(prodRes.reasonCode, 'INDEPENDENT_OBSERVER_NOT_IMPLEMENTED');
+
+    // 23.16: Insecure IPC channel access control rejected
+    const insecureIpcRes = authenticateObserver({
+      observerDescriptor: validObserverDescriptor,
+      peerCredentials: validPeerCredentials,
+      ipcChannel: { channelType: 'unix_domain_socket', restrictedAcl: false },
+      isSyntheticTest: true,
+    });
+    assert.equal(insecureIpcRes.isAuthenticated, false);
+    assert.equal(insecureIpcRes.reasonCode, 'INSECURE_IPC_CHANNEL');
+
+    // 23.17: Untrusted observer executable path rejected
+    const untrustedPathRes = authenticateObserver({
+      observerDescriptor: {
+        ...validObserverDescriptor,
+        executablePath: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\observer.exe',
+      },
+      peerCredentials: validPeerCredentials,
+      ipcChannel: validIpcChannel,
+      isSyntheticTest: true,
+    });
+    assert.equal(untrustedPathRes.isAuthenticated, false);
+    assert.equal(untrustedPathRes.reasonCode, 'UNTRUSTED_OBSERVER_EXECUTABLE_PATH');
+
+    // 23.18: Electron renderer or main process identity domain rejected
+    for (const invalidDomain of [OBSERVER_IDENTITY_SOURCES.ELECTRON_RENDERER, OBSERVER_IDENTITY_SOURCES.ELECTRON_MAIN, OBSERVER_IDENTITY_SOURCES.CHILD_PROCESS]) {
+      const domainRes = authenticateObserver({
+        observerDescriptor: {
+          ...validObserverDescriptor,
+          identitySource: invalidDomain,
+        },
+        peerCredentials: validPeerCredentials,
+        ipcChannel: validIpcChannel,
+        isSyntheticTest: true,
+      });
+      assert.equal(domainRes.isAuthenticated, false);
+      assert.equal(domainRes.state, OBSERVER_AUTHENTICATION_STATES.UNTRUSTED_PROCESS_DOMAIN);
+  }
+  }
+
+  // -------------------------------------------------------------------------
+  // 24. Windows OS-Authenticated Observer IPC — Implementation & Verification (V44.34)
+  // -------------------------------------------------------------------------
+  console.log('24. Testing Windows OS-Authenticated Observer IPC (V44.34)...');
+  {
+    const {
+      WINDOWS_IPC_SECURITY_STATES,
+      OBSERVER_IDENTITY_SOURCES,
+      OBSERVER_AUTHENTICATION_STATES,
+      validateWindowsNamedPipeSecurity,
+      validateWindowsProcessPeerIdentity,
+      authenticateObserver,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+
+    const validPipePath = '\\\\.\\pipe\\ai-help-agent-observer-1';
+    const validSecurityDescriptor = {
+      sddl: 'D:(A;;GA;;;SY)(A;;GA;;;BA)',
+      restrictedDacl: true,
+      nullDacl: false,
+      terminalSessionId: 1,
+    };
+
+    const validPeerProcess = {
+      pid: 8888,
+      handleValid: true,
+      processExited: false,
+      processCreationTimeUtc: '2026-11-01T07:00:00.000Z',
+      executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\observer.exe',
+      tokenUserSid: 'S-1-5-18',
+      identitySource: OBSERVER_IDENTITY_SOURCES.INDEPENDENT_AUTHENTICATED_OBSERVER,
+    };
+
+    // 24.1: Unauthorized named pipe path (relative or outside \\.\pipe\)
+    const invalidPathRes = validateWindowsNamedPipeSecurity({
+      pipePath: 'C:\\temp\\observer.sock',
+      securityDescriptor: validSecurityDescriptor,
+      isSyntheticTest: true,
+    });
+    assert.equal(invalidPathRes.valid, false);
+    assert.equal(invalidPathRes.reasonCode, 'INVALID_PIPE_PATH');
+
+    // 24.2: Insecure pipe security descriptor (NULL DACL / Everyone access) rejected
+    const nullDaclRes = validateWindowsNamedPipeSecurity({
+      pipePath: validPipePath,
+      securityDescriptor: { nullDacl: true, dacl: null },
+      isSyntheticTest: true,
+    });
+    assert.equal(nullDaclRes.valid, false);
+    assert.equal(nullDaclRes.reasonCode, 'NULL_DACL_REJECTED');
+
+    const everyoneDaclRes = validateWindowsNamedPipeSecurity({
+      pipePath: validPipePath,
+      securityDescriptor: { sddl: 'D:(A;;GA;;;WD)', restrictedDacl: false },
+      isSyntheticTest: true,
+    });
+    assert.equal(everyoneDaclRes.valid, false);
+    assert.equal(everyoneDaclRes.reasonCode, 'EVERYONE_ACCESS_REJECTED');
+
+    // 24.3: Invalid client PID (PID <= 4 or non-integer) rejected
+    for (const badPid of [0, 4, -1, 3.14, 'not-a-pid']) {
+      const badPidRes = validateWindowsProcessPeerIdentity({
+        peerProcessDescriptor: { ...validPeerProcess, pid: badPid },
+        isSyntheticTest: true,
+      });
+      assert.equal(badPidRes.valid, false);
+      assert.equal(badPidRes.reasonCode, 'INVALID_CLIENT_PID');
+    }
+
+    // 24.4: PID reuse / creation timestamp mismatch rejected
+    const pidReuseRes = validateWindowsProcessPeerIdentity({
+      peerProcessDescriptor: {
+        ...validPeerProcess,
+        processCreationTimeUtc: '2026-11-01T07:15:00.000Z',
+      },
+      expectedContext: {
+        processCreationTimeUtc: '2026-11-01T07:00:00.000Z',
+      },
+      isSyntheticTest: true,
+    });
+    assert.equal(pidReuseRes.valid, false);
+    assert.equal(pidReuseRes.state, WINDOWS_IPC_SECURITY_STATES.PID_REUSE_DETECTED);
+    assert.equal(pidReuseRes.reasonCode, 'PID_REUSE_DETECTED');
+
+    // 24.5: Invalid or closed process handle rejected
+    const closedHandleRes = validateWindowsProcessPeerIdentity({
+      peerProcessDescriptor: {
+        ...validPeerProcess,
+        handleValid: false,
+      },
+      isSyntheticTest: true,
+    });
+    assert.equal(closedHandleRes.valid, false);
+    assert.equal(closedHandleRes.reasonCode, 'INVALID_PROCESS_HANDLE');
+
+    // 24.6: Untrusted executable identity path rejected
+    const badExecRes = validateWindowsProcessPeerIdentity({
+      peerProcessDescriptor: {
+        ...validPeerProcess,
+        executablePath: 'C:\\Users\\Admin\\AppData\\Local\\Temp\\attacker.exe',
+      },
+      isSyntheticTest: true,
+    });
+    assert.equal(badExecRes.valid, false);
+    assert.equal(badExecRes.reasonCode, 'UNTRUSTED_OBSERVER_EXECUTABLE_PATH');
+
+    // 24.7: Wrong OS security principal (unauthorized user SID instead of SYSTEM or service) rejected
+    const wrongSidRes = validateWindowsProcessPeerIdentity({
+      peerProcessDescriptor: {
+        ...validPeerProcess,
+        tokenUserSid: 'S-1-5-21-123456789-123456789-1001',
+      },
+      expectedPrincipalSid: 'S-1-5-18',
+      isSyntheticTest: true,
+    });
+    assert.equal(wrongSidRes.valid, false);
+    assert.equal(wrongSidRes.state, WINDOWS_IPC_SECURITY_STATES.SECURITY_PRINCIPAL_MISMATCH);
+    assert.equal(wrongSidRes.reasonCode, 'SECURITY_PRINCIPAL_MISMATCH');
+
+    // 24.8: Cross-session connection rejected (Terminal Services session ID mismatch)
+    const crossSessionPipeRes = validateWindowsNamedPipeSecurity({
+      pipePath: validPipePath,
+      securityDescriptor: { ...validSecurityDescriptor, terminalSessionId: 0 },
+      clientContext: { terminalSessionId: 1 },
+      isSyntheticTest: true,
+    });
+    assert.equal(crossSessionPipeRes.valid, false);
+    assert.equal(crossSessionPipeRes.state, WINDOWS_IPC_SECURITY_STATES.CROSS_SESSION_REJECTED);
+    assert.equal(crossSessionPipeRes.reasonCode, 'CROSS_SESSION_ACCESS_REJECTED');
+
+    // 24.9: Stale observer process rejected in authenticateObserver
+    const staleProcRes = authenticateObserver({
+      observerDescriptor: {
+        observerId: 'obs-win-1',
+        identitySource: OBSERVER_IDENTITY_SOURCES.INDEPENDENT_AUTHENTICATED_OBSERVER,
+        executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\observer.exe',
+        pid: 8888,
+        lastHeartbeat: new Date(Date.now() - 45000).toISOString(),
+        maxHeartbeatAgeMs: 10000,
+      },
+      peerCredentials: { authenticated: true, peerPid: 8888 },
+      isSyntheticTest: true,
+    });
+    assert.equal(staleProcRes.isAuthenticated, false);
+    assert.equal(staleProcRes.reasonCode, 'OBSERVER_HEARTBEAT_STALE');
+
+    // 24.10: Observer process termination detected
+    const terminatedProcRes = authenticateObserver({
+      observerDescriptor: {
+        observerId: 'obs-win-1',
+        identitySource: OBSERVER_IDENTITY_SOURCES.INDEPENDENT_AUTHENTICATED_OBSERVER,
+        executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\observer.exe',
+        pid: 8888,
+        isAlive: false,
+        terminated: true,
+      },
+      peerCredentials: { authenticated: true, peerPid: 8888 },
+      isSyntheticTest: true,
+    });
+    assert.equal(terminatedProcRes.isAuthenticated, false);
+    assert.equal(terminatedProcRes.reasonCode, 'OBSERVER_PROCESS_TERMINATED');
+
+    // 24.11: Caller-forged authentication result rejected
+    for (const forgedFlag of ['windowsPipeVerified', 'osProcessIdentityVerified', 'ipcClientAuthenticated']) {
+      const forgedRes = authenticateObserver({
+        observerDescriptor: {
+          observerId: 'obs-win-1',
+          identitySource: OBSERVER_IDENTITY_SOURCES.INDEPENDENT_AUTHENTICATED_OBSERVER,
+          executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\observer.exe',
+          pid: 8888,
+          [forgedFlag]: true,
+        },
+        peerCredentials: { authenticated: true, peerPid: 8888 },
+        isSyntheticTest: true,
+      });
+      assert.equal(forgedRes.isAuthenticated, false);
+      assert.equal(forgedRes.state, OBSERVER_AUTHENTICATION_STATES.CALLER_FORGED);
+      assert.equal(forgedRes.reasonCode, 'CALLER_FORGED_OBSERVER_IDENTITY');
+    }
+
+    // 24.12: Renderer pretending to be observer rejected
+    const rendererProcRes = validateWindowsProcessPeerIdentity({
+      peerProcessDescriptor: {
+        ...validPeerProcess,
+        identitySource: OBSERVER_IDENTITY_SOURCES.ELECTRON_RENDERER,
+      },
+      isSyntheticTest: true,
+    });
+    assert.equal(rendererProcRes.valid, false);
+    assert.equal(rendererProcRes.reasonCode, 'UNTRUSTED_PROCESS_DOMAIN');
+
+    // 24.13: Ordinary child process pretending to be independent observer rejected
+    const childProcWinRes = validateWindowsProcessPeerIdentity({
+      peerProcessDescriptor: {
+        ...validPeerProcess,
+        identitySource: OBSERVER_IDENTITY_SOURCES.CHILD_PROCESS,
+      },
+      isSyntheticTest: true,
+    });
+    assert.equal(childProcWinRes.valid, false);
+    assert.equal(childProcWinRes.reasonCode, 'UNTRUSTED_PROCESS_DOMAIN');
+
+    // 24.14: Pure Node.js production IPC peer authentication fails closed as NOT_IMPLEMENTED
+    const prodPipeRes = validateWindowsNamedPipeSecurity({
+      pipePath: validPipePath,
+      securityDescriptor: validSecurityDescriptor,
+      isSyntheticTest: false,
+    });
+    assert.equal(prodPipeRes.valid, false);
+    assert.equal(prodPipeRes.state, WINDOWS_IPC_SECURITY_STATES.NOT_IMPLEMENTED);
+    assert.equal(prodPipeRes.reasonCode, 'WINDOWS_NATIVE_IPC_AUTH_NOT_IMPLEMENTED');
+
+    const prodPeerRes = validateWindowsProcessPeerIdentity({
+      peerProcessDescriptor: validPeerProcess,
+      isSyntheticTest: false,
+    });
+    assert.equal(prodPeerRes.valid, false);
+    assert.equal(prodPeerRes.state, WINDOWS_IPC_SECURITY_STATES.NOT_VERIFIED);
+    assert.equal(prodPeerRes.reasonCode, 'OS_PROCESS_IDENTITY_NOT_VERIFIED');
+
+    // 24.15: Valid synthetic IPC descriptor without real OS authentication fails closed in production
+    const prodAuthRes = authenticateObserver({
+      observerDescriptor: {
+        observerId: 'obs-win-1',
+        identitySource: OBSERVER_IDENTITY_SOURCES.INDEPENDENT_AUTHENTICATED_OBSERVER,
+        executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\observer.exe',
+        pid: 8888,
+        windowsNamedPipe: {
+          pipePath: validPipePath,
+          securityDescriptor: validSecurityDescriptor,
+        },
+        windowsProcessPeer: validPeerProcess,
+      },
+      peerCredentials: { authenticated: true, peerPid: 8888 },
+      isSyntheticTest: false,
+    });
+    assert.equal(prodAuthRes.isAuthenticated, false);
+    assert.equal(prodAuthRes.state, OBSERVER_AUTHENTICATION_STATES.NOT_IMPLEMENTED);
+    assert.equal(prodAuthRes.reasonCode, 'WINDOWS_NATIVE_IPC_AUTH_NOT_IMPLEMENTED');
+  }
+
   console.log('All CODING AGENT V3 — Verified Isolated Project Execution tests passed successfully!');
 
 }

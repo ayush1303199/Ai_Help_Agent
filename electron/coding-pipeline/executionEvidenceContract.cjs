@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const path = require('node:path');
 
 const CURRENT_ATTESTATION_SCHEMA_VERSION = '1.0.0';
 const SUPPORTED_SIGNATURE_ALGORITHMS = Object.freeze([
@@ -100,6 +101,95 @@ const DOCKER_OBSERVATION_BINDING_FIELDS = Object.freeze([
   'planDigest',
   'observationTimestamp',
   'nonce',
+]);
+
+const KERNEL_OBSERVATION_STATES = Object.freeze({
+  NOT_AVAILABLE: 'NOT_AVAILABLE',
+  NOT_SUPPORTED: 'NOT_SUPPORTED',
+  DAEMON_REPORTED: 'DAEMON_REPORTED',
+  HOST_OBSERVED: 'HOST_OBSERVED',
+  KERNEL_ENFORCEMENT_NOT_VERIFIED: 'KERNEL_ENFORCEMENT_NOT_VERIFIED',
+  KERNEL_ENFORCED: 'KERNEL_ENFORCED',
+  OBSERVATION_CONFLICT: 'OBSERVATION_CONFLICT',
+  STALE_OBSERVATION: 'STALE_OBSERVATION',
+  IDENTITY_MISMATCH: 'IDENTITY_MISMATCH',
+  VERIFICATION_FAILED: 'VERIFICATION_FAILED',
+});
+
+const KERNEL_OBSERVATION_BINDING_FIELDS = Object.freeze([
+  'evidenceSource',
+  'verificationMethod',
+  'containerId',
+  'cgroupPath',
+  'mountNamespaceId',
+  'projectId',
+  'executionId',
+  'policyDigest',
+  'verificationPlanDigest',
+  'observationTimestamp',
+  'nonce',
+  'verificationState',
+]);
+
+const OBSERVER_IDENTITY_SOURCES = Object.freeze({
+  CALLER_PROVIDED: 'CALLER_PROVIDED',
+  ELECTRON_RENDERER: 'ELECTRON_RENDERER',
+  ELECTRON_MAIN: 'ELECTRON_MAIN',
+  CHILD_PROCESS: 'CHILD_PROCESS',
+  OS_AUTHENTICATED_PROCESS: 'OS_AUTHENTICATED_PROCESS',
+  INDEPENDENT_AUTHENTICATED_OBSERVER: 'INDEPENDENT_AUTHENTICATED_OBSERVER',
+});
+
+const OBSERVER_AUTHENTICATION_STATES = Object.freeze({
+  NOT_INITIALIZED: 'NOT_INITIALIZED',
+  UNAUTHENTICATED: 'UNAUTHENTICATED',
+  CALLER_FORGED: 'CALLER_FORGED',
+  UNTRUSTED_PROCESS_DOMAIN: 'UNTRUSTED_PROCESS_DOMAIN',
+  PEER_UNAUTHENTICATED: 'PEER_UNAUTHENTICATED',
+  LIFECYCLE_TERMINATED: 'LIFECYCLE_TERMINATED',
+  IDENTITY_MISMATCH: 'IDENTITY_MISMATCH',
+  STALE_HEARTBEAT: 'STALE_HEARTBEAT',
+  NOT_IMPLEMENTED: 'NOT_IMPLEMENTED',
+  AUTHENTICATED: 'AUTHENTICATED',
+});
+
+const OBSERVER_CONTEXT_BINDING_FIELDS = Object.freeze([
+  'projectId',
+  'projectRoot',
+  'sessionId',
+  'executionId',
+  'containerId',
+  'cgroupPath',
+  'mountNamespaceId',
+  'grantId',
+  'policyDigest',
+  'verificationPlanDigest',
+  'observedAt',
+  'observerNonce',
+]);
+
+const WINDOWS_IPC_SECURITY_STATES = Object.freeze({
+  NOT_CONFIGURED: 'NOT_CONFIGURED',
+  PIPE_PATH_KNOWN: 'PIPE_PATH_KNOWN',
+  PIPE_ACL_CONFIGURED: 'PIPE_ACL_CONFIGURED',
+  CONNECTING_CLIENT_AUTHENTICATED: 'CONNECTING_CLIENT_AUTHENTICATED',
+  CLIENT_OS_IDENTITY_VERIFIED: 'CLIENT_OS_IDENTITY_VERIFIED',
+  OBSERVER_IDENTITY_TRUSTED: 'OBSERVER_IDENTITY_TRUSTED',
+  UNAUTHORIZED_CLIENT: 'UNAUTHORIZED_CLIENT',
+  PID_REUSE_DETECTED: 'PID_REUSE_DETECTED',
+  SECURITY_PRINCIPAL_MISMATCH: 'SECURITY_PRINCIPAL_MISMATCH',
+  CROSS_SESSION_REJECTED: 'CROSS_SESSION_REJECTED',
+  NOT_IMPLEMENTED: 'NOT_IMPLEMENTED',
+  NOT_VERIFIED: 'NOT_VERIFIED',
+  AUTHENTICATED: 'AUTHENTICATED',
+  REJECTED: 'REJECTED',
+});
+
+const WINDOWS_TRUSTED_SECURITY_PRINCIPALS = Object.freeze([
+  'S-1-5-18', // Local System
+  'S-1-5-19', // Local Service
+  'S-1-5-20', // Network Service
+  'S-1-5-32-544', // Built-in Administrators
 ]);
 
 const ISSUER_REQUEST_FIELDS = Object.freeze([
@@ -1589,6 +1679,1294 @@ function evaluateDockerObservation({
   };
 }
 
+function validateCgroupV2Enforcement({
+  cgroupObservation,
+  expectedPolicy = {},
+  expectedContainerId = null,
+} = {}) {
+  if (!cgroupObservation || typeof cgroupObservation !== 'object' || Array.isArray(cgroupObservation)) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.NOT_AVAILABLE,
+      reasonCode: 'CGROUP_OBSERVATION_MISSING',
+      reason: 'Cgroup observation is missing or malformed.',
+    };
+  }
+
+  // Check cgroup v2 hierarchy
+  if (cgroupObservation.cgroupVersion !== 2 && cgroupObservation.isCgroupV2 !== true) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.NOT_SUPPORTED,
+      reasonCode: 'CGROUP_V2_HIERARCHY_MISSING',
+      reason: 'Unified cgroup v2 hierarchy is missing or unverified.',
+    };
+  }
+
+  // Check container cgroup identity binding
+  const cgroupPath = String(cgroupObservation.cgroupPath || '');
+  if (!cgroupPath.trim()) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.IDENTITY_MISMATCH,
+      reasonCode: 'CGROUP_PATH_MISSING',
+      reason: 'Cgroup path is missing from observation.',
+    };
+  }
+
+  if (expectedContainerId && !cgroupPath.includes(expectedContainerId)) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.IDENTITY_MISMATCH,
+      reasonCode: 'CGROUP_PATH_MISMATCH',
+      reason: `Cgroup path "${cgroupPath}" does not match container identity "${expectedContainerId}".`,
+    };
+  }
+
+  // Check controllers availability in cgroup.controllers and delegation in cgroup.subtree_control
+  const controllers = Array.isArray(cgroupObservation.controllers) ? cgroupObservation.controllers : [];
+  if (!controllers.includes('cpu')) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'CPU_CONTROLLER_MISSING',
+      reason: 'Cgroup v2 cpu controller is missing or not enabled.',
+    };
+  }
+  if (!controllers.includes('memory')) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'MEMORY_CONTROLLER_MISSING',
+      reason: 'Cgroup v2 memory controller is missing or not enabled.',
+    };
+  }
+  if (!controllers.includes('pids')) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'PIDS_CONTROLLER_MISSING',
+      reason: 'Cgroup v2 pids controller is missing or not enabled.',
+    };
+  }
+
+  // Evaluate CPU enforcement: cpu.max format is "<quota> <period>"
+  const cpuMax = cgroupObservation.cpuMax !== undefined ? cgroupObservation.cpuMax : cgroupObservation['cpu.max'];
+  if (typeof cpuMax !== 'string' || !cpuMax.trim()) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'CPU_MAX_MALFORMED',
+      reason: 'cgroup cpu.max value is missing or not a string.',
+    };
+  }
+
+  const cpuTokens = cpuMax.trim().split(/\s+/);
+  if (cpuTokens.length !== 2) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'CPU_MAX_MALFORMED',
+      reason: `Malformed cpu.max format: "${cpuMax}"; expected "<quota> <period>".`,
+    };
+  }
+
+  const [quotaStr, periodStr] = cpuTokens;
+  const periodVal = Number.parseInt(periodStr, 10);
+  if (!Number.isInteger(periodVal) || periodVal <= 0) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'CPU_MAX_MALFORMED',
+      reason: `Malformed cpu.max period value: "${periodStr}".`,
+    };
+  }
+
+  if (quotaStr.toLowerCase() === 'max') {
+    if (expectedPolicy.requireResourceLimits !== false) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+        reasonCode: 'UNEXPECTED_UNLIMITED_CPU',
+        reason: 'Resource limits policy requires bounded CPU quota, but cgroup cpu.max is "max" (unlimited).',
+      };
+    }
+  } else {
+    const quotaVal = Number.parseInt(quotaStr, 10);
+    if (!Number.isInteger(quotaVal) || quotaVal <= 0) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+        reasonCode: 'CPU_MAX_MALFORMED',
+        reason: `Malformed cpu.max quota value: "${quotaStr}".`,
+      };
+    }
+  }
+
+  // Evaluate Memory enforcement: memory.max
+  const memoryMax = cgroupObservation.memoryMax !== undefined ? cgroupObservation.memoryMax : cgroupObservation['memory.max'];
+  if (memoryMax === undefined || memoryMax === null || (typeof memoryMax !== 'string' && typeof memoryMax !== 'number')) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'MEMORY_MAX_MALFORMED',
+      reason: 'cgroup memory.max value is missing or not string/number.',
+    };
+  }
+
+  const memStr = String(memoryMax).trim().toLowerCase();
+  if (memStr === 'max') {
+    if (expectedPolicy.requireResourceLimits !== false) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+        reasonCode: 'UNEXPECTED_UNLIMITED_MEMORY',
+        reason: 'Resource limits policy requires bounded memory limit, but cgroup memory.max is "max" (unlimited).',
+      };
+    }
+  } else {
+    const memVal = Number(memStr);
+    if (!Number.isFinite(memVal) || memVal <= 0 || !Number.isInteger(memVal)) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+        reasonCode: 'MEMORY_MAX_MALFORMED',
+        reason: `Malformed memory.max value: "${memStr}".`,
+      };
+    }
+  }
+
+  // Evaluate PID enforcement: pids.max
+  const pidsMax = cgroupObservation.pidsMax !== undefined ? cgroupObservation.pidsMax : cgroupObservation['pids.max'];
+  if (pidsMax === undefined || pidsMax === null || (typeof pidsMax !== 'string' && typeof pidsMax !== 'number')) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'PIDS_MAX_MALFORMED',
+      reason: 'cgroup pids.max value is missing or not string/number.',
+    };
+  }
+
+  const pidsStr = String(pidsMax).trim().toLowerCase();
+  if (pidsStr === 'max') {
+    if (expectedPolicy.requireResourceLimits !== false) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+        reasonCode: 'UNEXPECTED_UNLIMITED_PIDS',
+        reason: 'Resource limits policy requires bounded PID limit, but cgroup pids.max is "max" (unlimited).',
+      };
+    }
+  } else {
+    const pidsVal = Number(pidsStr);
+    if (!Number.isFinite(pidsVal) || pidsVal <= 0 || !Number.isInteger(pidsVal)) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+        reasonCode: 'PIDS_MAX_MALFORMED',
+        reason: `Malformed pids.max value: "${pidsStr}".`,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    state: KERNEL_OBSERVATION_STATES.HOST_OBSERVED,
+    reasonCode: 'CGROUP_V2_ENFORCEMENT_OBSERVED',
+    reason: 'Host-observed cgroup v2 controllers and bounded limits validated.',
+    effectiveLimits: {
+      cpuMax: String(cpuMax).trim(),
+      memoryMax: memStr,
+      pidsMax: pidsStr,
+      cgroupPath,
+    },
+  };
+}
+
+function validateReadOnlyMountEnforcement({
+  mountObservation,
+  expectedContainerId = null,
+  expectedMountNamespaceId = null,
+} = {}) {
+  if (!mountObservation || typeof mountObservation !== 'object' || Array.isArray(mountObservation)) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.NOT_AVAILABLE,
+      reasonCode: 'MOUNT_OBSERVATION_MISSING',
+      reason: 'Mount observation is missing or malformed.',
+    };
+  }
+
+  // Validate mount namespace ID
+  const mountNsId = String(mountObservation.mountNamespaceId || '').trim();
+  if (!mountNsId) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.IDENTITY_MISMATCH,
+      reasonCode: 'MOUNT_NAMESPACE_MISSING',
+      reason: 'Container mount namespace ID is missing.',
+    };
+  }
+
+  if (expectedMountNamespaceId && mountNsId !== expectedMountNamespaceId) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.IDENTITY_MISMATCH,
+      reasonCode: 'MOUNT_NAMESPACE_MISMATCH',
+      reason: `Mount namespace mismatch: expected "${expectedMountNamespaceId}", got "${mountNsId}".`,
+    };
+  }
+
+  // Validate root mount read-only status in kernel mountinfo
+  const mounts = Array.isArray(mountObservation.mounts) ? mountObservation.mounts : [];
+  const rootMount = mounts.find((m) => m.target === '/' || m.destination === '/');
+  if (!rootMount) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'ROOT_MOUNT_MISSING',
+      reason: 'Root filesystem mount "/" not found in mount observations.',
+    };
+  }
+
+  const rootFlags = Array.isArray(rootMount.flags)
+    ? rootMount.flags.map((f) => String(f).toLowerCase())
+    : (typeof rootMount.flags === 'string' ? rootMount.flags.toLowerCase().split(/[\s,]+/) : []);
+  const rootIsReadOnly = rootFlags.includes('ro') && !rootFlags.includes('rw');
+  if (!rootIsReadOnly && rootMount.readOnly !== true) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'WRITABLE_ROOT_FILESYSTEM',
+      reason: 'Container root filesystem is not mounted read-only in kernel mountinfo.',
+    };
+  }
+
+  // Check bind mounts and volume mounts
+  const sensitivePatterns = [/\.git/i, /\.ssh/i, /\.aws/i, /docker\.sock/i, /^\/etc/i];
+  for (const m of mounts) {
+    const src = String(m.source || m.Source || '');
+    const dest = String(m.destination || m.target || '');
+    const flags = Array.isArray(m.flags)
+      ? m.flags.map((f) => String(f).toLowerCase())
+      : (typeof m.flags === 'string' ? m.flags.toLowerCase().split(/[\s,]+/) : []);
+    const isRw = flags.includes('rw') || m.readOnly === false || m.rw === true;
+
+    // Check sensitive host path exposure
+    if (sensitivePatterns.some((p) => p.test(src))) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+        reasonCode: 'SENSITIVE_HOST_PATH_EXPOSED',
+        reason: `Sensitive host path "${src}" exposed via mount at "${dest}".`,
+      };
+    }
+
+    // Writable bind mount check
+    if (m.isBindMount === true || m.type === 'bind' || m.propagation) {
+      if (isRw && dest !== '/tmp') {
+        return {
+          valid: false,
+          state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+          reasonCode: 'WRITABLE_BIND_MOUNT_DETECTED',
+          reason: `Bind mount "${dest}" is writable in kernel mountinfo.`,
+        };
+      }
+    }
+
+    // Writable volume check
+    if (m.isVolume === true || m.type === 'volume') {
+      if (isRw && dest !== '/tmp') {
+        return {
+          valid: false,
+          state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+          reasonCode: 'WRITABLE_VOLUME_DETECTED',
+          reason: `Volume mount "${dest}" is writable in kernel mountinfo.`,
+        };
+      }
+    }
+  }
+
+  return {
+    valid: true,
+    state: KERNEL_OBSERVATION_STATES.HOST_OBSERVED,
+    reasonCode: 'READ_ONLY_MOUNTS_OBSERVED',
+    reason: 'Host-observed kernel mountinfo confirms read-only root and no unauthorized writable mounts.',
+    mountNamespaceId: mountNsId,
+  };
+}
+
+function evaluateHostKernelEnforcement({
+  kernelObservation,
+  cgroupObservation,
+  mountObservation,
+  daemonInspect,
+  expectedBindings = {},
+  expectedPolicy = {},
+  maxObservationAgeMs = 60000,
+  activeNonces = new Set(),
+} = {}) {
+  if (!kernelObservation || typeof kernelObservation !== 'object' || Array.isArray(kernelObservation)) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.NOT_AVAILABLE,
+      reasonCode: 'KERNEL_OBSERVATION_MISSING',
+      reason: 'Host kernel observation record is missing or malformed.',
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  // Reject caller-supplied claims of kernel enforcement or observer authentication
+  if (kernelObservation.kernelEnforced === true || kernelObservation.independentlyVerified === true
+      || kernelObservation.observerAuthenticated === true
+      || kernelObservation.verificationState === KERNEL_OBSERVATION_STATES.KERNEL_ENFORCED
+      || kernelObservation.state === KERNEL_OBSERVATION_STATES.KERNEL_ENFORCED) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'CALLER_FORGED_KERNEL_ENFORCEMENT',
+      reason: 'Caller-supplied "kernelEnforced" or "observerAuthenticated" state rejected as unverified.',
+      kernelEnforcement: 'NOT_VERIFIED',
+      readOnlyFilesystemEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  // Validate required provenance binding fields
+  for (const field of KERNEL_OBSERVATION_BINDING_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(kernelObservation, field)) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+        reasonCode: 'MISSING_BINDING_FIELD',
+        reason: `Host kernel observation missing required binding field: ${field}.`,
+        fieldName: field,
+        kernelEnforcement: 'NOT_VERIFIED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        gateStatus: 'BLOCKED',
+      };
+    }
+  }
+
+  // Validate observation timestamp freshness
+  let obsTime;
+  try {
+    obsTime = parseTimestamp(kernelObservation.observationTimestamp, 'observationTimestamp');
+  } catch (err) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'OBSERVATION_TIMESTAMP_INVALID',
+      reason: err.message,
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  const now = Date.now();
+  if (obsTime > now + 30000) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'OBSERVATION_FUTURE_DATED',
+      reason: 'Kernel observation timestamp is in the future.',
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+  if (now - obsTime > maxObservationAgeMs) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.STALE_OBSERVATION,
+      reasonCode: 'STALE_OBSERVATION',
+      reason: 'Kernel observation timestamp exceeds maximum allowed age.',
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  // Anti-replay check on nonce
+  if (activeNonces.has(kernelObservation.nonce)) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.VERIFICATION_FAILED,
+      reasonCode: 'REPLAY_DETECTED',
+      reason: `Nonce "${kernelObservation.nonce}" has already been used.`,
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+  activeNonces.add(kernelObservation.nonce);
+
+  // Validate project and container identity bindings
+  if (expectedBindings.projectId && kernelObservation.projectId !== expectedBindings.projectId) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.IDENTITY_MISMATCH,
+      reasonCode: 'CROSS_PROJECT_OBSERVATION_SUBSTITUTION',
+      reason: `Cross-project observation substitution rejected: expected projectId "${expectedBindings.projectId}", got "${kernelObservation.projectId}".`,
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  if (expectedBindings.containerId && kernelObservation.containerId !== expectedBindings.containerId) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.IDENTITY_MISMATCH,
+      reasonCode: 'CONTAINER_ID_MISMATCH',
+      reason: `Container identity mismatch: expected containerId "${expectedBindings.containerId}", got "${kernelObservation.containerId}".`,
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  if (expectedBindings.projectRoot && kernelObservation.projectRoot) {
+    const expRoot = path.resolve(expectedBindings.projectRoot).toLowerCase();
+    const obsRoot = path.resolve(kernelObservation.projectRoot).toLowerCase();
+    if (expRoot !== obsRoot) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.IDENTITY_MISMATCH,
+        reasonCode: 'PROJECT_ROOT_MISMATCH',
+        reason: `Project root mismatch: expected "${expectedBindings.projectRoot}", got "${kernelObservation.projectRoot}".`,
+        kernelEnforcement: 'NOT_VERIFIED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        gateStatus: 'BLOCKED',
+      };
+    }
+  }
+
+  if (expectedBindings.sessionId && kernelObservation.sessionId && kernelObservation.sessionId !== expectedBindings.sessionId) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.IDENTITY_MISMATCH,
+      reasonCode: 'CROSS_SESSION_OBSERVATION_SUBSTITUTION',
+      reason: `Cross-session observation substitution rejected: expected sessionId "${expectedBindings.sessionId}", got "${kernelObservation.sessionId}".`,
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  // Evaluate Cgroup v2 observation
+  const cgroupResult = validateCgroupV2Enforcement({
+    cgroupObservation: cgroupObservation || kernelObservation.cgroupObservation,
+    expectedPolicy,
+    expectedContainerId: expectedBindings.containerId || kernelObservation.containerId,
+  });
+  if (!cgroupResult.valid) {
+    return {
+      valid: false,
+      state: cgroupResult.state,
+      reasonCode: cgroupResult.reasonCode,
+      reason: cgroupResult.reason,
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  // Evaluate Mount observation
+  const mountResult = validateReadOnlyMountEnforcement({
+    mountObservation: mountObservation || kernelObservation.mountObservation,
+    expectedContainerId: expectedBindings.containerId || kernelObservation.containerId,
+    expectedMountNamespaceId: expectedBindings.mountNamespaceId || kernelObservation.mountNamespaceId,
+  });
+  if (!mountResult.valid) {
+    return {
+      valid: false,
+      state: mountResult.state,
+      reasonCode: mountResult.reasonCode,
+      reason: mountResult.reason,
+      kernelEnforcement: 'NOT_VERIFIED',
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  // Check daemon vs host conflicts
+  if (daemonInspect && typeof daemonInspect === 'object') {
+    const daemonMemory = daemonInspect.HostConfig?.Memory;
+    const observedMem = Number(cgroupResult.effectiveLimits?.memoryMax);
+    if (daemonMemory && Number.isFinite(observedMem) && daemonMemory !== observedMem) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.OBSERVATION_CONFLICT,
+        reasonCode: 'DAEMON_HOST_OBSERVATION_CONFLICT',
+        reason: `Daemon reported memory limit (${daemonMemory}) conflicts with cgroup memory.max (${observedMem}).`,
+        kernelEnforcement: 'NOT_VERIFIED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        gateStatus: 'BLOCKED',
+      };
+    }
+
+    const daemonRo = daemonInspect.HostConfig?.ReadonlyRootfs;
+    if (daemonRo === false) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.OBSERVATION_CONFLICT,
+        reasonCode: 'DAEMON_HOST_OBSERVATION_CONFLICT',
+        reason: 'Daemon reports ReadonlyRootfs: false, conflicting with host read-only expectation.',
+        kernelEnforcement: 'NOT_VERIFIED',
+        gate: 'PROCESS_ISOLATION_GATE',
+        gateStatus: 'BLOCKED',
+      };
+    }
+  }
+
+  // Independent observer authentication:
+  if (kernelObservation.observerDescriptor) {
+    const authResult = authenticateObserver({
+      observerDescriptor: kernelObservation.observerDescriptor,
+      peerCredentials: kernelObservation.peerCredentials,
+      ipcChannel: kernelObservation.ipcChannel,
+      processContext: kernelObservation.processContext,
+      isSyntheticTest: kernelObservation.isSyntheticTest === true,
+    });
+    if (!authResult.isAuthenticated) {
+      return {
+        valid: false,
+        state: KERNEL_OBSERVATION_STATES.KERNEL_ENFORCEMENT_NOT_VERIFIED,
+        reasonCode: authResult.reasonCode || 'INDEPENDENT_OBSERVER_NOT_AUTHENTICATED',
+        reason: authResult.reason,
+        kernelEnforcement: 'NOT_VERIFIED',
+        readOnlyFilesystemEnforcement: 'NOT_VERIFIED',
+        cgroupState: cgroupResult.state,
+        mountState: mountResult.state,
+        gate: 'PROCESS_ISOLATION_GATE',
+        gateStatus: 'BLOCKED',
+      };
+    }
+  } else if (kernelObservation.observerAuthentication !== 'AUTHENTICATED' || !kernelObservation.hasIndependentSecurityPrincipal) {
+    return {
+      valid: false,
+      state: KERNEL_OBSERVATION_STATES.KERNEL_ENFORCEMENT_NOT_VERIFIED,
+      reasonCode: 'INDEPENDENT_OBSERVER_NOT_AUTHENTICATED',
+      reason: 'Host kernel observation is not authenticated by an independent OS security principal. KERNEL_RESOURCE_ENFORCEMENT and READ_ONLY_FILESYSTEM_ENFORCEMENT remain NOT_VERIFIED.',
+      kernelEnforcement: 'NOT_VERIFIED',
+      readOnlyFilesystemEnforcement: 'NOT_VERIFIED',
+      cgroupState: cgroupResult.state,
+      mountState: mountResult.state,
+      gate: 'PROCESS_ISOLATION_GATE',
+      gateStatus: 'BLOCKED',
+    };
+  }
+
+  return {
+    valid: true,
+    state: KERNEL_OBSERVATION_STATES.HOST_OBSERVED,
+    reasonCode: 'HOST_KERNEL_OBSERVATION_RECORDED',
+    reason: 'Host kernel telemetry recorded and cross-validated; independent OS attestation pending.',
+    kernelEnforcement: 'NOT_VERIFIED',
+    readOnlyFilesystemEnforcement: 'NOT_VERIFIED',
+    cgroupState: cgroupResult.state,
+    mountState: mountResult.state,
+    gate: 'PROCESS_ISOLATION_GATE',
+    gateStatus: 'BLOCKED',
+  };
+}
+
+function authenticateObserver({
+  observerDescriptor,
+  peerCredentials = null,
+  ipcChannel = null,
+  processContext = {},
+  isSyntheticTest = false,
+} = {}) {
+  if (!observerDescriptor || typeof observerDescriptor !== 'object' || Array.isArray(observerDescriptor)) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNAUTHENTICATED,
+      reasonCode: 'OBSERVER_DESCRIPTOR_MISSING',
+      reason: 'Observer descriptor is missing or malformed.',
+    };
+  }
+
+  // 1. Rejection of caller-forged authentication flags
+  if (observerDescriptor.observerAuthenticated === true ||
+      observerDescriptor.authenticated === true ||
+      observerDescriptor.independentlyVerified === true ||
+      observerDescriptor.kernelEnforced === true ||
+      observerDescriptor.trustedIssuer === true ||
+      observerDescriptor.hostObserved === true ||
+      observerDescriptor.windowsPipeVerified === true ||
+      observerDescriptor.osProcessIdentityVerified === true ||
+      observerDescriptor.ipcClientAuthenticated === true) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.CALLER_FORGED,
+      reasonCode: 'CALLER_FORGED_OBSERVER_IDENTITY',
+      reason: 'Caller-supplied observer authentication flag rejected as unverified.',
+    };
+  }
+
+  // 2. Identity source differentiation
+  const idSource = observerDescriptor.identitySource;
+  if (!idSource || idSource === OBSERVER_IDENTITY_SOURCES.CALLER_PROVIDED) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNAUTHENTICATED,
+      reasonCode: 'CALLER_PROVIDED_IDENTITY_UNTRUSTED',
+      reason: 'Caller-provided identity cannot be accepted as an authoritative observer source.',
+    };
+  }
+
+  if (idSource === OBSERVER_IDENTITY_SOURCES.ELECTRON_RENDERER) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNTRUSTED_PROCESS_DOMAIN,
+      reasonCode: 'RENDERER_PROCESS_UNTRUSTED',
+      reason: 'Electron renderer process cannot act as an authenticated host observer.',
+    };
+  }
+
+  if (idSource === OBSERVER_IDENTITY_SOURCES.ELECTRON_MAIN) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNTRUSTED_PROCESS_DOMAIN,
+      reasonCode: 'MAIN_PROCESS_UNTRUSTED',
+      reason: 'Electron main process cannot self-authenticate as an independent OS observer.',
+    };
+  }
+
+  if (idSource === OBSERVER_IDENTITY_SOURCES.CHILD_PROCESS) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNTRUSTED_PROCESS_DOMAIN,
+      reasonCode: 'CHILD_PROCESS_UNTRUSTED',
+      reason: 'Child process spawned by untrusted application cannot act as an independent OS observer.',
+    };
+  }
+
+  // 3. Process identity and parent-child relationship check
+  const currentPid = processContext.currentPid || process.pid;
+  if (observerDescriptor.pid !== undefined && observerDescriptor.pid === currentPid) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNTRUSTED_PROCESS_DOMAIN,
+      reasonCode: 'IN_PROCESS_OBSERVER_REJECTED',
+      reason: 'Observer cannot reside in the same process as the application runner.',
+    };
+  }
+
+  if (observerDescriptor.parentPid !== undefined && observerDescriptor.parentPid === currentPid) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNTRUSTED_PROCESS_DOMAIN,
+      reasonCode: 'CHILD_PROCESS_OBSERVER_REJECTED',
+      reason: 'Observer cannot be a child or descendant of the application runner.',
+    };
+  }
+
+  // 4. Observer executable identity check
+  const execPath = String(observerDescriptor.executablePath || '').trim();
+  if (!execPath) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNAUTHENTICATED,
+      reasonCode: 'OBSERVER_EXECUTABLE_PATH_MISSING',
+      reason: 'Observer executable path is missing or empty.',
+    };
+  }
+
+  const normExecPath = path.normalize(execPath);
+  const untrustedPathPatterns = [
+    /node_modules/i,
+    /AppData[\\/]Local[\\/]Temp/i,
+    /\/tmp\//i,
+    /\/var\/tmp\//i,
+    /Desktop[\\/]Ai_Help_Agent/i,
+  ];
+  if (untrustedPathPatterns.some((pattern) => pattern.test(normExecPath))) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNAUTHENTICATED,
+      reasonCode: 'UNTRUSTED_OBSERVER_EXECUTABLE_PATH',
+      reason: `Observer binary located in user-writable or untrusted path: "${execPath}".`,
+    };
+  }
+
+  // 5. IPC peer authentication
+  if (!peerCredentials || peerCredentials.authenticated !== true) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.PEER_UNAUTHENTICATED,
+      reasonCode: 'IPC_PEER_UNAUTHENTICATED',
+      reason: 'IPC connection lacks OS-level peer authentication (SO_PEERCRED / Windows named pipe impersonation).',
+    };
+  }
+
+  if (peerCredentials.peerPid !== undefined && observerDescriptor.pid !== undefined && peerCredentials.peerPid !== observerDescriptor.pid) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.IDENTITY_MISMATCH,
+      reasonCode: 'IPC_PEER_PID_MISMATCH',
+      reason: `IPC peer PID (${peerCredentials.peerPid}) does not match declared observer PID (${observerDescriptor.pid}).`,
+    };
+  }
+
+  // 6. IPC channel access control
+  if (ipcChannel && ipcChannel.restrictedAcl === false) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.UNAUTHENTICATED,
+      reasonCode: 'INSECURE_IPC_CHANNEL',
+      reason: 'IPC channel lacks restricted OS security descriptors / ACLs.',
+    };
+  }
+
+  // 7. Observer lifecycle and liveness
+  if (observerDescriptor.isAlive === false || observerDescriptor.terminated === true) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.LIFECYCLE_TERMINATED,
+      reasonCode: 'OBSERVER_PROCESS_TERMINATED',
+      reason: 'Observer process is terminated or no longer alive.',
+    };
+  }
+
+  if (observerDescriptor.lastHeartbeat) {
+    const hbTime = Date.parse(observerDescriptor.lastHeartbeat);
+    const maxHeartbeatAge = observerDescriptor.maxHeartbeatAgeMs || 15000;
+    if (Number.isNaN(hbTime) || Date.now() - hbTime > maxHeartbeatAge) {
+      return {
+        isAuthenticated: false,
+        state: OBSERVER_AUTHENTICATION_STATES.STALE_HEARTBEAT,
+        reasonCode: 'OBSERVER_HEARTBEAT_STALE',
+        reason: 'Observer heartbeat is stale or timed out.',
+      };
+    }
+  }
+
+  // 7b. Windows Named Pipe and OS process peer validation
+  if (observerDescriptor.windowsNamedPipe || ipcChannel?.channelType === 'named_pipe' || peerCredentials?.namedPipeConfig) {
+    const pipeConfig = observerDescriptor.windowsNamedPipe || peerCredentials?.namedPipeConfig || {};
+    const pipeCheck = validateWindowsNamedPipeSecurity({
+      pipePath: pipeConfig.pipePath || ipcChannel?.pipePath || observerDescriptor.pipePath,
+      securityDescriptor: pipeConfig.securityDescriptor || ipcChannel?.securityDescriptor,
+      clientContext: pipeConfig.clientContext || processContext,
+      isSyntheticTest,
+    });
+    if (!pipeCheck.valid) {
+      return {
+        isAuthenticated: false,
+        state: pipeCheck.state || OBSERVER_AUTHENTICATION_STATES.REJECTED,
+        reasonCode: pipeCheck.reasonCode || 'WINDOWS_PIPE_SECURITY_REJECTED',
+        reason: pipeCheck.reason,
+      };
+    }
+  }
+
+  if (observerDescriptor.windowsProcessPeer || peerCredentials?.peerProcessDescriptor) {
+    const peerDesc = observerDescriptor.windowsProcessPeer || peerCredentials?.peerProcessDescriptor;
+    const peerCheck = validateWindowsProcessPeerIdentity({
+      peerProcessDescriptor: peerDesc,
+      expectedPrincipalSid: observerDescriptor.expectedPrincipalSid || 'S-1-5-18',
+      expectedContext: processContext,
+      isSyntheticTest,
+    });
+    if (!peerCheck.valid) {
+      return {
+        isAuthenticated: false,
+        state: peerCheck.state || OBSERVER_AUTHENTICATION_STATES.REJECTED,
+        reasonCode: peerCheck.reasonCode || 'WINDOWS_PROCESS_IDENTITY_REJECTED',
+        reason: peerCheck.reason,
+      };
+    }
+  }
+
+  // 8. Production check: independent OS daemon is NOT implemented on this host
+  if (!isSyntheticTest) {
+    return {
+      isAuthenticated: false,
+      state: OBSERVER_AUTHENTICATION_STATES.NOT_IMPLEMENTED,
+      reasonCode: 'INDEPENDENT_OBSERVER_NOT_IMPLEMENTED',
+      reason: 'Independent host observer daemon running under a distinct OS security principal is NOT implemented on this platform.',
+    };
+  }
+
+  return {
+    isAuthenticated: true,
+    state: OBSERVER_AUTHENTICATION_STATES.AUTHENTICATED,
+    reasonCode: 'OBSERVER_AUTHENTICATED',
+    reason: 'Observer identity authenticated via verified OS peer credentials and security descriptor.',
+    observerDescriptor,
+  };
+}
+
+function validateWindowsNamedPipeSecurity({
+  pipePath,
+  securityDescriptor,
+  clientContext = {},
+  isSyntheticTest = false,
+} = {}) {
+  if (typeof pipePath !== 'string' || !pipePath.trim()) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'PIPE_PATH_MISSING',
+      reason: 'Windows named pipe path is missing or not a string.',
+    };
+  }
+
+  const normPath = pipePath.trim().toLowerCase().replace(/\//g, '\\');
+  if (!normPath.startsWith('\\\\.\\pipe\\')) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'INVALID_PIPE_PATH',
+      reason: `Pipe path "${pipePath}" is invalid; Windows named pipes must begin with "\\\\.\\pipe\\".`,
+    };
+  }
+
+  // 1. Pipe Path Known
+  // 2. Validate Security Descriptor & DACL
+  if (!securityDescriptor || typeof securityDescriptor !== 'object') {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.PIPE_PATH_KNOWN,
+      reasonCode: 'SECURITY_DESCRIPTOR_MISSING',
+      reason: 'Named pipe lacks an explicit Windows security descriptor.',
+    };
+  }
+
+  if (securityDescriptor.nullDacl === true || securityDescriptor.dacl === null) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'NULL_DACL_REJECTED',
+      reason: 'Named pipe with NULL DACL allows unrestricted access to any local process and is strictly rejected.',
+    };
+  }
+
+  const sddl = String(securityDescriptor.sddl || '').toUpperCase();
+  if (sddl.includes('WD') || sddl.includes('EVERYONE')) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'EVERYONE_ACCESS_REJECTED',
+      reason: 'Named pipe DACL grants access to Everyone (WD); restricted security principal required.',
+    };
+  }
+
+  if (securityDescriptor.restrictedDacl !== true && !sddl.includes('SY') && !sddl.includes('BA')) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.PIPE_ACL_CONFIGURED,
+      reasonCode: 'INSECURE_PIPE_DACL',
+      reason: 'Named pipe DACL is not restricted to trusted OS administrators or system service accounts.',
+    };
+  }
+
+  // 3. Cross-session access prevention (Terminal Services Session ID)
+  if (clientContext.terminalSessionId !== undefined && securityDescriptor.terminalSessionId !== undefined) {
+    if (clientContext.terminalSessionId !== securityDescriptor.terminalSessionId) {
+      return {
+        valid: false,
+        state: WINDOWS_IPC_SECURITY_STATES.CROSS_SESSION_REJECTED,
+        reasonCode: 'CROSS_SESSION_ACCESS_REJECTED',
+        reason: `Cross-session IPC rejected: client terminal session (${clientContext.terminalSessionId}) does not match pipe server session (${securityDescriptor.terminalSessionId}).`,
+      };
+    }
+  }
+
+  // 4. OS Authentication Feasibility Check in Pure Node.js
+  if (!isSyntheticTest) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.NOT_IMPLEMENTED,
+      reasonCode: 'WINDOWS_NATIVE_IPC_AUTH_NOT_IMPLEMENTED',
+      reason: 'Pure Node.js runtime cannot safely invoke ImpersonateNamedPipeClient or GetNamedPipeClientProcessId without native Win32 FFI bindings. Windows named pipe OS authentication is NOT_IMPLEMENTED.',
+    };
+  }
+
+  return {
+    valid: true,
+    state: WINDOWS_IPC_SECURITY_STATES.PIPE_ACL_CONFIGURED,
+    reasonCode: 'WINDOWS_PIPE_SECURITY_VALIDATED',
+    reason: 'Windows named pipe path and restricted DACL security descriptor structurally validated.',
+    pipePath: normPath,
+  };
+}
+
+function validateWindowsProcessPeerIdentity({
+  peerProcessDescriptor,
+  expectedPrincipalSid = 'S-1-5-18',
+  expectedContext = {},
+  isSyntheticTest = false,
+} = {}) {
+  if (!peerProcessDescriptor || typeof peerProcessDescriptor !== 'object') {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'PEER_DESCRIPTOR_MISSING',
+      reason: 'Windows peer process descriptor is missing or malformed.',
+    };
+  }
+
+  // 1. Process ID validation
+  const pid = peerProcessDescriptor.pid;
+  if (!Number.isInteger(pid) || pid <= 4) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'INVALID_CLIENT_PID',
+      reason: `Client PID ${pid} is invalid (must be a valid non-system PID > 4).`,
+    };
+  }
+
+  // 2. Process handle validation
+  if (peerProcessDescriptor.handleValid === false || peerProcessDescriptor.processExited === true) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'INVALID_PROCESS_HANDLE',
+      reason: 'Client process handle is invalid, closed, or process has terminated.',
+    };
+  }
+
+  // 3. Process creation identity & PID reuse protection
+  const creationTime = peerProcessDescriptor.processCreationTimeUtc || peerProcessDescriptor.creationTimestamp;
+  if (!creationTime) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'CREATION_TIME_MISSING',
+      reason: 'Process creation timestamp missing; PID reuse cannot be protected against.',
+    };
+  }
+
+  if (expectedContext.processCreationTimeUtc && creationTime !== expectedContext.processCreationTimeUtc) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.PID_REUSE_DETECTED,
+      reasonCode: 'PID_REUSE_DETECTED',
+      reason: `PID reuse detected: process creation time (${creationTime}) does not match expected creation time (${expectedContext.processCreationTimeUtc}).`,
+    };
+  }
+
+  // 4. Executable identity
+  const execPath = String(peerProcessDescriptor.executablePath || '').trim();
+  if (!execPath) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'EXECUTABLE_PATH_MISSING',
+      reason: 'Client process executable path is missing.',
+    };
+  }
+  const normExec = path.normalize(execPath);
+  const untrustedPatterns = [
+    /node_modules/i,
+    /AppData[\\/]Local[\\/]Temp/i,
+    /\/tmp\//i,
+    /\/var\/tmp\//i,
+    /Desktop[\\/]Ai_Help_Agent/i,
+  ];
+  if (untrustedPatterns.some((p) => p.test(normExec))) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'UNTRUSTED_OBSERVER_EXECUTABLE_PATH',
+      reason: `Observer binary in untrusted or user-writable path: "${execPath}".`,
+    };
+  }
+
+  // 5. OS Security Principal (TokenUser SID)
+  const tokenSid = String(peerProcessDescriptor.tokenUserSid || '').trim().toUpperCase();
+  if (!tokenSid) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'TOKEN_SID_MISSING',
+      reason: 'Windows process security token user SID is missing.',
+    };
+  }
+
+  if (expectedPrincipalSid && tokenSid !== expectedPrincipalSid.toUpperCase() && !WINDOWS_TRUSTED_SECURITY_PRINCIPALS.includes(tokenSid)) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.SECURITY_PRINCIPAL_MISMATCH,
+      reasonCode: 'SECURITY_PRINCIPAL_MISMATCH',
+      reason: `OS security principal mismatch: client runs under "${tokenSid}", expected "${expectedPrincipalSid}".`,
+    };
+  }
+
+  // 6. Process domain checks
+  const domain = peerProcessDescriptor.identitySource;
+  if (domain === OBSERVER_IDENTITY_SOURCES.ELECTRON_RENDERER || domain === OBSERVER_IDENTITY_SOURCES.ELECTRON_MAIN || domain === OBSERVER_IDENTITY_SOURCES.CHILD_PROCESS) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.REJECTED,
+      reasonCode: 'UNTRUSTED_PROCESS_DOMAIN',
+      reason: `Client process domain "${domain}" cannot act as an independent OS observer.`,
+    };
+  }
+
+  // 7. Production feasibility check
+  if (!isSyntheticTest) {
+    return {
+      valid: false,
+      state: WINDOWS_IPC_SECURITY_STATES.NOT_VERIFIED,
+      reasonCode: 'OS_PROCESS_IDENTITY_NOT_VERIFIED',
+      reason: 'Windows OS-authenticated process token and creation identity are not independently attested in production.',
+    };
+  }
+
+  return {
+    valid: true,
+    state: WINDOWS_IPC_SECURITY_STATES.CLIENT_OS_IDENTITY_VERIFIED,
+    reasonCode: 'PROCESS_PEER_IDENTITY_VERIFIED',
+    reason: 'Windows client OS process creation time, handle, and security principal verified.',
+    peerProcessDescriptor,
+  };
+}
+
+function validateObservationContext({
+  observation,
+  expectedBindings = {},
+} = {}) {
+  if (!observation || typeof observation !== 'object' || Array.isArray(observation)) {
+    return {
+      valid: false,
+      reasonCode: 'OBSERVATION_MALFORMED',
+      reason: 'Observation record is missing or not an object.',
+    };
+  }
+
+  // Check all 12 mandatory context binding fields
+  for (const field of OBSERVER_CONTEXT_BINDING_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(observation, field)) {
+      return {
+        valid: false,
+        reasonCode: 'MISSING_CONTEXT_BINDING_FIELD',
+        reason: `Observation missing mandatory context binding field: "${field}".`,
+        fieldName: field,
+      };
+    }
+  }
+
+  // Check expected bindings
+  if (expectedBindings.projectId && observation.projectId !== expectedBindings.projectId) {
+    return {
+      valid: false,
+      reasonCode: 'CROSS_PROJECT_EVIDENCE_REUSE',
+      reason: `Cross-project evidence reuse rejected: expected "${expectedBindings.projectId}", got "${observation.projectId}".`,
+    };
+  }
+
+  if (expectedBindings.projectRoot) {
+    const expRoot = path.resolve(expectedBindings.projectRoot).toLowerCase();
+    const obsRoot = path.resolve(observation.projectRoot).toLowerCase();
+    if (expRoot !== obsRoot) {
+      return {
+        valid: false,
+        reasonCode: 'PROJECT_ROOT_MISMATCH',
+        reason: `Project root mismatch: expected "${expectedBindings.projectRoot}", got "${observation.projectRoot}".`,
+      };
+    }
+  }
+
+  if (expectedBindings.sessionId && observation.sessionId !== expectedBindings.sessionId) {
+    return {
+      valid: false,
+      reasonCode: 'CROSS_SESSION_EVIDENCE_REUSE',
+      reason: `Cross-session evidence reuse rejected: expected "${expectedBindings.sessionId}", got "${observation.sessionId}".`,
+    };
+  }
+
+  if (expectedBindings.executionId && observation.executionId !== expectedBindings.executionId) {
+    return {
+      valid: false,
+      reasonCode: 'EXECUTION_ID_MISMATCH',
+      reason: `Execution ID mismatch: expected "${expectedBindings.executionId}", got "${observation.executionId}".`,
+    };
+  }
+
+  if (expectedBindings.containerId && observation.containerId !== expectedBindings.containerId) {
+    return {
+      valid: false,
+      reasonCode: 'CONTAINER_ID_MISMATCH',
+      reason: `Container ID mismatch: expected "${expectedBindings.containerId}", got "${observation.containerId}".`,
+    };
+  }
+
+  if (expectedBindings.grantId && observation.grantId !== expectedBindings.grantId) {
+    return {
+      valid: false,
+      reasonCode: 'GRANT_ID_MISMATCH',
+      reason: `Grant ID mismatch: expected "${expectedBindings.grantId}", got "${observation.grantId}".`,
+    };
+  }
+
+  if (expectedBindings.policyDigest && normalizeHash(observation.policyDigest) !== normalizeHash(expectedBindings.policyDigest)) {
+    return {
+      valid: false,
+      reasonCode: 'POLICY_DIGEST_MISMATCH',
+      reason: 'Policy digest in observation does not match expected execution policy digest.',
+    };
+  }
+
+  if (expectedBindings.verificationPlanDigest && normalizeHash(observation.verificationPlanDigest) !== normalizeHash(expectedBindings.verificationPlanDigest)) {
+    return {
+      valid: false,
+      reasonCode: 'PLAN_DIGEST_MISMATCH',
+      reason: 'Verification plan digest in observation does not match approved plan proposal digest.',
+    };
+  }
+
+  return {
+    valid: true,
+    reasonCode: 'CONTEXT_BINDINGS_VALIDATED',
+    reason: 'Observation context bindings successfully verified.',
+  };
+}
+
+function verifyObservationFreshness({
+  observationTimestamp,
+  observedAt,
+  maxObservationAgeMs = 60000,
+  activeNonces = new Set(),
+  nonce,
+  observerNonce,
+} = {}) {
+  const tsRaw = observedAt || observationTimestamp;
+  if (!tsRaw) {
+    return {
+      fresh: false,
+      reasonCode: 'TIMESTAMP_MISSING',
+      reason: 'Observation timestamp is missing.',
+    };
+  }
+
+  let tsMs;
+  try {
+    tsMs = parseTimestamp(tsRaw, 'observedAt');
+  } catch (err) {
+    return {
+      fresh: false,
+      reasonCode: 'TIMESTAMP_INVALID',
+      reason: err.message,
+    };
+  }
+
+  const now = Date.now();
+  if (tsMs > now + 30000) {
+    return {
+      fresh: false,
+      reasonCode: 'OBSERVATION_FUTURE_DATED',
+      reason: 'Observation timestamp is in the future.',
+    };
+  }
+
+  if (now - tsMs > maxObservationAgeMs) {
+    return {
+      fresh: false,
+      reasonCode: 'OBSERVATION_STALE',
+      reason: `Observation timestamp exceeds maximum allowed age of ${maxObservationAgeMs}ms.`,
+    };
+  }
+
+  // Anti-replay on nonce (Note: In-memory nonce tracking is non-durable and does not survive restarts or concurrent processes)
+  const effectiveNonce = observerNonce || nonce;
+  if (!effectiveNonce || typeof effectiveNonce !== 'string') {
+    return {
+      fresh: false,
+      reasonCode: 'NONCE_MISSING',
+      reason: 'Observer nonce is missing or not a string.',
+    };
+  }
+
+  if (activeNonces.has(effectiveNonce)) {
+    return {
+      fresh: false,
+      reasonCode: 'REPLAY_DETECTED',
+      reason: `Observer nonce "${effectiveNonce}" has already been used.`,
+    };
+  }
+  activeNonces.add(effectiveNonce);
+
+  return {
+    fresh: true,
+    reasonCode: 'FRESHNESS_VALIDATED',
+    reason: 'Observation timestamp and nonce freshness validated.',
+    observedTimeMs: tsMs,
+  };
+}
+
+function validateObserverRequest({
+  request,
+  observerDescriptor = null,
+  expectedContext = {},
+  activeNonces = new Set(),
+  maxRequestAgeMs = 60000,
+  isSyntheticTest = false,
+} = {}) {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    return makeDecision('BLOCKED', 'REQUEST_MALFORMED', 'Observer request is missing or malformed.');
+  }
+
+  // Reject caller-forged flags
+  if (request.observerAuthenticated === true || request.independentlyVerified === true || request.kernelEnforced === true) {
+    return makeDecision('BLOCKED', 'CALLER_FORGED_OBSERVER_IDENTITY', 'Caller-supplied authentication flag in request rejected.');
+  }
+
+  // Required request fields
+  const requiredFields = ['requestId', 'requestTimestamp', 'nonce', 'grantId', 'projectId', 'sessionId', 'executionId', 'containerId'];
+  for (const field of requiredFields) {
+    if (!Object.prototype.hasOwnProperty.call(request, field)) {
+      return makeDecision('BLOCKED', 'REQUEST_FIELD_MISSING', `Observer request missing required field: ${field}.`, { fieldName: field });
+    }
+  }
+
+  // Freshness check
+  const freshness = verifyObservationFreshness({
+    observationTimestamp: request.requestTimestamp,
+    maxObservationAgeMs: maxRequestAgeMs,
+    activeNonces,
+    nonce: request.nonce,
+  });
+  if (!freshness.fresh) {
+    return makeDecision('BLOCKED', freshness.reasonCode, freshness.reason);
+  }
+
+  // Context bindings
+  for (const field of ['projectId', 'sessionId', 'executionId', 'containerId', 'grantId']) {
+    if (expectedContext[field] && request[field] !== expectedContext[field]) {
+      return makeDecision('BLOCKED', 'CONTEXT_BINDING_MISMATCH', `Context binding mismatch on "${field}": expected "${expectedContext[field]}", got "${request[field]}".`, {
+        field,
+        expected: expectedContext[field],
+        actual: request[field],
+      });
+    }
+  }
+
+  // Observer identity check
+  if (observerDescriptor) {
+    const authCheck = authenticateObserver({
+      observerDescriptor,
+      isSyntheticTest,
+    });
+    if (!authCheck.isAuthenticated) {
+      return makeDecision('BLOCKED', authCheck.reasonCode, authCheck.reason);
+    }
+  }
+
+  return makeDecision('VALID', 'OBSERVER_REQUEST_VALIDATED', 'Observer request validated successfully.', {
+    validatedRequest: request,
+  });
+}
+
 function validateExecutionEvidenceManifest(manifest, expectedContext = {}) {
   if (manifest && (manifest.schemaVersion === CURRENT_ATTESTATION_SCHEMA_VERSION || manifest.attestation)) {
     const attestation = manifest.attestation || manifest;
@@ -1872,9 +3250,25 @@ module.exports = {
   DOCKER_DAEMON_TRUST_STATES,
   DOCKER_OBSERVATION_STATES,
   DOCKER_OBSERVATION_BINDING_FIELDS,
+  KERNEL_OBSERVATION_STATES,
+  KERNEL_OBSERVATION_BINDING_FIELDS,
+  OBSERVER_IDENTITY_SOURCES,
+  OBSERVER_AUTHENTICATION_STATES,
+  OBSERVER_CONTEXT_BINDING_FIELDS,
+  WINDOWS_IPC_SECURITY_STATES,
+  WINDOWS_TRUSTED_SECURITY_PRINCIPALS,
+  validateWindowsNamedPipeSecurity,
+  validateWindowsProcessPeerIdentity,
   evaluateDockerDaemonTrust,
   bindDockerObservationEvidence,
   evaluateDockerObservation,
+  validateCgroupV2Enforcement,
+  validateReadOnlyMountEnforcement,
+  evaluateHostKernelEnforcement,
+  authenticateObserver,
+  validateObserverRequest,
+  validateObservationContext,
+  verifyObservationFreshness,
   evaluateIssuerServiceBoundary,
   collectEvidenceFacts,
   validateIssuerRequest,

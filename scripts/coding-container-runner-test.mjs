@@ -1574,6 +1574,384 @@ async function runContainerRunnerTests() {
     assert.equal(evalOutcome.gateStatus, 'BLOCKED');
   }
 
+  // -------------------------------------------------------------------------
+  // 22. [V44.32] Host Kernel Enforcement Observer — Cgroups & Mount Gates
+  // -------------------------------------------------------------------------
+  console.log('22. [V44.32] Testing host kernel enforcement observer, cgroups v2 & mount gates in container runner...');
+  {
+    const {
+      KERNEL_OBSERVATION_STATES,
+      evaluateHostKernelEnforcement,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+
+    const realRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      isMock: false,
+    });
+
+    // 22.1: Runner rejects caller-supplied kernelEnforced or cgroupEnforced flags
+    const fakeKernelExecRes = await realRunner.executeWithRuntime({
+      plan: { operation: 'test', projectRoot: 'c:/dummy', planDigest: 'digest1' },
+      ownerWebContentsId: 9999,
+      sessionId: 'sess-1',
+      runtime: {
+        providerId: 'docker',
+        supportedOps: ['test'],
+        kernelEnforced: true,
+      },
+    });
+    assert.equal(fakeKernelExecRes.ok, false);
+    assert.equal(fakeKernelExecRes.gate, 'PROCESS_ISOLATION_GATE');
+
+    // 22.2: Verifier blocks execution if cgroup v2 observation is missing controllers
+    const badCgroupRes = verifyIsolationCapabilities({
+      providerDescriptor: {
+        providerId: 'docker',
+        supportedPlatforms: ['win32', 'linux', 'darwin'],
+        isReady: true,
+        capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+      },
+      evidence: {
+        kernelObservation: {
+          evidenceSource: 'host_kernel_telemetry',
+          verificationMethod: 'CGROUP_V2_AND_MOUNTINFO_PROBE',
+          containerId: 'container-abc-123',
+          cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+          mountNamespaceId: 'mnt:[4026532456]',
+          projectId: 'proj-1',
+          executionId: 'exec-1',
+          policyDigest: 'policy-digest-1',
+          verificationPlanDigest: 'plan-digest-1',
+          observationTimestamp: new Date().toISOString(),
+          nonce: crypto.randomUUID(),
+          verificationState: 'HOST_OBSERVED',
+          observerAuthentication: 'AUTHENTICATED',
+          hasIndependentSecurityPrincipal: true,
+          cgroupObservation: {
+            cgroupVersion: 2,
+            isCgroupV2: true,
+            cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+            controllers: ['cpu'],
+            cpuMax: '50000 100000',
+            memoryMax: '536870912',
+            pidsMax: '64',
+          },
+          mountObservation: {
+            mountNamespaceId: 'mnt:[4026532456]',
+            mounts: [{ destination: '/', target: '/', flags: ['ro'], readOnly: true }],
+          },
+        },
+      },
+      context: { projectId: 'proj-1', executionId: 'exec-1', sessionId: 'sess-1', containerId: 'container-abc-123' },
+    });
+    assert.equal(badCgroupRes.ready, false);
+    assert.equal(badCgroupRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(badCgroupRes.reasonCode, 'MEMORY_CONTROLLER_MISSING');
+
+    // 22.3: Verifier blocks execution if root filesystem is not mounted read-only
+    const writableMountRes = verifyIsolationCapabilities({
+      providerDescriptor: {
+        providerId: 'docker',
+        supportedPlatforms: ['win32', 'linux', 'darwin'],
+        isReady: true,
+        capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+      },
+      evidence: {
+        kernelObservation: {
+          evidenceSource: 'host_kernel_telemetry',
+          verificationMethod: 'CGROUP_V2_AND_MOUNTINFO_PROBE',
+          containerId: 'container-abc-123',
+          cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+          mountNamespaceId: 'mnt:[4026532456]',
+          projectId: 'proj-1',
+          executionId: 'exec-1',
+          policyDigest: 'policy-digest-1',
+          verificationPlanDigest: 'plan-digest-1',
+          observationTimestamp: new Date().toISOString(),
+          nonce: crypto.randomUUID(),
+          verificationState: 'HOST_OBSERVED',
+          observerAuthentication: 'AUTHENTICATED',
+          hasIndependentSecurityPrincipal: true,
+          cgroupObservation: {
+            cgroupVersion: 2,
+            isCgroupV2: true,
+            cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+            controllers: ['cpu', 'memory', 'pids'],
+            cpuMax: '50000 100000',
+            memoryMax: '536870912',
+            pidsMax: '64',
+          },
+          mountObservation: {
+            mountNamespaceId: 'mnt:[4026532456]',
+            mounts: [{ destination: '/', target: '/', flags: ['rw'], readOnly: false }],
+          },
+        },
+      },
+      context: { projectId: 'proj-1', executionId: 'exec-1', sessionId: 'sess-1', containerId: 'container-abc-123' },
+    });
+    assert.equal(writableMountRes.ready, false);
+    assert.equal(writableMountRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(writableMountRes.reasonCode, 'WRITABLE_ROOT_FILESYSTEM');
+
+    // 22.4: Production evaluation fails closed without an authenticated independent observer
+    const unauthHostRes = evaluateHostKernelEnforcement({
+      kernelObservation: {
+        evidenceSource: 'host_kernel_telemetry',
+        verificationMethod: 'CGROUP_V2_AND_MOUNTINFO_PROBE',
+        containerId: 'container-abc-123',
+        cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+        mountNamespaceId: 'mnt:[4026532456]',
+        projectId: 'proj-1',
+        executionId: 'exec-1',
+        policyDigest: 'policy-digest-1',
+        verificationPlanDigest: 'plan-digest-1',
+        observationTimestamp: new Date().toISOString(),
+        nonce: crypto.randomUUID(),
+        verificationState: 'HOST_OBSERVED',
+        observerAuthentication: 'UNAUTHENTICATED',
+        hasIndependentSecurityPrincipal: false,
+        cgroupObservation: {
+          cgroupVersion: 2,
+          isCgroupV2: true,
+          cgroupPath: '/sys/fs/cgroup/docker/container-abc-123/',
+          controllers: ['cpu', 'memory', 'pids'],
+          cpuMax: '50000 100000',
+          memoryMax: '536870912',
+          pidsMax: '64',
+        },
+        mountObservation: {
+          mountNamespaceId: 'mnt:[4026532456]',
+          mounts: [{ destination: '/', target: '/', flags: ['ro'], readOnly: true }],
+        },
+      },
+      expectedBindings: { projectId: 'proj-1', executionId: 'exec-1' },
+    });
+    assert.equal(unauthHostRes.valid, false);
+    assert.equal(unauthHostRes.reasonCode, 'INDEPENDENT_OBSERVER_NOT_AUTHENTICATED');
+    assert.equal(unauthHostRes.kernelEnforcement, 'NOT_VERIFIED');
+    assert.equal(unauthHostRes.gate, 'PROCESS_ISOLATION_GATE');
+    assert.equal(unauthHostRes.gateStatus, 'BLOCKED');
+  }
+
+  // -------------------------------------------------------------------------
+  // 23. Authenticated Host Observer Trust Boundary & Runner Gates (V44.33)
+  // -------------------------------------------------------------------------
+  console.log('23. Testing Authenticated Host Observer Trust Boundary & Runner Gates (V44.33)...');
+  {
+    const { discoverDocker } = require('../electron/coding-pipeline/isolationRuntimeDiscovery.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+    const testPlan = {
+      planDigest: 'a'.repeat(64),
+      operation: 'TEST',
+      binary: 'npm',
+      args: ['test'],
+      projectRoot: process.cwd(),
+    };
+    const ownerId = 4433;
+
+    // 23.1: Runner rejects execution when caller attempts to forge observer authentication
+    const forgedRunner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: async () => ({ status: 0, stdout: '', stderr: '' }),
+    });
+
+    const forgedRunResult = await forgedRunner.executeWithRuntime({
+      plan: testPlan,
+      ownerWebContentsId: ownerId,
+      sessionId: crypto.randomUUID(),
+      runtime: {
+        providerId: 'docker',
+        runtimeType: 'container',
+        supportedOps: ['test'],
+        isolationVerified: true,
+        observerAuthenticated: true,
+      },
+    });
+    assert.equal(forgedRunResult.ok, false);
+    assert.equal(forgedRunResult.gate, 'PROCESS_ISOLATION_GATE');
+    assert.match(forgedRunResult.reason, /Caller-supplied Boolean isolation flags rejected/i);
+
+    // 23.2: Verifier rejects caller-forged observer identity in evidence
+    const forgedObsVerifierRes = verifyIsolationCapabilities({
+      providerDescriptor: {
+        providerId: 'docker',
+        supportedPlatforms: ['win32', 'linux', 'darwin'],
+        isReady: true,
+        capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+      },
+      evidence: {
+        observerAuthenticated: true,
+        provenance: 'host-observed',
+        trustClass: 'APP_VERIFIED',
+      },
+      context: { projectId: 'proj-1' },
+    });
+    assert.equal(forgedObsVerifierRes.ready, false);
+    assert.equal(forgedObsVerifierRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(forgedObsVerifierRes.reasonCode, 'CALLER_FORGED_OBSERVER_IDENTITY');
+
+    // 23.3: Verifier rejects unauthenticated observer descriptor
+    const unauthDescRes = verifyIsolationCapabilities({
+      providerDescriptor: {
+        providerId: 'docker',
+        supportedPlatforms: ['win32', 'linux', 'darwin'],
+        isReady: true,
+        capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+      },
+      evidence: {
+        observerDescriptor: {
+          observerId: 'unauth-obs',
+          identitySource: 'CALLER_PROVIDED',
+          executablePath: '/usr/bin/node',
+          pid: 1234,
+        },
+        provenance: 'host-observed',
+        trustClass: 'APP_VERIFIED',
+      },
+      context: { projectId: 'proj-1' },
+    });
+    assert.equal(unauthDescRes.ready, false);
+    assert.equal(unauthDescRes.status, PROVIDER_STATUSES.BLOCKED);
+    assert.equal(unauthDescRes.reasonCode, 'CALLER_PROVIDED_IDENTITY_UNTRUSTED');
+
+    // 23.4: Discovery truthfully reports independentObserver: NOT_IMPLEMENTED, observerIdentityAuthentication: NOT_VERIFIED, ipcPeerAuthentication: NOT_VERIFIED
+    const dockerDiscovery = discoverDocker({ commandRunner: () => ({ succeeded: true, exitCode: 0, stdout: 'Docker version 27.0.0', stderr: '' }) });
+    assert.equal(dockerDiscovery.independentObserver, 'NOT_IMPLEMENTED');
+    assert.equal(dockerDiscovery.observerIdentityAuthentication, 'NOT_VERIFIED');
+    assert.equal(dockerDiscovery.ipcPeerAuthentication, 'NOT_VERIFIED');
+    assert.equal(dockerDiscovery.capabilityVerificationStatus, PROVIDER_STATUSES.BLOCKED);
+
+    const containerProvider = new (require('../electron/coding-pipeline/providers/containerProvider.cjs').ContainerProvider)();
+    const containerCaps = await containerProvider.discoverCapabilities();
+    assert.equal(containerCaps.independentObserver, 'NOT_IMPLEMENTED');
+    assert.equal(containerCaps.observerIdentityAuthentication, 'NOT_VERIFIED');
+    assert.equal(containerCaps.ipcPeerAuthentication, 'NOT_VERIFIED');
+    assert.equal(containerCaps.capabilityVerificationStatus, PROVIDER_STATUSES.BLOCKED);
+  }
+
+  // -------------------------------------------------------------------------
+  // 24. [V44.34] Windows OS-Authenticated Observer IPC & Peer Identity Audit
+  // -------------------------------------------------------------------------
+  console.log('24. [V44.34] Testing Windows OS-authenticated observer IPC & peer identity...');
+  {
+    const {
+      WINDOWS_IPC_SECURITY_STATES,
+      WINDOWS_TRUSTED_SECURITY_PRINCIPALS,
+      validateWindowsNamedPipeSecurity,
+      validateWindowsProcessPeerIdentity,
+      authenticateObserver,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
+    const { verifyIsolationCapabilities } = require('../electron/coding-pipeline/isolationCapabilityVerifier.cjs');
+    const { ProjectContainerExecutionRunner } = require('../electron/coding-pipeline/projectContainerExecutionRunner.cjs');
+    const { discoverDocker } = require('../electron/coding-pipeline/isolationRuntimeDiscovery.cjs');
+    const { PROVIDER_STATUSES } = require('../electron/coding-pipeline/isolationProviderRegistry.cjs');
+
+    const testPlan = {
+      operation: 'test',
+      command: 'npm',
+      args: ['test'],
+      projectRoot: process.cwd(),
+    };
+    const ownerId = 4434;
+
+    // 24.1: Runner rejects execution when caller attempts to forge windowsPipeVerified or osProcessIdentityVerified
+    const runner = new ProjectContainerExecutionRunner({
+      runtimeDetector: () => ({ daemonAvailable: true }),
+      dockerCli: async () => ({ status: 0, stdout: '', stderr: '' }),
+    });
+
+    for (const forgedFlag of ['windowsPipeVerified', 'osProcessIdentityVerified']) {
+      const forgedRun = await runner.executeWithRuntime({
+        plan: testPlan,
+        ownerWebContentsId: ownerId,
+        sessionId: crypto.randomUUID(),
+        runtime: {
+          providerId: 'docker',
+          runtimeType: 'container',
+          supportedOps: ['test'],
+          isolationVerified: true,
+          [forgedFlag]: true,
+        },
+      });
+      assert.equal(forgedRun.ok, false);
+      assert.equal(forgedRun.gate, 'PROCESS_ISOLATION_GATE');
+      assert.match(forgedRun.reason, /Caller-supplied Boolean isolation flags rejected/i);
+    }
+
+    // 24.2: Verifier rejects caller-forged Windows pipe security booleans in evidence
+    for (const forgedFlag of ['windowsPipeVerified', 'osProcessIdentityVerified']) {
+      const forgedVerifierRes = verifyIsolationCapabilities({
+        providerDescriptor: {
+          providerId: 'docker',
+          supportedPlatforms: ['win32', 'linux', 'darwin'],
+          isReady: true,
+          capabilityVerificationStatus: PROVIDER_STATUSES.CAPABILITY_VERIFIED,
+        },
+        evidence: {
+          [forgedFlag]: true,
+          provenance: 'host-observed',
+          trustClass: 'APP_VERIFIED',
+        },
+        context: { projectId: 'proj-1' },
+      });
+      assert.equal(forgedVerifierRes.ready, false);
+      assert.equal(forgedVerifierRes.status, PROVIDER_STATUSES.BLOCKED);
+      assert.equal(forgedVerifierRes.reasonCode, 'CALLER_FORGED_OBSERVER_IDENTITY');
+    }
+
+    // 24.3: Discovery truthfully reports windowsNamedPipeSecurity: NOT_VERIFIED, ipcClientAuthentication: NOT_VERIFIED, osProcessIdentity: NOT_VERIFIED
+    const dockerDiscovery = discoverDocker({ commandRunner: () => ({ succeeded: true, exitCode: 0, stdout: 'Docker version 27.0.0', stderr: '' }) });
+    assert.equal(dockerDiscovery.windowsNamedPipeSecurity, 'NOT_VERIFIED');
+    assert.equal(dockerDiscovery.ipcClientAuthentication, 'NOT_VERIFIED');
+    assert.equal(dockerDiscovery.osProcessIdentity, 'NOT_VERIFIED');
+    assert.equal(dockerDiscovery.capabilityVerificationStatus, PROVIDER_STATUSES.BLOCKED);
+
+    const containerProvider = new (require('../electron/coding-pipeline/providers/containerProvider.cjs').ContainerProvider)();
+    const containerCaps = await containerProvider.discoverCapabilities();
+    assert.equal(containerCaps.windowsNamedPipeSecurity, 'NOT_VERIFIED');
+    assert.equal(containerCaps.ipcClientAuthentication, 'NOT_VERIFIED');
+    assert.equal(containerCaps.osProcessIdentity, 'NOT_VERIFIED');
+    assert.equal(containerCaps.capabilityVerificationStatus, PROVIDER_STATUSES.BLOCKED);
+
+    const validPipePath = '\\\\.\\pipe\\ai-help-agent-observer-1';
+    const validSecurityDescriptor = {
+      sddl: 'D:(A;;GA;;;SY)(A;;GA;;;BA)',
+      restrictedDacl: true,
+      nullDacl: false,
+      terminalSessionId: 1,
+    };
+    const validPeerProcess = {
+      pid: 8888,
+      handleValid: true,
+      processExited: false,
+      processCreationTimeUtc: '2026-11-01T07:00:00.000Z',
+      executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\observer.exe',
+      tokenUserSid: 'S-1-5-18',
+    };
+
+    // 24.4: In production mode (isSyntheticTest: false), Windows named pipe security fails closed to NOT_IMPLEMENTED
+    const prodPipe = validateWindowsNamedPipeSecurity({
+      pipePath: validPipePath,
+      securityDescriptor: validSecurityDescriptor,
+      isSyntheticTest: false,
+    });
+    assert.equal(prodPipe.valid, false);
+    assert.equal(prodPipe.state, WINDOWS_IPC_SECURITY_STATES.NOT_IMPLEMENTED);
+    assert.equal(prodPipe.reasonCode, 'WINDOWS_NATIVE_IPC_AUTH_NOT_IMPLEMENTED');
+
+    // 24.5: In production mode (isSyntheticTest: false), OS process peer identity fails closed to NOT_VERIFIED
+    const prodPeer = validateWindowsProcessPeerIdentity({
+      peerProcessDescriptor: validPeerProcess,
+      isSyntheticTest: false,
+    });
+    assert.equal(prodPeer.valid, false);
+    assert.equal(prodPeer.state, WINDOWS_IPC_SECURITY_STATES.NOT_VERIFIED);
+    assert.equal(prodPeer.reasonCode, 'OS_PROCESS_IDENTITY_NOT_VERIFIED');
+  }
+
   console.log('All CODING AGENT V7 — Container Runner Security & Integration Audit tests passed successfully!');
 }
 

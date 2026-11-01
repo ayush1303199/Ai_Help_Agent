@@ -142,7 +142,7 @@ class ProjectContainerExecutionRunner {
       };
     }
 
-    if (runtime.sandbox === true || runtime.verified === true || runtime.independentlyVerified === true || runtime.kernelEnforced === true || runtime.daemonTrust === 'VERIFIED' || runtime.isTrustedDaemon === true) {
+    if (runtime.sandbox === true || runtime.verified === true || runtime.independentlyVerified === true || runtime.kernelEnforced === true || runtime.daemonTrust === 'VERIFIED' || runtime.isTrustedDaemon === true || runtime.cgroupEnforced === true || runtime.readOnlyEnforced === true || runtime.observerAuthenticated === true || runtime.trustedObserver === true || runtime.windowsPipeVerified === true || runtime.osProcessIdentityVerified === true) {
       return {
         ok: false,
         gate: 'PROCESS_ISOLATION_GATE',
