@@ -1826,10 +1826,12 @@ export class CodingAgentTransport {
 export type CodingRequestIntent =
   | 'QUESTION_OR_EXPLANATION'
   | 'CLARIFICATION_REQUIRED'
+  | 'CONVERSATIONAL'
   | 'AUTONOMOUS_WORKFLOW_TASK';
 
 export interface CodingRequestClassification {
   intent: CodingRequestIntent;
+  processingLevel?: 'LEVEL_A_DIRECT_INTERACTION' | 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING' | 'LEVEL_C_FOCUSED_INVESTIGATION' | 'LEVEL_D_FULL_DEVELOPMENT';
   clarificationPrompt?: string;
   isActionableTask: boolean;
 }
@@ -1865,22 +1867,80 @@ export function shouldRequireDeveloperWorkflowForAttachedProject({
     && !hasRepairContext;
 }
 
-export function classifyCodingRequestIntent(rawRequest: string): CodingRequestClassification {
+export function classifyCodingRequestIntent(
+  rawRequest: string,
+  contextMessages: Array<{ role: string; content: string }> = [],
+  projectContext?: { priorFindings?: unknown[]; taskStatus?: string; isCompleted?: boolean; isStale?: boolean } | null,
+): CodingRequestClassification {
   const text = String(rawRequest || '').trim();
   if (!text) {
     return {
       intent: 'CLARIFICATION_REQUIRED',
+      processingLevel: 'LEVEL_A_DIRECT_INTERACTION',
       clarificationPrompt: 'Please provide task requirements or the target issue to investigate.',
       isActionableTask: false,
     };
   }
 
   // 1. Detect vague/ambiguous requests that require clarification before any action
-  const isVague = /^(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:the\s+)?performance|fix\s+(?:the\s+)?(?:bug|issue|code|it|problem)|clean\s+(?:it\s+)?up|do\s+something|look\s+into\s+this|check\s+this|investigate\s+this)\s*[.!?]*$/i.test(text)
+  const isVague = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:the\s+)?performance|fix\s+(?:the\s+)?(?:bug|issue|code|it|problem)|clean\s+(?:it\s+)?up|do\s+something|look\s+into\s+this|check\s+this|investigate\s+this)\s*[.!?]*$/i.test(text)
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(text) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(text));
   if (isVague) {
+    const isStaleOrCompleted = projectContext?.taskStatus === 'COMPLETED'
+      || projectContext?.isCompleted === true
+      || projectContext?.isStale === true;
+    if (isStaleOrCompleted) {
+      return {
+        intent: 'CLARIFICATION_REQUIRED',
+        processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
+        clarificationPrompt: 'The previous task is already completed. Please specify what new issue or change you would like to work on.',
+        isActionableTask: false,
+      };
+    }
+
+    const priorFindings = Array.isArray(projectContext?.priorFindings) ? projectContext.priorFindings : [];
+    const hasPriorContext = Array.isArray(contextMessages) && contextMessages.length > 0
+      && contextMessages.some((msg) => msg && typeof msg.content === 'string' && msg.content.trim().length > 3);
+    const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|debug)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect)\b/i.test(text);
+
+    if (isAnaphoricFix) {
+      if (priorFindings.length > 1) {
+        return {
+          intent: 'CLARIFICATION_REQUIRED',
+          processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
+          clarificationPrompt: `Multiple issues were identified (${priorFindings.length} findings). Please clarify which specific issue you would like to address.`,
+          isActionableTask: false,
+        };
+      }
+
+      const latestAssistantMsg = Array.isArray(contextMessages)
+        ? contextMessages.slice().reverse().find((m) => m && m.role === 'assistant')
+        : null;
+      const assistantContent = latestAssistantMsg?.content || '';
+      const hasMultipleContextFindings = /\b(?:multiple\s+(?:issues|defects|bugs|errors|findings)|found\s+(?:\d+|two|three|several)\s+(?:issues|defects|bugs|errors|findings))\b/i.test(assistantContent)
+        || /(?:^|\n)\s*(?:1[.)]|first|issue\s*1)[\s\S]+(?:^|\n)\s*(?:2[.)]|second|issue\s*2)/i.test(assistantContent);
+
+      if (hasMultipleContextFindings) {
+        return {
+          intent: 'CLARIFICATION_REQUIRED',
+          processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
+          clarificationPrompt: 'Multiple issues were identified in the previous findings. Please clarify which specific issue you would like to address.',
+          isActionableTask: false,
+        };
+      }
+
+      if (hasPriorContext || priorFindings.length > 0) {
+        return {
+          intent: 'AUTONOMOUS_WORKFLOW_TASK',
+          processingLevel: 'LEVEL_D_FULL_DEVELOPMENT',
+          isActionableTask: true,
+        };
+      }
+    }
+
     return {
       intent: 'CLARIFICATION_REQUIRED',
+      processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
       clarificationPrompt: `The request "${text}" is ambiguous. Please specify the target behavior, expected outcome, or error details.`,
       isActionableTask: false,
     };
@@ -1889,10 +1949,11 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
   // 2. Detect ambiguous mixed-intent requests combining action directives and informational/exploratory questions
   // e.g. "Fix the rollback or explain why it failed", "Should I fix this or what do you recommend?", "Either add tests or explain why"
   const hasDisjunctiveInquiry = /\b(?:or\s+(?:should|can|could|would|what|why|how|explain|tell|describe|clarify|discuss|else)|either\b.*\bor\b|not\s+sure\s+(?:if|whether))\b/i.test(text);
-  const hasActionVerb = /\b(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|build|scaffold|setup|full-?stack)\b/i.test(text);
+  const hasActionVerb = /\b(?:debug|fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|build|scaffold|setup|full-?stack)\b/i.test(text);
   if (hasDisjunctiveInquiry && hasActionVerb) {
     return {
       intent: 'CLARIFICATION_REQUIRED',
+      processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
       clarificationPrompt: 'Your request combines an action directive and an informational inquiry. Please clarify whether you would like the agent to apply code changes or provide an explanation first.',
       isActionableTask: false,
     };
@@ -1905,15 +1966,17 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
     || /\bwithout\s+making\s+(?:any\s+)?(?:code\s+)?changes?(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text)
     || /\bno\s+(?:(?:code|file|source)\s+)?(?:changes?|modifications?|edits?|writes?|patches?)(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text);
   if (isExplicitNoChange) {
-    const requestsInvestigation = /\b(?:investigate|diagnose|find\s+(?:the\s+)?cause|root\s+cause|why|failing|fails|failed|broken|error|bug|bottleneck|performance|trace)\b/i.test(text);
+    const requestsInvestigation = /\b(?:investigate|diagnose|inspect|audit|examine|find\s+(?:the\s+)?cause|root\s+cause|why|failing|fails|failed|broken|error|bug|bottleneck|performance|trace)\b/i.test(text);
     if (requestsInvestigation) {
       return {
         intent: 'AUTONOMOUS_WORKFLOW_TASK',
+        processingLevel: 'LEVEL_C_FOCUSED_INVESTIGATION',
         isActionableTask: true,
       };
     }
     return {
       intent: 'QUESTION_OR_EXPLANATION',
+      processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
       isActionableTask: false,
     };
   }
@@ -1925,6 +1988,7 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
   if (isExplicitExplanation) {
     return {
       intent: 'QUESTION_OR_EXPLANATION',
+      processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
       isActionableTask: false,
     };
   }
@@ -1932,7 +1996,36 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
   if (isActionableProjectWorkflowRequest(text)) {
     return {
       intent: 'AUTONOMOUS_WORKFLOW_TASK',
+      processingLevel: 'LEVEL_D_FULL_DEVELOPMENT',
       isActionableTask: true,
+    };
+  }
+
+  const referencesConcreteArtifacts = /\b(?:code|files?|source|controller|model|view|route|routes|component|components|endpoint|endpoints|tests?|specs?|package|dependency|dependencies|node_modules|server|dev\s+server|app|database|schema|migration|script|scripts|config|bug|defect|error|trace|failure|crash)\b/i.test(text)
+    || /\b[\w-]+\.(?:js|cjs|mjs|ts|tsx|jsx|json|php|py|rb|go|rs|html|css|sql|ya?ml|env)\b/i.test(text);
+
+  const isSocialQuestion = /\b(?:how\s+are\s+you(?:\s+doing)?|how's\s+it\s+going|what's\s+up|how\s+do\s+you\s+do|how\s+are\s+things|how\s+is\s+your\s+day|how\s+have\s+you\s+been)\b/i.test(text);
+  if (isSocialQuestion && !referencesConcreteArtifacts) {
+    return {
+      intent: 'CONVERSATIONAL',
+      processingLevel: 'LEVEL_A_DIRECT_INTERACTION',
+      isActionableTask: false,
+    };
+  }
+
+  const strippedOfCourtesy = text
+    .replace(/^(?:(?:hello|hi|hey|good\s+(?:morning|afternoon|evening)|thanks(?:\s+for\s+[^,;!?.\n]+)?|thank\s+you(?:\s+for\s+[^,;!?.\n]+)?|understood|got\s+it|sounds\s+good|okay|ok|cool|great|awesome|perfect|nice|sure|all\s+right|alright)\s*[,;!?.\n]?\s*)+/i, '')
+    .replace(/^(?:(?:now|then|so)\s*[,;]?\s*)?(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)+/i, '')
+    .replace(/^(?:(?:now|then|so)\s*[,;]?\s*)+/i, '')
+    .trim();
+
+  const isPureConversational = !strippedOfCourtesy
+    || /^(?:you(?:'re|\s+are)\s+welcome|no\s+problem|my\s+pleasure|anytime|sounds\s+good|got\s+it|understood|ok|okay|cool|great|awesome|perfect|nice|sure|yes|no|yep|nope|bye|goodbye|see\s+you)\b[.!?]*$/i.test(strippedOfCourtesy);
+  if (isPureConversational && !referencesConcreteArtifacts) {
+    return {
+      intent: 'CONVERSATIONAL',
+      processingLevel: 'LEVEL_A_DIRECT_INTERACTION',
+      isActionableTask: false,
     };
   }
 
@@ -1942,25 +2035,28 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
   if (isQuestionInquiry) {
     return {
       intent: 'QUESTION_OR_EXPLANATION',
+      processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
       isActionableTask: false,
     };
   }
 
   // 5. Detect polite action directives (e.g. "Can you fix...", "Please add...", "Could you refactor...")
   // When polite framing is followed immediately by an action verb, it represents a command to execute changes.
-  const isPoliteActionDirective = /^(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|run|start|launch|boot|execute)\b/i.test(text);
+  const isPoliteActionDirective = /^(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?(?:debug|fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|diagnose|inspect|audit|examine|run|start|launch|boot|execute)\b/i.test(text);
   if (isPoliteActionDirective) {
     return {
       intent: 'AUTONOMOUS_WORKFLOW_TASK',
+      processingLevel: 'LEVEL_D_FULL_DEVELOPMENT',
       isActionableTask: true,
     };
   }
 
   // 6. Detect trailing questions that do not start with a direct action command
-  const startsWithDirectAction = /^(?:fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|find\s+and\s+fix|run|start|launch|boot|execute)\b/i.test(text);
+  const startsWithDirectAction = /^(?:debug|fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|diagnose|inspect|audit|examine|find\s+and\s+fix|run|start|launch|boot|execute)\b/i.test(text);
   if (text.endsWith('?') && !startsWithDirectAction) {
     return {
-      intent: 'QUESTION_OR_EXPLANATION',
+      intent: referencesConcreteArtifacts ? 'QUESTION_OR_EXPLANATION' : 'CONVERSATIONAL',
+      processingLevel: referencesConcreteArtifacts ? 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING' : 'LEVEL_A_DIRECT_INTERACTION',
       isActionableTask: false,
     };
   }
@@ -1968,6 +2064,7 @@ export function classifyCodingRequestIntent(rawRequest: string): CodingRequestCl
   // 7. Actionable coding task, bug fix, or investigation requiring autonomous workflow
   return {
     intent: 'AUTONOMOUS_WORKFLOW_TASK',
+    processingLevel: 'LEVEL_D_FULL_DEVELOPMENT',
     isActionableTask: true,
   };
 }

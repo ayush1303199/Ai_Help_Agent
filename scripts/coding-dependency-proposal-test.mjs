@@ -23,6 +23,15 @@ const {
   validateProposalContract,
 } = require('../electron/coding-pipeline/investigationWorkflowContract.cjs');
 const developerAgent = require('../electron/developerAgent.cjs');
+const {
+  INSTALL_INTENTS,
+  classifyInstallIntent,
+  checkLanguageConflict,
+} = require('../electron/coding-pipeline/genericIntentClassifier.cjs');
+const {
+  PROPOSAL_MISMATCH_TYPES,
+  classifyProposalMismatch,
+} = require('../electron/developerAgent.cjs');
 const developerFiles = require('../electron/developerFiles.cjs');
 
 test('CODING AGENT V12 — Intent Classification for Dependency Requests', () => {
@@ -354,4 +363,88 @@ test('CODING AGENT V12 — Post-Install Verification & Outcome Reporting', async
     process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS = prevRoots;
     await fs.rm(testRoot, { recursive: true, force: true });
   }
+});
+
+test('CODING AGENT V44.36 — Ambiguous Add Dependency Requests Clarification (No Silent npm install)', async () => {
+  const testRoot = await fs.mkdtemp(path.join(process.cwd(), '.v44-ambig-dep-'));
+  const tmpDir = path.join(testRoot, 'ambig-app');
+  await fs.mkdir(tmpDir, { recursive: true });
+
+  const ownerWebContentsId = 12005;
+  const sessionId = developerAgent.createSession(ownerWebContentsId);
+  const prevRoots = process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS;
+  process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS = testRoot;
+
+  try {
+    const pkgJson = {
+      name: 'ambig-project',
+      version: '1.0.0',
+      dependencies: {
+        express: '^4.19.2',
+      },
+    };
+    await fs.writeFile(path.join(tmpDir, 'package.json'), JSON.stringify(pkgJson, null, 2));
+    await developerFiles.discoverProjectByName('ambig-app', ownerWebContentsId);
+
+    // 1. "install a package" must NOT silently trigger npm install
+    const result = await developerAgent.executeAutonomousCodingWorkflow({
+      root: tmpDir,
+      userRequest: 'install a package',
+      sessionId,
+      ownerWebContentsId,
+    });
+
+    assert.equal(result.outcome, 'CLARIFICATION_REQUIRED');
+    assert.equal(result.phase, 'UNDERSTAND');
+    assert.match(result.clarificationPrompt, /Which package or dependency would you like to install/i);
+    assert.equal(result.filesModified.length, 0);
+
+    // 2. Intent classifier verification
+    const installIntent = classifyInstallIntent('install a package', { manifestPresent: true });
+    assert.equal(installIntent.intent, INSTALL_INTENTS.ADD_DEPENDENCY);
+    assert.equal(installIntent.requiresClarification, true);
+
+    // 3. Follow-up answering the clarification unloops
+    const unlooped = classifyInstallIntent('install a package', {
+      manifestPresent: true,
+      contextMessages: [{ role: 'user', content: 'install axios' }],
+    });
+    assert.equal(unlooped.requiresClarification, false);
+  } finally {
+    developerAgent.releaseSession(ownerWebContentsId);
+    developerFiles.releaseProject(ownerWebContentsId);
+    process.env.AI_HELP_AGENT_CODING_PROJECT_ROOTS = prevRoots;
+    await fs.rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test('CODING AGENT V44.36 — Proposal Validation Failure Classification Contract', () => {
+  assert.ok(PROPOSAL_MISMATCH_TYPES);
+  assert.equal(PROPOSAL_MISMATCH_TYPES.STALE_SOURCE_EVIDENCE, 'STALE_SOURCE_EVIDENCE');
+  assert.equal(PROPOSAL_MISMATCH_TYPES.CHANGED_FILE_CONTENTS, 'CHANGED_FILE_CONTENTS');
+  assert.equal(PROPOSAL_MISMATCH_TYPES.INCORRECT_FILE_PATH, 'INCORRECT_FILE_PATH');
+  assert.equal(PROPOSAL_MISMATCH_TYPES.INVALID_PATCH_CONTEXT, 'INVALID_PATCH_CONTEXT');
+  assert.equal(PROPOSAL_MISMATCH_TYPES.MALFORMED_DIFF, 'MALFORMED_DIFF');
+
+  // Test classifyProposalMismatch classifications
+  assert.equal(
+    classifyProposalMismatch({ error: new Error('Snapshot is stale for src/app.js') }),
+    PROPOSAL_MISMATCH_TYPES.STALE_SOURCE_EVIDENCE
+  );
+  assert.equal(
+    classifyProposalMismatch({ error: new Error('File contents changed on disk') }),
+    PROPOSAL_MISMATCH_TYPES.CHANGED_FILE_CONTENTS
+  );
+  assert.equal(
+    classifyProposalMismatch({ error: new Error('Proposal target is outside the approved scope: ../other.js') }),
+    PROPOSAL_MISMATCH_TYPES.INCORRECT_FILE_PATH
+  );
+  assert.equal(
+    classifyProposalMismatch({ error: new Error('Patch context does not match') }),
+    PROPOSAL_MISMATCH_TYPES.INVALID_PATCH_CONTEXT
+  );
+  assert.equal(
+    classifyProposalMismatch({ error: new Error('Invalid patch format: malformed hunk header') }),
+    PROPOSAL_MISMATCH_TYPES.MALFORMED_DIFF
+  );
 });

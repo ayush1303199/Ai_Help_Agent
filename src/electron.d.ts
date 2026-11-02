@@ -402,6 +402,7 @@ interface Window {
     }>;
     executeDeveloperWorkflow: (payload: {
       userRequest: string;
+      contextMessages?: Array<{ role: string; content: string }>;
       scope?: string;
       workflowRequestId?: string;
       continuationToken?: string;

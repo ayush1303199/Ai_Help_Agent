@@ -1025,7 +1025,11 @@ export function useCodingAgentController({
     }
 
 
-    const classification = classifyCodingRequestIntent(question);
+    const conversationContext = messages
+      .filter((message) => !message.streaming)
+      .slice(-10)
+      .map((message) => ({ role: message.role, content: message.content }));
+    const classification = classifyCodingRequestIntent(question, conversationContext);
     const isRuntimeProjectTest = isActionableProjectWorkflowRequest(question);
     const requiresBrowserBrokerWorkflow = !window.electronAPI?.executeDeveloperWorkflow
       && shouldRequireDeveloperWorkflowForAttachedProject({
@@ -1087,6 +1091,7 @@ export function useCodingAgentController({
           && executionSettings.executionMode === 'inline_review'
           ? window.electronAPI.executeDeveloperWorkflow({
             userRequest: question,
+            contextMessages: conversationContext,
             scope: currentScope,
             workflowRequestId: requestId,
             continuationToken: isRuntimeProjectTest ? undefined : continuationToken,
@@ -1557,12 +1562,14 @@ export function useCodingAgentController({
               ? { ...current, repairAvailable: false, chainStatus: 'reset' }
               : current);
           }
-          setActivity((previous) => upsertCodingActivity(previous, {
-            id: `start:${requestId}`,
-            executionId: requestId,
-            phase: 'reading',
-            message: 'Starting the Coding Agent task with the attached project context.',
-          }));
+          if (classification.processingLevel !== 'LEVEL_A_DIRECT_INTERACTION') {
+            setActivity((previous) => upsertCodingActivity(previous, {
+              id: `start:${requestId}`,
+              executionId: requestId,
+              phase: 'reading',
+              message: 'Starting the Coding Agent task with the attached project context.',
+            }));
+          }
         },
         onActivity: (entry) => {
           setActivity((previous) => upsertCodingActivity(previous, entry, requestId));

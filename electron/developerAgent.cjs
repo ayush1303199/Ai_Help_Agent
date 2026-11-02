@@ -93,9 +93,41 @@ const {
 } = require('./coding-pipeline/projectProcessIsolation.cjs');
 const {
   INTENT_CATEGORIES,
+  PROCESSING_LEVELS,
   classifyTaskIntent,
   extractConstraints,
+  INSTALL_INTENTS,
+  classifyInstallIntent,
+  checkLanguageConflict,
 } = require('./coding-pipeline/genericIntentClassifier.cjs');
+
+const PROPOSAL_MISMATCH_TYPES = Object.freeze({
+  STALE_SOURCE_EVIDENCE: 'STALE_SOURCE_EVIDENCE',
+  CHANGED_FILE_CONTENTS: 'CHANGED_FILE_CONTENTS',
+  INCORRECT_FILE_PATH: 'INCORRECT_FILE_PATH',
+  INVALID_PATCH_CONTEXT: 'INVALID_PATCH_CONTEXT',
+  MALFORMED_DIFF: 'MALFORMED_DIFF',
+});
+
+function classifyProposalMismatch({ error, targetFile, sourceContent, snapshot, patch }) {
+  const errMsg = error ? String(error.message || error) : '';
+  if (/malformed|invalid patch|parse patch|corrupted/i.test(errMsg)) {
+    return PROPOSAL_MISMATCH_TYPES.MALFORMED_DIFF;
+  }
+  if (/stale|hash mismatch|expected hash/i.test(errMsg)) {
+    return PROPOSAL_MISMATCH_TYPES.STALE_SOURCE_EVIDENCE;
+  }
+  if (/contents? changed|modified on disk/i.test(errMsg) || (snapshot && sourceContent !== undefined && snapshot.hash && crypto.createHash('sha256').update(sourceContent).digest('hex') !== snapshot.hash)) {
+    return PROPOSAL_MISMATCH_TYPES.CHANGED_FILE_CONTENTS;
+  }
+  if (/outside.*scope|target.*exist|no such file|incorrect.*path/i.test(errMsg)) {
+    return PROPOSAL_MISMATCH_TYPES.INCORRECT_FILE_PATH;
+  }
+  if (/patch context|context.*mismatch|hunk/i.test(errMsg)) {
+    return PROPOSAL_MISMATCH_TYPES.INVALID_PATCH_CONTEXT;
+  }
+  return PROPOSAL_MISMATCH_TYPES.STALE_SOURCE_EVIDENCE;
+}
 const {
   WORKSPACE_STATES,
   discoverWorkspace,
@@ -4977,6 +5009,7 @@ async function executeAutonomousCodingWorkflowStage({
   continuationToken = null,
   containerRunner: inputContainerRunner = null,
   contextMessages = [],
+  genericIntent: inputGenericIntent = null,
 }, continuation = null) {
   if (!sessionId || ownerWebContentsId === undefined) {
     throw new Error('Developer session ownership is required.');
@@ -5065,6 +5098,57 @@ async function executeAutonomousCodingWorkflowStage({
     });
   }
 
+function generateConversationalResponse(userRequest, contextMessages = []) {
+  const text = String(userRequest || '').trim();
+  const lower = text.toLowerCase();
+  if (/^(?:thanks|thank\s+you|thx|much\s+appreciated|appreciate\s+it)\b/i.test(lower)) {
+    return "You're welcome! Let me know if you need any further assistance with your project or code.";
+  }
+  if (/^(?:good\s+(?:morning|afternoon|evening)|hey|hi|hello|greetings|howdy)\b/i.test(lower)) {
+    return "Hello! I am your AI coding assistant. What would you like to explore, investigate, or build today?";
+  }
+  if (/^(?:how\s+are\s+you|how's\s+it\s+going|how\s+are\s+things)\b/i.test(lower)) {
+    return "I'm doing well, thank you! Ready to help you with code analysis, debugging, or project development.";
+  }
+  if (/^(?:ok|okay|sounds\s+good|got\s+it|understood|cool|great|awesome|perfect|nice|sure)\b/i.test(lower)) {
+    return "Understood. Whenever you're ready, let me know what you'd like to work on next.";
+  }
+  return "I'm here to assist you with your project. You can ask questions about the codebase, request bug fixes, or explore architectural enhancements.";
+}
+
+  // Fast-path Level A requests: direct conversational interaction without project discovery, investigation, or proposal
+  const preliminaryIntent = inputGenericIntent
+    || continuation?.genericIntent
+    || classifyTaskIntent({
+      request: userRequest,
+      contextMessages,
+    });
+
+  if (preliminaryIntent.processingLevel === PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION) {
+    onProgress({
+      phase: 'UNDERSTAND',
+      message: 'Processing direct conversational request.',
+    });
+    const message = generateConversationalResponse(userRequest, contextMessages);
+    return {
+      outcome: 'COMPLETED',
+      phase: 'DIRECT_INTERACTION',
+      processingLevel: PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION,
+      taskPlan: null,
+      intentClassification: preliminaryIntent,
+      message,
+      explanation: message,
+      filesModified: [],
+      inspectedFiles: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'COMPLETED',
+        stagesCompleted: ['UNDERSTAND', 'DIRECT_INTERACTION'],
+      }),
+    };
+  }
+
   // STAGE 1: UNDERSTAND
   onProgress({
     phase: continuation ? 'INVESTIGATE_RESUME' : 'UNDERSTAND',
@@ -5079,13 +5163,14 @@ async function executeAutonomousCodingWorkflowStage({
   const requirementsAnalysis = continuation?.requirementsAnalysis || analyzeTaskRequirements(userRequest, contextMessages);
   const workspaceDiscovery = continuation?.workspaceDiscovery
     || await discoverWorkspace({ projectRoot: root, ownerWebContentsId, sessionId });
-  const genericIntent = continuation?.genericIntent
-    || classifyTaskIntent({
+  const genericIntent = inputGenericIntent
+    || continuation?.genericIntent
+    || (preliminaryIntent.confidence === 'HIGH' ? preliminaryIntent : classifyTaskIntent({
       request: userRequest,
       projectContext: workspaceDiscovery,
       evidence: workspaceDiscovery?.evidence || [],
       contextMessages,
-    });
+    }));
 
   if (genericIntent.needsClarification || requirementsAnalysis.needsClarification) {
     const prompt = genericIntent.clarificationPrompt || requirementsAnalysis.clarificationPrompt;
@@ -5148,6 +5233,32 @@ async function executeAutonomousCodingWorkflowStage({
   const detected = continuation?.detected || await detectProject(root);
   const projectArch = continuation?.projectArch || discoverProjectArchitecture({ ...metadata, ...detected });
   const isGreenfieldDiscovery = await isGreenfieldWorkspace(root);
+
+  const langConflict = checkLanguageConflict(userRequest, {
+    projectArchitecture: projectArch,
+    workspaceDiscovery,
+    metadata,
+    contextMessages,
+  });
+  if (langConflict.conflict) {
+    const prompt = langConflict.clarificationPrompt;
+    advanceConversationTurn(turn.turnId, 'clarification_required', owner, {
+      phase: 'language_conflict_clarification',
+      prompt,
+    });
+    return {
+      outcome: 'CLARIFICATION_REQUIRED',
+      phase: 'UNDERSTAND',
+      conflict: langConflict,
+      clarificationPrompt: prompt,
+      reason: langConflict.reason,
+      filesModified: [],
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'CLARIFICATION_REQUIRED',
+        stagesCompleted: ['UNDERSTAND'],
+      }),
+    };
+  }
   const existingRuntimeTestPlan = (isRuntimeTestRequest && genericIntent.primaryIntent !== INTENT_CATEGORIES.RUN_OR_LAUNCH)
     ? await deriveExistingProjectTestPlan(root)
     : null;
@@ -5204,10 +5315,45 @@ async function executeAutonomousCodingWorkflowStage({
   const buildDiscovery = await discoverBuildOperations(root);
   taskPlan.buildDiscovery = buildDiscovery;
 
-  const isDependencyInstallRequest = /\b(?:install|download)\s+(?:the\s+)?(?:dependencies|deps|packages?|node_modules)\b/i.test(userRequest)
-    || /\b(?:npm|pnpm|yarn|bun)\s+(?:install|i|add)\b/i.test(userRequest)
-    || (/^(?:install|download)\b/i.test(userRequest) && !/\b(?:feature|component|route|endpoint|page|module|system)\b/i.test(userRequest))
-    || (/\binstall\b/i.test(userRequest) && dependencyReport.needsInstallation);
+  const detectedInstallIntent = classifyInstallIntent(userRequest, {
+    contextMessages,
+    manifestPresent: Boolean(dependencyReport.hasManifest || dependencyReport.primaryReport?.hasManifest),
+  });
+
+  if (detectedInstallIntent.intent === INSTALL_INTENTS.ADD_DEPENDENCY && detectedInstallIntent.requiresClarification) {
+    const prompt = detectedInstallIntent.clarificationPrompt;
+    advanceConversationTurn(turn.turnId, 'clarification_required', owner, {
+      phase: 'ambiguous_dependency_clarification',
+      prompt,
+    });
+    return {
+      outcome: 'CLARIFICATION_REQUIRED',
+      phase: 'UNDERSTAND',
+      clarificationPrompt: prompt,
+      installIntent: detectedInstallIntent,
+      filesModified: [],
+      taskPlan,
+      taskRepresentation: taskPlan.taskRepresentation,
+      userGoal: taskPlan.userGoal,
+      taskType: taskPlan.taskType,
+      requestedOutcomes: taskPlan.requestedOutcomes,
+      constraints: taskPlan.constraints,
+      unresolvedQuestions: [prompt],
+      evidenceLevel: VERIFICATION_EVIDENCE_LEVELS.NOT_RUN,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'CLARIFICATION_REQUIRED',
+        stagesCompleted: ['UNDERSTAND'],
+      }),
+    };
+  }
+
+  const isDependencyInstallRequest = (
+    detectedInstallIntent.intent === INSTALL_INTENTS.INSTALL_PROJECT_DEPENDENCIES
+    || detectedInstallIntent.intent === INSTALL_INTENTS.UPDATE_OR_REINSTALL
+    || (/\b(?:install|download)\s+(?:the\s+)?(?:dependencies|deps|node_modules)\b/i.test(userRequest))
+    || (/\b(?:npm|pnpm|yarn|bun)\s+(?:install|i)\b/i.test(userRequest))
+    || (/\binstall\b/i.test(userRequest) && dependencyReport.needsInstallation && detectedInstallIntent.intent !== INSTALL_INTENTS.ADD_DEPENDENCY)
+  ) && detectedInstallIntent.intent !== INSTALL_INTENTS.ADD_DEPENDENCY;
 
   const isProjectTestOrVerifyRequest = (
     isRuntimeTestRequest
@@ -6105,7 +6251,30 @@ async function executeAutonomousCodingWorkflowStage({
     };
   }
 
-  const isExplicitBuildOrTestRequest = (!isRuntimeTestRequest || !existingRuntimeTestPlan || genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH)
+  if (genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH && !isRuntimeTestRequest) {
+    onProgress({ phase: 'RUN_GATE', message: 'Evaluating process isolation policy for run request.' });
+    const blockReason = 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.';
+    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'launch_blocked', reason: blockReason });
+    return {
+      outcome: 'BLOCKED',
+      phase: 'RUN_OR_LAUNCH',
+      turnId: turn.turnId,
+      taskPlan,
+      intentClassification: genericIntent,
+      workspaceDiscovery,
+      executionBlocked: true,
+      reason: blockReason,
+      filesModified: [],
+      codeApplied: false,
+      codeVerified: false,
+      workflowReceipt: buildWorkflowReceipt({
+        outcome: 'BLOCKED',
+        stagesCompleted: ['UNDERSTAND', 'DISCOVER'],
+      }),
+    };
+  }
+
+  const isExplicitBuildOrTestRequest = (!isRuntimeTestRequest || !existingRuntimeTestPlan)
     && genericIntent.primaryIntent !== INTENT_CATEGORIES.EXPLAIN_OR_ASK
     && !isDependencyInstallRequest
     && !isCombinedInstallAndTestRequest
@@ -6707,28 +6876,7 @@ async function executeAutonomousCodingWorkflowStage({
     };
   }
 
-  if (genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH && !isRuntimeTestRequest) {
-    onProgress({ phase: 'RUN_GATE', message: 'Evaluating process isolation policy for run request.' });
-    const blockReason = 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.';
-    advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'launch_blocked', reason: blockReason });
-    return {
-      outcome: 'BLOCKED',
-      phase: 'RUN_OR_LAUNCH',
-      turnId: turn.turnId,
-      taskPlan,
-      intentClassification: genericIntent,
-      workspaceDiscovery,
-      executionBlocked: true,
-      reason: blockReason,
-      filesModified: [],
-      codeApplied: false,
-      codeVerified: false,
-      workflowReceipt: buildWorkflowReceipt({
-        outcome: 'BLOCKED',
-        stagesCompleted: ['UNDERSTAND', 'DISCOVER'],
-      }),
-    };
-  }
+  // RUN_OR_LAUNCH gate moved before isExplicitBuildOrTestRequest
   const cancelledResult = (phase, taskId = null) => {
     if (continuation?.token) workflowContinuations.delete(continuation.token);
     const activeStage = taskPlan.subtasks.find((item) => item.status === 'IN_PROGRESS');
@@ -9055,16 +9203,186 @@ async function executeAutonomousCodingWorkflowStage({
     };
   }
 
-  const task = await createProposal({
-    root,
-    raw: rawPatch,
-    expectedSnapshots: [beforeSnapshot],
-    sessionId,
-    ownerWebContentsId,
-    scope,
-    conversationTurnId: turn.turnId,
-    proposalContract,
-  });
+  let task = null;
+  let activeBeforeSnapshot = beforeSnapshot;
+  let activeRawPatch = rawPatch;
+  let activeProposalContract = proposalContract;
+
+  try {
+    task = await createProposal({
+      root,
+      raw: activeRawPatch,
+      expectedSnapshots: [activeBeforeSnapshot],
+      sessionId,
+      ownerWebContentsId,
+      scope,
+      conversationTurnId: turn.turnId,
+      proposalContract: activeProposalContract,
+    });
+  } catch (proposalErr) {
+    const mismatchType = classifyProposalMismatch({
+      error: proposalErr,
+      targetFile,
+      sourceContent: fullContent,
+      snapshot: activeBeforeSnapshot,
+      patch: activeRawPatch,
+    });
+
+    let recovered = false;
+    let freshSnapshot = null;
+    try {
+      freshSnapshot = await snapshotTarget(root, targetFile);
+      if (freshSnapshot && freshSnapshot.exists) {
+        const freshSafeTarget = await safePath(root, targetFile);
+        const freshContent = await fs.readFile(freshSafeTarget.absolutePath, 'utf8');
+
+        // Reconstruct block and patch from fresh authoritative content
+        const freshLines = freshContent.split(/\r?\n/);
+        const freshHasTrailing = freshContent.endsWith('\n');
+        let freshBlockStart = blockStartLine;
+        let freshBlockEnd = blockEndLine;
+        if (structuralScope && structuralScope.symbolName) {
+          const freshScope = extractEnclosingFunctionBlock(freshContent, structuralScope.symbolName);
+          if (freshScope && freshScope.found) {
+            freshBlockStart = freshScope.startLine;
+            freshBlockEnd = freshScope.endLine;
+          }
+        }
+        if (freshBlockStart > freshLines.length) freshBlockStart = 1;
+        if (freshBlockEnd > freshLines.length) freshBlockEnd = freshLines.length;
+
+        const freshLinesBefore = freshLines.slice(0, freshBlockStart - 1);
+        const freshTargetBlock = freshLines.slice(freshBlockStart - 1, freshBlockEnd).join(newline);
+        const freshLinesAfter = freshLines.slice(freshBlockEnd);
+        let freshPatchedBlock = freshTargetBlock;
+        let freshSynthesized = false;
+
+        // Apply same repair rules
+        if (objectiveRelevantDefects.some((d) => d.symbol === 'debug_probe')) {
+          if (targetLanguage === 'php') {
+            const b = freshPatchedBlock;
+            freshPatchedBlock = freshPatchedBlock.replace(/\s*var_dump\([^)]*\);?/g, '').replace(/\s*die\([^)]*\);?/g, '').replace(/\s*print_r\([^)]*\);?/g, '').replace(/\s*dd\([^)]*\);?/g, '');
+            if (freshPatchedBlock !== b) freshSynthesized = true;
+          } else if (targetLanguage === 'javascript' || targetLanguage === 'typescript') {
+            const b = freshPatchedBlock;
+            freshPatchedBlock = freshPatchedBlock.replace(/\s*debugger;?/g, '');
+            if (freshPatchedBlock !== b) freshSynthesized = true;
+          } else if (targetLanguage === 'python') {
+            const b = freshPatchedBlock;
+            freshPatchedBlock = freshPatchedBlock.replace(/\s*breakpoint\(\);?/g, '').replace(/\s*(?:import\s+pdb;\s*)?pdb\.set_trace\(\);?/g, '');
+            if (freshPatchedBlock !== b) freshSynthesized = true;
+          }
+        } else if (objectiveRelevantDefects.some((d) => d.symbol === 'conditional_assignment' || d.controlFlow?.includes('Assignment expression used inside conditional'))) {
+          const b = freshPatchedBlock;
+          if (targetLanguage === 'php') {
+            freshPatchedBlock = freshPatchedBlock.replace(/((?:if|while)\s*\(\s*\$[a-zA-Z0-9_]+)\s*=\s*(?!=)/g, '$1 == ');
+          } else if (['javascript', 'typescript', 'python'].includes(targetLanguage)) {
+            freshPatchedBlock = freshPatchedBlock.replace(/((?:if|while)\s*\(\s*[a-zA-Z0-9_]+)\s*=\s*(?!=)/g, '$1 === ');
+          }
+          if (freshPatchedBlock !== b) freshSynthesized = true;
+        } else if (objectiveRelevantDefects.some((d) => d.symbol === 'exception_handler' || d.controlFlow?.includes('swallowed in empty catch'))) {
+          const b = freshPatchedBlock;
+          if (['javascript', 'typescript'].includes(targetLanguage)) {
+            freshPatchedBlock = freshPatchedBlock.replace(/catch\s*\(([^)]+)\)\s*\{\s*\}/g, 'catch ($1) {\n    console.error($1);\n  }');
+          } else if (targetLanguage === 'python') {
+            freshPatchedBlock = freshPatchedBlock.replace(/(except(?:\s+[^:]*)?:\s*)(?:pass|\.\.\.)/g, '$1raise');
+          }
+          if (freshPatchedBlock !== b) freshSynthesized = true;
+        }
+
+        if (freshSynthesized && freshPatchedBlock !== freshTargetBlock) {
+          const freshReconstructed = [
+            ...freshLinesBefore,
+            ...freshPatchedBlock.split(/\r?\n/),
+            ...freshLinesAfter,
+          ];
+          const freshPatchedContent = freshReconstructed.join(newline) + (freshHasTrailing ? newline : '');
+          const freshSrcLines = freshContent.split(/\r?\n/);
+          if (freshContent.endsWith('\n') && freshSrcLines.at(-1) === '') freshSrcLines.pop();
+          const freshPatLines = freshPatchedContent.split(/\r?\n/);
+          if (freshPatchedContent.endsWith('\n') && freshPatLines.at(-1) === '') freshPatLines.pop();
+
+          const freshSurgical = generateSurgicalDiff(freshContent, freshPatchedContent, targetFile);
+          const freshRaw = [
+            `--- a/${normTarget}`,
+            `+++ b/${normTarget}`,
+            `@@ -1,${freshSrcLines.length} +1,${freshPatLines.length} @@`,
+            ...freshSrcLines.map((l) => `-${l}`),
+            ...freshPatLines.map((l) => `+${l}`),
+            '',
+          ].join('\n');
+
+          const freshContract = {
+            ...proposalContract,
+            diffPreview: freshSurgical.rawPatch || freshRaw,
+            surgicalDiff: freshSurgical.rawPatch,
+            rawPatch: freshRaw,
+            originalCode: freshSurgical.originalCode || targetFinding.codeEvidence || '',
+            proposedCode: freshSurgical.proposedCode || '',
+          };
+
+          const freshScopeCheck = validatePatchScope({
+            targetFiles: [targetFile],
+            inspectedFiles: inspectedFiles.map((f) => (typeof f === 'string' ? f : f.path)),
+            verifiedFindings: objectiveRelevantDefects,
+            proposalContract: freshContract,
+            acceptanceCriteria: requirementsAnalysis.acceptanceCriteria,
+          });
+
+          if (freshScopeCheck.isValid) {
+            task = await createProposal({
+              root,
+              raw: freshRaw,
+              expectedSnapshots: [freshSnapshot],
+              sessionId,
+              ownerWebContentsId,
+              scope,
+              conversationTurnId: turn.turnId,
+              proposalContract: freshContract,
+            });
+            activeBeforeSnapshot = freshSnapshot;
+            activeRawPatch = freshRaw;
+            activeProposalContract = freshContract;
+            recovered = true;
+          }
+        }
+      }
+    } catch (_recoveryErr) {
+      recovered = false;
+    }
+
+    if (!recovered || !task) {
+      const finalReason = `Proposal validation failed (${mismatchType}): ${proposalErr.message}`;
+      advanceConversationTurn(turn.turnId, 'failed', owner, {
+        phase: 'proposal_validation_failed',
+        reason: finalReason,
+      });
+      advanceTaskPlan(taskPlan, {
+        subtaskId: 'ST-3',
+        status: 'FAILED',
+        outcome: finalReason,
+      });
+      return {
+        outcome: 'PROPOSAL_VALIDATION_FAILED',
+        phase: 'PROPOSAL_VALIDATION',
+        turnId: turn.turnId,
+        taskPlan,
+        mismatchType,
+        targetFile,
+        expectedRevision: activeBeforeSnapshot?.hash || null,
+        actualRevision: freshSnapshot?.hash || null,
+        reason: finalReason,
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: false,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'FAILED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'INVESTIGATE', 'PLAN'],
+          rootCause: objectiveRelevantDefects[0] || null,
+        }),
+      };
+    }
+  }
   if (isCancelled()) {
     cancelTask(task.taskId, owner);
     return cancelledResult('APPROVE', task.taskId);
@@ -10463,11 +10781,14 @@ module.exports = {
   createTaskPlan,
   advanceTaskPlan,
   detectSourceLanguage,
+  PROPOSAL_MISMATCH_TYPES,
+  classifyProposalMismatch,
   executeAutonomousCodingWorkflow, isSuccessfulVerificationResult, isSuccessfulVerificationAttempt, normalizeVerificationStatus,
   buildWorkflowReceipt, validateWorkflowReceipt,
   validateSafePath, isGreenfieldWorkspace, discoverProjectConventions,
   deriveModularPlan, synthesizeMultiFilePatch, verifyIntegrationReachability,
   INTENT_CATEGORIES,
+  PROCESSING_LEVELS,
   classifyTaskIntent,
   extractConstraints,
   WORKSPACE_STATES,

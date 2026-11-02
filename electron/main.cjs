@@ -12,6 +12,10 @@ const developerIndex = require('./developerIndex.cjs');
 const developerContext = require('./developerContext.cjs');
 const developerBenchmark = require('./developerBenchmark.cjs');
 const generalAgent = require('./generalAgent.cjs');
+const {
+  classifyTaskIntent,
+  PROCESSING_LEVELS,
+} = require('./coding-pipeline/genericIntentClassifier.cjs');
 const { ProviderSecretVault } = require('./providerSecretVault.cjs');
 const { authorizeAppOwnedMutation } = require('./appOwnedPersistence.cjs');
 const { normalizeVerificationCriteria } = require('./coding-pipeline/workItemVerificationContract.cjs');
@@ -2889,18 +2893,28 @@ app.whenReady().then(async () => {
     }
     pruneWorkflowExecutions();
     let execution = null;
-    const taskId = workflowRequestId;
-    taskActivityService.createTask({
-      taskId,
-      title: userRequest,
-      projectRoot: root,
-      sessionId: owner.sessionId,
-      ownerWebContentsId: event.sender.id,
-      correlationId: workflowRequestId,
+    const sanitizedContextMessages = Array.isArray(payload?.contextMessages)
+      ? payload.contextMessages.filter((m) => m && ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
+      : [];
+    const authoritativeIntent = classifyTaskIntent({
+      request: userRequest,
+      contextMessages: sanitizedContextMessages,
     });
-    try {
-      taskActivityService.transitionTaskState(workflowRequestId, 'RUNNING', 'Autonomous coding workflow initiated', { owner });
-    } catch {}
+    const isLevelA = authoritativeIntent.processingLevel === PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION;
+    const taskId = isLevelA ? null : workflowRequestId;
+    if (!isLevelA) {
+      taskActivityService.createTask({
+        taskId,
+        title: userRequest,
+        projectRoot: root,
+        sessionId: owner.sessionId,
+        ownerWebContentsId: event.sender.id,
+        correlationId: workflowRequestId,
+      });
+      try {
+        taskActivityService.transitionTaskState(workflowRequestId, 'RUNNING', 'Autonomous coding workflow initiated', { owner });
+      } catch {}
+    }
 
     let activitySeq = 0;
     const onProgress = (progress) => {
@@ -2911,19 +2925,21 @@ app.whenReady().then(async () => {
         ...progress,
         timestamp: new Date().toISOString(),
       });
-      taskActivityService.recordEvent(workflowRequestId, 'PROGRESS', {
-        phase: progress?.phase,
-        message: progress?.message,
-        operationSequence: activitySeq,
-      }, { owner });
-      if (progress?.phase) {
-        const p = String(progress.phase).toUpperCase();
-        if (['UNDERSTAND', 'DISCOVER', 'INVESTIGATE'].includes(p)) {
-          try { taskActivityService.transitionTaskState(workflowRequestId, 'INSPECTING', `Phase: ${progress.phase}`, { owner }); } catch {}
-        } else if (['APPLY', 'PATCH'].includes(p)) {
-          try { taskActivityService.transitionTaskState(workflowRequestId, 'APPLYING', `Phase: ${progress.phase}`, { owner }); } catch {}
-        } else if (['VERIFY', 'TEST', 'RETEST'].includes(p)) {
-          try { taskActivityService.transitionTaskState(workflowRequestId, 'VERIFYING', `Phase: ${progress.phase}`, { owner }); } catch {}
+      if (!isLevelA) {
+        taskActivityService.recordEvent(workflowRequestId, 'PROGRESS', {
+          phase: progress?.phase,
+          message: progress?.message,
+          operationSequence: activitySeq,
+        }, { owner });
+        if (progress?.phase) {
+          const p = String(progress.phase).toUpperCase();
+          if (['UNDERSTAND', 'DISCOVER', 'INVESTIGATE'].includes(p)) {
+            try { taskActivityService.transitionTaskState(workflowRequestId, 'INSPECTING', `Phase: ${progress.phase}`, { owner }); } catch {}
+          } else if (['APPLY', 'PATCH'].includes(p)) {
+            try { taskActivityService.transitionTaskState(workflowRequestId, 'APPLYING', `Phase: ${progress.phase}`, { owner }); } catch {}
+          } else if (['VERIFY', 'TEST', 'RETEST'].includes(p)) {
+            try { taskActivityService.transitionTaskState(workflowRequestId, 'VERIFYING', `Phase: ${progress.phase}`, { owner }); } catch {}
+          }
         }
       }
     };
@@ -3132,6 +3148,8 @@ app.whenReady().then(async () => {
       requestApproval,
       isCancelled: () => execution.cancelRequested || event.sender.isDestroyed?.() === true,
       tools: payload?.tools || null,
+      contextMessages: sanitizedContextMessages,
+      genericIntent: authoritativeIntent,
     });
     execution.promise = promise.then((result) => {
       execution.settled = true;
@@ -3141,27 +3159,31 @@ app.whenReady().then(async () => {
         : null;
       execution.expiresAt = Date.now() + WORKFLOW_EXECUTION_TTL_MS;
       if (electronE2eTestMode) electronE2eTestMode.recordWorkflowResult(workflowRequestId, result);
-      if (result?.outcome === 'COMPLETED' || result?.codeVerified === true) {
-        try { taskActivityService.transitionTaskState(workflowRequestId, 'COMPLETED', result?.message || 'Workflow verified successfully', { owner }); } catch {}
-      } else if (result?.outcome === 'CANCELLED' || execution.cancelRequested) {
-        try { taskActivityService.transitionTaskState(workflowRequestId, 'CANCELLED', result?.message || 'Workflow cancelled', { owner }); } catch {}
-      } else if (result?.outcome === 'BLOCKED' || result?.status === 'BLOCKED') {
-        try { taskActivityService.transitionTaskState(workflowRequestId, 'BLOCKED', result?.message || 'Workflow blocked', { owner }); } catch {}
-      } else {
-        try { taskActivityService.transitionTaskState(workflowRequestId, 'FAILED', result?.message || 'Workflow execution or verification failed', { owner }); } catch {}
+      if (!isLevelA) {
+        if (result?.outcome === 'COMPLETED' || result?.codeVerified === true) {
+          try { taskActivityService.transitionTaskState(workflowRequestId, 'COMPLETED', result?.message || 'Workflow verified successfully', { owner }); } catch {}
+        } else if (result?.outcome === 'CANCELLED' || execution.cancelRequested) {
+          try { taskActivityService.transitionTaskState(workflowRequestId, 'CANCELLED', result?.message || 'Workflow cancelled', { owner }); } catch {}
+        } else if (result?.outcome === 'BLOCKED' || result?.status === 'BLOCKED') {
+          try { taskActivityService.transitionTaskState(workflowRequestId, 'BLOCKED', result?.message || 'Workflow blocked', { owner }); } catch {}
+        } else {
+          try { taskActivityService.transitionTaskState(workflowRequestId, 'FAILED', result?.message || 'Workflow execution or verification failed', { owner }); } catch {}
+        }
+        taskActivityService.recordEvent(workflowRequestId, 'WORKFLOW_SETTLED', {
+          outcome: result?.outcome,
+          status: result?.status,
+          codeVerified: result?.codeVerified,
+          filesModified: result?.filesModified,
+          workflowReceipt: result?.workflowReceipt,
+        }, { owner });
       }
-      taskActivityService.recordEvent(workflowRequestId, 'WORKFLOW_SETTLED', {
-        outcome: result?.outcome,
-        status: result?.status,
-        codeVerified: result?.codeVerified,
-        filesModified: result?.filesModified,
-        workflowReceipt: result?.workflowReceipt,
-      }, { owner });
       return result;
     }, (error) => {
       workflowExecutions.delete(workflowRequestKey);
-      try { taskActivityService.transitionTaskState(workflowRequestId, 'FAILED', error?.message || String(error), { owner }); } catch {}
-      taskActivityService.recordEvent(workflowRequestId, 'WORKFLOW_ERROR', { error: error?.message || String(error) }, { owner });
+      if (!isLevelA) {
+        try { taskActivityService.transitionTaskState(workflowRequestId, 'FAILED', error?.message || String(error), { owner }); } catch {}
+        taskActivityService.recordEvent(workflowRequestId, 'WORKFLOW_ERROR', { error: error?.message || String(error) }, { owner });
+      }
       throw error;
     });
     return execution.promise;

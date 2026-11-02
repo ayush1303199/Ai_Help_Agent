@@ -9,6 +9,7 @@ const developerAgent = require('../electron/developerAgent.cjs');
 const developerFiles = require('../electron/developerFiles.cjs');
 const {
   INTENT_CATEGORIES,
+  PROCESSING_LEVELS,
   classifyTaskIntent,
   extractConstraints,
   checkAmbiguity,
@@ -332,6 +333,97 @@ try {
   assert.equal(runResult.executionBlocked, true);
   assert.match(runResult.reason, /process isolation/i);
   assert.equal(runResult.filesModified.length, 0);
+
+  // D. Ambiguous add dependency request (asks clarification, does not silently convert to npm install)
+  const ambigDepResult = await developerAgent.executeAutonomousCodingWorkflow({
+    userRequest: 'add a package',
+    root: nodeAppDir,
+    sessionId,
+    ownerWebContentsId: ownerA,
+  });
+  assert.equal(ambigDepResult.outcome, 'CLARIFICATION_REQUIRED');
+  assert.equal(ambigDepResult.phase, 'UNDERSTAND');
+  assert.match(ambigDepResult.clarificationPrompt, /Which package or dependency would you like to install/i);
+
+  // E. Language conflict in existing project without explicit path
+  const conflictResult = await developerAgent.executeAutonomousCodingWorkflow({
+    userRequest: 'write a python script to process the data',
+    root: nodeAppDir,
+    sessionId,
+    ownerWebContentsId: ownerA,
+  });
+  assert.equal(conflictResult.outcome, 'CLARIFICATION_REQUIRED');
+  assert.equal(conflictResult.phase, 'UNDERSTAND');
+  assert.match(conflictResult.clarificationPrompt, /conflicts with the detected/i);
+
+  // F. Language conflict resolved when explicit path is provided
+  const resolvedPathResult = await developerAgent.executeAutonomousCodingWorkflow({
+    userRequest: 'write a python script in scripts/processor.py',
+    root: nodeAppDir,
+    sessionId,
+    ownerWebContentsId: ownerA,
+  });
+  assert.notEqual(resolvedPathResult.outcome, 'CLARIFICATION_REQUIRED');
+
+  // =========================================================================
+  // 7. Milestone V44.37: Adaptive Workflow Intelligence & Processing Levels
+  // =========================================================================
+  console.log('Testing Milestone V44.37: Adaptive Workflow Intelligence & Processing Levels...');
+
+  // Level A: Pure conversational interaction
+  const levelA1 = classifyTaskIntent({ request: 'Hello! How are you doing today?' });
+  assert.equal(levelA1.processingLevel, PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION);
+  assert.equal(levelA1.actionable, false);
+
+  const levelA2 = classifyTaskIntent({ request: 'Thanks for your help!' });
+  assert.equal(levelA2.processingLevel, PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION);
+  assert.equal(levelA2.actionable, false);
+
+  const levelA3 = classifyTaskIntent({ request: 'Sounds good, let us proceed.' });
+  assert.equal(levelA3.processingLevel, PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION);
+  assert.equal(levelA3.actionable, false);
+
+  // Level B: Lightweight Understanding & Inquiries
+  const levelB1 = classifyTaskIntent({ request: 'Can you explain how developerAgent implements rollback?' });
+  assert.equal(levelB1.processingLevel, PROCESSING_LEVELS.LEVEL_B_LIGHTWEIGHT_UNDERSTANDING);
+  assert.equal(levelB1.actionable, false);
+
+  const levelB2 = classifyTaskIntent({ request: 'How does the message queue routing work in this codebase?' });
+  assert.equal(levelB2.processingLevel, PROCESSING_LEVELS.LEVEL_B_LIGHTWEIGHT_UNDERSTANDING);
+  assert.equal(levelB2.actionable, false);
+
+  // Level C: Focused Read-only Investigation
+  const levelC1 = classifyTaskIntent({ request: 'Please investigate the crash without modifying any files' });
+  assert.equal(levelC1.processingLevel, PROCESSING_LEVELS.LEVEL_C_FOCUSED_INVESTIGATION);
+  assert.equal(levelC1.actionable, true);
+  assert.equal(levelC1.mutationRequired, false);
+
+  // Level D: Full Development Workflow
+  const levelD1 = classifyTaskIntent({ request: 'Please fix the bug in server.js' });
+  assert.equal(levelD1.processingLevel, PROCESSING_LEVELS.LEVEL_D_FULL_DEVELOPMENT);
+  assert.equal(levelD1.actionable, true);
+  assert.equal(levelD1.mutationRequired, true);
+
+  // Conversational preamble + action command must NOT be treated as greeting
+  const preambleFix = classifyTaskIntent({ request: 'Hello! Good morning. Please fix the bug in server.js' });
+  assert.equal(preambleFix.processingLevel, PROCESSING_LEVELS.LEVEL_D_FULL_DEVELOPMENT);
+  assert.equal(preambleFix.primaryIntent, INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG);
+  assert.equal(preambleFix.actionable, true);
+  assert.equal(preambleFix.mutationRequired, true);
+
+  // Level A Workflow Execution: Unnecessary Investigation Eliminated
+  const directResult = await developerAgent.executeAutonomousCodingWorkflow({
+    userRequest: 'Hello! How are you doing today?',
+    root: nodeAppDir,
+    sessionId,
+    ownerWebContentsId: ownerA,
+  });
+  assert.equal(directResult.outcome, 'COMPLETED');
+  assert.equal(directResult.phase, 'DIRECT_INTERACTION');
+  assert.equal(directResult.processingLevel, PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION);
+  assert.equal(directResult.filesModified.length, 0);
+  assert.equal(directResult.inspectedFiles.length, 0);
+  assert.deepEqual(directResult.workflowReceipt.stagesCompleted, ['UNDERSTAND', 'DIRECT_INTERACTION']);
 
   // Clean up sessions
   developerAgent.releaseSession(ownerA);
