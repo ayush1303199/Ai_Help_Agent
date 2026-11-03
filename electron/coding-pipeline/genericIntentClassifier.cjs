@@ -287,7 +287,37 @@ function checkAmbiguity(text, projectContext = null, contextMessages = []) {
   const isVague = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:this|it|the\s+project|the\s+app|the\s+code|performance|things)|fix\s+(?:this|it|the\s+bug|that\s+bug|the\s+code|stuff|things)|do\s+(?:something|coding|it)|optimize\s+(?:this|it|everything)|clean\s+(?:it\s+)?up)(?:\s+(?:now|please|for\s+me))?\s*[.!?]*$/i.test(clean)
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(clean) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(clean));
 
+  function referencesDefectOrArtifact(str) {
+    if (typeof str !== 'string' || str.trim().length < 5) return false;
+    const hasFile = /\b[\w-]+\.(?:js|cjs|mjs|ts|tsx|jsx|json|php|py|rb|go|rs|html|css|sql|ya?ml|env)\b/i.test(str);
+    const hasFinding = /\b(?:root\s+cause|identified\s+(?:a\s+)?defect|found\s+(?:a\s+)?defect|unhandled\s+rejection|null\s+pointer|memory\s+leak|stack\s+trace)\b/i.test(str);
+    const hasDefectWithTarget = /\b(?:defect|bug|error|exception|failure|crash|leak|timeout|issue|unhandled|broken|failing)\b/i.test(str)
+      && /\b(?:in|at|on|for|with)\s+(?:the\s+)?[\w_.-]+/i.test(str);
+    return hasFile || hasFinding || hasDefectWithTarget;
+  }
+
   if (isVague) {
+    const isCancelled = projectContext?.taskStatus === 'CANCELLED'
+      || projectContext?.isCancelled === true
+      || projectContext?.taskCancelled === true;
+    if (isCancelled) {
+      return {
+        needsClarification: true,
+        clarificationPrompt: 'The previous task was cancelled. Please specify if you would like to restart the task or work on a different issue.',
+        cancelledContext: true,
+      };
+    }
+
+    const isFailed = projectContext?.taskStatus === 'FAILED'
+      || projectContext?.isFailed === true;
+    if (isFailed) {
+      return {
+        needsClarification: true,
+        clarificationPrompt: 'The previous task or verification failed. Please clarify whether you would like to retry the task or investigate the failure.',
+        failedContext: true,
+      };
+    }
+
     const isStaleOrCompleted = projectContext?.taskStatus === 'COMPLETED'
       || projectContext?.isCompleted === true
       || projectContext?.taskCompleted === true
@@ -307,7 +337,7 @@ function checkAmbiguity(text, projectContext = null, contextMessages = []) {
     const hasPriorFindings = priorFindings.length > 0;
 
     const hasPriorContext = Array.isArray(contextMessages) && contextMessages.length > 0
-      && contextMessages.some((msg) => msg && typeof msg.content === 'string' && msg.content.trim().length > 3);
+      && contextMessages.some((msg) => msg && typeof msg.content === 'string' && referencesDefectOrArtifact(msg.content));
     const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|debug)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect)\b/i.test(clean);
 
     if (isAnaphoricFix) {
@@ -571,8 +601,17 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
     };
   }
 
+  function referencesDefectOrArtifact(str) {
+    if (typeof str !== 'string' || str.trim().length < 5) return false;
+    const hasFile = /\b[\w-]+\.(?:js|cjs|mjs|ts|tsx|jsx|json|php|py|rb|go|rs|html|css|sql|ya?ml|env)\b/i.test(str);
+    const hasFinding = /\b(?:root\s+cause|identified\s+(?:a\s+)?defect|found\s+(?:a\s+)?defect|unhandled\s+rejection|null\s+pointer|memory\s+leak|stack\s+trace)\b/i.test(str);
+    const hasDefectWithTarget = /\b(?:defect|bug|error|exception|failure|crash|leak|timeout|issue|unhandled|broken|failing)\b/i.test(str)
+      && /\b(?:in|at|on|for|with)\s+(?:the\s+)?[\w_.-]+/i.test(str);
+    return hasFile || hasFinding || hasDefectWithTarget;
+  }
+
   const hasPriorContext = Array.isArray(contextMessages) && contextMessages.length > 0
-    && contextMessages.some((msg) => msg && typeof msg.content === 'string' && msg.content.trim().length > 3);
+    && contextMessages.some((msg) => msg && typeof msg.content === 'string' && referencesDefectOrArtifact(msg.content));
   const hasPriorFindings = Array.isArray(projectContext?.priorFindings) && projectContext.priorFindings.length > 0;
 
   // 1. Detect Vague / Ambiguous Directives requiring clarification
@@ -685,7 +724,7 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
 
   const isDiscussionOrBrainstorm = /^(?:what\s+if\s+we\b|hows+about\s+(?:we|if)|let's\s+(?:think|discuss|talk|consider|explore|brainstorm)|we\s+could\s+(?:consider|explore|think\s+about)|could\s+we\s+(?:discuss|consider|explore|think\s+about)|can\s+we\s+(?:discuss|consider|explore|think\s+about)|i'm\s+thinking\s+(?:about|we\s+could)|i\s+was\s+thinking\s+(?:about|we\s+could))/i.test(strippedOfCourtesy);
 
-  const directActionPattern = /^(?:debug|fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|upgrade|migrate|replace|resolve|investigate|diagnose|inspect|audit|examine|trace|find\s+and\s+fix|run|start|launch|boot|execute|scaffold|bootstrap|setup|set\s+up|initialize|init|build|install|download)\b/i;
+  const directActionPattern = /^(?:debug|fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|upgrade|migrate|replace|resolve|investigate|diagnose|inspect|audit|examine|trace|find\s+and\s+fix|run|start|launch|boot|execute|scaffold|bootstrap|setup|set\s+up|initialize|init|build|install|download|ensure|make\s+sure|enforce|prevent|handle|support|guard\s+against|enable|disable)\b/i;
   const startsWithDirectAction = directActionPattern.test(strippedOfCourtesy) || clauseStripped.some((c) => directActionPattern.test(c));
 
   // 5. Evaluate Processing Levels
@@ -832,6 +871,19 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
       mutationRequired: false,
       needsClarification: false,
       reasoning: 'Trailing inquiry question without directive to perform project mutations.',
+    };
+  }
+
+  // Case C2: Technical task or actionable instruction referencing concrete artifacts / technical domain
+  if (referencesConcreteArtifacts || referencesTechnicalConcepts || strippedOfCourtesy.length > 25) {
+    return {
+      primaryIntent: INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG,
+      processingLevel: PROCESSING_LEVELS.LEVEL_D_FULL_DEVELOPMENT,
+      confidence: 'MEDIUM',
+      actionable: true,
+      mutationRequired: true,
+      needsClarification: false,
+      reasoning: 'Actionable software engineering task referencing concrete artifacts or technical objectives.',
     };
   }
 

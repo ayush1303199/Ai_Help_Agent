@@ -1883,11 +1883,35 @@ export function classifyCodingRequestIntent(
   }
 
   // 1. Detect vague/ambiguous requests that require clarification before any action
-  const isVague = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:the\s+)?performance|fix\s+(?:the\s+)?(?:bug|issue|code|it|problem)|clean\s+(?:it\s+)?up|do\s+something|look\s+into\s+this|check\s+this|investigate\s+this)\s*[.!?]*$/i.test(text)
+  const isVague = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:this|it|the\s+project|the\s+app|the\s+code|performance|things)|fix\s+(?:this|it|the\s+bug|that\s+bug|the\s+code|stuff|things)|do\s+(?:something|coding|it)|optimize\s+(?:this|it|everything)|clean\s+(?:it\s+)?up)(?:\s+(?:now|please|for\s+me))?\s*[.!?]*$/i.test(text)
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(text) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(text));
   if (isVague) {
+    const isCancelled = projectContext?.taskStatus === 'CANCELLED'
+      || (projectContext as Record<string, unknown> | null | undefined)?.isCancelled === true
+      || (projectContext as Record<string, unknown> | null | undefined)?.taskCancelled === true;
+    if (isCancelled) {
+      return {
+        intent: 'CLARIFICATION_REQUIRED',
+        processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
+        clarificationPrompt: 'The previous task was cancelled. Please specify if you would like to restart the task or work on a different issue.',
+        isActionableTask: false,
+      };
+    }
+
+    const isFailed = projectContext?.taskStatus === 'FAILED'
+      || (projectContext as Record<string, unknown> | null | undefined)?.isFailed === true;
+    if (isFailed) {
+      return {
+        intent: 'CLARIFICATION_REQUIRED',
+        processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
+        clarificationPrompt: 'The previous task or verification failed. Please clarify whether you would like to retry the task or investigate the failure.',
+        isActionableTask: false,
+      };
+    }
+
     const isStaleOrCompleted = projectContext?.taskStatus === 'COMPLETED'
       || projectContext?.isCompleted === true
+      || (projectContext as Record<string, unknown> | null | undefined)?.taskCompleted === true
       || projectContext?.isStale === true;
     if (isStaleOrCompleted) {
       return {
@@ -1898,9 +1922,23 @@ export function classifyCodingRequestIntent(
       };
     }
 
-    const priorFindings = Array.isArray(projectContext?.priorFindings) ? projectContext.priorFindings : [];
+    const referencesDefectOrArtifact = (str: string): boolean => {
+      if (typeof str !== 'string' || str.trim().length < 5) return false;
+      const hasFile = /\b[\w-]+\.(?:js|cjs|mjs|ts|tsx|jsx|json|php|py|rb|go|rs|html|css|sql|ya?ml|env)\b/i.test(str);
+      const hasFinding = /\b(?:root\s+cause|identified\s+(?:a\s+)?defect|found\s+(?:a\s+)?defect|unhandled\s+rejection|null\s+pointer|memory\s+leak|stack\s+trace)\b/i.test(str);
+      const hasDefectWithTarget = /\b(?:defect|bug|error|exception|failure|crash|leak|timeout|issue|unhandled|broken|failing)\b/i.test(str)
+        && /\b(?:in|at|on|for|with)\s+(?:the\s+)?[\w_.-]+/i.test(str);
+      return hasFile || hasFinding || hasDefectWithTarget;
+    };
+
+    const priorFindings = Array.isArray(projectContext?.priorFindings)
+      ? projectContext.priorFindings
+      : (Array.isArray((projectContext as Record<string, unknown> | null | undefined)?.findings)
+        ? (projectContext as Record<string, unknown>).findings as unknown[]
+        : []);
+    const hasPriorFindings = priorFindings.length > 0;
     const hasPriorContext = Array.isArray(contextMessages) && contextMessages.length > 0
-      && contextMessages.some((msg) => msg && typeof msg.content === 'string' && msg.content.trim().length > 3);
+      && contextMessages.some((msg) => msg && typeof msg.content === 'string' && referencesDefectOrArtifact(msg.content));
     const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|debug)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect)\b/i.test(text);
 
     if (isAnaphoricFix) {
@@ -1929,7 +1967,7 @@ export function classifyCodingRequestIntent(
         };
       }
 
-      if (hasPriorContext || priorFindings.length > 0) {
+      if (hasPriorContext || hasPriorFindings) {
         return {
           intent: 'AUTONOMOUS_WORKFLOW_TASK',
           processingLevel: 'LEVEL_D_FULL_DEVELOPMENT',

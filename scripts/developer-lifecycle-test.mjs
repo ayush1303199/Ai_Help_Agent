@@ -5,7 +5,23 @@ import path from 'node:path';
 import agent from '../electron/developerAgent.cjs';
 import files from '../electron/developerFiles.cjs';
 
-const root = await fs.mkdtemp(path.join(process.cwd(), '.developer-lifecycle-'));
+let attemptedExternalRequests = 0;
+let blockedExternalRequests = 0;
+let permittedLoopbackRequests = 0;
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (url, ...args) => {
+  const urlStr = String(url);
+  const isLocal = /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?\//i.test(urlStr);
+  if (!isLocal) {
+    attemptedExternalRequests += 1;
+    blockedExternalRequests += 1;
+    throw new Error(`Unexpected live external network call to ${urlStr} in deterministic offline test.`);
+  }
+  permittedLoopbackRequests += 1;
+  return { ok: true, json: async () => ({ decision: 'ALLOW', ok: true }) };
+};
+
+const root = await fs.mkdtemp(path.join(os.tmpdir(), '.developer-lifecycle-'));
 const ownerWebContentsId = 9001;
 const sessionId = agent.getSession(ownerWebContentsId);
 const owner = { ownerWebContentsId, sessionId };
@@ -363,8 +379,85 @@ try {
   }]);
   assert.equal(await fs.readFile(file, 'utf8'), 'one\ntwo\n', 'A malformed attempt must not prevent rollback.');
 
+  // =========================================================================
+  // Milestone V44.53: Deterministic Offline Synthetic Provider Verification
+  // =========================================================================
+  // Scenario A: Provider connection reset / network error (e.g. daily-cloudcode-pa.googleapis.com)
+  const networkErrorCheck = await agent.runVerificationChecks({
+    checks: ['typecheck'],
+    runCheck: async () => {
+      const err = new Error('fetch failed: connection reset to daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent');
+      err.status = 'NETWORK_ERROR';
+      err.classification = 'NETWORK_ERROR';
+      throw err;
+    },
+  });
+  assert.equal(networkErrorCheck.ok, false, 'Network error must never produce a PASS');
+  assert.equal(networkErrorCheck.status, 'NETWORK_ERROR');
+  assert.equal(networkErrorCheck.classification, 'NETWORK_ERROR');
+
+  // Scenario B: Provider timeout
+  const timeoutCheck = await agent.runVerificationChecks({
+    checks: ['typecheck'],
+    runCheck: async () => {
+      const err = new Error('Provider request timed out after 45000ms (ETIMEDOUT)');
+      err.status = 'TIMEOUT';
+      err.classification = 'TIMEOUT';
+      throw err;
+    },
+  });
+  assert.equal(timeoutCheck.ok, false, 'Provider timeout must never produce a PASS');
+  assert.equal(timeoutCheck.status, 'TIMEOUT');
+  assert.equal(timeoutCheck.classification, 'TIMEOUT');
+
+  // Scenario C: Interrupted streaming / truncated response
+  const interruptedStreamCheck = await agent.runVerificationChecks({
+    checks: ['typecheck'],
+    runCheck: async () => {
+      throw new Error('Streaming response interrupted mid-stream: unexpected EOF from provider');
+    },
+  });
+  assert.equal(interruptedStreamCheck.ok, false, 'Interrupted stream must not produce a PASS');
+  assert.notEqual(interruptedStreamCheck.status, 'PASS');
+
+  // Scenario D: 5 distinct failure outcomes verification (PASS, CODE_FAILURE, BLOCKED, NETWORK_ERROR, CANCELLED)
+  const passCheck = await agent.runVerificationChecks({
+    checks: ['typecheck'],
+    runCheck: async () => ({ ok: true, status: 'PASS', executed: true, exitCode: 0, attempts: [{ check: 'typecheck', ok: true, executed: true, exitCode: 0 }] }),
+  });
+  assert.equal(passCheck.ok, true);
+  assert.equal(passCheck.status, 'PASS');
+
+  const failCheck = await agent.runVerificationChecks({
+    checks: ['typecheck'],
+    runCheck: async () => ({ ok: false, status: 'CODE_FAILURE', classification: 'CODE_FAILURE', executed: true, exitCode: 1, attempts: [{ check: 'typecheck', ok: false, executed: true, exitCode: 1 }] }),
+  });
+  assert.equal(failCheck.ok, false);
+  assert.equal(failCheck.status, 'CODE_FAILURE');
+
+  const blockedCheck = await agent.runVerificationChecks({
+    checks: ['typecheck'],
+    runCheck: async () => ({ ok: false, status: 'BLOCKED', executionBlocked: true, evidenceState: 'NOT_ESTABLISHED', executed: false, exitCode: null }),
+  });
+  assert.equal(blockedCheck.ok, false);
+  assert.equal(blockedCheck.status, 'BLOCKED');
+
+  const cancelledCheck = await agent.runVerificationChecks({
+    checks: ['typecheck'],
+    isCancelled: () => true,
+    runCheck: async () => ({ ok: true }),
+  });
+  assert.equal(cancelledCheck.ok, false);
+  assert.equal(cancelledCheck.status, 'CANCELLED');
+
+  // Scenario E: Zero Live Network Calls
+  assert.equal(attemptedExternalRequests, 0, 'Lifecycle test must execute with ZERO attempted external requests');
+  assert.equal(blockedExternalRequests, 0, 'Lifecycle test must have ZERO blocked external requests');
+  console.log(`[NETWORK_GUARD] developer-lifecycle-test: attemptedExternalRequests=${attemptedExternalRequests}, blockedExternalRequests=${blockedExternalRequests}, permittedLoopbackRequests=${permittedLoopbackRequests}`);
+
   console.log('developer lifecycle tests passed');
 } finally {
+  globalThis.fetch = originalFetch;
   try { files.clearProject(ownerWebContentsId); } catch { /* fixture may not own the project after cleanup */ }
   agent.resetForTest();
   await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });

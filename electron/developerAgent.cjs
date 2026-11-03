@@ -149,7 +149,15 @@ const {
   checkBuildPrerequisites,
   createBuildPlan,
   executeBuildPlan,
+  isAuthorizedBuildPlanHarness,
 } = require('./coding-pipeline/buildOrchestrator.cjs');
+
+function resolveBuildPlanExecutor(tools) {
+  if (tools?.executeBuildPlan && typeof isAuthorizedBuildPlanHarness === 'function' && isAuthorizedBuildPlanHarness(tools.executeBuildPlan)) {
+    return tools.executeBuildPlan;
+  }
+  return executeBuildPlan;
+}
 const {
   DIAGNOSTIC_STATUSES,
   FAILURE_CATEGORIES,
@@ -805,6 +813,7 @@ const VERIFICATION_FAILURE_STATUSES = new Set([
   'ENVIRONMENT_FAILURE',
   'DEPENDENCY_FAILURE',
   'PROVIDER_FAILURE',
+  'NETWORK_ERROR',
   'SKIPPED',
   'VERIFICATION_UNAVAILABLE',
 ]);
@@ -3014,6 +3023,8 @@ function classifyFailureCategory(result) {
   if (result?.cancelled) return 'CANCELLED';
   if (result?.timedOut) return 'TIMEOUT';
   const text = `${result?.stderr || ''}\n${result?.stdout || ''}\n${result?.error || ''}`;
+  if (result?.timedOut || /timeout|timed out|etimedout/i.test(text)) return 'TIMEOUT';
+  if (/fetch failed|econnreset|enotfound|connection reset|socket hang up|network error|ehostunreach|econnrefused/i.test(text)) return 'NETWORK_ERROR';
   if (/provider|quota|rate.?limit|429|503|high demand|service unavailable/i.test(text)) return 'PROVIDER_FAILURE';
   if (result?.spawnError || result?.error) {
     return /not found|enoent|cannot find/i.test(text) ? 'COMMAND_NOT_AVAILABLE' : 'ENVIRONMENT_FAILURE';
@@ -3337,9 +3348,12 @@ function normalizeObservation(result, check = result?.script || '') {
 }
 function verificationFailureFromError(error, script = '') {
   const executionBlocked = error?.executionBlocked === true;
+  const isTimeout = error?.status === 'TIMEOUT' || error?.classification === 'TIMEOUT' || error?.timedOut === true || /timeout|timed out|etimedout/i.test(error?.message || '');
+  const isNetwork = !isTimeout && (error?.status === 'NETWORK_ERROR' || error?.classification === 'NETWORK_ERROR'
+    || /fetch failed|econnreset|enotfound|connection reset|socket hang up|streamGenerateContent/i.test(error?.message || ''));
   const status = executionBlocked
     ? GATE_FAILURE_STATUSES.has(error?.executionStatus) ? error.executionStatus : 'BLOCKED'
-    : 'UNVERIFIED';
+    : (isTimeout ? 'TIMEOUT' : (isNetwork ? 'NETWORK_ERROR' : 'UNVERIFIED'));
   const evidenceState = executionBlocked && NON_PASS_EVIDENCE_STATES.has(error?.evidenceState)
     ? error.evidenceState
     : undefined;
@@ -3562,7 +3576,7 @@ async function runEngineeringLoop({
   return { status: 'MAX_ATTEMPTS', attempts: observations, fixes };
 }
 
-async function resolveContractTarget(target, { candidatePaths = [], callerPath = '' } = {}) {
+function resolveContractTarget(target, { candidatePaths = [], callerPath = '' } = {}) {
   if (!target || typeof target !== 'string') return null;
   const cleanTarget = target.trim().replace(/^['"]|['"]$/g, '').replace(/\\/g, '/');
   if (!cleanTarget) return null;
@@ -4366,7 +4380,7 @@ async function handleTestFailureRepairAndRerun({
 
   advanceConversationTurn(turn.turnId, 'verifying', owner, { phase: 'repair_rerun_verifying' });
   onProgress({ phase: 'BUILD_PLAN', message: 'Rerunning project tests after applying repair patch.' });
-  const rerunExecResult = await executeBuildPlan({
+  const rerunExecResult = await resolveBuildPlanExecutor(tools)({
     plan,
     ownerWebContentsId,
     sessionId,
@@ -4633,7 +4647,7 @@ async function resumeAutonomousTestRepairWorkflow({
 
   advanceConversationTurn(turn.turnId, 'verifying', owner, { phase: 'repair_rerun_verifying' });
   onProgress({ phase: 'BUILD_PLAN', message: 'Rerunning project tests after applying repair patch.' });
-  const rerunExecResult = await executeBuildPlan({
+  const rerunExecResult = await resolveBuildPlanExecutor(tools)({
     plan,
     ownerWebContentsId,
     sessionId,
@@ -5700,7 +5714,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     });
     taskPlan.buildPlan = runnableTestPlan;
 
-    const testExecResult = await executeBuildPlan({ plan: runnableTestPlan, ownerWebContentsId, sessionId, containerRunner });
+    const testExecResult = await resolveBuildPlanExecutor(tools)({ plan: runnableTestPlan, ownerWebContentsId, sessionId, containerRunner });
 
     if (!testExecResult.ok && testExecResult.executionBlocked) {
       const diagnosis = diagnoseFailure(testExecResult, { projectRoot: root, attemptHistory: taskPlan.attemptHistory || [] });
@@ -6444,7 +6458,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
       };
     }
 
-    const execResult = await executeBuildPlan({ plan, ownerWebContentsId, sessionId, containerRunner });
+    const execResult = await resolveBuildPlanExecutor(tools)({ plan, ownerWebContentsId, sessionId, containerRunner });
     if (!execResult.ok && execResult.executionBlocked) {
       const diagnosis = diagnoseFailure(execResult, {
         projectRoot: root,
@@ -7053,7 +7067,13 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     scope,
     acceptanceCriteria: [...(requirementsAnalysis.acceptanceCriteria || [])],
   };
-  const createTaskState = ({ status, phase = 'INVESTIGATE', reason = null, nextAction = null } = {}) => ({
+  const createTaskState = ({ status, phase = 'INVESTIGATE', reason = null, classification = null, nextAction = null } = {}) => {
+    const isTimeout = /timeout|timed out|etimedout/i.test(reason || '');
+    const isNetwork = !isTimeout && /network|econnreset|enotfound|fetch failed|connection reset|socket hang up|streamGenerateContent/i.test(reason || '');
+
+    const determinedClassification = classification
+      || (status === 'INCOMPLETE' ? (isTimeout ? 'TIMEOUT' : (isNetwork ? 'NETWORK_ERROR' : 'PROVIDER_FAILURE')) : null);
+    return {
     objective: {
       request: originalObjective.request,
       scope: originalObjective.scope,
@@ -7061,6 +7081,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     },
     status,
     phase,
+    classification: determinedClassification,
     evidence: {
       searches: sessionSearches.map((search) => ({
         query: search.query,
@@ -7088,7 +7109,8 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     recoveries: recoveryEvents.map((event) => ({ ...event })),
     unresolvedQuestions: reason ? [reason] : [],
     nextAction,
-  });
+  };
+  };
   const searchState = continuation || {
     root,
     scope,
@@ -7425,6 +7447,10 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
   };
   const incompleteRelevanceResult = (reason, assessments = []) => {
     storeObjectiveAssessments(assessments);
+    const isTimeout = /timeout|timed out|etimedout/i.test(reason);
+    const isNetworkError = !isTimeout && /network|econnreset|enotfound|fetch failed|connection reset|socket hang up|streamGenerateContent/i.test(reason);
+
+    const failureClassification = isTimeout ? 'TIMEOUT' : (isNetworkError ? 'NETWORK_ERROR' : 'PROVIDER_FAILURE');
     const remainingCandidates = [...candidateFiles.keys()].filter((candidatePath) => (
       !readPaths.has(candidatePath) && (readAttempts.get(candidatePath) || 0) < 2
     ));
@@ -7469,6 +7495,8 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     return {
       outcome: 'INVESTIGATION_INCOMPLETE',
       phase: 'INVESTIGATE',
+      classification: failureClassification,
+      failureClassification,
       turnId: turn.turnId,
       architecture: projectArch,
       taskPlan,

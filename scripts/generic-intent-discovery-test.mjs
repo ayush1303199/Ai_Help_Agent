@@ -425,6 +425,64 @@ try {
   assert.equal(directResult.inspectedFiles.length, 0);
   assert.deepEqual(directResult.workflowReceipt.stagesCompleted, ['UNDERSTAND', 'DIRECT_INTERACTION']);
 
+  // =========================================================================
+  // 8. Milestone V44.41: Adversarial Context Integrity & Stale Isolation
+  // =========================================================================
+  console.log('Testing Milestone V44.41: Adversarial Context Integrity & Stale Isolation...');
+
+  // A. Cancelled task context isolation
+  const cancelledRes = checkAmbiguity('Fix it now.', { taskStatus: 'CANCELLED' }, [
+    { role: 'assistant', content: 'Found a defect in auth.js: unhandled rejection.' }
+  ]);
+  assert.equal(cancelledRes.needsClarification, true);
+  assert.equal(cancelledRes.cancelledContext, true);
+  assert.match(cancelledRes.clarificationPrompt, /cancelled/i);
+
+  // B. Failed task context isolation
+  const failedRes = checkAmbiguity('Fix it now.', { taskStatus: 'FAILED' }, [
+    { role: 'assistant', content: 'Found a defect in auth.js: unhandled rejection.' }
+  ]);
+  assert.equal(failedRes.needsClarification, true);
+  assert.equal(failedRes.failedContext, true);
+  assert.match(failedRes.clarificationPrompt, /failed/i);
+
+  // C. Stale completed task isolation
+  const staleRes = checkAmbiguity('Fix it now.', { taskStatus: 'COMPLETED' }, [
+    { role: 'assistant', content: 'Found a defect in auth.js: unhandled rejection.' }
+  ]);
+  assert.equal(staleRes.needsClarification, true);
+  assert.equal(staleRes.staleContext, true);
+  assert.match(staleRes.clarificationPrompt, /already completed/i);
+
+  // D. Social chat / non-defect context rejection
+  const socialRes = checkAmbiguity('Fix it.', null, [
+    { role: 'user', content: 'Hello there, how are you?' },
+    { role: 'assistant', content: 'Doing great, thanks for asking!' }
+  ]);
+  assert.equal(socialRes.needsClarification, true);
+  assert.match(socialRes.clarificationPrompt, /ambiguous/i);
+
+  // E. Multiple findings ambiguity in projectContext
+  const multiFindingsRes = checkAmbiguity('Fix it.', { priorFindings: ['Issue 1 in server.js', 'Issue 2 in db.js'] });
+  assert.equal(multiFindingsRes.needsClarification, true);
+  assert.equal(multiFindingsRes.multipleCandidates, true);
+  assert.match(multiFindingsRes.clarificationPrompt, /Multiple issues were identified/i);
+
+  // F. Multiple findings in latest assistant message
+  const multiMsgRes = checkAmbiguity('Fix it.', null, [
+    { role: 'assistant', content: 'Found multiple issues:\n1. Null pointer in server.js\n2. Timeout in db.js' }
+  ]);
+  assert.equal(multiMsgRes.needsClarification, true);
+  assert.equal(multiMsgRes.multipleCandidates, true);
+  assert.match(multiMsgRes.clarificationPrompt, /Multiple issues were identified/i);
+
+  // G. Legitimate defect in context resolves cleanly
+  const legitRes = checkAmbiguity('Fix it.', null, [
+    { role: 'assistant', content: 'Identified a defect: unhandled rejection in auth.js:42.' }
+  ]);
+  assert.equal(legitRes.needsClarification, false);
+  assert.equal(legitRes.resolvedFromContext, true);
+
   // Clean up sessions
   developerAgent.releaseSession(ownerA);
   developerFiles.releaseProject(ownerA);

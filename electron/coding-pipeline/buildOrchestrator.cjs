@@ -928,12 +928,38 @@ async function executeBuildPlan({
  * @param {Function} options.isolationGate
  * @param {ProjectContainerExecutionRunner} options.containerRunner
  */
+/**
+ * Module-private capability store for authentic test harnesses.
+ * Only authentic functions registered directly by createBuildPlanTestHarness are accepted.
+ * Unexported, un-enumerable, and impossible to access, inspect, or populate from outside this module.
+ */
+const authorizedTestHarnessRegistry = new WeakSet();
+const PRIVATE_HARNESS_TOKEN = Symbol('PRIVATE_BUILD_PLAN_HARNESS_TOKEN');
+
+function isAuthorizedBuildPlanHarness(candidate) {
+  if (typeof candidate !== 'function') {
+    return false;
+  }
+  if (!authorizedTestHarnessRegistry.has(candidate)) {
+    return false;
+  }
+  if (candidate[PRIVATE_HARNESS_TOKEN] !== true) {
+    return false;
+  }
+  return true;
+}
+
 function createBuildPlanTestHarness({ isolationGate, containerRunner } = {}) {
   const { ProjectContainerExecutionRunner } = require('./projectContainerExecutionRunner.cjs');
   if (
     !containerRunner ||
+    typeof containerRunner !== 'object' ||
     !(containerRunner instanceof ProjectContainerExecutionRunner) ||
-    containerRunner.isMockRunner !== true
+    containerRunner.constructor !== ProjectContainerExecutionRunner ||
+    containerRunner.isMockRunner !== true ||
+    typeof containerRunner.execute !== 'function' ||
+    typeof containerRunner.dockerCli !== 'function' ||
+    typeof containerRunner.runtimeDetector !== 'function'
   ) {
     throw new Error('Test harness requires an authentic ProjectContainerExecutionRunner mock instance.');
   }
@@ -941,23 +967,35 @@ function createBuildPlanTestHarness({ isolationGate, containerRunner } = {}) {
     throw new Error('Test harness requires a valid isolation gate function.');
   }
 
-  return {
-    executeBuildPlan: async ({
+  const executeHarness = async ({
+    plan,
+    ownerWebContentsId,
+    sessionId,
+    runner = null,
+  } = {}) => {
+    return _executeBuildPlanCore({
       plan,
       ownerWebContentsId,
       sessionId,
-      runner = null,
-    } = {}) => {
-      return _executeBuildPlanCore({
-        plan,
-        ownerWebContentsId,
-        sessionId,
-        runner,
-        containerRunner,
-        isolationGate,
-      });
-    },
+      runner,
+      containerRunner,
+      isolationGate,
+    });
   };
+
+  Object.defineProperty(executeHarness, PRIVATE_HARNESS_TOKEN, {
+    value: true,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
+  Object.freeze(executeHarness);
+  authorizedTestHarnessRegistry.add(executeHarness);
+
+  return Object.freeze({
+    executeBuildPlan: executeHarness,
+  });
 }
 
 module.exports = {
@@ -969,4 +1007,5 @@ module.exports = {
   createBuildPlan,
   executeBuildPlan,
   createBuildPlanTestHarness,
+  isAuthorizedBuildPlanHarness,
 };

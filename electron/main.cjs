@@ -2867,22 +2867,29 @@ app.whenReady().then(async () => {
     if (payload?.workflowRequestId !== undefined && !isUuid(payload.workflowRequestId)) {
       throw new TypeError('Invalid Coding workflow request ID.');
     }
-    if (['requestApproval', 'userApproved', 'autoApprove'].some((key) => Object.prototype.hasOwnProperty.call(payload || {}, key))) {
-      throw new Error('Renderer-supplied approval claims are not accepted.');
+    if (['requestApproval', 'userApproved', 'autoApprove', 'tools', 'containerRunner', 'runner', 'executeBuildPlan', 'provider', 'syntheticProvider', 'assessFindingRelevance', 'modelProvider', 'mockProvider'].some((key) => Object.prototype.hasOwnProperty.call(payload || {}, key))) {
+      throw new Error('Renderer-supplied approval claims or execution tools are not accepted.');
     }
     if (payload?.continuationToken !== undefined && !isUuid(payload.continuationToken)) {
       throw new TypeError('Invalid investigation continuation token.');
     }
+    const sanitizedContextMessages = Array.isArray(payload?.contextMessages)
+      ? payload.contextMessages
+          .filter((m) => m && typeof m === 'object' && ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
+          .slice(-16)
+          .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }))
+      : [];
     const workflowRequestId = payload?.workflowRequestId || crypto.randomUUID();
     const workflowRequestKey = `${event.sender.id}:${workflowRequestId}`;
     const workflowRequestFingerprint = crypto.createHash('sha256').update(JSON.stringify({
       root,
       scope,
       userRequest,
+      contextMessages: sanitizedContextMessages,
       continuationToken: payload?.continuationToken || null,
       autoRepairEnabled: payload?.autoRepairEnabled === true,
       maxRepairAttempts: payload?.maxRepairAttempts,
-      tools: payload?.tools || null,
+      tools: null,
     })).digest('hex');
     const existingWorkflow = workflowExecutions.get(workflowRequestKey);
     if (existingWorkflow) {
@@ -2893,9 +2900,6 @@ app.whenReady().then(async () => {
     }
     pruneWorkflowExecutions();
     let execution = null;
-    const sanitizedContextMessages = Array.isArray(payload?.contextMessages)
-      ? payload.contextMessages.filter((m) => m && ['user', 'assistant'].includes(m.role) && typeof m.content === 'string')
-      : [];
     const authoritativeIntent = classifyTaskIntent({
       request: userRequest,
       contextMessages: sanitizedContextMessages,
@@ -3147,7 +3151,7 @@ app.whenReady().then(async () => {
       assessFindingRelevance,
       requestApproval,
       isCancelled: () => execution.cancelRequested || event.sender.isDestroyed?.() === true,
-      tools: payload?.tools || null,
+      tools: null,
       contextMessages: sanitizedContextMessages,
       genericIntent: authoritativeIntent,
     });
