@@ -284,7 +284,7 @@ function checkAmbiguity(text, projectContext = null, contextMessages = []) {
   }
 
   // Detect vague requests lacking concrete target, file, symptom, or metric
-  const isVague = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:this|it|the\s+project|the\s+app|the\s+code|performance|things)|fix\s+(?:this|it|the\s+bug|that\s+bug|the\s+code|stuff|things)|do\s+(?:something|coding|it)|optimize\s+(?:this|it|everything)|clean\s+(?:it\s+)?up)(?:\s+(?:now|please|for\s+me))?\s*[.!?]*$/i.test(clean)
+  const isVague = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:this|it|the\s+project|the\s+app|the\s+code|performance|things)|(?:fix|resolve|patch|repair|apply)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect|the\s+fix|that\s+fix|the\s+patch|the\s+proposed\s+fix|the\s+proposal|the\s+code|stuff|things)|do\s+(?:something|coding|it)|optimize\s+(?:this|it|everything)|clean\s+(?:it\s+)?up)(?:\s+(?:now|please|for\s+me))?\s*[.!?]*$/i.test(clean)
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(clean) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(clean));
 
   function referencesDefectOrArtifact(str) {
@@ -338,7 +338,7 @@ function checkAmbiguity(text, projectContext = null, contextMessages = []) {
 
     const hasPriorContext = Array.isArray(contextMessages) && contextMessages.length > 0
       && contextMessages.some((msg) => msg && typeof msg.content === 'string' && referencesDefectOrArtifact(msg.content));
-    const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|debug)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect)\b/i.test(clean);
+    const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|debug|apply|implement|update)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect|the\s+fix|that\s+fix|those\s+changes|the\s+proposed\s+(?:fix|change|patch)|the\s+proposal)\b/i.test(clean);
 
     if (isAnaphoricFix) {
       // Multiple findings in projectContext -> ambiguous which finding to address
@@ -615,11 +615,11 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
   const hasPriorFindings = Array.isArray(projectContext?.priorFindings) && projectContext.priorFindings.length > 0;
 
   // 1. Detect Vague / Ambiguous Directives requiring clarification
-  const isVagueDirective = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:this|it|the\s+project|the\s+app|the\s+code|performance|things)|fix\s+(?:this|it|the\s+bug|that\s+bug|the\s+code|stuff|things)|do\s+(?:something|coding|it)|optimize\s+(?:this|it|everything)|clean\s+(?:it\s+)?up)\s*[.!?]*$/i.test(clean)
+  const isVagueDirective = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:this|it|the\s+project|the\s+app|the\s+code|performance|things)|(?:fix|resolve|patch|repair|apply)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect|the\s+fix|that\s+fix|the\s+patch|the\s+proposed\s+fix|the\s+proposal|the\s+code|stuff|things)|do\s+(?:something|coding|it)|optimize\s+(?:this|it|everything)|clean\s+(?:it\s+)?up)\s*[.!?]*$/i.test(clean)
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(clean) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(clean));
 
   if (isVagueDirective) {
-    const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|debug)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect)\b/i.test(clean);
+    const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|debug|apply|implement|update)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect|the\s+fix|that\s+fix|those\s+changes|the\s+proposed\s+(?:fix|change|patch)|the\s+proposal)\b/i.test(clean);
 
     if (isAnaphoricFix && (hasPriorContext || hasPriorFindings)) {
       return {
@@ -671,7 +671,7 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
     || /\bno\s+(?:(?:code|file|source)\s+)?(?:changes?|modifications?|edits?|writes?|patches?)(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(clean);
 
   // 4. Identify Operative Action Directives vs Informational Inquiries
-  const referencesConcreteArtifacts = /\b(?:code|files?|source|controller|model|view|route|routes|component|components|endpoint|endpoints|tests?|specs?|package|dependency|dependencies|node_modules|server|dev\s+server|app|database|schema|migration|script|scripts|config|bug|defect|error|trace|failure|crash)\b/i.test(clean)
+  const referencesConcreteArtifacts = /\b(?:code|files?|source|controllers?|models?|views?|routes?|components?|endpoints?|tests?|specs?|packages?|dependenc(?:y|ies)|node_modules|servers?|dev\s+server|apps?|databases?|schemas?|migrations?|scripts?|configs?|bugs?|defects?|errors?|traces?|failures?|crashes?|patches?|diffs?|proposals?|findings?|fix(?:es)?|audits?)\b/i.test(clean)
     || /\b[\w-]+\.(?:js|cjs|mjs|ts|tsx|jsx|json|php|py|rb|go|rs|html|css|sql|ya?ml|env)\b/i.test(clean);
 
   const referencesTechnicalConcepts = referencesConcreteArtifacts
@@ -724,7 +724,7 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
 
   const isDiscussionOrBrainstorm = /^(?:what\s+if\s+we\b|hows+about\s+(?:we|if)|let's\s+(?:think|discuss|talk|consider|explore|brainstorm)|we\s+could\s+(?:consider|explore|think\s+about)|could\s+we\s+(?:discuss|consider|explore|think\s+about)|can\s+we\s+(?:discuss|consider|explore|think\s+about)|i'm\s+thinking\s+(?:about|we\s+could)|i\s+was\s+thinking\s+(?:about|we\s+could))/i.test(strippedOfCourtesy);
 
-  const directActionPattern = /^(?:debug|fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|upgrade|migrate|replace|resolve|investigate|diagnose|inspect|audit|examine|trace|find\s+and\s+fix|run|start|launch|boot|execute|scaffold|bootstrap|setup|set\s+up|initialize|init|build|install|download|ensure|make\s+sure|enforce|prevent|handle|support|guard\s+against|enable|disable)\b/i;
+  const directActionPattern = /^(?:debug|fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|upgrade|migrate|replace|resolve|investigate|diagnose|inspect|audit|examine|trace|find\s+and\s+fix|run|start|launch|boot|execute|perform|scaffold|bootstrap|setup|set\s+up|initialize|init|build|install|download|ensure|make\s+sure|enforce|prevent|handle|support|guard\s+against|enable|disable)\b/i;
   const startsWithDirectAction = directActionPattern.test(strippedOfCourtesy) || clauseStripped.some((c) => directActionPattern.test(c));
 
   // 5. Evaluate Processing Levels
@@ -822,18 +822,19 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
     };
   }
 
-  if (/^(?:debug|investigate|diagnose|inspect|audit|examine)\b/i.test(strippedOfCourtesy) && (referencesConcreteArtifacts || strippedOfCourtesy.length > 15)) {
-    const hasRepairDirective = /\b(?:fix|repair|patch|resolve|correct|address|implement|change|modify)\b/i.test(strippedOfCourtesy);
+  if (/^(?:debug|investigate|diagnose|inspect|audit|examine|trace|find|locate|search(?:\s+for)?|(?:run|perform|execute)\s+(?:an?\s+)?(?:read-only\s+|preservation\s+|security\s+)?(?:audit|inspection))\b/i.test(strippedOfCourtesy) && (referencesConcreteArtifacts || referencesTechnicalConcepts || strippedOfCourtesy.length > 15)) {
+    const hasRepairDirective = /\b(?:fix|repair|patch|resolve|correct|address|implement|change|modify|create|add|write|refactor|build|update|install|upgrade|migrate)\b/i.test(strippedOfCourtesy);
+    const isReadOnlyInvestigation = !hasRepairDirective || isExplicitNoChange;
     return {
       primaryIntent: INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG,
-      processingLevel: hasRepairDirective && !isExplicitNoChange
+      processingLevel: !isReadOnlyInvestigation
         ? PROCESSING_LEVELS.LEVEL_D_FULL_DEVELOPMENT
-        : (isExplicitNoChange ? PROCESSING_LEVELS.LEVEL_C_FOCUSED_INVESTIGATION : PROCESSING_LEVELS.LEVEL_D_FULL_DEVELOPMENT),
+        : PROCESSING_LEVELS.LEVEL_C_FOCUSED_INVESTIGATION,
       confidence: 'HIGH',
       actionable: true,
-      mutationRequired: !isExplicitNoChange,
+      mutationRequired: !isReadOnlyInvestigation,
       needsClarification: false,
-      reasoning: 'Investigation and resolution of defect or issue in project artifacts.',
+      reasoning: isReadOnlyInvestigation ? 'Read-only focused source investigation requested without code modifications.' : 'Investigation and resolution of defect or issue in project artifacts.',
     };
   }
 
@@ -875,7 +876,8 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
   }
 
   // Case C2: Technical task or actionable instruction referencing concrete artifacts / technical domain
-  if (referencesConcreteArtifacts || referencesTechnicalConcepts || strippedOfCourtesy.length > 25) {
+  const hasActionDirective = startsWithDirectAction || directActionPattern.test(clean);
+  if (referencesConcreteArtifacts || referencesTechnicalConcepts || (hasActionDirective && strippedOfCourtesy.length > 10)) {
     return {
       primaryIntent: INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG,
       processingLevel: PROCESSING_LEVELS.LEVEL_D_FULL_DEVELOPMENT,

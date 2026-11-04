@@ -1933,6 +1933,10 @@ function restoreTaskCheckpoint(taskId, targetPhase, owner) {
 }
 
 function pauseTask(taskId, owner) {
+  const _targetTask = getTask(taskId, owner);
+  if (['completed', 'failed', 'cancelled'].includes(_targetTask.state)) {
+    throw new Error(`Cannot pause task in terminal state: ${_targetTask.state}`);
+  }
   const task = getTask(taskId, owner);
   task.paused = true;
   saveTaskCheckpoint(taskId, task.state, { pausedAt: now() }, owner);
@@ -1941,6 +1945,10 @@ function pauseTask(taskId, owner) {
 }
 
 function resumeTask(taskId, targetPhase, owner) {
+  const _targetTask = getTask(taskId, owner);
+  if (['completed', 'failed', 'cancelled'].includes(_targetTask.state)) {
+    throw new Error(`Cannot resume task in terminal state: ${_targetTask.state}`);
+  }
   const task = getTask(taskId, owner);
   task.paused = false;
   if (targetPhase && task.checkpoint) {
@@ -5168,7 +5176,8 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     phase: continuation ? 'INVESTIGATE_RESUME' : 'UNDERSTAND',
     message: continuation ? 'Resuming the bounded investigation from saved evidence.' : 'Analyzing task requirements and ambiguity.',
   });
-  const taskOperatingMode = tools?.operatingMode || null;
+  const taskOperatingMode = tools?.operatingMode
+    || (preliminaryIntent?.processingLevel === PROCESSING_LEVELS.LEVEL_C_FOCUSED_INVESTIGATION ? 'INVESTIGATE' : null);
   const isRuntimeTestRequest = isProjectRuntimeTestRequest(userRequest);
   const modeRouting = isRuntimeTestRequest
     ? routeTaskMode({ goal: userRequest, userRequestedMode: 'AUTONOMOUS' })
@@ -7862,7 +7871,8 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
                   controlFlow: customDefect.controlFlow || 'Defect identified by custom inspection tool',
                   expected: customDefect.expected || 'Specified expected behavior',
                   observed: customDefect.observed || customDefect.codeSnippet || '',
-                  evidenceType: customDefect.evidenceType || 'STATIC_INSPECTION_CONFIRMED',
+                  evidenceType: customDefect.evidenceType
+                    || (customDefect.isConfirmed === false || customDefect.classification === CLASSIFICATION_UNVERIFIED || customDefect.unverified === true || customDefect.confidence === 'LOW' ? 'MODEL_SUGGESTION_UNVERIFIED' : 'STATIC_INSPECTION_CONFIRMED'),
                 }));
               }
             }

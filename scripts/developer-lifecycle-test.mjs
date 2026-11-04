@@ -75,6 +75,8 @@ try {
     attempts: [{ check: 'typecheck', ok: true, executed: true, exitCode: 0 }],
   }), root, authorizeMutation);
   assert.equal(applied.state, 'completed');
+  assert.throws(() => agent.resumeTask(applied.taskId, 'applying', owner), /terminal state/);
+  assert.throws(() => agent.pauseTask(applied.taskId, owner), /terminal state/);
   assert.equal(applied.approval.actor, 'renderer-session');
   assert.deepEqual(applied.targetFiles, ['sample.txt']);
   assert.equal(applied.verification.ok, true);
@@ -449,6 +451,25 @@ try {
   });
   assert.equal(cancelledCheck.ok, false);
   assert.equal(cancelledCheck.status, 'CANCELLED');
+
+  // Scenario E: Model suggestion unverified defect must NOT be promoted to confirmed
+  const unverifiedDefect = agent.classifyDefect({
+    filePath: 'sample.txt',
+    symbol: 'testFn',
+    lines: '1-5',
+    evidenceType: 'MODEL_SUGGESTION_UNVERIFIED',
+  });
+  assert.equal(unverifiedDefect.isConfirmed, false);
+  assert.equal(unverifiedDefect.classification, 'UNVERIFIED');
+
+  // Scenario F: Cancelled task cannot be revived
+  const rejectProposal = await createBoundProposal({
+    root, sessionId, ownerWebContentsId,
+    raw: patch('sample.txt', 'one', 'five'),
+  });
+  agent.reject(rejectProposal.taskId, owner);
+  assert.throws(() => agent.resumeTask(rejectProposal.taskId, 'applying', owner), /terminal state/);
+  assert.throws(() => agent.pauseTask(rejectProposal.taskId, owner), /terminal state/);
 
   // Scenario E: Zero Live Network Calls
   assert.equal(attemptedExternalRequests, 0, 'Lifecycle test must execute with ZERO attempted external requests');

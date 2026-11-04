@@ -483,6 +483,57 @@ try {
   assert.equal(legitRes.needsClarification, false);
   assert.equal(legitRes.resolvedFromContext, true);
 
+  // =========================================================================
+  // 9. Milestone V44.54: Workflow Quality, Context Follow-ups & Read-Only Investigation
+  // =========================================================================
+  console.log('Testing Milestone V44.54: Workflow Quality, Context Follow-ups & Read-Only Investigation...');
+
+  // A. Read-only investigation without repair directive (Level C, mutationRequired: false)
+  const roInv = classifyTaskIntent({ request: 'Investigate why user authentication tokens expire unexpectedly' });
+  assert.equal(roInv.primaryIntent, INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG);
+  assert.equal(roInv.processingLevel, PROCESSING_LEVELS.LEVEL_C_FOCUSED_INVESTIGATION);
+  assert.equal(roInv.mutationRequired, false);
+  assert.equal(roInv.actionable, true);
+
+  const roAudit = classifyTaskIntent({ request: 'Perform a read-only audit of FormController for defects' });
+  assert.equal(roAudit.primaryIntent, INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG);
+  assert.equal(roAudit.processingLevel, PROCESSING_LEVELS.LEVEL_C_FOCUSED_INVESTIGATION);
+  assert.equal(roAudit.mutationRequired, false);
+  assert.equal(roAudit.actionable, true);
+
+  // B. Natural conversation of any length without technical concepts (Level A, non-actionable)
+  const casual = classifyTaskIntent({ request: 'Good morning! Just checking in to see how you are doing today.' });
+  assert.equal(casual.primaryIntent, INTENT_CATEGORIES.CONVERSATION_OR_FEEDBACK);
+  assert.equal(casual.processingLevel, PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION);
+  assert.equal(casual.mutationRequired, false);
+  assert.equal(casual.actionable, false);
+
+  const longCasual = classifyTaskIntent({
+    request: 'Good morning! Just wanted to say thank you for all the assistance you have been providing with our discussions and planning sessions. Hope you have a wonderful and productive day today!'
+  });
+  assert.equal(longCasual.primaryIntent, INTENT_CATEGORIES.CONVERSATION_OR_FEEDBACK);
+  assert.equal(longCasual.processingLevel, PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION);
+  assert.equal(longCasual.mutationRequired, false);
+  assert.equal(longCasual.actionable, false);
+
+  // C. Explicit repair requests are correctly classified as LEVEL_D_FULL_DEVELOPMENT with mutationRequired: true
+  const explicitFix = classifyTaskIntent({ request: 'Fix the null pointer bug in auth.js when token is expired' });
+  assert.equal(explicitFix.primaryIntent, INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG);
+  assert.equal(explicitFix.processingLevel, PROCESSING_LEVELS.LEVEL_D_FULL_DEVELOPMENT);
+  assert.equal(explicitFix.mutationRequired, true);
+  assert.equal(explicitFix.actionable, true);
+
+  // D. Contextual follow-up phrases resolve ONLY when prior evidence supports them
+  const followUpWithoutEvidence = checkAmbiguity('Please apply the proposed fix.', null, []);
+  assert.equal(followUpWithoutEvidence.needsClarification, true);
+  assert.equal(Boolean(followUpWithoutEvidence.resolvedFromContext), false);
+
+  const followUpWithEvidence = checkAmbiguity('Please apply the proposed fix.', null, [
+    { role: 'assistant', content: 'Identified a defect: unhandled rejection in auth.js:42.' }
+  ]);
+  assert.equal(followUpWithEvidence.needsClarification, false);
+  assert.equal(followUpWithEvidence.resolvedFromContext, true);
+
   // Clean up sessions
   developerAgent.releaseSession(ownerA);
   developerFiles.releaseProject(ownerA);

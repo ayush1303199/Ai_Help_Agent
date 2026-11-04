@@ -1939,7 +1939,7 @@ export function classifyCodingRequestIntent(
     const hasPriorFindings = priorFindings.length > 0;
     const hasPriorContext = Array.isArray(contextMessages) && contextMessages.length > 0
       && contextMessages.some((msg) => msg && typeof msg.content === 'string' && referencesDefectOrArtifact(msg.content));
-    const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|debug)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect)\b/i.test(text);
+    const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|debug|apply|implement|update)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect|the\s+fix|that\s+fix|those\s+changes|the\s+proposed\s+(?:fix|change|patch)|the\s+proposal)\b/i.test(text);
 
     if (isAnaphoricFix) {
       if (priorFindings.length > 1) {
@@ -2034,12 +2034,12 @@ export function classifyCodingRequestIntent(
   if (isActionableProjectWorkflowRequest(text)) {
     return {
       intent: 'AUTONOMOUS_WORKFLOW_TASK',
-      processingLevel: 'LEVEL_D_FULL_DEVELOPMENT',
+      processingLevel: (/^(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?(?:investigate|diagnose|inspect|audit|examine|trace)\b/i.test(text) && !/\b(?:fix|repair|patch|resolve|correct|address|implement|change|modify|create|add|write|refactor|build|update|install|upgrade|migrate)\b/i.test(text)) ? 'LEVEL_C_FOCUSED_INVESTIGATION' : 'LEVEL_D_FULL_DEVELOPMENT',
       isActionableTask: true,
     };
   }
 
-  const referencesConcreteArtifacts = /\b(?:code|files?|source|controller|model|view|route|routes|component|components|endpoint|endpoints|tests?|specs?|package|dependency|dependencies|node_modules|server|dev\s+server|app|database|schema|migration|script|scripts|config|bug|defect|error|trace|failure|crash)\b/i.test(text)
+  const referencesConcreteArtifacts = /\b(?:code|files?|source|controller|model|view|route|routes|component|components|endpoint|endpoints|tests?|specs?|package|dependency|dependencies|node_modules|server|dev\s+server|app|database|schema|migration|script|scripts|config|bug|defect|error|trace|failure|crash|patch|diff|proposal|proposals|finding|findings|fix|fixes)\b/i.test(text)
     || /\b[\w-]+\.(?:js|cjs|mjs|ts|tsx|jsx|json|php|py|rb|go|rs|html|css|sql|ya?ml|env)\b/i.test(text);
 
   const isSocialQuestion = /\b(?:how\s+are\s+you(?:\s+doing)?|how's\s+it\s+going|what's\s+up|how\s+do\s+you\s+do|how\s+are\s+things|how\s+is\s+your\s+day|how\s+have\s+you\s+been)\b/i.test(text);
@@ -2084,7 +2084,7 @@ export function classifyCodingRequestIntent(
   if (isPoliteActionDirective) {
     return {
       intent: 'AUTONOMOUS_WORKFLOW_TASK',
-      processingLevel: 'LEVEL_D_FULL_DEVELOPMENT',
+      processingLevel: (/^(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?(?:investigate|diagnose|inspect|audit|examine|trace)\b/i.test(text) && !/\b(?:fix|repair|patch|resolve|correct|address|implement|change|modify|create|add|write|refactor|build|update|install|upgrade|migrate)\b/i.test(text)) ? 'LEVEL_C_FOCUSED_INVESTIGATION' : 'LEVEL_D_FULL_DEVELOPMENT',
       isActionableTask: true,
     };
   }
