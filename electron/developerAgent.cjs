@@ -1934,7 +1934,7 @@ function restoreTaskCheckpoint(taskId, targetPhase, owner) {
 
 function pauseTask(taskId, owner) {
   const _targetTask = getTask(taskId, owner);
-  if (['completed', 'failed', 'cancelled'].includes(_targetTask.state)) {
+  if (['completed', 'failed', 'cancelled', 'undone'].includes(_targetTask.state)) {
     throw new Error(`Cannot pause task in terminal state: ${_targetTask.state}`);
   }
   const task = getTask(taskId, owner);
@@ -1946,7 +1946,7 @@ function pauseTask(taskId, owner) {
 
 function resumeTask(taskId, targetPhase, owner) {
   const _targetTask = getTask(taskId, owner);
-  if (['completed', 'failed', 'cancelled'].includes(_targetTask.state)) {
+  if (['completed', 'failed', 'cancelled', 'undone'].includes(_targetTask.state)) {
     throw new Error(`Cannot resume task in terminal state: ${_targetTask.state}`);
   }
   const task = getTask(taskId, owner);
@@ -1961,7 +1961,7 @@ function resumeTask(taskId, targetPhase, owner) {
 
 function cancelTask(taskId, owner, { syncConversationTurn = true } = {}) {
   const task = getTask(taskId, owner);
-  if (['completed', 'failed', 'cancelled'].includes(task.state)) {
+  if (['completed', 'failed', 'cancelled', 'undone'].includes(task.state)) {
     return { ...publicTask(task), cancellationAccepted: false };
   }
   task.cancelRequested = true;

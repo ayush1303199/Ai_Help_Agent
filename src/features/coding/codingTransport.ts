@@ -1883,7 +1883,7 @@ export function classifyCodingRequestIntent(
   }
 
   // 1. Detect vague/ambiguous requests that require clarification before any action
-  const isVague = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:this|it|the\s+project|the\s+app|the\s+code|performance|things)|fix\s+(?:this|it|the\s+bug|that\s+bug|the\s+code|stuff|things)|do\s+(?:something|coding|it)|optimize\s+(?:this|it|everything)|clean\s+(?:it\s+)?up)(?:\s+(?:now|please|for\s+me))?\s*[.!?]*$/i.test(text)
+  const isVague = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:this|it|the\s+project|the\s+app|the\s+code|performance|things)|(?:fix|resolve|patch|repair|apply)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect|the\s+fix|that\s+fix|the\s+patch|the\s+proposed\s+fix|the\s+proposal|the\s+code|stuff|things)|do\s+(?:something|coding|it)|optimize\s+(?:this|it|everything)|clean\s+(?:it\s+)?up)(?:\s+(?:now|please|for\s+me))?\s*[.!?]*$/i.test(text)
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(text) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(text));
   if (isVague) {
     const isCancelled = projectContext?.taskStatus === 'CANCELLED'
@@ -2090,7 +2090,7 @@ export function classifyCodingRequestIntent(
   }
 
   // 6. Detect trailing questions that do not start with a direct action command
-  const startsWithDirectAction = /^(?:debug|fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|diagnose|inspect|audit|examine|find\s+and\s+fix|run|start|launch|boot|execute)\b/i.test(text);
+  const startsWithDirectAction = /^(?:debug|fix|repair|patch|modify|change|refactor|remove|delete|add|create|implement|write|apply|update|replace|resolve|investigate|diagnose|inspect|audit|examine|find\s+and\s+fix|run|start|launch|boot|execute|(?:run|perform|execute)\s+(?:an?\s+)?(?:read-only\s+|preservation\s+|security\s+)?(?:audit|inspection))\b/i.test(text);
   if (text.endsWith('?') && !startsWithDirectAction) {
     return {
       intent: referencesConcreteArtifacts ? 'QUESTION_OR_EXPLANATION' : 'CONVERSATIONAL',
@@ -2099,7 +2099,27 @@ export function classifyCodingRequestIntent(
     };
   }
 
-  // 7. Actionable coding task, bug fix, or investigation requiring autonomous workflow
+  // 7. Direct investigation directives without code modification
+  const isDirectInvestigation = /^(?:debug|investigate|diagnose|inspect|audit|examine|trace|find|locate|search(?:\s+for)?|(?:run|perform|execute)\s+(?:an?\s+)?(?:read-only\s+|preservation\s+|security\s+)?(?:audit|inspection))\b/i.test(strippedOfCourtesy)
+    && !/\b(?:fix|repair|patch|resolve|correct|address|implement|change|modify|create|add|write|refactor|build|update|install|upgrade|migrate)\b/i.test(strippedOfCourtesy);
+  if (isDirectInvestigation) {
+    return {
+      intent: 'AUTONOMOUS_WORKFLOW_TASK',
+      processingLevel: 'LEVEL_C_FOCUSED_INVESTIGATION',
+      isActionableTask: true,
+    };
+  }
+
+  // 8. Ordinary conversation of any length without technical artifacts or action verbs
+  if (!referencesConcreteArtifacts && !startsWithDirectAction && !hasActionVerb) {
+    return {
+      intent: 'CONVERSATIONAL',
+      processingLevel: 'LEVEL_A_DIRECT_INTERACTION',
+      isActionableTask: false,
+    };
+  }
+
+  // 9. Actionable coding task, bug fix, or investigation requiring autonomous workflow
   return {
     intent: 'AUTONOMOUS_WORKFLOW_TASK',
     processingLevel: 'LEVEL_D_FULL_DEVELOPMENT',

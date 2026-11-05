@@ -534,6 +534,85 @@ try {
   assert.equal(followUpWithEvidence.needsClarification, false);
   assert.equal(followUpWithEvidence.resolvedFromContext, true);
 
+  // E. Cross-Layer Parity with Renderer (classifyCodingRequestIntent)
+  const { classifyCodingRequestIntent } = await import('../src/features/coding/codingTransport.ts');
+
+  // Parity 1: Long casual conversation
+  const rendererCasual = classifyCodingRequestIntent(
+    'Good morning! Just wanted to say thank you for all the assistance you have been providing with our discussions and planning sessions. Hope you have a wonderful and productive day today!'
+  );
+  assert.equal(rendererCasual.intent, 'CONVERSATIONAL');
+  assert.equal(rendererCasual.processingLevel, 'LEVEL_A_DIRECT_INTERACTION');
+  assert.equal(rendererCasual.isActionableTask, false);
+
+  // Parity 2: Read-only investigation
+  const rendererRoInv = classifyCodingRequestIntent('Investigate why user authentication tokens expire unexpectedly');
+  assert.equal(rendererRoInv.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(rendererRoInv.processingLevel, 'LEVEL_C_FOCUSED_INVESTIGATION');
+  assert.equal(rendererRoInv.isActionableTask, true);
+
+  // Parity 3: Read-only audit
+  const rendererRoAudit = classifyCodingRequestIntent('Perform a read-only audit of FormController for defects');
+  assert.equal(rendererRoAudit.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(rendererRoAudit.processingLevel, 'LEVEL_C_FOCUSED_INVESTIGATION');
+  assert.equal(rendererRoAudit.isActionableTask, true);
+
+  // Parity 4: Explicit repair
+  const rendererRepair = classifyCodingRequestIntent('Fix the null pointer bug in auth.js when token is expired');
+  assert.equal(rendererRepair.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(rendererRepair.processingLevel, 'LEVEL_D_FULL_DEVELOPMENT');
+  assert.equal(rendererRepair.isActionableTask, true);
+
+  // Parity 5: Ambiguous follow-up without prior context requires clarification
+  const rendererAmbiguous = classifyCodingRequestIntent('Please apply the proposed fix.', []);
+  assert.equal(rendererAmbiguous.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(rendererAmbiguous.processingLevel, 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING');
+  assert.equal(rendererAmbiguous.isActionableTask, false);
+
+  // Parity 6: Contextual follow-up with prior context resolves
+  const rendererResolved = classifyCodingRequestIntent('Please apply the proposed fix.', [
+    { role: 'assistant', content: 'Identified a defect: unhandled rejection in auth.js:42.' },
+  ]);
+  assert.equal(rendererResolved.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(rendererResolved.processingLevel, 'LEVEL_D_FULL_DEVELOPMENT');
+  assert.equal(rendererResolved.isActionableTask, true);
+
+  // Parity 7: Disjunctive inquiry combining action and informational question
+  const rendererDisjunctive = classifyCodingRequestIntent('Fix the authentication bug or explain why it failed', []);
+  assert.equal(rendererDisjunctive.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(rendererDisjunctive.processingLevel, 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING');
+  assert.equal(rendererDisjunctive.isActionableTask, false);
+
+  // Parity 8: Inquiry question on architecture/behavior
+  const rendererInquiry = classifyCodingRequestIntent('How does developerAgent implement rollback?', []);
+  assert.equal(rendererInquiry.intent, 'QUESTION_OR_EXPLANATION');
+  assert.equal(rendererInquiry.processingLevel, 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING');
+  assert.equal(rendererInquiry.isActionableTask, false);
+
+  // Parity 9: Polite refactor action directive
+  const rendererPoliteRefactor = classifyCodingRequestIntent('Could you please refactor the database session resolver?', []);
+  assert.equal(rendererPoliteRefactor.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(rendererPoliteRefactor.processingLevel, 'LEVEL_D_FULL_DEVELOPMENT');
+  assert.equal(rendererPoliteRefactor.isActionableTask, true);
+
+  // Parity 10: Explicit no-change investigation directive
+  const rendererNoChangeInv = classifyCodingRequestIntent('Investigate the network timeout issue without modifying any files', []);
+  assert.equal(rendererNoChangeInv.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(rendererNoChangeInv.processingLevel, 'LEVEL_C_FOCUSED_INVESTIGATION');
+  assert.equal(rendererNoChangeInv.isActionableTask, true);
+
+  // Parity 11: Vague directive on completed task requires clarification
+  const rendererCompleted = classifyCodingRequestIntent('Fix it.', [], { taskStatus: 'COMPLETED' });
+  assert.equal(rendererCompleted.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(rendererCompleted.processingLevel, 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING');
+  assert.equal(rendererCompleted.isActionableTask, false);
+
+  // Parity 12: Vague directive on cancelled task requires clarification
+  const rendererCancelled = classifyCodingRequestIntent('Fix it.', [], { taskStatus: 'CANCELLED' });
+  assert.equal(rendererCancelled.intent, 'CLARIFICATION_REQUIRED');
+  assert.equal(rendererCancelled.processingLevel, 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING');
+  assert.equal(rendererCancelled.isActionableTask, false);
+
   // Clean up sessions
   developerAgent.releaseSession(ownerA);
   developerFiles.releaseProject(ownerA);

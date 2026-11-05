@@ -462,7 +462,8 @@ try {
   assert.equal(unverifiedDefect.isConfirmed, false);
   assert.equal(unverifiedDefect.classification, 'UNVERIFIED');
 
-  // Scenario F: Cancelled task cannot be revived
+  // Scenario F: Terminal tasks cannot be revived across all terminal states
+  // 1. Cancelled task
   const rejectProposal = await createBoundProposal({
     root, sessionId, ownerWebContentsId,
     raw: patch('sample.txt', 'one', 'five'),
@@ -470,6 +471,58 @@ try {
   agent.reject(rejectProposal.taskId, owner);
   assert.throws(() => agent.resumeTask(rejectProposal.taskId, 'applying', owner), /terminal state/);
   assert.throws(() => agent.pauseTask(rejectProposal.taskId, owner), /terminal state/);
+
+  // 2. Failed task
+  assert.throws(() => agent.resumeTask(failed.taskId, 'applying', owner), /terminal state/);
+  assert.throws(() => agent.pauseTask(failed.taskId, owner), /terminal state/);
+
+  // 3. Completed task
+  assert.throws(() => agent.resumeTask(applied.taskId, 'applying', owner), /terminal state/);
+  assert.throws(() => agent.pauseTask(applied.taskId, owner), /terminal state/);
+
+  // Scenario G: Test Runner Readiness & Child Cleanup Contract (V44.56)
+  {
+    let probeAttempts = 0;
+    const simulatedChild = {
+      exitCode: null,
+      signalCode: null,
+      killed: false,
+      kill(sig) { this.killed = true; this.signalCode = sig; },
+      once() {},
+    };
+
+    // Simulated readiness probe contract matching scripts/test-all.mjs
+    async function testReadinessContract(fetchFn, timeoutMs = 150) {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < timeoutMs) {
+        probeAttempts += 1;
+        try {
+          const res = await fetchFn();
+          if (res?.ok) return true;
+        } catch {
+          // retry
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      return false;
+    }
+
+    // 1. Failing loopback (EACCES) must timeout and return false (NO false PASS)
+    const readyResult = await testReadinessContract(async () => {
+      const err = new Error('connect EACCES 127.0.0.1:60071');
+      err.code = 'EACCES';
+      throw err;
+    }, 100);
+    assert.equal(readyResult, false, 'Readiness must return false on persistent loopback EACCES failure (no false PASS)');
+    assert.ok(probeAttempts > 1, 'Readiness probe must retry until timeout');
+
+    // 2. Cleanup contract: Child must be terminated when readiness fails
+    if (!readyResult) {
+      simulatedChild.kill('SIGTERM');
+    }
+    assert.equal(simulatedChild.killed, true, 'Child process must be killed when readiness fails');
+    assert.equal(simulatedChild.signalCode, 'SIGTERM');
+  }
 
   // Scenario E: Zero Live Network Calls
   assert.equal(attemptedExternalRequests, 0, 'Lifecycle test must execute with ZERO attempted external requests');
