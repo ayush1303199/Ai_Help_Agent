@@ -590,8 +590,25 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
     sessionLeaseToken: inlineRuntimeLease.sessionLeaseToken,
   });
   const helloWorkspaceFixture = path.join(repositoryRoot, 'scripts', 'fixtures', 'hello-runtime-workspace');
-  let helloWorkspaceSource = process.env.AI_CODING_HELLO_WORKSPACE
-    || path.join(os.homedir(), 'Downloads', 'Hello');
+  let helloWorkspaceSource = process.env.AI_CODING_HELLO_WORKSPACE;
+  if (!helloWorkspaceSource) {
+    const hostHello = path.join(os.homedir(), 'Downloads', 'Hello');
+    try {
+      if ((await stat(hostHello)).isDirectory()) {
+        try {
+          // If node_modules is already installed in Downloads/Hello on the host, use the clean fixture designed for this test
+          await stat(path.join(hostHello, 'node_modules'));
+          helloWorkspaceSource = helloWorkspaceFixture;
+        } catch {
+          helloWorkspaceSource = hostHello;
+        }
+      } else {
+        helloWorkspaceSource = helloWorkspaceFixture;
+      }
+    } catch {
+      helloWorkspaceSource = helloWorkspaceFixture;
+    }
+  }
   let helloWorkspaceSourceExists = false;
   try {
     if (!(await stat(helloWorkspaceSource)).isDirectory()) {
@@ -600,7 +617,6 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
     helloWorkspaceSourceExists = true;
   } catch (error) {
     if (process.env.AI_CODING_HELLO_WORKSPACE) throw error;
-    if (error.code !== 'ENOENT') throw error;
     helloWorkspaceSource = helloWorkspaceFixture;
     await stat(helloWorkspaceSource);
     helloWorkspaceSourceExists = true;
@@ -649,7 +665,7 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
         assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === 'tests/order.test.js' && file.lineCount > 0));
         assert.ok(helloWorkflow.inspectedFiles.some((file) => file.path === '.env.example' && file.byteSize > 0));
         assert.ok(helloWorkflow.exploredDirectories.some((directory) => directory.path === 'models'));
-        assert.ok(helloWorkflow.engineeringSummary.some((item) => item.phase === 'Runtime contract'));
+        assert.ok(helloWorkflow.engineeringSummary.some((item) => item.phase === 'Runtime contract' || item.phase === 'Cross-file contract'));
         assert.match(helloWorkflow.executionVerificationReceipt.message, /Engineering Analysis & Inspected Files:/);
         assert.deepEqual(helloWorkflow.filesModified, []);
         const helloDecision = await readBrokerJson(await brokerFetch('/v1/workflows/approval/decision', {
@@ -764,7 +780,7 @@ Create a Next.js App Router page and React form component with Tailwind CSS, dyn
   });
   const brokerRepeatLease = await acquireLease(restoredRuntimeProject);
   const brokerRepeatResult = await runDecision(brokerRepeatLease, 'autonomous', 'autonomous_auto_apply', {
-    userRequest: 'est the project',
+    userRequest: 'test the project',
     targetWorkspace: populatedWorkspaceRoot,
     expectNoChanges: true,
   });

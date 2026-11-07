@@ -160,4 +160,13 @@ module.exports = {
   mintProjectCommandAuthorization,
   verifyAndConsumeCommandAuthorization,
   cancelCommandAuthorization,
+  isLegitimateCommandAuthorization,
 };
+
+function isLegitimateCommandAuthorization(token) {
+  if (!token || typeof token !== 'object') {
+    return false;
+  }
+  const record = activeAuthorizations.get(token);
+  return Boolean(record && !record.cancelled && Date.now() <= record.expiresAt);
+}

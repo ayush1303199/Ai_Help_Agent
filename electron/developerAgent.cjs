@@ -9656,6 +9656,7 @@ async function executeAutonomousCodingWorkflowApprovalAndApply({
       evidenceLevel: VERIFICATION_EVIDENCE_LEVELS.NOT_RUN,
       proposalContract,
       proposal: proposalContract,
+      executionVerificationReceipt: proposalContract?.executionVerificationReceipt || null,
       findings: objectiveRelevantDefects || [],
       inspectedFiles: inspectedFiles.map((f) => (typeof f === 'string' ? f : f.path)),
       providerQuotaExhausted: Boolean(providerQuotaExhausted),

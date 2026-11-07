@@ -908,6 +908,24 @@ function assertSandboxProbe(checks, result) {
   return result;
 }
 
+function registerProjectCommandAuthorization(token) {
+  if (!token || typeof token !== 'object') {
+    return false;
+  }
+  let isLegitimate = false;
+  try {
+    const { isLegitimateCommandAuthorization } = require('./projectCommandAuthorization.cjs');
+    isLegitimate = typeof isLegitimateCommandAuthorization === 'function' && isLegitimateCommandAuthorization(token);
+  } catch {
+    return false;
+  }
+  if (!isLegitimate) {
+    return false;
+  }
+  projectCommandAuthorizations.add(token);
+  return true;
+}
+
 module.exports = {
   assertSandboxProbe,
   combineSandboxRunAndCleanupFailures,
@@ -918,4 +936,5 @@ module.exports = {
   runWindowsSandboxCommand,
   waitForSandboxResult,
   waitForSandboxShutdown,
+  registerProjectCommandAuthorization,
 };

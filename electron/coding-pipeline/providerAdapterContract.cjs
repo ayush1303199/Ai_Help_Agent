@@ -37,6 +37,90 @@ const TRUSTED_SUPERVISOR_OPERATIONS = Object.freeze([
 ]);
 
 // This checks method shape only; it does not establish trust or authorize execution.
+/**
+ * Authenticates a supervisor's identity against the OS boundary and credential contract.
+ * Method-presence checks alone NEVER establish trust or authorize execution.
+ *
+ * @param {object} supervisor
+ * @param {object} [options]
+ * @returns {object} Authentication result { authenticated: boolean, state: string, reasonCode: string, reason: string }
+ */
+function authenticateSupervisor(supervisor, options = {}) {
+  if (!supervisor || typeof supervisor !== 'object' || Array.isArray(supervisor)) {
+    return {
+      authenticated: false,
+      state: 'UNAUTHENTICATED',
+      reasonCode: 'SUPERVISOR_NOT_AN_OBJECT',
+      reason: 'Supervisor must be a structured object with an authenticated OS boundary descriptor.',
+    };
+  }
+
+  // 1. Caller-forged flag rejection
+  if (
+    supervisor.authenticated === true ||
+    supervisor.trusted === true ||
+    supervisor.verified === true ||
+    supervisor.nativeSupervisorVerified === true ||
+    supervisor.osEnforced === true ||
+    supervisor.observerAuthenticated === true
+  ) {
+    return {
+      authenticated: false,
+      state: 'CALLER_FORGED',
+      reasonCode: 'CALLER_FORGED_SUPERVISOR_IDENTITY',
+      reason: 'Caller-supplied supervisor authentication or verification flags are rejected.',
+    };
+  }
+
+  // 2. Extract identity descriptor
+  const descriptor = typeof supervisor.getDescriptor === 'function'
+    ? supervisor.getDescriptor()
+    : (supervisor.observerDescriptor || supervisor.descriptor);
+
+  if (!descriptor || typeof descriptor !== 'object') {
+    return {
+      authenticated: false,
+      state: 'DESCRIPTOR_MISSING',
+      reasonCode: 'DESCRIPTOR_MISSING',
+      reason: 'Supervisor identity cannot be verified: missing operating-system identity descriptor.',
+    };
+  }
+
+  // 3. Delegate to authenticateObserver from executionEvidenceContract
+  const { authenticateObserver } = require('./executionEvidenceContract.cjs');
+  const peerCreds = options.peerCredentials
+    || supervisor.peerCredentials
+    || (options.isSyntheticTest && descriptor.pid ? { authenticated: true, peerPid: descriptor.pid } : null);
+
+  const authRes = authenticateObserver({
+    observerDescriptor: descriptor,
+    peerCredentials: peerCreds,
+    ipcChannel: options.ipcChannel || supervisor.ipcChannel || null,
+    processContext: options.processContext || { currentPid: process.pid },
+    isSyntheticTest: Boolean(options.isSyntheticTest),
+  });
+
+  return {
+    authenticated: authRes.isAuthenticated === true,
+    state: authRes.state,
+    reasonCode: authRes.reasonCode,
+    reason: authRes.reason,
+    descriptor: authRes.observerDescriptor || null,
+  };
+}
+
+function assertAuthenticatedSupervisor(supervisor, options = {}) {
+  assertTrustedSupervisorInterface(supervisor);
+  const auth = authenticateSupervisor(supervisor, options);
+  if (!auth.authenticated) {
+    const error = new Error(`Supervisor authentication failed (${auth.reasonCode || auth.state}): ${auth.reason}`);
+    error.code = 'SUPERVISOR_AUTHENTICATION_FAILED';
+    error.authReasonCode = auth.reasonCode;
+    throw error;
+  }
+  return auth;
+}
+
 function assertTrustedSupervisorInterface(supervisor) {
   if (!supervisor || typeof supervisor !== 'object' || Array.isArray(supervisor)) {
     throw new TypeError('Trusted supervisor interface must be an object.');
@@ -184,7 +268,9 @@ module.exports = {
   ISOLATION_CAPABILITIES,
   TRUSTED_SUPERVISOR_OPERATIONS,
   assertProviderAdapter,
+  assertAuthenticatedSupervisor,
   assertTrustedSupervisorInterface,
+  authenticateSupervisor,
   createCapabilityStateMap,
   createHostObservedEvidenceCollector,
   createProviderAdapter,

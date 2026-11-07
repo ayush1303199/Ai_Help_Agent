@@ -524,6 +524,147 @@ try {
     assert.equal(simulatedChild.signalCode, 'SIGTERM');
   }
 
+  // =========================================================================
+  // Milestone V44.59: Comprehensive Terminal State & Undo Lifecycle Suite
+  // =========================================================================
+  {
+    // Create an isolated file for undo lifecycle testing
+    const undoFile = path.join(root, 'undo-test.txt');
+    await fs.writeFile(undoFile, 'original-content\n', 'utf8');
+
+    // 1. Setup a fresh completed task
+    const completedProposal = await createBoundProposal({
+      root, sessionId, ownerWebContentsId,
+      raw: '--- a/undo-test.txt\n+++ b/undo-test.txt\n@@ -1 +1 @@\n-original-content\n+updated-content\n',
+    });
+    agent.approve(completedProposal.taskId, owner);
+    const completedTask = await agent.apply(
+      completedProposal.taskId,
+      owner,
+      async () => ({
+        ok: true,
+        status: 'PASS',
+        executed: true,
+        exitCode: 0,
+        attempts: [{ check: 'typecheck', ok: true, executed: true, exitCode: 0 }],
+      }),
+      root,
+      authorizeMutation,
+    );
+    assert.equal(completedTask.state, 'completed');
+    assert.equal(await fs.readFile(undoFile, 'utf8'), 'updated-content\n');
+
+    // Terminal State Immobility: completed
+    assert.throws(() => agent.pauseTask(completedTask.taskId, owner), /Cannot pause task in terminal state: completed/);
+    assert.throws(() => agent.resumeTask(completedTask.taskId, 'applying', owner), /Cannot resume task in terminal state: completed/);
+    const cancelCompleted = agent.cancelTask(completedTask.taskId, owner);
+    assert.equal(cancelCompleted.cancellationAccepted, false, 'Completed task cannot accept cancellation');
+    assert.equal(agent.getTaskForTest(completedTask.taskId).state, 'completed');
+
+    // Terminal State Immobility: failed
+    assert.throws(() => agent.pauseTask(failed.taskId, owner), /Cannot pause task in terminal state: failed/);
+    assert.throws(() => agent.resumeTask(failed.taskId, 'applying', owner), /Cannot resume task in terminal state: failed/);
+    const cancelFailed = agent.cancelTask(failed.taskId, owner);
+    assert.equal(cancelFailed.cancellationAccepted, false, 'Failed task cannot accept cancellation');
+    assert.equal(agent.getTaskForTest(failed.taskId).state, 'failed');
+
+    // Terminal State Immobility: cancelled
+    assert.throws(() => agent.pauseTask(rejectProposal.taskId, owner), /Cannot pause task in terminal state: cancelled/);
+    assert.throws(() => agent.resumeTask(rejectProposal.taskId, 'applying', owner), /Cannot resume task in terminal state: cancelled/);
+    const cancelCancelled = agent.cancelTask(rejectProposal.taskId, owner);
+    assert.equal(cancelCancelled.cancellationAccepted, false, 'Already cancelled task cannot accept cancellation');
+    assert.equal(agent.getTaskForTest(rejectProposal.taskId).state, 'cancelled');
+
+    // Undo Authorization & Ownership Checks
+    // A: Missing explicit approval
+    await assert.rejects(
+      () => agent.undo(completedTask.taskId, owner, authorizeMutation, false),
+      /Undo requires a separate explicit user approval/,
+      'Undo without explicit approval must reject',
+    );
+    assert.equal(agent.getTaskForTest(completedTask.taskId).state, 'completed');
+
+    // B: Missing authoritative file mutation policy
+    await assert.rejects(
+      () => agent.undo(completedTask.taskId, owner, null, true),
+      /The authoritative file mutation policy is unavailable/,
+      'Undo without authorize callback must reject',
+    );
+    assert.equal(agent.getTaskForTest(completedTask.taskId).state, 'completed');
+
+    // C: Unauthorized owner / cross-session rejection
+    const unauthenticatedOwner = { ownerWebContentsId: 9999, sessionId: 'rogue-session' };
+    await assert.rejects(
+      () => agent.undo(completedTask.taskId, unauthenticatedOwner, authorizeMutation, true),
+      /not owned/,
+      'Cross-session undo must be refused',
+    );
+    assert.equal(agent.getTaskForTest(completedTask.taskId).state, 'completed');
+
+    // D: Attempt undo on non-completed tasks
+    await assert.rejects(
+      () => agent.undo(failed.taskId, owner, authorizeMutation, true),
+      /Only a completed proposal can be undone/,
+      'Undo on failed task must be refused',
+    );
+    assert.equal(agent.getTaskForTest(failed.taskId).state, 'failed');
+
+    await assert.rejects(
+      () => agent.undo(rejectProposal.taskId, owner, authorizeMutation, true),
+      /Only a completed proposal can be undone/,
+      'Undo on cancelled task must be refused',
+    );
+    assert.equal(agent.getTaskForTest(rejectProposal.taskId).state, 'cancelled');
+
+    // E: Hash mismatch / external tampering protection
+    await fs.writeFile(undoFile, 'tampered-content\n', 'utf8');
+    await assert.rejects(
+      () => agent.undo(completedTask.taskId, owner, authorizeMutation, true),
+      /Undo refused: files changed after apply/,
+      'Undo when file changed after apply must be refused to avoid data loss',
+    );
+    assert.equal(agent.getTaskForTest(completedTask.taskId).state, 'completed', 'Failed undo attempt must leave task in completed state');
+    assert.equal(await fs.readFile(undoFile, 'utf8'), 'tampered-content\n', 'Tampered file must remain untouched when undo is refused');
+
+    // Restore expected file content so valid undo can proceed
+    await fs.writeFile(undoFile, 'updated-content\n', 'utf8');
+
+    // F: Authorized, valid undo execution
+    const undoneTask = await agent.undo(completedTask.taskId, owner, authorizeMutation, true);
+    assert.equal(undoneTask.state, 'undone', 'Successful undo must transition task state to undone');
+    assert.equal(agent.getTaskForTest(completedTask.taskId).state, 'undone');
+    assert.equal(await fs.readFile(undoFile, 'utf8'), 'original-content\n', 'Undo must restore original file content');
+
+    // Terminal State Immobility: undone
+    assert.throws(() => agent.pauseTask(completedTask.taskId, owner), /Cannot pause task in terminal state: undone/);
+    assert.throws(() => agent.resumeTask(completedTask.taskId, 'applying', owner), /Cannot resume task in terminal state: undone/);
+    const cancelUndone = agent.cancelTask(completedTask.taskId, owner);
+    assert.equal(cancelUndone.cancellationAccepted, false, 'Undone task cannot accept cancellation');
+    assert.equal(agent.getTaskForTest(completedTask.taskId).state, 'undone');
+
+    // G: Repeated undo requests on already undone task
+    await assert.rejects(
+      () => agent.undo(completedTask.taskId, owner, authorizeMutation, true),
+      /Only a completed proposal can be undone/,
+      'Repeated undo on already undone task must be rejected',
+    );
+    assert.equal(agent.getTaskForTest(completedTask.taskId).state, 'undone');
+
+    // H: Preservation of ownership and approval integrity
+    const finalTaskSnapshot = agent.getTaskForTest(completedTask.taskId);
+    assert.equal(finalTaskSnapshot.ownerWebContentsId, ownerWebContentsId);
+    assert.equal(finalTaskSnapshot.sessionId, sessionId);
+    assert.equal(finalTaskSnapshot.approval.actor, 'renderer-session');
+    assert.equal(finalTaskSnapshot.progress.phase, 'undo');
+    assert.equal(finalTaskSnapshot.progress.message, 'Undo completed and verified.');
+    await agent.flushDurability();
+    const latestAuditEvents = (await fs.readFile(path.join(auditDirectory, 'audit.jsonl'), 'utf8'))
+      .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    assert.ok(latestAuditEvents.some((event) => (
+      event.taskId === completedTask.taskId && event.type === 'undo_completed'
+    )));
+  }
+
   // Scenario E: Zero Live Network Calls
   assert.equal(attemptedExternalRequests, 0, 'Lifecycle test must execute with ZERO attempted external requests');
   assert.equal(blockedExternalRequests, 0, 'Lifecycle test must have ZERO blocked external requests');

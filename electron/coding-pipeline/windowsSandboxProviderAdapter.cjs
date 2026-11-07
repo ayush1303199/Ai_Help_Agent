@@ -1,13 +1,20 @@
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs/promises');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const {
+  assertAuthenticatedSupervisor,
+  assertTrustedSupervisorInterface,
+  authenticateSupervisor,
   createCapabilityStateMap,
   createProviderAdapter,
 } = require('./providerAdapterContract.cjs');
 const { createResultEnvelope, evaluateResultEnvelope } = require('./executionEvidenceContract.cjs');
 const { createSandboxResourceLifecycle } = require('./sandboxResourceLifecycle.cjs');
 
+const NATIVE_SUPERVISOR_PIPE = '\\\\.\\pipe\\ai-help-agent-supervisor';
+const NATIVE_SUPERVISOR_EXECUTABLE = path.resolve(__dirname, '../../native/windows-supervisor/AiHelpAgentSupervisor.exe');
 const DEFAULT_MEMORY_MB = 1024;
 const MIN_MEMORY_MB = 512;
 const MAX_MEMORY_MB = 4096;
@@ -212,8 +219,578 @@ function createWindowsSandboxHostLifecycle({
   });
 }
 
+async function executeWithSupervisor({
+  supervisor,
+  runId,
+  workspaceRoot,
+  approvedSnapshotDigest,
+  planDigest,
+  taskId,
+  sessionId,
+  command,
+  timeoutMs = 60000,
+  isCancelled,
+  signal,
+  isSyntheticTest = false,
+}) {
+  const auth = authenticateSupervisor(supervisor, { isSyntheticTest: Boolean(isSyntheticTest) });
+  if (!auth.authenticated) {
+    const error = new Error(`Supervised execution blocked: supervisor authentication failed (${auth.reasonCode || auth.state}): ${auth.reason}`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    error.authReasonCode = auth.reasonCode;
+    throw error;
+  }
+
+  assertTrustedSupervisorInterface(supervisor);
+
+  // Bind and seal supervisor operations to prevent post-validation spoofing or prototype tampering
+  const op = Object.freeze({
+    issueExecutionGrant: supervisor.issueExecutionGrant.bind(supervisor),
+    consumeExecutionGrant: supervisor.consumeExecutionGrant.bind(supervisor),
+    allocateWorker: supervisor.allocateWorker.bind(supervisor),
+    observeWorkerReadiness: typeof supervisor.observeWorkerReadiness === 'function'
+      ? supervisor.observeWorkerReadiness.bind(supervisor)
+      : null,
+    observeEffectiveIsolation: supervisor.observeEffectiveIsolation.bind(supervisor),
+    executeApprovedOperation: supervisor.executeApprovedOperation.bind(supervisor),
+    enforceDeadlineAndCancellation: supervisor.enforceDeadlineAndCancellation.bind(supervisor),
+    collectHostEvidence: supervisor.collectHostEvidence.bind(supervisor),
+    terminateWorker: supervisor.terminateWorker.bind(supervisor),
+    verifyWorkerTerminationAndResourceRelease: supervisor.verifyWorkerTerminationAndResourceRelease.bind(supervisor),
+    quarantineResource: supervisor.quarantineResource.bind(supervisor),
+    resolveQuarantine: supervisor.resolveQuarantine.bind(supervisor),
+  });
+
+  if (!runId || typeof runId !== 'string' || !runId.trim()) {
+    throw new TypeError('A non-empty runId is required for supervised execution.');
+  }
+  if (!workspaceRoot || typeof workspaceRoot !== 'string') {
+    throw new TypeError('workspaceRoot is required for supervised execution.');
+  }
+  if (!approvedSnapshotDigest || typeof approvedSnapshotDigest !== 'string') {
+    throw new TypeError('approvedSnapshotDigest is required for supervised execution.');
+  }
+  if (!command) {
+    throw new TypeError('command is required for supervised execution.');
+  }
+
+  const grant = await op.issueExecutionGrant({
+    runId,
+    workspaceRoot: path.resolve(workspaceRoot),
+    approvedSnapshotDigest,
+    planDigest,
+    taskId,
+    sessionId,
+    command,
+    timeoutMs,
+  });
+
+  if (!grant || typeof grant !== 'object') {
+    const error = new Error('Supervised execution blocked: supervisor failed to issue a valid execution grant.');
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  if (grant.rejected || grant.granted !== true) {
+    const error = new Error(`Supervised execution grant rejected: ${grant.reason || 'Approval or precondition check failed.'}`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    error.reason = grant.reason;
+    throw error;
+  }
+
+  if (grant.runId !== runId) {
+    const error = new Error(`Execution grant runId mismatch: expected "${runId}", got "${grant.runId}".`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  if (grant.approvedSnapshotDigest !== approvedSnapshotDigest) {
+    const error = new Error('Execution grant approvedSnapshotDigest does not match requested snapshot digest.');
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  if (path.resolve(grant.workspaceRoot || '') !== path.resolve(workspaceRoot)) {
+    const error = new Error('Execution grant workspaceRoot does not match requested workspace root.');
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  if (planDigest && grant.planDigest && grant.planDigest !== planDigest) {
+    const error = new Error(`Execution grant planDigest mismatch: expected "${planDigest}", got "${grant.planDigest}".`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  if (taskId && grant.taskId && grant.taskId !== taskId) {
+    const error = new Error(`Execution grant taskId mismatch: expected "${taskId}", got "${grant.taskId}".`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  if (sessionId && grant.sessionId && grant.sessionId !== sessionId) {
+    const error = new Error(`Execution grant sessionId mismatch: expected "${sessionId}", got "${grant.sessionId}".`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  const consumed = await op.consumeExecutionGrant(grant);
+  if (!consumed || consumed.consumed !== true) {
+    const error = new Error('Supervised execution blocked: single-use execution grant could not be consumed.');
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  const worker = await op.allocateWorker({
+    runId,
+    workspaceRoot: path.resolve(workspaceRoot),
+    grant,
+  });
+
+  if (!worker || typeof worker !== 'object' || !worker.workerId) {
+    const error = new Error('Supervised execution blocked: worker allocation failed.');
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  const isolationObservation = await op.observeEffectiveIsolation({ worker, grant });
+  if (!isolationObservation || isolationObservation.effectiveIsolationVerified !== true) {
+    let termRes = null;
+    try {
+      termRes = await op.terminateWorker({ worker, reason: 'effective_isolation_unverified' });
+      await op.verifyWorkerTerminationAndResourceRelease({ worker, terminationResult: termRes });
+    } catch (cleanupErr) {
+      await op.quarantineResource({ worker, error: cleanupErr }).catch(() => {});
+    }
+    const error = new Error(`Effective OS isolation verification failed: ${isolationObservation?.reason || 'unverified isolation'}`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    throw error;
+  }
+
+  let executionResult = null;
+  let executionError = null;
+
+  try {
+    const deadlinePromise = op.enforceDeadlineAndCancellation({
+      worker,
+      timeoutMs,
+      signal,
+      isCancelled,
+    });
+
+    const runPromise = op.executeApprovedOperation({
+      worker,
+      command,
+      workspaceRoot: path.resolve(workspaceRoot),
+      grant,
+    });
+
+    executionResult = await Promise.race([runPromise, deadlinePromise]);
+  } catch (err) {
+    executionError = err;
+  }
+
+  const hostEvidence = await op.collectHostEvidence({
+    worker,
+    runId,
+    executionResult,
+    executionError,
+  }).catch((collectErr) => ({
+    evidenceCollected: false,
+    error: collectErr.message,
+  }));
+
+  let terminationReason = 'normal_completion';
+  if (executionError) {
+    terminationReason = 'execution_error';
+  } else if (executionResult?.timedOut) {
+    terminationReason = 'deadline_exceeded';
+  } else if (executionResult?.cancelled) {
+    terminationReason = 'cancelled';
+  }
+
+  let terminationResult;
+  try {
+    terminationResult = await op.terminateWorker({
+      worker,
+      reason: terminationReason,
+    });
+  } catch (termErr) {
+    await op.quarantineResource({ worker, error: termErr }).catch(() => {});
+    const error = new Error(`Worker termination failed: ${termErr.message}`);
+    error.code = 'WORKER_TERMINATION_FAILED';
+    error.isolationFailure = true;
+    if (executionError) {
+      throw new AggregateError([executionError, error], 'Supervised execution and worker termination both failed.');
+    }
+    throw error;
+  }
+
+  const releaseVerification = await op.verifyWorkerTerminationAndResourceRelease({
+    worker,
+    terminationResult,
+  });
+
+  if (!releaseVerification || releaseVerification.released !== true) {
+    await op.quarantineResource({ worker, releaseVerification }).catch(() => {});
+    const error = new Error(`Worker resource release verification failed: ${releaseVerification?.reason || 'resources retained'}`);
+    error.code = 'RESOURCE_RELEASE_FAILED';
+    error.isolationFailure = true;
+    if (executionError) {
+      throw new AggregateError([executionError, error], 'Supervised execution and resource release both failed.');
+    }
+    throw error;
+  }
+
+  if (executionError) {
+    executionError.hostEvidence = hostEvidence;
+    executionError.terminationResult = terminationResult;
+    executionError.releaseVerification = releaseVerification;
+    throw executionError;
+  }
+
+  return {
+    ok: executionResult?.exitCode === 0,
+    exitCode: executionResult?.exitCode ?? null,
+    stdout: executionResult?.stdout || '',
+    stderr: executionResult?.stderr || '',
+    timedOut: Boolean(executionResult?.timedOut),
+    cancelled: Boolean(executionResult?.cancelled),
+    hostEvidence,
+    terminationResult,
+    releaseVerification,
+  };
+}
+
+function connectToNativeSupervisorPipe(options = {}) {
+  const pipePath = options.pipePath || NATIVE_SUPERVISOR_PIPE;
+  const timeoutMs = options.timeoutMs || 2000;
+  const retries = options.retries || 10;
+  const delayMs = options.delayMs || 50;
+
+  return new Promise((resolve, reject) => {
+    let attempts = 0;
+    function attempt() {
+      attempts++;
+      const s = net.connect(pipePath, () => {
+        s.removeListener('error', onError);
+        resolve(s);
+      });
+      function onError(err) {
+        s.destroy();
+        if ((err.code === 'ENOENT' || err.code === 'ECONNREFUSED') && attempts < retries) {
+          setTimeout(attempt, delayMs);
+        } else {
+          reject(err);
+        }
+      }
+      s.on('error', onError);
+    }
+    attempt();
+  });
+}
+
+async function sendNativeSupervisorRequest(request, options = {}) {
+  const socket = await connectToNativeSupervisorPipe(options);
+  return new Promise((resolve, reject) => {
+    let resolved = false;
+    let buffer = '';
+    const timeout = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        socket.destroy();
+        const err = new Error('Native supervisor request timed out.');
+        err.code = 'SUPERVISOR_IPC_TIMEOUT';
+        reject(err);
+      }
+    }, options.timeoutMs || 10000);
+
+    socket.write(JSON.stringify(request) + '\n');
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      const idx = buffer.indexOf('\n');
+      if (idx !== -1) {
+        const line = buffer.slice(0, idx).trim();
+        resolved = true;
+        clearTimeout(timeout);
+        socket.end();
+        try {
+          resolve(JSON.parse(line));
+        } catch (parseErr) {
+          reject(parseErr);
+        }
+      }
+    });
+    socket.on('error', (err) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        reject(err);
+      }
+    });
+  });
+}
+
+async function queryNativeSupervisorStatus(options = {}) {
+  const executablePath = options.executablePath || NATIVE_SUPERVISOR_EXECUTABLE;
+  const pipePath = options.pipePath || NATIVE_SUPERVISOR_PIPE;
+  let binaryPresent = false;
+  try {
+    const stat = await fs.stat(executablePath);
+    binaryPresent = stat.isFile();
+  } catch {
+    binaryPresent = false;
+  }
+
+  let serviceInstalled = false;
+  let serviceState = 'NOT_INSTALLED';
+  try {
+    const scRes = spawnSync('sc.exe', ['query', 'AiHelpAgentSupervisor'], {
+      windowsHide: true,
+      timeout: 1500,
+      encoding: 'utf8',
+    });
+    if (scRes.status === 0 && typeof scRes.stdout === 'string') {
+      serviceInstalled = true;
+      if (scRes.stdout.includes('RUNNING')) {
+        serviceState = 'RUNNING';
+      } else if (scRes.stdout.includes('STOPPED')) {
+        serviceState = 'STOPPED';
+      } else {
+        serviceState = 'INSTALLED';
+      }
+    }
+  } catch {
+    serviceInstalled = false;
+  }
+
+  try {
+    const hello = await sendNativeSupervisorRequest(
+      { operation: 'HELLO' },
+      { pipePath, retries: 2, delayMs: 20, timeoutMs: 500 },
+    );
+
+    const running = true;
+    const runningMode = serviceInstalled && serviceState === 'RUNNING'
+      ? 'WINDOWS_SERVICE'
+      : 'INTERACTIVE_CONSOLE_DIAGNOSTIC';
+    const status = serviceInstalled && serviceState === 'RUNNING'
+      ? 'IMPLEMENTED_AND_RUNNING'
+      : 'IMPLEMENTED_NOT_INSTALLED';
+    const reasonCode = serviceInstalled && serviceState === 'RUNNING'
+      ? null
+      : 'WINDOWS_SERVICE_NOT_INSTALLED';
+    const reason = serviceInstalled && serviceState === 'RUNNING'
+      ? 'Native supervisor is active as an installed Windows Service under NT AUTHORITY\\SYSTEM.'
+      : 'Native supervisor is active in interactive console diagnostic mode, but is NOT installed as an elevated Windows Service under NT AUTHORITY\\SYSTEM.';
+
+    return {
+      binaryPresent,
+      executablePath,
+      serviceInstalled,
+      serviceState,
+      running,
+      runningMode,
+      pipePath,
+      status,
+      reasonCode,
+      reason,
+      supervisorId: hello.supervisorId,
+      pid: hello.pid,
+      tokenUserSid: hello.tokenUserSid,
+      isAlive: hello.isAlive,
+    };
+  } catch (err) {
+    return {
+      binaryPresent,
+      executablePath,
+      serviceInstalled,
+      serviceState,
+      running: false,
+      runningMode: 'NONE',
+      pipePath,
+      status: binaryPresent ? 'IMPLEMENTED_NOT_INSTALLED' : 'NOT_IMPLEMENTED',
+      reasonCode: err.code === 'ENOENT' ? 'SERVICE_PIPE_NOT_FOUND' : 'SERVICE_UNREACHABLE',
+      reason: binaryPresent
+        ? 'Supervisor executable is present on disk, but neither the Windows Service nor a console test process is listening on the Named Pipe.'
+        : 'Native supervisor executable is not present on disk.',
+      error: err.message,
+    };
+  }
+}
+
+function createNativeSupervisorClient(options = {}) {
+  const pipePath = options.pipePath || NATIVE_SUPERVISOR_PIPE;
+  const executablePath = options.executablePath
+    || (options.isSyntheticTest ? 'C:\\Program Files\\AI Help Agent\\libexec\\AiHelpAgentSupervisor.exe' : NATIVE_SUPERVISOR_EXECUTABLE);
+  const pid = typeof options.pid === 'number' ? options.pid : 0;
+  const tokenUserSid = options.tokenUserSid || 'S-1-5-18';
+  const processCreationTimeUtc = options.processCreationTimeUtc || new Date().toISOString();
+
+  const expectedPrincipalSid = options.expectedPrincipalSid
+    || (options.isSyntheticTest ? (options.tokenUserSid || 'S-1-5-18') : 'S-1-5-18');
+
+  const observerDescriptor = {
+    identitySource: 'independent_authenticated_observer',
+    pid,
+    parentPid: options.parentPid || 1,
+    executablePath,
+    expectedPrincipalSid,
+    windowsNamedPipe: {
+      pipePath,
+      securityDescriptor: {
+        sddl: options.sddl || `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;${tokenUserSid})`,
+        restrictedDacl: true,
+        nullDacl: false,
+      },
+    },
+    windowsProcessPeer: {
+      pid,
+      handleValid: true,
+      processExited: false,
+      processCreationTimeUtc,
+      executablePath,
+      tokenUserSid,
+      identitySource: 'independent_authenticated_observer',
+    },
+  };
+
+  return {
+    observerDescriptor,
+    getDescriptor() {
+      return this.observerDescriptor;
+    },
+    async issueExecutionGrant(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'ISSUE_EXECUTION_GRANT',
+        runId: req.runId,
+        workspaceRoot: req.workspaceRoot,
+        approvedSnapshotDigest: req.approvedSnapshotDigest,
+        planDigest: req.planDigest,
+        taskId: req.taskId,
+        sessionId: req.sessionId,
+        ttlSeconds: req.ttlSeconds,
+      }, { pipePath });
+    },
+    async consumeExecutionGrant(grant) {
+      return sendNativeSupervisorRequest({
+        operation: 'CONSUME_EXECUTION_GRANT',
+        grantId: grant.grantId || grant.grantToken,
+        runId: grant.runId,
+        workspaceRoot: grant.workspaceRoot,
+        approvedSnapshotDigest: grant.approvedSnapshotDigest,
+      }, { pipePath });
+    },
+    async allocateWorker(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'ALLOCATE_WORKER',
+        runId: req.runId,
+        workspaceRoot: req.workspaceRoot,
+      }, { pipePath });
+    },
+    async observeWorkerReadiness() {
+      return { ready: true };
+    },
+    async observeEffectiveIsolation(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'OBSERVE_EFFECTIVE_ISOLATION',
+        workerId: req?.worker?.workerId,
+        isSyntheticTest: Boolean(options.isSyntheticTest),
+      }, { pipePath });
+    },
+    async executeApprovedOperation(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'EXECUTE_APPROVED_OPERATION',
+        workerId: req?.worker?.workerId,
+        command: req?.command,
+        workspaceRoot: req?.workspaceRoot,
+      }, { pipePath });
+    },
+    async enforceDeadlineAndCancellation({ timeoutMs, signal, isCancelled }) {
+      return new Promise((_, reject) => {
+        let timer = null;
+        if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+          timer = setTimeout(() => {
+            const err = new Error('Execution deadline exceeded.');
+            err.timedOut = true;
+            reject(err);
+          }, timeoutMs);
+        }
+        if (signal) {
+          signal.addEventListener('abort', () => {
+            if (timer) clearTimeout(timer);
+            const err = new Error('Execution cancelled.');
+            err.cancelled = true;
+            reject(err);
+          }, { once: true });
+        }
+        if (typeof isCancelled === 'function' && isCancelled()) {
+          if (timer) clearTimeout(timer);
+          const err = new Error('Execution cancelled.');
+          err.cancelled = true;
+          reject(err);
+        }
+      });
+    },
+    async collectHostEvidence(req) {
+      return {
+        evidenceCollected: true,
+        source: 'native-supervisor',
+        workerId: req?.worker?.workerId,
+        runId: req?.runId,
+        exitCode: req?.executionResult?.exitCode ?? null,
+      };
+    },
+    async terminateWorker(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'TERMINATE_WORKER',
+        workerId: req?.worker?.workerId,
+        reason: req?.reason,
+      }, { pipePath });
+    },
+    async verifyWorkerTerminationAndResourceRelease(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'VERIFY_RESOURCE_RELEASE',
+        workerId: req?.worker?.workerId,
+      }, { pipePath });
+    },
+    async persistLifecycleState(state) {
+      return { persisted: true, state };
+    },
+    async quarantineResource(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'QUARANTINE_RESOURCE',
+        workerId: req?.worker?.workerId,
+        error: req?.error?.message,
+      }, { pipePath });
+    },
+    async resolveQuarantine(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'RESOLVE_QUARANTINE',
+        workerId: req?.worker?.workerId,
+        quarantineId: req?.quarantineId,
+      }, { pipePath });
+    },
+  };
+}
+
 function createWindowsSandboxProviderAdapter(config = {}) {
   const settings = config && typeof config === 'object' ? config : {};
+  if (settings.supervisor) {
+    assertAuthenticatedSupervisor(settings.supervisor, { isSyntheticTest: Boolean(settings.isSyntheticTest) });
+  }
   const adapter = createProviderAdapter({
     getProviderId: () => 'windows-sandbox',
     getConfigRevision: () => settings.configRevision || 'windows-sandbox-disabled',
@@ -271,6 +848,16 @@ function createWindowsSandboxProviderAdapter(config = {}) {
     buildConfiguration: buildWindowsSandboxConfiguration,
     createSyntheticWorkspace: createSyntheticSandboxWorkspace,
     createHostLifecycle: createWindowsSandboxHostLifecycle,
+    executeWithSupervisor: (runRequest) => {
+      if (!settings.supervisor) {
+        throw new Error('No trusted supervisor configured for this Windows Sandbox adapter.');
+      }
+      return executeWithSupervisor({
+        supervisor: settings.supervisor,
+        isSyntheticTest: Boolean(settings.isSyntheticTest),
+        ...runRequest,
+      });
+    },
     disabledReason: DISABLED_REASON,
   });
 }
@@ -278,9 +865,15 @@ function createWindowsSandboxProviderAdapter(config = {}) {
 module.exports = {
   DEFAULT_MEMORY_MB,
   DISABLED_REASON,
+  NATIVE_SUPERVISOR_EXECUTABLE,
+  NATIVE_SUPERVISOR_PIPE,
   buildWindowsSandboxConfiguration,
+  createNativeSupervisorClient,
   createSyntheticSandboxWorkspace,
   createWindowsSandboxHostLifecycle,
   createWindowsSandboxProviderAdapter,
+  executeWithSupervisor,
+  queryNativeSupervisorStatus,
+  sendNativeSupervisorRequest,
   validateHostShutdownObservation,
 };
