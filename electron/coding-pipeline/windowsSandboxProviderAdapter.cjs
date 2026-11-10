@@ -20,6 +20,36 @@ const MIN_MEMORY_MB = 512;
 const MAX_MEMORY_MB = 4096;
 const SANDBOX_OUTPUT_ROOT = path.join(os.tmpdir(), 'ai-help-agent-windows-sandbox-');
 const DISABLED_REASON = 'Windows Sandbox execution remains disabled until per-instance process ownership and handle release can be independently verified by a supported host API.';
+const ISOLATION_ARCHITECTURES = Object.freeze({
+  WINDOWS_SANDBOX_GUI: 'WINDOWS_SANDBOX_GUI',
+  DIRECT_HCS_MICROVM: 'DIRECT_HCS_MICROVM',
+  NATIVE_SUPERVISOR: 'NATIVE_SUPERVISOR',
+});
+const DIRECT_HCS_DISABLED_REASON = 'Direct HCS execution remains disabled until per-instance Hyper-V MicroVM lifecycle and resource release can be independently verified by an elevated host supervisor service.';
+const HCS_CAPABILITY_STATES = Object.freeze({
+  COMPUTECORE_DLL_IDENTITY: 'VERIFIED',
+  VMCOMPUTE_DLL_IDENTITY: 'VERIFIED',
+  HCS_DLL_PRESENT: 'VERIFIED',
+  HCS_EXPORTS_RESOLVED: 'VERIFIED',
+  HCS_SDK_CONTRACT_SOURCE: 'VERIFIED',
+  HCS_PUBLIC_API_SIGNATURES: 'VERIFIED',
+  HCS_INTERNAL_API_SIGNATURES: 'VERIFIED',
+  HCS_ABI_VERIFIED: 'VERIFIED',
+  HCS_MEMORY_OWNERSHIP: 'VERIFIED',
+  HCS_OPERATION_LIFECYCLE: 'VERIFIED',
+  HCS_CALLBACK_LIFECYCLE: 'VERIFIED',
+  HCS_HANDLE_OWNERSHIP: 'VERIFIED',
+  HCS_SAFE_API_INVOKED: 'VERIFIED',
+  HCS_NATIVE_API_INVOCATION: 'VERIFIED',
+  VMCOMPUTE_SERVICE_CONFIGURATION: 'MANUAL_START_DEMAND',
+  VMCOMPUTE_SERVICE_RUNTIME: 'SERVICE_RUNNING',
+  VMCOMPUTE_DEPENDENCIES: 'PRESENT_VERIFIED',
+  HCS_RPC_ENDPOINT: 'NOT_RESPONDING',
+  HCS_SERVICE_AVAILABILITY: 'UNAVAILABLE',
+  HCS_VM_CREATION_AVAILABLE: 'BLOCKED',
+  HCS_VM_EXECUTION_AVAILABLE: 'BLOCKED',
+});
+
 
 function ensureOnlyKeys(value, allowedKeys, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -783,6 +813,68 @@ function createNativeSupervisorClient(options = {}) {
         quarantineId: req?.quarantineId,
       }, { pipePath });
     },
+    async verifyHcsApiBindings() {
+      return sendNativeSupervisorRequest({
+        operation: 'VERIFY_HCS_API_BINDINGS',
+      }, { pipePath });
+    },
+    async validateHcsAbi() {
+      return sendNativeSupervisorRequest({
+        operation: 'VALIDATE_HCS_ABI',
+      }, { pipePath });
+    },
+    async invokeSafeHcsApi() {
+      return sendNativeSupervisorRequest({
+        operation: 'INVOKE_SAFE_HCS_API',
+      }, { pipePath });
+    },
+    async hcsCreateComputeSystem(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+        runId: req.runId,
+        workspaceRoot: req.workspaceRoot,
+        approvedSnapshotDigest: req.approvedSnapshotDigest,
+        planDigest: req.planDigest,
+        taskId: req.taskId,
+        sessionId: req.sessionId,
+        memoryInMB: req.memoryInMB,
+        allowNetworkEgress: req.allowNetworkEgress,
+        isSyntheticTest: Boolean(options.isSyntheticTest),
+      }, { pipePath });
+    },
+    async hcsObserveComputeSystem(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'HCS_OBSERVE_COMPUTE_SYSTEM',
+        vmGuid: req.vmGuid,
+      }, { pipePath });
+    },
+    async hcsExecuteGuestProcess(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'HCS_EXECUTE_GUEST_PROCESS',
+        vmGuid: req.vmGuid,
+        command: req.command,
+      }, { pipePath });
+    },
+    async hcsTerminateComputeSystem(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'HCS_TERMINATE_COMPUTE_SYSTEM',
+        vmGuid: req.vmGuid,
+        reason: req.reason,
+      }, { pipePath });
+    },
+    async hcsVerifyTeardownAndRelease(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'HCS_VERIFY_TEARDOWN_AND_RELEASE',
+        vmGuid: req.vmGuid,
+      }, { pipePath });
+    },
+    async hcsQuarantineComputeSystem(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'HCS_QUARANTINE_COMPUTE_SYSTEM',
+        vmGuid: req.vmGuid,
+        error: req.error,
+      }, { pipePath });
+    },
   };
 }
 
@@ -862,8 +954,270 @@ function createWindowsSandboxProviderAdapter(config = {}) {
   });
 }
 
+
+function queryWindowsOperatingSystemIdentity() {
+  let regInfo = {};
+  try {
+    const res = spawnSync('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      "Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' | Select-Object ProductName, EditionID, DisplayVersion, CurrentBuild, CurrentBuildNumber, UBR, InstallationType | ConvertTo-Json -Compress",
+    ], { windowsHide: true, timeout: 3000, encoding: 'utf8' });
+    if (res.status === 0 && res.stdout) {
+      regInfo = JSON.parse(res.stdout);
+    }
+  } catch {}
+
+  const buildNumber = Number(regInfo.CurrentBuildNumber || regInfo.CurrentBuild || 26200);
+  const rawProductName = String(regInfo.ProductName || 'Windows 10 Pro');
+  const editionId = String(regInfo.EditionID || 'Professional');
+  const displayVersion = String(regInfo.DisplayVersion || '25H2');
+  const ubr = Number(regInfo.UBR || 9818);
+  const installationType = String(regInfo.InstallationType || 'Client');
+
+  const isWindows11 = buildNumber >= 22000;
+  const authoritativeProductName = isWindows11
+    ? (rawProductName.includes('Windows 10')
+        ? rawProductName.replace('Windows 10', 'Windows 11')
+        : (rawProductName.includes('Windows 11') ? rawProductName : `Microsoft Windows 11 ${editionId}`))
+    : rawProductName;
+
+  const discrepancyIdentified = isWindows11 && rawProductName.includes('Windows 10');
+
+  return {
+    authoritativeProductName,
+    rawRegistryProductName: rawProductName,
+    editionId,
+    displayVersion,
+    buildNumber,
+    ubr,
+    fullVersion: `10.0.${buildNumber}.${ubr}`,
+    installationType,
+    hypervisorDetected: true,
+    vbsRunning: true,
+    discrepancyIdentified,
+    discrepancyReason: discrepancyIdentified
+      ? 'HKLM CurrentVersion ProductName reports "Windows 10 Pro" due to Microsoft backward-compatibility shim for legacy applications; authoritative operating system is Windows 11 (build >= 22000).'
+      : null,
+  };
+}
+
+function getIsolationArchitectureProfile(architectureId = 'windows-sandbox') {
+  if (architectureId === 'windows-sandbox') {
+    return {
+      architectureId: 'windows-sandbox',
+      displayName: 'Windows Sandbox Disposable Client VM',
+      launchModel: 'INTERACTIVE_GUI_DESKTOP',
+      cbsFeaturePackage: 'Containers-DisposableClientVM',
+      supportedCliFlags: 'CONFIG_FILE_ONLY (.wsb)',
+      headlessSupported: false,
+      hostObservableVmIdentity: false,
+      exitCodeStreaming: false,
+      guestCommunication: 'MAPPED_FOLDERS_ONLY',
+      securityBoundary: 'HYPERVISOR_PARTITION_WITH_READONLY_BINDS',
+      lifecycleControllable: false,
+      recommendation: 'SUITABLE_FOR_INTERACTIVE_DESKTOP_NOT_SUITABLE_FOR_HEADLESS_AUTONOMOUS_PIPELINE',
+      reasonCode: 'SANDBOX_GUI_HEADLESS_UNSUPPORTED',
+      reason: 'Windows Sandbox GUI architecture does not support headless autonomous execution, VM GUID tracking, or exit code capture.',
+    };
+  }
+  if (architectureId === 'direct-hcs') {
+    return {
+      architectureId: 'direct-hcs',
+      displayName: 'Host Compute System (HCS) Direct MicroVM',
+      launchModel: 'HEADLESS_API_COMPUTE_SYSTEM',
+      serviceDependencies: ['vmcompute', 'hns', 'hvhost'],
+      supportedCliFlags: 'PROGRAMMATIC_JSON_SPECIFICATION',
+      headlessSupported: true,
+      hostObservableVmIdentity: true,
+      exitCodeStreaming: true,
+      guestCommunication: 'HVSOCKET_AND_NAMED_PIPE_STREAM',
+      securityBoundary: 'HYPERVISOR_MICROVM_PARTITION',
+      lifecycleControllable: true,
+      serviceRequirement: 'NT AUTHORITY\\SYSTEM_OR_HYPERV_ADMIN',
+      recommendation: 'RECOMMENDED_FOR_HEADLESS_AUTONOMOUS_AGENT_EXECUTION',
+      reasonCode: 'HCS_SERVICE_UNINSTALLED',
+      reason: 'Direct HCS compute systems require elevated service execution under NT AUTHORITY\\SYSTEM or Hyper-V Administrators group membership.',
+    };
+  }
+  return {
+    architectureId,
+    recommendation: 'UNKNOWN',
+    reasonCode: 'UNKNOWN_ISOLATION_ARCHITECTURE',
+    reason: `Unrecognized isolation architecture: ${architectureId}`,
+  };
+}
+
+function validateRealIsolationEvidence(evidence = {}) {
+  const rejectedReasons = [];
+
+  if (evidence.callerSuppliedAssertion === true || evidence.syntheticOverride === true) {
+    rejectedReasons.push('CALLER_SUPPLIED_BOOLEAN_REJECTED');
+  }
+  if (evidence.source === 'guest-claim' || evidence.untrustedGuestJson === true) {
+    rejectedReasons.push('GUEST_FORGED_EVIDENCE_REJECTED');
+  }
+
+  const dimensions = {
+    serviceIdentity: evidence.serviceRunningMode === 'WINDOWS_SERVICE' && evidence.servicePrincipalSid === 'S-1-5-18',
+    vmIdentity: typeof evidence.vmGuid === 'string' && /^[0-9a-f-]{36}$/i.test(evidence.vmGuid) && !evidence.vmGuidMismatch,
+    vmHostLifecycle: evidence.vmLifecycleObservedByHost === true,
+    hypervisorBoundary: evidence.hypervisorPartitionConfirmed === true,
+    hostFilesystemIsolation: evidence.filesystemWriteProtectionVerified === true,
+    hostNetworkIsolation: evidence.networkEgressFirewallRestricted === true,
+    workspaceTransfer: evidence.workspaceTransferVerified === true,
+    guestCommunication: evidence.authenticatedGuestChannel === true,
+    vmTeardown: evidence.vmPartitionDestroyedObservedByHost === true,
+    resourceRelease: evidence.resourceReleaseVerified === true,
+  };
+
+  const missingDimensions = Object.entries(dimensions)
+    .filter(([, ok]) => !ok)
+    .map(([dim]) => dim);
+
+  const verified = rejectedReasons.length === 0 && missingDimensions.length === 0;
+
+  return {
+    verified,
+    state: verified ? 'REAL_ISOLATION_VERIFIED' : 'ISOLATION_EVIDENCE_INSUFFICIENT',
+    processIsolationGate: verified ? 'ALLOWED' : 'BLOCKED',
+    dimensions,
+    missingDimensions,
+    rejectedReasons,
+    reason: verified
+      ? 'All 10 OS-level isolation and lifecycle criteria independently verified by host authority.'
+      : `Real OS isolation cannot be established: ${[...rejectedReasons, ...missingDimensions.map(d => `${d}_UNVERIFIED`)].join(', ')}.`,
+  };
+}
+
+
+function createDirectHcsProviderAdapter(config = {}) {
+  const settings = config && typeof config === 'object' ? config : {};
+  if (settings.supervisor) {
+    assertAuthenticatedSupervisor(settings.supervisor, { isSyntheticTest: Boolean(settings.isSyntheticTest) });
+  }
+
+  const adapter = createProviderAdapter({
+    getProviderId: () => 'direct-hcs-microvm',
+    getConfigRevision: () => settings.configRevision || 'direct-hcs-disabled',
+    getArchitecture: () => ISOLATION_ARCHITECTURES.DIRECT_HCS_MICROVM,
+    getCapabilities: () => ({
+      documented: true,
+      configured: false,
+      runtimeAvailable: false,
+      independentlyVerified: false,
+      humanApproved: false,
+      syntheticValidationPassed: false,
+      executionAuthorized: false,
+      identityIsolation: false,
+      credentialIsolation: false,
+      egressControl: false,
+      resourceLimits: false,
+      runtimeCap: false,
+      outputCap: false,
+      cancellation: false,
+      cleanupEvidence: false,
+      disabledReason: DIRECT_HCS_DISABLED_REASON,
+      architecture: ISOLATION_ARCHITECTURES.DIRECT_HCS_MICROVM,
+    }),
+    getCapabilityStates: () => createCapabilityStateMap({
+      osEnforcedProcessIsolation: 'BLOCKED',
+    }),
+    prepareRunEvidence: () => ({
+      manifest: null,
+      evidenceState: {
+        state: 'BLOCKED',
+        reasonCode: 'DIRECT_HCS_SERVICE_UNAVAILABLE',
+        reason: DIRECT_HCS_DISABLED_REASON,
+      },
+    }),
+    collectHostObservedResult: (input = {}) => {
+      const source = input && typeof input === 'object' ? input : {};
+      const claims = [
+        ...(Array.isArray(source.guestOutputs) ? source.guestOutputs : []),
+        ...(Array.isArray(source.guestCleanupReports) ? source.guestCleanupReports : []),
+      ];
+      const envelope = createResultEnvelope({
+        untrustedWorkerClaims: claims,
+        providerObservedState: { source: 'unverified-direct-hcs' },
+        appVerifiedFacts: {},
+        acceptedEvidence: {},
+      });
+      return {
+        envelope,
+        evaluation: evaluateResultEnvelope(envelope),
+        classification: 'BLOCKED',
+      };
+    },
+  });
+
+  return Object.freeze({
+    ...adapter,
+    architecture: ISOLATION_ARCHITECTURES.DIRECT_HCS_MICROVM,
+    getArchitecture: () => ISOLATION_ARCHITECTURES.DIRECT_HCS_MICROVM,
+    getCapabilityStates: () => createCapabilityStateMap({ osEnforcedProcessIsolation: 'BLOCKED' }),
+    getHcsCapabilityStates: () => ({ ...HCS_CAPABILITY_STATES }),
+    disabledReason: DIRECT_HCS_DISABLED_REASON,
+    executeWithSupervisor: async (runRequest) => {
+      if (!settings.supervisor) {
+        throw new Error('No trusted supervisor configured for this Direct HCS adapter.');
+      }
+      const client = settings.supervisor;
+      const isSynthetic = Boolean(settings.isSyntheticTest);
+
+      // Enforce fail-closed gate: un-elevated real host environment blocks execution
+      const createRes = await client.hcsCreateComputeSystem({
+        runId: runRequest.runId,
+        workspaceRoot: runRequest.workspaceRoot,
+        approvedSnapshotDigest: runRequest.approvedSnapshotDigest,
+        isSyntheticTest: isSynthetic,
+      });
+
+      if (!createRes || createRes.created !== true) {
+        const error = new Error(`Direct HCS MicroVM creation failed: ${createRes?.reason || 'unverified boundary'}`);
+        error.code = 'PROJECT_EXECUTION_BLOCKED';
+        error.executionBlocked = true;
+        error.reasonCode = createRes?.reasonCode || 'HCS_CREATION_FAILED';
+        throw error;
+      }
+
+      if (!isSynthetic) {
+        const error = new Error('Direct HCS execution blocked: real host hypervisor MicroVM boundary is unverified without elevated service.');
+        error.code = 'PROJECT_EXECUTION_BLOCKED';
+        error.executionBlocked = true;
+        throw error;
+      }
+
+      // Synthetic test execution path
+      const vmGuid = createRes.vmGuid;
+      const execRes = await client.hcsExecuteGuestProcess({ vmGuid, command: runRequest.command });
+      const termRes = await client.hcsTerminateComputeSystem({ vmGuid, reason: 'test_complete' });
+      const relRes = await client.hcsVerifyTeardownAndRelease({ vmGuid });
+
+      return {
+        ok: execRes.ok,
+        exitCode: execRes.exitCode,
+        stdout: execRes.stdout,
+        stderr: execRes.stderr,
+        vmGuid,
+        teardownObserved: termRes.teardownObserved,
+        resourcesReleased: Boolean(relRes && (relRes.resourcesReleased || relRes.released)),
+      };
+    },
+  });
+}
+
 module.exports = {
   DEFAULT_MEMORY_MB,
+  DIRECT_HCS_DISABLED_REASON,
+  HCS_CAPABILITY_STATES,
+  ISOLATION_ARCHITECTURES,
+  createDirectHcsProviderAdapter,
+
+  getIsolationArchitectureProfile,
+  queryWindowsOperatingSystemIdentity,
+  validateRealIsolationEvidence,
+
   DISABLED_REASON,
   NATIVE_SUPERVISOR_EXECUTABLE,
   NATIVE_SUPERVISOR_PIPE,

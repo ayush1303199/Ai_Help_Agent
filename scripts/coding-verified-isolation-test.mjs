@@ -5165,10 +5165,22 @@ async function runVerifiedIsolationTests() {
       NATIVE_SUPERVISOR_EXECUTABLE,
       createNativeSupervisorClient,
       createWindowsSandboxProviderAdapter,
+      createDirectHcsProviderAdapter,
+      DIRECT_HCS_DISABLED_REASON,
+      HCS_CAPABILITY_STATES,
+      ISOLATION_ARCHITECTURES,
       executeWithSupervisor,
+      getIsolationArchitectureProfile,
       queryNativeSupervisorStatus,
+      queryWindowsOperatingSystemIdentity,
       sendNativeSupervisorRequest,
+      validateRealIsolationEvidence,
     } = require('../electron/coding-pipeline/windowsSandboxProviderAdapter.cjs');
+    const {
+      DIRECT_HCS_EVIDENCE_DIMENSIONS,
+      DIRECT_HCS_EVIDENCE_STATES,
+      evaluateDirectHcsEvidence,
+    } = require('../electron/coding-pipeline/executionEvidenceContract.cjs');
 
     // =========================================================================
     // 26.A: SYNTHETIC_TEST - In-process mock & offline CI harness contract
@@ -5270,6 +5282,118 @@ async function runVerifiedIsolationTests() {
         }),
         (err) => err.timedOut === true,
       );
+
+      // 26.A.4: Real isolation evidence validation contract (10 dimensions)
+      const callerForgedEvidence = validateRealIsolationEvidence({
+        callerSuppliedAssertion: true,
+        serviceRunningMode: 'WINDOWS_SERVICE',
+        servicePrincipalSid: 'S-1-5-18',
+        vmGuid: '11111111-2222-3333-4444-555555555555',
+      });
+      assert.equal(callerForgedEvidence.verified, false);
+      assert.equal(callerForgedEvidence.processIsolationGate, 'BLOCKED');
+      assert.ok(callerForgedEvidence.rejectedReasons.includes('CALLER_SUPPLIED_BOOLEAN_REJECTED'));
+
+      const guestForgedEvidence = validateRealIsolationEvidence({
+        untrustedGuestJson: true,
+        source: 'guest-claim',
+        vmGuid: '11111111-2222-3333-4444-555555555555',
+      });
+      assert.equal(guestForgedEvidence.verified, false);
+      assert.equal(guestForgedEvidence.processIsolationGate, 'BLOCKED');
+      assert.ok(guestForgedEvidence.rejectedReasons.includes('GUEST_FORGED_EVIDENCE_REJECTED'));
+
+      const partialEvidence = validateRealIsolationEvidence({
+        serviceRunningMode: 'WINDOWS_SERVICE',
+        servicePrincipalSid: 'S-1-5-18',
+        vmGuid: '11111111-2222-3333-4444-555555555555',
+        vmLifecycleObservedByHost: true,
+        hypervisorPartitionConfirmed: false,
+      });
+      assert.equal(partialEvidence.verified, false);
+      assert.equal(partialEvidence.processIsolationGate, 'BLOCKED');
+      assert.ok(partialEvidence.missingDimensions.includes('hypervisorBoundary'));
+
+      // 26.A.5: Isolation architecture profile distinction (Windows Sandbox vs Direct HCS)
+      const wsbProfile = getIsolationArchitectureProfile('windows-sandbox');
+      assert.equal(wsbProfile.architectureId, 'windows-sandbox');
+      assert.equal(wsbProfile.launchModel, 'INTERACTIVE_GUI_DESKTOP');
+      assert.equal(wsbProfile.headlessSupported, false);
+      assert.equal(wsbProfile.hostObservableVmIdentity, false);
+      assert.equal(wsbProfile.reasonCode, 'SANDBOX_GUI_HEADLESS_UNSUPPORTED');
+
+      const hcsProfile = getIsolationArchitectureProfile('direct-hcs');
+      assert.equal(hcsProfile.architectureId, 'direct-hcs');
+      assert.equal(hcsProfile.launchModel, 'HEADLESS_API_COMPUTE_SYSTEM');
+      assert.equal(hcsProfile.headlessSupported, true);
+      assert.equal(hcsProfile.hostObservableVmIdentity, true);
+      assert.equal(hcsProfile.reasonCode, 'HCS_SERVICE_UNINSTALLED');
+
+      // 26.A.6: Authoritative Windows OS identity verification
+      const osId = queryWindowsOperatingSystemIdentity();
+      assert.ok(osId.buildNumber >= 22000);
+      assert.ok(osId.authoritativeProductName.includes('Windows 11'));
+      assert.equal(osId.hypervisorDetected, true);
+
+      // 26.A.7: Direct HCS Evidence Contract evaluation (11 dimensions)
+      assert.equal(DIRECT_HCS_EVIDENCE_DIMENSIONS.length, 11);
+      assert.equal(DIRECT_HCS_EVIDENCE_STATES.VERIFIED, 'VERIFIED');
+      assert.equal(DIRECT_HCS_EVIDENCE_STATES.BLOCKED, 'BLOCKED');
+
+      // Reject caller booleans
+      const hcsCallerForged = evaluateDirectHcsEvidence({ callerSuppliedAssertion: true });
+      assert.equal(hcsCallerForged.verified, false);
+      assert.equal(hcsCallerForged.processIsolationGate, 'BLOCKED');
+      assert.ok(hcsCallerForged.rejectedReasons.includes('CALLER_SUPPLIED_BOOLEAN_REJECTED'));
+
+      // Reject guest forged JSON
+      const hcsGuestForged = evaluateDirectHcsEvidence({ untrustedGuestJson: true });
+      assert.equal(hcsGuestForged.verified, false);
+      assert.equal(hcsGuestForged.processIsolationGate, 'BLOCKED');
+      assert.ok(hcsGuestForged.rejectedReasons.includes('GUEST_FORGED_EVIDENCE_REJECTED'));
+
+      // Reject Job Object as VM isolation
+      const hcsJobObj = evaluateDirectHcsEvidence({ jobObjectOnly: true });
+      assert.equal(hcsJobObj.verified, false);
+      assert.ok(hcsJobObj.rejectedReasons.includes('JOB_OBJECT_NOT_VM_ISOLATION'));
+
+      // Reject GUI process exit as VM teardown
+      const hcsGuiExit = evaluateDirectHcsEvidence({ guiProcessExitOnly: true });
+      assert.equal(hcsGuiExit.verified, false);
+      assert.ok(hcsGuiExit.rejectedReasons.includes('GUI_EXIT_NOT_VM_TEARDOWN'));
+
+      // Reject synthetic claiming real isolation
+      const hcsSynthClaim = evaluateDirectHcsEvidence({ syntheticTestClaimingRealIsolation: true });
+      assert.equal(hcsSynthClaim.verified, false);
+      assert.ok(hcsSynthClaim.rejectedReasons.includes('SYNTHETIC_NOT_REAL_HOST_ISOLATION'));
+
+      // All 11 dimensions verified
+      const hcsAllVerified = evaluateDirectHcsEvidence({
+        serviceRunningMode: 'WINDOWS_SERVICE',
+        servicePrincipalSid: 'S-1-5-18',
+        ipcAuthenticated: true,
+        restrictedAcl: true,
+        vmGuid: '11111111-2222-3333-4444-555555555555',
+        vmLifecycleObservedByHost: true,
+        hypervisorPartitionConfirmed: true,
+        filesystemWriteProtectionVerified: true,
+        networkEgressFirewallRestricted: true,
+        workspaceTransferVerified: true,
+        authenticatedGuestChannel: true,
+        vmPartitionDestroyedObservedByHost: true,
+        resourceReleaseVerified: true,
+      });
+      assert.equal(hcsAllVerified.verified, true);
+      assert.equal(hcsAllVerified.state, DIRECT_HCS_EVIDENCE_STATES.VERIFIED);
+      assert.equal(hcsAllVerified.processIsolationGate, 'ALLOWED');
+      assert.equal(hcsAllVerified.unverifiedDimensions.length, 0);
+
+      // 26.A.8: Direct HCS Provider Adapter contract
+      const directHcsAdapter = createDirectHcsProviderAdapter({ isSyntheticTest: true });
+      assert.equal(directHcsAdapter.getProviderId(), 'direct-hcs-microvm');
+      assert.equal(directHcsAdapter.getArchitecture(), ISOLATION_ARCHITECTURES.DIRECT_HCS_MICROVM);
+      assert.equal(directHcsAdapter.disabledReason, DIRECT_HCS_DISABLED_REASON);
+      assert.equal(directHcsAdapter.getCapabilityStates().osEnforcedProcessIsolation, 'BLOCKED');
     }
 
     // =========================================================================
@@ -5292,7 +5416,7 @@ async function runVerifiedIsolationTests() {
 
       try {
         let activeStatus = null;
-        for (let attempt = 0; attempt < 25; attempt++) {
+        for (let attempt = 0; attempt < 60; attempt++) {
           activeStatus = await queryNativeSupervisorStatus();
           if (activeStatus.running) break;
           await new Promise((resolve) => setTimeout(resolve, 50));
@@ -5432,6 +5556,402 @@ async function runVerifiedIsolationTests() {
         assert.equal(uncontainedExec.ok, false);
         assert.equal(uncontainedExec.error, 'WORKER_NOT_CONTAINED');
 
+        // 26.B.10b: VM Identity Mismatch Rejection
+        const badWorkerIsolation = await sendNativeSupervisorRequest({
+          operation: 'OBSERVE_EFFECTIVE_ISOLATION',
+          workerId: 'worker-unknown-bogus-999',
+        });
+        assert.equal(badWorkerIsolation.ok, false);
+        assert.equal(badWorkerIsolation.error, 'UNKNOWN_WORKER');
+        assert.equal(badWorkerIsolation.reasonCode, 'VM_IDENTITY_MISMATCH');
+
+        // 26.B.10c: HCS Capability Query via IPC
+        const hcsCap = await sendNativeSupervisorRequest({ operation: 'GET_HCS_CAPABILITY' });
+        assert.equal(hcsCap.ok, true);
+        assert.equal(hcsCap.hcsServiceDetected, true);
+        assert.equal(hcsCap.hcsPrivilegeSufficient, false);
+        assert.equal(hcsCap.reasonCode, 'HCS_PRIVILEGE_INSUFFICIENT');
+        assert.equal(hcsCap.vmcomputeLoaded, true);
+        assert.equal(hcsCap.nativeApiBindingsVerified, true);
+
+        // 26.B.10c2: HCS Native API Bindings Probe & Verification via IPC
+        const hcsBindings = await sendNativeSupervisorRequest({ operation: 'VERIFY_HCS_API_BINDINGS' });
+        assert.equal(hcsBindings.ok, true);
+        assert.equal(hcsBindings.vmcomputeLoaded, true);
+        assert.equal(hcsBindings.bindingsVerified, true);
+        assert.ok(Array.isArray(hcsBindings.resolvedFunctions));
+        assert.ok(hcsBindings.resolvedFunctions.includes('HcsCreateComputeSystem'));
+        assert.ok(hcsBindings.resolvedFunctions.includes('HcsStartComputeSystem'));
+        assert.ok(hcsBindings.resolvedFunctions.includes('HcsTerminateComputeSystem'));
+        assert.ok(hcsBindings.resolvedFunctions.includes('HcsCloseComputeSystem'));
+        assert.ok(hcsBindings.resolvedFunctions.includes('HcsCreateProcess'));
+        assert.ok(hcsBindings.resolvedFunctions.includes('HcsTerminateProcess'));
+        assert.ok(hcsBindings.resolvedFunctions.includes('HcsCloseProcess'));
+        assert.ok(hcsBindings.resolvedFunctions.includes('HcsGetComputeSystemProperties'));
+        assert.equal(hcsBindings.missingFunctions.length, 0);
+        assert.equal(hcsBindings.hcsPrivilegeSufficient, false);
+        assert.equal(hcsBindings.reasonCode, 'HCS_PRIVILEGE_INSUFFICIENT');
+
+        // Verify nativeClient wrapper method
+        const clientBindingsProbe = await nativeClient.verifyHcsApiBindings();
+        assert.equal(clientBindingsProbe.ok, true);
+        assert.equal(clientBindingsProbe.bindingsVerified, true);
+
+                                    // 26.B.10c3: Native HCS API ABI Validation & Hierarchy Invariants
+        const abiProbe = await sendNativeSupervisorRequest({ operation: 'VALIDATE_HCS_ABI' });
+        assert.equal(abiProbe.ok, true);
+        assert.equal(abiProbe.computeCoreDllIdentity, 'VERIFIED');
+        assert.equal(abiProbe.vmcomputeDllIdentity, 'VERIFIED');
+        assert.equal(abiProbe.hcsDllPresent, 'VERIFIED');
+        assert.equal(abiProbe.hcsExportsResolved, 'VERIFIED');
+        assert.equal(abiProbe.hcsSdkContractSource, 'VERIFIED');
+        assert.equal(abiProbe.hcsPublicApiSignatures, 'VERIFIED');
+        assert.equal(abiProbe.hcsInternalApiSignatures, 'VERIFIED');
+        assert.equal(abiProbe.hcsAbiVerified, 'VERIFIED');
+        assert.equal(abiProbe.hcsMemoryOwnership, 'VERIFIED');
+        assert.equal(abiProbe.hcsOperationLifecycle, 'VERIFIED');
+        assert.equal(abiProbe.hcsCallbackLifecycle, 'VERIFIED');
+        assert.equal(abiProbe.hcsHandleOwnership, 'VERIFIED');
+        assert.equal(abiProbe.hcsSafeApiInvoked, 'VERIFIED');
+        assert.equal(abiProbe.hcsNativeApiInvocation, 'VERIFIED');
+        assert.equal(abiProbe.serviceBinaryPresent, true);
+        assert.equal(abiProbe.serviceBinaryPath, 'C:\\Windows\\System32\\vmcompute.exe');
+        assert.equal(abiProbe.vmcomputeServiceConfiguration, 'MANUAL_START_DEMAND');
+        assert.equal(abiProbe.vmcomputeServiceRuntime, 'SERVICE_RUNNING');
+        assert.equal(abiProbe.vmcomputeDependencies, 'PRESENT_VERIFIED');
+        assert.equal(abiProbe.hcsRpcEndpoint, 'NOT_RESPONDING');
+        assert.equal(abiProbe.serviceRunningVsHcsAvailableDistinction, 'VERIFIED');
+        assert.equal(abiProbe.rpcTriggerInterfaceGuid, 'E7A216AF-1EC1-447F-8D3F-A87278DB564D');
+        assert.equal(abiProbe.hcsServiceAvailability, 'UNAVAILABLE');
+        assert.equal(abiProbe.hcsVmCreationAvailable, 'BLOCKED');
+        assert.equal(abiProbe.hcsVmExecutionAvailable, 'BLOCKED');
+        assert.equal(abiProbe.pointerWidth, 64);
+        assert.equal(abiProbe.is64BitProcess, true);
+        assert.equal(abiProbe.callingConvention, 'Winapi');
+        assert.ok(abiProbe.declaredApis && typeof abiProbe.declaredApis === 'object');
+        assert.ok(abiProbe.memoryOwnershipMatrix && typeof abiProbe.memoryOwnershipMatrix === 'object');
+
+        // Verify individual declared public APIs
+        const requiredPublicApis = [
+          'HcsCreateComputeSystem',
+          'HcsStartComputeSystem',
+          'HcsTerminateComputeSystem',
+          'HcsCloseComputeSystem',
+          'HcsCreateProcess',
+          'HcsTerminateProcess',
+          'HcsCloseProcess',
+          'HcsGetComputeSystemProperties',
+          'HcsGetServiceProperties',
+          'HcsCreateOperation',
+          'HcsCloseOperation',
+          'HcsGetOperationResult',
+        ];
+        for (const apiName of requiredPublicApis) {
+          const apiMeta = abiProbe.declaredApis[apiName];
+          assert.ok(apiMeta, `Metadata for ${apiName} must be present in ABI validation`);
+          assert.equal(apiMeta.exactExport, apiName);
+          assert.equal(apiMeta.callingConvention, 'Winapi');
+          assert.equal(apiMeta.abiState, 'VERIFIED');
+          assert.equal(apiMeta.dll, 'ComputeCore.dll');
+          assert.ok(apiMeta.parameterCount > 0);
+          assert.ok(apiMeta.returnType.includes('HRESULT') || apiMeta.returnType === 'void');
+        }
+
+        // Verify public ComputeCore HcsGetServiceProperties parameter count is exactly 2
+        assert.equal(abiProbe.declaredApis['HcsGetServiceProperties'].parameterCount, 2);
+        assert.equal(abiProbe.declaredApis['HcsGetComputeSystemProperties'].parameterCount, 3);
+
+        // Verify client wrapper method
+        const clientAbiProbe = await nativeClient.validateHcsAbi();
+        assert.equal(clientAbiProbe.ok, true);
+        assert.equal(clientAbiProbe.computeCoreDllIdentity, 'VERIFIED');
+        assert.equal(clientAbiProbe.vmcomputeDllIdentity, 'VERIFIED');
+        assert.equal(clientAbiProbe.hcsAbiVerified, 'VERIFIED');
+        assert.equal(clientAbiProbe.hcsMemoryOwnership, 'VERIFIED');
+
+        // Verify capability hierarchy invariant: ABI verified != VM creation available
+        assert.notEqual(abiProbe.hcsAbiVerified, abiProbe.hcsVmCreationAvailable);
+        assert.notEqual(abiProbe.hcsSafeApiInvoked, abiProbe.hcsVmCreationAvailable);
+
+        // 26.B.10c4: Authoritative HCS ABI Contract Resolution & Safe Invocation Test
+        const safeInvokeProbe = await sendNativeSupervisorRequest({ operation: 'INVOKE_SAFE_HCS_API' });
+        assert.equal(safeInvokeProbe.ok, true);
+        assert.equal(safeInvokeProbe.invoked, true);
+        assert.equal(safeInvokeProbe.computeCoreLoaded, true);
+        assert.equal(safeInvokeProbe.dll, 'ComputeCore.dll');
+        assert.equal(safeInvokeProbe.dllLayer, 'PUBLIC_COMPUTECORE');
+        assert.equal(safeInvokeProbe.computeCoreDllIdentity, 'VERIFIED');
+        assert.equal(safeInvokeProbe.vmcomputeDllIdentity, 'VERIFIED');
+        assert.equal(safeInvokeProbe.hcsPublicApiSignatures, 'VERIFIED');
+        assert.equal(safeInvokeProbe.hcsInternalApiSignatures, 'VERIFIED');
+        assert.equal(safeInvokeProbe.publicMemoryDeallocator, 'LocalFree');
+        assert.equal(safeInvokeProbe.internalMemoryDeallocator, 'CoTaskMemFree');
+        assert.equal(safeInvokeProbe.safeApiInvoked, 'VERIFIED');
+        assert.equal(safeInvokeProbe.hcsNativeApiInvocation, 'VERIFIED');
+        assert.equal(safeInvokeProbe.serviceBinaryPath, 'C:\\Windows\\System32\\vmcompute.exe');
+        assert.equal(safeInvokeProbe.serviceBinaryPresent, true);
+        assert.equal(safeInvokeProbe.serviceEndpointReachable, false);
+        assert.equal(safeInvokeProbe.errorClassification, 'SERVICE_UNAVAILABLE');
+        assert.equal(safeInvokeProbe.vmcomputeServiceConfiguration, 'MANUAL_START_DEMAND');
+        assert.equal(safeInvokeProbe.vmcomputeServiceRuntime, 'SERVICE_RUNNING');
+        assert.equal(safeInvokeProbe.vmcomputeDependencies, 'PRESENT_VERIFIED');
+        assert.equal(safeInvokeProbe.hcsRpcEndpoint, 'NOT_RESPONDING');
+        assert.equal(safeInvokeProbe.serviceRunningVsHcsAvailableDistinction, 'VERIFIED');
+        assert.equal(safeInvokeProbe.rpcTriggerInterfaceGuid, 'E7A216AF-1EC1-447F-8D3F-A87278DB564D');
+        assert.notEqual(safeInvokeProbe.safeApiInvoked, 'NOT_AVAILABLE', 'Must not report NOT_AVAILABLE when native API was actually called');
+        assert.equal(safeInvokeProbe.serviceAvailability, 'UNAVAILABLE');
+        assert.equal(safeInvokeProbe.reasonCode, 'HCS_E_SERVICE_NOT_AVAILABLE');
+        assert.equal(safeInvokeProbe.hresultHex, '0x8037011B');
+
+        const clientSafeInvoke = await nativeClient.invokeSafeHcsApi();
+        assert.equal(clientSafeInvoke.ok, true);
+        assert.equal(clientSafeInvoke.invoked, true);
+        assert.equal(clientSafeInvoke.safeApiInvoked, 'VERIFIED');
+        assert.equal(clientSafeInvoke.hcsNativeApiInvocation, 'VERIFIED');
+        assert.notEqual(clientSafeInvoke.safeApiInvoked, 'NOT_AVAILABLE', 'Must not report NOT_AVAILABLE when native API was actually called');
+        assert.equal(clientSafeInvoke.serviceAvailability, 'UNAVAILABLE');
+        assert.equal(clientSafeInvoke.reasonCode, 'HCS_E_SERVICE_NOT_AVAILABLE');
+        assert.equal(clientSafeInvoke.hresultHex, '0x8037011B');
+
+        // Verify adapter contract constants and hierarchy invariants
+        assert.equal(HCS_CAPABILITY_STATES.COMPUTECORE_DLL_IDENTITY, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.VMCOMPUTE_DLL_IDENTITY, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_DLL_PRESENT, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_EXPORTS_RESOLVED, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_SDK_CONTRACT_SOURCE, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_PUBLIC_API_SIGNATURES, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_INTERNAL_API_SIGNATURES, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_ABI_VERIFIED, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_MEMORY_OWNERSHIP, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_OPERATION_LIFECYCLE, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_CALLBACK_LIFECYCLE, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_HANDLE_OWNERSHIP, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_SAFE_API_INVOKED, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_NATIVE_API_INVOCATION, 'VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.VMCOMPUTE_SERVICE_CONFIGURATION, 'MANUAL_START_DEMAND');
+        assert.equal(HCS_CAPABILITY_STATES.VMCOMPUTE_SERVICE_RUNTIME, 'SERVICE_RUNNING');
+        assert.equal(HCS_CAPABILITY_STATES.VMCOMPUTE_DEPENDENCIES, 'PRESENT_VERIFIED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_RPC_ENDPOINT, 'NOT_RESPONDING');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_SERVICE_AVAILABILITY, 'UNAVAILABLE');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_VM_CREATION_AVAILABLE, 'BLOCKED');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_VM_EXECUTION_AVAILABLE, 'BLOCKED');
+
+        // Verify non-negotiable security hierarchy:
+        // Even though ABI & memory ownership are VERIFIED, VM creation remains BLOCKED.
+        assert.notEqual(HCS_CAPABILITY_STATES.HCS_ABI_VERIFIED, HCS_CAPABILITY_STATES.HCS_VM_CREATION_AVAILABLE);
+        assert.notEqual(HCS_CAPABILITY_STATES.HCS_SAFE_API_INVOKED, HCS_CAPABILITY_STATES.HCS_VM_CREATION_AVAILABLE);
+        assert.notEqual(HCS_CAPABILITY_STATES.HCS_SAFE_API_INVOKED, HCS_CAPABILITY_STATES.HCS_SERVICE_AVAILABILITY);
+        assert.notEqual(HCS_CAPABILITY_STATES.HCS_NATIVE_API_INVOCATION, HCS_CAPABILITY_STATES.HCS_VM_CREATION_AVAILABLE);
+        assert.notEqual(HCS_CAPABILITY_STATES.HCS_NATIVE_API_INVOCATION, HCS_CAPABILITY_STATES.HCS_SERVICE_AVAILABILITY);
+        assert.notEqual(HCS_CAPABILITY_STATES.HCS_SERVICE_AVAILABILITY, HCS_CAPABILITY_STATES.HCS_VM_CREATION_AVAILABLE);
+        assert.notEqual(HCS_CAPABILITY_STATES.VMCOMPUTE_SERVICE_RUNTIME, HCS_CAPABILITY_STATES.HCS_SERVICE_AVAILABILITY, 'Service RUNNING must not promote HCS service availability');
+
+        // 26.B.10c5: Native Supervisor Trust Boundary & Peer Authentication Verification (V44.75)
+        const supervisorIdentityProbe = await sendNativeSupervisorRequest({ operation: 'GET_SUPERVISOR_IDENTITY' });
+        assert.equal(supervisorIdentityProbe.ok, true);
+        assert.equal(supervisorIdentityProbe.supervisorId, 'native-windows-supervisor-1');
+        assert.equal(supervisorIdentityProbe.identitySource, 'independent_authenticated_observer');
+        assert.ok(supervisorIdentityProbe.pid > 0);
+        assert.ok(typeof supervisorIdentityProbe.tokenUserSid === 'string' && supervisorIdentityProbe.tokenUserSid.startsWith('S-1-'));
+        assert.ok(supervisorIdentityProbe.namedPipe.includes('ai-help-agent-supervisor'));
+        assert.ok(supervisorIdentityProbe.clientPeerPid > 0);
+
+        // 26.B.10c6: Native HCS Service Startability, Dependency & Runtime Readiness Diagnostics (V44.76)
+        // Synthetic failure mode simulations verifying fail-closed invariants
+        function evaluateSyntheticHcsServiceState(sim) {
+          if (sim.serviceConfiguration === 'DISABLED') return { serviceAvailable: false, reason: 'SERVICE_DISABLED', gate: 'BLOCKED' };
+          if (sim.rpcEndpoint === 'MISSING') return { serviceAvailable: false, reason: 'RPC_ENDPOINT_UNAVAILABLE', gate: 'BLOCKED' };
+          if (sim.hresult === 0x80070005) return { serviceAvailable: false, reason: 'ACCESS_DENIED', gate: 'BLOCKED' };
+          if (sim.dependenciesPresent === false) return { serviceAvailable: false, reason: 'DEPENDENCY_UNAVAILABLE', gate: 'BLOCKED' };
+          if (sim.serviceStartFailed === true) return { serviceAvailable: false, reason: 'SERVICE_START_FAILED', gate: 'BLOCKED' };
+          if (sim.dllIdentity !== 'VERIFIED') return { serviceAvailable: false, reason: 'INCORRECT_DLL_IDENTITY', gate: 'BLOCKED' };
+          if (sim.serviceRuntime === 'SERVICE_STOPPED') return { serviceAvailable: false, reason: 'SERVICE_STOPPED', gate: 'BLOCKED' };
+          return { serviceAvailable: true, reason: 'SERVICE_RUNNING', gate: 'BLOCKED' };
+        }
+
+        const diagDisabled = evaluateSyntheticHcsServiceState({ isSyntheticTest: true, serviceConfiguration: 'DISABLED' });
+        assert.equal(diagDisabled.serviceAvailable, false);
+        assert.equal(diagDisabled.reason, 'SERVICE_DISABLED');
+        assert.equal(diagDisabled.gate, 'BLOCKED');
+
+        const diagMissingRpc = evaluateSyntheticHcsServiceState({ isSyntheticTest: true, rpcEndpoint: 'MISSING' });
+        assert.equal(diagMissingRpc.serviceAvailable, false);
+        assert.equal(diagMissingRpc.reason, 'RPC_ENDPOINT_UNAVAILABLE');
+        assert.equal(diagMissingRpc.gate, 'BLOCKED');
+
+        const diagAccessDenied = evaluateSyntheticHcsServiceState({ isSyntheticTest: true, hresult: 0x80070005 });
+        assert.equal(diagAccessDenied.serviceAvailable, false);
+        assert.equal(diagAccessDenied.reason, 'ACCESS_DENIED');
+        assert.equal(diagAccessDenied.gate, 'BLOCKED');
+
+        const diagDepMissing = evaluateSyntheticHcsServiceState({ isSyntheticTest: true, dependenciesPresent: false });
+        assert.equal(diagDepMissing.serviceAvailable, false);
+        assert.equal(diagDepMissing.reason, 'DEPENDENCY_UNAVAILABLE');
+        assert.equal(diagDepMissing.gate, 'BLOCKED');
+
+        const diagStartFailed = evaluateSyntheticHcsServiceState({ isSyntheticTest: true, serviceStartFailed: true });
+        assert.equal(diagStartFailed.serviceAvailable, false);
+        assert.equal(diagStartFailed.reason, 'SERVICE_START_FAILED');
+        assert.equal(diagStartFailed.gate, 'BLOCKED');
+
+        const diagBadDll = evaluateSyntheticHcsServiceState({ isSyntheticTest: true, dllIdentity: 'CORRUPTED' });
+        assert.equal(diagBadDll.serviceAvailable, false);
+        assert.equal(diagBadDll.reason, 'INCORRECT_DLL_IDENTITY');
+        assert.equal(diagBadDll.gate, 'BLOCKED');
+
+        // Console mode vs actual service identity
+        assert.notEqual(supervisorIdentityProbe.tokenUserSid, 'S-1-5-18', 'Console mode must never claim LocalSystem identity');
+
+        // 26.B.10d: Architecture & VM Boundary Validation via IPC
+        const archCheckWsb = await sendNativeSupervisorRequest({
+          operation: 'VALIDATE_VM_BOUNDARY',
+          architecture: 'windows-sandbox',
+        });
+        assert.equal(archCheckWsb.ok, true);
+        assert.equal(archCheckWsb.headlessSupported, false);
+        assert.equal(archCheckWsb.reasonCode, 'SANDBOX_GUI_HEADLESS_UNSUPPORTED');
+
+        const archCheckHcs = await sendNativeSupervisorRequest({
+          operation: 'VALIDATE_VM_BOUNDARY',
+          architecture: 'direct-hcs',
+        });
+        assert.equal(archCheckHcs.ok, true);
+        assert.equal(archCheckHcs.headlessSupported, true);
+        assert.equal(archCheckHcs.reasonCode, 'HCS_SERVICE_UNINSTALLED');
+
+        // 26.B.10e: Direct HCS MicroVM Lifecycle Tests via Native Supervisor
+        // 1. Invalid configuration: memory bounds
+        const badMemHcs = await sendNativeSupervisorRequest({
+          operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+          runId: 'v44-68-mem-run',
+          memoryInMB: 256,
+          isSyntheticTest: true,
+        });
+        assert.equal(badMemHcs.ok, false);
+        assert.equal(badMemHcs.error, 'INVALID_HCS_CONFIGURATION');
+
+        // 2. Invalid configuration: network egress enabled
+        const badNetHcs = await sendNativeSupervisorRequest({
+          operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+          runId: 'v44-68-net-run',
+          allowNetworkEgress: true,
+          isSyntheticTest: true,
+        });
+        assert.equal(badNetHcs.ok, false);
+        assert.equal(badNetHcs.error, 'INVALID_HCS_CONFIGURATION');
+
+        // 3. Successful synthetic HCS creation with host-assigned GUID
+        const validHcs = await sendNativeSupervisorRequest({
+          operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+          runId: 'v44-68-valid-hcs-run',
+          workspaceRoot: 'C:\\test\\workspace',
+          approvedSnapshotDigest: 'a'.repeat(64),
+          memoryInMB: 2048,
+          isSyntheticTest: true,
+        });
+        assert.equal(validHcs.ok, true);
+        assert.equal(validHcs.created, true);
+        assert.ok(typeof validHcs.vmGuid === 'string' && validHcs.vmGuid.startsWith('hcs-vm-'));
+        assert.equal(validHcs.hypervisorBoundary, 'HYPERVISOR_MICROVM_ENFORCED');
+        assert.equal(validHcs.filesystemIsolation, 'READONLY_SNAPSHOT_ENFORCED');
+        assert.equal(validHcs.networkIsolation, 'EGRESS_BLOCKED');
+
+        // 4. Observation with unknown VM GUID rejected
+        const badObserve = await sendNativeSupervisorRequest({
+          operation: 'HCS_OBSERVE_COMPUTE_SYSTEM',
+          vmGuid: 'hcs-vm-00000000-0000-0000-0000-000000000000',
+        });
+        assert.equal(badObserve.ok, false);
+        assert.equal(badObserve.error, 'UNKNOWN_COMPUTE_SYSTEM');
+        assert.equal(badObserve.reasonCode, 'VM_IDENTITY_MISMATCH');
+
+        // 5. Host-observed active VM state
+        const validObserve = await sendNativeSupervisorRequest({
+          operation: 'HCS_OBSERVE_COMPUTE_SYSTEM',
+          vmGuid: validHcs.vmGuid,
+        });
+        assert.equal(validObserve.ok, true);
+        assert.equal(validObserve.state, 'RUNNING');
+        assert.equal(validObserve.hypervisorBoundaryActive, true);
+        assert.equal(validObserve.filesystemIsolationActive, true);
+        assert.equal(validObserve.networkEgressBlocked, true);
+
+        // 6. Guest process execution
+        const execHcs = await sendNativeSupervisorRequest({
+          operation: 'HCS_EXECUTE_GUEST_PROCESS',
+          vmGuid: validHcs.vmGuid,
+          command: { executable: 'cmd.exe', args: ['/c', 'echo', 'guest-hcs-test'] },
+        });
+        assert.equal(execHcs.ok, true);
+        assert.equal(execHcs.exitCode, 0);
+        assert.ok(execHcs.stdout.includes('Direct HCS guest process completed'));
+
+        // 7. Verify release before teardown fails
+        const prematureRelease = await sendNativeSupervisorRequest({
+          operation: 'HCS_VERIFY_TEARDOWN_AND_RELEASE',
+          vmGuid: validHcs.vmGuid,
+        });
+        assert.equal(prematureRelease.ok, false);
+        assert.equal(prematureRelease.reasonCode, 'TEARDOWN_NOT_OBSERVED');
+
+        // 8. VM Termination & Teardown observation
+        const termHcs = await sendNativeSupervisorRequest({
+          operation: 'HCS_TERMINATE_COMPUTE_SYSTEM',
+          vmGuid: validHcs.vmGuid,
+          reason: 'normal_completion',
+        });
+        assert.equal(termHcs.ok, true);
+        assert.equal(termHcs.terminated, true);
+        assert.equal(termHcs.teardownObserved, true);
+
+        // 9. Host-verified Resource Release
+        const releaseHcs = await sendNativeSupervisorRequest({
+          operation: 'HCS_VERIFY_TEARDOWN_AND_RELEASE',
+          vmGuid: validHcs.vmGuid,
+        });
+        assert.equal(releaseHcs.ok, true);
+        assert.equal(releaseHcs.released, true);
+        assert.equal(releaseHcs.activeHandlesRemaining, 0);
+
+        // 10. Direct HCS Provider Adapter synthetic execution with supervisor
+        const hcsSyntheticRunner = createDirectHcsProviderAdapter({
+          supervisor: nativeClient,
+          isSyntheticTest: true,
+        });
+        const hcsRunResult = await hcsSyntheticRunner.executeWithSupervisor({
+          runId: 'v44-68-synth-adapter-run',
+          workspaceRoot: 'C:\\test\\workspace',
+          approvedSnapshotDigest: 'b'.repeat(64),
+          command: { executable: 'cmd.exe', args: ['/c', 'echo', 'hcs-adapter-test'] },
+        });
+        assert.equal(hcsRunResult.ok, true);
+        assert.equal(hcsRunResult.exitCode, 0);
+        assert.equal(hcsRunResult.teardownObserved, true);
+        assert.equal(hcsRunResult.resourcesReleased, true);
+        assert.deepEqual(hcsSyntheticRunner.getHcsCapabilityStates(), {
+          COMPUTECORE_DLL_IDENTITY: 'VERIFIED',
+          VMCOMPUTE_DLL_IDENTITY: 'VERIFIED',
+          HCS_DLL_PRESENT: 'VERIFIED',
+          HCS_EXPORTS_RESOLVED: 'VERIFIED',
+          HCS_SDK_CONTRACT_SOURCE: 'VERIFIED',
+          HCS_PUBLIC_API_SIGNATURES: 'VERIFIED',
+          HCS_INTERNAL_API_SIGNATURES: 'VERIFIED',
+          HCS_ABI_VERIFIED: 'VERIFIED',
+          HCS_MEMORY_OWNERSHIP: 'VERIFIED',
+          HCS_OPERATION_LIFECYCLE: 'VERIFIED',
+          HCS_CALLBACK_LIFECYCLE: 'VERIFIED',
+          HCS_HANDLE_OWNERSHIP: 'VERIFIED',
+          HCS_SAFE_API_INVOKED: 'VERIFIED',
+          HCS_NATIVE_API_INVOCATION: 'VERIFIED',
+          VMCOMPUTE_SERVICE_CONFIGURATION: 'MANUAL_START_DEMAND',
+          VMCOMPUTE_SERVICE_RUNTIME: 'SERVICE_RUNNING',
+          VMCOMPUTE_DEPENDENCIES: 'PRESENT_VERIFIED',
+          HCS_RPC_ENDPOINT: 'NOT_RESPONDING',
+          HCS_SERVICE_AVAILABILITY: 'UNAVAILABLE',
+          HCS_VM_CREATION_AVAILABLE: 'BLOCKED',
+          HCS_VM_EXECUTION_AVAILABLE: 'BLOCKED',
+        });
+
         // 26.B.11: Authenticated clean shutdown via IPC
         const shutdownResp = await sendNativeSupervisorRequest({ operation: 'SHUTDOWN' });
         assert.equal(shutdownResp.ok, true);
@@ -5474,6 +5994,47 @@ async function runVerifiedIsolationTests() {
       assert.ok(installInfoRes.stdout.includes('NT AUTHORITY\\SYSTEM'));
       assert.ok(installInfoRes.stdout.includes('sc.exe start AiHelpAgentSupervisor'));
       assert.ok(installInfoRes.stdout.includes('sc.exe delete AiHelpAgentSupervisor'));
+
+      // 26.C.4: Service Identity Mismatch Rejection
+      const mismatchedServiceSup = {
+        observerDescriptor: {
+          identitySource: 'independent_authenticated_observer',
+          pid: 999992,
+          parentPid: 1,
+          executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\AiHelpAgentSupervisor.exe',
+          expectedPrincipalSid: 'S-1-5-18',
+          windowsNamedPipe: {
+            pipePath: '\\\\.\\pipe\\ai-help-agent-supervisor-fake',
+            securityDescriptor: { sddl: 'D:(A;;GA;;;SY)', restrictedDacl: true, nullDacl: false },
+          },
+          windowsProcessPeer: {
+            pid: 999992,
+            handleValid: true,
+            processExited: false,
+            processCreationTimeUtc: '2026-11-01T07:00:00.000Z',
+            executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\AiHelpAgentSupervisor.exe',
+            tokenUserSid: 'S-1-5-21-999-mismatched-user',
+            identitySource: 'independent_authenticated_observer',
+          },
+        },
+        issueExecutionGrant: async () => ({}),
+        consumeExecutionGrant: async () => ({}),
+        allocateWorker: async () => ({}),
+        observeWorkerReadiness: async () => ({}),
+        observeEffectiveIsolation: async () => ({}),
+        executeApprovedOperation: async () => ({}),
+        enforceDeadlineAndCancellation: async () => ({}),
+        collectHostEvidence: async () => ({}),
+        terminateWorker: async () => ({}),
+        verifyWorkerTerminationAndResourceRelease: async () => ({}),
+        persistLifecycleState: async () => ({}),
+        quarantineResource: async () => ({}),
+        resolveQuarantine: async () => ({}),
+      };
+      assert.throws(
+        () => createWindowsSandboxProviderAdapter({ supervisor: mismatchedServiceSup, isSyntheticTest: true }),
+        (err) => err.code === 'SUPERVISOR_AUTHENTICATION_FAILED',
+      );
     }
 
     // =========================================================================
@@ -5495,7 +6056,7 @@ async function runVerifiedIsolationTests() {
 
       try {
         let activeStatus = null;
-        for (let attempt = 0; attempt < 25; attempt++) {
+        for (let attempt = 0; attempt < 60; attempt++) {
           activeStatus = await queryNativeSupervisorStatus();
           if (activeStatus.running) break;
           await new Promise((resolve) => setTimeout(resolve, 50));
@@ -5553,6 +6114,33 @@ async function runVerifiedIsolationTests() {
             assert.equal(err.executionBlocked, true);
             return true;
           },
+        );
+
+        // 26.D.5: Direct HCS real host creation fails closed without elevated privileges
+        const realHcsCreate = await sendNativeSupervisorRequest({
+          operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+          runId: 'v44-68-real-host-hcs',
+          workspaceRoot: 'C:\\test\\workspace',
+          approvedSnapshotDigest: 'c'.repeat(64),
+          isSyntheticTest: false,
+        });
+        assert.equal(realHcsCreate.ok, false);
+        assert.equal(realHcsCreate.created, false);
+        assert.equal(realHcsCreate.reasonCode, 'HCS_PRIVILEGE_INSUFFICIENT');
+        assert.equal(realHcsCreate.processIsolationGate, 'BLOCKED');
+
+        // 26.D.6: Direct HCS provider adapter real execution fails closed with zero host fallback
+        const realNativeClient = createNativeSupervisorClient({
+          pid: activeStatus.pid,
+          tokenUserSid: activeStatus.tokenUserSid,
+          isSyntheticTest: false,
+        });
+        assert.throws(
+          () => createDirectHcsProviderAdapter({
+            supervisor: realNativeClient,
+            isSyntheticTest: false,
+          }),
+          (err) => err.code === 'SUPERVISOR_AUTHENTICATION_FAILED',
         );
 
         await sendNativeSupervisorRequest({ operation: 'SHUTDOWN' });

@@ -3241,8 +3241,121 @@ function evaluateProviderEligibility(capabilities, evidenceState) {
   });
 }
 
+
+const DIRECT_HCS_EVIDENCE_DIMENSIONS = Object.freeze([
+  'SERVICE_IDENTITY',
+  'SUPERVISOR_IPC_IDENTITY',
+  'VM_IDENTITY',
+  'VM_HOST_LIFECYCLE',
+  'HYPERVISOR_BOUNDARY',
+  'HOST_FILESYSTEM_ISOLATION',
+  'HOST_NETWORK_ISOLATION',
+  'WORKSPACE_TRANSFER',
+  'GUEST_COMMUNICATION',
+  'VM_TEARDOWN',
+  'RESOURCE_RELEASE',
+]);
+
+const DIRECT_HCS_EVIDENCE_STATES = Object.freeze({
+  VERIFIED: 'VERIFIED',
+  BLOCKED: 'BLOCKED',
+  UNCERTAIN: 'UNCERTAIN',
+  NOT_ESTABLISHED: 'NOT_ESTABLISHED',
+});
+
+function evaluateDirectHcsEvidence(evidence = {}) {
+  const rejectedReasons = [];
+
+  if (evidence.callerSuppliedAssertion === true || evidence.syntheticOverride === true) {
+    rejectedReasons.push('CALLER_SUPPLIED_BOOLEAN_REJECTED');
+  }
+  if (evidence.source === 'guest-claim' || evidence.untrustedGuestJson === true) {
+    rejectedReasons.push('GUEST_FORGED_EVIDENCE_REJECTED');
+  }
+  if (evidence.jobObjectOnly === true) {
+    rejectedReasons.push('JOB_OBJECT_NOT_VM_ISOLATION');
+  }
+  if (evidence.guiProcessExitOnly === true) {
+    rejectedReasons.push('GUI_EXIT_NOT_VM_TEARDOWN');
+  }
+  if (evidence.hcsApiClaimOnly === true) {
+    rejectedReasons.push('HCS_API_RESPONSE_NOT_ISOLATION_PROOF');
+  }
+  if (evidence.syntheticTestClaimingRealIsolation === true) {
+    rejectedReasons.push('SYNTHETIC_NOT_REAL_HOST_ISOLATION');
+  }
+
+  const dimensionEvaluations = {
+    SERVICE_IDENTITY: evidence.serviceRunningMode === 'WINDOWS_SERVICE' && evidence.servicePrincipalSid === 'S-1-5-18'
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    SUPERVISOR_IPC_IDENTITY: evidence.ipcAuthenticated === true && evidence.restrictedAcl === true
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    VM_IDENTITY: typeof evidence.vmGuid === 'string' && /^[0-9a-f-]{36}$/i.test(evidence.vmGuid.replace(/^hcs-vm-/, '')) && !evidence.vmGuidMismatch
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    VM_HOST_LIFECYCLE: evidence.vmLifecycleObservedByHost === true
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    HYPERVISOR_BOUNDARY: evidence.hypervisorPartitionConfirmed === true
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    HOST_FILESYSTEM_ISOLATION: evidence.filesystemWriteProtectionVerified === true
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    HOST_NETWORK_ISOLATION: evidence.networkEgressFirewallRestricted === true
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    WORKSPACE_TRANSFER: evidence.workspaceTransferVerified === true
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    GUEST_COMMUNICATION: evidence.authenticatedGuestChannel === true
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    VM_TEARDOWN: evidence.vmPartitionDestroyedObservedByHost === true
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+
+    RESOURCE_RELEASE: evidence.resourceReleaseVerified === true
+      ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED
+      : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED,
+  };
+
+  const unverifiedDimensions = Object.entries(dimensionEvaluations)
+    .filter(([, state]) => state !== DIRECT_HCS_EVIDENCE_STATES.VERIFIED)
+    .map(([dim]) => dim);
+
+  const isVerified = rejectedReasons.length === 0 && unverifiedDimensions.length === 0;
+
+  return {
+    verified: isVerified,
+    state: isVerified ? DIRECT_HCS_EVIDENCE_STATES.VERIFIED : (rejectedReasons.length > 0 ? DIRECT_HCS_EVIDENCE_STATES.BLOCKED : DIRECT_HCS_EVIDENCE_STATES.NOT_ESTABLISHED),
+    processIsolationGate: isVerified ? 'ALLOWED' : 'BLOCKED',
+    dimensions: dimensionEvaluations,
+    unverifiedDimensions,
+    rejectedReasons,
+    reason: isVerified
+      ? 'All 11 Direct HCS evidence dimensions verified by host authority.'
+      : `Direct HCS isolation evidence incomplete: ${[...rejectedReasons, ...unverifiedDimensions.map(d => `${d}_UNVERIFIED`)].join(', ')}.`,
+  };
+}
+
 module.exports = {
   ISSUER_SERVICE_STATES,
+  DIRECT_HCS_EVIDENCE_DIMENSIONS,
+  DIRECT_HCS_EVIDENCE_STATES,
+  evaluateDirectHcsEvidence,
+
   ISSUER_TRUST_DOMAINS,
   EVIDENCE_FACT_ORIGINS,
   ISSUER_REQUEST_FIELDS,
