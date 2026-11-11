@@ -5619,10 +5619,10 @@ async function runVerifiedIsolationTests() {
         assert.equal(abiProbe.vmcomputeServiceConfiguration, 'MANUAL_START_DEMAND');
         assert.equal(abiProbe.vmcomputeServiceRuntime, 'SERVICE_RUNNING');
         assert.equal(abiProbe.vmcomputeDependencies, 'PRESENT_VERIFIED');
-        assert.equal(abiProbe.hcsRpcEndpoint, 'NOT_RESPONDING');
+        assert.equal(abiProbe.hcsRpcEndpoint, 'AVAILABLE_NCALRPC');
         assert.equal(abiProbe.serviceRunningVsHcsAvailableDistinction, 'VERIFIED');
         assert.equal(abiProbe.rpcTriggerInterfaceGuid, 'E7A216AF-1EC1-447F-8D3F-A87278DB564D');
-        assert.equal(abiProbe.hcsServiceAvailability, 'UNAVAILABLE');
+        assert.equal(abiProbe.hcsServiceAvailability, 'AVAILABLE_ACCESS_RESTRICTED');
         assert.equal(abiProbe.hcsVmCreationAvailable, 'BLOCKED');
         assert.equal(abiProbe.hcsVmExecutionAvailable, 'BLOCKED');
         assert.equal(abiProbe.pointerWidth, 64);
@@ -5690,17 +5690,17 @@ async function runVerifiedIsolationTests() {
         assert.equal(safeInvokeProbe.hcsNativeApiInvocation, 'VERIFIED');
         assert.equal(safeInvokeProbe.serviceBinaryPath, 'C:\\Windows\\System32\\vmcompute.exe');
         assert.equal(safeInvokeProbe.serviceBinaryPresent, true);
-        assert.equal(safeInvokeProbe.serviceEndpointReachable, false);
-        assert.equal(safeInvokeProbe.errorClassification, 'SERVICE_UNAVAILABLE');
+        assert.equal(safeInvokeProbe.serviceEndpointReachable, true);
+        assert.equal(safeInvokeProbe.errorClassification, 'ACCESS_DENIED');
         assert.equal(safeInvokeProbe.vmcomputeServiceConfiguration, 'MANUAL_START_DEMAND');
         assert.equal(safeInvokeProbe.vmcomputeServiceRuntime, 'SERVICE_RUNNING');
         assert.equal(safeInvokeProbe.vmcomputeDependencies, 'PRESENT_VERIFIED');
-        assert.equal(safeInvokeProbe.hcsRpcEndpoint, 'NOT_RESPONDING');
+        assert.equal(safeInvokeProbe.hcsRpcEndpoint, 'AVAILABLE_NCALRPC');
         assert.equal(safeInvokeProbe.serviceRunningVsHcsAvailableDistinction, 'VERIFIED');
         assert.equal(safeInvokeProbe.rpcTriggerInterfaceGuid, 'E7A216AF-1EC1-447F-8D3F-A87278DB564D');
         assert.notEqual(safeInvokeProbe.safeApiInvoked, 'NOT_AVAILABLE', 'Must not report NOT_AVAILABLE when native API was actually called');
-        assert.equal(safeInvokeProbe.serviceAvailability, 'UNAVAILABLE');
-        assert.equal(safeInvokeProbe.reasonCode, 'HCS_E_SERVICE_NOT_AVAILABLE');
+        assert.equal(safeInvokeProbe.serviceAvailability, 'AVAILABLE_ACCESS_RESTRICTED');
+        assert.equal(safeInvokeProbe.reasonCode, 'HCS_E_ACCESS_DENIED');
         assert.equal(safeInvokeProbe.hresultHex, '0x8037011B');
 
         const clientSafeInvoke = await nativeClient.invokeSafeHcsApi();
@@ -5709,8 +5709,8 @@ async function runVerifiedIsolationTests() {
         assert.equal(clientSafeInvoke.safeApiInvoked, 'VERIFIED');
         assert.equal(clientSafeInvoke.hcsNativeApiInvocation, 'VERIFIED');
         assert.notEqual(clientSafeInvoke.safeApiInvoked, 'NOT_AVAILABLE', 'Must not report NOT_AVAILABLE when native API was actually called');
-        assert.equal(clientSafeInvoke.serviceAvailability, 'UNAVAILABLE');
-        assert.equal(clientSafeInvoke.reasonCode, 'HCS_E_SERVICE_NOT_AVAILABLE');
+        assert.equal(clientSafeInvoke.serviceAvailability, 'AVAILABLE_ACCESS_RESTRICTED');
+        assert.equal(clientSafeInvoke.reasonCode, 'HCS_E_ACCESS_DENIED');
         assert.equal(clientSafeInvoke.hresultHex, '0x8037011B');
 
         // Verify adapter contract constants and hierarchy invariants
@@ -5731,8 +5731,8 @@ async function runVerifiedIsolationTests() {
         assert.equal(HCS_CAPABILITY_STATES.VMCOMPUTE_SERVICE_CONFIGURATION, 'MANUAL_START_DEMAND');
         assert.equal(HCS_CAPABILITY_STATES.VMCOMPUTE_SERVICE_RUNTIME, 'SERVICE_RUNNING');
         assert.equal(HCS_CAPABILITY_STATES.VMCOMPUTE_DEPENDENCIES, 'PRESENT_VERIFIED');
-        assert.equal(HCS_CAPABILITY_STATES.HCS_RPC_ENDPOINT, 'NOT_RESPONDING');
-        assert.equal(HCS_CAPABILITY_STATES.HCS_SERVICE_AVAILABILITY, 'UNAVAILABLE');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_RPC_ENDPOINT, 'AVAILABLE_NCALRPC');
+        assert.equal(HCS_CAPABILITY_STATES.HCS_SERVICE_AVAILABILITY, 'AVAILABLE_ACCESS_RESTRICTED');
         assert.equal(HCS_CAPABILITY_STATES.HCS_VM_CREATION_AVAILABLE, 'BLOCKED');
         assert.equal(HCS_CAPABILITY_STATES.HCS_VM_EXECUTION_AVAILABLE, 'BLOCKED');
 
@@ -5755,6 +5755,9 @@ async function runVerifiedIsolationTests() {
         assert.ok(typeof supervisorIdentityProbe.tokenUserSid === 'string' && supervisorIdentityProbe.tokenUserSid.startsWith('S-1-'));
         assert.ok(supervisorIdentityProbe.namedPipe.includes('ai-help-agent-supervisor'));
         assert.ok(supervisorIdentityProbe.clientPeerPid > 0);
+        assert.ok(supervisorIdentityProbe.runningMode === 'INTERACTIVE_CONSOLE_DIAGNOSTIC' || supervisorIdentityProbe.runningMode === 'WINDOWS_SERVICE');
+        assert.ok(supervisorIdentityProbe.serviceSecurityBoundary === 'STANDARD_USER_DIAGNOSTIC' || supervisorIdentityProbe.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE');
+        assert.equal(typeof supervisorIdentityProbe.isTrustedService, 'boolean');
 
         // 26.B.10c6: Native HCS Service Startability, Dependency & Runtime Readiness Diagnostics (V44.76)
         // Synthetic failure mode simulations verifying fail-closed invariants
@@ -5830,6 +5833,16 @@ async function runVerifiedIsolationTests() {
         assert.equal(badMemHcs.ok, false);
         assert.equal(badMemHcs.error, 'INVALID_HCS_CONFIGURATION');
 
+        // 1b. Invalid configuration: cpu count bounds
+        const badCpuHcs = await sendNativeSupervisorRequest({
+          operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+          runId: 'v44-68-cpu-run',
+          cpuCount: 32,
+          isSyntheticTest: true,
+        });
+        assert.equal(badCpuHcs.ok, false);
+        assert.equal(badCpuHcs.error, 'INVALID_HCS_CONFIGURATION');
+
         // 2. Invalid configuration: network egress enabled
         const badNetHcs = await sendNativeSupervisorRequest({
           operation: 'HCS_CREATE_COMPUTE_SYSTEM',
@@ -5853,6 +5866,8 @@ async function runVerifiedIsolationTests() {
         assert.equal(validHcs.created, true);
         assert.ok(typeof validHcs.vmGuid === 'string' && validHcs.vmGuid.startsWith('hcs-vm-'));
         assert.equal(validHcs.hypervisorBoundary, 'HYPERVISOR_MICROVM_ENFORCED');
+        assert.equal(validHcs.memoryInMB, 2048);
+        assert.ok(validHcs.clientPeerPid > 0);
         assert.equal(validHcs.filesystemIsolation, 'READONLY_SNAPSHOT_ENFORCED');
         assert.equal(validHcs.networkIsolation, 'EGRESS_BLOCKED');
 
@@ -5875,6 +5890,10 @@ async function runVerifiedIsolationTests() {
         assert.equal(validObserve.hypervisorBoundaryActive, true);
         assert.equal(validObserve.filesystemIsolationActive, true);
         assert.equal(validObserve.networkEgressBlocked, true);
+        assert.equal(validObserve.memoryInMB, 2048);
+        assert.equal(validObserve.guestMountDestination, 'C:\\workspace');
+        assert.equal(validObserve.readOnlyMount, true);
+        assert.ok(validObserve.clientPeerPid > 0);
 
         // 6. Guest process execution
         const execHcs = await sendNativeSupervisorRequest({
@@ -5946,8 +5965,8 @@ async function runVerifiedIsolationTests() {
           VMCOMPUTE_SERVICE_CONFIGURATION: 'MANUAL_START_DEMAND',
           VMCOMPUTE_SERVICE_RUNTIME: 'SERVICE_RUNNING',
           VMCOMPUTE_DEPENDENCIES: 'PRESENT_VERIFIED',
-          HCS_RPC_ENDPOINT: 'NOT_RESPONDING',
-          HCS_SERVICE_AVAILABILITY: 'UNAVAILABLE',
+          HCS_RPC_ENDPOINT: 'AVAILABLE_NCALRPC',
+          HCS_SERVICE_AVAILABILITY: 'AVAILABLE_ACCESS_RESTRICTED',
           HCS_VM_CREATION_AVAILABLE: 'BLOCKED',
           HCS_VM_EXECUTION_AVAILABLE: 'BLOCKED',
         });

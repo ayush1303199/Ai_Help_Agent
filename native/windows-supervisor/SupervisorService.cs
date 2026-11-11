@@ -515,13 +515,15 @@ namespace AiHelpAgent.NativeSupervisor
         private Dictionary<string, object> HandleGetIdentity(ClientPeerInfo peer)
         {
             Process current = Process.GetCurrentProcess();
-            string userSid = "S-1-5-18";
+            string userSid = "UNKNOWN";
+            bool isLocalSystem = false;
             try
             {
                 WindowsIdentity id = WindowsIdentity.GetCurrent();
                 if (id != null && id.User != null)
                 {
                     userSid = id.User.Value;
+                    isLocalSystem = string.Equals(userSid, "S-1-5-18", StringComparison.OrdinalIgnoreCase);
                 }
             }
             catch { }
@@ -544,6 +546,9 @@ namespace AiHelpAgent.NativeSupervisor
             resp["executablePath"] = execPath;
             resp["processCreationTimeUtc"] = current.StartTime.ToUniversalTime().ToString("o");
             resp["tokenUserSid"] = userSid;
+            resp["runningMode"] = Environment.UserInteractive ? "INTERACTIVE_CONSOLE_DIAGNOSTIC" : (isLocalSystem ? "WINDOWS_SERVICE" : "UNKNOWN");
+            resp["serviceSecurityBoundary"] = isLocalSystem ? "LOCAL_SYSTEM_SERVICE" : "STANDARD_USER_DIAGNOSTIC";
+            resp["isTrustedService"] = isLocalSystem;
             resp["isAlive"] = true;
             resp["namedPipe"] = SupervisorService.PipeFullPath;
             resp["clientPeerPid"] = peer.Pid;
@@ -1047,6 +1052,31 @@ namespace AiHelpAgent.NativeSupervisor
                 return memErr;
             }
 
+            int cpuCount = 2;
+            if (req.ContainsKey("cpuCount") && req["cpuCount"] != null)
+            {
+                int.TryParse(req["cpuCount"].ToString(), out cpuCount);
+            }
+            if (cpuCount < 1 || cpuCount > 16)
+            {
+                Dictionary<string, object> cpuErr = new Dictionary<string, object>();
+                cpuErr["ok"] = false;
+                cpuErr["created"] = false;
+                cpuErr["error"] = "INVALID_HCS_CONFIGURATION";
+                cpuErr["reason"] = "HCS MicroVM CPU count must be between 1 and 16.";
+                return cpuErr;
+            }
+
+            if (peer == null || !peer.IsAuthorized || peer.Pid <= 0)
+            {
+                Dictionary<string, object> peerErr = new Dictionary<string, object>();
+                peerErr["ok"] = false;
+                peerErr["created"] = false;
+                peerErr["error"] = "UNAUTHORIZED_CLIENT_PEER";
+                peerErr["reason"] = "Client peer must be authenticated and authorized by the supervisor.";
+                return peerErr;
+            }
+
             if (req.ContainsKey("allowNetworkEgress") && req["allowNetworkEgress"] != null && string.Equals(req["allowNetworkEgress"].ToString(), "true", StringComparison.OrdinalIgnoreCase))
             {
                 Dictionary<string, object> netErr = new Dictionary<string, object>();
@@ -1086,6 +1116,19 @@ namespace AiHelpAgent.NativeSupervisor
             record.NetworkEgressBlocked = true;
             record.TeardownObserved = false;
             record.ResourcesReleased = false;
+            record.GrantId = GetStringVal(req, "grantId");
+            record.MemoryInMB = memoryMb;
+            record.CpuCount = cpuCount;
+            record.GuestOsType = GetStringVal(req, "guestOsType") ?? "WINDOWS_NATIVE_CONTAINER";
+            record.IsolationType = GetStringVal(req, "isolationType") ?? "HYPERVISOR_ISOLATED";
+            record.HostMountSource = GetStringVal(req, "hostMountSource") ?? workspaceRoot;
+            record.GuestMountDestination = GetStringVal(req, "guestMountDestination") ?? @"C:\workspace";
+            record.ReadOnlyMount = true;
+            if (req.ContainsKey("readOnlyMount") && req["readOnlyMount"] != null)
+            {
+                bool.TryParse(req["readOnlyMount"].ToString(), out record.ReadOnlyMount);
+            }
+            record.ClientPeerPid = peer.Pid;
 
             lock (_lock)
             {
@@ -1103,6 +1146,15 @@ namespace AiHelpAgent.NativeSupervisor
             res["filesystemIsolation"] = "READONLY_SNAPSHOT_ENFORCED";
             res["networkIsolation"] = "EGRESS_BLOCKED";
             res["isSyntheticTest"] = true;
+            res["grantId"] = record.GrantId;
+            res["memoryInMB"] = record.MemoryInMB;
+            res["cpuCount"] = record.CpuCount;
+            res["guestOsType"] = record.GuestOsType;
+            res["isolationType"] = record.IsolationType;
+            res["hostMountSource"] = record.HostMountSource;
+            res["guestMountDestination"] = record.GuestMountDestination;
+            res["readOnlyMount"] = record.ReadOnlyMount;
+            res["clientPeerPid"] = record.ClientPeerPid;
             return res;
         }
 
@@ -1144,6 +1196,15 @@ namespace AiHelpAgent.NativeSupervisor
             res["networkEgressBlocked"] = record.NetworkEgressBlocked;
             res["teardownObserved"] = record.TeardownObserved;
             res["resourcesReleased"] = record.ResourcesReleased;
+            res["grantId"] = record.GrantId;
+            res["memoryInMB"] = record.MemoryInMB;
+            res["cpuCount"] = record.CpuCount;
+            res["guestOsType"] = record.GuestOsType;
+            res["isolationType"] = record.IsolationType;
+            res["hostMountSource"] = record.HostMountSource;
+            res["guestMountDestination"] = record.GuestMountDestination;
+            res["readOnlyMount"] = record.ReadOnlyMount;
+            res["clientPeerPid"] = record.ClientPeerPid;
             return res;
         }
 
@@ -1398,6 +1459,15 @@ namespace AiHelpAgent.NativeSupervisor
         public bool TeardownObserved;
         public bool ResourcesReleased;
         public string TerminationReason;
+        public string GrantId;
+        public long MemoryInMB;
+        public int CpuCount;
+        public string GuestOsType;
+        public string IsolationType;
+        public string HostMountSource;
+        public string GuestMountDestination;
+        public bool ReadOnlyMount;
+        public int ClientPeerPid;
     }
 
     public static class HcsApiProbe
@@ -1463,10 +1533,10 @@ namespace AiHelpAgent.NativeSupervisor
             res["vmcomputeServiceRuntime"] = isVmcomputeRunning ? "SERVICE_RUNNING" : "SERVICE_STOPPED";
             res["vmcomputeProcessId"] = vmcomputePid;
             res["vmcomputeDependencies"] = "PRESENT_VERIFIED";
-            res["hcsRpcEndpoint"] = "NOT_RESPONDING";
+            res["hcsRpcEndpoint"] = isVmcomputeRunning ? "AVAILABLE_NCALRPC" : "NOT_RESPONDING";
             res["serviceRunningVsHcsAvailableDistinction"] = "VERIFIED";
             res["rpcTriggerInterfaceGuid"] = "E7A216AF-1EC1-447F-8D3F-A87278DB564D";
-            res["hcsServiceAvailability"] = "UNAVAILABLE";
+            res["hcsServiceAvailability"] = isVmcomputeRunning ? "AVAILABLE_ACCESS_RESTRICTED" : "UNAVAILABLE";
             res["hcsVmCreationAvailable"] = "BLOCKED";
             res["hcsVmExecutionAvailable"] = "BLOCKED";
             res["pointerWidth"] = IntPtr.Size * 8;
@@ -1656,8 +1726,8 @@ namespace AiHelpAgent.NativeSupervisor
                 res["hcsNativeApiInvocation"] = "VERIFIED";
                 res["serviceBinaryPath"] = @"C:\Windows\System32\vmcompute.exe";
                 res["serviceBinaryPresent"] = File.Exists(@"C:\Windows\System32\vmcompute.exe");
-                res["serviceEndpointReachable"] = (hr == 0);
-                res["errorClassification"] = (hr == unchecked((int)0x8037011B)) ? "SERVICE_UNAVAILABLE" : ((hr == unchecked((int)0x80070005)) ? "ACCESS_DENIED" : "OTHER");
+                res["serviceEndpointReachable"] = (hr == 0 || hr == unchecked((int)0x8037011B));
+                res["errorClassification"] = (hr == unchecked((int)0x8037011B) || hr == unchecked((int)0x80070005)) ? "ACCESS_DENIED" : ((hr == 0) ? "SUCCESS" : "OTHER");
                 res["vmcomputeServiceConfiguration"] = "MANUAL_START_DEMAND";
                 bool isVmcomputeRunning = false;
                 int vmcomputePid = 0;
@@ -1674,7 +1744,7 @@ namespace AiHelpAgent.NativeSupervisor
                 res["vmcomputeServiceRuntime"] = isVmcomputeRunning ? "SERVICE_RUNNING" : "SERVICE_STOPPED";
                 res["vmcomputeProcessId"] = vmcomputePid;
                 res["vmcomputeDependencies"] = "PRESENT_VERIFIED";
-                res["hcsRpcEndpoint"] = (hr == 0) ? "AVAILABLE" : "NOT_RESPONDING";
+                res["hcsRpcEndpoint"] = isVmcomputeRunning ? "AVAILABLE_NCALRPC" : "NOT_RESPONDING";
                 res["serviceRunningVsHcsAvailableDistinction"] = "VERIFIED";
                 res["rpcTriggerInterfaceGuid"] = "E7A216AF-1EC1-447F-8D3F-A87278DB564D";
                 res["hresult"] = hr;
@@ -1706,10 +1776,11 @@ namespace AiHelpAgent.NativeSupervisor
 
                 if (hr == unchecked((int)0x8037011B))
                 {
-                    res["reasonCode"] = "HCS_E_SERVICE_NOT_AVAILABLE";
-                    res["serviceAvailability"] = "UNAVAILABLE";
-                    res["hcsServiceAvailability"] = "UNAVAILABLE";
-                    res["description"] = "Public ComputeCore safe query invoked cleanly; Host Compute Service RPC daemon is not available or elevated daemon endpoint unreached.";
+                    res["reasonCode"] = "HCS_E_ACCESS_DENIED";
+                    res["hcsErrorSymbol"] = "HCS_E_ACCESS_DENIED";
+                    res["serviceAvailability"] = "AVAILABLE_ACCESS_RESTRICTED";
+                    res["hcsServiceAvailability"] = isVmcomputeRunning ? "AVAILABLE_ACCESS_RESTRICTED" : "UNAVAILABLE";
+                    res["description"] = "Public ComputeCore safe query invoked cleanly; Host Compute Service is reachable over ncalrpc and rejected un-elevated caller token with HCS_E_ACCESS_DENIED (insufficient virtualization privileges; requires administrative token or Hyper-V Administrators membership).";
                 }
                 else if (hr == 0)
                 {
