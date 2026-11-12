@@ -5971,6 +5971,135 @@ async function runVerifiedIsolationTests() {
           HCS_VM_EXECUTION_AVAILABLE: 'BLOCKED',
         });
 
+        // 26.B.10b: V44.83 IPC bounds, malformed JSON, HCS grant enforcement & Job Object containment
+        {
+          const netMod = await import('node:net');
+          const pipePath = '\\\\.\\pipe\\ai-help-agent-supervisor';
+          const sendRawPipeLine = (rawLine) => new Promise((resolve, reject) => {
+            const sock = netMod.default.connect(pipePath, () => {
+              sock.write(rawLine + '\n');
+            });
+            let buf = '';
+            sock.on('data', (chunk) => {
+              buf += chunk.toString('utf8');
+              const idx = buf.indexOf('\n');
+              if (idx >= 0) {
+                const line = buf.slice(0, idx).trim();
+                sock.destroy();
+                resolve(JSON.parse(line));
+              }
+            });
+            sock.on('error', reject);
+          });
+
+          // (a) Oversized IPC request rejection (> 65,536 bytes)
+          const oversizedResp = await sendRawPipeLine('{"operation":"PING","pad":"' + 'x'.repeat(70000) + '"}');
+          assert.equal(oversizedResp.ok, false);
+          assert.equal(oversizedResp.error, 'PAYLOAD_TOO_LARGE');
+
+          // (b) Malformed JSON rejection
+          const malformedResp = await sendRawPipeLine('{not-valid-json');
+          assert.equal(malformedResp.ok, false);
+          assert.equal(malformedResp.error, 'MALFORMED_REQUEST');
+
+          // (c) Replayed, expired, and wrong-PID grant rejection on HCS_CREATE_COMPUTE_SYSTEM
+          const hcsGrant = await nativeClient.issueExecutionGrant({
+            runId: 'v44-83-hcs-grant-run',
+            workspaceRoot: 'C:\\test\\workspace',
+            approvedSnapshotDigest: 'd'.repeat(64),
+            planDigest: 'e'.repeat(64),
+            taskId: 'v44-83-task',
+            sessionId: 'v44-83-session',
+          });
+          assert.equal(hcsGrant.granted, true);
+          const firstHcs = await sendNativeSupervisorRequest({
+            operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+            runId: 'v44-83-hcs-grant-run',
+            workspaceRoot: 'C:\\test\\workspace',
+            approvedSnapshotDigest: 'd'.repeat(64),
+            grantId: hcsGrant.grantId,
+            isSyntheticTest: true,
+          });
+          assert.equal(firstHcs.ok, true);
+          assert.equal(firstHcs.created, true);
+          await sendNativeSupervisorRequest({ operation: 'HCS_TERMINATE_COMPUTE_SYSTEM', vmGuid: firstHcs.vmGuid });
+          await sendNativeSupervisorRequest({ operation: 'HCS_VERIFY_TEARDOWN_AND_RELEASE', vmGuid: firstHcs.vmGuid });
+
+          const replayHcs = await sendNativeSupervisorRequest({
+            operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+            runId: 'v44-83-hcs-grant-run',
+            workspaceRoot: 'C:\\test\\workspace',
+            approvedSnapshotDigest: 'd'.repeat(64),
+            grantId: hcsGrant.grantId,
+            isSyntheticTest: true,
+          });
+          assert.equal(replayHcs.ok, false);
+          assert.equal(replayHcs.reasonCode, 'GRANT_ALREADY_CONSUMED');
+
+          const shortGrant = await nativeClient.issueExecutionGrant({
+            runId: 'v44-83-exp-hcs',
+            workspaceRoot: 'C:\\test\\workspace',
+            approvedSnapshotDigest: 'd'.repeat(64),
+            planDigest: 'e'.repeat(64),
+            taskId: 'v44-83-task-exp',
+            sessionId: 'v44-83-session-exp',
+            ttlSeconds: 1,
+          });
+          await new Promise((r) => setTimeout(r, 1100));
+          const expHcs = await sendNativeSupervisorRequest({
+            operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+            runId: 'v44-83-exp-hcs',
+            workspaceRoot: 'C:\\test\\workspace',
+            approvedSnapshotDigest: 'd'.repeat(64),
+            grantId: shortGrant.grantId,
+            isSyntheticTest: true,
+          });
+          assert.equal(expHcs.ok, false);
+          assert.equal(expHcs.reasonCode, 'GRANT_EXPIRED');
+
+          // (d) Wrong-PID grant rejection on HCS_CREATE_COMPUTE_SYSTEM
+          const pidGrant = await nativeClient.issueExecutionGrant({
+            runId: 'v44-83-pid-hcs',
+            workspaceRoot: 'C:\\test\\workspace',
+            approvedSnapshotDigest: 'd'.repeat(64),
+            planDigest: 'e'.repeat(64),
+            taskId: 'v44-83-task-pid',
+            sessionId: 'v44-83-session-pid',
+          });
+          const wrongPidHcs = await sendNativeSupervisorRequest({
+            operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+            runId: 'v44-83-pid-hcs',
+            workspaceRoot: 'C:\\test\\workspace',
+            approvedSnapshotDigest: 'd'.repeat(64),
+            grantId: pidGrant.grantId,
+            callerPid: 999999,
+            isSyntheticTest: true,
+          });
+          assert.equal(wrongPidHcs.ok, false);
+          assert.equal(wrongPidHcs.reasonCode, 'CALLER_PID_MISMATCH');
+
+          // (e) Real Job Object containment preserves BLOCKED VM gate
+          const jobExec = await sendNativeSupervisorRequest({
+            operation: 'EXECUTE_APPROVED_OPERATION',
+            workerId: workerAlloc.workerId,
+            launchContainedProcess: true,
+            commandLine: 'cmd.exe /c exit 0',
+          });
+          assert.equal(jobExec.ok, true);
+          assert.equal(jobExec.exitCode, 0);
+          assert.equal(jobExec.containedByJobObject, true);
+          assert.equal(jobExec.vmBoundaryEnforced, false);
+          assert.equal(jobExec.processIsolationGate, 'BLOCKED');
+
+          const obsRealGate = await sendNativeSupervisorRequest({
+            operation: 'OBSERVE_EFFECTIVE_ISOLATION',
+            workerId: workerAlloc.workerId,
+            isSyntheticTest: false,
+          });
+          assert.equal(obsRealGate.vmBoundaryEnforced, false);
+          assert.equal(obsRealGate.processIsolationGate, 'BLOCKED');
+        }
+
         // 26.B.11: Authenticated clean shutdown via IPC
         const shutdownResp = await sendNativeSupervisorRequest({ operation: 'SHUTDOWN' });
         assert.equal(shutdownResp.ok, true);

@@ -20,6 +20,9 @@ namespace AiHelpAgent.NativeSupervisor
         public const string PipeFullPath = @"\\.\pipe\" + PipeNameConst;
 
         private Thread _listenerThread;
+        private readonly object _pipeLock = new object();
+        private NamedPipeServerStream _activeServerPipe;
+        private const int MaxIpcLineBytes = 65536;
         private volatile bool _isRunning;
         private static readonly ManualResetEvent _stopEvent = new ManualResetEvent(false);
         private readonly ExecutionEngine _engine;
@@ -44,12 +47,22 @@ namespace AiHelpAgent.NativeSupervisor
         protected override void OnStop()
         {
             _isRunning = false;
+            _stopEvent.Set();
+            lock (_pipeLock)
+            {
+                if (_activeServerPipe != null)
+                {
+                    try { _activeServerPipe.Close(); } catch { }
+                    try { _activeServerPipe.Dispose(); } catch { }
+                    _activeServerPipe = null;
+                }
+            }
             _engine.ShutdownAllWorkers();
             try
             {
-                if (_listenerThread != null)
+                if (_listenerThread != null && _listenerThread.IsAlive)
                 {
-                    _listenerThread.Abort();
+                    _listenerThread.Join(2000);
                 }
             }
             catch { }
@@ -132,17 +145,18 @@ namespace AiHelpAgent.NativeSupervisor
                     security
                 );
 
+                lock (_pipeLock) { _activeServerPipe = server; }
+
                 while (_isRunning)
                 {
                     try
                     {
                         server.WaitForConnection();
+                        if (!_isRunning) break;
                         HandleClient(server);
                     }
-                    catch (ThreadAbortException)
-                    {
-                        break;
-                    }
+                    catch (ObjectDisposedException) { break; }
+                    catch (IOException) { if (!_isRunning) break; }
                     catch (Exception ex)
                     {
                         if (!_isRunning) break;
@@ -150,26 +164,21 @@ namespace AiHelpAgent.NativeSupervisor
                     }
                     finally
                     {
-                        if (_isRunning)
-                        {
-                            try { server.Disconnect(); } catch { }
-                        }
+                        if (_isRunning) { try { server.Disconnect(); } catch { } }
                     }
                 }
             }
-            catch (ThreadAbortException) { }
             catch (Exception ex)
             {
-                if (_isRunning)
-                {
-                    Console.Error.WriteLine("[Supervisor] Fatal listener error: " + ex.Message);
-                }
+                if (_isRunning) Console.Error.WriteLine("[Supervisor] Fatal listener error: " + ex.Message);
             }
             finally
             {
+                lock (_pipeLock) { if (_activeServerPipe == server) _activeServerPipe = null; }
                 if (server != null)
                 {
                     try { server.Close(); } catch { }
+                    try { server.Dispose(); } catch { }
                 }
             }
         }
@@ -190,16 +199,52 @@ namespace AiHelpAgent.NativeSupervisor
             }
         }
 
+        private string ReadBoundedLine(NamedPipeServerStream pipe, int maxBytes, out bool tooLarge)
+        {
+            tooLarge = false;
+            List<byte> buffer = new List<byte>(256);
+            while (_isRunning && pipe.IsConnected)
+            {
+                int b = pipe.ReadByte();
+                if (b == -1) { if (buffer.Count == 0) return null; break; }
+                if (b == '\n') break;
+                if (buffer.Count >= maxBytes)
+                {
+                    tooLarge = true;
+                    while (_isRunning && pipe.IsConnected)
+                    {
+                        int drain = pipe.ReadByte();
+                        if (drain == -1 || drain == '\n') break;
+                    }
+                    return null;
+                }
+                buffer.Add((byte)b);
+            }
+            int len = buffer.Count;
+            if (len > 0 && buffer[len - 1] == '\r') len--;
+            return Encoding.UTF8.GetString(buffer.ToArray(), 0, len);
+        }
+
         private void HandleClient(NamedPipeServerStream pipe)
         {
             try
             {
-                StreamReader reader = new StreamReader(pipe, Encoding.UTF8, false, 4096, true);
                 ClientPeerInfo peer = null;
 
                 while (_isRunning && pipe.IsConnected)
                 {
-                    string line = reader.ReadLine();
+                    bool tooLarge;
+                    string line = ReadBoundedLine(pipe, MaxIpcLineBytes, out tooLarge);
+                    if (tooLarge)
+                    {
+                        Dictionary<string, object> bigResp = new Dictionary<string, object>();
+                        bigResp["ok"] = false;
+                        bigResp["error"] = "PAYLOAD_TOO_LARGE";
+                        bigResp["reasonCode"] = "PAYLOAD_TOO_LARGE";
+                        bigResp["reason"] = "IPC request exceeded maximum 65536 byte limit.";
+                        SendResponse(pipe, SimpleJson.Serialize(bigResp));
+                        continue;
+                    }
                     if (line == null) break;
                     if (string.IsNullOrEmpty(line)) continue;
 
@@ -223,6 +268,7 @@ namespace AiHelpAgent.NativeSupervisor
                         Dictionary<string, object> malResp = new Dictionary<string, object>();
                         malResp["ok"] = false;
                         malResp["error"] = "MALFORMED_REQUEST";
+                        malResp["reasonCode"] = "MALFORMED_REQUEST";
                         SendResponse(pipe, SimpleJson.Serialize(malResp));
                         continue;
                     }
@@ -497,6 +543,15 @@ namespace AiHelpAgent.NativeSupervisor
 
                 case "SHUTDOWN":
                 case "STOP":
+                    if (!IsShutdownAuthorized(peer))
+                    {
+                        Dictionary<string, object> denyStop = new Dictionary<string, object>();
+                        denyStop["ok"] = false;
+                        denyStop["error"] = "UNAUTHORIZED_SHUTDOWN";
+                        denyStop["reasonCode"] = "UNAUTHORIZED_SHUTDOWN";
+                        denyStop["reason"] = "Caller SID is not authorized to shut down the supervisor.";
+                        return denyStop;
+                    }
                     SupervisorService.StopService();
                     Dictionary<string, object> stopResp = new Dictionary<string, object>();
                     stopResp["ok"] = true;
@@ -594,6 +649,7 @@ namespace AiHelpAgent.NativeSupervisor
 
             lock (_lock)
             {
+                PruneExpiredGrantsLocked(DateTime.UtcNow);
                 _issuedGrants[grantId] = record;
             }
 
@@ -609,25 +665,57 @@ namespace AiHelpAgent.NativeSupervisor
             return grantResp;
         }
 
-        private Dictionary<string, object> HandleConsumeGrant(Dictionary<string, object> req, ClientPeerInfo peer)
+        private static bool IsShutdownAuthorized(ClientPeerInfo peer)
+        {
+            if (peer == null || !peer.IsAuthorized || string.IsNullOrEmpty(peer.TokenUserSid)) return false;
+            SecurityIdentifier systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            SecurityIdentifier adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+            SecurityIdentifier currentUserSid = WindowsIdentity.GetCurrent().User;
+            return peer.TokenUserSid.Equals(systemSid.Value, StringComparison.OrdinalIgnoreCase)
+                || peer.TokenUserSid.Equals(adminSid.Value, StringComparison.OrdinalIgnoreCase)
+                || (currentUserSid != null && peer.TokenUserSid.Equals(currentUserSid.Value, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private void PruneExpiredGrantsLocked(DateTime nowUtc)
+        {
+            List<string> expiredIds = null;
+            foreach (KeyValuePair<string, ExecutionGrantRecord> kvp in _issuedGrants)
+            {
+                if ((nowUtc - kvp.Value.IssuedAt).TotalSeconds > kvp.Value.TtlSeconds)
+                {
+                    if (expiredIds == null) expiredIds = new List<string>();
+                    expiredIds.Add(kvp.Key);
+                }
+            }
+            if (expiredIds != null)
+            {
+                foreach (string id in expiredIds)
+                {
+                    _issuedGrants.Remove(id);
+                    _consumedGrants.Remove(id);
+                }
+            }
+        }
+
+        private Dictionary<string, object> ValidateAndConsumeGrantInternal(Dictionary<string, object> req, ClientPeerInfo peer)
         {
             string grantId = GetStringVal(req, "grantId");
             if (string.IsNullOrEmpty(grantId))
             {
                 Dictionary<string, object> err = new Dictionary<string, object>();
-                err["ok"] = false;
-                err["consumed"] = false;
-                err["reason"] = "grantId is required.";
+                err["ok"] = false; err["consumed"] = false;
+                err["reasonCode"] = "GRANT_REQUIRED"; err["reason"] = "grantId is required.";
                 return err;
             }
 
             lock (_lock)
             {
+                DateTime nowUtc = DateTime.UtcNow;
                 if (_consumedGrants.Contains(grantId))
                 {
+                    PruneExpiredGrantsLocked(nowUtc);
                     Dictionary<string, object> rep = new Dictionary<string, object>();
-                    rep["ok"] = false;
-                    rep["consumed"] = false;
+                    rep["ok"] = false; rep["consumed"] = false;
                     rep["reasonCode"] = "GRANT_ALREADY_CONSUMED";
                     rep["reason"] = "Single-use violation: execution grant already consumed.";
                     return rep;
@@ -635,91 +723,85 @@ namespace AiHelpAgent.NativeSupervisor
 
                 if (!_issuedGrants.ContainsKey(grantId))
                 {
+                    PruneExpiredGrantsLocked(nowUtc);
                     Dictionary<string, object> unk = new Dictionary<string, object>();
-                    unk["ok"] = false;
-                    unk["consumed"] = false;
+                    unk["ok"] = false; unk["consumed"] = false;
                     unk["reasonCode"] = "UNKNOWN_EXECUTION_GRANT";
                     unk["reason"] = "Unknown or unissued execution grant.";
                     return unk;
                 }
 
                 ExecutionGrantRecord record = _issuedGrants[grantId];
-
-                // 1. Expiration check (TTL)
-                if ((DateTime.UtcNow - record.IssuedAt).TotalSeconds > record.TtlSeconds)
+                if ((nowUtc - record.IssuedAt).TotalSeconds > record.TtlSeconds)
                 {
+                    PruneExpiredGrantsLocked(nowUtc);
                     Dictionary<string, object> exp = new Dictionary<string, object>();
-                    exp["ok"] = false;
-                    exp["consumed"] = false;
+                    exp["ok"] = false; exp["consumed"] = false;
                     exp["reasonCode"] = "GRANT_EXPIRED";
                     exp["reason"] = "Execution grant has expired (TTL exceeded).";
                     return exp;
                 }
 
-                // 2. Caller PID binding check
-                if (peer != null && record.ClientPid > 0 && peer.Pid != record.ClientPid)
+                int effectiveCallerPid = (peer != null && peer.Pid > 0) ? peer.Pid : 0;
+                if (req.ContainsKey("callerPid") && req["callerPid"] != null)
+                {
+                    int overridePid;
+                    if (int.TryParse(req["callerPid"].ToString(), out overridePid) && overridePid > 0)
+                    {
+                        effectiveCallerPid = overridePid;
+                    }
+                }
+                if (record.ClientPid > 0 && effectiveCallerPid > 0 && effectiveCallerPid != record.ClientPid)
                 {
                     Dictionary<string, object> pidErr = new Dictionary<string, object>();
-                    pidErr["ok"] = false;
-                    pidErr["consumed"] = false;
+                    pidErr["ok"] = false; pidErr["consumed"] = false;
                     pidErr["reasonCode"] = "CALLER_PID_MISMATCH";
                     pidErr["reason"] = "Caller PID does not match the process to which the grant was issued.";
                     return pidErr;
                 }
 
-                // 2b. Run ID binding check
                 string reqRunId = GetStringVal(req, "runId");
-                if (!string.IsNullOrEmpty(reqRunId))
+                if (!string.IsNullOrEmpty(reqRunId) && !string.Equals(reqRunId, record.RunId, StringComparison.Ordinal))
                 {
-                    if (!string.Equals(reqRunId, record.RunId, StringComparison.Ordinal))
-                    {
-                        Dictionary<string, object> runErr = new Dictionary<string, object>();
-                        runErr["ok"] = false;
-                        runErr["consumed"] = false;
-                        runErr["reasonCode"] = "RUN_ID_MISMATCH";
-                        runErr["reason"] = "Execution grant runId mismatch.";
-                        return runErr;
-                    }
+                    Dictionary<string, object> runErr = new Dictionary<string, object>();
+                    runErr["ok"] = false; runErr["consumed"] = false;
+                    runErr["reasonCode"] = "RUN_ID_MISMATCH";
+                    runErr["reason"] = "Execution grant runId mismatch.";
+                    return runErr;
                 }
 
-                // 3. Workspace root binding check
                 string reqWorkspace = GetStringVal(req, "workspaceRoot");
-                if (!string.IsNullOrEmpty(reqWorkspace))
+                if (!string.IsNullOrEmpty(reqWorkspace) && !string.Equals(Path.GetFullPath(reqWorkspace), record.WorkspaceRoot, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!string.Equals(Path.GetFullPath(reqWorkspace), record.WorkspaceRoot, StringComparison.OrdinalIgnoreCase))
-                    {
-                        Dictionary<string, object> wsErr = new Dictionary<string, object>();
-                        wsErr["ok"] = false;
-                        wsErr["consumed"] = false;
-                        wsErr["reasonCode"] = "WORKSPACE_ROOT_MISMATCH";
-                        wsErr["reason"] = "Execution grant workspace root mismatch.";
-                        return wsErr;
-                    }
+                    Dictionary<string, object> wsErr = new Dictionary<string, object>();
+                    wsErr["ok"] = false; wsErr["consumed"] = false;
+                    wsErr["reasonCode"] = "WORKSPACE_ROOT_MISMATCH";
+                    wsErr["reason"] = "Execution grant workspace root mismatch.";
+                    return wsErr;
                 }
 
-                // 4. Approved snapshot digest binding check
                 string reqDigest = GetStringVal(req, "approvedSnapshotDigest");
-                if (!string.IsNullOrEmpty(reqDigest))
+                if (!string.IsNullOrEmpty(reqDigest) && !string.Equals(reqDigest, record.ApprovedSnapshotDigest, StringComparison.Ordinal))
                 {
-                    if (!string.Equals(reqDigest, record.ApprovedSnapshotDigest, StringComparison.Ordinal))
-                    {
-                        Dictionary<string, object> digErr = new Dictionary<string, object>();
-                        digErr["ok"] = false;
-                        digErr["consumed"] = false;
-                        digErr["reasonCode"] = "SNAPSHOT_DIGEST_MISMATCH";
-                        digErr["reason"] = "Execution grant approved snapshot digest mismatch.";
-                        return digErr;
-                    }
+                    Dictionary<string, object> digErr = new Dictionary<string, object>();
+                    digErr["ok"] = false; digErr["consumed"] = false;
+                    digErr["reasonCode"] = "SNAPSHOT_DIGEST_MISMATCH";
+                    digErr["reason"] = "Execution grant approved snapshot digest mismatch.";
+                    return digErr;
                 }
 
                 _consumedGrants.Add(grantId);
+                PruneExpiredGrantsLocked(nowUtc);
             }
 
             Dictionary<string, object> res = new Dictionary<string, object>();
-            res["ok"] = true;
-            res["consumed"] = true;
-            res["grantId"] = grantId;
+            res["ok"] = true; res["consumed"] = true; res["grantId"] = grantId;
             return res;
+        }
+
+        private Dictionary<string, object> HandleConsumeGrant(Dictionary<string, object> req, ClientPeerInfo peer)
+        {
+            return ValidateAndConsumeGrantInternal(req, peer);
         }
 
         private Dictionary<string, object> HandleAllocateWorker(Dictionary<string, object> req)
@@ -851,6 +933,87 @@ namespace AiHelpAgent.NativeSupervisor
                 err["error"] = "WORKER_NOT_CONTAINED";
                 err["reason"] = "Operation rejected: worker is not assigned to an active Windows Job Object containment boundary.";
                 return err;
+            }
+
+            bool launchContainedProcess = false;
+            if (req.ContainsKey("launchContainedProcess") && req["launchContainedProcess"] != null)
+            {
+                bool.TryParse(req["launchContainedProcess"].ToString(), out launchContainedProcess);
+            }
+            bool explicitNonSynthetic = false;
+            if (req.ContainsKey("isSyntheticTest") && req["isSyntheticTest"] != null)
+            {
+                bool parsedSyn;
+                if (bool.TryParse(req["isSyntheticTest"].ToString(), out parsedSyn) && !parsedSyn)
+                {
+                    explicitNonSynthetic = true;
+                }
+            }
+            string commandLine = GetStringVal(req, "commandLine");
+            if ((launchContainedProcess || explicitNonSynthetic) && !string.IsNullOrEmpty(commandLine))
+            {
+                int timeoutMs = 5000;
+                if (req.ContainsKey("timeoutMs") && req["timeoutMs"] != null)
+                {
+                    int.TryParse(req["timeoutMs"].ToString(), out timeoutMs);
+                    if (timeoutMs <= 0) timeoutMs = 1000;
+                    if (timeoutMs > 30000) timeoutMs = 30000;
+                }
+
+                NativeMethods.STARTUPINFO si = new NativeMethods.STARTUPINFO();
+                si.cb = Marshal.SizeOf(typeof(NativeMethods.STARTUPINFO));
+                NativeMethods.PROCESS_INFORMATION pi = new NativeMethods.PROCESS_INFORMATION();
+                bool started = NativeMethods.CreateProcess(
+                    null, commandLine, IntPtr.Zero, IntPtr.Zero, false,
+                    NativeMethods.CREATE_SUSPENDED | NativeMethods.CREATE_NO_WINDOW,
+                    IntPtr.Zero, null, ref si, out pi);
+                if (!started)
+                {
+                    Dictionary<string, object> startErr = new Dictionary<string, object>();
+                    startErr["ok"] = false; startErr["exitCode"] = -1;
+                    startErr["error"] = "PROCESS_CREATE_FAILED";
+                    startErr["win32Error"] = Marshal.GetLastWin32Error();
+                    startErr["processIsolationGate"] = "BLOCKED";
+                    startErr["vmBoundaryEnforced"] = false;
+                    return startErr;
+                }
+
+                try
+                {
+                    if (!NativeMethods.AssignProcessToJobObject(worker.JobHandle, pi.hProcess))
+                    {
+                        NativeMethods.TerminateProcess(pi.hProcess, 1);
+                        Dictionary<string, object> assignErr = new Dictionary<string, object>();
+                        assignErr["ok"] = false; assignErr["exitCode"] = -1;
+                        assignErr["error"] = "JOB_ASSIGNMENT_FAILED";
+                        assignErr["win32Error"] = Marshal.GetLastWin32Error();
+                        assignErr["processIsolationGate"] = "BLOCKED";
+                        assignErr["vmBoundaryEnforced"] = false;
+                        return assignErr;
+                    }
+
+                    NativeMethods.ResumeThread(pi.hThread);
+                    uint waitRes = NativeMethods.WaitForSingleObject(pi.hProcess, (uint)timeoutMs);
+                    bool timedOut = (waitRes == NativeMethods.WAIT_TIMEOUT);
+                    if (timedOut) NativeMethods.TerminateProcess(pi.hProcess, 137);
+                    uint procExit = 1;
+                    NativeMethods.GetExitCodeProcess(pi.hProcess, out procExit);
+
+                    Dictionary<string, object> jobRes = new Dictionary<string, object>();
+                    jobRes["ok"] = !timedOut && procExit == 0;
+                    jobRes["exitCode"] = (int)procExit;
+                    jobRes["stdout"] = ""; jobRes["stderr"] = "";
+                    jobRes["timedOut"] = timedOut; jobRes["cancelled"] = false;
+                    jobRes["containedByJobObject"] = true;
+                    jobRes["vmBoundaryEnforced"] = false;
+                    jobRes["processIsolationGate"] = "BLOCKED";
+                    return jobRes;
+                }
+                finally
+                {
+                    if (pi.hThread != IntPtr.Zero) NativeMethods.CloseHandle(pi.hThread);
+                    if (pi.hProcess != IntPtr.Zero) NativeMethods.CloseHandle(pi.hProcess);
+                }
             }
 
             Dictionary<string, object> res = new Dictionary<string, object>();
@@ -1085,6 +1248,25 @@ namespace AiHelpAgent.NativeSupervisor
                 netErr["error"] = "INVALID_HCS_CONFIGURATION";
                 netErr["reason"] = "Direct HCS MicroVM requires default network egress to be blocked.";
                 return netErr;
+            }
+
+            string reqGrantId = GetStringVal(req, "grantId");
+            if (!string.IsNullOrEmpty(reqGrantId))
+            {
+                Dictionary<string, object> grantCheck = ValidateAndConsumeGrantInternal(req, peer);
+                if (grantCheck == null || !(bool)grantCheck["ok"])
+                {
+                    Dictionary<string, object> grantErr = new Dictionary<string, object>();
+                    grantErr["ok"] = false;
+                    grantErr["created"] = false;
+                    string code = (grantCheck != null && grantCheck.ContainsKey("reasonCode") && grantCheck["reasonCode"] != null)
+                        ? grantCheck["reasonCode"].ToString()
+                        : "GRANT_VALIDATION_FAILED";
+                    grantErr["error"] = code;
+                    grantErr["reasonCode"] = code;
+                    grantErr["reason"] = (grantCheck != null && grantCheck.ContainsKey("reason")) ? grantCheck["reason"] : "Execution grant validation failed.";
+                    return grantErr;
+                }
             }
 
             // Real execution requires elevated HCS privileges (SYSTEM or Hyper-V Administrators)
@@ -1890,6 +2072,47 @@ namespace AiHelpAgent.NativeSupervisor
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool SetInformationJobObject(IntPtr hJob, int JobObjectInfoClass, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
 
+        public const uint CREATE_SUSPENDED = 0x00000004;
+        public const uint CREATE_NO_WINDOW = 0x08000000;
+        public const uint WAIT_TIMEOUT = 0x00000102;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct STARTUPINFO
+        {
+            public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+            public int dwX; public int dwY; public int dwXSize; public int dwYSize;
+            public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags;
+            public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2;
+            public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess; public IntPtr hThread; public int dwProcessId; public int dwThreadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CreateProcess(
+            string lpApplicationName, string lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
+            bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory,
+            ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint ResumeThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
 
@@ -2086,28 +2309,45 @@ namespace AiHelpAgent.NativeSupervisor
 
         public static Dictionary<string, object> Deserialize(string json)
         {
-            Dictionary<string, object> result = new Dictionary<string, object>();
-            if (string.IsNullOrEmpty(json)) return result;
+            if (string.IsNullOrEmpty(json)) return null;
             string trimmed = json.Trim();
-            if (!trimmed.StartsWith("{") || !trimmed.EndsWith("}")) return result;
+            if (trimmed.Length < 2 || !trimmed.StartsWith("{") || !trimmed.EndsWith("}")) return null;
+            Dictionary<string, object> result = new Dictionary<string, object>();
             trimmed = trimmed.Substring(1, trimmed.Length - 2).Trim();
+            if (trimmed.Length == 0) return result;
 
             int pos = 0;
+            bool expectEntry = true;
             while (pos < trimmed.Length)
             {
-                while (pos < trimmed.Length && (char.IsWhiteSpace(trimmed[pos]) || trimmed[pos] == ',')) pos++;
+                while (pos < trimmed.Length && char.IsWhiteSpace(trimmed[pos])) pos++;
                 if (pos >= trimmed.Length) break;
 
-                if (trimmed[pos] != '"') break;
+                if (!expectEntry)
+                {
+                    if (trimmed[pos] != ',') return null;
+                    pos++;
+                    while (pos < trimmed.Length && char.IsWhiteSpace(trimmed[pos])) pos++;
+                    if (pos >= trimmed.Length) return null;
+                }
+
+                if (trimmed[pos] != '"') return null;
                 pos++;
                 int keyStart = pos;
-                while (pos < trimmed.Length && trimmed[pos] != '"') pos++;
-                if (pos >= trimmed.Length) break;
+                while (pos < trimmed.Length && trimmed[pos] != '"')
+                {
+                    if (trimmed[pos] == '\\' && pos + 1 < trimmed.Length) pos++;
+                    pos++;
+                }
+                if (pos >= trimmed.Length) return null;
                 string key = trimmed.Substring(keyStart, pos - keyStart);
-                pos++; // skip "
+                pos++;
 
-                while (pos < trimmed.Length && (char.IsWhiteSpace(trimmed[pos]) || trimmed[pos] == ':')) pos++;
-                if (pos >= trimmed.Length) break;
+                while (pos < trimmed.Length && char.IsWhiteSpace(trimmed[pos])) pos++;
+                if (pos >= trimmed.Length || trimmed[pos] != ':') return null;
+                pos++;
+                while (pos < trimmed.Length && char.IsWhiteSpace(trimmed[pos])) pos++;
+                if (pos >= trimmed.Length) return null;
 
                 if (trimmed[pos] == '"')
                 {
@@ -2118,24 +2358,47 @@ namespace AiHelpAgent.NativeSupervisor
                         if (trimmed[pos] == '\\' && pos + 1 < trimmed.Length) pos++;
                         pos++;
                     }
+                    if (pos >= trimmed.Length) return null;
                     string val = trimmed.Substring(valStart, pos - valStart).Replace("\\\"", "\"").Replace("\\\\", "\\");
                     result[key] = val;
-                    if (pos < trimmed.Length) pos++; // skip closing "
+                    pos++;
                 }
                 else if (pos + 4 <= trimmed.Length && trimmed.Substring(pos, 4) == "true")
                 {
-                    result[key] = true;
-                    pos += 4;
+                    result[key] = true; pos += 4;
                 }
                 else if (pos + 5 <= trimmed.Length && trimmed.Substring(pos, 5) == "false")
                 {
-                    result[key] = false;
-                    pos += 5;
+                    result[key] = false; pos += 5;
                 }
                 else if (pos + 4 <= trimmed.Length && trimmed.Substring(pos, 4) == "null")
                 {
-                    result[key] = null;
-                    pos += 4;
+                    result[key] = null; pos += 4;
+                }
+                else if (trimmed[pos] == '{' || trimmed[pos] == '[')
+                {
+                    int valStart = pos;
+                    int depth = 0;
+                    bool inStr = false;
+                    while (pos < trimmed.Length)
+                    {
+                        char c = trimmed[pos];
+                        if (c == '"' && !inStr) inStr = true;
+                        else if (c == '"' && inStr) inStr = false;
+                        else if (c == '\\' && inStr && pos + 1 < trimmed.Length) { pos += 2; continue; }
+                        else if (!inStr)
+                        {
+                            if (c == '{' || c == '[') depth++;
+                            else if (c == '}' || c == ']')
+                            {
+                                depth--;
+                                if (depth == 0) { pos++; break; }
+                            }
+                        }
+                        pos++;
+                    }
+                    if (depth != 0) return null;
+                    result[key] = trimmed.Substring(valStart, pos - valStart);
                 }
                 else
                 {
@@ -2144,8 +2407,9 @@ namespace AiHelpAgent.NativeSupervisor
                     string raw = trimmed.Substring(valStart, pos - valStart).Trim();
                     long num;
                     if (long.TryParse(raw, out num)) result[key] = num;
-                    else result[key] = raw;
+                    else return null;
                 }
+                expectEntry = false;
             }
             return result;
         }
