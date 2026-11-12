@@ -12168,6 +12168,9 @@ class CodingWebSocketAuthenticationTests(unittest.IsolatedAsyncioTestCase):
             "Implement binary search in Rust",
             "Generate a SQL query to find duplicate records",
             "Show me an example of LRU cache logic",
+            "Where does the app save user preferences?",
+            "How does save_session work?",
+            "Explain how to generate a token in auth.js",
         ]
         for req in standalone_requests:
             self.assertFalse(_requires_proposal(req), f"Standalone prompt must not force diff proposal: {req}")
@@ -12181,10 +12184,16 @@ class CodingWebSocketAuthenticationTests(unittest.IsolatedAsyncioTestCase):
             "Create a database migration for the orders table",
             "Generate a random password helper function and save it to src/utils/password.js",
             "Fix the null pointer exception in authController.ts",
+            "Fix the bug in server.js",
         ]
         for req in mutation_requests:
             classified = classify_task_intent(req)
             self.assertTrue(classified["proposal_required"], f"Repo target must require proposal: {req}")
+
+        db_loc_cls = classify_task_intent("Where is the database configuration?")
+        self.assertFalse(_requires_proposal("Where is the database configuration?"))
+        self.assertFalse(db_loc_cls["proposal_required"])
+        self.assertFalse(db_loc_cls["execution_required"])
 
     async def test_standalone_code_generation_turn_without_project_root_delivers_chat_code(self):
         import coding_websocket

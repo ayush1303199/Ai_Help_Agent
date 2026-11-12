@@ -851,7 +851,7 @@ ONLY_YES_NO_PATTERN = re.compile(
 )
 EXPLANATION_PATTERN = re.compile(
     r"^\s*(?:please\s+)?(?:explain|describe|what\s+(?:does|do|is|are)|how\s+(?:does|do|is|can\s+i)|"
-    r"why\s+(?:does|do|is)|tell\s+me\s+about|can\s+you\s+explain|what\s+is\s+the\s+purpose\s+of)\b|"
+    r"why\s+(?:does|do|is)|where\s+(?:does|do|is|are)|tell\s+me\s+about|can\s+you\s+explain|what\s+is\s+the\s+purpose\s+of)\b|"
     r"\b(?:check\s+karo|inspect\s+karo|audit\s+karo|dekh\s+ke\s+batao|batao\s+kya|kya\s+slow)\b|"
     r"\b(?:ko\s+check\s+karo\s+aur\s+batao)\b",
     re.IGNORECASE,
@@ -1609,7 +1609,7 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     elif re.search(r"\b(?:500|404|error|exception|buge?s?|issue|kabhi\s+kabhi|fail|crash(?:es|ed|ing)?|wrong|incorrect)\b", req, re.I) and not re.search(r"\b(?:fix|repair|resolve|banao)\b", req, re.I):
         intent = TaskIntent.BUG_INVESTIGATION
         proposal_required = False
-    elif re.search(r"\b(?:samjhao|samjha\s+do|kaise\s+kaam\s+karta\s+hai|kya\s+karta\s+hai|explain|describe|what\s+(?:does|do|is|are)|how\s+(?:does|do|is|can\s+i)|why\s+(?:does|do|is)|overview|walkthrough)\b", req, re.I):
+    elif re.search(r"\b(?:samjhao|samjha\s+do|kaise\s+kaam\s+karta\s+hai|kya\s+karta\s+hai|explain|describe|what\s+(?:does|do|is|are)|how\s+(?:does|do|is|can\s+i)|why\s+(?:does|do|is)|where\s+(?:does|do|is|are)|overview|walkthrough)\b", req, re.I):
         intent = TaskIntent.QUESTION
         proposal_required = False
     elif re.search(r"\b(?:che[ck]{1,2}(?:\s+karo)?|inspect(?:\s+karo)?|dekh\s+ke\s+batao|batao\s+kya)\b", req, re.I):
