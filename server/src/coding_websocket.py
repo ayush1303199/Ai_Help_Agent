@@ -820,7 +820,7 @@ def _coding_task_steps(intent: str, proposal_required: bool) -> List[str]:
         steps.append("Answer from recorded evidence and identify only relevant unverified checks")
     return steps
 WRITE_PATTERN = re.compile(
-    r"\b(fix|implement|add|create|change|modify|update|write|refactor|optimi[sz]e|improve|remove|rewrite|"
+    r"\b(fix|implement|add|create|change|modify|update|write|generate|save|refactor|optimi[sz]e|improve|remove|rewrite|"
     r"resolve|patch|migrate|convert|introduce|build|scaffold|setup|bootstrap|greenfield|full-?stack)\b|"
     r"(?:\b(?:jodo|sudhar|sudharo|badlo|banao|banana|banani|bana\s+do|hatao)\b)|"
     r"(?:\bfile(?:n)?bn(?:a|ana|ani)\b)|"
@@ -886,8 +886,73 @@ CHANGE_FOLLOW_UP_PATTERN = re.compile(
 )
 
 
+def _is_standalone_code_generation_request(request: str) -> bool:
+    clean = str(request or "").strip()
+    if not clean:
+        return False
+    if re.search(r"\b[\w-]+\.[a-z0-9]{1,8}\b", clean, re.I) or re.search(
+        r"(?:^|\s)(?:\.{0,2}/|~/|[a-zA-Z]:\\|[\w.-]+/[\w.-]+)", clean
+    ):
+        return False
+    stripped = re.sub(
+        r"^(?:(?:hello|hi|hey|good\s+(?:morning|afternoon|evening)|thanks(?:\s+for\s+[^,;!?\n]+)?|thank\s+you(?:\s+for\s+[^,;!?\n]+)?|sure|okay|ok)\s*[,;!?\n]?\s*)+",
+        "",
+        clean,
+        flags=re.I,
+    )
+    stripped = re.sub(
+        r"^(?:(?:can\s+you|could\s+you|would\s+you|will\s+you|please)\s+(?:please\s+)?)+",
+        "",
+        stripped,
+        flags=re.I,
+    ).strip()
+    if re.match(
+        r"^(?:fix|debug|repair|patch|refactor|modify|change|edit|update|upgrade|migrate|remove|delete|replace|install|scaffold|bootstrap|setup|set\s+up|deploy|integrate|run|start|launch|boot|execute|test|verify|investigate|diagnose|audit|inspect|examine|trace|review)\b",
+        stripped,
+        re.I,
+    ):
+        return False
+    if (
+        re.search(
+            r"\b(?:in|into|to|on|from|for|across|within)\s+(?:this|the|our|my)\s+(?:project|repo|repository|codebase|workspace|app|application|server|backend|frontend|ui|api|endpoint|route|service|controller|model|view|component|middleware|database|db|table|schema|migration|file|files|module|modules|folder|directory|package|workflow|data|code)\b",
+            clean,
+            re.I,
+        )
+        or re.search(
+            r"\b(?:attached|existing|current)\s+(?:project|repo|repository|codebase|workspace|app|application|server|files?|code)\b",
+            clean,
+            re.I,
+        )
+        or re.search(
+            r"\b(?:process|transform|update|load|read|write|migrate|query)\s+the\s+(?:data|files?|database|table|records?|config|schema|state)\b",
+            clean,
+            re.I,
+        )
+        or re.search(
+            r"\b(?:project|repository|codebase|workspace|feature|authentication\s+service|notification\s+service|microservices?|endpoints?|routes?|controllers?|models?|views?|components?|middleware|migrations?|test\s+suites?|full-?stack|dockerfile|packages?|dependencies|node_modules)\b",
+            clean,
+            re.I,
+        )
+        or re.search(
+            r"\b(?:clean\s*up|code\s+review|and\s+(?:test|run|save|write\s+(?:it|them)\s+to|apply|commit|deploy|verify)|save\s+(?:it\s+)?to\s+(?:a\s+)?file|in\s+this\s+project|to\s+this\s+repo)\b",
+            clean,
+            re.I,
+        )
+    ):
+        return False
+    return bool(
+        re.match(
+            r"^(?:write|create|implement|generate|show\s+me|give\s+me|provide|demonstrate|illustrate)\s+\S+",
+            stripped,
+            re.I,
+        )
+    )
+
+
 def _requires_proposal(request: str) -> bool:
     if _is_capability_question(request):
+        return False
+    if _is_standalone_code_generation_request(request):
         return False
     if EXPLANATION_PATTERN.search(request) and not EXPLICIT_CHANGE_PATTERN.search(request):
         return False
@@ -1458,6 +1523,9 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     if understanding.get("action") == TaskIntent.CAPABILITY_QUESTION:
         intent = TaskIntent.CAPABILITY_QUESTION
         proposal_required = False
+    elif _is_standalone_code_generation_request(req):
+        intent = TaskIntent.QUESTION
+        proposal_required = False
     # Check for explicit performance fix first if user asks to fix the slow query
     elif PERFORMANCE_FIX_PATTERN.search(req):
         intent = TaskIntent.PERFORMANCE_FIX
@@ -1528,7 +1596,7 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
         proposal_required = False
     elif _matches_database_investigation(req):
         intent = TaskIntent.DATABASE_INVESTIGATION
-        proposal_required = bool(re.search(r"\b(?:apply|migrate|fix|banao)\b", req, re.I))
+        proposal_required = bool(re.search(r"\b(?:apply|migrate|fix|banao)\b|\b(?:create|add|write|generate)\s+(?:a\s+)?(?:[\w-]+\s+)?migration\b", req, re.I))
     elif re.search(r"\b(?:architecture|system\s+design|module\s+boundary|repository\s+structure|directory\s+structure|how\s+is\s+the\s+repo\s+structured|entry\s+points?|layout)\b", req, re.I):
         intent = TaskIntent.ARCHITECTURE_INVESTIGATION
         proposal_required = False
@@ -5715,7 +5783,7 @@ async def _resolve_semantic_task_with_model(
         "or database state. The operation is an execution proposal only: application policy validates it before "
         "execution. Include concise intent, goal, target/type, confidence, each resource's reason/confidence, "
         "each target candidate's evidence/score, required evidence and verification "
-        "metadata with the selected next action. For ANSWER include a concise evidence-grounded answer. "
+        "metadata with the selected next action. For ANSWER include a concise evidence-grounded answer, or for standalone programming/code-generation requests not targeting repository files, provide complete, idiomatic code with dynamic input handling rather than hardcoded toy values. "
         "Include continuity_detected as true or false, a concise "
         "reasoning_summary, and any current hypotheses. Provide arguments as an object, even when empty.\n"
         f"Safe task context: {json.dumps(database_context, ensure_ascii=False)}"
@@ -7785,6 +7853,91 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
     )
 
     if not project_root:
+        if not proposal_required and _is_standalone_code_generation_request(request):
+            standalone_system = (
+                "You are a helpful AI coding assistant. Answer the user's programming request or generate "
+                "complete, idiomatic, runnable code directly in chat. When writing a program that operates "
+                "on inputs, accept input dynamically from the user or arguments rather than hardcoding static "
+                "values as the only solution. Do not output a git unified diff or claim to modify repository files."
+            )
+            standalone_messages = [
+                {"role": "system", "content": standalone_system},
+                *supplied[-CODING_MAX_HISTORY_MESSAGES:],
+            ]
+            try:
+                final_msg, _prov = await asyncio.to_thread(
+                    complete_coding_model,
+                    registry,
+                    config_path,
+                    _compact_coding_conversation(standalone_messages),
+                    None,
+                    selected_provider_id,
+                    False,
+                    request_id,
+                    session_id,
+                )
+            except Exception as err:
+                await _send(send_json, {
+                    "type": "error",
+                    "requestId": request_id,
+                    "classification": "PROVIDER_FAILURE",
+                    "message": SecretProtector.redact_text(str(err))[:400],
+                })
+                return
+            content = SecretProtector.redact_text(str((final_msg or {}).get("content") or ""))[:12000]
+            if not content.strip():
+                await _send(send_json, {
+                    "type": "error",
+                    "requestId": request_id,
+                    "classification": "PROVIDER_FAILURE",
+                    "category": "PROVIDER_EMPTY_RESPONSE",
+                    "message": "The configured provider returned an empty response for the standalone coding request.",
+                })
+                return
+            task_state = _build_semantic_task(
+                request_id=request_id,
+                user_message=raw_request,
+                intent=TaskIntent.QUESTION,
+                resources=[],
+                target=None,
+                project_root="",
+                scope=scope,
+                architecture={},
+                required_evidence=[],
+                conversation_message_count=len(supplied),
+                session_id=session_id,
+                conversation_messages=supplied,
+            )
+            task_state.update({
+                "status": "COMPLETED",
+                "assistantContent": content,
+                "understanding": request_understanding,
+                "selectedAction": "ANSWER_STANDALONE_CODE",
+                "nextAction": None,
+                "nextActionName": None,
+                "proposalRequired": False,
+                "objectiveSatisfied": True,
+                "requiredEvidenceSatisfied": True,
+            })
+            task_state["intent"]["primary"] = TaskIntent.QUESTION
+            await _send(send_json, {"type": "token", "requestId": request_id, "content": content})
+            await _send(send_json, {
+                "type": "done",
+                "requestId": request_id,
+                "content": content,
+                "status": "COMPLETED",
+                "readOnly": True,
+                "writeRequired": False,
+                "proposalRequired": False,
+                "applyRequired": False,
+                "approvalRequired": False,
+                "intent": TaskIntent.QUESTION,
+                "toolCalls": [],
+                "filesRead": [],
+                "semanticTask": task_state,
+                "agentTaskState": task_state,
+            })
+            return
         await _send(send_json, {
             "type": "error",
             "requestId": request_id,

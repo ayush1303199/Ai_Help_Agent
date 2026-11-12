@@ -237,7 +237,53 @@ function classifyInstallIntent(text, optionsOrContext = []) {
   return buildResult({ isInstallRequest: false, intent: null });
 }
 
+/**
+ * Infers from natural-language structure whether the request asks for a
+ * standalone / response-only code solution or example in chat rather than a
+ * repository modification, without language-specific or example-specific rules.
+ */
+function isStandaloneCodeGenerationRequest(text) {
+  const clean = String(text || '').trim();
+  if (!clean) return false;
+
+  // Exclude explicit workspace file paths or extensions
+  if (/\b[\w-]+\.[a-z0-9]{1,8}\b/i.test(clean)
+    || /(?:^|\s)(?:\.{0,2}\/|~\/|[a-zA-Z]:\\|[\w.-]+\/[\w.-]+)/.test(clean)) {
+    return false;
+  }
+
+  const stripped = clean
+    .replace(/^(?:(?:hello|hi|hey|good\s+(?:morning|afternoon|evening)|thanks(?:\s+for\s+[^,;!?.\n]+)?|thank\s+you(?:\s+for\s+[^,;!?.\n]+)?|sure|okay|ok)\s*[,;!?.\n]?\s*)+/i, '')
+    .replace(/^(?:(?:can\s+you|could\s+you|would\s+you|will\s+you|please)\s+(?:please\s+)?)+/i, '')
+    .trim();
+
+  // Imperative repository mutation, execution, verification, or investigation actions
+  if (/^(?:fix|debug|repair|patch|refactor|modify|change|edit|update|upgrade|migrate|remove|delete|replace|install|scaffold|bootstrap|setup|set\s+up|deploy|integrate|run|start|launch|boot|execute|test|verify|investigate|diagnose|audit|inspect|examine|trace|review)\b/i.test(stripped)
+    || /\b(?:clean\s*up|code\s+review)\b/i.test(clean)) {
+    return false;
+  }
+
+  // Workspace, application, architectural, or definite project resource references
+  if (/\b(?:in|into|to|on|from|for|across|within)\s+(?:this|the|our|my)\s+(?:project|repo|repository|codebase|workspace|app|application|server|backend|frontend|ui|api|endpoint|route|service|controller|model|view|component|middleware|database|db|table|schema|migration|file|files|module|modules|folder|directory|package|workflow|data|code)\b/i.test(clean)
+    || /\b(?:attached|existing|current)\s+(?:project|repo|repository|codebase|workspace|app|application|server|files?|code)\b/i.test(clean)
+    || /\b(?:process|transform|update|load|read|write|migrate|query)\s+the\s+(?:data|files?|database|table|records?|config|schema|state)\b/i.test(clean)
+    || /\b(?:project|repository|codebase|workspace|feature|authentication\s+service|notification\s+service|microservices?|endpoints?|routes?|controllers?|models?|views?|components?|middleware|migrations?|test\s+suites?|full-?stack|dockerfile|packages?|dependencies|node_modules)\b/i.test(clean)) {
+    return false;
+  }
+
+  // Compound actions targeting file persistence or test/runtime verification
+  if (/\b(?:and\s+(?:test|run|save|write\s+(?:it|them)\s+to|apply|commit|deploy|verify)|save\s+(?:it\s+)?to\s+(?:a\s+)?file|in\s+this\s+project|to\s+this\s+repo)\b/i.test(clean)) {
+    return false;
+  }
+
+  // Standalone generative or illustrative request speech act requiring substance
+  return /^(?:write|create|implement|generate|show\s+me|give\s+me|provide|demonstrate|illustrate)\s+\S+/i.test(stripped);
+}
+
 function checkLanguageConflict(clean, projectContext) {
+  if (isStandaloneCodeGenerationRequest(clean)) {
+    return { needsClarification: false, clarificationPrompt: null };
+  }
   if (projectContext && projectContext.workspaceState === 'EXISTING_APPLICATION' && Array.isArray(projectContext.languages) && projectContext.languages.length > 0) {
     const knownEcosystems = {
       python: { names: ['python', 'django', 'flask', 'fastapi', 'pytest', 'pip'], ext: '.py' },
@@ -769,6 +815,21 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
       mutationRequired: false,
       needsClarification: false,
       reasoning: 'Information or explanation inquiry without directive to modify workspace.',
+      responseOnly: isStandaloneCodeGenerationRequest(clean),
+    };
+  }
+
+  // Case B2: Standalone / Response-Only Code Generation Request (Level B)
+  if (!isRunOrLaunch && !isTestOrVerify && !isDependencyOperation && isStandaloneCodeGenerationRequest(clean)) {
+    return {
+      primaryIntent: INTENT_CATEGORIES.EXPLAIN_OR_ASK,
+      processingLevel: PROCESSING_LEVELS.LEVEL_B_LIGHTWEIGHT_UNDERSTANDING,
+      confidence: 'HIGH',
+      actionable: false,
+      mutationRequired: false,
+      responseOnly: true,
+      needsClarification: false,
+      reasoning: 'Standalone response-only code generation or illustration request without repository mutation target.',
     };
   }
 
@@ -810,7 +871,7 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
   }
 
   // Pure Read-only Investigation Directive (Level C)
-  if (isExplicitNoChange && /\b(?:investigate|diagnose|inspect|audit|examine|find\s+(?:the\s+)?cause|trace)\b/i.test(strippedOfCourtesy)) {
+  if (isExplicitNoChange && /\b(?:investigate|diagnose|inspect|audit|examine|review|find\s+(?:the\s+)?cause|trace)\b/i.test(strippedOfCourtesy)) {
     return {
       primaryIntent: INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG,
       processingLevel: PROCESSING_LEVELS.LEVEL_C_FOCUSED_INVESTIGATION,
@@ -984,7 +1045,7 @@ function classifyTaskIntent({ request, projectContext = null, evidence = [], con
   let confidence = semanticAnalysis.confidence || 'MEDIUM';
   let reasoning = semanticAnalysis.reasoning || 'Evaluated request based on semantic analysis.';
 
-  if (sorted.length > 0 && semanticAnalysis.processingLevel !== PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION) {
+  if (sorted.length > 0 && semanticAnalysis.processingLevel !== PROCESSING_LEVELS.LEVEL_A_DIRECT_INTERACTION && !semanticAnalysis.responseOnly) {
     primaryIntent = sorted[0][0];
     const topScore = sorted[0][1];
     confidence = topScore >= 30 ? 'HIGH' : (topScore >= 20 ? 'MEDIUM' : 'LOW');
@@ -1009,7 +1070,7 @@ function classifyTaskIntent({ request, projectContext = null, evidence = [], con
     INTENT_CATEGORIES.TEST_OR_VERIFY,
   ];
 
-  const actionable = !nonActionable.includes(primaryIntent) || semanticAnalysis.actionable;
+  const actionable = semanticAnalysis.responseOnly ? false : (!nonActionable.includes(primaryIntent) || semanticAnalysis.actionable);
   let mutationRequired = actionable && !nonMutatingActionable.includes(primaryIntent);
   if (isReadOnlyConstrained || (semanticAnalysis.actionable && semanticAnalysis.mutationRequired === false)) {
     mutationRequired = false;
@@ -1064,6 +1125,7 @@ function classifyTaskIntent({ request, projectContext = null, evidence = [], con
     reasoning,
     actionable,
     mutationRequired,
+    responseOnly: Boolean(semanticAnalysis.responseOnly),
     constraints,
     originalRequest,
     installIntent: installIntentResult.installIntent || null,
@@ -1081,6 +1143,7 @@ module.exports = {
   ALL_CATEGORIES,
   INSTALL_INTENTS,
   classifyInstallIntent,
+  isStandaloneCodeGenerationRequest,
   checkLanguageConflict,
   extractConstraints,
   checkAmbiguity,

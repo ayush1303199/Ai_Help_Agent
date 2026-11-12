@@ -12160,5 +12160,117 @@ class CodingWebSocketAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 await server
 
 
+    def test_standalone_code_generation_does_not_require_proposal(self):
+        from coding_websocket import TaskIntent, _requires_proposal, classify_task_intent
+
+        standalone_requests = [
+            "Write a function to check if a string is a palindrome",
+            "Implement binary search in Rust",
+            "Generate a SQL query to find duplicate records",
+            "Show me an example of LRU cache logic",
+        ]
+        for req in standalone_requests:
+            self.assertFalse(_requires_proposal(req), f"Standalone prompt must not force diff proposal: {req}")
+            classified = classify_task_intent(req)
+            self.assertEqual(classified["intent"], TaskIntent.QUESTION)
+            self.assertFalse(classified["proposal_required"])
+
+        mutation_requests = [
+            "Add rate limiting middleware to src/routes/api.js",
+            "Create a schema migration for the billing service",
+            "Create a database migration for the orders table",
+            "Generate a random password helper function and save it to src/utils/password.js",
+            "Fix the null pointer exception in authController.ts",
+        ]
+        for req in mutation_requests:
+            classified = classify_task_intent(req)
+            self.assertTrue(classified["proposal_required"], f"Repo target must require proposal: {req}")
+
+    async def test_standalone_code_generation_turn_without_project_root_delivers_chat_code(self):
+        import coding_websocket
+        from coding_websocket import TaskIntent, _run_coding_turn
+
+        sent = []
+        async def send_json(msg):
+            sent.append(msg)
+
+        java_solution = (
+            "import java.util.Scanner;\n\n"
+            "public class AddTwoNumbers {\n"
+            "    public static void main(String[] args) {\n"
+            "        Scanner scanner = new Scanner(System.in);\n"
+            "        System.out.print(\"Enter first number: \");\n"
+            "        int first = scanner.nextInt();\n"
+            "        System.out.print(\"Enter second number: \");\n"
+            "        int second = scanner.nextInt();\n"
+            "        int sum = first + second;\n"
+            "        System.out.println(\"Sum: \" + sum);\n"
+            "        scanner.close();\n"
+            "    }\n"
+            "}\n"
+        )
+
+        with patch.object(coding_websocket, "get_backend_project_state", return_value={"attached": False, "projectRoot": None}), \
+             patch.object(coding_websocket, "complete_coding_model", return_value=({"role": "assistant", "content": java_solution}, "mock-provider")) as mock_model:
+            await _run_coding_turn(
+                {
+                    "requestId": "standalone-java-add",
+                    "sessionId": "standalone-java-session",
+                    "messages": [{"role": "user", "content": "Can you write the two number addition in Java?"}],
+                },
+                send_json,
+                {"pending": {}, "completed": {}, "tasks": set()},
+                None,
+                "",
+            )
+
+        mock_model.assert_called_once()
+        self.assertFalse(any(m.get("type") == "error" for m in sent), sent)
+        done = next((m for m in sent if m.get("type") == "done"), None)
+        self.assertIsNotNone(done, sent)
+        self.assertEqual(done["status"], "COMPLETED")
+        self.assertEqual(done["intent"], TaskIntent.QUESTION)
+        self.assertTrue(done["readOnly"])
+        self.assertFalse(done["proposalRequired"])
+        self.assertFalse(done["applyRequired"])
+        self.assertFalse(done["approvalRequired"])
+        self.assertIn("Scanner", done["content"])
+        self.assertIn("nextInt()", done["content"])
+
+    async def test_standalone_code_generation_handles_empty_and_failed_model_safely(self):
+        import coding_websocket
+        from coding_websocket import _run_coding_turn
+
+        # 1. Empty response must emit PROVIDER_EMPTY_RESPONSE error, never COMPLETED
+        sent_empty = []
+        async def send_empty(msg):
+            sent_empty.append(msg)
+        with patch.object(coding_websocket, "get_backend_project_state", return_value={"attached": False, "projectRoot": None}), \
+             patch.object(coding_websocket, "complete_coding_model", return_value=({"role": "assistant", "content": "   "}, "mock-provider")):
+            await _run_coding_turn(
+                {"requestId": "empty-standalone", "sessionId": "empty-sess", "messages": [{"role": "user", "content": "Write a sorting function in Go"}]},
+                send_empty, {"pending": {}, "completed": {}, "tasks": set()}, None, "",
+            )
+        self.assertFalse(any(m.get("type") == "done" for m in sent_empty), sent_empty)
+        err_empty = next((m for m in sent_empty if m.get("type") == "error"), None)
+        self.assertIsNotNone(err_empty, sent_empty)
+        self.assertEqual(err_empty.get("category"), "PROVIDER_EMPTY_RESPONSE")
+
+        # 2. Timeout/exception must emit PROVIDER_FAILURE error, never COMPLETED
+        sent_fail = []
+        async def send_fail(msg):
+            sent_fail.append(msg)
+        with patch.object(coding_websocket, "get_backend_project_state", return_value={"attached": False, "projectRoot": None}), \
+             patch.object(coding_websocket, "complete_coding_model", side_effect=TimeoutError("Provider timed out")):
+            await _run_coding_turn(
+                {"requestId": "fail-standalone", "sessionId": "fail-sess", "messages": [{"role": "user", "content": "Write a sorting function in Go"}]},
+                send_fail, {"pending": {}, "completed": {}, "tasks": set()}, None, "",
+            )
+        self.assertFalse(any(m.get("type") == "done" for m in sent_fail), sent_fail)
+        err_fail = next((m for m in sent_fail if m.get("type") == "error"), None)
+        self.assertIsNotNone(err_fail, sent_fail)
+        self.assertEqual(err_fail.get("classification"), "PROVIDER_FAILURE")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

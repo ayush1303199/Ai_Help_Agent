@@ -613,6 +613,90 @@ try {
   assert.equal(rendererCancelled.processingLevel, 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING');
   assert.equal(rendererCancelled.isActionableTask, false);
 
+  // =========================================================================
+  // 10. Generic Response-Only Code Generation vs Project Mutation Routing
+  // =========================================================================
+  console.log('Testing generic response-only code generation vs project mutation routing...');
+
+  const standalonePrompts = [
+    'Write a function to check if a string is a palindrome',
+    'Implement binary search in Rust',
+    'Can you write a sorting helper in Haskell?',
+    'Generate a SQL query to find duplicate records',
+    'Show me an example of LRU cache logic',
+  ];
+
+  for (const standalonePrompt of standalonePrompts) {
+    const backendCls = classifyTaskIntent({ request: standalonePrompt });
+    assert.equal(backendCls.primaryIntent, INTENT_CATEGORIES.EXPLAIN_OR_ASK, `Standalone prompt must route to EXPLAIN_OR_ASK: ${standalonePrompt}`);
+    assert.equal(backendCls.processingLevel, PROCESSING_LEVELS.LEVEL_B_LIGHTWEIGHT_UNDERSTANDING);
+    assert.equal(backendCls.actionable, false);
+    assert.equal(backendCls.mutationRequired, false);
+    assert.equal(backendCls.responseOnly, true);
+
+    const uiCls = classifyCodingRequestIntent(standalonePrompt, []);
+    assert.equal(uiCls.intent, 'QUESTION_OR_EXPLANATION', `UI parity must route to QUESTION_OR_EXPLANATION: ${standalonePrompt}`);
+    assert.equal(uiCls.processingLevel, 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING');
+    assert.equal(uiCls.isActionableTask, false);
+    assert.equal(uiCls.responseOnly, true);
+  }
+
+  // Standalone code request on attached Node app must NOT falsely claim language conflict or force diff mutation
+  let generatedResponseCalled = false;
+  const standaloneWorkflowResult = await developerAgent.executeAutonomousCodingWorkflow({
+    userRequest: 'Implement binary search in Rust',
+    root: nodeAppDir,
+    sessionId,
+    ownerWebContentsId: ownerA,
+    tools: {
+      generateResponse: async ({ userRequest: reqText }) => {
+        generatedResponseCalled = true;
+        return `Generated standalone response for: ${reqText}`;
+      },
+    },
+  });
+  assert.equal(generatedResponseCalled, true);
+  assert.equal(standaloneWorkflowResult.outcome, 'COMPLETED');
+  assert.equal(standaloneWorkflowResult.phase, 'EXPLAIN');
+  assert.equal(standaloneWorkflowResult.responseOnly, true);
+  assert.equal(standaloneWorkflowResult.mutationRequired, false);
+  assert.equal(standaloneWorkflowResult.filesModified.length, 0);
+  assert.match(standaloneWorkflowResult.explanation, /Generated standalone response for: Implement binary search in Rust/);
+
+  // Explicit repository/architectural targets MUST remain actionable mutation tasks
+  const repoTargets = [
+    'Add rate limiting middleware to src/routes/api.js',
+    'Create a schema migration for the billing service',
+    'Refactor the authentication controller to reject expired tokens',
+  ];
+  for (const targetPrompt of repoTargets) {
+    const targetCls = classifyTaskIntent({ request: targetPrompt });
+    assert.equal(targetCls.actionable, true, `Repo target prompt must remain actionable: ${targetPrompt}`);
+    assert.equal(targetCls.mutationRequired, true, `Repo target prompt must require mutation: ${targetPrompt}`);
+    assert.equal(targetCls.responseOnly, false);
+
+    const targetUiCls = classifyCodingRequestIntent(targetPrompt, []);
+    assert.equal(targetUiCls.intent, 'AUTONOMOUS_WORKFLOW_TASK', `Repo target UI prompt must use autonomous workflow: ${targetPrompt}`);
+    assert.equal(targetUiCls.isActionableTask, true);
+  }
+
+  // Adversarial cross-layer parity: read-only review constraint & mixed-action requests
+  const reviewPrompt = 'Code review this module and suggest improvements without modifying files';
+  const reviewNode = classifyTaskIntent({ request: reviewPrompt });
+  const reviewUi = classifyCodingRequestIntent(reviewPrompt, []);
+  assert.equal(reviewNode.processingLevel, PROCESSING_LEVELS.LEVEL_C_FOCUSED_INVESTIGATION);
+  assert.equal(reviewNode.mutationRequired, false);
+  assert.equal(reviewUi.processingLevel, 'LEVEL_C_FOCUSED_INVESTIGATION');
+
+  const mixedActionPrompt = 'Write a quick sort function in Python, and also fix the bug in server.js';
+  const mixedNode = classifyTaskIntent({ request: mixedActionPrompt });
+  const mixedUi = classifyCodingRequestIntent(mixedActionPrompt, []);
+  assert.equal(mixedNode.processingLevel, PROCESSING_LEVELS.LEVEL_D_FULL_DEVELOPMENT);
+  assert.equal(mixedNode.mutationRequired, true);
+  assert.equal(mixedNode.responseOnly, false);
+  assert.equal(mixedUi.intent, 'AUTONOMOUS_WORKFLOW_TASK');
+  assert.equal(mixedUi.processingLevel, 'LEVEL_D_FULL_DEVELOPMENT');
+
   // Clean up sessions
   developerAgent.releaseSession(ownerA);
   developerFiles.releaseProject(ownerA);

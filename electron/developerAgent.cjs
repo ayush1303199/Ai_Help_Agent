@@ -5257,24 +5257,17 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
   const projectArch = continuation?.projectArch || discoverProjectArchitecture({ ...metadata, ...detected });
   const isGreenfieldDiscovery = await isGreenfieldWorkspace(root);
 
-  const langConflict = checkLanguageConflict(userRequest, {
-    projectArchitecture: projectArch,
-    workspaceDiscovery,
-    metadata,
-    contextMessages,
-  });
-  if (langConflict.conflict) {
+  const langConflict = (genericIntent.responseOnly || genericIntent.primaryIntent === INTENT_CATEGORIES.EXPLAIN_OR_ASK)
+    ? { needsClarification: false, clarificationPrompt: null }
+    : checkLanguageConflict(userRequest, workspaceDiscovery);
+  if (langConflict.needsClarification) {
     const prompt = langConflict.clarificationPrompt;
-    advanceConversationTurn(turn.turnId, 'clarification_required', owner, {
-      phase: 'language_conflict_clarification',
-      prompt,
-    });
     return {
       outcome: 'CLARIFICATION_REQUIRED',
       phase: 'UNDERSTAND',
       conflict: langConflict,
       clarificationPrompt: prompt,
-      reason: langConflict.reason,
+      reason: prompt,
       filesModified: [],
       workflowReceipt: buildWorkflowReceipt({
         outcome: 'CLARIFICATION_REQUIRED',
@@ -6254,7 +6247,17 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
   }
 
   if (genericIntent.primaryIntent === INTENT_CATEGORIES.EXPLAIN_OR_ASK && !isRuntimeTestRequest && modeRouting.mode !== 'AUDIT' && modeRouting.mode !== 'INVESTIGATE') {
-    onProgress({ phase: 'EXPLAIN', message: 'Analyzing project context to answer question.' });
+    onProgress({
+      phase: 'EXPLAIN',
+      message: genericIntent.responseOnly
+        ? 'Generating response-only code solution without repository mutations.'
+        : 'Analyzing project context to answer question.',
+    });
+    const generated = typeof tools?.generateResponse === 'function'
+      ? await tools.generateResponse({ userRequest, workspaceDiscovery, contextMessages, intent: genericIntent })
+      : null;
+    const responseText = (typeof generated === 'string' ? generated : generated?.content || generated?.explanation)
+      || `Discovered project context: state=${workspaceDiscovery.workspaceState}, manifests=${workspaceDiscovery.manifests.map((m) => m.name).join(', ') || 'none'}, languages=${workspaceDiscovery.languages.join(', ') || 'none'}.`;
     advanceConversationTurn(turn.turnId, 'completed', owner, { phase: 'explanation_completed' });
     return {
       outcome: 'COMPLETED',
@@ -6263,7 +6266,10 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
       taskPlan,
       intentClassification: genericIntent,
       workspaceDiscovery,
-      explanation: `Discovered project context: state=${workspaceDiscovery.workspaceState}, manifests=${workspaceDiscovery.manifests.map((m) => m.name).join(', ') || 'none'}, languages=${workspaceDiscovery.languages.join(', ') || 'none'}.`,
+      responseOnly: Boolean(genericIntent.responseOnly),
+      mutationRequired: false,
+      explanation: responseText,
+      message: responseText,
       filesModified: [],
       codeApplied: false,
       codeVerified: false,

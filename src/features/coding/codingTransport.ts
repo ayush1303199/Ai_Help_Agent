@@ -1834,6 +1834,7 @@ export interface CodingRequestClassification {
   processingLevel?: 'LEVEL_A_DIRECT_INTERACTION' | 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING' | 'LEVEL_C_FOCUSED_INVESTIGATION' | 'LEVEL_D_FULL_DEVELOPMENT';
   clarificationPrompt?: string;
   isActionableTask: boolean;
+  responseOnly?: boolean;
 }
 
 export function shouldRequireDeveloperWorkflowForAttachedProject({
@@ -1865,6 +1866,39 @@ export function shouldRequireDeveloperWorkflowForAttachedProject({
     && !hasDeveloperWorkflowBridge
     && !isResumingProviderTask
     && !hasRepairContext;
+}
+
+export function isStandaloneCodeGenerationRequest(rawRequest: string): boolean {
+  const clean = String(rawRequest || '').trim();
+  if (!clean) return false;
+
+  if (/\b[\w-]+\.[a-z0-9]{1,8}\b/i.test(clean)
+    || /(?:^|\s)(?:\.{0,2}\/|~\/|[a-zA-Z]:\\|[\w.-]+\/[\w.-]+)/.test(clean)) {
+    return false;
+  }
+
+  const stripped = clean
+    .replace(/^(?:(?:hello|hi|hey|good\s+(?:morning|afternoon|evening)|thanks(?:\s+for\s+[^,;!?.\n]+)?|thank\s+you(?:\s+for\s+[^,;!?.\n]+)?|sure|okay|ok)\s*[,;!?.\n]?\s*)+/i, '')
+    .replace(/^(?:(?:can\s+you|could\s+you|would\s+you|will\s+you|please)\s+(?:please\s+)?)+/i, '')
+    .trim();
+
+  if (/^(?:fix|debug|repair|patch|refactor|modify|change|edit|update|upgrade|migrate|remove|delete|replace|install|scaffold|bootstrap|setup|set\s+up|deploy|integrate|run|start|launch|boot|execute|test|verify|investigate|diagnose|audit|inspect|examine|trace|review)\b/i.test(stripped)
+    || /\b(?:clean\s*up|code\s+review)\b/i.test(clean)) {
+    return false;
+  }
+
+  if (/\b(?:in|into|to|on|from|for|across|within)\s+(?:this|the|our|my)\s+(?:project|repo|repository|codebase|workspace|app|application|server|backend|frontend|ui|api|endpoint|route|service|controller|model|view|component|middleware|database|db|table|schema|migration|file|files|module|modules|folder|directory|package|workflow|data|code)\b/i.test(clean)
+    || /\b(?:attached|existing|current)\s+(?:project|repo|repository|codebase|workspace|app|application|server|files?|code)\b/i.test(clean)
+    || /\b(?:process|transform|update|load|read|write|migrate|query)\s+the\s+(?:data|files?|database|table|records?|config|schema|state)\b/i.test(clean)
+    || /\b(?:project|repository|codebase|workspace|feature|authentication\s+service|notification\s+service|microservices?|endpoints?|routes?|controllers?|models?|views?|components?|middleware|migrations?|test\s+suites?|full-?stack|dockerfile|packages?|dependencies|node_modules)\b/i.test(clean)) {
+    return false;
+  }
+
+  if (/\b(?:and\s+(?:test|run|save|write\s+(?:it|them)\s+to|apply|commit|deploy|verify)|save\s+(?:it\s+)?to\s+(?:a\s+)?file|in\s+this\s+project|to\s+this\s+repo)\b/i.test(clean)) {
+    return false;
+  }
+
+  return /^(?:write|create|implement|generate|show\s+me|give\s+me|provide|demonstrate|illustrate)\s+\S+/i.test(stripped);
 }
 
 export function classifyCodingRequestIntent(
@@ -2004,7 +2038,7 @@ export function classifyCodingRequestIntent(
     || /\bwithout\s+making\s+(?:any\s+)?(?:code\s+)?changes?(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text)
     || /\bno\s+(?:(?:code|file|source)\s+)?(?:changes?|modifications?|edits?|writes?|patches?)(?:\s+to\s+(?:the\s+)?(?:code|files?|source))?\b/i.test(text);
   if (isExplicitNoChange) {
-    const requestsInvestigation = /\b(?:investigate|diagnose|inspect|audit|examine|find\s+(?:the\s+)?cause|root\s+cause|why|failing|fails|failed|broken|error|bug|bottleneck|performance|trace)\b/i.test(text);
+    const requestsInvestigation = /\b(?:investigate|diagnose|inspect|audit|examine|review|find\s+(?:the\s+)?cause|root\s+cause|why|failing|fails|failed|broken|error|bug|bottleneck|performance|trace)\b/i.test(text);
     if (requestsInvestigation) {
       return {
         intent: 'AUTONOMOUS_WORKFLOW_TASK',
@@ -2028,6 +2062,7 @@ export function classifyCodingRequestIntent(
       intent: 'QUESTION_OR_EXPLANATION',
       processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
       isActionableTask: false,
+      responseOnly: isStandaloneCodeGenerationRequest(text),
     };
   }
 
@@ -2075,6 +2110,16 @@ export function classifyCodingRequestIntent(
       intent: 'QUESTION_OR_EXPLANATION',
       processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
       isActionableTask: false,
+    };
+  }
+
+  // 4b. Detect standalone response-only code generation requests without workspace mutation targets
+  if (isStandaloneCodeGenerationRequest(text)) {
+    return {
+      intent: 'QUESTION_OR_EXPLANATION',
+      processingLevel: 'LEVEL_B_LIGHTWEIGHT_UNDERSTANDING',
+      isActionableTask: false,
+      responseOnly: true,
     };
   }
 

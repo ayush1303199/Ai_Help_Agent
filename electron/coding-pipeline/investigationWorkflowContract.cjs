@@ -1246,10 +1246,10 @@ function analyzeTaskRequirements(userRequest, contextMessages = []) {
 
   const hasPriorContext = Array.isArray(contextMessages) && contextMessages.length > 0
     && contextMessages.some((msg) => msg && typeof msg.content === 'string' && msg.content.trim().length > 3);
-  const isAnaphoricFix = /^(?:fix|resolve|patch|repair|address)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect)\b/i.test(text);
+  const isAnaphoricFix = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:fix|resolve|patch|repair|address|apply|implement)\s+(?:this|it|the\s+bug|that\s+bug|the\s+issue|that\s+issue|the\s+problem|the\s+defect|the\s+fix|that\s+fix|those\s+changes)\b/i.test(text);
 
   // Detect vague requests lacking concrete target, file, symptom, or metric
-  const isVague = /^(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:the\s+)?performance|fix\s+(?:the\s+)?bug|do\s+something)\s*[.!?]*$/i.test(text)
+  const isVague = /^(?:(?:can\s+you|could\s+you|would\s+you|please|will\s+you)\s+(?:please\s+)?)?(?:make\s+[\w\s]*\s*(?:better|faster|cleaner|nicer|cool(?:er)?)|improve\s+(?:the\s+)?performance|fix\s+(?:the\s+)?bug|do\s+something)\s*[.!?]*$/i.test(text)
     || (/^(?:make|improve|optimize)\b.*\b(?:faster|better|cleaner)\b/i.test(text) && !/\b(?:ms|seconds?|query|queries|index|profile|benchmark|endpoint|test|error)\b/i.test(text));
 
   if (isVague && !(isAnaphoricFix && hasPriorContext)) {
