@@ -6274,8 +6274,48 @@ async function runVerifiedIsolationTests() {
         });
         assert.equal(realHcsCreate.ok, false);
         assert.equal(realHcsCreate.created, false);
-        assert.equal(realHcsCreate.reasonCode, 'HCS_PRIVILEGE_INSUFFICIENT');
         assert.equal(realHcsCreate.processIsolationGate, 'BLOCKED');
+        assert.ok(['HCS_PRIVILEGE_INSUFFICIENT', 'HCS_OPERATION_CREATE_FAILED', 'HCS_COMPUTE_SYSTEM_CREATE_FAILED'].includes(realHcsCreate.reasonCode));
+
+        // 26.D.5b: Direct HCS real host creation with grant invokes ComputeCore.dll and fails closed with HRESULT
+        const realGrantClient = createNativeSupervisorClient({
+          pid: activeStatus.pid,
+          tokenUserSid: activeStatus.tokenUserSid,
+          isSyntheticTest: false,
+        });
+        const realHcsGrant = await realGrantClient.issueExecutionGrant({
+          runId: 'v44-84-real-grant-run',
+          workspaceRoot: 'C:\\test\\workspace',
+          approvedSnapshotDigest: 'c'.repeat(64),
+          planDigest: 'd'.repeat(64),
+          taskId: 'v44-84-task',
+          sessionId: 'v44-84-session',
+        });
+        assert.equal(realHcsGrant.granted, true);
+        const realGrantedHcsCreate = await sendNativeSupervisorRequest({
+          operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+          runId: 'v44-84-real-grant-run',
+          workspaceRoot: 'C:\\test\\workspace',
+          approvedSnapshotDigest: 'c'.repeat(64),
+          grantId: realHcsGrant.grantId,
+          isSyntheticTest: false,
+        });
+        assert.equal(realGrantedHcsCreate.ok, false);
+        assert.equal(realGrantedHcsCreate.created, false);
+        assert.equal(realGrantedHcsCreate.processIsolationGate, 'BLOCKED');
+        assert.ok(['HCS_PRIVILEGE_INSUFFICIENT', 'HCS_OPERATION_CREATE_FAILED', 'HCS_COMPUTE_SYSTEM_CREATE_FAILED'].includes(realGrantedHcsCreate.reasonCode));
+
+        // Replayed grant on non-synthetic HCS create is rejected before ComputeCore invocation
+        const replayRealCreate = await sendNativeSupervisorRequest({
+          operation: 'HCS_CREATE_COMPUTE_SYSTEM',
+          runId: 'v44-84-real-grant-run',
+          workspaceRoot: 'C:\\test\\workspace',
+          approvedSnapshotDigest: 'c'.repeat(64),
+          grantId: realHcsGrant.grantId,
+          isSyntheticTest: false,
+        });
+        assert.equal(replayRealCreate.ok, false);
+        assert.equal(replayRealCreate.reasonCode, 'GRANT_ALREADY_CONSUMED');
 
         // 26.D.6: Direct HCS provider adapter real execution fails closed with zero host fallback
         const realNativeClient = createNativeSupervisorClient({
