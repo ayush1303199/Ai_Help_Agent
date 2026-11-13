@@ -144,9 +144,10 @@ function classifyInstallIntent(text, optionsOrContext = []) {
   const isExplicitProjectInstall =
     /\b(?:install|download)\s+(?:the\s+)?(?:project\s+)?(?:dependencies|deps|node_modules|missing\s+dependencies)\b/i.test(clean)
     || /\b(?:install|download)\s+all\s+(?:the\s+)?(?:dependencies|deps|packages?)\b/i.test(clean)
-    || /^(?:npm|pnpm|yarn|bun|composer)\s+(?:install|i)\s*(?:--[\w-]+)*$/i.test(clean)
-    || /^(?:install\s+dependencies|install\s+deps|install\s+node_modules|npm\s+i|npm\s+install|pnpm\s+install|yarn\s+install|composer\s+install)\s*$/i.test(clean)
-    || /\binstall\s+(?:the\s+)?packages\s+declared\s+in\s+(?:the\s+)?(?:manifest|package\.json)\b/i.test(clean);
+    || /^(?:(?:can\s+you\s+)?(?:please\s+)?(?:run|execute|perform|do)\s+)?(?:npm|pnpm|yarn|bun|composer)\s+(?:install|i)\s*(?:--[\w-]+)*$/i.test(clean)
+    || /^(?:(?:can\s+you\s+)?(?:please\s+)?(?:run|execute|perform|do)\s+)?(?:install\s+dependencies|install\s+deps|install\s+node_modules|npm\s+i|npm\s+install|pnpm\s+install|yarn\s+install|composer\s+install)\s*$/i.test(clean)
+    || /\binstall\s+(?:the\s+)?packages\s+declared\s+in\s+(?:the\s+)?(?:manifest|package\.json)\b/i.test(clean)
+    || (/\b(?:npm|pnpm|yarn|bun|composer)\s+(?:install|i)\b/i.test(clean) && !/\b(?:npm|pnpm|yarn|bun|composer)\s+(?:install|i)\s+[@\w./-]+/i.test(clean));
 
   if (isExplicitProjectInstall) {
     return buildResult({

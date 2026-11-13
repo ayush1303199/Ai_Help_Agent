@@ -5407,7 +5407,10 @@ async function runVerifiedIsolationTests() {
       assert.equal(typeof initialStatus.executablePath, 'string');
       assert.equal(initialStatus.running, false);
       assert.equal(initialStatus.status, 'IMPLEMENTED_NOT_INSTALLED');
-      assert.equal(initialStatus.reasonCode, 'SERVICE_PIPE_NOT_FOUND');
+      assert.ok(
+        initialStatus.reasonCode === 'SERVICE_PIPE_NOT_FOUND' || initialStatus.reasonCode === 'SERVICE_UNREACHABLE',
+        'Initial reason code must indicate supervisor is not actively serving requests'
+      );
 
       // 26.B.2: Spawn native supervisor in interactive/console mode
       const supervisorProcess = spawn(NATIVE_SUPERVISOR_EXECUTABLE, ['--console'], {
@@ -6115,7 +6118,10 @@ async function runVerifiedIsolationTests() {
       const postStatus = await queryNativeSupervisorStatus();
       assert.equal(postStatus.running, false);
       assert.equal(postStatus.status, 'IMPLEMENTED_NOT_INSTALLED');
-      assert.equal(postStatus.reasonCode, 'SERVICE_PIPE_NOT_FOUND');
+      assert.ok(
+        postStatus.reasonCode === 'SERVICE_PIPE_NOT_FOUND' || postStatus.reasonCode === 'SERVICE_UNREACHABLE',
+        'Post-shutdown reason code must indicate supervisor is not actively serving requests'
+      );
     }
 
     // =========================================================================

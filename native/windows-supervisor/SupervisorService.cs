@@ -115,6 +115,37 @@ namespace AiHelpAgent.NativeSupervisor
             OnStop();
         }
 
+        private static SecurityIdentifier GetActiveConsoleUserSid()
+        {
+            try
+            {
+                uint sessionId = NativeMethods.WTSGetActiveConsoleSessionId();
+                if (sessionId != 0xFFFFFFFF)
+                {
+                    IntPtr hUserToken = IntPtr.Zero;
+                    if (NativeMethods.WTSQueryUserToken(sessionId, out hUserToken) && hUserToken != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            using (WindowsIdentity userIdent = new WindowsIdentity(hUserToken))
+                            {
+                                if (userIdent != null && userIdent.User != null)
+                                {
+                                    return userIdent.User;
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            NativeMethods.CloseHandle(hUserToken);
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
         private void ListenForClients()
         {
             NamedPipeServerStream server = null;
@@ -131,6 +162,11 @@ namespace AiHelpAgent.NativeSupervisor
                 if (currentUserSid != null && !currentUserSid.Equals(systemSid) && !currentUserSid.Equals(adminSid))
                 {
                     security.AddAccessRule(new PipeAccessRule(currentUserSid, PipeAccessRights.FullControl, AccessControlType.Allow));
+                }
+                SecurityIdentifier consoleUserSid = GetActiveConsoleUserSid();
+                if (consoleUserSid != null && !consoleUserSid.Equals(systemSid) && !consoleUserSid.Equals(adminSid) && !consoleUserSid.Equals(currentUserSid))
+                {
+                    security.AddAccessRule(new PipeAccessRule(consoleUserSid, PipeAccessRights.ReadWrite, AccessControlType.Allow));
                 }
                 // Broad ALL APPLICATION PACKAGES (S-1-15-2-1) removed for least-privilege boundary enforcement
 
@@ -349,10 +385,11 @@ namespace AiHelpAgent.NativeSupervisor
                 return failed;
             }
 
-            // Verify authorized token: must match Current User, LocalSystem (S-1-5-18), or Built-in Administrators (S-1-5-32-544)
+            // Verify authorized token: must match Current User, LocalSystem (S-1-5-18), Built-in Administrators (S-1-5-32-544), or active console user
             SecurityIdentifier systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
             SecurityIdentifier adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
             SecurityIdentifier currentUserSid = WindowsIdentity.GetCurrent().User;
+            SecurityIdentifier consoleUserSid = GetActiveConsoleUserSid();
 
             bool isAuthorizedPrincipal = false;
             if (currentUserSid != null && clientTokenUserSid.Equals(currentUserSid.Value, StringComparison.OrdinalIgnoreCase))
@@ -361,6 +398,10 @@ namespace AiHelpAgent.NativeSupervisor
             }
             else if (clientTokenUserSid.Equals(systemSid.Value, StringComparison.OrdinalIgnoreCase) ||
                      clientTokenUserSid.Equals(adminSid.Value, StringComparison.OrdinalIgnoreCase))
+            {
+                isAuthorizedPrincipal = true;
+            }
+            else if (consoleUserSid != null && clientTokenUserSid.Equals(consoleUserSid.Value, StringComparison.OrdinalIgnoreCase))
             {
                 isAuthorizedPrincipal = true;
             }
@@ -2240,6 +2281,12 @@ namespace AiHelpAgent.NativeSupervisor
         public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
         public const uint JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x00000400;
         public const uint JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint WTSGetActiveConsoleSessionId();
+
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        public static extern bool WTSQueryUserToken(uint SessionId, out IntPtr phToken);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GetNamedPipeClientProcessId(IntPtr Pipe, out int ClientProcessId);
