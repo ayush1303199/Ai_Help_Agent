@@ -45,6 +45,24 @@ test('CODING AGENT V12 — Intent Classification for Dependency Requests', () =>
     'install missing dependencies',
   ];
 
+  const combinedPhrases = [
+    'run the project and if any dependency not install then install them',
+    'start the project and install missing dependencies',
+  ];
+  for (const phrase of combinedPhrases) {
+    const intent = classifyTaskIntent({ request: phrase });
+    assert.equal(
+      intent.primaryIntent,
+      INTENT_CATEGORIES.RUN_OR_LAUNCH,
+      `Request "${phrase}" must have primaryIntent RUN_OR_LAUNCH (got ${intent.primaryIntent})`
+    );
+    assert.equal(
+      intent.installIntent,
+      'INSTALL_PROJECT_DEPENDENCIES',
+      `Request "${phrase}" must have installIntent INSTALL_PROJECT_DEPENDENCIES (got ${intent.installIntent})`
+    );
+  }
+
   for (const phrase of testPhrases) {
     const intent = classifyTaskIntent({ request: phrase });
     assert.equal(

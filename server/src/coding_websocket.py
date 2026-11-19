@@ -1550,9 +1550,12 @@ def classify_task_intent(request: str, history: Optional[List[Dict[str, Any]]] =
     elif re.search(r"\b(?:code\s+review|review\s+this|review\s+(?:the|this|a)?\s*(?:pull\s+request|pr|code|diff)|review\s+karo|review\s+karke|audit\s+karo|security\s+(?:audit|vulnerability))\b", req, re.I):
         intent = TaskIntent.CODE_REVIEW
         proposal_required = False
+    elif re.search(r"\b(?:run|start|launch|boot|spin\s+up|execute)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace|server)\b", req, re.I):
+        intent = TaskIntent.GENERAL_REPOSITORY_TASK
+        proposal_required = False
     elif re.search(r"\b(?:dependency|dependencies|outdated\s+packages?|package\s+conflict|docker|dockerfile|env\b|config\b|configuration|node_modules)\b", req, re.I):
         intent = TaskIntent.CONFIGURATION
-        proposal_required = bool(re.search(r"\b(?:fix|update|modify|change|banao|install|download)\b", req, re.I))
+        proposal_required = bool(re.search(r"\b(?:fix|update|modify|change|banao|patch)\b", req, re.I)) and not bool(re.search(r"\b(?:run|start|launch|boot)\b", req, re.I))
     elif DATABASE_CREDENTIAL_REQUEST_PATTERN.search(req):
         intent = TaskIntent.DATABASE_CREDENTIAL_REQUEST
         proposal_required = False

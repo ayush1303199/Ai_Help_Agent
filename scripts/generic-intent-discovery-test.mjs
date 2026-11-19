@@ -112,6 +112,16 @@ try {
   assert.equal(multi3.primaryIntent, INTENT_CATEGORIES.UPGRADE_OR_MIGRATE);
   assert.ok(multi3.secondaryIntents.includes(INTENT_CATEGORIES.TEST_OR_VERIFY));
 
+  // Multi-intent: Run Project + Install Missing Dependencies
+  const multi4 = classifyTaskIntent({
+    request: 'run the project and if any dependency not install then install them',
+  });
+  assert.equal(multi4.primaryIntent, INTENT_CATEGORIES.RUN_OR_LAUNCH);
+  assert.equal(multi4.actionable, true);
+  assert.equal(multi4.mutationRequired, false);
+  assert.equal(multi4.installIntent, 'INSTALL_PROJECT_DEPENDENCIES');
+  assert.ok(multi4.secondaryIntents.includes(INTENT_CATEGORIES.UPGRADE_OR_MIGRATE));
+
   // Natural language conversational explanation
   const naturalExplain = classifyTaskIntent({
     request: 'Can you please explain how the routing architecture is structured here?',

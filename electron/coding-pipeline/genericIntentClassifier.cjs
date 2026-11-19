@@ -142,6 +142,9 @@ function classifyInstallIntent(text, optionsOrContext = []) {
 
   // 2. INSTALL_PROJECT_DEPENDENCIES: install dependencies declared in project manifest
   const isExplicitProjectInstall =
+    /\b(?:if\s+any\s+)?(?:dependency|dependencies|deps|packages?)\s+(?:is\s+|are\s+)?(?:not\s+install(?:ed)?|missing)\s+(?:then\s+)?(?:install|download)(?:\s+them)?\b/i.test(clean)
+    || (/\b(?:install|download)\s+(?:them|all(?:\s+of\s+them)?)\b/i.test(clean) && /\b(?:dependency|dependencies|deps|packages?)\b/i.test(clean))
+    ||
     /\b(?:install|download)\s+(?:the\s+)?(?:project\s+)?(?:dependencies|deps|node_modules|missing\s+dependencies)\b/i.test(clean)
     || /\b(?:install|download)\s+all\s+(?:the\s+)?(?:dependencies|deps|packages?)\b/i.test(clean)
     || /^(?:(?:can\s+you\s+)?(?:please\s+)?(?:run|execute|perform|do)\s+)?(?:npm|pnpm|yarn|bun|composer)\s+(?:install|i)\s*(?:--[\w-]+)*$/i.test(clean)
@@ -478,7 +481,7 @@ function scoreIntentCategories(text, projectContext = null, evidence = []) {
   } else if (/^(?:investigate|diagnose|debug|troubleshoot|trace|find\s+(?:the\s+)?cause|fix|resolve|patch|repair|correct|ensure|guarantee|prevent|inspect|audit|examine|analyze|analyse)\b/i.test(leadingCommand)) {
     scores[INTENT_CATEGORIES.INVESTIGATE_OR_DEBUG] += 10;
   } else if (/^(?:start|launch|boot|spin\s+up)\b/i.test(leadingCommand) || /^(?:run|execute)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace|server|dev\s+server)\b/i.test(leadingCommand)) {
-    scores[INTENT_CATEGORIES.RUN_OR_LAUNCH] += 10;
+    scores[INTENT_CATEGORIES.RUN_OR_LAUNCH] += 45;
   } else if (/^(?:run|execute|check|perform)\s+(?:the\s+)?(?:tests?|test\s+suite|unit\s+tests?|e2e|specs?)/i.test(leadingCommand) || /^(?:test|verify)\b/i.test(leadingCommand)) {
     scores[INTENT_CATEGORIES.TEST_OR_VERIFY] += 10;
   } else if (/^(?:refactor|restructure|reorganize|clean\s+up|simplify|decouple|remove|delete|eliminate|drop|change|modify|alter|adjust|switch|replace|set)\b/i.test(leadingCommand)) {
@@ -738,7 +741,8 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
   }
 
   // Distinct action domains:
-  const isRunOrLaunch = /^(?:run|start|launch|boot|spin\s+up|execute)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace|server)(?:\s+(?:now|please|for\s+me|locally|in\s+dev(?:\s+mode)?))?$/i.test(clean)
+  const isRunOrLaunch = /^(?:run|start|launch|boot|spin\s+up|execute)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace|server)(?:(?:\s+(?:and|then|if)\s+[\s\S]+)|\s+(?:now|please|for\s+me|locally|in\s+dev(?:\s+mode)?))?$/i.test(clean)
+    || /^(?:install|download)\s+(?:(?:the|all|missing)\s+)?(?:dependencies|deps|packages?|node_modules)\s+(?:and|then)\s+(?:run|start|launch|boot)\b/i.test(clean)
     || /^(?:build\s+and\s+(?:test|run)|(?:run|start)\s+and\s+test)\s+(?:(?:the|my|this|our)\s+)?(?:attached\s+)?(?:project|app|application|workspace)/i.test(clean)
     || /\b(?:start|launch|boot|spin\s+up)\s+(?:(?:the|my|this|our)\s+)?(?:dev\s+server|server|application|app)\b/i.test(clean);
 
@@ -747,7 +751,8 @@ function analyzeSemanticIntent(text, { projectContext = null, evidence = [], con
 
   const isDependencyOperation = /\b(?:install|download|upgrade|migrate|update)\s+(?:(?:the|all|any|our|project|workspace|missing)\s+)*(?:dependencies|deps|packages?|node_modules)\b/i.test(clean)
     || /\b(?:npm|pnpm|yarn|bun)\s+(?:install|i|add|update)\b/i.test(clean)
-    || /^(?:install|add|upgrade|update)\s+(?:a\s+)?(?:package|dependency)\b/i.test(clean);
+    || /^(?:install|add|upgrade|update)\s+(?:a\s+)?(?:package|dependency)\b/i.test(clean)
+    || /\b(?:if\s+any\s+)?(?:dependency|dependencies|deps|packages?)\s+(?:is\s+|are\s+)?(?:not\s+install(?:ed)?|missing)\s+(?:then\s+)?(?:install|download)(?:\s+them)?\b/i.test(clean);
 
   // Split into sentences/clauses to handle conversational preambles (e.g. "Thanks for explaining! Please fix X.")
   const sentences = clean.split(/[.!?\n]+/).map((s) => s.trim()).filter(Boolean);
