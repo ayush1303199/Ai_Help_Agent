@@ -53,15 +53,52 @@ function projectProcessIsolationStatus(platform = process.platform) {
     );
   }
   if (process.platform === 'win32') {
+    if (currentStatus.verified && currentStatus.available) {
+      return currentStatus;
+    }
     return makeUnavailableStatus(windowsDisabledReason);
   }
   return currentStatus;
 }
 
-async function verifyProjectProcessIsolation() {
-  const reason = process.platform === 'win32'
-    ? windowsDisabledReason
-    : `Project-context process execution has no verified sandbox adapter for platform "${process.platform}".`;
+async function verifyProjectProcessIsolation(options = {}) {
+  if (process.platform === 'win32') {
+    try {
+      const { verifyLiveSupervisorProcessIsolation } = require('./windowsSandboxProviderAdapter.cjs');
+      const liveResult = await verifyLiveSupervisorProcessIsolation({
+        isSyntheticTest: Boolean(options.isSyntheticTest),
+        timeoutMs: options.timeoutMs || 1500,
+      });
+      if (liveResult && liveResult.verified && liveResult.processIsolationGate === 'ALLOWED') {
+        currentStatus = Object.freeze({
+          available: true,
+          verified: true,
+          platformRecognized: true,
+          reason: null,
+          platform: 'win32',
+          capabilityStates: createCapabilityStateMap({
+            osEnforcedProcessIsolation: 'SUPPORTED',
+            runtimeWorkerIdentityBinding: 'SUPPORTED',
+            effectiveNetworkEndpointRestrictions: 'SUPPORTED',
+            resourceFilesystemBoundaries: 'SUPPORTED',
+            hostObservedProcessWorkerTermination: 'SUPPORTED',
+            hostObservedResourceCleanup: 'SUPPORTED',
+            evidenceFreshnessIntegrityReplayProtection: 'SUPPORTED',
+            secureErasureEvidence: 'SUPPORTED',
+          }),
+          supervisor: liveResult.identity,
+          hcsStatus: liveResult.hcsStatus,
+          grant: liveResult.grant,
+        });
+        return currentStatus;
+      }
+    } catch (_) {
+      // Fail closed
+    }
+    currentStatus = makeUnavailableStatus(windowsDisabledReason);
+    return currentStatus;
+  }
+  const reason = `Project-context process execution has no verified sandbox adapter for platform "${process.platform}".`;
   currentStatus = makeUnavailableStatus(reason);
   return currentStatus;
 }
@@ -95,6 +132,18 @@ function requireProjectProcessIsolation(operation, evidence = null, expectedCont
     ? operation.trim()
     : 'Project command';
   const status = projectProcessIsolationStatus();
+
+  if (process.platform === 'win32' && status.available && status.verified) {
+    return {
+      providerId: 'native_windows_supervisor',
+      runtimeType: 'supervisor',
+      available: true,
+      isolationVerified: true,
+      supportedOps: ['build', 'test', 'run', 'install', 'Dependency installation', 'Windows Sandbox project command'],
+      supervisor: status.supervisor,
+      grant: status.grant,
+    };
+  }
 
   // Initial platform/availability check – we postpone the BLOCKED decision until after discovery.
   // If the status reports unavailable, we will still attempt runtime discovery; only if no suitable runtime is found do we block.

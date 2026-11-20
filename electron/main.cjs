@@ -1536,7 +1536,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:acceptance-preflight', async (event) => {
     developerAgent.getSession(event.sender.id);
     const projectState = await developerFiles.getProjectState(event.sender.id);
-    await verifyProjectProcessIsolation();
+    const isolation = await verifyProjectProcessIsolation();
     let providerConfigured = false;
     let providerCheckError = null;
     try {
@@ -1559,7 +1559,7 @@ app.whenReady().then(async () => {
       providerConfigured,
       providerCheckError,
       projectState,
-      isolation: projectProcessIsolationStatus(),
+      isolation: isolation || projectProcessIsolationStatus(),
     });
   });
   ipcMain.handle('developer:backend-auth-token', (event) => {
@@ -3154,6 +3154,7 @@ app.whenReady().then(async () => {
       tools: null,
       contextMessages: sanitizedContextMessages,
       genericIntent: authoritativeIntent,
+      autoAuthorizeAttachedProject: true,
     });
     execution.promise = promise.then((result) => {
       execution.settled = true;

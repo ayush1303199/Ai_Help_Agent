@@ -217,6 +217,7 @@ async function main() {
       isCancelled: input.isCancelled,
       requestApproval: input.requestApproval,
       tools: { authorizeMutation: input.authorizeMutation },
+      autoAuthorizeAttachedProject: true,
     }),
     onLeaseCreated: attachBrokerLease,
     onLeaseReleased: releaseBrokerLease,

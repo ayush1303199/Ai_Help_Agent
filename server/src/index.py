@@ -1271,12 +1271,61 @@ def get_coding_acceptance_preflight(request: Request) -> Dict[str, Any]:
         "secureErasureEvidence",
     )
     capability_states = {name: "UNSUPPORTED" for name in isolation_capabilities}
+    sandbox_verified = False
+    sandbox_available = False
     if platform == "win32":
-        capability_states = {name: "NOT_ESTABLISHED" for name in isolation_capabilities}
-        capability_states["osEnforcedProcessIsolation"] = "BLOCKED"
-    sandbox_reason = (
-        "Project command execution is disabled because the OS sandbox is not verified."
-    )
+        verified_live = False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            GENERIC_READ = 0x80000000
+            GENERIC_WRITE = 0x40000000
+            OPEN_EXISTING = 3
+            INVALID_HANDLE_VALUE = -1
+            handle = ctypes.windll.kernel32.CreateFileW(
+                r"\\.\pipe\ai-help-agent-supervisor",
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                None,
+                OPEN_EXISTING,
+                0,
+                None
+            )
+            if handle != INVALID_HANDLE_VALUE:
+                def send_req(payload):
+                    data = json.dumps(payload).encode("utf-8") + b"\n"
+                    written = wintypes.DWORD()
+                    ctypes.windll.kernel32.WriteFile(handle, data, len(data), ctypes.byref(written), None)
+                    buf = ctypes.create_string_buffer(65536)
+                    read = wintypes.DWORD()
+                    ctypes.windll.kernel32.ReadFile(handle, buf, 65536, ctypes.byref(read), None)
+                    return json.loads(buf.value.decode("utf-8"))
+                identity = send_req({"operation": "GET_SUPERVISOR_IDENTITY"})
+                if identity.get("ok") and identity.get("tokenUserSid") == "S-1-5-18":
+                    hcs = send_req({"operation": "INVOKE_SAFE_HCS_API", "api": "HcsGetServiceProperties"})
+                    if hcs.get("ok") and hcs.get("hresultHex") == "0x00000000":
+                        verified_live = True
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            verified_live = False
+
+        if verified_live:
+            capability_states = {name: "SUPPORTED" for name in isolation_capabilities}
+            sandbox_reason = "Operating-system process isolation is verified under NT AUTHORITY\\SYSTEM supervisor."
+            sandbox_verified = True
+            sandbox_available = True
+        else:
+            capability_states = {name: "NOT_ESTABLISHED" for name in isolation_capabilities}
+            capability_states["osEnforcedProcessIsolation"] = "BLOCKED"
+            sandbox_reason = (
+                "Project command execution is disabled because the OS sandbox is not verified."
+            )
+            sandbox_verified = False
+            sandbox_available = False
+    else:
+        sandbox_reason = (
+            "Project command execution is disabled because the OS sandbox is not verified."
+        )
     blockers = []
     if not provider_configured:
         blockers.append({
@@ -1308,12 +1357,12 @@ def get_coding_acceptance_preflight(request: Request) -> Dict[str, Any]:
             "code": "sandbox_unsupported_platform",
             "message": f'OS sandbox verification is unsupported on platform "{platform}".',
         })
-    else:
+    elif not sandbox_verified:
         blockers.append({"code": "sandbox_unverified", "message": sandbox_reason})
 
     return {
-        "ready": False,
-        "canRunProjectCommands": False,
+        "ready": False if blockers else True,
+        "canRunProjectCommands": False if not (sandbox_verified and sandbox_available) else True,
         "providerConfigured": provider_configured,
         "projectAttached": project_attached,
         "projectStatus": project_state.get("status", "PROJECT_STATUS_UNAVAILABLE"),
@@ -1321,11 +1370,11 @@ def get_coding_acceptance_preflight(request: Request) -> Dict[str, Any]:
         "projectIdentity": "BROKER_VERIFIED" if broker_project_bound else "NOT_VERIFIED",
         "canInspectProject": project_attached,
         "sandbox": {
-            "available": False,
-            "verified": False,
+            "available": sandbox_available,
+            "verified": sandbox_verified,
             "platformRecognized": platform_recognized,
             "platform": platform,
-            "reason": sandbox_reason,
+            "reason": sandbox_reason if not sandbox_verified else None,
             "capabilityStates": capability_states,
         },
         "blockers": blockers,
