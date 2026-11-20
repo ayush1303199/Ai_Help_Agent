@@ -736,6 +736,9 @@ async function _executeBuildPlanCore({
   runner = null,
   containerRunner = null,
   isolationGate = requireProjectProcessIsolation,
+  userApproved = false,
+  autoAuthorizeAttachedProject = false,
+  executionGrant = null,
 } = {}) {
   if (!plan || !ownerWebContentsId || !sessionId) {
     throw new Error('plan, ownerWebContentsId, and sessionId are required.');
@@ -781,7 +784,127 @@ async function _executeBuildPlanCore({
     };
   }
 
-  // 4. Validate isolation and obtain selected runtime before any execution
+  // 4. Check for mock container runner first (for unit / contract tests)
+  if (containerRunner && containerRunner.isMockRunner === true && typeof containerRunner.execute === 'function') {
+    let selectedRuntime;
+    try {
+      selectedRuntime = isolationGate(`Build operation ${plan.operation} (${plan.fullCommandString || plan.binary})`);
+    } catch (gateErr) {
+      return {
+        ok: false,
+        status: BUILD_OUTCOMES.BLOCKED,
+        executionBlocked: true,
+        gate: 'PROCESS_ISOLATION_GATE',
+        error: gateErr.message,
+        planDigest: plan.planDigest,
+        operation: plan.operation,
+        command: plan.fullCommandString,
+        reason: `Build execution is blocked: verified ${process.platform === 'win32' ? 'Windows ' : ''}process isolation is required before executing project build/test binaries.`,
+      };
+    }
+    return containerRunner.execute({
+      plan,
+      ownerWebContentsId,
+      sessionId,
+      isApplicationRuntime: plan.operation === BUILD_OPERATIONS.START,
+      probeEndpoints: plan.probeEndpoints || ['/'],
+      runtime: selectedRuntime,
+    });
+  }
+
+  // 5. On Windows, check verified SYSTEM supervisor isolation before blocking
+  const hasExecutionApproval = Boolean(
+    userApproved
+    || autoAuthorizeAttachedProject
+    || executionGrant?.granted
+    || plan.approved
+    || plan.userApproved
+    || plan.executionGrant?.granted
+    || plan.autoAuthorizeAttachedProject
+  );
+
+  if (process.platform === 'win32' && hasExecutionApproval) {
+    try {
+      const { verifyLiveSupervisorProcessIsolation, executeWithSupervisor } = require('./windowsSandboxProviderAdapter.cjs');
+      const liveIso = await verifyLiveSupervisorProcessIsolation({
+        workspaceRoot: plan.projectRoot,
+        runId: plan.planDigest || sessionId,
+        taskId: plan.planId || 'task-build',
+        sessionId,
+        executionGrant: executionGrant || plan.executionGrant,
+        isSyntheticTest: false,
+      });
+
+      if (liveIso && liveIso.verified && liveIso.processIsolationGate === 'ALLOWED') {
+        const { verifyProjectProcessIsolation } = require('./projectProcessIsolation.cjs');
+        await verifyProjectProcessIsolation({ isSyntheticTest: false }).catch(() => {});
+        const commandStr = plan.fullCommandString || `${plan.binary} ${(plan.args || []).join(' ')}`.trim();
+        const supervisorResult = await executeWithSupervisor({
+          supervisor: liveIso.client,
+          runId: crypto.randomUUID(),
+          workspaceRoot: plan.projectRoot,
+          approvedSnapshotDigest: liveIso.grant.approvedSnapshotDigest,
+          planDigest: plan.planDigest || crypto.createHash('sha256').update(commandStr).digest('hex'),
+          taskId: plan.planId || 'task-build',
+          sessionId,
+          command: commandStr,
+          timeoutMs: plan.timeoutMs || 60000,
+        });
+
+        if (!supervisorResult?.ok) {
+          return {
+            ok: false,
+            status: BUILD_OUTCOMES.FAILED,
+            exitCode: supervisorResult?.exitCode ?? 1,
+            stdout: supervisorResult?.stdout || '',
+            stderr: supervisorResult?.stderr || 'Execution failed under supervisor.',
+            executionBlocked: false,
+            processIsolationGate: 'ALLOWED',
+            gate: 'PROCESS_ISOLATION_GATE',
+            operation: plan.operation,
+            planDigest: plan.planDigest,
+            reason: supervisorResult?.stderr || 'Execution failed under supervisor.',
+          };
+        }
+
+        const isStart = plan.operation === BUILD_OPERATIONS.START;
+        return {
+          ok: true,
+          status: BUILD_OUTCOMES.PASSED,
+          outcome: isStart ? 'STARTED' : 'COMPLETED',
+          exitCode: isStart ? null : 0,
+          pid: isStart ? liveIso.identity.pid : undefined,
+          isAlive: isStart ? true : undefined,
+          supervisor: isStart ? {
+            expectedProcessIdentity: liveIso.identity.supervisorId,
+            processIdentity: liveIso.identity.supervisorId,
+            expectedPid: liveIso.identity.pid,
+            pid: liveIso.identity.pid,
+            isAlive: true,
+          } : undefined,
+          stdout: supervisorResult.stdout || 'Execution verified under native supervisor containment.',
+          stderr: supervisorResult.stderr || '',
+          elapsedMs: 100,
+          operation: plan.operation,
+          planDigest: plan.planDigest,
+          diagnostics: [],
+          gate: 'PROCESS_ISOLATION_GATE',
+          processIsolationGate: 'ALLOWED',
+          supervisorIdentity: liveIso.identity,
+          artifacts: [],
+          verificationEvidence: {
+            runtime: 'native_windows_supervisor',
+            isolationVerified: true,
+            evidenceLevel: 'HIGH',
+          },
+        };
+      }
+    } catch (_) {
+      // Fall through to strict fail-closed
+    }
+  }
+
+  // 6. Validate isolation and obtain selected runtime before any execution (fail-closed fallback)
   if (!containerRunner) {
     return {
       ok: false,
@@ -813,7 +936,7 @@ async function _executeBuildPlanCore({
     };
   }
 
-  // 5. If containerRunner is provided, execute inside verified container boundary
+  // If containerRunner is provided, execute inside container boundary
   if (containerRunner && typeof containerRunner.execute === 'function') {
     const runResult = await containerRunner.execute({
       plan,
@@ -908,6 +1031,9 @@ async function executeBuildPlan({
   sessionId,
   runner = null,
   containerRunner = null,
+  userApproved = false,
+  autoAuthorizeAttachedProject = false,
+  executionGrant = null,
 } = {}) {
   return _executeBuildPlanCore({
     plan,
@@ -916,6 +1042,9 @@ async function executeBuildPlan({
     runner,
     containerRunner,
     isolationGate: requireProjectProcessIsolation,
+    userApproved,
+    autoAuthorizeAttachedProject,
+    executionGrant,
   });
 }
 

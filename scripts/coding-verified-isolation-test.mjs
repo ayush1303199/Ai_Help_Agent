@@ -6431,6 +6431,62 @@ async function runVerifiedIsolationTests() {
         assert.equal(verifyOutcome.hostFallback, 'ZERO');
       }
     }
+
+    // =========================================================================
+    // 26.F: V44.90 Live Supervisor BUILD_EXECUTION_GATE & Process Isolation Wire
+    // =========================================================================
+    console.log('  26.F: Testing V44.90 BUILD_EXECUTION_GATE & PROCESS_ISOLATION_GATE live supervisor wiring...');
+    {
+      const { createBuildPlan, executeBuildPlan } = require('../electron/coding-pipeline/buildOrchestrator.cjs');
+      const { verifyLiveSupervisorProcessIsolation } = require('../electron/coding-pipeline/windowsSandboxProviderAdapter.cjs');
+
+      const testOwnerId = 989;
+      await developerFiles.attachProject(process.cwd(), testOwnerId);
+
+      const buildPlan = await createBuildPlan({
+        projectRoot: process.cwd(),
+        operation: BUILD_OPERATIONS.START,
+      });
+
+      if (isAlreadyRunningService) {
+        // 1. When approved, build plan routes to verified supervisor and passes
+        const approvedBuildRes = await executeBuildPlan({
+          plan: buildPlan,
+          ownerWebContentsId: testOwnerId,
+          sessionId: 'test-session-v44-90-approved',
+          userApproved: true,
+          autoAuthorizeAttachedProject: true,
+        });
+        assert.equal(approvedBuildRes.ok, true);
+        assert.equal(approvedBuildRes.outcome, 'STARTED');
+        assert.equal(approvedBuildRes.gate, 'PROCESS_ISOLATION_GATE');
+        assert.equal(approvedBuildRes.processIsolationGate, 'ALLOWED');
+        assert.equal(approvedBuildRes.isAlive, true);
+        assert.ok(approvedBuildRes.pid > 0);
+
+        // 2. When unapproved, build plan strictly fails closed with PROCESS_ISOLATION_GATE: BLOCKED
+        const unapprovedBuildRes = await executeBuildPlan({
+          plan: buildPlan,
+          ownerWebContentsId: testOwnerId,
+          sessionId: 'test-session-v44-90-unapproved',
+          userApproved: false,
+          autoAuthorizeAttachedProject: false,
+        });
+        assert.equal(unapprovedBuildRes.ok, false);
+        assert.equal(unapprovedBuildRes.gate, 'PROCESS_ISOLATION_GATE');
+        assert.equal(unapprovedBuildRes.executionBlocked, true);
+      } else {
+        const buildRes = await executeBuildPlan({
+          plan: buildPlan,
+          ownerWebContentsId: testOwnerId,
+          sessionId: 'test-session-v44-90-unverified',
+          userApproved: true,
+        });
+        assert.equal(buildRes.ok, false);
+        assert.equal(buildRes.gate, 'PROCESS_ISOLATION_GATE');
+        assert.equal(buildRes.executionBlocked, true);
+      }
+    }
   }
 
   console.log('All CODING AGENT V3 — Verified Isolated Project Execution tests passed successfully!');

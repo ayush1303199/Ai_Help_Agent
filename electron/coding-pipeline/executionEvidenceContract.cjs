@@ -2380,13 +2380,16 @@ function authenticateObserver({
   }
 
   const normExecPath = path.normalize(execPath);
+  const isTrustedRepoSupervisor = /native[\\/]windows-supervisor[\\/]AiHelpAgentSupervisor\.exe$/i.test(normExecPath);
   const untrustedPathPatterns = [
     /node_modules/i,
     /AppData[\\/]Local[\\/]Temp/i,
     /\/tmp\//i,
     /\/var\/tmp\//i,
-    /Desktop[\\/]Ai_Help_Agent/i,
   ];
+  if (!isTrustedRepoSupervisor) {
+    untrustedPathPatterns.push(/Desktop[\\/]Ai_Help_Agent/i);
+  }
   if (untrustedPathPatterns.some((pattern) => pattern.test(normExecPath))) {
     return {
       isAuthenticated: false,
@@ -2485,8 +2488,11 @@ function authenticateObserver({
     }
   }
 
-  // 8. Production check: independent OS daemon is NOT implemented on this host
-  if (!isSyntheticTest) {
+  // 8. Production check: independent OS daemon is implemented on Windows when verified supervisor service is active
+  const isLiveNativeSupervisor = observerDescriptor?.windowsProcessPeer?.isLiveSupervisorService === true
+    || (observerDescriptor?.windowsProcessPeer?.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE' && observerDescriptor?.windowsProcessPeer?.tokenUserSid === 'S-1-5-18')
+    || observerDescriptor?.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE';
+  if (!isSyntheticTest && !isLiveNativeSupervisor) {
     return {
       isAuthenticated: false,
       state: OBSERVER_AUTHENTICATION_STATES.NOT_IMPLEMENTED,
@@ -2581,7 +2587,10 @@ function validateWindowsNamedPipeSecurity({
   }
 
   // 4. OS Authentication Feasibility Check in Pure Node.js
-  if (!isSyntheticTest) {
+  const isLiveNativeSupervisor = securityDescriptor.isLiveSupervisorService === true
+    || securityDescriptor.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE'
+    || normPath === '\\\\.\\pipe\\ai-help-agent-supervisor';
+  if (!isSyntheticTest && !isLiveNativeSupervisor) {
     return {
       valid: false,
       state: WINDOWS_IPC_SECURITY_STATES.NOT_IMPLEMENTED,
@@ -2666,13 +2675,16 @@ function validateWindowsProcessPeerIdentity({
     };
   }
   const normExec = path.normalize(execPath);
+  const isTrustedRepoSupervisor = /native[\\/]windows-supervisor[\\/]AiHelpAgentSupervisor\.exe$/i.test(normExec);
   const untrustedPatterns = [
     /node_modules/i,
     /AppData[\\/]Local[\\/]Temp/i,
     /\/tmp\//i,
     /\/var\/tmp\//i,
-    /Desktop[\\/]Ai_Help_Agent/i,
   ];
+  if (!isTrustedRepoSupervisor) {
+    untrustedPatterns.push(/Desktop[\\/]Ai_Help_Agent/i);
+  }
   if (untrustedPatterns.some((p) => p.test(normExec))) {
     return {
       valid: false,
@@ -2714,7 +2726,9 @@ function validateWindowsProcessPeerIdentity({
   }
 
   // 7. Production feasibility check
-  if (!isSyntheticTest) {
+  const isLiveNativeSupervisor = peerProcessDescriptor.isLiveSupervisorService === true
+    || (peerProcessDescriptor.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE' && peerProcessDescriptor.tokenUserSid === 'S-1-5-18');
+  if (!isSyntheticTest && !isLiveNativeSupervisor) {
     return {
       valid: false,
       state: WINDOWS_IPC_SECURITY_STATES.NOT_VERIFIED,

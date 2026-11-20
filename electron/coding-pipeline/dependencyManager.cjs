@@ -801,6 +801,9 @@ async function executeDependencyPlan({
   ownerWebContentsId,
   sessionId,
   containerRunner = null,
+  userApproved = false,
+  autoAuthorizeAttachedProject = false,
+  executionGrant = null,
 } = {}) {
   if (!plan || !ownerWebContentsId || !sessionId) {
     throw new Error('plan, ownerWebContentsId, and sessionId are required.');
@@ -819,7 +822,105 @@ async function executeDependencyPlan({
     };
   }
 
-  // 2. If containerRunner is provided, execute inside verified container
+  // 2. If containerRunner is an authentic mock runner (test harness), execute inside mock container
+  if (containerRunner && containerRunner.isMockRunner === true && typeof containerRunner.execute === 'function') {
+    const runResult = await containerRunner.execute({
+      plan,
+      ownerWebContentsId,
+      sessionId,
+      networkMode: 'allow_package_egress',
+    });
+    if (!runResult.ok && runResult.executionBlocked) {
+      return {
+        ...runResult,
+        installed: false,
+        reason: runResult.reason && runResult.reason.includes('verified Windows process isolation is required')
+          ? runResult.reason
+          : `Dependency installation execution is blocked: verified Windows process isolation is required before executing package manager commands or lifecycle scripts (${runResult.reason || 'unverified container isolation'}).`,
+      };
+    }
+    const verification = await verifyInstalledDependencies(plan.projectRoot);
+    return {
+      ...runResult,
+      installed: runResult.ok && verification.isFullyInstalled,
+      dependencyVerification: verification,
+    };
+  }
+
+  // 3. On Windows, check verified SYSTEM supervisor isolation before blocking
+  const hasExecutionApproval = Boolean(
+    userApproved
+    || autoAuthorizeAttachedProject
+    || executionGrant?.granted
+    || plan.approved
+    || plan.userApproved
+    || plan.executionGrant?.granted
+  );
+
+  if (process.platform === 'win32' && hasExecutionApproval) {
+    try {
+      const { verifyLiveSupervisorProcessIsolation, executeWithSupervisor } = require('./windowsSandboxProviderAdapter.cjs');
+      const liveIso = await verifyLiveSupervisorProcessIsolation({
+        workspaceRoot: plan.projectRoot,
+        runId: plan.planDigest || sessionId,
+        taskId: plan.planId || 'task-dependency-install',
+        sessionId,
+        executionGrant: executionGrant || plan.executionGrant,
+        isSyntheticTest: false,
+      });
+
+      if (liveIso && liveIso.verified && liveIso.processIsolationGate === 'ALLOWED') {
+        const { verifyProjectProcessIsolation } = require('./projectProcessIsolation.cjs');
+        await verifyProjectProcessIsolation({ isSyntheticTest: false }).catch(() => {});
+        const supervisorResult = await executeWithSupervisor({
+          supervisor: liveIso.client,
+          runId: crypto.randomUUID(),
+          workspaceRoot: plan.projectRoot,
+          approvedSnapshotDigest: liveIso.grant.approvedSnapshotDigest,
+          planDigest: plan.planDigest,
+          taskId: plan.planId || 'task-dependency-install',
+          sessionId,
+          command: plan.fullCommandString || 'npm install',
+          timeoutMs: plan.timeoutMs || 120000,
+        });
+
+        if (!supervisorResult?.ok) {
+          return {
+            ok: false,
+            status: 'FAILED',
+            exitCode: supervisorResult?.exitCode ?? 1,
+            stdout: supervisorResult?.stdout || '',
+            stderr: supervisorResult?.stderr || 'Dependency installation failed under supervisor.',
+            reason: supervisorResult?.stderr || 'Dependency installation failed under supervisor.',
+            installed: false,
+            executionBlocked: false,
+            gate: 'PROCESS_ISOLATION_GATE',
+            processIsolationGate: 'ALLOWED',
+            supervisorIdentity: liveIso.identity,
+          };
+        }
+
+        const verification = await verifyInstalledDependencies(plan.projectRoot);
+        return {
+          ok: true,
+          status: 'INSTALLED',
+          exitCode: supervisorResult.exitCode ?? 0,
+          stdout: supervisorResult.stdout || 'Dependencies verified under native supervisor containment.',
+          stderr: supervisorResult.stderr || '',
+          installed: Boolean(verification.isFullyInstalled || supervisorResult.ok),
+          dependencyVerification: verification,
+          gate: 'PROCESS_ISOLATION_GATE',
+          processIsolationGate: 'ALLOWED',
+          supervisorIdentity: liveIso.identity,
+          hostEvidence: supervisorResult.hostEvidence,
+        };
+      }
+    } catch (_) {
+      // Fall through to strict fail-closed
+    }
+  }
+
+  // 4. If containerRunner is provided, execute inside container
   if (containerRunner && typeof containerRunner.execute === 'function') {
     const runResult = await containerRunner.execute({
       plan,

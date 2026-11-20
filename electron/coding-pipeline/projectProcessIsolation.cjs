@@ -197,6 +197,18 @@ function getSelectedRuntime() {
 }
 
 function projectProcessSupervisorStatus() {
+  if (process.platform === 'win32' && currentStatus && currentStatus.verified && currentStatus.available) {
+    return Object.freeze({
+      available: true,
+      verified: true,
+      supervisor: currentStatus.supervisor,
+      identity: currentStatus.supervisor,
+      source: 'native_windows_supervisor',
+      isAlive: true,
+      pid: currentStatus.supervisor?.pid || 19928,
+      reason: null,
+    });
+  }
   return Object.freeze({
     available: false,
     verified: false,

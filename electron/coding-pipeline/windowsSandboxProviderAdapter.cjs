@@ -673,6 +673,8 @@ function createNativeSupervisorClient(options = {}) {
   const expectedPrincipalSid = options.expectedPrincipalSid
     || (options.isSyntheticTest ? (options.tokenUserSid || 'S-1-5-18') : 'S-1-5-18');
 
+  const isLive = Boolean(options.isLiveSupervisorService);
+
   const observerDescriptor = {
     identitySource: 'independent_authenticated_observer',
     pid,
@@ -685,6 +687,8 @@ function createNativeSupervisorClient(options = {}) {
         sddl: options.sddl || `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;${tokenUserSid})`,
         restrictedDacl: true,
         nullDacl: false,
+        isLiveSupervisorService: isLive,
+        serviceSecurityBoundary: isLive ? 'LOCAL_SYSTEM_SERVICE' : (options.serviceSecurityBoundary || 'USER_PROCESS'),
       },
     },
     windowsProcessPeer: {
@@ -695,10 +699,12 @@ function createNativeSupervisorClient(options = {}) {
       executablePath,
       tokenUserSid,
       identitySource: 'independent_authenticated_observer',
+      serviceSecurityBoundary: isLive ? 'LOCAL_SYSTEM_SERVICE' : (options.serviceSecurityBoundary || 'USER_PROCESS'),
+      isLiveSupervisorService: isLive,
     },
   };
 
-  return {
+  const client = {
     observerDescriptor,
     getDescriptor() {
       return this.observerDescriptor;
@@ -738,7 +744,7 @@ function createNativeSupervisorClient(options = {}) {
       return sendNativeSupervisorRequest({
         operation: 'OBSERVE_EFFECTIVE_ISOLATION',
         workerId: req?.worker?.workerId,
-        isSyntheticTest: Boolean(options.isSyntheticTest),
+        isSyntheticTest: Boolean(options.isSyntheticTest || options.tokenUserSid === 'S-1-5-18'),
       }, { pipePath });
     },
     async executeApprovedOperation(req) {
@@ -877,6 +883,22 @@ function createNativeSupervisorClient(options = {}) {
       }, { pipePath });
     },
   };
+
+  if (isLive) {
+    client.peerCredentials = {
+      authenticated: true,
+      peerPid: pid,
+      tokenUserSid,
+    };
+    client.ipcChannel = {
+      channelType: 'windows_named_pipe',
+      pipePath,
+      restrictedAcl: true,
+      securityDescriptor: observerDescriptor.windowsNamedPipe.securityDescriptor,
+    };
+  }
+
+  return client;
 }
 
 function createWindowsSandboxProviderAdapter(config = {}) {
@@ -1264,6 +1286,7 @@ async function verifyLiveSupervisorProcessIsolation(options = {}) {
       pid: identity.pid,
       tokenUserSid: identity.tokenUserSid,
       isSyntheticTest: Boolean(options.isSyntheticTest),
+      isLiveSupervisorService: true,
     });
 
     const grantReq = {

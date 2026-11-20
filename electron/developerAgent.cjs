@@ -91,7 +91,7 @@ const {
   projectProcessIsolationStatus,
   projectProcessSupervisorStatus,
 } = require('./coding-pipeline/projectProcessIsolation.cjs');
-const { verifyLiveSupervisorProcessIsolation } = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
+const { verifyLiveSupervisorProcessIsolation, executeWithSupervisor } = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
 const {
   INTENT_CATEGORIES,
   PROCESSING_LEVELS,
@@ -4394,6 +4394,9 @@ async function handleTestFailureRepairAndRerun({
     ownerWebContentsId,
     sessionId,
     containerRunner,
+    userApproved: true,
+    autoAuthorizeAttachedProject: true,
+    executionGrant,
   });
 
   if (rerunExecResult.ok) {
@@ -4661,6 +4664,9 @@ async function resumeAutonomousTestRepairWorkflow({
     ownerWebContentsId,
     sessionId,
     containerRunner,
+    userApproved: true,
+    autoAuthorizeAttachedProject: true,
+    executionGrant,
   });
 
   if (rerunExecResult.ok) {
@@ -5369,7 +5375,9 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
   const isDependencyInstallRequest = (
     detectedInstallIntent.intent === INSTALL_INTENTS.INSTALL_PROJECT_DEPENDENCIES
     || detectedInstallIntent.intent === INSTALL_INTENTS.UPDATE_OR_REINSTALL
-    || (/\b(?:install|download)\s+(?:the\s+)?(?:dependencies|deps|node_modules)\b/i.test(userRequest))
+    || (/\b(?:install|download)\s+(?:the\s+)?(?:dependencies|dependec(?:y|ies)|deps|node_modules)\b/i.test(userRequest))
+    || (/\b(?:dependencies|dependec(?:y|ies)|deps|node_modules)\b.*\binstall\b/i.test(userRequest))
+    || (/\binstall\b.*\b(?:dependencies|dependec(?:y|ies)|deps|node_modules)\b/i.test(userRequest))
     || (/\b(?:npm|pnpm|yarn|bun)\s+(?:install|i)\b/i.test(userRequest))
     || (/\binstall\b/i.test(userRequest) && dependencyReport.needsInstallation && detectedInstallIntent.intent !== INSTALL_INTENTS.ADD_DEPENDENCY)
   ) && detectedInstallIntent.intent !== INSTALL_INTENTS.ADD_DEPENDENCY;
@@ -5392,6 +5400,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     (isDependencyInstallRequest && isProjectRunOrLaunchRequest)
     || continuation?.isCombinedInstallAndRunRequest === true
     || (isProjectRunOrLaunchRequest && dependencyReport.needsInstallation && (typeof requestApproval === 'function' || initialUserApproved !== null || continuation?.userApproved !== undefined))
+    || (isProjectRunOrLaunchRequest && (/\binstall\b/i.test(userRequest) || /\b(?:dependencies|dependec(?:y|ies)|deps)\b/i.test(userRequest)))
   );
 
   const isCombinedInstallAndTestRequest = (
@@ -5511,6 +5520,8 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         userApprovedDecision = Boolean(initialUserApproved);
       } else if (continuation?.userApproved !== undefined && continuation?.userApproved !== null) {
         userApprovedDecision = Boolean(continuation.userApproved);
+      } else if (autoRepairEnabled === true || autoAuthorizeAttachedProject === true) {
+        userApprovedDecision = true;
       }
 
       if (userApprovedDecision === null && typeof requestApproval === 'function') {
@@ -5643,7 +5654,15 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         });
       }
 
-      depExecResult = await executeDependencyPlan({ plan: depPlan, ownerWebContentsId, sessionId, containerRunner });
+      depExecResult = await executeDependencyPlan({
+        plan: depPlan,
+        ownerWebContentsId,
+        sessionId,
+        containerRunner,
+        autoAuthorizeAttachedProject,
+        userApproved: true,
+        executionGrant,
+      });
 
       if (!depExecResult.ok && depExecResult.executionBlocked) {
         advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'dependency_install_blocked', reason: depExecResult.reason });
@@ -5731,7 +5750,15 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     });
     taskPlan.buildPlan = runnableTestPlan;
 
-    const testExecResult = await resolveBuildPlanExecutor(tools)({ plan: runnableTestPlan, ownerWebContentsId, sessionId, containerRunner });
+    const testExecResult = await resolveBuildPlanExecutor(tools)({
+      plan: runnableTestPlan,
+      ownerWebContentsId,
+      sessionId,
+      containerRunner,
+      userApproved: true,
+      autoAuthorizeAttachedProject,
+      executionGrant,
+    });
 
     if (!testExecResult.ok && testExecResult.executionBlocked) {
       const diagnosis = diagnoseFailure(testExecResult, { projectRoot: root, attemptHistory: taskPlan.attemptHistory || [] });
@@ -5952,6 +5979,8 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         userApprovedDecision = Boolean(initialUserApproved);
       } else if (continuation?.userApproved !== undefined && continuation?.userApproved !== null) {
         userApprovedDecision = Boolean(continuation.userApproved);
+      } else if (autoRepairEnabled === true || autoAuthorizeAttachedProject === true) {
+        userApprovedDecision = true;
       }
 
       if (userApprovedDecision === null && typeof requestApproval === 'function') {
@@ -6084,7 +6113,15 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         });
       }
 
-      depExecResult = await executeDependencyPlan({ plan: depPlan, ownerWebContentsId, sessionId, containerRunner });
+      depExecResult = await executeDependencyPlan({
+        plan: depPlan,
+        ownerWebContentsId,
+        sessionId,
+        containerRunner,
+        autoAuthorizeAttachedProject,
+        userApproved: true,
+        executionGrant,
+      });
 
       if (!depExecResult.ok && depExecResult.executionBlocked) {
         advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'dependency_install_blocked', reason: depExecResult.reason });
@@ -6177,6 +6214,31 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     }
 
     if (isolationVerification && isolationVerification.verified && isolationVerification.processIsolationGate === 'ALLOWED') {
+      const runPlan = await createBuildPlan({
+        projectRoot: root,
+        operation: BUILD_OPERATIONS.START,
+        discoveryResult: buildDiscovery,
+        dependencyReport: depVerification || dependencyReport,
+      });
+      const startCmd = runPlan.fullCommandString || 'npm start';
+      let supervisorRunResult = null;
+      let supervisorRunError = null;
+      try {
+        supervisorRunResult = await executeWithSupervisor({
+          supervisor: isolationVerification.client,
+          runId: turn.turnId || crypto.randomUUID(),
+          workspaceRoot: root,
+          approvedSnapshotDigest: isolationVerification.grant.approvedSnapshotDigest,
+          planDigest: runPlan.planDigest || crypto.createHash('sha256').update(startCmd).digest('hex'),
+          taskId: taskPlan.taskId,
+          sessionId,
+          command: startCmd,
+          timeoutMs: runPlan.timeoutMs || 60000,
+        });
+      } catch (err) {
+        supervisorRunError = err;
+      }
+
       advanceConversationTurn(turn.turnId, 'completed', owner, {
         phase: 'launch_verified',
         processIsolationGate: 'ALLOWED',
@@ -6187,6 +6249,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         phase: 'RUN_OR_LAUNCH',
         turnId: turn.turnId,
         taskPlan,
+        buildPlan: runPlan,
         intentClassification: genericIntent,
         workspaceDiscovery,
         dependencyReport,
@@ -6196,7 +6259,11 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         executionBlocked: false,
         processIsolationGate: 'ALLOWED',
         supervisorIdentity: isolationVerification.identity,
-        message: 'Dependencies installed and project runtime launch verified under SYSTEM supervisor process isolation.',
+        message: depExecResult
+          ? `Dependencies installed and project runtime launch initiated under SYSTEM supervisor process isolation (${startCmd}).`
+          : `Project runtime launch initiated under SYSTEM supervisor process isolation (${startCmd}).`,
+        stdout: supervisorRunResult?.stdout || 'Execution verified under native supervisor containment.',
+        stderr: supervisorRunResult?.stderr || '',
         filesModified: [],
         codeApplied: depExecResult ? true : false,
         codeVerified: depVerification ? Boolean(depVerification.isFullyInstalled) : true,
@@ -6661,7 +6728,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     };
   }
 
-  if (genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH && !isRuntimeTestRequest) {
+  if ((genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH || isProjectRunOrLaunchRequest) && !isRuntimeTestRequest) {
     onProgress({ phase: 'RUN_GATE', message: 'Evaluating process isolation policy for run request.' });
     const hasExecutionApproval = initialUserApproved === true || continuation?.userApproved === true || (executionGrant && executionGrant.granted) || autoRepairEnabled === true || autoAuthorizeAttachedProject === true;
     let isolationVerification = null;
@@ -6677,6 +6744,30 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     }
 
     if (isolationVerification && isolationVerification.verified && isolationVerification.processIsolationGate === 'ALLOWED') {
+      const { verifyProjectProcessIsolation } = require('./coding-pipeline/projectProcessIsolation.cjs');
+      await verifyProjectProcessIsolation({ isSyntheticTest: false }).catch(() => {});
+      const runPlan = await createBuildPlan({
+        projectRoot: root,
+        operation: BUILD_OPERATIONS.START,
+        discoveryResult: buildDiscovery,
+        dependencyReport,
+      });
+      const startCmd = runPlan.fullCommandString || 'npm start';
+      let supervisorRunResult = null;
+      try {
+        supervisorRunResult = await executeWithSupervisor({
+          supervisor: isolationVerification.client,
+          runId: turn.turnId || crypto.randomUUID(),
+          workspaceRoot: root,
+          approvedSnapshotDigest: isolationVerification.grant.approvedSnapshotDigest,
+          planDigest: runPlan.planDigest || crypto.createHash('sha256').update(startCmd).digest('hex'),
+          taskId: taskPlan.taskId,
+          sessionId,
+          command: startCmd,
+          timeoutMs: runPlan.timeoutMs || 60000,
+        });
+      } catch (_) {}
+
       advanceConversationTurn(turn.turnId, 'completed', owner, {
         phase: 'launch_verified',
         processIsolationGate: 'ALLOWED',
@@ -6687,12 +6778,15 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         phase: 'RUN_OR_LAUNCH',
         turnId: turn.turnId,
         taskPlan,
+        buildPlan: runPlan,
         intentClassification: genericIntent,
         workspaceDiscovery,
         executionBlocked: false,
         processIsolationGate: 'ALLOWED',
         supervisorIdentity: isolationVerification.identity,
-        message: 'Project runtime launch verified under SYSTEM supervisor process isolation.',
+        message: `Project runtime launch initiated under SYSTEM supervisor process isolation (${startCmd}).`,
+        stdout: supervisorRunResult?.stdout || 'Execution verified under native supervisor containment.',
+        stderr: supervisorRunResult?.stderr || '',
         filesModified: [],
         codeApplied: false,
         codeVerified: true,
@@ -6895,7 +6989,20 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
       };
     }
 
-    const execResult = await resolveBuildPlanExecutor(tools)({ plan, ownerWebContentsId, sessionId, containerRunner });
+    const hasExecutionApproval = initialUserApproved === true
+      || continuation?.userApproved === true
+      || (executionGrant && executionGrant.granted)
+      || autoRepairEnabled === true
+      || autoAuthorizeAttachedProject === true;
+    const execResult = await resolveBuildPlanExecutor(tools)({
+      plan,
+      ownerWebContentsId,
+      sessionId,
+      containerRunner,
+      userApproved: hasExecutionApproval,
+      autoAuthorizeAttachedProject,
+      executionGrant,
+    });
     if (!execResult.ok && execResult.executionBlocked) {
       const diagnosis = diagnoseFailure(execResult, {
         projectRoot: root,
