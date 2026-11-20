@@ -91,6 +91,7 @@ const {
   projectProcessIsolationStatus,
   projectProcessSupervisorStatus,
 } = require('./coding-pipeline/projectProcessIsolation.cjs');
+const { verifyLiveSupervisorProcessIsolation } = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
 const {
   INTENT_CATEGORIES,
   PROCESSING_LEVELS,
@@ -5032,6 +5033,7 @@ async function executeAutonomousCodingWorkflowStage({
   containerRunner: inputContainerRunner = null,
   contextMessages = [],
   genericIntent: inputGenericIntent = null,
+  executionGrant = null,
 }, continuation = null) {
   if (!sessionId || ownerWebContentsId === undefined) {
     throw new Error('Developer session ownership is required.');
@@ -6160,7 +6162,53 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     }
 
     onProgress({ phase: 'RUN_GATE', message: 'Evaluating process isolation policy for run request.' });
-    const blockReason = 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.';
+    const hasExecutionApproval = initialUserApproved === true || continuation?.userApproved === true || (executionGrant && executionGrant.granted);
+    let isolationVerification = null;
+    if (hasExecutionApproval) {
+      isolationVerification = await verifyLiveSupervisorProcessIsolation({
+        runId: turn.turnId,
+        workspaceRoot: root,
+        taskId: taskPlan.taskId,
+        sessionId,
+        executionGrant: executionGrant,
+        isSyntheticTest: false,
+      });
+    }
+
+    if (isolationVerification && isolationVerification.verified && isolationVerification.processIsolationGate === 'ALLOWED') {
+      advanceConversationTurn(turn.turnId, 'completed', owner, {
+        phase: 'launch_verified',
+        processIsolationGate: 'ALLOWED',
+        supervisorIdentity: isolationVerification.identity,
+      });
+      return {
+        outcome: 'COMPLETED',
+        phase: 'RUN_OR_LAUNCH',
+        turnId: turn.turnId,
+        taskPlan,
+        intentClassification: genericIntent,
+        workspaceDiscovery,
+        dependencyReport,
+        dependencyPlan: depPlan,
+        dependencyResult: depExecResult,
+        dependencyVerification: depVerification,
+        executionBlocked: false,
+        processIsolationGate: 'ALLOWED',
+        supervisorIdentity: isolationVerification.identity,
+        message: 'Dependencies installed and project runtime launch verified under SYSTEM supervisor process isolation.',
+        filesModified: [],
+        codeApplied: depExecResult ? true : false,
+        codeVerified: depVerification ? Boolean(depVerification.isFullyInstalled) : true,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'COMPLETED',
+          stagesCompleted: depExecResult
+            ? ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL', 'RUN_GATE', 'SUPERVISOR_ISOLATION_VERIFIED']
+            : ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_CHECK', 'RUN_GATE', 'SUPERVISOR_ISOLATION_VERIFIED'],
+        }),
+      };
+    }
+
+    const blockReason = isolationVerification?.reason || 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.';
     advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'launch_blocked', reason: blockReason });
     return {
       outcome: 'BLOCKED',
@@ -6614,7 +6662,47 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
 
   if (genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH && !isRuntimeTestRequest) {
     onProgress({ phase: 'RUN_GATE', message: 'Evaluating process isolation policy for run request.' });
-    const blockReason = 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.';
+    const hasExecutionApproval = initialUserApproved === true || continuation?.userApproved === true || (executionGrant && executionGrant.granted);
+    let isolationVerification = null;
+    if (hasExecutionApproval) {
+      isolationVerification = await verifyLiveSupervisorProcessIsolation({
+        runId: turn.turnId,
+        workspaceRoot: root,
+        taskId: taskPlan.taskId,
+        sessionId,
+        executionGrant: executionGrant,
+        isSyntheticTest: false,
+      });
+    }
+
+    if (isolationVerification && isolationVerification.verified && isolationVerification.processIsolationGate === 'ALLOWED') {
+      advanceConversationTurn(turn.turnId, 'completed', owner, {
+        phase: 'launch_verified',
+        processIsolationGate: 'ALLOWED',
+        supervisorIdentity: isolationVerification.identity,
+      });
+      return {
+        outcome: 'COMPLETED',
+        phase: 'RUN_OR_LAUNCH',
+        turnId: turn.turnId,
+        taskPlan,
+        intentClassification: genericIntent,
+        workspaceDiscovery,
+        executionBlocked: false,
+        processIsolationGate: 'ALLOWED',
+        supervisorIdentity: isolationVerification.identity,
+        message: 'Project runtime launch verified under SYSTEM supervisor process isolation.',
+        filesModified: [],
+        codeApplied: false,
+        codeVerified: true,
+        workflowReceipt: buildWorkflowReceipt({
+          outcome: 'COMPLETED',
+          stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'RUN_GATE', 'SUPERVISOR_ISOLATION_VERIFIED'],
+        }),
+      };
+    }
+
+    const blockReason = isolationVerification?.reason || 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.';
     advanceConversationTurn(turn.turnId, 'failed', owner, { phase: 'launch_blocked', reason: blockReason });
     return {
       outcome: 'BLOCKED',

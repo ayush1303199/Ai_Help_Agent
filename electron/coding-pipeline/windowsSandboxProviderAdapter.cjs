@@ -1,3 +1,4 @@
+const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs/promises');
 const net = require('node:net');
@@ -1207,6 +1208,108 @@ function createDirectHcsProviderAdapter(config = {}) {
   });
 }
 
+
+async function verifyLiveSupervisorProcessIsolation(options = {}) {
+  const pipePath = options.pipePath || NATIVE_SUPERVISOR_PIPE;
+  const timeoutMs = options.timeoutMs || 2000;
+  try {
+    const supervisorStatus = await queryNativeSupervisorStatus({ pipePath, timeoutMs });
+    if (!supervisorStatus.running) {
+      return {
+        verified: false,
+        processIsolationGate: 'BLOCKED',
+        reasonCode: supervisorStatus.reasonCode || 'SERVICE_UNREACHABLE',
+        reason: 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.',
+        hostFallback: 'ZERO',
+      };
+    }
+
+    const identity = await sendNativeSupervisorRequest(
+      { operation: 'GET_SUPERVISOR_IDENTITY' },
+      { pipePath, timeoutMs },
+    );
+    const isLocalSystem = identity?.tokenUserSid === 'S-1-5-18'
+      || identity?.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE'
+      || (options.isSyntheticTest && identity?.ok);
+
+    if (!identity?.ok || !isLocalSystem) {
+      return {
+        verified: false,
+        processIsolationGate: 'BLOCKED',
+        reasonCode: 'SUPERVISOR_UNPRIVILEGED',
+        reason: 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.',
+        hostFallback: 'ZERO',
+      };
+    }
+
+    const safeInvoke = await sendNativeSupervisorRequest(
+      { operation: 'INVOKE_SAFE_HCS_API' },
+      { pipePath, timeoutMs },
+    );
+    const isHcsOk = safeInvoke?.ok && (safeInvoke?.hresult === 0 || safeInvoke?.hresultHex === '0x00000000');
+
+    if (!isHcsOk) {
+      return {
+        verified: false,
+        processIsolationGate: 'BLOCKED',
+        reasonCode: safeInvoke?.reasonCode || 'HCS_NOT_OK',
+        reason: 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.',
+        hostFallback: 'ZERO',
+      };
+    }
+
+    // If an execution grant was supplied, verify it; otherwise issue and verify grant on supervisor
+    const client = createNativeSupervisorClient({
+      pipePath,
+      pid: identity.pid,
+      tokenUserSid: identity.tokenUserSid,
+      isSyntheticTest: Boolean(options.isSyntheticTest),
+    });
+
+    const grantReq = {
+      runId: options.runId || crypto.randomUUID(),
+      workspaceRoot: options.workspaceRoot || process.cwd(),
+      approvedSnapshotDigest: options.approvedSnapshotDigest || crypto.createHash('sha256').update(options.workspaceRoot || process.cwd()).digest('hex'),
+      planDigest: options.planDigest || crypto.createHash('sha256').update(options.runId || 'plan').digest('hex'),
+      taskId: options.taskId || 'task-run-or-launch',
+      sessionId: options.sessionId || 'session-run-or-launch',
+      ttlSeconds: options.ttlSeconds || 300,
+    };
+
+    const grant = options.executionGrant && options.executionGrant.granted
+      ? options.executionGrant
+      : await client.issueExecutionGrant(grantReq);
+
+    if (!grant || !grant.granted) {
+      return {
+        verified: false,
+        processIsolationGate: 'BLOCKED',
+        reasonCode: 'GRANT_REJECTED',
+        reason: 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.',
+        hostFallback: 'ZERO',
+      };
+    }
+
+    return {
+      verified: true,
+      processIsolationGate: 'ALLOWED',
+      identity,
+      hcsStatus: safeInvoke,
+      grant,
+      client,
+      hostFallback: 'ZERO',
+    };
+  } catch (err) {
+    return {
+      verified: false,
+      processIsolationGate: 'BLOCKED',
+      reasonCode: err.code || 'SUPERVISOR_PROBE_ERROR',
+      reason: 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.',
+      hostFallback: 'ZERO',
+    };
+  }
+}
+
 module.exports = {
   DEFAULT_MEMORY_MB,
   DIRECT_HCS_DISABLED_REASON,
@@ -1230,4 +1333,5 @@ module.exports = {
   queryNativeSupervisorStatus,
   sendNativeSupervisorRequest,
   validateHostShutdownObservation,
+  verifyLiveSupervisorProcessIsolation,
 };

@@ -5397,6 +5397,7 @@ async function runVerifiedIsolationTests() {
     }
 
     // =========================================================================
+    let isAlreadyRunningService = false;
     // 26.B: LOCAL_NATIVE_IPC_TEST - Live compiled native binary, pipe IPC, Job Object containment
     // =========================================================================
     console.log('  26.B: Testing LOCAL_NATIVE_IPC_TEST contract...');
@@ -5405,30 +5406,43 @@ async function runVerifiedIsolationTests() {
       const initialStatus = await queryNativeSupervisorStatus();
       assert.equal(initialStatus.binaryPresent, true, 'Native supervisor executable must exist on disk.');
       assert.equal(typeof initialStatus.executablePath, 'string');
-      assert.equal(initialStatus.running, false);
-      assert.equal(initialStatus.status, 'IMPLEMENTED_NOT_INSTALLED');
-      assert.ok(
-        initialStatus.reasonCode === 'SERVICE_PIPE_NOT_FOUND' || initialStatus.reasonCode === 'SERVICE_UNREACHABLE',
-        'Initial reason code must indicate supervisor is not actively serving requests'
-      );
+      isAlreadyRunningService = initialStatus.running && (initialStatus.runningMode === 'WINDOWS_SERVICE' || initialStatus.tokenUserSid === 'S-1-5-18');
+      if (!isAlreadyRunningService) {
+        assert.equal(initialStatus.running, false);
+        assert.equal(initialStatus.status, 'IMPLEMENTED_NOT_INSTALLED');
+        assert.ok(
+          initialStatus.reasonCode === 'SERVICE_PIPE_NOT_FOUND' || initialStatus.reasonCode === 'SERVICE_UNREACHABLE',
+          'Initial reason code must indicate supervisor is not actively serving requests'
+        );
+      } else {
+        assert.equal(initialStatus.running, true);
+        assert.equal(initialStatus.status, 'IMPLEMENTED_AND_RUNNING');
+      }
 
-      // 26.B.2: Spawn native supervisor in interactive/console mode
-      const supervisorProcess = spawn(NATIVE_SUPERVISOR_EXECUTABLE, ['--console'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      // 26.B.2: Spawn native supervisor in interactive/console mode if not already running as service
+      const supervisorProcess = isAlreadyRunningService
+        ? null
+        : spawn(NATIVE_SUPERVISOR_EXECUTABLE, ['--console'], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
 
       try {
-        let activeStatus = null;
-        for (let attempt = 0; attempt < 60; attempt++) {
-          activeStatus = await queryNativeSupervisorStatus();
-          if (activeStatus.running) break;
-          await new Promise((resolve) => setTimeout(resolve, 50));
+        let activeStatus = isAlreadyRunningService ? await queryNativeSupervisorStatus() : null;
+        if (!activeStatus) {
+          for (let attempt = 0; attempt < 60; attempt++) {
+            activeStatus = await queryNativeSupervisorStatus();
+            if (activeStatus.running) break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
         }
 
         assert.equal(activeStatus.running, true, 'Native supervisor must be running and listening on pipe.');
         assert.equal(activeStatus.isAlive, true);
         assert.ok(activeStatus.pid > 0, 'Supervisor must report a valid OS process PID.');
-        assert.equal(activeStatus.runningMode, 'INTERACTIVE_CONSOLE_DIAGNOSTIC');
+        assert.ok(
+          activeStatus.runningMode === 'INTERACTIVE_CONSOLE_DIAGNOSTIC' || activeStatus.runningMode === 'WINDOWS_SERVICE',
+          'Supervisor runningMode must be valid'
+        );
 
         const nativeClient = createNativeSupervisorClient({
           pid: activeStatus.pid,
@@ -5694,7 +5708,6 @@ async function runVerifiedIsolationTests() {
         assert.equal(safeInvokeProbe.serviceBinaryPath, 'C:\\Windows\\System32\\vmcompute.exe');
         assert.equal(safeInvokeProbe.serviceBinaryPresent, true);
         assert.equal(safeInvokeProbe.serviceEndpointReachable, true);
-        assert.equal(safeInvokeProbe.errorClassification, 'ACCESS_DENIED');
         assert.equal(safeInvokeProbe.vmcomputeServiceConfiguration, 'MANUAL_START_DEMAND');
         assert.equal(safeInvokeProbe.vmcomputeServiceRuntime, 'SERVICE_RUNNING');
         assert.equal(safeInvokeProbe.vmcomputeDependencies, 'PRESENT_VERIFIED');
@@ -5702,9 +5715,16 @@ async function runVerifiedIsolationTests() {
         assert.equal(safeInvokeProbe.serviceRunningVsHcsAvailableDistinction, 'VERIFIED');
         assert.equal(safeInvokeProbe.rpcTriggerInterfaceGuid, 'E7A216AF-1EC1-447F-8D3F-A87278DB564D');
         assert.notEqual(safeInvokeProbe.safeApiInvoked, 'NOT_AVAILABLE', 'Must not report NOT_AVAILABLE when native API was actually called');
-        assert.equal(safeInvokeProbe.serviceAvailability, 'AVAILABLE_ACCESS_RESTRICTED');
-        assert.equal(safeInvokeProbe.reasonCode, 'HCS_E_ACCESS_DENIED');
-        assert.equal(safeInvokeProbe.hresultHex, '0x8037011B');
+        if (!isAlreadyRunningService) {
+          assert.equal(safeInvokeProbe.errorClassification, 'ACCESS_DENIED');
+          assert.equal(safeInvokeProbe.serviceAvailability, 'AVAILABLE_ACCESS_RESTRICTED');
+          assert.equal(safeInvokeProbe.reasonCode, 'HCS_E_ACCESS_DENIED');
+          assert.equal(safeInvokeProbe.hresultHex, '0x8037011B');
+        } else {
+          assert.equal(safeInvokeProbe.errorClassification, 'SUCCESS');
+          assert.equal(safeInvokeProbe.serviceAvailability, 'AVAILABLE');
+          assert.equal(safeInvokeProbe.hresultHex, '0x00000000');
+        }
 
         const clientSafeInvoke = await nativeClient.invokeSafeHcsApi();
         assert.equal(clientSafeInvoke.ok, true);
@@ -5712,9 +5732,13 @@ async function runVerifiedIsolationTests() {
         assert.equal(clientSafeInvoke.safeApiInvoked, 'VERIFIED');
         assert.equal(clientSafeInvoke.hcsNativeApiInvocation, 'VERIFIED');
         assert.notEqual(clientSafeInvoke.safeApiInvoked, 'NOT_AVAILABLE', 'Must not report NOT_AVAILABLE when native API was actually called');
-        assert.equal(clientSafeInvoke.serviceAvailability, 'AVAILABLE_ACCESS_RESTRICTED');
-        assert.equal(clientSafeInvoke.reasonCode, 'HCS_E_ACCESS_DENIED');
-        assert.equal(clientSafeInvoke.hresultHex, '0x8037011B');
+        if (!isAlreadyRunningService) {
+          assert.equal(clientSafeInvoke.serviceAvailability, 'AVAILABLE_ACCESS_RESTRICTED');
+          assert.equal(clientSafeInvoke.reasonCode, 'HCS_E_ACCESS_DENIED');
+          assert.equal(clientSafeInvoke.hresultHex, '0x8037011B');
+        } else {
+          assert.equal(clientSafeInvoke.hresultHex, '0x00000000');
+        }
 
         // Verify adapter contract constants and hierarchy invariants
         assert.equal(HCS_CAPABILITY_STATES.COMPUTECORE_DLL_IDENTITY, 'VERIFIED');
@@ -5806,7 +5830,11 @@ async function runVerifiedIsolationTests() {
         assert.equal(diagBadDll.gate, 'BLOCKED');
 
         // Console mode vs actual service identity
-        assert.notEqual(supervisorIdentityProbe.tokenUserSid, 'S-1-5-18', 'Console mode must never claim LocalSystem identity');
+        if (!isAlreadyRunningService) {
+          assert.notEqual(supervisorIdentityProbe.tokenUserSid, 'S-1-5-18', 'Console mode must never claim LocalSystem identity');
+        } else {
+          assert.equal(supervisorIdentityProbe.tokenUserSid, 'S-1-5-18', 'Service mode under NT AUTHORITY\\SYSTEM must report S-1-5-18');
+        }
 
         // 26.B.10d: Architecture & VM Boundary Validation via IPC
         const archCheckWsb = await sendNativeSupervisorRequest({
@@ -6104,24 +6132,30 @@ async function runVerifiedIsolationTests() {
         }
 
         // 26.B.11: Authenticated clean shutdown via IPC
-        const shutdownResp = await sendNativeSupervisorRequest({ operation: 'SHUTDOWN' });
-        assert.equal(shutdownResp.ok, true);
-        assert.equal(shutdownResp.status, 'STOPPING');
+        if (!isAlreadyRunningService) {
+          const shutdownResp = await sendNativeSupervisorRequest({ operation: 'SHUTDOWN' });
+          assert.equal(shutdownResp.ok, true);
+          assert.equal(shutdownResp.status, 'STOPPING');
+        }
       } finally {
-        try {
-          supervisorProcess.kill();
-        } catch {}
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        if (supervisorProcess) {
+          try {
+            supervisorProcess.kill();
+          } catch {}
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
       }
 
       // 26.B.12: Verify post-shutdown fail-closed state
-      const postStatus = await queryNativeSupervisorStatus();
-      assert.equal(postStatus.running, false);
-      assert.equal(postStatus.status, 'IMPLEMENTED_NOT_INSTALLED');
-      assert.ok(
-        postStatus.reasonCode === 'SERVICE_PIPE_NOT_FOUND' || postStatus.reasonCode === 'SERVICE_UNREACHABLE',
-        'Post-shutdown reason code must indicate supervisor is not actively serving requests'
-      );
+      if (!isAlreadyRunningService) {
+        const postStatus = await queryNativeSupervisorStatus();
+        assert.equal(postStatus.running, false);
+        assert.equal(postStatus.status, 'IMPLEMENTED_NOT_INSTALLED');
+        assert.ok(
+          postStatus.reasonCode === 'SERVICE_PIPE_NOT_FOUND' || postStatus.reasonCode === 'SERVICE_UNREACHABLE',
+          'Post-shutdown reason code must indicate supervisor is not actively serving requests'
+        );
+      }
     }
 
     // =========================================================================
@@ -6129,13 +6163,17 @@ async function runVerifiedIsolationTests() {
     // =========================================================================
     console.log('  26.C: Testing REAL_WINDOWS_SERVICE_TEST contract...');
     {
-      // 26.C.1: SCM query reports service is not installed in un-elevated environment
+      // 26.C.1: SCM query reports service status
       const scmStatus = await queryNativeSupervisorStatus();
-      assert.equal(scmStatus.serviceInstalled, false, 'Service must not be registered in SCM without elevation.');
-      assert.equal(scmStatus.serviceState, 'NOT_INSTALLED');
-
-      // 26.C.2: Console execution is strictly NEVER reported as installed Windows Service
-      assert.notEqual(scmStatus.runningMode, 'WINDOWS_SERVICE');
+      if (!isAlreadyRunningService) {
+        assert.equal(scmStatus.serviceInstalled, false, 'Service must not be registered in SCM without elevation.');
+        assert.equal(scmStatus.serviceState, 'NOT_INSTALLED');
+        assert.notEqual(scmStatus.runningMode, 'WINDOWS_SERVICE');
+      } else {
+        assert.equal(scmStatus.serviceInstalled, true);
+        assert.equal(scmStatus.serviceState, 'RUNNING');
+        assert.equal(scmStatus.runningMode, 'WINDOWS_SERVICE');
+      }
 
       // 26.C.3: Test --install-info CLI switch output
       const installInfoRes = spawnSync(NATIVE_SUPERVISOR_EXECUTABLE, ['--install-info'], {
@@ -6204,16 +6242,20 @@ async function runVerifiedIsolationTests() {
       );
 
       // 26.D.2: When evaluating real OS isolation (isSyntheticTest: false), hypervisor VM boundary check fails closed
-      const supervisorProcess = spawn(NATIVE_SUPERVISOR_EXECUTABLE, ['--console'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      const supervisorProcess = isAlreadyRunningService
+        ? null
+        : spawn(NATIVE_SUPERVISOR_EXECUTABLE, ['--console'], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
 
       try {
-        let activeStatus = null;
-        for (let attempt = 0; attempt < 60; attempt++) {
-          activeStatus = await queryNativeSupervisorStatus();
-          if (activeStatus.running) break;
-          await new Promise((resolve) => setTimeout(resolve, 50));
+        let activeStatus = isAlreadyRunningService ? await queryNativeSupervisorStatus() : null;
+        if (!activeStatus) {
+          for (let attempt = 0; attempt < 60; attempt++) {
+            activeStatus = await queryNativeSupervisorStatus();
+            if (activeStatus.running) break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
         }
         assert.equal(activeStatus.running, true);
 
@@ -6337,17 +6379,62 @@ async function runVerifiedIsolationTests() {
           (err) => err.code === 'SUPERVISOR_AUTHENTICATION_FAILED',
         );
 
-        await sendNativeSupervisorRequest({ operation: 'SHUTDOWN' });
+        if (!isAlreadyRunningService) {
+          await sendNativeSupervisorRequest({ operation: 'SHUTDOWN' });
+        }
       } finally {
-        try {
-          supervisorProcess.kill();
-        } catch {}
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        if (supervisorProcess) {
+          try {
+            supervisorProcess.kill();
+          } catch {}
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+      }
+    }
+    // =========================================================================
+    // 26.E: V44.88 Live SYSTEM Supervisor Handshake & RUN_OR_LAUNCH Unblocking
+    // =========================================================================
+    console.log('  26.E: Testing V44.88 Live SYSTEM Supervisor Handshake & RUN_OR_LAUNCH unblocking...');
+    {
+      const { verifyLiveSupervisorProcessIsolation } = require('../electron/coding-pipeline/windowsSandboxProviderAdapter.cjs');
+      const verifyOutcome = await verifyLiveSupervisorProcessIsolation({
+        runId: 'v44-88-verify-run',
+        workspaceRoot: process.cwd(),
+      });
+
+      if (isAlreadyRunningService) {
+        assert.equal(verifyOutcome.verified, true);
+        assert.equal(verifyOutcome.processIsolationGate, 'ALLOWED');
+        assert.equal(verifyOutcome.identity.tokenUserSid, 'S-1-5-18');
+        assert.equal(verifyOutcome.hcsStatus.hresultHex, '0x00000000');
+        assert.equal(verifyOutcome.hostFallback, 'ZERO');
+        assert.ok(verifyOutcome.grant && verifyOutcome.grant.granted);
+
+        // Test unblocking RUN_OR_LAUNCH through developerAgent when grant is verified
+        const testOwnerId = 988;
+        await developerFiles.attachProject(process.cwd(), testOwnerId);
+        const runTurnRes = await executeAutonomousCodingWorkflow({
+          userRequest: 'Run the project application runtime',
+          root: process.cwd(),
+          sessionId: 'test-session-v44-88',
+          ownerWebContentsId: testOwnerId,
+          userApproved: true,
+          executionGrant: verifyOutcome.grant,
+        });
+        assert.equal(runTurnRes.outcome, 'COMPLETED');
+        assert.equal(runTurnRes.phase, 'RUN_OR_LAUNCH');
+        assert.equal(runTurnRes.processIsolationGate, 'ALLOWED');
+        assert.equal(runTurnRes.executionBlocked, false);
+      } else {
+        assert.equal(verifyOutcome.verified, false);
+        assert.equal(verifyOutcome.processIsolationGate, 'BLOCKED');
+        assert.equal(verifyOutcome.hostFallback, 'ZERO');
       }
     }
   }
 
   console.log('All CODING AGENT V3 — Verified Isolated Project Execution tests passed successfully!');
+  process.exit(0);
 
 }
 
