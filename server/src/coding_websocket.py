@@ -7873,6 +7873,12 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         or payload.get("processIsolationGate") == "ALLOWED"
         or payload.get("processIsolationAllowed") is True
     )
+    is_project_attached = bool(
+        payload.get("projectRoot")
+        or payload.get("projectAttached")
+        or state.get("project_attached")
+        or _active_backend_project.get("status") == "PROJECT_ATTACHED"
+    )
     request_understanding = understand_human_request(request, supplied)
     underspecified_file_creation = _is_underspecified_file_creation_request(request)
     capability_question = request_understanding.get("action") == TaskIntent.CAPABILITY_QUESTION
@@ -8051,6 +8057,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         })
         return
     project_root = str(Path(project_root).resolve())
+    is_project_attached = bool(project_root)
     try:
         context_identity = await asyncio.to_thread(
             register_coding_request_context,
