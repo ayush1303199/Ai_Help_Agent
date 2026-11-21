@@ -1482,14 +1482,14 @@ export class CodingAgentTransport {
       request.handlers.onToken(chunk);
       return;
     }
-    if (message.type === 'tool_call') {
+    if (message.type === 'tool_call' || message.type === 'WORKSPACE_COMMAND_EXECUTION_REQUEST') {
       request.operation = 'tool';
       this.resetIdleDeadline(request);
       const toolCallId = String(message.toolCallId || '');
-      const rawName = String(message.name || '');
+      const rawName = String(message.name || (message.type === 'WORKSPACE_COMMAND_EXECUTION_REQUEST' ? 'execute_workspace_commands' : ''));
       const rawArgs = message.arguments && typeof message.arguments === 'object'
         ? message.arguments as Record<string, unknown>
-        : {};
+        : (Array.isArray((message as Record<string, unknown>).commands) ? { commands: (message as Record<string, unknown>).commands } : {});
       if (message.turnId !== request.turnId) {
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({
@@ -1542,6 +1542,15 @@ export class CodingAgentTransport {
       }
 
       request.toolCalls.push({ name, arguments: args, round: request.toolCalls.length + 1 });
+      if (name === 'execute_workspace_commands') {
+        const cmds = Array.isArray(args.commands) ? args.commands.join(', ') : (typeof args.command === 'string' ? args.command : '');
+        request.handlers.onActivity({
+          id: `message:${requestId}:${request.activityCount++}`,
+          executionId: requestId,
+          phase: 'launch_verified',
+          message: `Executing workspace commands in verified supervisor: ${cmds}`,
+        });
+      }
       let result: unknown;
       try {
         if (window.electronAPI) {
@@ -1584,7 +1593,13 @@ export class CodingAgentTransport {
         };
       }
       if (socket.readyState === WebSocket.OPEN && !request.cancellationRequested) {
-        socket.send(JSON.stringify({ type: 'tool_result', requestId, toolCallId, result }));
+        socket.send(JSON.stringify({
+          type: 'tool_result',
+          action: name === 'execute_workspace_commands' ? 'WORKSPACE_COMMAND_EXECUTION_RESULT' : undefined,
+          requestId,
+          toolCallId,
+          result,
+        }));
       }
       if (!request.cancellationRequested) {
         request.operation = 'model';

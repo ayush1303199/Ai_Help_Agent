@@ -703,6 +703,10 @@ CODING_TOOLS = [
                         "items": {"type": "string"},
                         "description": "List of shell/workspace commands to execute in order inside supervisor process isolation (e.g. ['npm install'], ['npm start']).",
                     },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Engineering rationale for executing these commands (e.g. 'Install missing project dependencies and start project server').",
+                    },
                     "reason": {
                         "type": "string",
                         "description": "Reason for executing these commands (e.g. 'Install missing project dependencies and start project server').",
@@ -2556,6 +2560,7 @@ _SAFE_EXPLORATION_TOOLS = {
     "search_symbols",
     "find_references",
     "get_context",
+    "execute_workspace_commands",
 }
 
 
@@ -2620,6 +2625,18 @@ def _normalize_extracted_tool_args(canonical: str, raw_args: Any, scope: str = "
         if "maxTokens" in args and isinstance(args["maxTokens"], int) and args["maxTokens"] > 0:
             res["maxTokens"] = min(args["maxTokens"], 8000)
         return res
+    elif canonical == "execute_workspace_commands":
+        raw_cmds = args.get("commands") or args.get("command") or args.get("script") or []
+        if isinstance(raw_cmds, str):
+            raw_cmds = [raw_cmds]
+        cmds = [str(c).strip() for c in raw_cmds if str(c).strip()]
+        if not cmds:
+            return None
+        return {
+            "commands": cmds,
+            "rationale": str(args.get("rationale") or args.get("reason") or "").strip(),
+            "reason": str(args.get("rationale") or args.get("reason") or "").strip(),
+        }
     return None
 
 
@@ -6830,7 +6847,8 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             for c in raw_cmds
             if str(c).strip()
         ]
-        normalized_args["reason"] = str(arguments.get("reason") or "").strip()[:CODING_MAX_PATH_CHARS]
+        normalized_args["rationale"] = str(arguments.get("rationale") or arguments.get("reason") or "").strip()[:CODING_MAX_PATH_CHARS]
+        normalized_args["reason"] = normalized_args["rationale"]
     elif canonical_name == "execute_sql":
         raw_sql = arguments.get("sql") or arguments.get("query") or arguments.get("command") or ""
         normalized_args["sql"] = str(raw_sql).strip()[:CODING_MAX_PATH_CHARS]
@@ -7559,15 +7577,19 @@ async def _dispatch_coding_tool(
         turn_id = request_id
     arguments = arguments or {}
     await _publish_activity_event(send_json, action, request_id, session_id, "STARTED")
-    await _send(send_json, {
-
+    tool_payload = {
         "type": "tool_call",
         "requestId": request_id,
         "turnId": turn_id,
         "toolCallId": tool_call_id,
         "name": name,
         "arguments": arguments,
-    })
+    }
+    if name == "execute_workspace_commands":
+        tool_payload["action"] = "WORKSPACE_COMMAND_EXECUTION_REQUEST"
+        tool_payload["commands"] = arguments.get("commands", [])
+        tool_payload["rationale"] = arguments.get("rationale") or arguments.get("reason") or ""
+    await _send(send_json, tool_payload)
 
 
 async def _wait_for_tool(state: Dict[str, Any], request_id: str, tool_call_id: str) -> Any:
@@ -7672,7 +7694,7 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
             "cleanupTimedOut": cleanup_timed_out,
         })
         return
-    if payload.get("type") == "tool_result":
+    if payload.get("type") in ("tool_result", "WORKSPACE_COMMAND_EXECUTION_RESULT") or payload.get("action") == "WORKSPACE_COMMAND_EXECUTION_RESULT":
         if request_id in state.get("cancelled_request_ids", []):
             return
         key = f"{request_id}:{payload.get('toolCallId', '')}"
@@ -10375,9 +10397,11 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
     system = (
         f"{CODING_ENGINEERING_POLICY} "
         "You are the autonomous Coding Agent for the currently selected project. Inspect and navigate it through "
-        "the available tools. When the user asks to run, start, launch, build, test, or install dependencies "
-        "for the project, inspect project configuration (such as package.json) if needed, and invoke "
-        "execute_workspace_commands to execute the necessary commands inside verified Windows supervisor process isolation. "
+        "the available tools. When the user's goal requires installing dependencies, building, testing, or running "
+        "the project, inspect workspace files (e.g. list_directory to see if node_modules exists, read_file on package.json to inspect scripts and dependencies), "
+        "and invoke execute_workspace_commands with the exact commands (e.g. ['npm install', 'npm start']) and observe the real tool output (stdout, stderr, exitCode, pid) before responding—NEVER reply with a passive text guide telling the user to open a terminal when execution is available. "
+        "For pure conceptual/coding Q&A (e.g. 8+8, standalone programming examples in Java, Python, etc.), answer directly without calling workspace execution tools. "
+        "For offensive security exploit requests (e.g. SQL injection attacks, exploit generation, credential harvesting, or bypass instructions), refuse immediately with a brief security explanation; do not attempt code changes, file mutations, or unified-diff generation. "
         "Never run raw destructive host commands or claim changes were applied without verified execution. "
         "Use the project root and optional scope supplied in the task context. Discover the narrowest relevant "
         "directory yourself from the user's natural-language request; do not ask the user to browse files. "
@@ -10625,9 +10649,13 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 )
             )
             inspection_tools = CODING_TOOLS
+            has_executed_workspace_commands = any(
+                (action.get("tool") == "execute_workspace_commands" or (isinstance(action.get("arguments"), dict) and action.get("arguments", {}).get("commands")))
+                for action in semantic_task.get("actions", [])
+            )
             if evidence_sufficiency["sufficient"] and (
                 (proposal_required and has_relevant_source_evidence)
-                or (not proposal_required and has_read_evidence and round_number >= 2)
+                or (not proposal_required and has_read_evidence and (has_executed_workspace_commands or round_number >= 4))
             ):
                 final_message = None
                 break
@@ -10648,6 +10676,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         "repo_browser.list_directory",
                         "get_repository_map",
                         "get_context",
+                        "execute_workspace_commands",
                     }
                 ]
             inspection_tools = _tools_for_task_resources(
