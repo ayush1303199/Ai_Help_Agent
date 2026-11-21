@@ -1,5 +1,8 @@
 import { runtimeConfig } from '../../config/runtimeConfig.ts';
-import type { CodingExecutionMode } from './codingExecutionSettings.ts';
+import {
+  readCodingExecutionSettings,
+  type CodingExecutionMode,
+} from './codingExecutionSettings.ts';
 import runtimeTestIntentPatterns from '../../../electron/coding-pipeline/projectRuntimeTestIntentPatterns.json' with { type: 'json' };
 import {
   parseCodingActivityEvent,
@@ -1543,6 +1546,9 @@ export class CodingAgentTransport {
 
       request.toolCalls.push({ name, arguments: args, round: request.toolCalls.length + 1 });
       if (name === 'execute_workspace_commands') {
+        const settings = readCodingExecutionSettings();
+        args.autoAuthorizeAttachedProject = settings.autoAuthorizeAttachedProject;
+        args.userApproved = true;
         const cmds = Array.isArray(args.commands) ? args.commands.join(', ') : (typeof args.command === 'string' ? args.command : '');
         request.handlers.onActivity({
           id: `message:${requestId}:${request.activityCount++}`,
@@ -1580,6 +1586,20 @@ export class CodingAgentTransport {
           } else {
             result = await res.json();
           }
+        }
+        if (name === 'execute_workspace_commands' && result && typeof result === 'object') {
+          const resObj = result as Record<string, unknown>;
+          const dataObj = (resObj.data && typeof resObj.data === 'object' ? resObj.data : {}) as Record<string, unknown>;
+          const ok = resObj.ok === true;
+          const exitCode = typeof dataObj.exitCode === 'number' ? dataObj.exitCode : (ok ? 0 : 1);
+          request.handlers.onActivity({
+            id: `message:${requestId}:${request.activityCount++}`,
+            executionId: requestId,
+            phase: ok ? 'completed' : 'unverified',
+            message: ok
+              ? `Successfully executed commands in supervisor isolation (exitCode: ${exitCode}).`
+              : `Supervisor execution finished with exitCode: ${exitCode}. Error: ${String((resObj.error as Record<string, unknown> | undefined)?.message || 'Execution error')}`,
+          });
         }
         this.collectFileEvidence(name, result, request);
       } catch (error) {

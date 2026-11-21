@@ -6194,7 +6194,7 @@ def _coding_finalization_messages(
         "You are the Coding Agent. Use only the user's request and the project evidence provided. "
         "This is FINALIZATION, after investigation. Do not call or request tools; return a plain-text answer "
         "using the supplied evidence, or state what could not be verified. Do not claim any files were changed "
-        "or commands were run. "
+        "or commands were run unless verified execution results are recorded in the task evidence and state. "
     )
     if proposal_required:
         system += (
@@ -10648,7 +10648,11 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     )
                 )
             )
-            inspection_tools = CODING_TOOLS
+            is_project_attached = bool(project_root) or _active_backend_project.get("status") == "PROJECT_ATTACHED"
+            inspection_tools = [
+                tool for tool in CODING_TOOLS
+                if is_project_attached or tool.get("function", {}).get("name") != "execute_workspace_commands"
+            ]
             has_executed_workspace_commands = any(
                 (action.get("tool") == "execute_workspace_commands" or (isinstance(action.get("arguments"), dict) and action.get("arguments", {}).get("commands")))
                 for action in semantic_task.get("actions", [])
@@ -10663,21 +10667,23 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 (proposal_required and round_number > 0 and not has_relevant_source_evidence)
                 or (not proposal_required and round_number > 0 and not has_read_evidence)
             ):
+                allowed_tool_names = {
+                    "read_file",
+                    "repo_browser.read_file",
+                    "repo_browser.open_file",
+                    "search_code",
+                    "search_symbols",
+                    "find_references",
+                    "list_directory",
+                    "repo_browser.list_directory",
+                    "get_repository_map",
+                    "get_context",
+                }
+                if is_project_attached:
+                    allowed_tool_names.add("execute_workspace_commands")
                 inspection_tools = [
                     tool for tool in CODING_TOOLS
-                    if tool["function"]["name"] in {
-                        "read_file",
-                        "repo_browser.read_file",
-                        "repo_browser.open_file",
-                        "search_code",
-                        "search_symbols",
-                        "find_references",
-                        "list_directory",
-                        "repo_browser.list_directory",
-                        "get_repository_map",
-                        "get_context",
-                        "execute_workspace_commands",
-                    }
+                    if tool["function"]["name"] in allowed_tool_names
                 ]
             inspection_tools = _tools_for_task_resources(
                 inspection_tools,
