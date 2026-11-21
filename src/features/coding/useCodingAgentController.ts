@@ -1349,17 +1349,21 @@ export function useCodingAgentController({
                       || result.workspaceAudit?.engineeringAnalysis,
               },
             )
-            : `${result.message || 'Autonomous coding workflow completed successfully.'}\n\nModified files:\n${result.filesModified.map((f: string) => `- \`${f}\``).join('\n')}`;
-          setAppliedPatchLog((previous) => [
-            ...previous,
-            {
-              proposalId: result.taskId || `task-${Date.now()}`,
-              state: 'completed',
-              appliedAt: new Date().toISOString(),
-              files: result.filesModified,
-              verification: result.workflowReceipt?.verificationReport?.verificationMode || 'PASS',
-            },
-          ]);
+            : (result.phase === 'RUN_OR_LAUNCH' || !Array.isArray(result.filesModified) || result.filesModified.length === 0)
+              ? (result.message || 'Autonomous coding workflow completed successfully.')
+              : `${result.message || 'Autonomous coding workflow completed successfully.'}\n\nModified files:\n${result.filesModified.map((f: string) => `- \`${f}\``).join('\n')}`;
+          if (Array.isArray(result.filesModified) && result.filesModified.length > 0) {
+            setAppliedPatchLog((previous) => [
+              ...previous,
+              {
+                proposalId: result.taskId || `task-${Date.now()}`,
+                state: 'completed',
+                appliedAt: new Date().toISOString(),
+                files: result.filesModified,
+                verification: result.workflowReceipt?.verificationReport?.verificationMode || 'PASS',
+              },
+            ]);
+          }
         } else if (result.outcome === 'WORK_ITEM_COVERAGE_NOT_ESTABLISHED') {
           outcomeContent = `${result.message || 'The approved proposal was applied and verification passed, but request completion could not be established from trusted item-specific evidence.'}\n\nThe task remains incomplete; review the applied files and resolve the outstanding work items:\n${result.filesModified.map((file: string) => `- \`${file}\``).join('\n')}`;
           setAppliedPatchLog((previous) => [

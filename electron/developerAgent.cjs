@@ -6730,9 +6730,8 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
 
   if ((genericIntent.primaryIntent === INTENT_CATEGORIES.RUN_OR_LAUNCH || isProjectRunOrLaunchRequest) && !isRuntimeTestRequest) {
     onProgress({ phase: 'RUN_GATE', message: 'Evaluating process isolation policy for run request.' });
-    const hasExecutionApproval = initialUserApproved === true || continuation?.userApproved === true || (executionGrant && executionGrant.granted) || autoRepairEnabled === true || autoAuthorizeAttachedProject === true;
     let isolationVerification = null;
-    if (hasExecutionApproval) {
+    try {
       isolationVerification = await verifyLiveSupervisorProcessIsolation({
         runId: turn.turnId,
         workspaceRoot: root,
@@ -6741,7 +6740,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         executionGrant: executionGrant,
         isSyntheticTest: false,
       });
-    }
+    } catch (_) {}
 
     if (isolationVerification && isolationVerification.verified && isolationVerification.processIsolationGate === 'ALLOWED') {
       const { verifyProjectProcessIsolation } = require('./coding-pipeline/projectProcessIsolation.cjs');

@@ -73,6 +73,29 @@ const providerSecretVault = new ProviderSecretVault({
   safeStorage,
 });
 process.env.AI_CODING_AUTH_TOKEN = codingAuthToken;
+
+async function ensureWindowsSupervisorBootstrap() {
+  if (process.platform !== 'win32') return;
+  try {
+    const { queryNativeSupervisorStatus } = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
+    const status = await queryNativeSupervisorStatus({ timeoutMs: 800 });
+    if (status && status.running) {
+      return;
+    }
+  } catch (_) {}
+
+  try {
+    const { exec } = require('child_process');
+    const cmd = `powershell.exe -NoProfile -NonInteractive -Command "Start-Process sc.exe -ArgumentList 'start AiHelpAgentSupervisor' -Verb RunAs"`;
+    exec(cmd, { windowsHide: true }, (err) => {
+      if (err) {
+        console.warn('[SUPERVISOR][BOOTSTRAP] Automatic supervisor service start request emitted:', err.message);
+      }
+    });
+  } catch (startErr) {
+    console.warn('[SUPERVISOR][BOOTSTRAP] Failed to trigger supervisor auto-start:', startErr);
+  }
+}
 process.env.AI_CODING_MUTATION_HANDSHAKE_SECRET = codingMutationHandshakeSecret;
 developerFiles.configureAuditDirectory(path.join(app.getPath('userData'), 'developer-audit'));
 developerIndex.configureSemanticSearch({
@@ -1260,6 +1283,9 @@ async function createOverlayWindow() {
 }
 
 app.whenReady().then(async () => {
+  if (process.platform === 'win32') {
+    void ensureWindowsSupervisorBootstrap();
+  }
   try {
     await startPackagedBackend();
   } catch (error) {
@@ -1536,6 +1562,9 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:acceptance-preflight', async (event) => {
     developerAgent.getSession(event.sender.id);
     const projectState = await developerFiles.getProjectState(event.sender.id);
+    if (process.platform === 'win32') {
+      await ensureWindowsSupervisorBootstrap();
+    }
     const isolation = await verifyProjectProcessIsolation();
     let providerConfigured = false;
     let providerCheckError = null;
