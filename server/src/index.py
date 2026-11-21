@@ -1273,7 +1273,7 @@ def get_coding_acceptance_preflight(request: Request) -> Dict[str, Any]:
     capability_states = {name: "UNSUPPORTED" for name in isolation_capabilities}
     sandbox_verified = False
     sandbox_available = False
-    if platform == "win32":
+    if platform == "win32" and broker_project_bound:
         verified_live = False
         try:
             import ctypes

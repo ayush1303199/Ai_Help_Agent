@@ -890,6 +890,8 @@ def _is_standalone_code_generation_request(request: str) -> bool:
     clean = str(request or "").strip()
     if not clean:
         return False
+    if DatabaseSessionManager.resolve_database_intent(clean).get("is_deterministic"):
+        return False
     if re.search(r"\b[\w-]+\.[a-z0-9]{1,8}\b", clean, re.I) or re.search(
         r"(?:^|\s)(?:\.{0,2}/|~/|[a-zA-Z]:\\|[\w.-]+/[\w.-]+)", clean
     ):
@@ -940,10 +942,20 @@ def _is_standalone_code_generation_request(request: str) -> bool:
         )
     ):
         return False
+    if not re.match(
+        r"^(?:write|create|implement|generate|show\s+me|give\s+me|provide|demonstrate|illustrate)\s+\S+",
+        stripped,
+        re.I,
+    ):
+        return False
     return bool(
-        re.match(
-            r"^(?:write|create|implement|generate|show\s+me|give\s+me|provide|demonstrate|illustrate)\s+\S+",
-            stripped,
+        re.search(
+            r"\b(?:in|using)\s+(?:rust|go|golang|java|python|c\+\+|cpp|c#|csharp|ruby|swift|kotlin|scala|php|typescript|javascript|bash|powershell|sql)\b|"
+            r"\b(?:example\s+of|sample|snippet|template|boilerplate|demonstration|illustration)\b|"
+            r"\b(?:binary\s+search|lru\s+cache|palindrome|sorting\s+function|fibonacci|factorial|linked\s+list|bubble\s+sort|quick\s+sort|merge\s+sort)\b|"
+            r"\b(?:sql\s+query\s+to|regex\s+to|regular\s+expression\s+to)\b|"
+            r"\bfunction\s+to\s+(?:check|find|calculate|convert|parse|validate|reverse|format|sort|filter|add)\b",
+            clean,
             re.I,
         )
     )
@@ -8991,7 +9003,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         "source": semantic_task.get("sourceOfDecision"),
     })
     _persist_agent_task_state(session, semantic_task, session_id, "TASK_STATE_UPDATED")
-    selected_uses_database = bool(db_det.get("is_deterministic"))
+    selected_uses_database = bool(db_det.get("is_deterministic")) and not database_routed_to_code
     if selected_uses_database:
         configuration_action = {
             "actionId": f"{semantic_task.get('taskId')}:{semantic_task.get('turnId')}:database-configuration",

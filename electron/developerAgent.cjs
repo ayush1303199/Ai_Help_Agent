@@ -5375,9 +5375,9 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
   const isDependencyInstallRequest = (
     detectedInstallIntent.intent === INSTALL_INTENTS.INSTALL_PROJECT_DEPENDENCIES
     || detectedInstallIntent.intent === INSTALL_INTENTS.UPDATE_OR_REINSTALL
-    || (/\b(?:install|download)\s+(?:the\s+)?(?:dependencies|dependec(?:y|ies)|deps|node_modules)\b/i.test(userRequest))
-    || (/\b(?:dependencies|dependec(?:y|ies)|deps|node_modules)\b.*\binstall\b/i.test(userRequest))
-    || (/\binstall\b.*\b(?:dependencies|dependec(?:y|ies)|deps|node_modules)\b/i.test(userRequest))
+    || (/\b(?:install|download)\s+(?:the\s+)?(?:dependencies|deps|node_modules)\b/i.test(userRequest))
+    || (/\b(?:dependencies|deps|node_modules)\b.*\binstall\b/i.test(userRequest))
+    || (/\binstall\b.*\b(?:dependencies|deps|node_modules)\b/i.test(userRequest))
     || (/\b(?:npm|pnpm|yarn|bun)\s+(?:install|i)\b/i.test(userRequest))
     || (/\binstall\b/i.test(userRequest) && dependencyReport.needsInstallation && detectedInstallIntent.intent !== INSTALL_INTENTS.ADD_DEPENDENCY)
   ) && detectedInstallIntent.intent !== INSTALL_INTENTS.ADD_DEPENDENCY;
@@ -5400,7 +5400,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
     (isDependencyInstallRequest && isProjectRunOrLaunchRequest)
     || continuation?.isCombinedInstallAndRunRequest === true
     || (isProjectRunOrLaunchRequest && dependencyReport.needsInstallation && (typeof requestApproval === 'function' || initialUserApproved !== null || continuation?.userApproved !== undefined))
-    || (isProjectRunOrLaunchRequest && (/\binstall\b/i.test(userRequest) || /\b(?:dependencies|dependec(?:y|ies)|deps)\b/i.test(userRequest)))
+    || (isProjectRunOrLaunchRequest && (/\binstall\b/i.test(userRequest) || /\b(?:dependencies|deps)\b/i.test(userRequest)))
   );
 
   const isCombinedInstallAndTestRequest = (
