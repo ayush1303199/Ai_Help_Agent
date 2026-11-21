@@ -27,3 +27,4 @@ build
 .developer-test-*
 .developer-gates-*
 .developer-lifecycle-*
+query
