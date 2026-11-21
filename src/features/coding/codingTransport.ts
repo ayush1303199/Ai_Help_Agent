@@ -1212,6 +1212,7 @@ export class CodingAgentTransport {
     conversationId?: string,
     verificationAttempt?: { attemptNumber: number; maxAttempts: number; label: string; repairToken?: string } | null,
     resumeProviderTask = false,
+    isolationOptions?: { sandboxVerified?: boolean; processIsolationGate?: 'ALLOWED' | 'BLOCKED' },
   ): Promise<string> {
     const request = latestCodingUserRequest(messages);
     if (!request.trim()) throw new Error('The current Coding Agent request is missing. Please send it again.');
@@ -1275,6 +1276,23 @@ export class CodingAgentTransport {
       operation: 'model',
     });
     this.armRequestDeadlines(this.requests.get(requestId)!);
+    let sandboxVerified = Boolean(isolationOptions?.sandboxVerified);
+    let processIsolationGate = isolationOptions?.processIsolationGate || (sandboxVerified ? 'ALLOWED' : 'BLOCKED');
+    if (!sandboxVerified && window.electronAPI?.getDeveloperAcceptancePreflight) {
+      try {
+        const preflight: unknown = await window.electronAPI.getDeveloperAcceptancePreflight();
+        if (preflight && typeof preflight === 'object') {
+          const p = preflight as Record<string, unknown>;
+          if (p.canRunProjectCommands === true || (p.sandbox && typeof p.sandbox === 'object' && (p.sandbox as Record<string, unknown>).verified === true)) {
+            sandboxVerified = true;
+            processIsolationGate = 'ALLOWED';
+          }
+        }
+      } catch {
+        // fail-closed
+      }
+    }
+
     try {
       socket.send(JSON.stringify({
         type: 'chat',
@@ -1285,6 +1303,9 @@ export class CodingAgentTransport {
         projectRoot: currentProjectRoot,
         scope: currentScope,
         messages,
+        sandboxVerified,
+        processIsolationGate,
+        processIsolationAllowed: sandboxVerified,
         verificationAttempt: verificationAttempt
           ? {
               attemptNumber: verificationAttempt.attemptNumber,
@@ -1613,13 +1634,27 @@ export class CodingAgentTransport {
         };
       }
       if (socket.readyState === WebSocket.OPEN && !request.cancellationRequested) {
-        socket.send(JSON.stringify({
-          type: 'tool_result',
-          action: name === 'execute_workspace_commands' ? 'WORKSPACE_COMMAND_EXECUTION_RESULT' : undefined,
-          requestId,
-          toolCallId,
-          result,
-        }));
+        const payloadToSend = name === 'execute_workspace_commands'
+          ? {
+              type: 'WORKSPACE_COMMAND_EXECUTION_RESULT',
+              action: 'WORKSPACE_COMMAND_EXECUTION_RESULT',
+              requestId,
+              toolCallId,
+              result,
+              ok: (result as Record<string, unknown>)?.ok === true,
+              stdout: ((result as Record<string, unknown>)?.data as Record<string, unknown>)?.stdout || '',
+              stderr: ((result as Record<string, unknown>)?.data as Record<string, unknown>)?.stderr || '',
+              exitCode: typeof ((result as Record<string, unknown>)?.data as Record<string, unknown>)?.exitCode === 'number'
+                ? ((result as Record<string, unknown>)?.data as Record<string, unknown>)?.exitCode
+                : (((result as Record<string, unknown>)?.ok === true) ? 0 : 1),
+            }
+          : {
+              type: 'tool_result',
+              requestId,
+              toolCallId,
+              result,
+            };
+        socket.send(JSON.stringify(payloadToSend));
       }
       if (!request.cancellationRequested) {
         request.operation = 'model';

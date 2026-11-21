@@ -1555,6 +1555,22 @@ export function useCodingAgentController({
     try {
       const transport = transportRef.current;
       if (!transport) throw new Error('Coding Agent transport is unavailable.');
+      let sandboxVerified = false;
+      let processIsolationGate: 'ALLOWED' | 'BLOCKED' = 'BLOCKED';
+      if (window.electronAPI?.getDeveloperAcceptancePreflight) {
+        try {
+          const preflight: unknown = await window.electronAPI.getDeveloperAcceptancePreflight();
+          if (preflight && typeof preflight === 'object') {
+            const p = preflight as Record<string, unknown>;
+            if (p.canRunProjectCommands === true || (p.sandbox && typeof p.sandbox === 'object' && (p.sandbox as Record<string, unknown>).verified === true)) {
+              sandboxVerified = true;
+              processIsolationGate = 'ALLOWED';
+            }
+          }
+        } catch {
+          // ignore fail-closed
+        }
+      }
       await transport.send(requestId, conversationHistory, currentScope, currentProjectRoot, {
         onStart: (turnId, root, scope) => {
           turnIdsRef.current.set(requestId, turnId);
@@ -1843,7 +1859,7 @@ export function useCodingAgentController({
         maxAttempts: repairContext.maxAttempts,
         label: repairContext.attemptLabel,
         repairToken: repairContext.repairToken,
-      } : null, resumeProviderTask);
+      } : null, resumeProviderTask, { sandboxVerified, processIsolationGate });
     } catch (error) {
       if (repairContext && window.electronAPI && proposal?.id) {
         await window.electronAPI.cancelDeveloperVerificationRepairChain(proposal.id).catch(() => undefined);
