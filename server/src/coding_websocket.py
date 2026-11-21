@@ -689,6 +689,29 @@ CODING_TOOLS = [
             "parameters": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string"}}, "additionalProperties": False},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_workspace_commands",
+            "description": "Execute approved workspace setup, dependency installation, build, or project run commands (e.g. ['npm install'], ['npm start']) inside the verified Windows supervisor process isolation environment. Call this whenever the user asks to run, start, launch, build, or install dependencies for the attached project.",
+            "parameters": {
+                "type": "object",
+                "required": ["commands"],
+                "properties": {
+                    "commands": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of shell/workspace commands to execute in order inside supervisor process isolation (e.g. ['npm install'], ['npm start']).",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Reason for executing these commands (e.g. 'Install missing project dependencies and start project server').",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 TOOL_NAMES = {tool["function"]["name"] for tool in CODING_TOOLS}
 TOOL_ALIASES: Dict[str, str] = {
@@ -723,6 +746,11 @@ TOOL_ALIASES: Dict[str, str] = {
     "terminal.run_command": "run_verification",
     "run_command": "run_verification",
     "verify": "run_verification",
+    "execute_workspace_commands": "execute_workspace_commands",
+    "execute_commands": "execute_workspace_commands",
+    "run_workspace_commands": "execute_workspace_commands",
+    "run_project": "execute_workspace_commands",
+    "run_commands": "execute_workspace_commands",
 }
 TOOL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     name: {"available": True}
@@ -5102,6 +5130,8 @@ def _provider_failure_evidence_fallback(
 def _task_resource_for_tool(name: str) -> str:
     if not isinstance(name, str) or not name.strip():
         return "UNKNOWN"
+    if name in ("execute_workspace_commands", "execute_commands", "run_workspace_commands", "run_project", "run_commands"):
+        return "RUNTIME"
     database_capabilities = {
         value for key, value in vars(DatabaseCapability).items()
         if key.startswith("DATABASE_") and isinstance(value, str)
@@ -6788,6 +6818,19 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         normalized_args["command"] = str(raw_cmd).strip()[:CODING_MAX_PATH_CHARS]
         if "sql" in arguments or "query" in arguments:
             normalized_args["sql"] = str(arguments.get("sql") or arguments.get("query") or "").strip()[:CODING_MAX_PATH_CHARS]
+    elif canonical_name == "execute_workspace_commands":
+        raw_cmds = arguments.get("commands")
+        if isinstance(raw_cmds, str):
+            raw_cmds = [raw_cmds]
+        elif not isinstance(raw_cmds, list):
+            raw_cmd = arguments.get("command") or arguments.get("script") or ""
+            raw_cmds = [str(raw_cmd)] if str(raw_cmd).strip() else []
+        normalized_args["commands"] = [
+            str(c).strip()[:CODING_MAX_PATH_CHARS]
+            for c in raw_cmds
+            if str(c).strip()
+        ]
+        normalized_args["reason"] = str(arguments.get("reason") or "").strip()[:CODING_MAX_PATH_CHARS]
     elif canonical_name == "execute_sql":
         raw_sql = arguments.get("sql") or arguments.get("query") or arguments.get("command") or ""
         normalized_args["sql"] = str(raw_sql).strip()[:CODING_MAX_PATH_CHARS]
@@ -6822,6 +6865,7 @@ def _activity_type_for_tool(tool: str) -> str:
         "repo_browser.find_references": "TRACING_CALLER",
         "run_verification": "VERIFYING",
         "terminal.run_command": "VERIFYING",
+        "execute_workspace_commands": "EXECUTING_COMMANDS",
         "execute_sql": "INSPECTING_DATABASE",
         "discover_database_configuration": "INSPECTING_DATABASE",
         "DATABASE_CONNECT": "INSPECTING_DATABASE",
@@ -6874,7 +6918,7 @@ def _activity_status_for_result(tool: str, result: Any) -> str:
                 malformed_status = True
                 continue
             reported_states.add(value.strip().upper())
-    is_verification = tool in ("run_verification", "terminal.run_command")
+    is_verification = tool in ("run_verification", "terminal.run_command", "execute_workspace_commands")
     if is_verification and malformed_status:
         return "UNVERIFIED"
     if is_verification and reported_states.difference({
@@ -6980,6 +7024,10 @@ def _activity_target_for_tool(tool: str, arguments: Dict[str, Any]) -> str:
             or arguments.get("symbol")
         )
         return _redact_activity_text(target, 300) if isinstance(target, str) and target else "project code"
+    if tool == "execute_workspace_commands":
+        cmds = arguments.get("commands") or []
+        cmd_str = ", ".join(cmds) if isinstance(cmds, list) else str(cmds)
+        return _redact_activity_text(cmd_str or "workspace commands", 300)
     if tool in ("run_verification", "terminal.run_command"):
         return "verification command"
     target = (
@@ -7037,8 +7085,8 @@ def _activity_event_payload(
             safe_result["executed"] = False
         elif isinstance(data.get("executed"), bool):
             safe_result["executed"] = data["executed"]
-        if tool in ("run_verification", "terminal.run_command"):
-            cmd = data.get("command") or action.get("command") or action_args.get("command")
+        if tool in ("run_verification", "terminal.run_command", "execute_workspace_commands"):
+            cmd = data.get("command") or ", ".join(action_args.get("commands") or []) or action.get("command") or action_args.get("command")
             if isinstance(cmd, str) and cmd:
                 safe_result["command"] = _redact_activity_text(cmd, 300)
             stdout = data.get("stdout")
@@ -10326,8 +10374,11 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
     })
     system = (
         f"{CODING_ENGINEERING_POLICY} "
-        "You are the Coding Agent for the currently selected project. Inspect it only through the supplied "
-        "read-only tools. Never write files, run commands, access credentials, or claim changes were applied. "
+        "You are the autonomous Coding Agent for the currently selected project. Inspect and navigate it through "
+        "the available tools. When the user asks to run, start, launch, build, test, or install dependencies "
+        "for the project, inspect project configuration (such as package.json) if needed, and invoke "
+        "execute_workspace_commands to execute the necessary commands inside verified Windows supervisor process isolation. "
+        "Never run raw destructive host commands or claim changes were applied without verified execution. "
         "Use the project root and optional scope supplied in the task context. Discover the narrowest relevant "
         "directory yourself from the user's natural-language request; do not ask the user to browse files. "
         "Use the authoritative semantic task decision and its evidence requirements below; do not reinterpret "
@@ -11616,8 +11667,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     except Exception:
                         pass
 
-                if name in ("run_verification", "terminal.run_command") and isinstance(result, dict):
-                    v_cmd = str(arguments.get("script") or arguments.get("command") or "")
+                if name in ("run_verification", "terminal.run_command", "execute_workspace_commands") and isinstance(result, dict):
+                    v_cmd = str(arguments.get("script") or arguments.get("command") or ", ".join(arguments.get("commands") or []) or "")
                     v_data = result.get("data") if isinstance(result.get("data"), dict) else {}
                     raw_exit_code = v_data.get("exitCode")
                     has_execution_result = (

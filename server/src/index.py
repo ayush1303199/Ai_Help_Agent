@@ -2726,6 +2726,21 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
             if not res.get("ok"):
                 return {"ok": False, "error": res.get("error") or {"code": "DATABASE_QUERY_FAILED", "message": res.get("content") or "The database query failed."}}
             return {"ok": True, "data": SecretProtector.redact_data(res)}
+        elif canonical == "execute_workspace_commands":
+            return {
+                "ok": False,
+                "data": {
+                    "executed": False,
+                    "status": "UNAVAILABLE",
+                    "processIsolationGate": "BLOCKED",
+                    "hostFallback": "ZERO",
+                    "message": "Workspace command execution requires the trusted desktop Electron app with verified Windows supervisor process isolation.",
+                },
+                "error": {
+                    "code": "SUPERVISOR_ISOLATION_REQUIRED",
+                    "message": "Workspace command execution requires the trusted desktop Electron app with verified Windows supervisor process isolation.",
+                },
+            }
         elif canonical == "run_verification":
             cmd = str(args.get("command") or args.get("script") or args.get("check") or "").strip()
             eval_res, reason = UNIVERSAL_POLICY_GATE.evaluate_command(cmd)

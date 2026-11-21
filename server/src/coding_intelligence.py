@@ -1126,6 +1126,11 @@ class CapabilityIntelligenceEngine:
         "query_database": CanonicalCapability.DATABASE_QUERY,
         "run_verification": CanonicalCapability.TERMINAL_EXEC,
         "terminal.run_command": CanonicalCapability.TERMINAL_EXEC,
+        "execute_workspace_commands": CanonicalCapability.TERMINAL_EXEC,
+        "execute_commands": CanonicalCapability.TERMINAL_EXEC,
+        "run_workspace_commands": CanonicalCapability.TERMINAL_EXEC,
+        "run_project": CanonicalCapability.TERMINAL_EXEC,
+        "run_commands": CanonicalCapability.TERMINAL_EXEC,
     }
 
     CAPABILITY_METADATA = {

@@ -1838,6 +1838,8 @@ app.whenReady().then(async () => {
       name = 'find_references';
     } else if (name === 'execute_sql' || name === 'run_query' || name === 'db_query' || name === 'database.query' || name === 'sql_query' || name === 'query_database' || name === 'executeQuery' || name === 'check_db' || name === 'inspect_database' || name === 'show_tables' || name === 'list_tables') {
       name = 'run_verification';
+    } else if (name === 'execute_commands' || name === 'run_workspace_commands' || name === 'run_project' || name === 'run_commands') {
+      name = 'execute_workspace_commands';
     }
 
     // Normalize arguments
@@ -2007,6 +2009,84 @@ app.whenReady().then(async () => {
           },
         };
       }
+    }
+    if (name === 'execute_workspace_commands') {
+      const rawCommands = args.commands || args.command || args.script || [];
+      const commandsList = Array.isArray(rawCommands)
+        ? rawCommands.map((c) => String(c).trim()).filter(Boolean)
+        : (typeof rawCommands === 'string' && rawCommands.trim() ? [rawCommands.trim()] : []);
+      if (commandsList.length === 0) {
+        return {
+          ok: false,
+          tool: name,
+          error: {
+            code: 'COMMANDS_REQUIRED',
+            message: 'A non-empty list of workspace commands is required.',
+          },
+        };
+      }
+      if (process.platform === 'win32') {
+        await ensureWindowsSupervisorBootstrap();
+      }
+      const { verifyLiveSupervisorProcessIsolation, executeWithSupervisor } = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
+      const isolationVerification = await verifyLiveSupervisorProcessIsolation({
+        workspaceRoot: root,
+        timeoutMs: 3000,
+        isSyntheticTest: Boolean(payload?.isSyntheticTest || args?.isSyntheticTest),
+      });
+      if (!isolationVerification || !isolationVerification.verified || isolationVerification.processIsolationGate !== 'ALLOWED') {
+        return {
+          ok: false,
+          tool: name,
+          error: {
+            code: 'PROCESS_ISOLATION_BLOCKED',
+            message: isolationVerification?.reason || 'Verified Windows process isolation is required before executing workspace commands.',
+          },
+          data: {
+            executed: false,
+            processIsolationGate: 'BLOCKED',
+            reason: isolationVerification?.reason,
+            hostFallback: 'ZERO',
+          },
+        };
+      }
+      const executedResults = [];
+      for (const cmd of commandsList) {
+        const runResult = await executeWithSupervisor({
+          supervisor: isolationVerification.client,
+          runId: crypto.randomUUID(),
+          workspaceRoot: root,
+          approvedSnapshotDigest: isolationVerification.grant.approvedSnapshotDigest,
+          planDigest: crypto.createHash('sha256').update(cmd).digest('hex'),
+          taskId: `tool-cmd-${Date.now()}`,
+          sessionId: owner?.sessionId || 'developer-session',
+          command: cmd,
+          timeoutMs: 120000,
+          isSyntheticTest: Boolean(payload?.isSyntheticTest || args?.isSyntheticTest),
+        });
+        executedResults.push({ command: cmd, ...runResult });
+        if (!runResult.ok) {
+          break;
+        }
+      }
+      const lastResult = executedResults[executedResults.length - 1];
+      const allOk = executedResults.length > 0 && executedResults.every((r) => r.ok);
+      return {
+        ok: allOk,
+        tool: name,
+        data: {
+          executed: true,
+          ok: allOk,
+          exitCode: lastResult?.exitCode ?? (allOk ? 0 : 1),
+          stdout: executedResults.map((r) => `[${r.command}]\n${r.stdout || ''}`).join('\n\n'),
+          stderr: executedResults.map((r) => `[${r.command}]\n${r.stderr || ''}`).join('\n\n'),
+          commands: commandsList,
+          results: executedResults,
+          isolated: true,
+          supervisorIdentity: isolationVerification.identity,
+          processIsolationGate: 'ALLOWED',
+        },
+      };
     }
     if (name === 'search_symbols' || name === 'find_references' || name === 'get_repository_map') {
       const cached = developerIndexCaches.get(root) || null;

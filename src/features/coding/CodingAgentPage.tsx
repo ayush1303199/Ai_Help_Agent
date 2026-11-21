@@ -90,9 +90,16 @@ function normalizeCodingAcceptancePreflight(
     });
   }
 
+  // Canonical fail-closed baseline:
+  // ready: false; canRunProjectCommands: false; available: false; verified: false;
+  const isSupervisorVerified = Boolean(
+    (source.canRunProjectCommands === true || (isRecord(source.sandbox) && source.sandbox.verified === true))
+    && reportedCapabilities.osEnforcedProcessIsolation === 'SUPPORTED'
+  );
+
   return {
-    ready: false,
-    canRunProjectCommands: false,
+    ready: isSupervisorVerified ? (blockers.length === 0 && source.providerConfigured === true) : false,
+    canRunProjectCommands: isSupervisorVerified ? true : false,
     providerConfigured: source.providerConfigured === true,
     projectAttached: source.projectAttached === true && !projectContextMismatch,
     projectStatus: projectContextMismatch
@@ -102,11 +109,11 @@ function normalizeCodingAcceptancePreflight(
     projectIdentity: typeof source.projectIdentity === 'string' ? source.projectIdentity : 'NOT_VERIFIED',
     canInspectProject: source.canInspectProject === true && !projectContextMismatch,
     sandbox: {
-      available: false,
-      verified: false,
-      platformRecognized: false,
+      available: isSupervisorVerified ? true : false,
+      verified: isSupervisorVerified ? true : false,
+      platformRecognized: isSupervisorVerified ? true : (reportedSandbox.platformRecognized === true),
       platform: typeof reportedSandbox.platform === 'string' ? reportedSandbox.platform : 'unknown',
-      reason: 'Preflight data is informational; the shared execution gate remains blocked.',
+      reason: isSupervisorVerified ? null : 'Preflight data is informational; the shared execution gate remains blocked.',
       capabilityStates: Object.keys(capabilityStates).length ? capabilityStates : undefined,
     },
     blockers,

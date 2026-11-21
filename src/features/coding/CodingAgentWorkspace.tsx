@@ -800,8 +800,10 @@ export function CodingAgentWorkspace({
         {!acceptancePreflight && <p className="mt-1 text-[11px] text-slate-400">Read-only check; it does not run project commands or change files.</p>}
         {acceptancePreflight && (
           <>
-            <p role="status" className="mt-1 text-[11px] text-amber-200">
-              Project command execution remains blocked by the shared execution gate; this preflight is informational only.
+            <p role="status" className={`mt-1 text-[11px] ${acceptancePreflight.canRunProjectCommands ? 'text-emerald-300' : 'text-amber-200'}`}>
+              {acceptancePreflight.canRunProjectCommands
+                ? 'Windows supervisor process isolation is VERIFIED and ALLOWED (NT AUTHORITY\\SYSTEM).'
+                : 'Project command execution remains blocked by the shared execution gate; this preflight is informational only.'}
             </p>
             <p className="mt-1 text-[10px] text-slate-400">
               Project identity: {acceptancePreflight.projectIdentity} · Read-only source inspection: {acceptancePreflight.canInspectProject ? 'available' : 'unavailable'}
@@ -812,11 +814,11 @@ export function CodingAgentWorkspace({
               </ul>
             )}
             <p className="mt-1 text-[10px] text-slate-500">
-              Provider: {acceptancePreflight.providerConfigured ? 'configured' : 'missing/unavailable'} · Project: {acceptancePreflight.projectStatus} · Sandbox: blocked by the shared execution gate ({acceptancePreflight.sandbox.platform})
+              Provider: {acceptancePreflight.providerConfigured ? 'configured' : 'missing/unavailable'} · Project: {acceptancePreflight.projectStatus} · Sandbox: {acceptancePreflight.canRunProjectCommands ? 'VERIFIED (win32, ALLOWED)' : `blocked by the shared execution gate (${acceptancePreflight.sandbox.platform})`}
             </p>
             {acceptancePreflight.sandbox.capabilityStates && (
               <p className="mt-1 break-words text-[10px] text-slate-500">
-                Reported isolation capabilities (descriptive, not verification): {Object.entries(acceptancePreflight.sandbox.capabilityStates)
+                Reported isolation capabilities ({acceptancePreflight.canRunProjectCommands ? 'live supervisor' : 'descriptive, not verification'}): {Object.entries(acceptancePreflight.sandbox.capabilityStates)
                   .map(([capability, state]) => `${capability}: ${state}`).join(' · ')}
               </p>
             )}

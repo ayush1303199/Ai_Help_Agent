@@ -1516,9 +1516,18 @@ export class CodingAgentTransport {
         name = 'read_file';
       } else if (name === 'repo_browser.list_directory' || name === 'ls') {
         name = 'list_directory';
+      } else if (name === 'execute_commands' || name === 'run_workspace_commands' || name === 'run_project' || name === 'run_commands') {
+        name = 'execute_workspace_commands';
       }
 
       // Argument aliases
+      if (name === 'execute_workspace_commands') {
+        if (!args.commands && typeof args.command === 'string') {
+          args.commands = [args.command];
+        } else if (!args.commands && typeof args.script === 'string') {
+          args.commands = [args.script];
+        }
+      }
       if (name === 'search_code' && !args.query && typeof args.pattern === 'string') {
         args.query = args.pattern;
       }
