@@ -12052,6 +12052,19 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     })
 
             if consecutive_no_progress >= 2 and round_number > 0:
+                if can_execute_commands and not has_executed_workspace_commands and not proposal_required and has_read_evidence:
+                    force_workspace_command_tool = True
+                    consecutive_no_progress = 0
+                    conversation.append({
+                        "role": "system",
+                        "content": (
+                            "Project files have already been inspected and verified. "
+                            "Stop repeating read_file or inspection tools. Immediately call "
+                            "execute_workspace_commands now with the exact commands needed "
+                            "(e.g. ['npm install'], ['npm start']) to run or set up the project."
+                        ),
+                    })
+                    continue
                 if scoped_pattern_discovery and not _has_relevant_proposal_source_evidence(semantic_task):
                     content = _set_proposal_evidence_limitation(semantic_task)
                     final_message = {"role": "assistant", "content": content}
@@ -12073,6 +12086,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             if reused_tool_result_this_round and not executed_tool_this_round:
                 if has_read_evidence or (proposal_required and has_relevant_source_evidence):
                     if can_execute_commands and not has_executed_workspace_commands and not proposal_required:
+                        force_workspace_command_tool = True
+                        consecutive_no_progress = 0
                         conversation.append({
                             "role": "system",
                             "content": (
