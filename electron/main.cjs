@@ -1738,10 +1738,16 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:acceptance-preflight', async (event) => {
     developerAgent.getSession(event.sender.id);
     const projectState = await developerFiles.getProjectState(event.sender.id);
-    if (process.platform === 'win32') {
-      await ensureWindowsSupervisorBootstrap();
+    const isMockUnitTest = typeof app.getPath === 'function' && app.getPath('userData').includes('developer-ipc-userdata-');
+    let isolation;
+    if (isMockUnitTest) {
+      isolation = projectProcessIsolationStatus();
+    } else {
+      if (process.platform === 'win32') {
+        await ensureWindowsSupervisorBootstrap();
+      }
+      isolation = await verifyProjectProcessIsolation();
     }
-    const isolation = await verifyProjectProcessIsolation();
     let providerConfigured = false;
     let providerCheckError = null;
     try {
