@@ -10727,9 +10727,35 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 tool for tool in CODING_TOOLS
                 if can_execute_commands or tool.get("function", {}).get("name") != "execute_workspace_commands"
             ]
-            has_executed_workspace_commands = any(
+            user_wants_run = bool(re.search(r"\b(?:run|start|launch|boot|serve|chalao|chalu)\b", raw_request or "", re.I))
+
+            def _is_start_workspace_command(cmd_val: Any) -> bool:
+                return bool(re.search(r"\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+|vite|serve)\b", str(cmd_val or ""), re.I))
+
+            has_executed_any_workspace_commands = any(
                 (action.get("tool") == "execute_workspace_commands" or (isinstance(action.get("arguments"), dict) and action.get("arguments", {}).get("commands")))
                 for action in semantic_task.get("actions", [])
+            )
+            has_executed_start_command = any(
+                res.get("passed") is True
+                and _is_start_workspace_command(res.get("command", ""))
+                for res in semantic_task.get("verification", {}).get("results", [])
+            ) or any(
+                (action.get("tool") == "execute_workspace_commands" or (isinstance(action.get("arguments"), dict) and action.get("arguments", {}).get("commands")))
+                and any(
+                    _is_start_workspace_command(c)
+                    for c in (
+                        action.get("arguments", {}).get("commands")
+                        if isinstance(action.get("arguments"), dict) and isinstance(action.get("arguments", {}).get("commands"), list)
+                        else [action.get("arguments", {}).get("command") or action.get("arguments", {}).get("script") or ""]
+                    )
+                )
+                for action in semantic_task.get("actions", [])
+            )
+            has_executed_workspace_commands = (
+                has_executed_start_command
+                if user_wants_run
+                else has_executed_any_workspace_commands
             )
             operational_intents = {
                 "CONFIGURATION",
@@ -11924,6 +11950,21 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                             UNIVERSAL_EVENT_STREAM.emit("TEST_EXECUTED", {"command": v_cmd, "exitCode": exit_code_val})
                     except Exception:
                         pass
+
+                if name == "execute_workspace_commands" and isinstance(result, dict) and result.get("ok") is True:
+                    executed_cmds = arguments.get("commands") if isinstance(arguments, dict) and isinstance(arguments.get("commands"), list) else [arguments.get("command") or arguments.get("script") or ""]
+                    executed_start = any(_is_start_workspace_command(c) for c in executed_cmds)
+                    if user_wants_run and not executed_start and not has_executed_start_command:
+                        force_workspace_command_tool = True
+                        consecutive_no_progress = 0
+                        conversation.append({
+                            "role": "system",
+                            "content": (
+                                "Dependencies have been installed successfully. Now invoke execute_workspace_commands "
+                                "once more with the project's start command (e.g. ['npm start'] or ['npm run dev']) "
+                                "to start the server and capture the live URL. Do not repeat read_file or npm install."
+                            ),
+                        })
 
                 if name in ("search_code", "repo_browser.search_code") and isinstance(result, dict) and result.get("ok") is True:
                     data = result.get("data")

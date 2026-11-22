@@ -885,15 +885,24 @@ function journalTask(task) {
     rejectedHypotheses: Array.isArray(task.rejectedHypotheses) ? task.rejectedHypotheses.slice(0, 20) : [],
   };
 }
-async function renameWithRetry(source, target, attempts = 4) {
+async function renameWithRetry(source, target, attempts = 8) {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       await fs.rename(source, target);
       return;
     } catch (error) {
       const retryable = ['EPERM', 'EBUSY', 'ENOTEMPTY'].includes(error.code);
-      if (!retryable || attempt === attempts - 1) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+      if (retryable && attempt === attempts - 1) {
+        try {
+          await fs.copyFile(source, target);
+          await fs.unlink(source).catch(() => {});
+          return;
+        } catch {
+          throw error;
+        }
+      }
+      if (!retryable) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
     }
   }
 }

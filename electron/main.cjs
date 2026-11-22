@@ -325,7 +325,7 @@ async function executeWorkspaceCommandsPipeline({
         userApproved,
       });
     } catch (execErr) {
-      if (isServerCmd) {
+      if (isServerCmd && execErr?.timedOut === true) {
         runResult = {
           ok: true,
           exitCode: 0,
@@ -333,7 +333,12 @@ async function executeWorkspaceCommandsPipeline({
           stderr: '',
         };
       } else {
-        throw execErr;
+        runResult = {
+          ok: false,
+          exitCode: execErr?.exitCode ?? 1,
+          stdout: execErr?.stdout || '',
+          stderr: execErr?.stderr || execErr?.message || String(execErr),
+        };
       }
     }
 
