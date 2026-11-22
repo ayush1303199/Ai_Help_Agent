@@ -1945,14 +1945,15 @@ function App() {
 
       {settingsOpen && (
         <div
-          className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-slate-950/70 px-3 py-4 backdrop-blur-sm sm:px-4 sm:py-8"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
           role="presentation"
           onMouseDown={(event) => {
             if (event.target === event.currentTarget && !providerSaving && !agentSaving) setSettingsOpen(false);
           }}
         >
           <div
-            className="my-auto max-h-[calc(100vh-2rem)] w-full max-w-3xl overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl sm:p-5 lg:p-6"
+            className="relative max-h-[85vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 text-slate-100 p-5 shadow-2xl sm:p-6"
+            style={{ backgroundColor: '#0f172a' }}
             role="dialog"
             aria-modal="true"
             aria-labelledby="configuration-title"
@@ -1961,7 +1962,7 @@ function App() {
           >
             <div className="mb-5 flex items-start justify-between">
               <div>
-                <h2 id="configuration-title" className="text-lg font-semibold">Configuration</h2>
+                <h2 id="configuration-title" className="text-lg font-semibold text-slate-100">Configuration</h2>
                 <p className="mt-1 text-xs text-slate-400">Choose a provider and connect its API key at runtime.</p>
               </div>
               <button type="button" onClick={() => { if (!providerSaving && !agentSaving) setSettingsOpen(false); }} disabled={providerSaving || agentSaving} aria-label="Close configuration" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"><X className="h-4 w-4" /></button>
