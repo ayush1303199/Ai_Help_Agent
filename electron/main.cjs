@@ -1,6 +1,7 @@
 const { app, BrowserWindow, desktopCapturer, session, ipcMain, dialog, globalShortcut, screen, safeStorage } = require('electron');
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
+const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
@@ -233,6 +234,21 @@ function probePort(port, host = '127.0.0.1', timeoutMs = 300) {
   });
 }
 
+function probeHttpReadiness(port, host = '127.0.0.1', timeoutMs = 500) {
+  return new Promise((resolve) => {
+    const req = http.get({ host, port, path: '/', timeout: timeoutMs }, (res) => {
+      const code = res.statusCode;
+      res.resume();
+      resolve(code || null);
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+
 async function findVerifiedOpenPort(candidatePorts, maxDurationMs = 3000) {
   const deadline = Date.now() + maxDurationMs;
   while (Date.now() < deadline) {
@@ -303,6 +319,17 @@ async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout
   const verifiedPort = await findVerifiedOpenPort(candidatePorts, 3000);
   if (!verifiedPort) return null;
 
+  const httpStatus = await probeHttpReadiness(verifiedPort, '127.0.0.1', 500);
+  if (typeof httpStatus === 'number') {
+    if (httpStatus >= 200 && httpStatus < 400) {
+      return `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Ready)`;
+    }
+    if (httpStatus >= 400 && httpStatus < 500) {
+      return `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Responsive)`;
+    }
+    return `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Unhealthy)`;
+  }
+
   return `Server listening at http://localhost:${verifiedPort}`;
 }
 
@@ -360,6 +387,7 @@ async function executeWorkspaceCommandsPipeline({
     const isServerCmd = /\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b/i.test(cmd);
     const commandTimeout = isServerCmd ? 8000 : 120000;
     let runResult;
+    let execTimedOut = false;
     try {
       runResult = await executeWithSupervisor({
         supervisor: isolationVerification.client,
@@ -377,9 +405,10 @@ async function executeWorkspaceCommandsPipeline({
       });
     } catch (execErr) {
       if (isServerCmd && execErr?.timedOut === true) {
+        execTimedOut = true;
         runResult = {
-          ok: true,
-          exitCode: 0,
+          ok: false,
+          exitCode: 124,
           stdout: execErr?.stdout || '',
           stderr: execErr?.stderr || '',
         };
@@ -393,13 +422,19 @@ async function executeWorkspaceCommandsPipeline({
       }
     }
 
-    if (isServerCmd && (runResult?.ok || runResult?.timedOut)) {
-      runResult.ok = true;
-      runResult.exitCode = 0;
-      runResult.timedOut = false;
+    if (isServerCmd) {
       const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout);
       if (endpointInfo) {
+        runResult.ok = true;
+        runResult.exitCode = 0;
+        runResult.timedOut = false;
         runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
+      } else if (execTimedOut) {
+        runResult.ok = false;
+        runResult.exitCode = 124;
+        runResult.timedOut = true;
+        const timeoutMsg = 'Server command timed out before establishing a verified listening endpoint.';
+        runResult.stderr = [runResult.stderr, timeoutMsg].filter(Boolean).join('\n');
       }
     } else if (runResult && runResult.ok) {
       const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout);

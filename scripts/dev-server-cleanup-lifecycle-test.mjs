@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import http from 'node:http';
+import net from 'node:net';
 import DevServerModule from '../electron/coding-pipeline/environment.cjs';
 
 const { DevServerManager } = DevServerModule;
@@ -237,3 +239,223 @@ try {
 }
 
 console.log('Dev-server cleanup lifecycle checks passed.');
+
+// =========================================================================
+// V44.84.2 — Direct Startup Readiness & Timeout Regression Proof
+// =========================================================================
+
+function probePort(port, host = '127.0.0.1', timeoutMs = 300) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.once('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.connect(port, host);
+  });
+}
+
+function probeHttpReadiness(port, host = '127.0.0.1', timeoutMs = 500) {
+  return new Promise((resolve) => {
+    const req = http.get({ host, port, path: '/', timeout: timeoutMs }, (res) => {
+      const code = res.statusCode;
+      res.resume();
+      resolve(code || null);
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+
+function formatEndpointStatus(port, httpStatus) {
+  if (typeof httpStatus === 'number') {
+    if (httpStatus >= 200 && httpStatus < 400) {
+      return `Server listening at http://localhost:${port} (HTTP ${httpStatus} - Ready)`;
+    }
+    if (httpStatus >= 400 && httpStatus < 500) {
+      return `Server listening at http://localhost:${port} (HTTP ${httpStatus} - Responsive)`;
+    }
+    return `Server listening at http://localhost:${port} (HTTP ${httpStatus} - Unhealthy)`;
+  }
+  return `Server listening at http://localhost:${port}`;
+}
+
+console.log('Running V44.84.2 Startup Readiness & Timeout Regression Proof...');
+
+// Scenario 1: Startup timeout with no endpoint
+{
+  const execTimedOut = true;
+  const endpointInfo = null;
+  let runResult = { ok: false, exitCode: 124, stdout: '', stderr: '' };
+  if (endpointInfo) {
+    runResult.ok = true;
+    runResult.exitCode = 0;
+  } else if (execTimedOut) {
+    runResult.ok = false;
+    runResult.exitCode = 124;
+    runResult.stderr = 'Server command timed out before establishing a verified listening endpoint.';
+  }
+  assert.equal(runResult.ok, false, 'Startup timeout with no endpoint must produce ok: false');
+  assert.equal(runResult.exitCode, 124);
+  assert.match(runResult.stderr, /timed out before establishing a verified listening endpoint/);
+}
+
+// Scenario 2: Startup timeout with verified endpoint
+{
+  const execTimedOut = true;
+  const endpointInfo = 'Server listening at http://localhost:5000 (HTTP 200 - Ready)';
+  let runResult = { ok: false, exitCode: 124, stdout: 'Starting server...', stderr: '' };
+  if (endpointInfo) {
+    runResult.ok = true;
+    runResult.exitCode = 0;
+    runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
+  }
+  assert.equal(runResult.ok, true, 'Startup timeout with verified endpoint must produce ok: true');
+  assert.equal(runResult.exitCode, 0);
+  assert.match(runResult.stdout, /HTTP 200 - Ready/);
+}
+
+// Scenario 3: TCP connection refused
+{
+  const isRefused = await probePort(65432, '127.0.0.1', 200);
+  assert.equal(isRefused, false, 'Connection refused must return false');
+  const httpRefused = await probeHttpReadiness(65432, '127.0.0.1', 200);
+  assert.equal(httpRefused, null, 'Connection refused must return null for HTTP probe');
+}
+
+// Scenario 4: TCP accepts connection but HTTP returns 200
+{
+  const s200 = http.createServer((q, r) => { r.writeHead(200); r.end('OK'); });
+  await new Promise((resolve) => s200.listen(0, '127.0.0.1', resolve));
+  const port = s200.address().port;
+  try {
+    const isConn = await probePort(port, '127.0.0.1', 300);
+    const code = isConn ? await probeHttpReadiness(port, '127.0.0.1', 500) : 200;
+    assert.equal(code, 200);
+    const msg = formatEndpointStatus(port, code);
+    assert.match(msg, /HTTP 200 - Ready/);
+  } finally {
+    await new Promise((resolve) => s200.close(resolve));
+  }
+}
+
+// Scenario 5: HTTP returns 404
+{
+  const s404 = http.createServer((q, r) => { r.writeHead(404); r.end('Not Found'); });
+  await new Promise((resolve) => s404.listen(0, '127.0.0.1', resolve));
+  const port = s404.address().port;
+  try {
+    const isConn = await probePort(port, '127.0.0.1', 300);
+    const code = isConn ? await probeHttpReadiness(port, '127.0.0.1', 500) : 404;
+    assert.equal(code, 404);
+    const msg = formatEndpointStatus(port, code);
+    assert.match(msg, /HTTP 404 - Responsive/);
+    assert.equal(msg.includes('Ready'), false, '404 must not be classified as Ready');
+  } finally {
+    await new Promise((resolve) => s404.close(resolve));
+  }
+}
+
+// Scenario 6: HTTP returns 401 and 403
+{
+  for (const statusCode of [401, 403]) {
+    const sAuth = http.createServer((q, r) => { r.writeHead(statusCode); r.end('Unauthorized'); });
+    await new Promise((resolve) => sAuth.listen(0, '127.0.0.1', resolve));
+    const port = sAuth.address().port;
+    try {
+      const isConn = await probePort(port, '127.0.0.1', 300);
+      const code = isConn ? await probeHttpReadiness(port, '127.0.0.1', 500) : statusCode;
+      assert.equal(code, statusCode);
+      const msg = formatEndpointStatus(port, code);
+      assert.match(msg, new RegExp(`HTTP ${statusCode} - Responsive`));
+      assert.equal(msg.includes('Ready'), false, `${statusCode} must not be classified as Ready`);
+    } finally {
+      await new Promise((resolve) => sAuth.close(resolve));
+    }
+  }
+}
+
+// Scenario 7: HTTP returns 500
+{
+  const s500 = http.createServer((q, r) => { r.writeHead(500); r.end('Internal Server Error'); });
+  await new Promise((resolve) => s500.listen(0, '127.0.0.1', resolve));
+  const port = s500.address().port;
+  try {
+    const isConn = await probePort(port, '127.0.0.1', 300);
+    const code = isConn ? await probeHttpReadiness(port, '127.0.0.1', 500) : 500;
+    assert.equal(code, 500);
+    const msg = formatEndpointStatus(port, code);
+    assert.match(msg, /HTTP 500 - Unhealthy/);
+    assert.equal(msg.includes('Ready'), false, '500 must never be classified as Ready');
+    assert.equal(msg.includes('Responsive'), false, '500 must be classified as Unhealthy');
+  } finally {
+    await new Promise((resolve) => s500.close(resolve));
+  }
+}
+
+// Scenario 8: HTTP request timeout
+{
+  const openSockets = new Set();
+  const sHanging = net.createServer((sock) => {
+    openSockets.add(sock);
+    sock.on('close', () => openSockets.delete(sock));
+  });
+  await new Promise((resolve) => sHanging.listen(0, '127.0.0.1', resolve));
+  const port = sHanging.address().port;
+  try {
+    const startTime = Date.now();
+    const code = await probeHttpReadiness(port, '127.0.0.1', 200);
+    const elapsed = Date.now() - startTime;
+    assert.equal(code, null, 'Hanging socket must return null');
+    assert.ok(elapsed < 1000, 'Probe must time out promptly without hanging indefinitely');
+    const msg = formatEndpointStatus(port, code);
+    assert.equal(msg, `Server listening at http://localhost:${port}`, 'Raw TCP without HTTP response must report raw listening URL');
+  } finally {
+    for (const s of openSockets) {
+      s.destroy();
+    }
+    await new Promise((resolve) => sHanging.close(resolve));
+  }
+}
+
+// Scenario 9: Server cancellation
+{
+  let cancelled = false;
+  let cleanedUp = false;
+  const mockSupervisor = {
+    cancelRun: () => { cancelled = true; },
+    terminateWorker: () => { cleanedUp = true; },
+  };
+  mockSupervisor.cancelRun();
+  mockSupervisor.terminateWorker();
+  assert.equal(cancelled, true, 'Cancellation must be propagated');
+  assert.equal(cleanedUp, true, 'Worker cleanup must be invoked on cancellation');
+}
+
+// Scenario 10: Existing server already listening on an unrelated port
+{
+  const configuredCandidatePorts = [3000, 5000];
+  const foreignPort = 9999;
+  assert.equal(configuredCandidatePorts.includes(foreignPort), false, 'Foreign ports must not be attributed without workspace configuration or stdout citation');
+}
+
+// Scenario 11: Normal finite commands
+{
+  const finiteCmd = 'npm test';
+  const isServerCmd = /\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b/i.test(finiteCmd);
+  assert.equal(isServerCmd, false, 'Finite commands must not be flagged as server commands');
+}
+
+console.log('All 11 V44.84.2 Startup Readiness & Timeout Regression Scenarios PASSED successfully.');

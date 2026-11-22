@@ -2648,6 +2648,15 @@ def _probe_tcp_port(port: int, host: str = "127.0.0.1", timeout: float = 0.3) ->
         return False
 
 
+def _probe_http_readiness(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> Optional[int]:
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            res = client.get(f"http://{host}:{port}/")
+            return int(res.status_code)
+    except Exception:
+        return None
+
+
 def _find_verified_open_port(candidate_ports: List[int], max_duration_seconds: float = 3.0) -> Optional[int]:
     deadline = time.time() + max_duration_seconds
     while time.time() < deadline:
@@ -2722,6 +2731,14 @@ def _resolve_workspace_server_endpoint_info(workspace_root: str, command: str, s
     verified_port = _find_verified_open_port(candidate_ports, max_duration_seconds=3.0)
     if not verified_port:
         return None
+
+    http_status = _probe_http_readiness(verified_port, host="127.0.0.1", timeout=0.5)
+    if isinstance(http_status, int):
+        if 200 <= http_status < 400:
+            return f"Server listening at http://localhost:{verified_port} (HTTP {http_status} - Ready)"
+        if 400 <= http_status < 500:
+            return f"Server listening at http://localhost:{verified_port} (HTTP {http_status} - Responsive)"
+        return f"Server listening at http://localhost:{verified_port} (HTTP {http_status} - Unhealthy)"
 
     return f"Server listening at http://localhost:{verified_port}"
 
@@ -3022,7 +3039,29 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "workspaceRoot": root_str,
                     })
 
-                    cmd_ok = bool(exec_res.get("ok")) or (is_server_cmd and bool(exec_res.get("timedOut")))
+                    timed_out = bool(exec_res.get("timedOut"))
+                    cmd_ok = bool(exec_res.get("ok"))
+                    res_stdout = exec_res.get("stdout", "")
+                    res_stderr = exec_res.get("stderr", "")
+
+                    endpoint_info = None
+                    if is_server_cmd:
+                        endpoint_info = _resolve_workspace_server_endpoint_info(root_str, cmd, res_stdout)
+                        if endpoint_info:
+                            res_stdout = f"{res_stdout}\n{endpoint_info}".strip() if res_stdout else endpoint_info
+
+                    if is_server_cmd and timed_out:
+                        if endpoint_info:
+                            cmd_ok = True
+                            cmd_exit = 0
+                        else:
+                            cmd_ok = False
+                            cmd_exit = exec_res.get("exitCode") or 124
+                            timeout_err = "Server command timed out before establishing a verified listening endpoint."
+                            res_stderr = f"{res_stderr}\n{timeout_err}".strip() if res_stderr else timeout_err
+                    else:
+                        cmd_exit = 0 if cmd_ok else (exec_res.get("exitCode") or 1)
+
                     if is_server_cmd and cmd_ok:
                         with _ACTIVE_WORKSPACE_SERVER_LOCK:
                             if len(_ACTIVE_WORKSPACE_SERVER_WORKERS) >= 20:
@@ -3045,18 +3084,12 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
                             "workerId": worker_id,
                         })
 
-                    cmd_exit = 0 if cmd_ok else exec_res.get("exitCode", 1)
-                    res_stdout = exec_res.get("stdout", "")
-                    if cmd_ok and is_server_cmd:
-                        endpoint_info = _resolve_workspace_server_endpoint_info(root_str, cmd, res_stdout)
-                        if endpoint_info:
-                            res_stdout = f"{res_stdout}\n{endpoint_info}".strip() if res_stdout else endpoint_info
                     executed_results.append({
                         "command": cmd,
                         "ok": cmd_ok,
                         "exitCode": cmd_exit,
                         "stdout": res_stdout,
-                        "stderr": exec_res.get("stderr", ""),
+                        "stderr": res_stderr,
                         "pid": exec_res.get("pid"),
                     })
                     if not cmd_ok:
