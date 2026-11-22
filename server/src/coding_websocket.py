@@ -993,31 +993,10 @@ def _is_standalone_code_generation_request(request: str) -> bool:
     )
 
 
-def _is_operational_workspace_command_request(request: str) -> bool:
-    if not request or not isinstance(request, str):
-        return False
-    text = request.strip().casefold()
-    operational_terms = ("install", "run", "start", "build", "setup", "test", "launch", "chalao")
-    if not any(term in text for term in operational_terms):
-        return False
-    explicit_code_terms = (
-        "proposal", "unified diff", "diff", "patch", "refactor",
-        "edit file", "modify file", "change file", "update file",
-        "write code", "edit code", "modify code", "change code",
-    )
-    if any(term in text for term in explicit_code_terms):
-        return False
-    if re.search(r"\b(?:edit|modify|write|update|change|create|add)\s+(?:the\s+|a\s+|an\s+)?[\w_/-]+\.(?:js|jsx|ts|tsx|py|java|cpp|c|go|rs|rb|php|html|css)\b", text):
-        return False
-    return True
-
-
 def _requires_proposal(request: str) -> bool:
     if _is_capability_question(request):
         return False
     if _is_standalone_code_generation_request(request):
-        return False
-    if _is_operational_workspace_command_request(request):
         return False
     if EXPLANATION_PATTERN.search(request) and not EXPLICIT_CHANGE_PATTERN.search(request):
         return False
@@ -1261,8 +1240,6 @@ def _requires_proposal_for_conversation(messages: List[Dict[str, Any]]) -> bool:
         return False
     latest_request = user_requests[-1]
     if _is_capability_question(latest_request):
-        return False
-    if _is_operational_workspace_command_request(latest_request):
         return False
     if EXPLANATION_FOLLOW_UP_PATTERN.search(latest_request):
         return False
@@ -5366,11 +5343,13 @@ def _update_task_from_tool_result(
                     "results", "symbols", "references", "content", "path",
                     "directories", "entries", "files", "languages", "frameworks", "entryPoints",
                     "sourceDirectories", "configFiles", "schema_details",
-                    "schemaDetails",
+                    "schemaDetails", "stdout", "stderr", "executed",
                 )
-            )
+            ) or (data.get("executed") is True)
             if any(key in data and isinstance(data.get(key), str) for key in ("content",)):
                 informative_result = bool(data["content"].strip())
+            if data.get("executed") is True:
+                informative_result = True
         elif isinstance(data, list):
             informative_result = bool(data)
         elif isinstance(data, str):
@@ -8726,6 +8705,19 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             ]) or request
         intent_info["proposal_required"] = proposal_required
         request_understanding["action"] = selected_intent or "CODE_QUESTION"
+    resolved_by_model = bool(db_det.get("resolved_by_model"))
+    if selected_semantics and resolved_by_model:
+        if selected_intent != "SOURCE_CHANGE":
+            proposal_required = False
+            proposal_goal = None
+        else:
+            proposal_required = True
+            proposal_goal = _proposal_goal([
+                str(message.get("content") or "")
+                for message in supplied
+                if message.get("role") == "user"
+            ]) or request
+        intent_info["proposal_required"] = proposal_required
     if selected_semantics:
         if selected_semantics.get("goal"):
             request_understanding["goal"] = selected_semantics["goal"]
@@ -11701,7 +11693,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 if isinstance(result, dict) and isinstance(result.get("data"), (dict, list)):
                     if not result["data"]:
                         is_data_empty = True
-                    elif isinstance(result["data"], dict) and not any(result["data"].values()):
+                    elif isinstance(result["data"], dict) and not any(result["data"].values()) and result["data"].get("executed") is not True:
                         is_data_empty = True
                 is_empty_or_trivial = (
                     not serialized.strip()
