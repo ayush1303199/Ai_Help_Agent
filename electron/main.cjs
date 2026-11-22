@@ -211,48 +211,99 @@ async function unregisterTrustedBrokerProject(ownerId) {
   await publishTrustedBrokerRegistry();
 }
 
-function resolveWorkspaceServerEndpointInfo(workspaceRoot, command) {
+const activeWorkspaceServerWorkers = new Map();
+
+function probePort(port, host = '127.0.0.1', timeoutMs = 300) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.once('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.connect(port, host);
+  });
+}
+
+async function findVerifiedOpenPort(candidatePorts, maxDurationMs = 3000) {
+  const deadline = Date.now() + maxDurationMs;
+  while (Date.now() < deadline) {
+    for (const port of candidatePorts) {
+      if (port >= 1 && port <= 65535) {
+        // eslint-disable-next-line no-await-in-loop
+        const isOpen = await probePort(port);
+        if (isOpen) return port;
+      }
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return null;
+}
+
+async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout = '') {
   if (!workspaceRoot || typeof workspaceRoot !== 'string') return null;
   const cmdLower = (command || '').trim().toLowerCase();
-  const isStartOrDev = /\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b/.test(cmdLower);
+  const isStartOrDev = /\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b/.test(cmdLower);
   if (!isStartOrDev) return null;
 
-  let port = 5000;
-  let routeSuffix = '';
+  const candidatePorts = [];
+  const text = stdout || '';
+  const urlMatches = text.matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1):(\d{2,5})/gi);
+  for (const m of urlMatches) {
+    const p = parseInt(m[1], 10);
+    if (!candidatePorts.includes(p)) candidatePorts.push(p);
+  }
+  const portMatches = text.matchAll(/\b(?:port|listening on|running at|listening at|ready on)\b[^\d\n\r]*(\d{2,5})\b/gi);
+  for (const m of portMatches) {
+    const p = parseInt(m[1], 10);
+    if (!candidatePorts.includes(p)) candidatePorts.push(p);
+  }
+
   try {
     const pkgPath = path.join(workspaceRoot, 'package.json');
     if (fsSync.existsSync(pkgPath)) {
       const pkgData = JSON.parse(fsSync.readFileSync(pkgPath, 'utf8'));
       const startScript = String(pkgData?.scripts?.start || pkgData?.scripts?.dev || '');
       const portMatch = startScript.match(/(?:--port|-p)\s+([0-9]+)/);
-      if (portMatch) port = parseInt(portMatch[1], 10);
+      if (portMatch) {
+        const p = parseInt(portMatch[1], 10);
+        if (!candidatePorts.includes(p)) candidatePorts.push(p);
+      }
     }
   } catch {}
 
-  const configCandidates = ['config/db.js', 'config.js', '.env', 'server.js', 'app.js'];
+  const configCandidates = ['config/db.js', 'config.js', '.env', '.env.example', 'server.js', 'app.js', 'vite.config.js', 'vite.config.ts', 'vite.config.mjs'];
   for (const rel of configCandidates) {
     try {
       const fullPath = path.join(workspaceRoot, rel);
       if (fsSync.existsSync(fullPath)) {
         const content = fsSync.readFileSync(fullPath, 'utf8');
         const portMatch = content.match(/\b(?:port|PORT)\b\s*[:=]\s*(?:Number\(process\.env\.PORT\)\s*\|\|\s*)?(\d{2,5})/);
-        if (portMatch) port = parseInt(portMatch[1], 10);
-        if (content.includes('/orders') || content.toLowerCase().includes('orders')) {
-          routeSuffix = '/orders';
+        if (portMatch) {
+          const p = parseInt(portMatch[1], 10);
+          if (!candidatePorts.includes(p)) candidatePorts.push(p);
         }
       }
     } catch {}
   }
 
-  if (!routeSuffix && fsSync.existsSync(path.join(workspaceRoot, 'routes', 'orders.js'))) {
-    routeSuffix = '/orders';
+  for (const defaultPort of [3000, 5000, 5173, 8080, 8000]) {
+    if (!candidatePorts.includes(defaultPort)) candidatePorts.push(defaultPort);
   }
 
-  return [
-    `Full-Stack UI Ready: http://localhost:${port}${routeSuffix}`,
-    `REST API Endpoint:   http://localhost:${port}/api${routeSuffix}`,
-    'Application server verified and running under supervisor process containment.',
-  ].join('\n');
+  const verifiedPort = await findVerifiedOpenPort(candidatePorts, 3000);
+  if (!verifiedPort) return null;
+
+  return `Server listening at http://localhost:${verifiedPort}`;
 }
 
 async function executeWorkspaceCommandsPipeline({
@@ -306,7 +357,7 @@ async function executeWorkspaceCommandsPipeline({
   }
   const executedResults = [];
   for (const cmd of commandsList) {
-    const isServerCmd = /\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b/i.test(cmd);
+    const isServerCmd = /\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b/i.test(cmd);
     const commandTimeout = isServerCmd ? 8000 : 120000;
     let runResult;
     try {
@@ -329,8 +380,8 @@ async function executeWorkspaceCommandsPipeline({
         runResult = {
           ok: true,
           exitCode: 0,
-          stdout: 'Server process started under supervisor containment.',
-          stderr: '',
+          stdout: execErr?.stdout || '',
+          stderr: execErr?.stderr || '',
         };
       } else {
         runResult = {
@@ -346,12 +397,12 @@ async function executeWorkspaceCommandsPipeline({
       runResult.ok = true;
       runResult.exitCode = 0;
       runResult.timedOut = false;
-      const endpointInfo = resolveWorkspaceServerEndpointInfo(root, cmd);
+      const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout);
       if (endpointInfo) {
-        runResult.stdout = [runResult.stdout || 'Server process started under supervisor containment.', endpointInfo].filter(Boolean).join('\n');
+        runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
       }
     } else if (runResult && runResult.ok) {
-      const endpointInfo = resolveWorkspaceServerEndpointInfo(root, cmd);
+      const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout);
       if (endpointInfo) {
         runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
       }

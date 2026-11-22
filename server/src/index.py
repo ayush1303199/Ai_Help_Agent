@@ -5,6 +5,7 @@ import json
 import math
 import os
 import secrets
+import socket
 import sys
 import hmac
 import logging
@@ -2635,17 +2636,56 @@ async def assess_finding_relevance_endpoint(payload: Dict[str, Any]) -> Dict[str
         ) from error
 
 
-def _resolve_workspace_server_endpoint_info(workspace_root: str, command: str) -> Optional[str]:
-    """Inspects workspace server configuration and reports live local URL/port for start/dev/run commands."""
+_ACTIVE_WORKSPACE_SERVER_WORKERS: Dict[str, str] = {}
+_ACTIVE_WORKSPACE_SERVER_LOCK = threading.Lock()
+
+
+def _probe_tcp_port(port: int, host: str = "127.0.0.1", timeout: float = 0.3) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.error):
+        return False
+
+
+def _find_verified_open_port(candidate_ports: List[int], max_duration_seconds: float = 3.0) -> Optional[int]:
+    deadline = time.time() + max_duration_seconds
+    while time.time() < deadline:
+        for p in candidate_ports:
+            if 1 <= p <= 65535 and _probe_tcp_port(p):
+                return p
+        time.sleep(0.2)
+    return None
+
+
+def _resolve_workspace_server_endpoint_info(workspace_root: str, command: str, stdout: str = "") -> Optional[str]:
+    """Inspects workspace server configuration, probes TCP ports, and reports live verified URL for server commands."""
     if not workspace_root or not os.path.isdir(workspace_root):
         return None
     cmd_lower = (command or "").strip().lower()
-    is_start_or_dev = bool(re.search(r"\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b", cmd_lower))
+    is_start_or_dev = bool(re.search(r"\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b", cmd_lower))
     if not is_start_or_dev:
         return None
 
-    port = 5000
-    route_suffix = ""
+    candidate_ports: List[int] = []
+
+    text = stdout or ""
+    for m in re.finditer(r"https?://(?:localhost|127\.0\.0\.1):(\d{2,5})", text, re.I):
+        try:
+            p = int(m.group(1))
+            if p not in candidate_ports:
+                candidate_ports.append(p)
+        except Exception:
+            pass
+
+    for m in re.finditer(r"\b(?:port|listening on|running at|listening at|ready on)\b[^\d\n\r]*(\d{2,5})\b", text, re.I):
+        try:
+            p = int(m.group(1))
+            if p not in candidate_ports:
+                candidate_ports.append(p)
+        except Exception:
+            pass
+
     pkg_path = os.path.join(workspace_root, "package.json")
     if os.path.isfile(pkg_path):
         try:
@@ -2655,11 +2695,13 @@ def _resolve_workspace_server_endpoint_info(workspace_root: str, command: str) -
                 start_script = str(scripts.get("start") or scripts.get("dev") or "")
                 port_match = re.search(r"(?:--port|-p)\s+([0-9]+)", start_script)
                 if port_match:
-                    port = int(port_match.group(1))
+                    p = int(port_match.group(1))
+                    if p not in candidate_ports:
+                        candidate_ports.append(p)
         except Exception:
             pass
 
-    for config_rel in ("config/db.js", "config.js", ".env", "server.js", "app.js"):
+    for config_rel in ("config/db.js", "config.js", ".env", ".env.example", "server.js", "app.js", "vite.config.js", "vite.config.ts", "vite.config.mjs"):
         c_path = os.path.join(workspace_root, config_rel)
         if os.path.isfile(c_path):
             try:
@@ -2667,22 +2709,21 @@ def _resolve_workspace_server_endpoint_info(workspace_root: str, command: str) -
                     content = f.read()
                     port_m = re.search(r"\b(?:port|PORT)\b\s*[:=]\s*(?:Number\(process\.env\.PORT\)\s*\|\|\s*)?(\d{2,5})", content)
                     if port_m:
-                        port = int(port_m.group(1))
-                    if "/orders" in content or "orders" in content.lower():
-                        route_suffix = "/orders"
+                        p = int(port_m.group(1))
+                        if p not in candidate_ports:
+                            candidate_ports.append(p)
             except Exception:
                 pass
 
-    if not route_suffix:
-        if os.path.isfile(os.path.join(workspace_root, "routes", "orders.js")):
-            route_suffix = "/orders"
+    for default_port in (3000, 5000, 5173, 8080, 8000):
+        if default_port not in candidate_ports:
+            candidate_ports.append(default_port)
 
-    lines = [
-        f"Full-Stack UI Ready: http://localhost:{port}{route_suffix}",
-        f"REST API Endpoint:   http://localhost:{port}/api{route_suffix}",
-        "Application server verified and running under supervisor process containment.",
-    ]
-    return "\n".join(lines)
+    verified_port = _find_verified_open_port(candidate_ports, max_duration_seconds=3.0)
+    if not verified_port:
+        return None
+
+    return f"Server listening at http://localhost:{verified_port}"
 
 
 @app.post("/api/coding/tool")
@@ -2963,27 +3004,51 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
                         })
                         break
 
+                    is_server_cmd = bool(re.search(r"\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b", cmd, re.I))
+                    if is_server_cmd:
+                        with _ACTIVE_WORKSPACE_SERVER_LOCK:
+                            prior_worker = _ACTIVE_WORKSPACE_SERVER_WORKERS.pop(root_str, None)
+                        if prior_worker:
+                            try:
+                                send_supervisor_ipc({"operation": "TERMINATE_WORKER", "workerId": prior_worker, "reason": "superseded_by_new_server"})
+                                send_supervisor_ipc({"operation": "VERIFY_RESOURCE_RELEASE", "workerId": prior_worker})
+                            except Exception:
+                                pass
+
                     exec_res = send_supervisor_ipc({
                         "operation": "EXECUTE_APPROVED_OPERATION",
                         "workerId": worker_id,
                         "command": cmd,
                         "workspaceRoot": root_str,
                     })
-                    send_supervisor_ipc({
-                        "operation": "TERMINATE_WORKER",
-                        "workerId": worker_id,
-                        "reason": "normal_completion" if exec_res.get("ok") else "execution_error",
-                    })
-                    send_supervisor_ipc({
-                        "operation": "VERIFY_RESOURCE_RELEASE",
-                        "workerId": worker_id,
-                    })
-                    is_server_cmd = bool(re.search(r"\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b", cmd, re.I))
+
                     cmd_ok = bool(exec_res.get("ok")) or (is_server_cmd and bool(exec_res.get("timedOut")))
+                    if is_server_cmd and cmd_ok:
+                        with _ACTIVE_WORKSPACE_SERVER_LOCK:
+                            if len(_ACTIVE_WORKSPACE_SERVER_WORKERS) >= 20:
+                                oldest_key = next(iter(_ACTIVE_WORKSPACE_SERVER_WORKERS))
+                                old_worker = _ACTIVE_WORKSPACE_SERVER_WORKERS.pop(oldest_key)
+                                try:
+                                    send_supervisor_ipc({"operation": "TERMINATE_WORKER", "workerId": old_worker, "reason": "capacity_eviction"})
+                                    send_supervisor_ipc({"operation": "VERIFY_RESOURCE_RELEASE", "workerId": old_worker})
+                                except Exception:
+                                    pass
+                            _ACTIVE_WORKSPACE_SERVER_WORKERS[root_str] = worker_id
+                    else:
+                        send_supervisor_ipc({
+                            "operation": "TERMINATE_WORKER",
+                            "workerId": worker_id,
+                            "reason": "normal_completion" if exec_res.get("ok") else "execution_error",
+                        })
+                        send_supervisor_ipc({
+                            "operation": "VERIFY_RESOURCE_RELEASE",
+                            "workerId": worker_id,
+                        })
+
                     cmd_exit = 0 if cmd_ok else exec_res.get("exitCode", 1)
                     res_stdout = exec_res.get("stdout", "")
-                    if cmd_ok:
-                        endpoint_info = _resolve_workspace_server_endpoint_info(root_str, cmd)
+                    if cmd_ok and is_server_cmd:
+                        endpoint_info = _resolve_workspace_server_endpoint_info(root_str, cmd, res_stdout)
                         if endpoint_info:
                             res_stdout = f"{res_stdout}\n{endpoint_info}".strip() if res_stdout else endpoint_info
                     executed_results.append({
@@ -2994,7 +3059,7 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "stderr": exec_res.get("stderr", ""),
                         "pid": exec_res.get("pid"),
                     })
-                    if not exec_res.get("ok"):
+                    if not cmd_ok:
                         break
 
                 all_ok = len(executed_results) > 0 and all(r.get("ok") for r in executed_results)
