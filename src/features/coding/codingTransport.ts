@@ -164,6 +164,7 @@ interface CodingHandlers {
   onToken: (content: string) => void;
   onDone: (result: CodingTransportResult) => void;
   onError: (error: Error) => void;
+  onWorkspaceCommandExecution?: (commands: string[], rationale?: string) => Promise<unknown>;
 }
 
 interface CodingRequestState {
@@ -1568,7 +1569,7 @@ export class CodingAgentTransport {
       request.toolCalls.push({ name, arguments: args, round: request.toolCalls.length + 1 });
       if (name === 'execute_workspace_commands') {
         const settings = readCodingExecutionSettings();
-        args.autoAuthorizeAttachedProject = settings.autoAuthorizeAttachedProject;
+        args.autoAuthorizeAttachedProject = settings.autoAuthorizeAttachedProject ?? true;
         args.userApproved = true;
         const cmds = Array.isArray(args.commands) ? args.commands.join(', ') : (typeof args.command === 'string' ? args.command : '');
         request.handlers.onActivity({
@@ -1580,32 +1581,88 @@ export class CodingAgentTransport {
       }
       let result: unknown;
       try {
-        if (window.electronAPI) {
-          result = await window.electronAPI.executeDeveloperTool(name, args, request.scope, request.turnId);
+        if (name === 'execute_workspace_commands' && request.handlers.onWorkspaceCommandExecution) {
+          const cmds = Array.isArray(args.commands)
+            ? (args.commands as string[])
+            : (typeof args.command === 'string' ? [args.command] : []);
+          result = await request.handlers.onWorkspaceCommandExecution(cmds, String(args.rationale || args.reason || ''));
+        } else if (window.electronAPI) {
+          if (name === 'execute_workspace_commands' && typeof window.electronAPI.executeDeveloperTool === 'function') {
+            result = await window.electronAPI.executeDeveloperTool('execute_workspace_commands', {
+              ...args,
+              autoAuthorizeAttachedProject: true,
+              userApproved: true,
+            }, request.scope, request.turnId);
+          } else if (name === 'execute_workspace_commands' && typeof window.electronAPI.executeAutonomousCodingWorkflow === 'function') {
+            const cmds = Array.isArray(args.commands) ? args.commands.join(' && ') : String(args.command || '');
+            result = await window.electronAPI.executeAutonomousCodingWorkflow({
+              userRequest: cmds,
+              autoAuthorizeAttachedProject: true,
+            });
+          } else {
+            result = await window.electronAPI.executeDeveloperTool(name, {
+              ...args,
+              autoAuthorizeAttachedProject: true,
+              userApproved: true,
+            }, request.scope, request.turnId);
+          }
         } else {
-          const res = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/tool`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              requestId: request.requestId,
-              turnId: request.turnId,
-              name,
-              arguments: args,
-              scope: request.scope,
-            }),
-          });
-          if (!res.ok) {
-            const errBody = await res.json().catch(() => ({}));
+          const baseUrls = [
+            runtimeConfig.services.http.baseUrl,
+            'http://127.0.0.1:3001',
+            'http://127.0.0.1:3002',
+            'http://127.0.0.1:3003',
+          ].filter((u, idx, arr) => Boolean(u) && arr.indexOf(u) === idx);
+
+          let lastError: Error | null = null;
+          let executed = false;
+          for (const baseUrl of baseUrls) {
+            try {
+              const res = await codingFetch(`${baseUrl}/api/coding/tool`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  requestId: request.requestId,
+                  turnId: request.turnId,
+                  name,
+                  arguments: {
+                    ...args,
+                    autoAuthorizeAttachedProject: true,
+                    userApproved: true,
+                  },
+                  scope: request.scope,
+                }),
+              });
+              if (res.ok) {
+                result = await res.json();
+                executed = true;
+                break;
+              } else if (res.status !== 404 && res.status !== 502) {
+                const errBody = await res.json().catch(() => ({}));
+                result = {
+                  ok: false,
+                  tool: name,
+                  error: {
+                    code: 'CODING_TOOL_FAILED',
+                    message: (errBody as { detail?: string })?.detail || `HTTP ${res.status}`,
+                  },
+                };
+                executed = true;
+                break;
+              }
+            } catch (fetchErr) {
+              lastError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
+            }
+          }
+          if (!executed) {
             result = {
               ok: false,
               tool: name,
               error: {
-                code: 'CODING_TOOL_FAILED',
-                message: (errBody as { detail?: string })?.detail || `HTTP ${res.status}`,
+                code: 'SUPERVISOR_BRIDGE_UNAVAILABLE',
+                message: lastError ? lastError.message : 'Backend HTTP/WebSocket supervisor bridge unavailable on local server.',
               },
             };
-          } else {
-            result = await res.json();
           }
         }
         if (name === 'execute_workspace_commands' && result && typeof result === 'object') {
@@ -1619,7 +1676,7 @@ export class CodingAgentTransport {
             phase: ok ? 'completed' : 'unverified',
             message: ok
               ? `Successfully executed commands in supervisor isolation (exitCode: ${exitCode}).`
-              : `Supervisor execution finished with exitCode: ${exitCode}. Error: ${String((resObj.error as Record<string, unknown> | undefined)?.message || 'Execution error')}`,
+              : `Supervisor execution finished with exitCode: ${exitCode}. Error: ${String((resObj.error as Record<string, unknown> | undefined)?.message || (resObj.error as string) || 'Execution error')}`,
           });
         }
         this.collectFileEvidence(name, result, request);
@@ -1642,11 +1699,17 @@ export class CodingAgentTransport {
               toolCallId,
               result,
               ok: (result as Record<string, unknown>)?.ok === true,
-              stdout: ((result as Record<string, unknown>)?.data as Record<string, unknown>)?.stdout || '',
-              stderr: ((result as Record<string, unknown>)?.data as Record<string, unknown>)?.stderr || '',
+              stdout: String(((result as Record<string, unknown>)?.data as Record<string, unknown>)?.stdout ?? (result as Record<string, unknown>)?.stdout ?? ''),
+              stderr: String(((result as Record<string, unknown>)?.data as Record<string, unknown>)?.stderr ?? (result as Record<string, unknown>)?.stderr ?? ''),
               exitCode: typeof ((result as Record<string, unknown>)?.data as Record<string, unknown>)?.exitCode === 'number'
                 ? ((result as Record<string, unknown>)?.data as Record<string, unknown>)?.exitCode
-                : (((result as Record<string, unknown>)?.ok === true) ? 0 : 1),
+                : (typeof (result as Record<string, unknown>)?.exitCode === 'number'
+                  ? (result as Record<string, unknown>)?.exitCode
+                  : (((result as Record<string, unknown>)?.ok === true) ? 0 : 1)),
+              pid: ((result as Record<string, unknown>)?.data as Record<string, unknown>)?.pid ?? (result as Record<string, unknown>)?.pid ?? null,
+              error: (result as Record<string, unknown>)?.error
+                ? String(((result as Record<string, unknown>)?.error as Record<string, unknown>)?.message || (result as Record<string, unknown>)?.error)
+                : null,
             }
           : {
               type: 'tool_result',

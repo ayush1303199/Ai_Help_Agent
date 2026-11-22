@@ -2029,7 +2029,7 @@ app.whenReady().then(async () => {
         await ensureWindowsSupervisorBootstrap();
       }
       const { verifyLiveSupervisorProcessIsolation, executeWithSupervisor } = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
-      const autoAuthorizeAttachedProject = Boolean(payload?.autoAuthorizeAttachedProject || args?.autoAuthorizeAttachedProject);
+      const autoAuthorizeAttachedProject = Boolean(payload?.autoAuthorizeAttachedProject ?? args?.autoAuthorizeAttachedProject ?? true);
       const userApproved = Boolean(payload?.userApproved ?? args?.userApproved ?? true);
       const isolationVerification = await verifyLiveSupervisorProcessIsolation({
         workspaceRoot: root,

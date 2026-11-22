@@ -325,6 +325,9 @@ interface Window {
     findDeveloperReferences: (query: string) => Promise<Array<{ symbol: string; kind: string; file: string; line: number; relationship: 'definition' | 'reference' }>>;
     assembleDeveloperContext: (payload: { query: string; scope?: string; maxTokens?: number }) => Promise<{ tokenCount: number; budget: number; items: unknown[]; diversity: number; cached: boolean }>;
     executeDeveloperTool: (name: string, args: Record<string, unknown>, scope?: string, turnId?: string) => Promise<{ ok: boolean; tool: string; data?: unknown; error?: string }>;
+    executeAutonomousCodingWorkflow?: (payload: Record<string, unknown>) => Promise<unknown>;
+    executeDependencyPlan?: (payload: Record<string, unknown>) => Promise<unknown>;
+    executeBuildPlan?: (payload: Record<string, unknown>) => Promise<unknown>;
     runDeveloperVerification: (script: string) => Promise<{ ok: boolean; script: string; exitCode: number | null; stdout: string; stderr: string; durationMs: number; classification?: string; cancelled?: boolean }>;
     inspectDeveloperGit: (kind: 'status' | 'diff') => Promise<{ args: string[]; stdout: string; stderr: string }>;
     beginDeveloperConversation: (request: string, scope?: string, repairToken?: string | null) => Promise<{ turnId: string; state: string; projectRoot: string; scope: string; sessionId?: string }>;

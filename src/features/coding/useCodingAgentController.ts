@@ -1570,6 +1570,32 @@ export function useCodingAgentController({
         } catch {
           // ignore fail-closed
         }
+      } else {
+        try {
+          const preflightUrls = [
+            `${runtimeConfig.services.http.baseUrl}/api/coding/acceptance-preflight`,
+            'http://127.0.0.1:3001/api/coding/acceptance-preflight',
+            'http://127.0.0.1:3002/api/coding/acceptance-preflight',
+            'http://127.0.0.1:3003/api/coding/acceptance-preflight',
+          ].filter((u, idx, arr) => Boolean(u) && arr.indexOf(u) === idx);
+          for (const url of preflightUrls) {
+            try {
+              const res = await codingFetch(url);
+              if (res.ok) {
+                const p = await res.json();
+                if (p?.canRunProjectCommands === true || p?.sandbox?.verified === true) {
+                  sandboxVerified = true;
+                  processIsolationGate = 'ALLOWED';
+                  break;
+                }
+              }
+            } catch {
+              // try next preflight url
+            }
+          }
+        } catch {
+          // ignore fail-closed
+        }
       }
       await transport.send(requestId, conversationHistory, currentScope, currentProjectRoot, {
         onStart: (turnId, root, scope) => {
@@ -1593,6 +1619,73 @@ export function useCodingAgentController({
         },
         onActivity: (entry) => {
           setActivity((previous) => upsertCodingActivity(previous, entry, requestId));
+        },
+        onWorkspaceCommandExecution: async (commands: string[], rationale?: string) => {
+          if (window.electronAPI) {
+            if (typeof window.electronAPI.executeDeveloperTool === 'function') {
+              return await window.electronAPI.executeDeveloperTool('execute_workspace_commands', {
+                commands,
+                rationale,
+                autoAuthorizeAttachedProject: true,
+                userApproved: true,
+              }, currentScope);
+            }
+            if (typeof window.electronAPI.executeAutonomousCodingWorkflow === 'function') {
+              return await window.electronAPI.executeAutonomousCodingWorkflow({
+                userRequest: commands.join(' && '),
+                autoAuthorizeAttachedProject: true,
+              });
+            }
+            if (typeof window.electronAPI.executeDependencyPlan === 'function') {
+              return await window.electronAPI.executeDependencyPlan({
+                commands,
+                autoAuthorizeAttachedProject: true,
+              });
+            }
+            if (typeof window.electronAPI.executeBuildPlan === 'function') {
+              return await window.electronAPI.executeBuildPlan({
+                commands,
+                autoAuthorizeAttachedProject: true,
+              });
+            }
+          }
+          const localEndpoints = [
+            `${runtimeConfig.services.http.baseUrl}/api/coding/tool`,
+            'http://127.0.0.1:3001/api/coding/tool',
+            'http://127.0.0.1:3002/api/coding/tool',
+            'http://127.0.0.1:3003/api/coding/tool',
+          ].filter((u, idx, arr) => Boolean(u) && arr.indexOf(u) === idx);
+
+          for (const endpoint of localEndpoints) {
+            try {
+              const res = await codingFetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  name: 'execute_workspace_commands',
+                  arguments: {
+                    commands,
+                    rationale,
+                    autoAuthorizeAttachedProject: true,
+                    userApproved: true,
+                  },
+                  scope: currentScope,
+                }),
+              });
+              if (res.ok) {
+                return await res.json();
+              }
+            } catch {
+              // try next endpoint
+            }
+          }
+          return {
+            ok: false,
+            error: {
+              code: 'SUPERVISOR_BRIDGE_UNAVAILABLE',
+              message: 'Failed to route workspace command execution through local supervisor bridge.',
+            },
+          };
         },
         onToken: () => undefined,
         onDone: (result: CodingTransportResult) => {

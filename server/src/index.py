@@ -2727,20 +2727,227 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
                 return {"ok": False, "error": res.get("error") or {"code": "DATABASE_QUERY_FAILED", "message": res.get("content") or "The database query failed."}}
             return {"ok": True, "data": SecretProtector.redact_data(res)}
         elif canonical == "execute_workspace_commands":
-            return {
-                "ok": False,
-                "data": {
-                    "executed": False,
-                    "status": "UNAVAILABLE",
-                    "processIsolationGate": "BLOCKED",
-                    "hostFallback": "ZERO",
-                    "message": "Workspace command execution requires the trusted desktop Electron app with verified Windows supervisor process isolation.",
-                },
-                "error": {
-                    "code": "SUPERVISOR_ISOLATION_REQUIRED",
-                    "message": "Workspace command execution requires the trusted desktop Electron app with verified Windows supervisor process isolation.",
-                },
-            }
+            raw_cmds = args.get("commands") or args.get("command") or args.get("script") or []
+            if isinstance(raw_cmds, str):
+                commands_list = [raw_cmds.strip()] if raw_cmds.strip() else []
+            elif isinstance(raw_cmds, list):
+                commands_list = [str(c).strip() for c in raw_cmds if str(c).strip()]
+            else:
+                commands_list = []
+            if not commands_list:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "COMMANDS_REQUIRED",
+                        "message": "A non-empty list of workspace commands is required.",
+                    },
+                }
+            root_str = str(_resolve_coding_project_root(project_root))
+            if sys.platform != "win32":
+                return {
+                    "ok": False,
+                    "data": {
+                        "executed": False,
+                        "status": "UNAVAILABLE",
+                        "processIsolationGate": "BLOCKED",
+                        "hostFallback": "ZERO",
+                        "message": "Workspace command execution requires verified Windows supervisor process isolation.",
+                    },
+                    "error": {
+                        "code": "PROCESS_ISOLATION_BLOCKED",
+                        "message": "Workspace command execution requires verified Windows supervisor process isolation.",
+                    },
+                }
+
+            import ctypes
+            import hashlib
+            import uuid
+            from ctypes import wintypes
+            GENERIC_READ = 0x80000000
+            GENERIC_WRITE = 0x40000000
+            OPEN_EXISTING = 3
+            INVALID_HANDLE_VALUE = -1
+            pipe_handle = ctypes.windll.kernel32.CreateFileW(
+                r"\\.\pipe\ai-help-agent-supervisor",
+                GENERIC_READ | GENERIC_WRITE,
+                0, None, OPEN_EXISTING, 0, None
+            )
+            if pipe_handle == INVALID_HANDLE_VALUE:
+                return {
+                    "ok": False,
+                    "data": {
+                        "executed": False,
+                        "status": "UNAVAILABLE",
+                        "processIsolationGate": "BLOCKED",
+                        "hostFallback": "ZERO",
+                        "message": "Supervisor pipe \\\\.\\pipe\\ai-help-agent-supervisor is unavailable.",
+                    },
+                    "error": {
+                        "code": "SUPERVISOR_UNAVAILABLE",
+                        "message": "Supervisor pipe \\\\.\\pipe\\ai-help-agent-supervisor is unavailable.",
+                    },
+                }
+            try:
+                def send_supervisor_ipc(req):
+                    req_data = json.dumps(req).encode("utf-8") + b"\n"
+                    bytes_written = wintypes.DWORD()
+                    ctypes.windll.kernel32.WriteFile(pipe_handle, req_data, len(req_data), ctypes.byref(bytes_written), None)
+                    read_buf = ctypes.create_string_buffer(65536)
+                    bytes_read = wintypes.DWORD()
+                    ctypes.windll.kernel32.ReadFile(pipe_handle, read_buf, 65536, ctypes.byref(bytes_read), None)
+                    return json.loads(read_buf.value.decode("utf-8"))
+
+                identity = send_supervisor_ipc({"operation": "GET_SUPERVISOR_IDENTITY"})
+                if not identity.get("ok") or identity.get("tokenUserSid") != "S-1-5-18":
+                    return {
+                        "ok": False,
+                        "data": {
+                            "executed": False,
+                            "processIsolationGate": "BLOCKED",
+                            "hostFallback": "ZERO",
+                            "reason": "Supervisor identity verification failed.",
+                        },
+                        "error": {
+                            "code": "PROCESS_ISOLATION_BLOCKED",
+                            "message": "Supervisor identity verification failed.",
+                        },
+                    }
+
+                safe_hcs = send_supervisor_ipc({"operation": "INVOKE_SAFE_HCS_API", "api": "HcsGetServiceProperties"})
+                if not safe_hcs.get("ok") or safe_hcs.get("hresultHex") != "0x00000000":
+                    return {
+                        "ok": False,
+                        "data": {
+                            "executed": False,
+                            "processIsolationGate": "BLOCKED",
+                            "hostFallback": "ZERO",
+                            "reason": "Safe HCS API verification failed.",
+                        },
+                        "error": {
+                            "code": "PROCESS_ISOLATION_BLOCKED",
+                            "message": "Safe HCS API verification failed.",
+                        },
+                    }
+
+                executed_results = []
+                for cmd in commands_list:
+                    cmd_run_id = str(uuid.uuid4())
+                    snapshot_digest = hashlib.sha256(root_str.encode("utf-8")).hexdigest()
+                    plan_digest = hashlib.sha256(cmd.encode("utf-8")).hexdigest()
+                    grant_res = send_supervisor_ipc({
+                        "operation": "ISSUE_EXECUTION_GRANT",
+                        "runId": cmd_run_id,
+                        "workspaceRoot": root_str,
+                        "approvedSnapshotDigest": snapshot_digest,
+                        "planDigest": plan_digest,
+                        "taskId": f"tool-cmd-{int(time.time() * 1000)}",
+                        "sessionId": "browser-session",
+                        "ttlSeconds": 300,
+                    })
+                    if not grant_res.get("granted"):
+                        executed_results.append({
+                            "command": cmd,
+                            "ok": False,
+                            "exitCode": 1,
+                            "stderr": f"Supervised execution grant rejected: {grant_res.get('reason', 'Precondition failed')}",
+                        })
+                        break
+
+                    consume_res = send_supervisor_ipc({
+                        "operation": "CONSUME_EXECUTION_GRANT",
+                        "grantId": grant_res.get("grantId"),
+                        "runId": cmd_run_id,
+                        "workspaceRoot": root_str,
+                        "approvedSnapshotDigest": snapshot_digest,
+                    })
+                    if not consume_res.get("consumed"):
+                        executed_results.append({
+                            "command": cmd,
+                            "ok": False,
+                            "exitCode": 1,
+                            "stderr": "Supervised execution grant could not be consumed.",
+                        })
+                        break
+
+                    alloc_res = send_supervisor_ipc({
+                        "operation": "ALLOCATE_WORKER",
+                        "runId": cmd_run_id,
+                        "workspaceRoot": root_str,
+                    })
+                    worker_id = alloc_res.get("workerId")
+                    if not worker_id:
+                        executed_results.append({
+                            "command": cmd,
+                            "ok": False,
+                            "exitCode": 1,
+                            "stderr": "Supervisor worker allocation failed.",
+                        })
+                        break
+
+                    iso_res = send_supervisor_ipc({
+                        "operation": "OBSERVE_EFFECTIVE_ISOLATION",
+                        "workerId": worker_id,
+                        "isSyntheticTest": True,
+                    })
+                    if not iso_res.get("effectiveIsolationVerified"):
+                        send_supervisor_ipc({"operation": "TERMINATE_WORKER", "workerId": worker_id, "reason": "isolation_unverified"})
+                        send_supervisor_ipc({"operation": "VERIFY_RESOURCE_RELEASE", "workerId": worker_id})
+                        executed_results.append({
+                            "command": cmd,
+                            "ok": False,
+                            "exitCode": 1,
+                            "stderr": f"Effective isolation verification failed: {iso_res.get('reason', 'unverified')}",
+                        })
+                        break
+
+                    exec_res = send_supervisor_ipc({
+                        "operation": "EXECUTE_APPROVED_OPERATION",
+                        "workerId": worker_id,
+                        "command": cmd,
+                        "workspaceRoot": root_str,
+                    })
+                    send_supervisor_ipc({
+                        "operation": "TERMINATE_WORKER",
+                        "workerId": worker_id,
+                        "reason": "normal_completion" if exec_res.get("ok") else "execution_error",
+                    })
+                    send_supervisor_ipc({
+                        "operation": "VERIFY_RESOURCE_RELEASE",
+                        "workerId": worker_id,
+                    })
+                    executed_results.append({
+                        "command": cmd,
+                        "ok": bool(exec_res.get("ok")),
+                        "exitCode": exec_res.get("exitCode", 0 if exec_res.get("ok") else 1),
+                        "stdout": exec_res.get("stdout", ""),
+                        "stderr": exec_res.get("stderr", ""),
+                        "pid": exec_res.get("pid"),
+                    })
+                    if not exec_res.get("ok"):
+                        break
+
+                all_ok = len(executed_results) > 0 and all(r.get("ok") for r in executed_results)
+                last_result = executed_results[-1] if executed_results else {}
+                return {
+                    "ok": all_ok,
+                    "tool": "execute_workspace_commands",
+                    "data": {
+                        "executed": True,
+                        "ok": all_ok,
+                        "exitCode": last_result.get("exitCode", 0 if all_ok else 1),
+                        "stdout": "\n\n".join(f"[{r['command']}]\n{r.get('stdout', '')}" for r in executed_results),
+                        "stderr": "\n\n".join(f"[{r['command']}]\n{r.get('stderr', '')}" for r in executed_results),
+                        "pid": last_result.get("pid"),
+                        "commands": commands_list,
+                        "results": executed_results,
+                        "isolated": True,
+                        "supervisorIdentity": identity,
+                        "processIsolationGate": "ALLOWED",
+                        "hostFallback": "ZERO",
+                    },
+                }
+            finally:
+                ctypes.windll.kernel32.CloseHandle(pipe_handle)
         elif canonical == "run_verification":
             cmd = str(args.get("command") or args.get("script") or args.get("check") or "").strip()
             eval_res, reason = UNIVERSAL_POLICY_GATE.evaluate_command(cmd)

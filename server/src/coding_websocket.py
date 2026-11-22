@@ -7669,7 +7669,34 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
         key = f"{request_id}:{payload.get('toolCallId', '')}"
         future = state["pending"].get(key)
         tool_res = payload.get("result")
-        if tool_res is None and (
+        if payload.get("type") == "WORKSPACE_COMMAND_EXECUTION_RESULT" or payload.get("action") == "WORKSPACE_COMMAND_EXECUTION_RESULT":
+            if tool_res is None:
+                tool_res = {
+                    "ok": bool(payload.get("ok", True)),
+                    "data": {
+                        "stdout": payload.get("stdout", ""),
+                        "stderr": payload.get("stderr", ""),
+                        "exitCode": payload.get("exitCode", 0 if payload.get("ok", True) else 1),
+                        "pid": payload.get("pid"),
+                        "executed": bool(payload.get("executed", True)),
+                    },
+                    "error": payload.get("error"),
+                }
+            elif isinstance(tool_res, dict):
+                tool_res.setdefault("ok", bool(payload.get("ok", True)))
+                if not isinstance(tool_res.get("data"), dict):
+                    tool_res["data"] = {}
+                data_dict = tool_res["data"]
+                data_dict.setdefault("executed", True)
+                if "stdout" in payload and not data_dict.get("stdout"):
+                    data_dict["stdout"] = payload["stdout"]
+                if "stderr" in payload and not data_dict.get("stderr"):
+                    data_dict["stderr"] = payload["stderr"]
+                if "exitCode" in payload:
+                    data_dict.setdefault("exitCode", payload["exitCode"])
+                if "pid" in payload and data_dict.get("pid") is None:
+                    data_dict["pid"] = payload["pid"]
+        elif tool_res is None and (
             "ok" in payload
             or "stdout" in payload
             or "stderr" in payload
@@ -12045,6 +12072,16 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
 
             if reused_tool_result_this_round and not executed_tool_this_round:
                 if has_read_evidence or (proposal_required and has_relevant_source_evidence):
+                    if can_execute_commands and not has_executed_workspace_commands and not proposal_required:
+                        conversation.append({
+                            "role": "system",
+                            "content": (
+                                "You have already inspected the project. Now invoke execute_workspace_commands "
+                                "with the required commands (e.g. ['npm install', 'npm start']). "
+                                "Do not repeat read_file or other inspection tools."
+                            ),
+                        })
+                        continue
                     conversation.append({
                         "role": "system",
                         "content": (
