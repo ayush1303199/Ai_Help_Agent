@@ -10730,9 +10730,40 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 (action.get("tool") == "execute_workspace_commands" or (isinstance(action.get("arguments"), dict) and action.get("arguments", {}).get("commands")))
                 for action in semantic_task.get("actions", [])
             )
+            operational_intents = {
+                "CONFIGURATION",
+                "GENERAL_REPOSITORY_TASK",
+                "TEST_FAILURE",
+                "BUILD_FAILURE",
+                "RUNTIME_INVESTIGATION",
+                "RUN_PROJECT",
+                "ENVIRONMENT_SETUP",
+                "DEPENDENCY_MANAGEMENT",
+            }
             is_operational_cmd_intent = (
                 force_workspace_command_tool
-                or selected_intent in ("RUN_PROJECT", "ENVIRONMENT_SETUP", "DEPENDENCY_MANAGEMENT", "BUILD_FAILURE", "TEST_FAILURE")
+                or selected_intent in operational_intents
+            )
+            has_inspected_package_or_root = (
+                has_read_evidence
+                or any(
+                    isinstance(msg, dict)
+                    and msg.get("role") == "tool"
+                    and (
+                        msg.get("name") in ("list_directory", "get_repository_map", "repo_browser.list_directory")
+                        or "package.json" in str(msg.get("content") or "").lower()
+                    )
+                    for msg in conversation
+                )
+            )
+            should_force_workspace_commands = (
+                can_execute_commands
+                and not has_executed_workspace_commands
+                and not proposal_required
+                and (
+                    force_workspace_command_tool
+                    or (is_operational_cmd_intent and has_inspected_package_or_root)
+                )
             )
             if evidence_sufficiency["sufficient"] and (
                 (proposal_required and has_relevant_source_evidence)
@@ -10778,9 +10809,9 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     )
                     if exec_tool_def:
                         inspection_tools.append(exec_tool_def)
-                if force_workspace_command_tool:
+                if should_force_workspace_commands:
                     forced_tools = [
-                        t for t in inspection_tools
+                        t for t in CODING_TOOLS
                         if (t.get("function") or {}).get("name") == "execute_workspace_commands"
                     ]
                     if forced_tools:
@@ -10789,6 +10820,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 (proposal_required and round_number > 0 and not has_relevant_source_evidence)
                 or (gate_requires_more_evidence and not (can_execute_commands and has_read_evidence))
                 or force_workspace_command_tool
+                or should_force_workspace_commands
             )
             credential_fallback_active = (
                 credential_config_scan_routed
@@ -10999,9 +11031,9 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         )
                     else:
                         active_tools = [
-                            t for t in inspection_tools
+                            t for t in CODING_TOOLS
                             if (t.get("function") or {}).get("name") == "execute_workspace_commands"
-                        ] if (force_workspace_command_tool and can_execute_commands) else inspection_tools
+                        ] if (should_force_workspace_commands and can_execute_commands) else inspection_tools
                         message, selected_provider = await asyncio.to_thread(
                             complete_coding_model, registry, config_path,
                             _compact_coding_conversation(conversation),
@@ -11013,9 +11045,9 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         )
             else:
                 active_tools = [
-                    t for t in inspection_tools
+                    t for t in CODING_TOOLS
                     if (t.get("function") or {}).get("name") == "execute_workspace_commands"
-                ] if (force_workspace_command_tool and can_execute_commands) else inspection_tools
+                ] if (should_force_workspace_commands and can_execute_commands) else inspection_tools
                 message, selected_provider = await asyncio.to_thread(
                     complete_coding_model, registry, config_path,
                     _compact_coding_conversation(conversation),
@@ -11373,7 +11405,10 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                             phrase in content_text.casefold()
                             for phrase in ("what you need to do", "run:", "run the following", "in your terminal", "open a terminal", "to run the project", "to start the project", "install dependencies")
                         )
-                        if has_command_guidance:
+                        if (
+                            has_command_guidance
+                            or (is_operational_cmd_intent and not proposal_required and (has_inspected_package_or_root or force_workspace_command_tool))
+                        ):
                             force_workspace_command_tool = True
                             conversation.append({
                                 "role": "system",
@@ -12111,24 +12146,23 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 break
 
             if reused_tool_result_this_round and not executed_tool_this_round:
+                if (
+                    can_execute_commands
+                    and not has_executed_workspace_commands
+                    and not proposal_required
+                ):
+                    force_workspace_command_tool = True
+                    consecutive_no_progress = 0
+                    conversation.append({
+                        "role": "system",
+                        "content": (
+                            "You have already inspected the project. Now invoke execute_workspace_commands "
+                            "with the required commands (e.g. ['npm install', 'npm start']). "
+                            "Do not repeat read_file or other inspection tools."
+                        ),
+                    })
+                    continue
                 if has_read_evidence or (proposal_required and has_relevant_source_evidence):
-                    if (
-                        can_execute_commands
-                        and not has_executed_workspace_commands
-                        and not proposal_required
-                        and (force_workspace_command_tool or selected_intent in ("RUN_PROJECT", "ENVIRONMENT_SETUP", "DEPENDENCY_MANAGEMENT", "BUILD_FAILURE", "TEST_FAILURE"))
-                    ):
-                        force_workspace_command_tool = True
-                        consecutive_no_progress = 0
-                        conversation.append({
-                            "role": "system",
-                            "content": (
-                                "You have already inspected the project. Now invoke execute_workspace_commands "
-                                "with the required commands (e.g. ['npm install', 'npm start']). "
-                                "Do not repeat read_file or other inspection tools."
-                            ),
-                        })
-                        continue
                     conversation.append({
                         "role": "system",
                         "content": (
