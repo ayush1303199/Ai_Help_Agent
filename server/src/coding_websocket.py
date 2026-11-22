@@ -2683,11 +2683,27 @@ def _extract_tool_call_from_text(
             t_name = m.group(1)
             raw_args = m.group(2) or "{}"
             if raw_args.startswith("(") and raw_args.endswith(")"):
-                raw_args = "{}"
-            try:
-                args = json.loads(raw_args)
-            except Exception:
-                args = {}
+                inner = raw_args[1:-1].strip()
+                if inner:
+                    try:
+                        parsed_inner = json.loads(inner)
+                        if isinstance(parsed_inner, list):
+                            args = {"commands": parsed_inner}
+                        elif isinstance(parsed_inner, dict):
+                            args = parsed_inner
+                        elif isinstance(parsed_inner, str):
+                            args = {"commands": [parsed_inner]}
+                        else:
+                            args = {}
+                    except Exception:
+                        args = {}
+                else:
+                    args = {}
+            else:
+                try:
+                    args = json.loads(raw_args)
+                except Exception:
+                    args = {}
             canonical = resolve_tool_capability(t_name)
             if canonical and canonical in _SAFE_EXPLORATION_TOOLS:
                 norm_args = _normalize_extracted_tool_args(canonical, args, scope)
@@ -10423,9 +10439,9 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
     system = (
         f"{CODING_ENGINEERING_POLICY} "
         "You are the autonomous Coding Agent for the currently selected project. Inspect and navigate it through "
-        "the available tools. When the user's goal requires installing dependencies, building, testing, or running "
-        "the project, inspect workspace files (e.g. list_directory to see if node_modules exists, read_file on package.json to inspect scripts and dependencies), "
-        "and invoke execute_workspace_commands with the exact commands (e.g. ['npm install', 'npm start']) and observe the real tool output (stdout, stderr, exitCode, pid) before responding—NEVER reply with a passive text guide telling the user to open a terminal when execution is available. "
+        "the available tools. You have live access to execute_workspace_commands in a verified isolated Windows supervisor sandbox. "
+        "When the user asks to install dependencies, build, test, or run the project, inspect package.json if needed and call execute_workspace_commands directly—do NOT write a manual 'What you need to do' tutorial. "
+        "Observe the real tool output (stdout, stderr, exitCode, pid) before responding—NEVER reply with a passive text guide telling the user to open a terminal when execution is available. "
         "Verified Windows supervisor process isolation via AiHelpAgentSupervisor is enabled and available: you CAN and MUST execute workspace commands via execute_workspace_commands. Never state or imply 'I am unable to execute shell commands' or 'I cannot run npm install or start the server for you'. "
         "For pure conceptual/coding Q&A (e.g. 8+8, standalone programming examples in Java, Python, etc.), answer directly without calling workspace execution tools. "
         "For offensive security exploit requests (e.g. SQL injection attacks, exploit generation, credential harvesting, or bypass instructions), refuse immediately with a brief security explanation; do not attempt code changes, file mutations, or unified-diff generation. "
@@ -10560,8 +10576,9 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
     if sandbox_verified or is_project_attached:
         execution_note = (
             "Verified Windows supervisor process isolation is ACTIVE and ALLOWED (NT AUTHORITY\\SYSTEM). "
-            "You have full authority to execute workspace commands (such as dependency installation, building, testing, or starting project servers) "
-            "via execute_workspace_commands. Never state or imply that you cannot execute shell commands or run scripts in this environment."
+            "You have live access to execute_workspace_commands in a verified isolated Windows supervisor sandbox. "
+            "When the user asks to install dependencies, build, test, or run the project, inspect package.json if needed and call execute_workspace_commands directly—do NOT write a manual 'What you need to do' tutorial. "
+            "Never state or imply that you cannot execute shell commands or run scripts in this environment."
         )
     else:
         execution_note = "All file operations are read-only and project-root confined."
@@ -10725,9 +10742,21 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 inspection_tools,
                 semantic_task,
             )
+            if can_execute_commands:
+                has_exec_tool = any(
+                    (t.get("function") or {}).get("name") == "execute_workspace_commands"
+                    for t in inspection_tools
+                )
+                if not has_exec_tool:
+                    exec_tool_def = next(
+                        (t for t in CODING_TOOLS if (t.get("function") or {}).get("name") == "execute_workspace_commands"),
+                        None
+                    )
+                    if exec_tool_def:
+                        inspection_tools.append(exec_tool_def)
             require_tool = (
                 (proposal_required and round_number > 0 and not has_relevant_source_evidence)
-                or gate_requires_more_evidence
+                or (gate_requires_more_evidence and not (can_execute_commands and has_read_evidence))
             )
             credential_fallback_active = (
                 credential_config_scan_routed
@@ -11296,6 +11325,22 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                         final_message = message
                         break
                 else:
+                    if can_execute_commands and not has_executed_workspace_commands and round_number < MAX_CODING_TOOL_ROUNDS - 1:
+                        content_text = str(message.get("content") or "")
+                        has_command_guidance = bool(re.search(r"\b(?:npm|node|yarn|pnpm|cargo|pip|python|dotnet|mvn|gradle)\s+[a-z0-9_\-\.:]+", content_text, re.IGNORECASE)) or any(
+                            phrase in content_text.casefold()
+                            for phrase in ("what you need to do", "run:", "run the following", "in your terminal", "open a terminal", "to run the project", "to start the project", "install dependencies")
+                        )
+                        if has_command_guidance:
+                            conversation.append({
+                                "role": "system",
+                                "content": (
+                                    "You have live access to execute_workspace_commands in a verified isolated Windows supervisor sandbox. "
+                                    "When the user asks to install dependencies, build, test, or run the project, inspect package.json if needed and call execute_workspace_commands directly—do NOT write a manual 'What you need to do' tutorial. "
+                                    "Invoke execute_workspace_commands now with the exact commands (e.g. ['npm install', 'npm start'])."
+                                ),
+                            })
+                            continue
                     final_message = message
                     break
             executed_tool_this_round = False
