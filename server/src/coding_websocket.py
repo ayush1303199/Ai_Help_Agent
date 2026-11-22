@@ -993,10 +993,31 @@ def _is_standalone_code_generation_request(request: str) -> bool:
     )
 
 
+def _is_operational_workspace_command_request(request: str) -> bool:
+    if not request or not isinstance(request, str):
+        return False
+    text = request.strip().casefold()
+    operational_terms = ("install", "run", "start", "build", "setup", "test", "launch", "chalao")
+    if not any(term in text for term in operational_terms):
+        return False
+    explicit_code_terms = (
+        "proposal", "unified diff", "diff", "patch", "refactor",
+        "edit file", "modify file", "change file", "update file",
+        "write code", "edit code", "modify code", "change code",
+    )
+    if any(term in text for term in explicit_code_terms):
+        return False
+    if re.search(r"\b(?:edit|modify|write|update|change|create|add)\s+(?:the\s+|a\s+|an\s+)?[\w_/-]+\.(?:js|jsx|ts|tsx|py|java|cpp|c|go|rs|rb|php|html|css)\b", text):
+        return False
+    return True
+
+
 def _requires_proposal(request: str) -> bool:
     if _is_capability_question(request):
         return False
     if _is_standalone_code_generation_request(request):
+        return False
+    if _is_operational_workspace_command_request(request):
         return False
     if EXPLANATION_PATTERN.search(request) and not EXPLICIT_CHANGE_PATTERN.search(request):
         return False
@@ -1240,6 +1261,8 @@ def _requires_proposal_for_conversation(messages: List[Dict[str, Any]]) -> bool:
         return False
     latest_request = user_requests[-1]
     if _is_capability_question(latest_request):
+        return False
+    if _is_operational_workspace_command_request(latest_request):
         return False
     if EXPLANATION_FOLLOW_UP_PATTERN.search(latest_request):
         return False
@@ -2716,56 +2739,6 @@ def _extract_tool_call_from_text(
                             "arguments": json.dumps(norm_args),
                         },
                     }
-    return None
-    json_match = re.search(
-        r'\{[^{}]*?"(?:tool|name|function)"\s*:\s*"([a-zA-Z0-9_\.]+)"[^{}]*?\}',
-        content,
-    )
-    if json_match:
-        try:
-            parsed = json.loads(json_match.group(0))
-            tool_name = parsed.get("tool") or parsed.get("name") or parsed.get("function")
-            raw_args = parsed.get("arguments") or {}
-            canonical = resolve_tool_capability(str(tool_name or ""))
-            if canonical and canonical != "run_verification":
-                norm_args = _normalize_extracted_tool_args(canonical, raw_args, scope)
-                return {
-                    "id": f"extracted-{canonical}-{round_number}",
-                    "type": "function",
-                    "function": {
-                        "name": canonical,
-                        "arguments": json.dumps(norm_args),
-                    },
-                }
-        except Exception:
-            pass
-
-    allowed_candidates = [
-        t for t in TOOL_NAMES if t not in ("run_verification", "terminal.run_command", "execute_sql")
-    ]
-    for tool in sorted(allowed_candidates, key=len, reverse=True):
-        pattern = rf'\b(?:Next step:\s*)?({re.escape(tool)})\s*(\{{[^}}]*\}}|\([^)]*\))?'
-        m = re.search(pattern, content)
-        if m:
-            t_name = m.group(1)
-            raw_args = m.group(2) or "{}"
-            if raw_args.startswith("(") and raw_args.endswith(")"):
-                raw_args = "{}"
-            try:
-                args = json.loads(raw_args)
-            except Exception:
-                args = {}
-            canonical = resolve_tool_capability(t_name)
-            if canonical and canonical != "run_verification":
-                norm_args = _normalize_extracted_tool_args(canonical, args, scope)
-                return {
-                    "id": f"extracted-{canonical}-{round_number}",
-                    "type": "function",
-                    "function": {
-                        "name": canonical,
-                        "arguments": json.dumps(norm_args),
-                    },
-                }
     return None
 
 
@@ -7717,15 +7690,21 @@ async def handle_coding_payload(raw: str, send_json, state: Dict[str, Any], regi
         key = f"{request_id}:{payload.get('toolCallId', '')}"
         future = state["pending"].get(key)
         tool_res = payload.get("result")
-        if tool_res is None and (payload.get("ok") is not None or payload.get("stdout") is not None):
+        if tool_res is None and (
+            "ok" in payload
+            or "stdout" in payload
+            or "stderr" in payload
+            or "error" in payload
+            or "exitCode" in payload
+        ):
             tool_res = {
                 "ok": bool(payload.get("ok", True)),
                 "data": {
                     "stdout": payload.get("stdout", ""),
                     "stderr": payload.get("stderr", ""),
-                    "exitCode": payload.get("exitCode", 0),
+                    "exitCode": payload.get("exitCode", 0 if payload.get("ok", True) else 1),
                     "pid": payload.get("pid"),
-                    "executed": True,
+                    "executed": bool(payload.get("executed", True)),
                 },
                 "error": payload.get("error"),
             }
@@ -7896,6 +7875,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         or _active_backend_project.get("status") == "PROJECT_ATTACHED"
     )
     request_understanding = understand_human_request(request, supplied)
+    force_workspace_command_tool = False
     underspecified_file_creation = _is_underspecified_file_creation_request(request)
     capability_question = request_understanding.get("action") == TaskIntent.CAPABILITY_QUESTION
     proposal_required = (
@@ -8886,6 +8866,27 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
     if previous_created_at:
         semantic_task["timestamps"]["createdAt"] = previous_created_at
     if selected_semantics:
+        placeholder = "Resolve the task goal, relevant target, and required evidence."
+        if placeholder in semantic_task.get("requiredEvidence", []):
+            semantic_task["requiredEvidence"] = [
+                item for item in semantic_task.get("requiredEvidence", [])
+                if item != placeholder
+            ]
+        if placeholder in semantic_task.get("evidenceRequirementDefinitions", []):
+            semantic_task["evidenceRequirementDefinitions"] = [
+                item for item in semantic_task.get("evidenceRequirementDefinitions", [])
+                if item != placeholder
+            ]
+        if "evidenceRequirements" in semantic_task:
+            semantic_task["evidenceRequirements"] = [
+                item for item in semantic_task.get("evidenceRequirements", [])
+                if (item.get("requirement") if isinstance(item, dict) else item) != placeholder
+            ]
+        if "requiredEvidenceDetails" in semantic_task:
+            semantic_task["requiredEvidenceDetails"] = [
+                item for item in semantic_task.get("requiredEvidenceDetails", [])
+                if (item.get("requirement") if isinstance(item, dict) else item) != placeholder
+            ]
         if not explicit_continuation:
             semantic_task["goal"].update({
                 "statement": SecretProtector.redact_text(selected_semantics.get("goal") or request),
@@ -10757,6 +10758,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             require_tool = (
                 (proposal_required and round_number > 0 and not has_relevant_source_evidence)
                 or (gate_requires_more_evidence and not (can_execute_commands and has_read_evidence))
+                or force_workspace_command_tool
             )
             credential_fallback_active = (
                 credential_config_scan_routed
@@ -11006,6 +11008,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 if extracted:
                     calls = [extracted]
                     message["tool_calls"] = calls
+            if calls:
+                force_workspace_command_tool = False
             if proposal_required and calls:
                 listed_candidates = {
                     candidate.casefold()
@@ -11332,6 +11336,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                             for phrase in ("what you need to do", "run:", "run the following", "in your terminal", "open a terminal", "to run the project", "to start the project", "install dependencies")
                         )
                         if has_command_guidance:
+                            force_workspace_command_tool = True
                             conversation.append({
                                 "role": "system",
                                 "content": (
