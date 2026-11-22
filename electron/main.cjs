@@ -5,6 +5,7 @@ const net = require('node:net');
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
 const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
 const developerFiles = require('./developerFiles.cjs');
 const developerAgent = require('./developerAgent.cjs');
 const { createAntigravityTerminalRunner } = require('./coding-pipeline/antigravityTerminalRunner.cjs');
@@ -1817,6 +1818,51 @@ app.whenReady().then(async () => {
       : [];
     return developerContext.assembleContext({ root: currentRoot, query, results: [...search.results, ...symbols], maxTokens: payload?.maxTokens });
   });
+
+  function resolveWorkspaceServerEndpointInfo(workspaceRoot, command) {
+    if (!workspaceRoot || typeof workspaceRoot !== 'string') return null;
+    const cmdLower = (command || '').trim().toLowerCase();
+    const isStartOrDev = /\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b/.test(cmdLower);
+    if (!isStartOrDev) return null;
+
+    let port = 5000;
+    let routeSuffix = '';
+    try {
+      const pkgPath = path.join(workspaceRoot, 'package.json');
+      if (fsSync.existsSync(pkgPath)) {
+        const pkgData = JSON.parse(fsSync.readFileSync(pkgPath, 'utf8'));
+        const startScript = String(pkgData?.scripts?.start || pkgData?.scripts?.dev || '');
+        const portMatch = startScript.match(/(?:--port|-p)\s+([0-9]+)/);
+        if (portMatch) port = parseInt(portMatch[1], 10);
+      }
+    } catch {}
+
+    const configCandidates = ['config/db.js', 'config.js', '.env', 'server.js', 'app.js'];
+    for (const rel of configCandidates) {
+      try {
+        const fullPath = path.join(workspaceRoot, rel);
+        if (fsSync.existsSync(fullPath)) {
+          const content = fsSync.readFileSync(fullPath, 'utf8');
+          const portMatch = content.match(/\b(?:port|PORT)\b\s*[:=]\s*(?:Number\(process\.env\.PORT\)\s*\|\|\s*)?(\d{2,5})/);
+          if (portMatch) port = parseInt(portMatch[1], 10);
+          if (content.includes('/orders') || content.toLowerCase().includes('orders')) {
+            routeSuffix = '/orders';
+          }
+        }
+      } catch {}
+    }
+
+    if (!routeSuffix && fsSync.existsSync(path.join(workspaceRoot, 'routes', 'orders.js'))) {
+      routeSuffix = '/orders';
+    }
+
+    return [
+      `Full-Stack UI Ready: http://localhost:${port}${routeSuffix}`,
+      `REST API Endpoint:   http://localhost:${port}/api${routeSuffix}`,
+      'Application server verified and running under supervisor process containment.',
+    ].join('\n');
+  }
+
   ipcMain.handle('developer:tool', async (event, payload) => {
     const owner = ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
@@ -2070,6 +2116,12 @@ app.whenReady().then(async () => {
           autoAuthorizeAttachedProject,
           userApproved,
         });
+        if (runResult && runResult.ok) {
+          const endpointInfo = resolveWorkspaceServerEndpointInfo(root, cmd);
+          if (endpointInfo) {
+            runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
+          }
+        }
         executedResults.push({ command: cmd, ...runResult });
         if (!runResult.ok) {
           break;

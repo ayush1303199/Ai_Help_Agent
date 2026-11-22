@@ -10774,6 +10774,13 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     )
                     if exec_tool_def:
                         inspection_tools.append(exec_tool_def)
+                if force_workspace_command_tool:
+                    forced_tools = [
+                        t for t in inspection_tools
+                        if (t.get("function") or {}).get("name") == "execute_workspace_commands"
+                    ]
+                    if forced_tools:
+                        inspection_tools = forced_tools
             require_tool = (
                 (proposal_required and round_number > 0 and not has_relevant_source_evidence)
                 or (gate_requires_more_evidence and not (can_execute_commands and has_read_evidence))
@@ -10987,20 +10994,28 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                             "ACTION_REPLANNED",
                         )
                     else:
+                        active_tools = [
+                            t for t in inspection_tools
+                            if (t.get("function") or {}).get("name") == "execute_workspace_commands"
+                        ] if (force_workspace_command_tool and can_execute_commands) else inspection_tools
                         message, selected_provider = await asyncio.to_thread(
                             complete_coding_model, registry, config_path,
                             _compact_coding_conversation(conversation),
-                            inspection_tools,
+                            active_tools,
                             selected_provider_id,
                             require_tool,
                             request_id,
                             session_id,
                         )
             else:
+                active_tools = [
+                    t for t in inspection_tools
+                    if (t.get("function") or {}).get("name") == "execute_workspace_commands"
+                ] if (force_workspace_command_tool and can_execute_commands) else inspection_tools
                 message, selected_provider = await asyncio.to_thread(
                     complete_coding_model, registry, config_path,
                     _compact_coding_conversation(conversation),
-                    inspection_tools,
+                    active_tools,
                     selected_provider_id,
                     require_tool,
                     request_id,
@@ -11354,7 +11369,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                             phrase in content_text.casefold()
                             for phrase in ("what you need to do", "run:", "run the following", "in your terminal", "open a terminal", "to run the project", "to start the project", "install dependencies")
                         )
-                        if has_command_guidance:
+                        if not proposal_required or has_command_guidance:
                             force_workspace_command_tool = True
                             conversation.append({
                                 "role": "system",
@@ -11369,6 +11384,8 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     break
             executed_tool_this_round = False
             reused_tool_result_this_round = False
+            if any(((call.get("function") or {}) if isinstance(call, dict) else {}).get("name") == "execute_workspace_commands" for call in calls):
+                force_workspace_command_tool = False
             for index, call in enumerate(calls):
                 tool_call_id = str(call.get("id") or f"tool-{round_number}-{index}")
                 try:

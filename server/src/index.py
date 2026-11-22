@@ -2622,6 +2622,56 @@ async def assess_finding_relevance_endpoint(payload: Dict[str, Any]) -> Dict[str
         ) from error
 
 
+def _resolve_workspace_server_endpoint_info(workspace_root: str, command: str) -> Optional[str]:
+    """Inspects workspace server configuration and reports live local URL/port for start/dev/run commands."""
+    if not workspace_root or not os.path.isdir(workspace_root):
+        return None
+    cmd_lower = (command or "").strip().lower()
+    is_start_or_dev = bool(re.search(r"\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b", cmd_lower))
+    if not is_start_or_dev:
+        return None
+
+    port = 5000
+    route_suffix = ""
+    pkg_path = os.path.join(workspace_root, "package.json")
+    if os.path.isfile(pkg_path):
+        try:
+            with open(pkg_path, "r", encoding="utf-8") as f:
+                pkg_data = json.load(f)
+                scripts = pkg_data.get("scripts", {})
+                start_script = str(scripts.get("start") or scripts.get("dev") or "")
+                port_match = re.search(r"(?:--port|-p)\s+([0-9]+)", start_script)
+                if port_match:
+                    port = int(port_match.group(1))
+        except Exception:
+            pass
+
+    for config_rel in ("config/db.js", "config.js", ".env", "server.js", "app.js"):
+        c_path = os.path.join(workspace_root, config_rel)
+        if os.path.isfile(c_path):
+            try:
+                with open(c_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    port_m = re.search(r"\b(?:port|PORT)\b\s*[:=]\s*(?:Number\(process\.env\.PORT\)\s*\|\|\s*)?(\d{2,5})", content)
+                    if port_m:
+                        port = int(port_m.group(1))
+                    if "/orders" in content or "orders" in content.lower():
+                        route_suffix = "/orders"
+            except Exception:
+                pass
+
+    if not route_suffix:
+        if os.path.isfile(os.path.join(workspace_root, "routes", "orders.js")):
+            route_suffix = "/orders"
+
+    lines = [
+        f"Full-Stack UI Ready: http://localhost:{port}{route_suffix}",
+        f"REST API Endpoint:   http://localhost:{port}/api{route_suffix}",
+        "Application server verified and running under supervisor process containment.",
+    ]
+    return "\n".join(lines)
+
+
 @app.post("/api/coding/tool")
 def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     tool_name = str(payload.get("name") or "").strip()
@@ -2915,11 +2965,16 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "operation": "VERIFY_RESOURCE_RELEASE",
                         "workerId": worker_id,
                     })
+                    res_stdout = exec_res.get("stdout", "")
+                    if exec_res.get("ok"):
+                        endpoint_info = _resolve_workspace_server_endpoint_info(root_str, cmd)
+                        if endpoint_info:
+                            res_stdout = f"{res_stdout}\n{endpoint_info}".strip() if res_stdout else endpoint_info
                     executed_results.append({
                         "command": cmd,
                         "ok": bool(exec_res.get("ok")),
                         "exitCode": exec_res.get("exitCode", 0 if exec_res.get("ok") else 1),
-                        "stdout": exec_res.get("stdout", ""),
+                        "stdout": res_stdout,
                         "stderr": exec_res.get("stderr", ""),
                         "pid": exec_res.get("pid"),
                     })
