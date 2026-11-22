@@ -6816,6 +6816,15 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             for c in raw_cmds
             if str(c).strip()
         ]
+        readonly_prefixes = ("cat", "ls", "dir", "type", "head", "tail", "pwd")
+        for cmd_item in normalized_args["commands"]:
+            cmd_tokens = cmd_item.strip().split()
+            first_token = cmd_tokens[0].lower() if cmd_tokens else ""
+            if first_token in readonly_prefixes:
+                raise ValueError(
+                    "Read-only inspection commands (cat, ls, dir, type) are not allowed in execute_workspace_commands. "
+                    "Use read_file to inspect package.json, then call execute_workspace_commands with ['npm install', 'npm start']."
+                )
         normalized_args["rationale"] = str(arguments.get("rationale") or arguments.get("reason") or "").strip()[:CODING_MAX_PATH_CHARS]
         normalized_args["reason"] = normalized_args["rationale"]
     elif canonical_name == "execute_sql":
@@ -10771,18 +10780,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 force_workspace_command_tool
                 or selected_intent in operational_intents
             )
-            has_inspected_package_or_root = (
-                has_read_evidence
-                or any(
-                    isinstance(msg, dict)
-                    and msg.get("role") == "tool"
-                    and (
-                        msg.get("name") in ("list_directory", "get_repository_map", "repo_browser.list_directory")
-                        or "package.json" in str(msg.get("content") or "").lower()
-                    )
-                    for msg in conversation
-                )
-            )
+            has_inspected_package_or_root = bool(has_read_evidence)
             should_force_workspace_commands = (
                 can_execute_commands
                 and not has_executed_workspace_commands
@@ -11459,10 +11457,21 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 except ValueError as tool_err:
                     raw_fn_name = str(((call.get("function") or {}) if isinstance(call, dict) else {}).get("name") or "unknown")
                     error_text = str(tool_err)[:500]
+                    is_readonly_rejection = "Read-only inspection commands" in error_text
                     error_code = (
-                        "INVALID_TOOL_ARGUMENTS"
+                        "READ_ONLY_COMMAND_NOT_ALLOWED"
+                        if is_readonly_rejection
+                        else "INVALID_TOOL_ARGUMENTS"
                         if error_text.startswith("INVALID_TOOL_ARGUMENTS:")
                         else "UNKNOWN_MODEL_TOOL"
+                    )
+                    recovery_instruction = (
+                        "Use read_file to inspect package.json, then call execute_workspace_commands with ['npm install', 'npm start']."
+                        if is_readonly_rejection
+                        else (
+                            "Do not ask the user to choose a tool. Select an exact capability from the "
+                            "available list in the error and retry through the normal reasoning cycle."
+                        )
                     )
                     conversation.append({
                         "role": "tool",
@@ -11472,10 +11481,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                             "ok": False,
                             "code": error_code,
                             "error": error_text,
-                            "recoveryInstruction": (
-                                "Do not ask the user to choose a tool. Select an exact capability from the "
-                                "available list in the error and retry through the normal reasoning cycle."
-                            ),
+                            "recoveryInstruction": recovery_instruction,
                         }),
                     })
                     continue
