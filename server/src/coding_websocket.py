@@ -6818,9 +6818,10 @@ def _validate_tool_call(call: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
         ]
         readonly_prefixes = ("cat", "ls", "dir", "type", "head", "tail", "pwd")
         for cmd_item in normalized_args["commands"]:
-            cmd_tokens = cmd_item.strip().split()
-            first_token = cmd_tokens[0].lower() if cmd_tokens else ""
-            if first_token in readonly_prefixes:
+            cmd_str = str(cmd_item).strip().lower()
+            cmd_tokens = cmd_str.split()
+            first_token = cmd_tokens[0] if cmd_tokens else ""
+            if cmd_str in readonly_prefixes or first_token in readonly_prefixes:
                 raise ValueError(
                     "Read-only inspection commands (cat, ls, dir, type) are not allowed in execute_workspace_commands. "
                     "Use read_file to inspect package.json, then call execute_workspace_commands with ['npm install', 'npm start']."
@@ -10837,7 +10838,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 if should_force_workspace_commands:
                     forced_tools = [
                         t for t in CODING_TOOLS
-                        if (t.get("function") or {}).get("name") == "execute_workspace_commands"
+                        if (t.get("function") or {}).get("name") in ("execute_workspace_commands", "read_file")
                     ]
                     if forced_tools:
                         inspection_tools = forced_tools
@@ -11057,7 +11058,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     else:
                         active_tools = [
                             t for t in CODING_TOOLS
-                            if (t.get("function") or {}).get("name") == "execute_workspace_commands"
+                            if (t.get("function") or {}).get("name") in ("execute_workspace_commands", "read_file")
                         ] if (should_force_workspace_commands and can_execute_commands) else inspection_tools
                         message, selected_provider = await asyncio.to_thread(
                             complete_coding_model, registry, config_path,
@@ -11071,7 +11072,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
             else:
                 active_tools = [
                     t for t in CODING_TOOLS
-                    if (t.get("function") or {}).get("name") == "execute_workspace_commands"
+                    if (t.get("function") or {}).get("name") in ("execute_workspace_commands", "read_file")
                 ] if (should_force_workspace_commands and can_execute_commands) else inspection_tools
                 message, selected_provider = await asyncio.to_thread(
                     complete_coding_model, registry, config_path,
