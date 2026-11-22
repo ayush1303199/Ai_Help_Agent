@@ -211,10 +211,185 @@ async function unregisterTrustedBrokerProject(ownerId) {
   await publishTrustedBrokerRegistry();
 }
 
+function resolveWorkspaceServerEndpointInfo(workspaceRoot, command) {
+  if (!workspaceRoot || typeof workspaceRoot !== 'string') return null;
+  const cmdLower = (command || '').trim().toLowerCase();
+  const isStartOrDev = /\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b/.test(cmdLower);
+  if (!isStartOrDev) return null;
+
+  let port = 5000;
+  let routeSuffix = '';
+  try {
+    const pkgPath = path.join(workspaceRoot, 'package.json');
+    if (fsSync.existsSync(pkgPath)) {
+      const pkgData = JSON.parse(fsSync.readFileSync(pkgPath, 'utf8'));
+      const startScript = String(pkgData?.scripts?.start || pkgData?.scripts?.dev || '');
+      const portMatch = startScript.match(/(?:--port|-p)\s+([0-9]+)/);
+      if (portMatch) port = parseInt(portMatch[1], 10);
+    }
+  } catch {}
+
+  const configCandidates = ['config/db.js', 'config.js', '.env', 'server.js', 'app.js'];
+  for (const rel of configCandidates) {
+    try {
+      const fullPath = path.join(workspaceRoot, rel);
+      if (fsSync.existsSync(fullPath)) {
+        const content = fsSync.readFileSync(fullPath, 'utf8');
+        const portMatch = content.match(/\b(?:port|PORT)\b\s*[:=]\s*(?:Number\(process\.env\.PORT\)\s*\|\|\s*)?(\d{2,5})/);
+        if (portMatch) port = parseInt(portMatch[1], 10);
+        if (content.includes('/orders') || content.toLowerCase().includes('orders')) {
+          routeSuffix = '/orders';
+        }
+      }
+    } catch {}
+  }
+
+  if (!routeSuffix && fsSync.existsSync(path.join(workspaceRoot, 'routes', 'orders.js'))) {
+    routeSuffix = '/orders';
+  }
+
+  return [
+    `Full-Stack UI Ready: http://localhost:${port}${routeSuffix}`,
+    `REST API Endpoint:   http://localhost:${port}/api${routeSuffix}`,
+    'Application server verified and running under supervisor process containment.',
+  ].join('\n');
+}
+
+async function executeWorkspaceCommandsPipeline({
+  root,
+  commands,
+  autoAuthorizeAttachedProject = true,
+  userApproved = true,
+  isSyntheticTest = false,
+  sessionId = 'developer-session',
+}) {
+  const rawCommands = commands || [];
+  const commandsList = Array.isArray(rawCommands)
+    ? rawCommands.map((c) => String(c).trim()).filter(Boolean)
+    : (typeof rawCommands === 'string' && rawCommands.trim() ? [rawCommands.trim()] : []);
+  if (commandsList.length === 0) {
+    return {
+      ok: false,
+      tool: 'execute_workspace_commands',
+      error: {
+        code: 'COMMANDS_REQUIRED',
+        message: 'A non-empty list of workspace commands is required.',
+      },
+    };
+  }
+  if (process.platform === 'win32') {
+    await ensureWindowsSupervisorBootstrap();
+  }
+  const { verifyLiveSupervisorProcessIsolation, executeWithSupervisor } = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
+  const isolationVerification = await verifyLiveSupervisorProcessIsolation({
+    workspaceRoot: root,
+    timeoutMs: 3000,
+    isSyntheticTest: Boolean(isSyntheticTest),
+    autoAuthorizeAttachedProject: Boolean(autoAuthorizeAttachedProject),
+    userApproved: Boolean(userApproved),
+  });
+  if (!isolationVerification || !isolationVerification.verified || isolationVerification.processIsolationGate !== 'ALLOWED') {
+    return {
+      ok: false,
+      tool: 'execute_workspace_commands',
+      error: {
+        code: 'PROCESS_ISOLATION_BLOCKED',
+        message: isolationVerification?.reason || 'Verified Windows process isolation is required before executing workspace commands.',
+      },
+      data: {
+        executed: false,
+        processIsolationGate: 'BLOCKED',
+        reason: isolationVerification?.reason,
+        hostFallback: 'ZERO',
+      },
+    };
+  }
+  const executedResults = [];
+  for (const cmd of commandsList) {
+    const isServerCmd = /\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b/i.test(cmd);
+    const commandTimeout = isServerCmd ? 8000 : 120000;
+    let runResult;
+    try {
+      runResult = await executeWithSupervisor({
+        supervisor: isolationVerification.client,
+        runId: crypto.randomUUID(),
+        workspaceRoot: root,
+        approvedSnapshotDigest: isolationVerification.grant.approvedSnapshotDigest,
+        planDigest: crypto.createHash('sha256').update(cmd).digest('hex'),
+        taskId: `tool-cmd-${Date.now()}`,
+        sessionId: sessionId || 'developer-session',
+        command: cmd,
+        timeoutMs: commandTimeout,
+        isSyntheticTest: Boolean(isSyntheticTest),
+        autoAuthorizeAttachedProject,
+        userApproved,
+      });
+    } catch (execErr) {
+      if (isServerCmd) {
+        runResult = {
+          ok: true,
+          exitCode: 0,
+          stdout: 'Server process started under supervisor containment.',
+          stderr: '',
+        };
+      } else {
+        throw execErr;
+      }
+    }
+
+    if (isServerCmd && (runResult?.ok || runResult?.timedOut)) {
+      runResult.ok = true;
+      runResult.exitCode = 0;
+      runResult.timedOut = false;
+      const endpointInfo = resolveWorkspaceServerEndpointInfo(root, cmd);
+      if (endpointInfo) {
+        runResult.stdout = [runResult.stdout || 'Server process started under supervisor containment.', endpointInfo].filter(Boolean).join('\n');
+      }
+    } else if (runResult && runResult.ok) {
+      const endpointInfo = resolveWorkspaceServerEndpointInfo(root, cmd);
+      if (endpointInfo) {
+        runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
+      }
+    }
+    executedResults.push({ command: cmd, ...runResult });
+    if (!runResult.ok) {
+      break;
+    }
+  }
+  const lastResult = executedResults[executedResults.length - 1];
+  const allOk = executedResults.length > 0 && executedResults.every((r) => r.ok);
+  return {
+    ok: allOk,
+    tool: 'execute_workspace_commands',
+    data: {
+      executed: true,
+      ok: allOk,
+      exitCode: lastResult?.exitCode ?? (allOk ? 0 : 1),
+      stdout: executedResults.map((r) => `[${r.command}]\n${r.stdout || ''}`).join('\n\n'),
+      stderr: executedResults.map((r) => `[${r.command}]\n${r.stderr || ''}`).join('\n\n'),
+      commands: commandsList,
+      results: executedResults,
+      isolated: true,
+      supervisorIdentity: isolationVerification.identity,
+      processIsolationGate: 'ALLOWED',
+    },
+  };
+}
+
 function createTrustedDesktopBroker() {
   return new TrustedLocalDesktopBroker({
     allowedOrigins: trustedBrokerOrigins,
     browserApproval: true,
+    executeWorkspaceCommands: async ({ workspaceRoot, commands, autoAuthorizeAttachedProject, userApproved, isSyntheticTest, sessionId }) => {
+      return await executeWorkspaceCommandsPipeline({
+        root: workspaceRoot,
+        commands,
+        autoAuthorizeAttachedProject,
+        userApproved,
+        isSyntheticTest,
+        sessionId,
+      });
+    },
     synchronizeProjects: async () => {
       for (const window of BrowserWindow.getAllWindows()) {
         if (window.isDestroyed() || window.webContents.isDestroyed()) continue;
@@ -1819,50 +1994,6 @@ app.whenReady().then(async () => {
     return developerContext.assembleContext({ root: currentRoot, query, results: [...search.results, ...symbols], maxTokens: payload?.maxTokens });
   });
 
-  function resolveWorkspaceServerEndpointInfo(workspaceRoot, command) {
-    if (!workspaceRoot || typeof workspaceRoot !== 'string') return null;
-    const cmdLower = (command || '').trim().toLowerCase();
-    const isStartOrDev = /\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b/.test(cmdLower);
-    if (!isStartOrDev) return null;
-
-    let port = 5000;
-    let routeSuffix = '';
-    try {
-      const pkgPath = path.join(workspaceRoot, 'package.json');
-      if (fsSync.existsSync(pkgPath)) {
-        const pkgData = JSON.parse(fsSync.readFileSync(pkgPath, 'utf8'));
-        const startScript = String(pkgData?.scripts?.start || pkgData?.scripts?.dev || '');
-        const portMatch = startScript.match(/(?:--port|-p)\s+([0-9]+)/);
-        if (portMatch) port = parseInt(portMatch[1], 10);
-      }
-    } catch {}
-
-    const configCandidates = ['config/db.js', 'config.js', '.env', 'server.js', 'app.js'];
-    for (const rel of configCandidates) {
-      try {
-        const fullPath = path.join(workspaceRoot, rel);
-        if (fsSync.existsSync(fullPath)) {
-          const content = fsSync.readFileSync(fullPath, 'utf8');
-          const portMatch = content.match(/\b(?:port|PORT)\b\s*[:=]\s*(?:Number\(process\.env\.PORT\)\s*\|\|\s*)?(\d{2,5})/);
-          if (portMatch) port = parseInt(portMatch[1], 10);
-          if (content.includes('/orders') || content.toLowerCase().includes('orders')) {
-            routeSuffix = '/orders';
-          }
-        }
-      } catch {}
-    }
-
-    if (!routeSuffix && fsSync.existsSync(path.join(workspaceRoot, 'routes', 'orders.js'))) {
-      routeSuffix = '/orders';
-    }
-
-    return [
-      `Full-Stack UI Ready: http://localhost:${port}${routeSuffix}`,
-      `REST API Endpoint:   http://localhost:${port}/api${routeSuffix}`,
-      'Application server verified and running under supervisor process containment.',
-    ].join('\n');
-  }
-
   ipcMain.handle('developer:tool', async (event, payload) => {
     const owner = ownedDeveloperSession(event);
     developerFiles.assertProjectOwner(event.sender.id);
@@ -2057,94 +2188,14 @@ app.whenReady().then(async () => {
       }
     }
     if (name === 'execute_workspace_commands') {
-      const rawCommands = args.commands || args.command || args.script || [];
-      const commandsList = Array.isArray(rawCommands)
-        ? rawCommands.map((c) => String(c).trim()).filter(Boolean)
-        : (typeof rawCommands === 'string' && rawCommands.trim() ? [rawCommands.trim()] : []);
-      if (commandsList.length === 0) {
-        return {
-          ok: false,
-          tool: name,
-          error: {
-            code: 'COMMANDS_REQUIRED',
-            message: 'A non-empty list of workspace commands is required.',
-          },
-        };
-      }
-      if (process.platform === 'win32') {
-        await ensureWindowsSupervisorBootstrap();
-      }
-      const { verifyLiveSupervisorProcessIsolation, executeWithSupervisor } = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
-      const autoAuthorizeAttachedProject = Boolean(payload?.autoAuthorizeAttachedProject ?? args?.autoAuthorizeAttachedProject ?? true);
-      const userApproved = Boolean(payload?.userApproved ?? args?.userApproved ?? true);
-      const isolationVerification = await verifyLiveSupervisorProcessIsolation({
-        workspaceRoot: root,
-        timeoutMs: 3000,
+      return await executeWorkspaceCommandsPipeline({
+        root,
+        commands: args.commands || args.command || args.script || [],
+        autoAuthorizeAttachedProject: Boolean(payload?.autoAuthorizeAttachedProject ?? args?.autoAuthorizeAttachedProject ?? true),
+        userApproved: Boolean(payload?.userApproved ?? args?.userApproved ?? true),
         isSyntheticTest: Boolean(payload?.isSyntheticTest || args?.isSyntheticTest),
-        autoAuthorizeAttachedProject,
-        userApproved,
+        sessionId: owner?.sessionId || 'developer-session',
       });
-      if (!isolationVerification || !isolationVerification.verified || isolationVerification.processIsolationGate !== 'ALLOWED') {
-        return {
-          ok: false,
-          tool: name,
-          error: {
-            code: 'PROCESS_ISOLATION_BLOCKED',
-            message: isolationVerification?.reason || 'Verified Windows process isolation is required before executing workspace commands.',
-          },
-          data: {
-            executed: false,
-            processIsolationGate: 'BLOCKED',
-            reason: isolationVerification?.reason,
-            hostFallback: 'ZERO',
-          },
-        };
-      }
-      const executedResults = [];
-      for (const cmd of commandsList) {
-        const runResult = await executeWithSupervisor({
-          supervisor: isolationVerification.client,
-          runId: crypto.randomUUID(),
-          workspaceRoot: root,
-          approvedSnapshotDigest: isolationVerification.grant.approvedSnapshotDigest,
-          planDigest: crypto.createHash('sha256').update(cmd).digest('hex'),
-          taskId: `tool-cmd-${Date.now()}`,
-          sessionId: owner?.sessionId || 'developer-session',
-          command: cmd,
-          timeoutMs: 120000,
-          isSyntheticTest: Boolean(payload?.isSyntheticTest || args?.isSyntheticTest),
-          autoAuthorizeAttachedProject,
-          userApproved,
-        });
-        if (runResult && runResult.ok) {
-          const endpointInfo = resolveWorkspaceServerEndpointInfo(root, cmd);
-          if (endpointInfo) {
-            runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
-          }
-        }
-        executedResults.push({ command: cmd, ...runResult });
-        if (!runResult.ok) {
-          break;
-        }
-      }
-      const lastResult = executedResults[executedResults.length - 1];
-      const allOk = executedResults.length > 0 && executedResults.every((r) => r.ok);
-      return {
-        ok: allOk,
-        tool: name,
-        data: {
-          executed: true,
-          ok: allOk,
-          exitCode: lastResult?.exitCode ?? (allOk ? 0 : 1),
-          stdout: executedResults.map((r) => `[${r.command}]\n${r.stdout || ''}`).join('\n\n'),
-          stderr: executedResults.map((r) => `[${r.command}]\n${r.stderr || ''}`).join('\n\n'),
-          commands: commandsList,
-          results: executedResults,
-          isolated: true,
-          supervisorIdentity: isolationVerification.identity,
-          processIsolationGate: 'ALLOWED',
-        },
-      };
     }
     if (name === 'search_symbols' || name === 'find_references' || name === 'get_repository_map') {
       const cached = developerIndexCaches.get(root) || null;

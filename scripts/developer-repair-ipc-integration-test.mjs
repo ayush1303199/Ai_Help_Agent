@@ -107,7 +107,15 @@ class FakeBrowserWindow extends EventEmitter {
 electronMock.BrowserWindow = FakeBrowserWindow;
 
 Module._load = function patchedLoad(request, parent, isMain) {
-  return request === 'electron' ? electronMock : originalLoad.call(this, request, parent, isMain);
+  if (request === 'electron') return electronMock;
+  if (typeof request === 'string' && (request.endsWith('projectProcessIsolation.cjs') || request === './coding-pipeline/projectProcessIsolation.cjs')) {
+    const original = originalLoad.call(this, request, parent, isMain);
+    return {
+      ...original,
+      verifyProjectProcessIsolation: async () => original.projectProcessIsolationStatus(),
+    };
+  }
+  return originalLoad.call(this, request, parent, isMain);
 };
 
 const developerFiles = require('../electron/developerFiles.cjs');

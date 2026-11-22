@@ -1617,42 +1617,49 @@ export class CodingAgentTransport {
           let lastError: Error | null = null;
           let executed = false;
           for (const baseUrl of baseUrls) {
-            try {
-              const res = await codingFetch(`${baseUrl}/api/coding/tool`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  requestId: request.requestId,
-                  turnId: request.turnId,
-                  name,
-                  arguments: {
-                    ...args,
-                    autoAuthorizeAttachedProject: true,
-                    userApproved: true,
-                  },
-                  scope: request.scope,
-                }),
-              });
-              if (res.ok) {
-                result = await res.json();
-                executed = true;
-                break;
-              } else if (res.status !== 404 && res.status !== 502) {
-                const errBody = await res.json().catch(() => ({}));
-                result = {
-                  ok: false,
-                  tool: name,
-                  error: {
-                    code: 'CODING_TOOL_FAILED',
-                    message: (errBody as { detail?: string })?.detail || `HTTP ${res.status}`,
-                  },
-                };
-                executed = true;
-                break;
+            const endpointPaths = name === 'execute_workspace_commands'
+              ? ['/api/coding/tool', '/api/coding/broker/workspace/commands', '/api/coding/broker/commands']
+              : ['/api/coding/tool'];
+            for (const endpointPath of endpointPaths) {
+              try {
+                const res = await codingFetch(`${baseUrl}${endpointPath}`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    requestId: request.requestId,
+                    turnId: request.turnId,
+                    name,
+                    commands: args.commands,
+                    arguments: {
+                      ...args,
+                      autoAuthorizeAttachedProject: true,
+                      userApproved: true,
+                    },
+                    scope: request.scope,
+                  }),
+                });
+                if (res.ok) {
+                  result = await res.json();
+                  executed = true;
+                  break;
+                } else if (res.status !== 404 && res.status !== 502) {
+                  const errBody = await res.json().catch(() => ({}));
+                  result = {
+                    ok: false,
+                    tool: name,
+                    error: {
+                      code: 'CODING_TOOL_FAILED',
+                      message: (errBody as { detail?: string })?.detail || `HTTP ${res.status}`,
+                    },
+                  };
+                  executed = true;
+                  break;
+                }
+              } catch (fetchErr) {
+                lastError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
               }
-            } catch (fetchErr) {
-              lastError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
             }
+            if (executed) break;
           }
           if (!executed) {
             result = {
@@ -2024,7 +2031,7 @@ export function isStandaloneCodeGenerationRequest(rawRequest: string): boolean {
     .replace(/^(?:(?:can\s+you|could\s+you|would\s+you|will\s+you|please)\s+(?:please\s+)?)+/i, '')
     .trim();
 
-  if (/^(?:fix|debug|repair|patch|refactor|modify|change|edit|update|upgrade|migrate|remove|delete|replace|install|scaffold|bootstrap|setup|set\s+up|deploy|integrate|run|start|launch|boot|execute|test|verify|investigate|diagnose|audit|inspect|examine|trace|review)\b/i.test(stripped)
+  if (/^(?:fix|debug|repair|patch|refactor|modify|change|edit|update|upgrade|migrate|remove|delete|replace|install|scaffold|bootstrap|setup|set\s+up|deploy|integrate|run|start|launch|boot|execute|test|verify|investigate|diagnose|audit|inspect|examine|trace|review|implement\s+(?:a\s+)?(?:change|fix|patch|feature|modification))\b/i.test(stripped)
     || /\b(?:clean\s*up|code\s+review)\b/i.test(clean)) {
     return false;
   }

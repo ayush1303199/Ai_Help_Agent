@@ -64,6 +64,7 @@ class TrustedLocalDesktopBroker {
     getTask,
     validateSnapshots,
     authorizeMutation = async () => ({ allowed: true }),
+    executeWorkspaceCommands = null,
   }) {
     if (!Array.isArray(allowedOrigins) || allowedOrigins.length === 0
       || !allowedOrigins.every((origin) => typeof origin === 'string' && /^https?:\/\//.test(origin))) {
@@ -87,6 +88,7 @@ class TrustedLocalDesktopBroker {
     this.getTaskDelegate = getTask;
     this.validateSnapshotsDelegate = validateSnapshots;
     this.authorizeMutationDelegate = authorizeMutation;
+    this.executeWorkspaceCommandsDelegate = executeWorkspaceCommands;
     this.projects = new Map();
     this.projectsByOwner = new Map();
     this.leases = new Map();
@@ -394,6 +396,67 @@ class TrustedLocalDesktopBroker {
     }
     await this.releaseLease(lease);
     return { released: true };
+  }
+
+  async executeWorkspaceCommands({
+    brokerSessionId,
+    sessionLeaseToken,
+    origin,
+    commands,
+    command,
+    script,
+    rationale,
+    reason,
+    scope = '.',
+    autoAuthorizeAttachedProject = true,
+    userApproved = true,
+    isSyntheticTest = false,
+    arguments: rawArguments,
+  }) {
+    let lease = null;
+    if (brokerSessionId && sessionLeaseToken) {
+      lease = this.assertLease(brokerSessionId, sessionLeaseToken, origin);
+    } else {
+      this.assertOrigin(origin);
+      lease = [...this.leases.values()].find((l) => l.active && l.origin === new URL(origin).origin)
+        || [...this.leases.values()][0]
+        || null;
+    }
+    const root = lease?.root || [...this.projects.values()][0]?.root;
+    if (!root) {
+      throw brokerError('BROKER_PROJECT_UNAUTHORIZED', 'No active registered project is available for command execution.', 403);
+    }
+    const argsObj = (rawArguments && typeof rawArguments === 'object') ? rawArguments : {};
+    const parsedCommands = commands || command || script || argsObj.commands || argsObj.command || argsObj.script || [];
+    const cmdsList = Array.isArray(parsedCommands) ? parsedCommands : (typeof parsedCommands === 'string' && parsedCommands.trim() ? [parsedCommands.trim()] : []);
+    const parsedRationale = String(rationale || reason || argsObj.rationale || argsObj.reason || '');
+
+    if (typeof this.executeWorkspaceCommandsDelegate === 'function') {
+      const res = await this.executeWorkspaceCommandsDelegate({
+        workspaceRoot: root,
+        commands: cmdsList,
+        rationale: parsedRationale,
+        scope,
+        autoAuthorizeAttachedProject: Boolean(autoAuthorizeAttachedProject ?? argsObj.autoAuthorizeAttachedProject ?? true),
+        userApproved: Boolean(userApproved ?? argsObj.userApproved ?? true),
+        isSyntheticTest: Boolean(isSyntheticTest ?? argsObj.isSyntheticTest ?? false),
+        sessionId: lease?.brokerSessionId || 'broker-session',
+        ownerWebContentsId: lease?.ownerWebContentsId,
+      });
+      const resObj = (res && typeof res === 'object') ? res : {};
+      const dataObj = (resObj.data && typeof resObj.data === 'object') ? resObj.data : {};
+      const ok = resObj.ok === true;
+      return {
+        ok,
+        executed: true,
+        exitCode: typeof dataObj.exitCode === 'number' ? dataObj.exitCode : (ok ? 0 : 1),
+        stdout: dataObj.stdout || resObj.stdout || '',
+        stderr: dataObj.stderr || resObj.stderr || '',
+        data: dataObj,
+        ...(resObj.error ? { error: resObj.error } : {}),
+      };
+    }
+    throw brokerError('BROKER_FEATURE_UNAVAILABLE', 'Workspace command execution is not configured on this broker.', 501);
   }
 
   async requestBoundApproval(lease, { taskId, proposal: proposalSummary, proposalContract, diff }) {
@@ -1068,6 +1131,27 @@ class TrustedLocalDesktopBroker {
         const body = await this.readJson(request);
         this.assertAllowedKeys(body, ['brokerSessionId', 'sessionLeaseToken']);
         this.sendJson(response, 200, await this.releaseSession({ ...body, origin }));
+        return;
+      }
+      if (request.method === 'POST' && (url.pathname === '/v1/workspace/commands' || url.pathname === '/v1/commands/execute' || url.pathname === '/v1/tools/execute')) {
+        const body = await this.readJson(request);
+        this.assertAllowedKeys(body, [
+          'brokerSessionId',
+          'sessionLeaseToken',
+          'commands',
+          'command',
+          'script',
+          'rationale',
+          'reason',
+          'scope',
+          'autoAuthorizeAttachedProject',
+          'userApproved',
+          'isSyntheticTest',
+          'name',
+          'arguments',
+        ]);
+        const result = await this.executeWorkspaceCommands({ ...body, origin });
+        this.sendJson(response, 200, result);
         return;
       }
       this.sendJson(response, 404, {

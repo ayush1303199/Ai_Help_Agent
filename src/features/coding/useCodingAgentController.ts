@@ -1651,7 +1651,9 @@ export function useCodingAgentController({
           }
           const localEndpoints = [
             `${runtimeConfig.services.http.baseUrl}/api/coding/tool`,
+            `${runtimeConfig.services.http.baseUrl}/api/coding/broker/workspace/commands`,
             'http://127.0.0.1:3001/api/coding/tool',
+            'http://127.0.0.1:3001/api/coding/broker/workspace/commands',
             'http://127.0.0.1:3002/api/coding/tool',
             'http://127.0.0.1:3003/api/coding/tool',
           ].filter((u, idx, arr) => Boolean(u) && arr.indexOf(u) === idx);
@@ -1663,6 +1665,7 @@ export function useCodingAgentController({
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   name: 'execute_workspace_commands',
+                  commands,
                   arguments: {
                     commands,
                     rationale,
@@ -1673,7 +1676,18 @@ export function useCodingAgentController({
                 }),
               });
               if (res.ok) {
-                return await res.json();
+                const body = await res.json() as Record<string, unknown>;
+                const dataObj = (body?.data && typeof body.data === 'object' ? body.data : {}) as Record<string, unknown>;
+                const ok = body?.ok === true || body?.executed === true;
+                return {
+                  ok,
+                  executed: true,
+                  exitCode: typeof dataObj.exitCode === 'number' ? dataObj.exitCode : (typeof body?.exitCode === 'number' ? body.exitCode : (ok ? 0 : 1)),
+                  stdout: String(dataObj.stdout ?? body?.stdout ?? ''),
+                  stderr: String(dataObj.stderr ?? body?.stderr ?? ''),
+                  data: dataObj,
+                  ...body,
+                };
               }
             } catch {
               // try next endpoint

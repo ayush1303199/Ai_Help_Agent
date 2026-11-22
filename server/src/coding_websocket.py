@@ -10465,7 +10465,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
         "Verified Windows supervisor process isolation via AiHelpAgentSupervisor is enabled and available: you CAN and MUST execute workspace commands via execute_workspace_commands. Never state or imply 'I am unable to execute shell commands' or 'I cannot run npm install or start the server for you'. "
         "For pure conceptual/coding Q&A (e.g. 8+8, standalone programming examples in Java, Python, etc.), answer directly without calling workspace execution tools. "
         "For offensive security exploit requests (e.g. SQL injection attacks, exploit generation, credential harvesting, or bypass instructions), refuse immediately with a brief security explanation; do not attempt code changes, file mutations, or unified-diff generation. "
-        "Never run raw destructive host commands or claim changes were applied without verified execution. "
+        "Never write files directly without an approved proposal; never run raw destructive host commands or claim changes were applied without verified execution. "
         "Use the project root and optional scope supplied in the task context. Discover the narrowest relevant "
         "directory yourself from the user's natural-language request; do not ask the user to browse files. "
         "Use the authoritative semantic task decision and its evidence requirements below; do not reinterpret "
@@ -10730,9 +10730,13 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                 (action.get("tool") == "execute_workspace_commands" or (isinstance(action.get("arguments"), dict) and action.get("arguments", {}).get("commands")))
                 for action in semantic_task.get("actions", [])
             )
+            is_operational_cmd_intent = (
+                force_workspace_command_tool
+                or selected_intent in ("RUN_PROJECT", "ENVIRONMENT_SETUP", "DEPENDENCY_MANAGEMENT", "BUILD_FAILURE", "TEST_FAILURE")
+            )
             if evidence_sufficiency["sufficient"] and (
                 (proposal_required and has_relevant_source_evidence)
-                or (not proposal_required and has_read_evidence and (has_executed_workspace_commands or round_number >= 4))
+                or (not proposal_required and has_read_evidence and (not is_operational_cmd_intent or has_executed_workspace_commands or round_number >= 4))
             ):
                 final_message = None
                 break
@@ -11369,7 +11373,7 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                             phrase in content_text.casefold()
                             for phrase in ("what you need to do", "run:", "run the following", "in your terminal", "open a terminal", "to run the project", "to start the project", "install dependencies")
                         )
-                        if not proposal_required or has_command_guidance:
+                        if has_command_guidance:
                             force_workspace_command_tool = True
                             conversation.append({
                                 "role": "system",
@@ -12069,7 +12073,13 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
                     })
 
             if consecutive_no_progress >= 2 and round_number > 0:
-                if can_execute_commands and not has_executed_workspace_commands and not proposal_required and has_read_evidence:
+                if (
+                    can_execute_commands
+                    and not has_executed_workspace_commands
+                    and not proposal_required
+                    and has_read_evidence
+                    and (force_workspace_command_tool or selected_intent in ("RUN_PROJECT", "ENVIRONMENT_SETUP", "DEPENDENCY_MANAGEMENT", "BUILD_FAILURE", "TEST_FAILURE"))
+                ):
                     force_workspace_command_tool = True
                     consecutive_no_progress = 0
                     conversation.append({
@@ -12102,7 +12112,12 @@ async def _run_coding_turn_impl(payload: Dict[str, Any], send_json, state: Dict[
 
             if reused_tool_result_this_round and not executed_tool_this_round:
                 if has_read_evidence or (proposal_required and has_relevant_source_evidence):
-                    if can_execute_commands and not has_executed_workspace_commands and not proposal_required:
+                    if (
+                        can_execute_commands
+                        and not has_executed_workspace_commands
+                        and not proposal_required
+                        and (force_workspace_command_tool or selected_intent in ("RUN_PROJECT", "ENVIRONMENT_SETUP", "DEPENDENCY_MANAGEMENT", "BUILD_FAILURE", "TEST_FAILURE"))
+                    ):
                         force_workspace_command_tool = True
                         consecutive_no_progress = 0
                         conversation.append({

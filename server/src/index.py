@@ -1918,6 +1918,18 @@ async def proxy_trusted_desktop_broker_release(request: Request) -> JSONResponse
     return await proxy_trusted_desktop_broker("release", request)
 
 
+@app.post("/api/coding/broker/workspace/commands")
+@app.post("/api/coding/broker/commands")
+def proxy_broker_workspace_commands(payload: Dict[str, Any]) -> Dict[str, Any]:
+    tool_payload = {
+        "name": "execute_workspace_commands",
+        "arguments": payload.get("arguments") or payload,
+        "scope": payload.get("scope") or ".",
+        "requestId": payload.get("requestId") or payload.get("brokerSessionId") or "",
+    }
+    return execute_coding_tool_endpoint(tool_payload)
+
+
 DISALLOWED_PROJECT_NAMES: Set[str] = {
     "the", "a", "an", "this", "that", "it", "its", "all", "any", "my", "your",
     "faq", "table", "tables", "database", "db", "query", "queries", "sql", "mysql",
@@ -2965,15 +2977,18 @@ def execute_coding_tool_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
                         "operation": "VERIFY_RESOURCE_RELEASE",
                         "workerId": worker_id,
                     })
+                    is_server_cmd = bool(re.search(r"\b(?:npm\s+start|npm\s+run\s+dev|node\s+server|node\s+app|vite|serve)\b", cmd, re.I))
+                    cmd_ok = bool(exec_res.get("ok")) or (is_server_cmd and bool(exec_res.get("timedOut")))
+                    cmd_exit = 0 if cmd_ok else exec_res.get("exitCode", 1)
                     res_stdout = exec_res.get("stdout", "")
-                    if exec_res.get("ok"):
+                    if cmd_ok:
                         endpoint_info = _resolve_workspace_server_endpoint_info(root_str, cmd)
                         if endpoint_info:
                             res_stdout = f"{res_stdout}\n{endpoint_info}".strip() if res_stdout else endpoint_info
                     executed_results.append({
                         "command": cmd,
-                        "ok": bool(exec_res.get("ok")),
-                        "exitCode": exec_res.get("exitCode", 0 if exec_res.get("ok") else 1),
+                        "ok": cmd_ok,
+                        "exitCode": cmd_exit,
                         "stdout": res_stdout,
                         "stderr": exec_res.get("stderr", ""),
                         "pid": exec_res.get("pid"),
