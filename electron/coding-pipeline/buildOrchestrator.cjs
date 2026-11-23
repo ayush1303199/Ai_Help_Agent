@@ -881,7 +881,11 @@ async function _executeBuildPlanCore({
           timedOut: Boolean(supervisorResult.timedOut),
           cancelled: Boolean(supervisorResult.cancelled),
           terminationConfirmed: Boolean(supervisorResult.terminationConfirmed),
+          lifecycleState: supervisorResult.lifecycleState || (supervisorResult.terminationConfirmed ? 'EXITED' : 'RUNNING'),
           executionStatus: supervisorResult.executionStatus || (supervisorResult.timedOut ? 'TIMED_OUT' : (supervisorResult.cancelled ? 'CANCELLED' : (supervisorResult.ok ? 'COMPLETED' : 'FAILED'))),
+          outputCaptureCompleted: supervisorResult.outputCaptureCompleted !== false && supervisorResult.outputCaptureStatus !== 'INCOMPLETE',
+          outputCaptureStatus: supervisorResult.outputCaptureStatus || 'COMPLETED',
+          executionId: plan.planDigest || sessionId,
           isAlive: isStart ? Boolean(supervisorResult.ok && (supervisorResult.childProcessSpawned || realWorkerPid)) : undefined,
           supervisor: isStart ? {
             expectedProcessIdentity: liveIso.identity.supervisorId,

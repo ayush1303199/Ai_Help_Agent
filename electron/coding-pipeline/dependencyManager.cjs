@@ -901,15 +901,24 @@ async function executeDependencyPlan({
         }
 
         const verification = await verifyInstalledDependencies(plan.projectRoot);
-        const hasRealProcessEvidence = Boolean(
-          supervisorResult.ok &&
-          supervisorResult.exitCode === 0 &&
-          !supervisorResult.timedOut &&
-          !supervisorResult.cancelled &&
-          !supervisorResult.isSynthetic &&
-          (supervisorResult.childProcessSpawned || supervisorResult.workerPid)
+        const pidNum = Number(supervisorResult.workerPid);
+        const hasValidPid = Number.isInteger(pidNum) && pidNum > 0;
+        const isCaptureExplicitlyCompleted = (
+          supervisorResult.outputCaptureCompleted === true &&
+          supervisorResult.outputCaptureStatus === 'COMPLETED'
         );
-        const isInstalled = Boolean(hasRealProcessEvidence && verification.isFullyInstalled);
+        const hasRealProcessEvidence = Boolean(
+          supervisorResult.ok === true &&
+          supervisorResult.childProcessSpawned === true &&
+          hasValidPid &&
+          supervisorResult.isSynthetic === false &&
+          supervisorResult.exitCode === 0 &&
+          supervisorResult.actualExitCode === 0 &&
+          supervisorResult.timedOut === false &&
+          supervisorResult.cancelled === false &&
+          isCaptureExplicitlyCompleted
+        );
+        const isInstalled = Boolean(hasRealProcessEvidence && verification && verification.isFullyInstalled === true);
         return {
           ok: Boolean(supervisorResult.ok && (!hasRealProcessEvidence ? false : verification.isFullyInstalled)),
           status: isInstalled ? 'INSTALLED' : (supervisorResult.isSynthetic ? 'SYNTHETIC_ACKNOWLEDGED' : 'FAILED'),
@@ -922,6 +931,9 @@ async function executeDependencyPlan({
           isSynthetic: Boolean(supervisorResult.isSynthetic),
           timedOut: Boolean(supervisorResult.timedOut),
           cancelled: Boolean(supervisorResult.cancelled),
+          outputCaptureCompleted: isCaptureExplicitlyCompleted,
+          outputCaptureStatus: supervisorResult.outputCaptureStatus || (isCaptureExplicitlyCompleted ? 'COMPLETED' : 'INCOMPLETE'),
+          executionId: plan.planDigest || sessionId,
           dependencyVerification: verification,
           gate: 'PROCESS_ISOLATION_GATE',
           processIsolationGate: 'ALLOWED',

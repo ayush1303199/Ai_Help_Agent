@@ -499,6 +499,58 @@ namespace AiHelpAgent.NativeSupervisor
         private readonly Dictionary<string, QuarantineRecord> _quarantinedResources = new Dictionary<string, QuarantineRecord>();
         private readonly Dictionary<string, HcsComputeSystemRecord> _activeHcsSystems = new Dictionary<string, HcsComputeSystemRecord>();
         private readonly Dictionary<string, HcsComputeSystemRecord> _quarantinedHcsSystems = new Dictionary<string, HcsComputeSystemRecord>();
+        private const int MAX_QUARANTINED_PIPE_HANDLES = 128;
+        private static readonly List<QuarantinedPipeHandle> _quarantinedPipeHandles = new List<QuarantinedPipeHandle>();
+
+        private static void ReapQuarantinedPipeHandles()
+        {
+            lock (_quarantinedPipeHandles)
+            {
+                for (int i = _quarantinedPipeHandles.Count - 1; i >= 0; i--)
+                {
+                    QuarantinedPipeHandle q = _quarantinedPipeHandles[i];
+                    IntPtr hThread = q.ThreadHandle;
+                    bool openedHere = false;
+                    if (hThread == IntPtr.Zero && q.ThreadId != 0)
+                    {
+                        hThread = NativeMethods.OpenThread(NativeMethods.SYNCHRONIZE | NativeMethods.THREAD_QUERY_INFORMATION, false, q.ThreadId);
+                        openedHere = true;
+                    }
+
+                    if (hThread != IntPtr.Zero)
+                    {
+                        uint waitRes = NativeMethods.WaitForSingleObject(hThread, 0);
+                        if (waitRes == NativeMethods.WAIT_OBJECT_0)
+                        {
+                            // Authoritative proof that the reader thread has exited: safe to close pipe handle
+                            if (q.Handle != IntPtr.Zero)
+                            {
+                                NativeMethods.CloseHandle(q.Handle);
+                                q.Handle = IntPtr.Zero;
+                            }
+                            if (q.ThreadHandle != IntPtr.Zero)
+                            {
+                                NativeMethods.CloseHandle(q.ThreadHandle);
+                                q.ThreadHandle = IntPtr.Zero;
+                            }
+                            if (openedHere)
+                            {
+                                NativeMethods.CloseHandle(hThread);
+                            }
+                            _quarantinedPipeHandles.RemoveAt(i);
+                        }
+                        else
+                        {
+                            // Thread is still alive: do NOT close pipe handle under any circumstances
+                            if (openedHere)
+                            {
+                                q.ThreadHandle = hThread;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         private static string ReadAllFromPipe(IntPtr hPipe, int maxBytes, out bool isTruncated)
         {
@@ -1359,6 +1411,21 @@ namespace AiHelpAgent.NativeSupervisor
                     if (timeoutMs > 30000) timeoutMs = 30000;
                 }
 
+                ReapQuarantinedPipeHandles();
+                lock (_quarantinedPipeHandles)
+                {
+                    if (_quarantinedPipeHandles.Count + 2 > MAX_QUARANTINED_PIPE_HANDLES)
+                    {
+                        Dictionary<string, object> capErr = new Dictionary<string, object>();
+                        capErr["ok"] = false; capErr["exitCode"] = -1;
+                        capErr["error"] = "QUARANTINE_CAPACITY_EXCEEDED";
+                        capErr["reason"] = "Quarantine registry has reached capacity (128) with active reader threads; cannot allocate additional monitored pipe resources.";
+                        capErr["processIsolationGate"] = "BLOCKED";
+                        capErr["vmBoundaryEnforced"] = false;
+                        return capErr;
+                    }
+                }
+
                 NativeMethods.SECURITY_ATTRIBUTES saAttr = new NativeMethods.SECURITY_ATTRIBUTES();
                 saAttr.nLength = Marshal.SizeOf(typeof(NativeMethods.SECURITY_ATTRIBUTES));
                 saAttr.bInheritHandle = true;
@@ -1396,11 +1463,60 @@ namespace AiHelpAgent.NativeSupervisor
                 si.hStdInput = IntPtr.Zero;
                 si.dwFlags |= NativeMethods.STARTF_USESTDHANDLES;
 
+                NativeMethods.STARTUPINFOEX siEx = new NativeMethods.STARTUPINFOEX();
+                siEx.StartupInfo = si;
+                siEx.StartupInfo.cb = Marshal.SizeOf(typeof(NativeMethods.STARTUPINFOEX));
+
+                IntPtr lpSize = IntPtr.Zero;
+                NativeMethods.InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref lpSize);
+                IntPtr lpAttributeList = Marshal.AllocHGlobal(lpSize);
+                bool attrInitOk = NativeMethods.InitializeProcThreadAttributeList(lpAttributeList, 1, 0, ref lpSize);
+                IntPtr[] handlesToInherit = new IntPtr[] { hStdoutWrite, hStderrWrite };
+                GCHandle pinnedHandles = GCHandle.Alloc(handlesToInherit, GCHandleType.Pinned);
+                bool attrUpdateOk = false;
+                if (attrInitOk)
+                {
+                    attrUpdateOk = NativeMethods.UpdateProcThreadAttribute(
+                        lpAttributeList, 0, (IntPtr)NativeMethods.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                        pinnedHandles.AddrOfPinnedObject(), (IntPtr)(IntPtr.Size * handlesToInherit.Length),
+                        IntPtr.Zero, IntPtr.Zero);
+                }
+
+                if (!attrInitOk || !attrUpdateOk)
+                {
+                    pinnedHandles.Free();
+                    if (attrInitOk) NativeMethods.DeleteProcThreadAttributeList(lpAttributeList);
+                    Marshal.FreeHGlobal(lpAttributeList);
+                    NativeMethods.CloseHandle(hStdoutRead);
+                    NativeMethods.CloseHandle(hStderrRead);
+                    NativeMethods.CloseHandle(hStdoutWrite);
+                    NativeMethods.CloseHandle(hStderrWrite);
+                    Dictionary<string, object> attrErr = new Dictionary<string, object>();
+                    attrErr["ok"] = false; attrErr["exitCode"] = -1;
+                    attrErr["error"] = "ATTRIBUTE_LIST_INIT_FAILED";
+                    attrErr["win32Error"] = Marshal.GetLastWin32Error();
+                    attrErr["processIsolationGate"] = "BLOCKED";
+                    attrErr["vmBoundaryEnforced"] = false;
+                    return attrErr;
+                }
+
+                siEx.lpAttributeList = lpAttributeList;
+
                 NativeMethods.PROCESS_INFORMATION pi = new NativeMethods.PROCESS_INFORMATION();
-                bool started = NativeMethods.CreateProcess(
-                    null, commandLine, IntPtr.Zero, IntPtr.Zero, true,
-                    NativeMethods.CREATE_SUSPENDED | NativeMethods.CREATE_NO_WINDOW,
-                    IntPtr.Zero, null, ref si, out pi);
+                bool started = false;
+                try
+                {
+                    started = NativeMethods.CreateProcess(
+                        null, commandLine, IntPtr.Zero, IntPtr.Zero, true,
+                        NativeMethods.CREATE_SUSPENDED | NativeMethods.CREATE_NO_WINDOW | NativeMethods.EXTENDED_STARTUPINFO_PRESENT,
+                        IntPtr.Zero, null, ref siEx, out pi);
+                }
+                finally
+                {
+                    pinnedHandles.Free();
+                    NativeMethods.DeleteProcThreadAttributeList(lpAttributeList);
+                    Marshal.FreeHGlobal(lpAttributeList);
+                }
 
                 // Parent closes its copies of the write handles immediately so child process holds the only open write handles
                 NativeMethods.CloseHandle(hStdoutWrite);
@@ -1426,10 +1542,14 @@ namespace AiHelpAgent.NativeSupervisor
 
                 Thread stdoutThread = null;
                 Thread stderrThread = null;
+                uint stdoutNativeThreadId = 0;
+                uint stderrNativeThreadId = 0;
                 string stdoutResult = string.Empty;
                 string stderrResult = string.Empty;
                 bool stdoutTruncated = false;
                 bool stderrTruncated = false;
+                bool stdoutJoined = false;
+                bool stderrJoined = false;
 
                 try
                 {
@@ -1438,6 +1558,7 @@ namespace AiHelpAgent.NativeSupervisor
                         NativeMethods.TerminateProcess(pi.hProcess, 1);
                         worker.ProcessHandle = IntPtr.Zero;
                         worker.IsTerminated = true;
+                        worker.LifecycleState = "TERMINATED_JOB_FAILED";
                         Dictionary<string, object> assignErr = new Dictionary<string, object>();
                         assignErr["ok"] = false; assignErr["exitCode"] = -1;
                         assignErr["error"] = "JOB_ASSIGNMENT_FAILED";
@@ -1449,10 +1570,12 @@ namespace AiHelpAgent.NativeSupervisor
 
                     stdoutThread = new Thread(() =>
                     {
+                        stdoutNativeThreadId = NativeMethods.GetCurrentThreadId();
                         stdoutResult = ReadAllFromPipe(hStdoutRead, 1024 * 1024, out stdoutTruncated);
                     });
                     stderrThread = new Thread(() =>
                     {
+                        stderrNativeThreadId = NativeMethods.GetCurrentThreadId();
                         stderrResult = ReadAllFromPipe(hStderrRead, 1024 * 1024, out stderrTruncated);
                     });
                     stdoutThread.IsBackground = true;
@@ -1466,6 +1589,7 @@ namespace AiHelpAgent.NativeSupervisor
                         NativeMethods.TerminateProcess(pi.hProcess, 1);
                         worker.ProcessHandle = IntPtr.Zero;
                         worker.IsTerminated = true;
+                        worker.LifecycleState = "TERMINATED_RESUME_FAILED";
                         Dictionary<string, object> resErr = new Dictionary<string, object>();
                         resErr["ok"] = false; resErr["exitCode"] = -1;
                         resErr["error"] = "RESUME_THREAD_FAILED";
@@ -1478,20 +1602,89 @@ namespace AiHelpAgent.NativeSupervisor
                     uint waitRes = NativeMethods.WaitForSingleObject(pi.hProcess, (uint)timeoutMs);
                     bool timedOut = (waitRes == NativeMethods.WAIT_TIMEOUT);
                     bool termConfirmed = false;
+                    string lifecycleState = "RUNNING";
                     if (timedOut)
                     {
-                        NativeMethods.TerminateProcess(pi.hProcess, 137);
-                        uint termWait = NativeMethods.WaitForSingleObject(pi.hProcess, 1000);
-                        termConfirmed = (termWait == NativeMethods.WAIT_OBJECT_0);
+                        lifecycleState = "TERMINATION_REQUESTED";
+                        if (!NativeMethods.TerminateProcess(pi.hProcess, 137))
+                        {
+                            lifecycleState = "TERMINATION_API_FAILED";
+                        }
+                        else
+                        {
+                            uint termWait = NativeMethods.WaitForSingleObject(pi.hProcess, 1000);
+                            if (termWait == NativeMethods.WAIT_OBJECT_0)
+                            {
+                                lifecycleState = "EXITED";
+                                termConfirmed = true;
+                            }
+                            else if (termWait == NativeMethods.WAIT_TIMEOUT)
+                            {
+                                lifecycleState = "TERMINATION_UNCONFIRMED";
+                            }
+                            else
+                            {
+                                lifecycleState = "WAIT_FAILED";
+                            }
+                        }
                     }
+                    else if (waitRes == NativeMethods.WAIT_OBJECT_0)
+                    {
+                        lifecycleState = "EXITED";
+                        termConfirmed = true;
+                    }
+                    else
+                    {
+                        lifecycleState = "WAIT_FAILED";
+                    }
+
                     uint procExit = 1;
-                    NativeMethods.GetExitCodeProcess(pi.hProcess, out procExit);
+                    bool exitCodeRetrieved = NativeMethods.GetExitCodeProcess(pi.hProcess, out procExit);
+                    if (!exitCodeRetrieved && lifecycleState == "EXITED")
+                    {
+                        lifecycleState = "GET_EXIT_CODE_FAILED";
+                    }
 
-                    if (stdoutThread != null && stdoutThread.IsAlive) stdoutThread.Join(2000);
-                    if (stderrThread != null && stderrThread.IsAlive) stderrThread.Join(2000);
+                    // Reader thread bounded join sequence
+                    stdoutJoined = stdoutThread != null && stdoutThread.Join(2000);
+                    stderrJoined = stderrThread != null && stderrThread.Join(2000);
 
-                    worker.IsTerminated = true;
+                    // Cancel synchronous I/O if still blocked
+                    if (!stdoutJoined && stdoutThread != null && stdoutThread.IsAlive && stdoutNativeThreadId != 0)
+                    {
+                        IntPtr hTh = NativeMethods.OpenThread(NativeMethods.THREAD_TERMINATE | NativeMethods.THREAD_QUERY_INFORMATION, false, stdoutNativeThreadId);
+                        if (hTh != IntPtr.Zero)
+                        {
+                            NativeMethods.CancelSynchronousIo(hTh);
+                            NativeMethods.CloseHandle(hTh);
+                        }
+                        stdoutJoined = stdoutThread.Join(1000);
+                    }
+
+                    if (!stderrJoined && stderrThread != null && stderrThread.IsAlive && stderrNativeThreadId != 0)
+                    {
+                        IntPtr hTh = NativeMethods.OpenThread(NativeMethods.THREAD_TERMINATE | NativeMethods.THREAD_QUERY_INFORMATION, false, stderrNativeThreadId);
+                        if (hTh != IntPtr.Zero)
+                        {
+                            NativeMethods.CancelSynchronousIo(hTh);
+                            NativeMethods.CloseHandle(hTh);
+                        }
+                        stderrJoined = stderrThread.Join(1000);
+                    }
+
+                    bool outputCaptureCompleted = stdoutJoined && stderrJoined;
+                    string outputCaptureStatus = outputCaptureCompleted
+                        ? (stdoutTruncated || stderrTruncated ? "TRUNCATED" : "COMPLETED")
+                        : ((stdoutThread != null && stdoutThread.IsAlive) || (stderrThread != null && stderrThread.IsAlive)
+                            ? "INCOMPLETE_UNJOINED_READER"
+                            : "INCOMPLETE_TIMEOUT");
+
+                    worker.IsTerminated = termConfirmed;
+                    worker.AuthoritativeExitRecorded = termConfirmed && exitCodeRetrieved;
+                    worker.AuthoritativeExitCode = worker.AuthoritativeExitRecorded ? (int?)procExit : null;
+                    worker.LifecycleState = lifecycleState;
                     worker.ProcessHandle = IntPtr.Zero;
+
                     lock (_lock)
                     {
                         if (!string.IsNullOrEmpty(worker.GrantId))
@@ -1501,15 +1694,18 @@ namespace AiHelpAgent.NativeSupervisor
                     }
 
                     Dictionary<string, object> jobRes = new Dictionary<string, object>();
-                    jobRes["ok"] = !timedOut && procExit == 0;
+                    jobRes["ok"] = !timedOut && exitCodeRetrieved && procExit == 0 && outputCaptureCompleted;
                     jobRes["exitCode"] = (int)procExit;
-                    jobRes["actualExitCode"] = timedOut ? null : (int?)procExit;
+                    jobRes["actualExitCode"] = (timedOut || !exitCodeRetrieved) ? null : (int?)procExit;
                     jobRes["stdout"] = stdoutResult ?? "";
                     jobRes["stderr"] = stderrResult ?? "";
                     jobRes["outputTruncated"] = stdoutTruncated || stderrTruncated;
+                    jobRes["outputCaptureCompleted"] = outputCaptureCompleted;
+                    jobRes["outputCaptureStatus"] = outputCaptureStatus;
                     jobRes["timedOut"] = timedOut;
                     jobRes["cancelled"] = false;
-                    jobRes["terminationConfirmed"] = timedOut ? termConfirmed : true;
+                    jobRes["terminationConfirmed"] = termConfirmed;
+                    jobRes["lifecycleState"] = lifecycleState;
                     jobRes["executionStatus"] = timedOut ? "TIMED_OUT" : (procExit == 0 ? "COMPLETED" : "FAILED");
                     jobRes["containedByJobObject"] = true;
                     jobRes["vmBoundaryEnforced"] = false;
@@ -1521,15 +1717,58 @@ namespace AiHelpAgent.NativeSupervisor
                 }
                 finally
                 {
-                    if (stdoutThread != null && stdoutThread.IsAlive) stdoutThread.Join(1000);
-                    if (stderrThread != null && stderrThread.IsAlive) stderrThread.Join(1000);
-                    if (hStdoutRead != IntPtr.Zero) NativeMethods.CloseHandle(hStdoutRead);
-                    if (hStderrRead != IntPtr.Zero) NativeMethods.CloseHandle(hStderrRead);
+                    if (stdoutJoined)
+                    {
+                        if (hStdoutRead != IntPtr.Zero) { NativeMethods.CloseHandle(hStdoutRead); hStdoutRead = IntPtr.Zero; }
+                    }
+                    else if (hStdoutRead != IntPtr.Zero)
+                    {
+                        IntPtr qTh = stdoutNativeThreadId != 0
+                            ? NativeMethods.OpenThread(NativeMethods.SYNCHRONIZE | NativeMethods.THREAD_QUERY_INFORMATION, false, stdoutNativeThreadId)
+                            : IntPtr.Zero;
+                        lock (_quarantinedPipeHandles)
+                        {
+                            _quarantinedPipeHandles.Add(new QuarantinedPipeHandle
+                            {
+                                Handle = hStdoutRead,
+                                ThreadHandle = qTh,
+                                ThreadId = stdoutNativeThreadId,
+                                ExecutionId = worker.RunId,
+                                QuarantinedAt = DateTime.UtcNow
+                            });
+                        }
+                        hStdoutRead = IntPtr.Zero;
+                    }
+
+                    if (stderrJoined)
+                    {
+                        if (hStderrRead != IntPtr.Zero) { NativeMethods.CloseHandle(hStderrRead); hStderrRead = IntPtr.Zero; }
+                    }
+                    else if (hStderrRead != IntPtr.Zero)
+                    {
+                        IntPtr qTh = stderrNativeThreadId != 0
+                            ? NativeMethods.OpenThread(NativeMethods.SYNCHRONIZE | NativeMethods.THREAD_QUERY_INFORMATION, false, stderrNativeThreadId)
+                            : IntPtr.Zero;
+                        lock (_quarantinedPipeHandles)
+                        {
+                            _quarantinedPipeHandles.Add(new QuarantinedPipeHandle
+                            {
+                                Handle = hStderrRead,
+                                ThreadHandle = qTh,
+                                ThreadId = stderrNativeThreadId,
+                                ExecutionId = worker.RunId,
+                                QuarantinedAt = DateTime.UtcNow
+                            });
+                        }
+                        hStderrRead = IntPtr.Zero;
+                    }
+
                     if (hStdoutWrite != IntPtr.Zero) NativeMethods.CloseHandle(hStdoutWrite);
                     if (hStderrWrite != IntPtr.Zero) NativeMethods.CloseHandle(hStderrWrite);
                     if (pi.hThread != IntPtr.Zero) NativeMethods.CloseHandle(pi.hThread);
                     if (pi.hProcess != IntPtr.Zero) NativeMethods.CloseHandle(pi.hProcess);
                     worker.ProcessHandle = IntPtr.Zero;
+                    ReapQuarantinedPipeHandles();
                 }
             }
 
@@ -1575,19 +1814,83 @@ namespace AiHelpAgent.NativeSupervisor
 
             if (worker != null)
             {
-                worker.IsTerminated = true;
+                bool termConfirmed = false;
+                string lifecycleState = "RUNNING";
+                int exitCode = 0;
+
                 if (worker.ProcessHandle != IntPtr.Zero)
                 {
-                    NativeMethods.TerminateProcess(worker.ProcessHandle, 1);
+                    uint preWait = NativeMethods.WaitForSingleObject(worker.ProcessHandle, 0);
+                    if (preWait == NativeMethods.WAIT_OBJECT_0)
+                    {
+                        lifecycleState = "EXITED";
+                        termConfirmed = true;
+                        worker.AuthoritativeExitRecorded = true;
+                        uint pCode = 0;
+                        if (NativeMethods.GetExitCodeProcess(worker.ProcessHandle, out pCode))
+                        {
+                            exitCode = (int)pCode;
+                            worker.AuthoritativeExitCode = exitCode;
+                        }
+                    }
+                    else
+                    {
+                        bool termSucceeded = NativeMethods.TerminateProcess(worker.ProcessHandle, 1);
+                        if (!termSucceeded)
+                        {
+                            lifecycleState = "TERMINATION_API_FAILED";
+                        }
+                        else
+                        {
+                            uint termWait = NativeMethods.WaitForSingleObject(worker.ProcessHandle, 1000);
+                            if (termWait == NativeMethods.WAIT_OBJECT_0)
+                            {
+                                lifecycleState = "EXITED";
+                                termConfirmed = true;
+                                worker.AuthoritativeExitRecorded = true;
+                                uint pCode = 1;
+                                NativeMethods.GetExitCodeProcess(worker.ProcessHandle, out pCode);
+                                exitCode = (int)pCode;
+                                worker.AuthoritativeExitCode = exitCode;
+                            }
+                            else if (termWait == NativeMethods.WAIT_TIMEOUT)
+                            {
+                                lifecycleState = "TERMINATION_UNCONFIRMED";
+                            }
+                            else
+                            {
+                                lifecycleState = "WAIT_FAILED";
+                            }
+                        }
+                    }
                     NativeMethods.CloseHandle(worker.ProcessHandle);
                     worker.ProcessHandle = IntPtr.Zero;
                 }
+                else
+                {
+                    if (worker.AuthoritativeExitRecorded)
+                    {
+                        lifecycleState = "ALREADY_EXITED";
+                        termConfirmed = true;
+                        exitCode = worker.AuthoritativeExitCode ?? 0;
+                    }
+                    else
+                    {
+                        lifecycleState = "HANDLE_UNAVAILABLE";
+                        termConfirmed = false;
+                    }
+                }
+
                 if (worker.JobHandle != IntPtr.Zero)
                 {
                     NativeMethods.TerminateJobObject(worker.JobHandle, 0);
                     NativeMethods.CloseHandle(worker.JobHandle);
                     worker.JobHandle = IntPtr.Zero;
                 }
+
+                worker.IsTerminated = termConfirmed;
+                worker.LifecycleState = lifecycleState;
+
                 lock (_lock)
                 {
                     if (!string.IsNullOrEmpty(worker.GrantId))
@@ -1596,13 +1899,23 @@ namespace AiHelpAgent.NativeSupervisor
                     }
                     _activeWorkers.Remove(workerId);
                 }
+
+                Dictionary<string, object> res = new Dictionary<string, object>();
+                res["terminated"] = termConfirmed;
+                res["terminationConfirmed"] = termConfirmed;
+                res["lifecycleState"] = lifecycleState;
+                res["workerId"] = workerId;
+                res["exitCode"] = exitCode;
+                return res;
             }
 
-            Dictionary<string, object> res = new Dictionary<string, object>();
-            res["terminated"] = true;
-            res["workerId"] = workerId;
-            res["exitCode"] = 0;
-            return res;
+            Dictionary<string, object> notFound = new Dictionary<string, object>();
+            notFound["terminated"] = true;
+            notFound["terminationConfirmed"] = true;
+            notFound["lifecycleState"] = "WORKER_NOT_FOUND";
+            notFound["workerId"] = workerId;
+            notFound["exitCode"] = 0;
+            return notFound;
         }
 
         private Dictionary<string, object> HandleVerifyRelease(Dictionary<string, object> req)
@@ -1618,16 +1931,18 @@ namespace AiHelpAgent.NativeSupervisor
             }
 
             bool handlesClosed = worker == null || (worker.JobHandle == IntPtr.Zero && worker.ProcessHandle == IntPtr.Zero);
+            bool released = handlesClosed && (worker == null || worker.AuthoritativeExitRecorded || worker.IsTerminated);
 
             Dictionary<string, object> res = new Dictionary<string, object>();
-            res["ok"] = handlesClosed;
-            res["released"] = handlesClosed;
+            res["ok"] = released;
+            res["released"] = released;
             res["workerId"] = workerId;
-            res["activeProcessesRemaining"] = handlesClosed ? 0 : 1;
+            res["activeProcessesRemaining"] = released ? 0 : 1;
             res["jobClosed"] = handlesClosed;
-            if (!handlesClosed)
+            res["lifecycleState"] = worker != null ? worker.LifecycleState : "RELEASED";
+            if (!released)
             {
-                res["reason"] = "Worker Job Object or process handle remains unclosed.";
+                res["reason"] = "Worker Job Object, process handle, or OS termination remains unverified.";
             }
             return res;
         }
@@ -2358,6 +2673,18 @@ namespace AiHelpAgent.NativeSupervisor
         public string WorkspaceRoot;
         public string SessionId;
         public bool IsTerminated;
+        public bool AuthoritativeExitRecorded;
+        public int? AuthoritativeExitCode;
+        public string LifecycleState;
+    }
+
+    public class QuarantinedPipeHandle
+    {
+        public IntPtr Handle;
+        public IntPtr ThreadHandle;
+        public uint ThreadId;
+        public string ExecutionId;
+        public DateTime QuarantinedAt;
     }
 
     public class QuarantineRecord
@@ -2822,6 +3149,11 @@ namespace AiHelpAgent.NativeSupervisor
 
         public const uint CREATE_SUSPENDED = 0x00000004;
         public const uint CREATE_NO_WINDOW = 0x08000000;
+        public const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+        public const int PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002;
+        public const uint THREAD_TERMINATE = 0x0001;
+        public const uint THREAD_QUERY_INFORMATION = 0x0040;
+        public const uint SYNCHRONIZE = 0x00100000;
         public const uint WAIT_OBJECT_0 = 0x00000000;
         public const uint WAIT_TIMEOUT = 0x00000102;
         public const int STD_INPUT_HANDLE = -10;
@@ -2860,6 +3192,13 @@ namespace AiHelpAgent.NativeSupervisor
             public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError;
         }
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct STARTUPINFOEX
+        {
+            public STARTUPINFO StartupInfo;
+            public IntPtr lpAttributeList;
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         public struct PROCESS_INFORMATION
         {
@@ -2871,6 +3210,30 @@ namespace AiHelpAgent.NativeSupervisor
             string lpApplicationName, string lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
             bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory,
             ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CreateProcess(
+            string lpApplicationName, string lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes,
+            bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory,
+            ref STARTUPINFOEX lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute, IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern void DeleteProcThreadAttributeList(IntPtr lpAttributeList);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint GetCurrentThreadId();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CancelSynchronousIo(IntPtr hThread);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);

@@ -662,14 +662,17 @@ async function executeWithSupervisor({
 
   const timedOut = Boolean(executionResult?.timedOut);
   const cancelled = Boolean(executionResult?.cancelled);
-  const terminationConfirmed = Boolean(executionResult?.terminationConfirmed ?? terminationResult?.terminated);
+  const terminationConfirmed = Boolean(executionResult?.terminationConfirmed ?? terminationResult?.terminated ?? terminationResult?.terminationConfirmed);
   const actualExitCode = executionResult?.actualExitCode !== undefined
     ? executionResult.actualExitCode
     : (timedOut ? null : (executionResult?.exitCode ?? null));
   const executionStatus = executionResult?.executionStatus || (timedOut ? 'TIMED_OUT' : (cancelled ? 'CANCELLED' : (executionResult?.exitCode === 0 ? 'COMPLETED' : 'FAILED')));
+  const outputCaptureCompleted = executionResult?.outputCaptureCompleted ?? true;
+  const outputCaptureStatus = executionResult?.outputCaptureStatus || (executionResult?.outputTruncated ? 'TRUNCATED' : 'COMPLETED');
+  const lifecycleState = executionResult?.lifecycleState || (terminationConfirmed ? 'EXITED' : (timedOut ? 'TERMINATION_UNCONFIRMED' : 'RUNNING'));
 
   return {
-    ok: executionResult?.exitCode === 0 && !timedOut && !cancelled,
+    ok: executionResult?.exitCode === 0 && !timedOut && !cancelled && outputCaptureCompleted,
     exitCode: executionResult?.exitCode ?? null,
     actualExitCode,
     stdout: cleanStdout,
@@ -677,7 +680,10 @@ async function executeWithSupervisor({
     timedOut,
     cancelled,
     terminationConfirmed,
+    lifecycleState,
     executionStatus,
+    outputCaptureCompleted,
+    outputCaptureStatus,
     workerPid: executionResult?.workerPid ?? worker?.workerPid ?? null,
     childProcessSpawned,
     isSynthetic,

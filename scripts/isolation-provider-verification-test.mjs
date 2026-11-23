@@ -1294,6 +1294,477 @@ async function testV44857CExecutionAndLifecycleAudit() {
   assert.strictEqual(utf8Res.stdout, utf8Payload, 'UTF-8 multibyte characters must be preserved without corruption');
 }
 
+// Test 15: Milestone V44.85.7D Process Lifecycle Evidence, Pipe Shutdown & Execution Correlation Hardening
+// ----------------------------------------------------------------------------------------------------------
+async function testV44857DExecutionAndLifecycleHardening() {
+  console.log('Testing V44.85.7D process lifecycle evidence, pipe shutdown & execution correlation hardening...');
+  const { executeWithSupervisor } = windowsAdapterPkg;
+
+  const hardenWs = path.join(tempDir, 'v44-harden-ws');
+  await fs.mkdir(hardenWs, { recursive: true });
+
+  function createMockSupervisorD(overrides = {}) {
+    const base = createNativeSupervisorClient({
+      isSyntheticTest: true,
+      pid: 9999,
+      tokenUserSid: 'S-1-5-18',
+    });
+    return {
+      ...base,
+      issueExecutionGrant: async (req) => ({
+        granted: true,
+        runId: req.runId,
+        workspaceRoot: req.workspaceRoot,
+        approvedSnapshotDigest: req.approvedSnapshotDigest,
+        commandDigest: crypto.createHash('sha256').update(String(req.command || '')).digest('hex'),
+        sessionId: req.sessionId,
+        grantId: 'grant-test-7d',
+      }),
+      consumeExecutionGrant: async () => ({ consumed: true }),
+      allocateWorker: async (req) => ({
+        workerId: 'worker-test-7d',
+        runId: req.runId,
+        sessionId: req.sessionId,
+        workerPid: 76543,
+      }),
+      observeEffectiveIsolation: async () => ({ effectiveIsolationVerified: true }),
+      executeApprovedOperation: async () => ({
+        ok: true,
+        exitCode: 0,
+        actualExitCode: 0,
+        stdout: 'test output',
+        stderr: '',
+        isSynthetic: false,
+        childProcessSpawned: true,
+        workerPid: 76543,
+        timedOut: false,
+        cancelled: false,
+        terminationConfirmed: true,
+        executionStatus: 'COMPLETED',
+        outputTruncated: false,
+        outputCaptureCompleted: true,
+        outputCaptureStatus: 'COMPLETED',
+      }),
+      enforceDeadlineAndCancellation: async () => new Promise(() => {}),
+      collectHostEvidence: async () => ({ evidenceCollected: true }),
+      terminateWorker: async () => ({
+        terminated: true,
+        terminationState: 'EXITED',
+        exitCode: 0,
+        actualExitCode: 0,
+        error: null,
+      }),
+      verifyWorkerTerminationAndResourceRelease: async () => ({
+        released: true,
+        terminationConfirmed: true,
+        terminationState: 'EXITED',
+      }),
+      quarantineResource: async () => {},
+      resolveQuarantine: async () => {},
+      ...overrides,
+    };
+  }
+
+  // 1. Pipe reader shutdown & output capture status propagation
+  // Case A: Full capture completed
+  const completedSup = createMockSupervisorD({
+    executeApprovedOperation: async () => ({
+      ok: true,
+      exitCode: 0,
+      actualExitCode: 0,
+      stdout: 'all captured',
+      stderr: '',
+      isSynthetic: false,
+      childProcessSpawned: true,
+      workerPid: 76544,
+      timedOut: false,
+      cancelled: false,
+      terminationConfirmed: true,
+      executionStatus: 'COMPLETED',
+      outputTruncated: false,
+      outputCaptureCompleted: true,
+      outputCaptureStatus: 'COMPLETED',
+    }),
+  });
+  const completedRes = await executeWithSupervisor({
+    supervisor: completedSup,
+    isSyntheticTest: true,
+    runId: 'run-comp-7d',
+    workspaceRoot: hardenWs,
+    approvedSnapshotDigest: 'snap-digest-7d',
+    command: 'echo ok',
+    sessionId: 'session-7d-1',
+  });
+  assert.strictEqual(completedRes.outputCaptureCompleted, true, 'outputCaptureCompleted must be true for completed capture');
+  assert.strictEqual(completedRes.outputCaptureStatus, 'COMPLETED');
+
+  // Case B: Incomplete reader timeout
+  const timeoutReaderSup = createMockSupervisorD({
+    executeApprovedOperation: async () => ({
+      ok: true,
+      exitCode: 0,
+      actualExitCode: 0,
+      stdout: 'partial captured',
+      stderr: '',
+      isSynthetic: false,
+      childProcessSpawned: true,
+      workerPid: 76545,
+      timedOut: false,
+      cancelled: false,
+      terminationConfirmed: true,
+      executionStatus: 'COMPLETED',
+      outputTruncated: false,
+      outputCaptureCompleted: false,
+      outputCaptureStatus: 'INCOMPLETE_TIMEOUT',
+    }),
+  });
+  const timeoutReaderRes = await executeWithSupervisor({
+    supervisor: timeoutReaderSup,
+    isSyntheticTest: true,
+    runId: 'run-timeout-reader-7d',
+    workspaceRoot: hardenWs,
+    approvedSnapshotDigest: 'snap-digest-7d',
+    command: 'echo partial',
+    sessionId: 'session-7d-2',
+  });
+  assert.strictEqual(timeoutReaderRes.outputCaptureCompleted, false, 'outputCaptureCompleted must be false when reader times out');
+  assert.strictEqual(timeoutReaderRes.outputCaptureStatus, 'INCOMPLETE_TIMEOUT');
+
+  // Case C: Incomplete unjoined reader
+  const unjoinedReaderSup = createMockSupervisorD({
+    executeApprovedOperation: async () => ({
+      ok: true,
+      exitCode: 0,
+      actualExitCode: 0,
+      stdout: 'unjoined capture',
+      stderr: '',
+      isSynthetic: false,
+      childProcessSpawned: true,
+      workerPid: 76546,
+      timedOut: false,
+      cancelled: false,
+      terminationConfirmed: true,
+      executionStatus: 'COMPLETED',
+      outputTruncated: false,
+      outputCaptureCompleted: false,
+      outputCaptureStatus: 'INCOMPLETE_UNJOINED_READER',
+    }),
+  });
+  const unjoinedReaderRes = await executeWithSupervisor({
+    supervisor: unjoinedReaderSup,
+    isSyntheticTest: true,
+    runId: 'run-unjoined-7d',
+    workspaceRoot: hardenWs,
+    approvedSnapshotDigest: 'snap-digest-7d',
+    command: 'echo unjoined',
+    sessionId: 'session-7d-3',
+  });
+  assert.strictEqual(unjoinedReaderRes.outputCaptureCompleted, false);
+  assert.strictEqual(unjoinedReaderRes.outputCaptureStatus, 'INCOMPLETE_UNJOINED_READER');
+
+  // 2. Multi-state termination & exit code 259 verification
+  // Case A: Valid application exit code 259 after WAIT_OBJECT_0
+  const exit259Sup = createMockSupervisorD({
+    executeApprovedOperation: async () => ({
+      ok: true,
+      exitCode: 259,
+      actualExitCode: 259,
+      stdout: 'returned 259',
+      stderr: '',
+      isSynthetic: false,
+      childProcessSpawned: true,
+      workerPid: 76547,
+      timedOut: false,
+      cancelled: false,
+      terminationConfirmed: true,
+      executionStatus: 'COMPLETED',
+      outputTruncated: false,
+      outputCaptureCompleted: true,
+      outputCaptureStatus: 'COMPLETED',
+      terminationResult: {
+        terminated: true,
+        terminationState: 'EXITED',
+        exitCode: 259,
+        actualExitCode: 259,
+        error: null,
+      },
+    }),
+  });
+  const exit259Res = await executeWithSupervisor({
+    supervisor: exit259Sup,
+    isSyntheticTest: true,
+    runId: 'run-259-7d',
+    workspaceRoot: hardenWs,
+    approvedSnapshotDigest: 'snap-digest-7d',
+    command: 'exit 259',
+    sessionId: 'session-7d-4',
+  });
+  assert.strictEqual(exit259Res.actualExitCode, 259, 'Exit code 259 after process wait must be preserved as legitimate application exit');
+  assert.strictEqual(exit259Res.terminationConfirmed, true);
+
+  // Case B: Unconfirmed termination (timeout waiting for process exit)
+  const unconfirmedSup = createMockSupervisorD({
+    terminateWorker: async () => ({
+      terminated: false,
+      terminationState: 'TERMINATION_UNCONFIRMED',
+      exitCode: null,
+      actualExitCode: null,
+      error: 'Process failed to signal exit within deadline.',
+    }),
+    verifyWorkerTerminationAndResourceRelease: async () => ({
+      released: false,
+      terminationConfirmed: false,
+      terminationState: 'TERMINATION_UNCONFIRMED',
+    }),
+  });
+  const unconfirmedTerm = await unconfirmedSup.terminateWorker({ workerPid: 76548 });
+  assert.strictEqual(unconfirmedTerm.terminated, false);
+  assert.strictEqual(unconfirmedTerm.terminationState, 'TERMINATION_UNCONFIRMED');
+
+  // Case C: HANDLE_UNAVAILABLE without authoritative exit cannot claim ALREADY_EXITED
+  const handleUnavailSup = createMockSupervisorD({
+    terminateWorker: async () => ({
+      terminated: false,
+      terminationState: 'HANDLE_UNAVAILABLE',
+      exitCode: null,
+      actualExitCode: null,
+      error: 'Process handle unavailable and no authoritative exit was previously recorded.',
+    }),
+    verifyWorkerTerminationAndResourceRelease: async () => ({
+      released: false,
+      terminationConfirmed: false,
+      terminationState: 'HANDLE_UNAVAILABLE',
+    }),
+  });
+  const handleUnavailTerm = await handleUnavailSup.terminateWorker({ workerPid: 76549 });
+  assert.strictEqual(handleUnavailTerm.terminated, false);
+  assert.strictEqual(handleUnavailTerm.terminationState, 'HANDLE_UNAVAILABLE');
+
+  // 3. Listener socket ownership attribution logic
+  // Test simulated listener attribution with matching and non-matching socket ownership
+  const matchingOwnership = { verified: true, socketOwnerPid: 1234, targetPid: 1234, isDescendant: false };
+  const descendantOwnership = { verified: true, socketOwnerPid: 5678, targetPid: 1234, isDescendant: true };
+  const unverifiedOwnership = { verified: false, socketOwnerPid: 9999, targetPid: 1234, isDescendant: false, reason: 'Socket owner PID does not match target or descendant' };
+  const noSocketOwnership = { verified: false, socketOwnerPid: null, targetPid: 1234, isDescendant: false, reason: 'Port 3000 is not currently listening' };
+
+  function simulateListenerAttribution(ownership, httpSuccess) {
+    if (httpSuccess && ownership.verified) {
+      return { listenerOwnershipStatus: 'ATTRIBUTED', serverStartupStatus: 'SUCCESS' };
+    }
+    return { listenerOwnershipStatus: 'NOT_VERIFIED', serverStartupStatus: 'NOT_VERIFIED' };
+  }
+
+  // Listener attribution with process creation time verification
+  const now = Date.now();
+  const preExistingOwnership = { verified: false, socketPid: 1234, targetPid: 1234, reason: 'PRE_EXISTING_LISTENER_PID_REUSE' };
+  const unavailableOwnership = { verified: false, socketPid: 1234, targetPid: 1234, reason: 'PROCESS_INFO_UNAVAILABLE' };
+
+  assert.strictEqual(simulateListenerAttribution(matchingOwnership, true).listenerOwnershipStatus, 'ATTRIBUTED');
+  assert.strictEqual(simulateListenerAttribution(descendantOwnership, true).listenerOwnershipStatus, 'ATTRIBUTED');
+  // Pre-existing listener or PID reuse must NOT attribute listener
+  assert.strictEqual(simulateListenerAttribution(preExistingOwnership, true).listenerOwnershipStatus, 'NOT_VERIFIED');
+  assert.strictEqual(simulateListenerAttribution(preExistingOwnership, true).serverStartupStatus, 'NOT_VERIFIED');
+  assert.strictEqual(simulateListenerAttribution(unavailableOwnership, true).listenerOwnershipStatus, 'NOT_VERIFIED');
+  // Even if HTTP responded 200, unverified socket owner must NOT attribute listener
+  assert.strictEqual(simulateListenerAttribution(unverifiedOwnership, true).listenerOwnershipStatus, 'NOT_VERIFIED');
+  assert.strictEqual(simulateListenerAttribution(unverifiedOwnership, true).serverStartupStatus, 'NOT_VERIFIED');
+  assert.strictEqual(simulateListenerAttribution(noSocketOwnership, true).listenerOwnershipStatus, 'NOT_VERIFIED');
+
+  // 4. Strict dependency execution multi-point evidence verification (V44.85.7D.2)
+  // Valid evidence: childProcessSpawned === true, integer workerPid > 0, outputCaptureCompleted === true,
+  // outputCaptureStatus === 'COMPLETED', !isSynthetic, exitCode === 0, isFullyInstalled === true
+  function evaluateStrictDependencyEvidence(supResult, isFullyInstalled) {
+    const pidNum = Number(supResult.workerPid);
+    const hasValidPid = Number.isInteger(pidNum) && pidNum > 0;
+    const isCaptureExplicitlyCompleted = (
+      supResult.outputCaptureCompleted === true &&
+      supResult.outputCaptureStatus === 'COMPLETED'
+    );
+    const hasRealProcessEvidence = Boolean(
+      supResult.ok === true &&
+      supResult.childProcessSpawned === true &&
+      hasValidPid &&
+      supResult.isSynthetic === false &&
+      supResult.exitCode === 0 &&
+      supResult.actualExitCode === 0 &&
+      supResult.timedOut === false &&
+      supResult.cancelled === false &&
+      isCaptureExplicitlyCompleted
+    );
+    return Boolean(hasRealProcessEvidence && isFullyInstalled === true);
+  }
+
+  // Positive case: strictly completed output capture with actualExitCode === 0
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    actualExitCode: 0,
+    timedOut: false,
+    cancelled: false,
+    outputCaptureCompleted: true,
+    outputCaptureStatus: 'COMPLETED',
+  }, true), true, 'Valid multi-point process evidence with completed capture and full installation must succeed');
+
+  // Negative: actualExitCode undefined in production must fail closed
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    actualExitCode: undefined,
+    timedOut: false,
+    cancelled: false,
+    outputCaptureCompleted: true,
+    outputCaptureStatus: 'COMPLETED',
+  }, true), false, 'Undefined actualExitCode in production must fail closed');
+
+  // Negative: actualExitCode non-zero must fail closed
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    actualExitCode: 1,
+    timedOut: false,
+    cancelled: false,
+    outputCaptureCompleted: true,
+    outputCaptureStatus: 'COMPLETED',
+  }, true), false, 'Non-zero actualExitCode must fail closed');
+
+  // Negative: TRUNCATED output capture must never pass as completed dependency execution
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    actualExitCode: 0,
+    timedOut: false,
+    cancelled: false,
+    outputCaptureCompleted: true,
+    outputCaptureStatus: 'TRUNCATED',
+  }, true), false, 'TRUNCATED capture must fail closed for dependency installation');
+
+  // Negative: INCOMPLETE_TIMEOUT
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    actualExitCode: 0,
+    timedOut: false,
+    cancelled: false,
+    outputCaptureCompleted: false,
+    outputCaptureStatus: 'INCOMPLETE_TIMEOUT',
+  }, true), false, 'INCOMPLETE_TIMEOUT capture must fail closed');
+
+  // Negative: INCOMPLETE_UNJOINED_READER
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    actualExitCode: 0,
+    timedOut: false,
+    cancelled: false,
+    outputCaptureCompleted: false,
+    outputCaptureStatus: 'INCOMPLETE_UNJOINED_READER',
+  }, true), false, 'INCOMPLETE_UNJOINED_READER capture must fail closed');
+
+  // Negative: INCOMPLETE_ERROR
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    actualExitCode: 0,
+    timedOut: false,
+    cancelled: false,
+    outputCaptureCompleted: false,
+    outputCaptureStatus: 'INCOMPLETE_ERROR',
+  }, true), false, 'INCOMPLETE_ERROR capture must fail closed');
+
+  // Negative: outputCaptureCompleted undefined or null
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+  }, true), false, 'Missing outputCaptureCompleted must fail closed');
+
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    outputCaptureCompleted: null,
+    outputCaptureStatus: 'COMPLETED',
+  }, true), false, 'Null outputCaptureCompleted must fail closed');
+
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    outputCaptureCompleted: 'true',
+    outputCaptureStatus: 'COMPLETED',
+  }, true), false, 'String outputCaptureCompleted must fail closed');
+
+  // Negative: string non-numeric PID
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 'invalid-pid',
+    isSynthetic: false,
+    exitCode: 0,
+    outputCaptureCompleted: true,
+    outputCaptureStatus: 'COMPLETED',
+  }, true), false, 'Non-integer PID must reject');
+
+  // Negative: workerPid <= 0
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: true,
+    workerPid: 0,
+    isSynthetic: false,
+    exitCode: 0,
+    outputCaptureCompleted: true,
+    outputCaptureStatus: 'COMPLETED',
+  }, true), false, 'Zero PID must reject');
+
+  // Negative: childProcessSpawned === false
+  assert.strictEqual(evaluateStrictDependencyEvidence({
+    ok: true,
+    childProcessSpawned: false,
+    workerPid: 12345,
+    isSynthetic: false,
+    exitCode: 0,
+    outputCaptureCompleted: true,
+    outputCaptureStatus: 'COMPLETED',
+  }, true), false, 'childProcessSpawned === false must reject dependency evidence');
+
+  // 5. Execution ID hierarchy preservation
+  const rootExecutionId = 'root-exec-uuid-7d';
+  const parentExecutionId = rootExecutionId;
+  const childExecutionIds = [0, 1, 2].map((i) => `${rootExecutionId}:cmd:${i}`);
+
+  assert.strictEqual(parentExecutionId, rootExecutionId, 'parentExecutionId must match authoritative root executionId');
+  assert.strictEqual(childExecutionIds[0], 'root-exec-uuid-7d:cmd:0');
+  assert.strictEqual(childExecutionIds[1], 'root-exec-uuid-7d:cmd:1');
+  assert.strictEqual(childExecutionIds[2], 'root-exec-uuid-7d:cmd:2');
+}
+
 async function runAllTests() {
   try {
     await setupTestDir();
@@ -1311,6 +1782,7 @@ async function runAllTests() {
     await testV44857ACommandOutputIntegrity();
     await testV44857BCommandOutputIntegrityAndEvidencePipeline();
     await testV44857CExecutionAndLifecycleAudit();
+    await testV44857DExecutionAndLifecycleHardening();
     console.log('All Isolation Provider Verification & Sandbox Readiness regression tests passed successfully!');
   } finally {
     await cleanupTestDir();

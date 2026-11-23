@@ -265,6 +265,99 @@ async function findVerifiedOpenPort(candidatePorts, maxDurationMs = 3000) {
   return null;
 }
 
+function getProcessStartTimeMs(pid) {
+  if (!pid || typeof pid !== 'number' || pid <= 0) return null;
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync(`powershell -NoProfile -Command (Get-Process -Id ${pid}).StartTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')`, {
+      timeout: 1000,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (!out) return null;
+    const ms = Date.parse(out);
+    return Number.isFinite(ms) ? ms : null;
+  } catch {
+    return null;
+  }
+}
+
+function verifySocketOwnership(port, targetPid, minCreationTime = null) {
+  if (!port || !targetPid || typeof targetPid !== 'number' || targetPid <= 0) {
+    return { verified: false, socketPid: null, reason: 'INVALID_TARGET_PID' };
+  }
+  if (process.platform !== 'win32') {
+    return { verified: false, socketPid: null, reason: 'UNSUPPORTED_PLATFORM' };
+  }
+  try {
+    const { execSync } = require('child_process');
+    const netstatOut = execSync('netstat -ano -p tcp', { timeout: 1000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const portRegex = new RegExp(`(?:127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::\\]|\\[::1\\]):${port}\\s+[^\\s]+\\s+LISTENING\\s+(\\d+)`, 'i');
+    const match = netstatOut.match(portRegex);
+    if (!match) {
+      return { verified: false, socketPid: null, reason: 'PORT_NOT_LISTENING' };
+    }
+    const socketPid = parseInt(match[1], 10);
+    if (!socketPid || socketPid <= 0) {
+      return { verified: false, socketPid: null, reason: 'INVALID_SOCKET_PID' };
+    }
+
+    // Verify process creation time to reject pre-existing listeners / recycled PIDs
+    function checkCreationTime(pid) {
+      if (!minCreationTime) {
+        return { ok: false, reason: 'CREATION_TIME_REQUIRED' };
+      }
+      const minTimeMs = typeof minCreationTime === 'number' ? minCreationTime : Date.parse(minCreationTime);
+      if (!Number.isFinite(minTimeMs)) {
+        return { ok: false, reason: 'INVALID_CREATION_TIME' };
+      }
+      const startMs = getProcessStartTimeMs(pid);
+      if (startMs === null) {
+        return { ok: false, reason: 'PROCESS_INFO_UNAVAILABLE' };
+      }
+      // Tolerate clock skew up to 1000ms between process creation and timestamp recording
+      if (startMs < minTimeMs - 1000) {
+        return { ok: false, reason: 'PRE_EXISTING_LISTENER_PID_REUSE', startMs, minTimeMs };
+      }
+      return { ok: true, startMs };
+    }
+
+    if (socketPid === targetPid) {
+      const timeCheck = checkCreationTime(socketPid);
+      if (!timeCheck.ok) {
+        return { verified: false, socketPid, reason: timeCheck.reason };
+      }
+      return { verified: true, socketPid, isDirect: true };
+    }
+
+    // Bounded cycle-safe parent/descendant traversal up to 4 levels
+    try {
+      let currentCheckPid = socketPid;
+      const visitedPids = new Set([currentCheckPid]);
+      for (let depth = 0; depth < 4; depth++) {
+        const parentOut = execSync(`powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ProcessId = ${currentCheckPid}').ParentProcessId"`, { timeout: 1000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        const parentPid = parseInt(parentOut, 10);
+        if (!parentPid || parentPid <= 0 || visitedPids.has(parentPid)) {
+          break;
+        }
+        if (parentPid === targetPid) {
+          const timeCheck = checkCreationTime(socketPid);
+          if (!timeCheck.ok) {
+            return { verified: false, socketPid, reason: timeCheck.reason };
+          }
+          return { verified: true, socketPid, isDescendant: true, parentPid, depth: depth + 1 };
+        }
+        visitedPids.add(parentPid);
+        currentCheckPid = parentPid;
+      }
+    } catch {}
+
+    return { verified: false, socketPid, reason: 'PID_MISMATCH' };
+  } catch (err) {
+    return { verified: false, socketPid: null, error: err.message, reason: 'SOCKET_INSPECTION_FAILED' };
+  }
+}
+
 async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout = '', processMeta = {}) {
   if (!workspaceRoot || typeof workspaceRoot !== 'string') return null;
   if (!processMeta || (!processMeta.childProcessSpawned && !processMeta.workerPid)) {
@@ -353,27 +446,37 @@ async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout
   let displayInfo = `Server listening at http://localhost:${verifiedPort}`;
   let httpReadinessStatus = 'NOT_VERIFIED';
   let serverStartupStatus = 'NOT_VERIFIED';
+  let listenerOwnershipStatus = 'NOT_VERIFIED';
 
-  if (typeof httpStatus === 'number') {
-    httpReadinessStatus = 'VERIFIED';
-    serverStartupStatus = 'VERIFIED';
-    if (httpStatus >= 200 && httpStatus < 400) {
-      displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Ready)`;
-    } else if (httpStatus >= 400 && httpStatus < 500) {
-      displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Responsive)`;
-    } else {
-      displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Unhealthy)`;
+  const targetPid = processMeta.workerPid || processMeta.pid;
+  const ownership = typeof targetPid === 'number' && targetPid > 0
+    ? verifySocketOwnership(verifiedPort, targetPid, processMeta.createdAt)
+    : { verified: false };
+
+  if (ownership.verified) {
+    listenerOwnershipStatus = 'ATTRIBUTED';
+    if (typeof httpStatus === 'number') {
+      httpReadinessStatus = 'VERIFIED';
+      serverStartupStatus = 'VERIFIED';
+      if (httpStatus >= 200 && httpStatus < 400) {
+        displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Ready)`;
+      } else if (httpStatus >= 400 && httpStatus < 500) {
+        displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Responsive)`;
+      } else {
+        displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Unhealthy)`;
+      }
     }
   }
 
   return {
     commandExecutionStatus: 'SUCCESS',
     processIdentityStatus: (processMeta.childProcessSpawned && (processMeta.workerPid || processMeta.pid)) ? 'VERIFIED' : 'UNVERIFIED',
-    listenerOwnershipStatus: 'ATTRIBUTED',
+    listenerOwnershipStatus,
     httpReadinessStatus,
     serverStartupStatus,
     port: verifiedPort,
     httpStatus,
+    socketOwnerPid: ownership.socketPid || null,
     displayInfo,
     toString() { return displayInfo; },
   };
@@ -386,8 +489,10 @@ async function executeWorkspaceCommandsPipeline({
   userApproved = true,
   isSyntheticTest = false,
   sessionId = 'developer-session',
+  executionId = null,
+  parentExecutionId = null,
 }) {
-  const rawCommands = commands || [];
+  const authoritativeExecutionId = executionId || parentExecutionId || `exec-${Date.now()}`;
   const commandsList = Array.isArray(rawCommands)
     ? rawCommands.map((c) => String(c).trim()).filter(Boolean)
     : (typeof rawCommands === 'string' && rawCommands.trim() ? [rawCommands.trim()] : []);
@@ -434,6 +539,7 @@ async function executeWorkspaceCommandsPipeline({
     const commandTimeout = isServerCmd ? 8000 : 120000;
     let runResult;
     let execTimedOut = false;
+    const commandStartTime = Date.now();
     try {
       runResult = await executeWithSupervisor({
         supervisor: isolationVerification.client,
@@ -488,6 +594,7 @@ async function executeWorkspaceCommandsPipeline({
           workerPid: runResult.workerPid || runResult.pid,
           childProcessSpawned: runResult.childProcessSpawned,
           isAlive: runResult.ok,
+          createdAt: runResult.createdAt || commandStartTime,
         });
         if (endpointInfo) {
           const displayStr = typeof endpointInfo === 'string' ? endpointInfo : endpointInfo.displayInfo;
@@ -503,6 +610,7 @@ async function executeWorkspaceCommandsPipeline({
         workerPid: runResult.workerPid || runResult.pid,
         childProcessSpawned: runResult.childProcessSpawned,
         isAlive: runResult.ok,
+        createdAt: runResult.createdAt || commandStartTime,
       });
       if (endpointInfo) {
         const displayStr = typeof endpointInfo === 'string' ? endpointInfo : endpointInfo.displayInfo;
@@ -513,6 +621,7 @@ async function executeWorkspaceCommandsPipeline({
       }
     }
     const serverReadiness = runResult.serverReadiness;
+    const childExecutionId = `${authoritativeExecutionId}:cmd:${executedResults.length}`;
     executedResults.push({
       command: cmd,
       ok: Boolean(runResult.ok),
@@ -526,12 +635,16 @@ async function executeWorkspaceCommandsPipeline({
       cancelled: Boolean(runResult.cancelled),
       terminationConfirmed: Boolean(runResult.terminationConfirmed ?? (runResult.ok && !runResult.timedOut)),
       executionStatus: runResult.executionStatus || (runResult.timedOut ? 'TIMED_OUT' : (runResult.cancelled ? 'CANCELLED' : (runResult.ok ? 'COMPLETED' : 'FAILED'))),
+      outputCaptureCompleted: Boolean(runResult.outputCaptureCompleted ?? true),
+      outputCaptureStatus: runResult.outputCaptureStatus || 'COMPLETED',
       commandExecutionStatus: runResult.ok ? 'COMPLETED' : 'FAILED',
       processIdentityStatus: runResult.childProcessSpawned ? 'VERIFIED' : 'UNVERIFIED',
       listenerOwnershipStatus: serverReadiness?.listenerOwnershipStatus || (isServerCmd ? 'NOT_VERIFIED' : 'NOT_APPLICABLE'),
       httpReadinessStatus: serverReadiness?.httpReadinessStatus || (isServerCmd ? 'NOT_VERIFIED' : 'NOT_APPLICABLE'),
       serverStartupStatus: serverReadiness?.serverStartupStatus || (isServerCmd ? 'NOT_VERIFIED' : 'NOT_APPLICABLE'),
-      executionId: `exec-${Date.now()}-${executedResults.length}`,
+      executionId: authoritativeExecutionId,
+      parentExecutionId: authoritativeExecutionId,
+      childExecutionId,
     });
     if (!runResult.ok) {
       break;
@@ -566,6 +679,8 @@ async function executeWorkspaceCommandsPipeline({
       commands: commandsList,
       results: executedResults,
       isolated: true,
+      executionId: authoritativeExecutionId,
+      parentExecutionId: authoritativeExecutionId,
       serverStartupStatus: isServerCmd ? (lastResult?.serverStartupStatus || 'NOT_VERIFIED') : 'NOT_APPLICABLE',
       listenerOwnershipStatus: isServerCmd ? (lastResult?.listenerOwnershipStatus || 'NOT_VERIFIED') : 'NOT_APPLICABLE',
       httpReadinessStatus: isServerCmd ? (lastResult?.httpReadinessStatus || 'NOT_VERIFIED') : 'NOT_APPLICABLE',
