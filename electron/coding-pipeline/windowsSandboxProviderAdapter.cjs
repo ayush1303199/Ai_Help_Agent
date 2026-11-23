@@ -646,6 +646,9 @@ async function executeWithSupervisor({
     stderr: executionResult?.stderr || '',
     timedOut: Boolean(executionResult?.timedOut),
     cancelled: Boolean(executionResult?.cancelled),
+    workerPid: executionResult?.workerPid || null,
+    childProcessSpawned: Boolean(executionResult?.childProcessSpawned),
+    isSynthetic: Boolean(executionResult?.isSynthetic),
     hostEvidence,
     terminationResult,
     releaseVerification,
@@ -943,6 +946,7 @@ function createNativeSupervisorClient(options = {}) {
         commandDigest: req?.commandDigest,
         workspaceRoot: req?.workspaceRoot,
         sessionId: req?.sessionId || req?.grant?.sessionId || defaultSessionId,
+        isSyntheticTest: Boolean(options.isSyntheticTest),
       }, { pipePath });
     },
     async enforceDeadlineAndCancellation({ timeoutMs, signal, isCancelled }) {

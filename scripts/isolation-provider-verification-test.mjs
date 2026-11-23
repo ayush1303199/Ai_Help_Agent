@@ -744,6 +744,187 @@ async function testV44856DSecurityRemediation() {
   assert.strictEqual(liveRes.hostFallback, 'ZERO');
 }
 
+// -------------------------------------------------------------
+// Test 12: Milestone V44.85.7A Command Output Integrity & Evidence Pipeline
+// -------------------------------------------------------------
+async function testV44857ACommandOutputIntegrity() {
+  console.log('Testing V44.85.7A command output integrity, real process evidence and honest launch verification...');
+
+  const { executeWithSupervisor } = windowsAdapterPkg;
+
+  function createMockSupervisor(overrides = {}) {
+    const base = createNativeSupervisorClient({
+      isSyntheticTest: true,
+      pid: 9999,
+      tokenUserSid: 'S-1-5-18',
+    });
+    return {
+      ...base,
+      issueExecutionGrant: async (req) => ({
+        granted: true,
+        runId: req.runId,
+        workspaceRoot: req.workspaceRoot,
+        approvedSnapshotDigest: req.approvedSnapshotDigest,
+        commandDigest: req.commandDigest,
+        sessionId: req.sessionId,
+      }),
+      consumeExecutionGrant: async () => ({ ok: true, consumed: true }),
+      allocateWorker: async () => ({ workerId: 'w-v44-7a' }),
+      observeEffectiveIsolation: async () => ({ effectiveIsolationVerified: true }),
+      executeApprovedOperation: async (req) => {
+        return {
+          ok: true,
+          exitCode: 0,
+          stdout: 'REAL_STDOUT_PAYLOAD',
+          stderr: 'REAL_STDERR_PAYLOAD',
+          workerPid: 54321,
+          childProcessSpawned: true,
+          isSynthetic: false,
+        };
+      },
+      enforceDeadlineAndCancellation: async () => {},
+      collectHostEvidence: async () => ({ evidenceCollected: true }),
+      terminateWorker: async () => ({ terminated: true }),
+      verifyWorkerTerminationAndResourceRelease: async () => ({ released: true }),
+      quarantineResource: async () => ({ quarantined: true }),
+      resolveQuarantine: async () => ({ resolved: true }),
+      ...overrides,
+    };
+  }
+
+  const safeWs = path.join(tempDir, 'v44-7a-safe-ws');
+  await fs.mkdir(safeWs, { recursive: true });
+
+  // 1. Real stdout and stderr preservation
+  const realRes = await executeWithSupervisor({
+    supervisor: createMockSupervisor(),
+    isSyntheticTest: true,
+    runId: 'run-v44-real-out',
+    workspaceRoot: safeWs,
+    approvedSnapshotDigest: 'snap-digest',
+    command: 'npm run test-evidence',
+    sessionId: 'session-7a',
+  });
+  assert.strictEqual(realRes.ok, true);
+  assert.strictEqual(realRes.exitCode, 0);
+  assert.strictEqual(realRes.stdout, 'REAL_STDOUT_PAYLOAD', 'Actual child stdout must be preserved intact');
+  assert.strictEqual(realRes.stderr, 'REAL_STDERR_PAYLOAD', 'Actual child stderr must be preserved intact');
+  assert.strictEqual(realRes.workerPid, 54321);
+  assert.strictEqual(realRes.childProcessSpawned, true);
+
+  // 2. Non-zero exit code preservation (never inverted to 0)
+  const failRes = await executeWithSupervisor({
+    supervisor: createMockSupervisor({
+      executeApprovedOperation: async () => ({
+        ok: false,
+        exitCode: 42,
+        stdout: '',
+        stderr: 'Compilation failed on line 12',
+        workerPid: 54322,
+        childProcessSpawned: true,
+      }),
+    }),
+    isSyntheticTest: true,
+    runId: 'run-v44-fail-out',
+    workspaceRoot: safeWs,
+    approvedSnapshotDigest: 'snap-digest',
+    command: 'npm run compile',
+    sessionId: 'session-7a',
+  });
+  assert.strictEqual(failRes.ok, false);
+  assert.strictEqual(failRes.exitCode, 42, 'Non-zero exit code must be preserved');
+  assert.strictEqual(failRes.stderr, 'Compilation failed on line 12');
+
+  // 3. Process creation failure handling
+  let createFailErr = null;
+  try {
+    await executeWithSupervisor({
+      supervisor: createMockSupervisor({
+        executeApprovedOperation: async () => {
+          const err = new Error('CreateProcess failed: binary not found.');
+          err.code = 'PROCESS_CREATE_FAILED';
+          err.exitCode = -1;
+          throw err;
+        },
+      }),
+      isSyntheticTest: true,
+      runId: 'run-v44-create-fail',
+      workspaceRoot: safeWs,
+      approvedSnapshotDigest: 'snap-digest',
+      command: 'nonexistent-binary',
+      sessionId: 'session-7a',
+    });
+  } catch (err) {
+    createFailErr = err;
+  }
+  assert.ok(createFailErr, 'Process creation failure must be caught and not reported as success');
+  assert.strictEqual(createFailErr.code, 'PROCESS_CREATE_FAILED');
+
+  // 4. Missing process result rejection (null/undefined exitCode must not yield ok: true)
+  const missingExitRes = await executeWithSupervisor({
+    supervisor: createMockSupervisor({
+      executeApprovedOperation: async () => ({
+        stdout: '',
+        stderr: '',
+        // exitCode is missing
+      }),
+    }),
+    isSyntheticTest: true,
+    runId: 'run-v44-missing-exit',
+    workspaceRoot: safeWs,
+    approvedSnapshotDigest: 'snap-digest',
+    command: 'npm test',
+    sessionId: 'session-7a',
+  });
+  assert.strictEqual(missingExitRes.ok, false, 'Missing exit code must not become ok: true');
+  assert.strictEqual(missingExitRes.exitCode, null);
+
+  // 5. Empty output handling without substituting wrapper message
+  const emptyRes = await executeWithSupervisor({
+    supervisor: createMockSupervisor({
+      executeApprovedOperation: async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        workerPid: 54323,
+        childProcessSpawned: true,
+      }),
+    }),
+    isSyntheticTest: true,
+    runId: 'run-v44-empty-out',
+    workspaceRoot: safeWs,
+    approvedSnapshotDigest: 'snap-digest',
+    command: 'npm install',
+    sessionId: 'session-7a',
+  });
+  assert.strictEqual(emptyRes.ok, true);
+  assert.strictEqual(emptyRes.exitCode, 0);
+  assert.strictEqual(emptyRes.stdout, '', 'Empty stdout must not be substituted with wrapper strings');
+
+  // 6. Distinction between synthetic mock and real OS process evidence
+  const synRes = await executeWithSupervisor({
+    supervisor: createMockSupervisor({
+      executeApprovedOperation: async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        childProcessSpawned: false,
+        isSynthetic: true,
+      }),
+    }),
+    isSyntheticTest: true,
+    runId: 'run-v44-syn-out',
+    workspaceRoot: safeWs,
+    approvedSnapshotDigest: 'snap-digest',
+    command: 'echo synthetic',
+    sessionId: 'session-7a',
+  });
+  assert.strictEqual(synRes.childProcessSpawned, false, 'Synthetic execution must report childProcessSpawned: false');
+  assert.strictEqual(synRes.isSynthetic, true, 'Synthetic execution must report isSynthetic: true');
+}
+
 async function runAllTests() {
   try {
     await setupTestDir();
@@ -758,6 +939,7 @@ async function runAllTests() {
     await testV44856SecurityGateAndSupervisorRemediation();
     await testV44856BSecurityHardening();
     await testV44856DSecurityRemediation();
+    await testV44857ACommandOutputIntegrity();
     console.log('All Isolation Provider Verification & Sandbox Readiness regression tests passed successfully!');
   } finally {
     await cleanupTestDir();

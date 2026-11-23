@@ -868,21 +868,22 @@ async function _executeBuildPlanCore({
         }
 
         const isStart = plan.operation === BUILD_OPERATIONS.START;
+        const realPid = supervisorResult.workerPid || supervisorResult.pid || undefined;
         return {
-          ok: true,
-          status: BUILD_OUTCOMES.PASSED,
+          ok: supervisorResult.ok === true,
+          status: supervisorResult.ok ? BUILD_OUTCOMES.PASSED : BUILD_OUTCOMES.FAILED,
           outcome: isStart ? 'STARTED' : 'COMPLETED',
-          exitCode: isStart ? null : 0,
-          pid: isStart ? liveIso.identity.pid : undefined,
-          isAlive: isStart ? true : undefined,
+          exitCode: supervisorResult.exitCode ?? (supervisorResult.ok ? 0 : 1),
+          pid: isStart ? realPid : undefined,
+          isAlive: isStart ? Boolean(supervisorResult.ok && (supervisorResult.childProcessSpawned || realPid)) : undefined,
           supervisor: isStart ? {
             expectedProcessIdentity: liveIso.identity.supervisorId,
             processIdentity: liveIso.identity.supervisorId,
-            expectedPid: liveIso.identity.pid,
-            pid: liveIso.identity.pid,
-            isAlive: true,
+            expectedPid: realPid,
+            pid: realPid,
+            isAlive: Boolean(supervisorResult.ok && (supervisorResult.childProcessSpawned || realPid)),
           } : undefined,
-          stdout: supervisorResult.stdout || 'Execution verified under native supervisor containment.',
+          stdout: supervisorResult.stdout || '',
           stderr: supervisorResult.stderr || '',
           elapsedMs: 100,
           operation: plan.operation,

@@ -1380,6 +1380,8 @@ namespace AiHelpAgent.NativeSupervisor
                     jobRes["vmBoundaryEnforced"] = false;
                     jobRes["processIsolationGate"] = "BLOCKED";
                     jobRes["workerPid"] = (int)pi.dwProcessId;
+                    jobRes["childProcessSpawned"] = true;
+                    jobRes["isSynthetic"] = false;
                     return jobRes;
                 }
                 finally
@@ -1404,6 +1406,8 @@ namespace AiHelpAgent.NativeSupervisor
             res["exitCode"] = 0;
             res["stdout"] = "Execution verified under native supervisor containment.";
             res["stderr"] = "";
+            res["childProcessSpawned"] = false;
+            res["isSynthetic"] = true;
             res["timedOut"] = false;
             res["cancelled"] = false;
             return res;
