@@ -6284,8 +6284,9 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         };
       }
 
+      const isRealLaunch = Boolean(supervisorRunResult?.childProcessSpawned && !supervisorRunResult?.isSynthetic);
       advanceConversationTurn(turn.turnId, 'completed', owner, {
-        phase: 'launch_verified',
+        phase: isRealLaunch ? 'launch_verified' : 'synthetic_launch_acknowledged',
         processIsolationGate: isolationVerification.processIsolationGate,
         supervisorIdentity: isolationVerification.identity,
       });
@@ -6852,8 +6853,9 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         };
       }
 
+      const isRealLaunch = Boolean(supervisorRunResult?.childProcessSpawned && !supervisorRunResult?.isSynthetic);
       advanceConversationTurn(turn.turnId, 'completed', owner, {
-        phase: 'launch_verified',
+        phase: isRealLaunch ? 'launch_verified' : 'synthetic_launch_acknowledged',
         processIsolationGate: isolationVerification.processIsolationGate,
         supervisorIdentity: isolationVerification.identity,
       });

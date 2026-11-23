@@ -660,13 +660,24 @@ async function executeWithSupervisor({
   const cleanMessage = executionResult?.message || (isLegacySyntheticMsg ? 'Synthetic supervisor operation acknowledged; no child process spawned.' : null);
   const childProcessSpawned = executionResult?.childProcessSpawned ?? (!isSynthetic && Boolean(executionResult?.workerPid));
 
+  const timedOut = Boolean(executionResult?.timedOut);
+  const cancelled = Boolean(executionResult?.cancelled);
+  const terminationConfirmed = Boolean(executionResult?.terminationConfirmed ?? terminationResult?.terminated);
+  const actualExitCode = executionResult?.actualExitCode !== undefined
+    ? executionResult.actualExitCode
+    : (timedOut ? null : (executionResult?.exitCode ?? null));
+  const executionStatus = executionResult?.executionStatus || (timedOut ? 'TIMED_OUT' : (cancelled ? 'CANCELLED' : (executionResult?.exitCode === 0 ? 'COMPLETED' : 'FAILED')));
+
   return {
-    ok: executionResult?.exitCode === 0,
+    ok: executionResult?.exitCode === 0 && !timedOut && !cancelled,
     exitCode: executionResult?.exitCode ?? null,
+    actualExitCode,
     stdout: cleanStdout,
     stderr: executionResult?.stderr || '',
-    timedOut: Boolean(executionResult?.timedOut),
-    cancelled: Boolean(executionResult?.cancelled),
+    timedOut,
+    cancelled,
+    terminationConfirmed,
+    executionStatus,
     workerPid: executionResult?.workerPid ?? worker?.workerPid ?? null,
     childProcessSpawned,
     isSynthetic,

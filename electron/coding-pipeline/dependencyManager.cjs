@@ -901,14 +901,27 @@ async function executeDependencyPlan({
         }
 
         const verification = await verifyInstalledDependencies(plan.projectRoot);
-        const isInstalled = Boolean(verification.isFullyInstalled && supervisorResult.ok);
+        const hasRealProcessEvidence = Boolean(
+          supervisorResult.ok &&
+          supervisorResult.exitCode === 0 &&
+          !supervisorResult.timedOut &&
+          !supervisorResult.cancelled &&
+          !supervisorResult.isSynthetic &&
+          (supervisorResult.childProcessSpawned || supervisorResult.workerPid)
+        );
+        const isInstalled = Boolean(hasRealProcessEvidence && verification.isFullyInstalled);
         return {
-          ok: Boolean(supervisorResult.ok && verification.isFullyInstalled),
-          status: isInstalled ? 'INSTALLED' : 'FAILED',
+          ok: Boolean(supervisorResult.ok && (!hasRealProcessEvidence ? false : verification.isFullyInstalled)),
+          status: isInstalled ? 'INSTALLED' : (supervisorResult.isSynthetic ? 'SYNTHETIC_ACKNOWLEDGED' : 'FAILED'),
           exitCode: supervisorResult.exitCode ?? (supervisorResult.ok ? 0 : 1),
+          actualExitCode: supervisorResult.actualExitCode !== undefined ? supervisorResult.actualExitCode : (supervisorResult.timedOut ? null : (supervisorResult.exitCode ?? null)),
           stdout: supervisorResult.stdout || '',
           stderr: supervisorResult.stderr || '',
           installed: isInstalled,
+          childProcessSpawned: Boolean(supervisorResult.childProcessSpawned),
+          isSynthetic: Boolean(supervisorResult.isSynthetic),
+          timedOut: Boolean(supervisorResult.timedOut),
+          cancelled: Boolean(supervisorResult.cancelled),
           dependencyVerification: verification,
           gate: 'PROCESS_ISOLATION_GATE',
           processIsolationGate: 'ALLOWED',

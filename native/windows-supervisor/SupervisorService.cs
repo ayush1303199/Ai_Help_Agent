@@ -506,40 +506,54 @@ namespace AiHelpAgent.NativeSupervisor
             if (hPipe == IntPtr.Zero) return string.Empty;
             byte[] buffer = new byte[4096];
             List<byte> totalBytes = new List<byte>();
-            while (true)
+            try
             {
-                uint bytesRead = 0;
-                bool success = NativeMethods.ReadFile(hPipe, buffer, (uint)buffer.Length, out bytesRead, IntPtr.Zero);
-                if (!success || bytesRead == 0)
+                while (true)
                 {
-                    break;
-                }
-                if (totalBytes.Count + (int)bytesRead > maxBytes)
-                {
-                    int allowed = maxBytes - totalBytes.Count;
-                    if (allowed > 0)
+                    uint bytesRead = 0;
+                    bool success = NativeMethods.ReadFile(hPipe, buffer, (uint)buffer.Length, out bytesRead, IntPtr.Zero);
+                    if (!success || bytesRead == 0)
                     {
-                        byte[] slice = new byte[allowed];
-                        Array.Copy(buffer, 0, slice, 0, allowed);
+                        break;
+                    }
+                    if (totalBytes.Count + (int)bytesRead > maxBytes)
+                    {
+                        int allowed = maxBytes - totalBytes.Count;
+                        if (allowed > 0)
+                        {
+                            byte[] slice = new byte[allowed];
+                            Array.Copy(buffer, 0, slice, 0, allowed);
+                            totalBytes.AddRange(slice);
+                        }
+                        isTruncated = true;
+                        while (true)
+                        {
+                            uint drainRead = 0;
+                            bool drainSuccess = NativeMethods.ReadFile(hPipe, buffer, (uint)buffer.Length, out drainRead, IntPtr.Zero);
+                            if (!drainSuccess || drainRead == 0) break;
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        byte[] slice = new byte[bytesRead];
+                        Array.Copy(buffer, 0, slice, 0, bytesRead);
                         totalBytes.AddRange(slice);
                     }
-                    isTruncated = true;
-                    while (true)
-                    {
-                        uint drainRead = 0;
-                        bool drainSuccess = NativeMethods.ReadFile(hPipe, buffer, (uint)buffer.Length, out drainRead, IntPtr.Zero);
-                        if (!drainSuccess || drainRead == 0) break;
-                    }
-                    break;
-                }
-                else
-                {
-                    byte[] slice = new byte[bytesRead];
-                    Array.Copy(buffer, 0, slice, 0, bytesRead);
-                    totalBytes.AddRange(slice);
                 }
             }
-            return Encoding.UTF8.GetString(totalBytes.ToArray());
+            catch
+            {
+                isTruncated = true;
+            }
+            try
+            {
+                return Encoding.UTF8.GetString(totalBytes.ToArray());
+            }
+            catch
+            {
+                return string.Empty;
+            }
         }
 
         private static bool HasReparsePointOrJunction(string path)
@@ -1379,7 +1393,7 @@ namespace AiHelpAgent.NativeSupervisor
                 si.cb = Marshal.SizeOf(typeof(NativeMethods.STARTUPINFO));
                 si.hStdOutput = hStdoutWrite;
                 si.hStdError = hStderrWrite;
-                si.hStdInput = NativeMethods.GetStdHandle(NativeMethods.STD_INPUT_HANDLE);
+                si.hStdInput = IntPtr.Zero;
                 si.dwFlags |= NativeMethods.STARTF_USESTDHANDLES;
 
                 NativeMethods.PROCESS_INFORMATION pi = new NativeMethods.PROCESS_INFORMATION();
@@ -1463,7 +1477,13 @@ namespace AiHelpAgent.NativeSupervisor
 
                     uint waitRes = NativeMethods.WaitForSingleObject(pi.hProcess, (uint)timeoutMs);
                     bool timedOut = (waitRes == NativeMethods.WAIT_TIMEOUT);
-                    if (timedOut) NativeMethods.TerminateProcess(pi.hProcess, 137);
+                    bool termConfirmed = false;
+                    if (timedOut)
+                    {
+                        NativeMethods.TerminateProcess(pi.hProcess, 137);
+                        uint termWait = NativeMethods.WaitForSingleObject(pi.hProcess, 1000);
+                        termConfirmed = (termWait == NativeMethods.WAIT_OBJECT_0);
+                    }
                     uint procExit = 1;
                     NativeMethods.GetExitCodeProcess(pi.hProcess, out procExit);
 
@@ -1483,11 +1503,14 @@ namespace AiHelpAgent.NativeSupervisor
                     Dictionary<string, object> jobRes = new Dictionary<string, object>();
                     jobRes["ok"] = !timedOut && procExit == 0;
                     jobRes["exitCode"] = (int)procExit;
+                    jobRes["actualExitCode"] = timedOut ? null : (int?)procExit;
                     jobRes["stdout"] = stdoutResult ?? "";
                     jobRes["stderr"] = stderrResult ?? "";
                     jobRes["outputTruncated"] = stdoutTruncated || stderrTruncated;
                     jobRes["timedOut"] = timedOut;
                     jobRes["cancelled"] = false;
+                    jobRes["terminationConfirmed"] = timedOut ? termConfirmed : true;
+                    jobRes["executionStatus"] = timedOut ? "TIMED_OUT" : (procExit == 0 ? "COMPLETED" : "FAILED");
                     jobRes["containedByJobObject"] = true;
                     jobRes["vmBoundaryEnforced"] = false;
                     jobRes["processIsolationGate"] = "BLOCKED";
@@ -2799,6 +2822,7 @@ namespace AiHelpAgent.NativeSupervisor
 
         public const uint CREATE_SUSPENDED = 0x00000004;
         public const uint CREATE_NO_WINDOW = 0x08000000;
+        public const uint WAIT_OBJECT_0 = 0x00000000;
         public const uint WAIT_TIMEOUT = 0x00000102;
         public const int STD_INPUT_HANDLE = -10;
         public const int STD_OUTPUT_HANDLE = -11;

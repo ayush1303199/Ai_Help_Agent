@@ -1105,6 +1105,195 @@ async function testV44857BCommandOutputIntegrityAndEvidencePipeline() {
   assert.strictEqual(liveRes.hostFallback, 'ZERO');
 }
 
+// Test 14: Milestone V44.85.7C Independent Native Execution & Lifecycle Audit
+// -------------------------------------------------------------------------
+async function testV44857CExecutionAndLifecycleAudit() {
+  console.log('Testing V44.85.7C native pipe capture, handle lifecycle, exit-code integrity & readiness audit...');
+  const { executeWithSupervisor } = windowsAdapterPkg;
+
+  const auditWs = path.join(tempDir, 'v44-audit-ws');
+  await fs.mkdir(auditWs, { recursive: true });
+
+  function createMockSupervisorC(overrides = {}) {
+    const base = createNativeSupervisorClient({
+      isSyntheticTest: true,
+      pid: 9999,
+      tokenUserSid: 'S-1-5-18',
+    });
+    return {
+      ...base,
+      issueExecutionGrant: async (req) => ({
+        granted: true,
+        runId: req.runId,
+        workspaceRoot: req.workspaceRoot,
+        approvedSnapshotDigest: req.approvedSnapshotDigest,
+        commandDigest: crypto.createHash('sha256').update(String(req.command || '')).digest('hex'),
+        sessionId: req.sessionId,
+        grantId: 'grant-test-7c',
+      }),
+      consumeExecutionGrant: async () => ({ consumed: true }),
+      allocateWorker: async (req) => ({
+        workerId: 'worker-test-7c',
+        runId: req.runId,
+        sessionId: req.sessionId,
+        workerPid: 65432,
+      }),
+      observeEffectiveIsolation: async () => ({ effectiveIsolationVerified: true }),
+      executeApprovedOperation: async () => ({
+        ok: true,
+        exitCode: 0,
+        actualExitCode: 0,
+        stdout: '',
+        stderr: '',
+        isSynthetic: false,
+        childProcessSpawned: true,
+        workerPid: 65432,
+        timedOut: false,
+        cancelled: false,
+        terminationConfirmed: true,
+        executionStatus: 'COMPLETED',
+        outputTruncated: false,
+      }),
+      enforceDeadlineAndCancellation: async () => new Promise(() => {}),
+      collectHostEvidence: async () => ({ evidenceCollected: true }),
+      terminateWorker: async () => ({ terminated: true }),
+      verifyWorkerTerminationAndResourceRelease: async () => ({ released: true }),
+      quarantineResource: async () => {},
+      resolveQuarantine: async () => {},
+      ...overrides,
+    };
+  }
+
+  // 1. Process termination confirmation and actualExitCode distinction
+  const timeoutSup = createMockSupervisorC({
+    executeApprovedOperation: async () => {
+      const err = new Error('Execution deadline exceeded.');
+      err.timedOut = true;
+      err.exitCode = 124;
+      err.actualExitCode = null;
+      err.terminationConfirmed = true;
+      err.executionStatus = 'TIMED_OUT';
+      err.childProcessSpawned = true;
+      err.workerPid = 65433;
+      throw err;
+    },
+  });
+
+  let capturedTimeoutErr = null;
+  try {
+    await executeWithSupervisor({
+      supervisor: timeoutSup,
+      isSyntheticTest: true,
+      runId: 'run-timeout-7c',
+      workspaceRoot: auditWs,
+      approvedSnapshotDigest: 'snap-digest-7c',
+      command: 'npm start',
+      sessionId: 'session-7c-1',
+    });
+  } catch (err) {
+    capturedTimeoutErr = err;
+  }
+  assert.ok(capturedTimeoutErr, 'Timed out operation must reject');
+  assert.strictEqual(capturedTimeoutErr.timedOut, true);
+  assert.strictEqual(capturedTimeoutErr.actualExitCode, null, 'Actual exit code must be null when timed out without process exit');
+
+  // 2. Cancellation integrity: cancellation is distinguishable from timeout
+  const cancelSup = createMockSupervisorC({
+    executeApprovedOperation: async () => {
+      const err = new Error('Execution cancelled.');
+      err.cancelled = true;
+      err.timedOut = false;
+      err.actualExitCode = null;
+      err.terminationConfirmed = true;
+      err.executionStatus = 'CANCELLED';
+      err.childProcessSpawned = true;
+      err.workerPid = 65434;
+      throw err;
+    },
+  });
+
+  let capturedCancelErr = null;
+  try {
+    await executeWithSupervisor({
+      supervisor: cancelSup,
+      isSyntheticTest: true,
+      runId: 'run-cancel-7c',
+      workspaceRoot: auditWs,
+      approvedSnapshotDigest: 'snap-digest-7c',
+      command: 'npm test',
+      sessionId: 'session-7c-2',
+    });
+  } catch (err) {
+    capturedCancelErr = err;
+  }
+  assert.ok(capturedCancelErr, 'Cancelled operation must reject');
+  assert.strictEqual(capturedCancelErr.cancelled, true);
+  assert.strictEqual(capturedCancelErr.timedOut, false);
+
+  // 3. Output truncation metadata accurate and preserved
+  const truncSup = createMockSupervisorC({
+    executeApprovedOperation: async () => ({
+      ok: true,
+      exitCode: 0,
+      actualExitCode: 0,
+      stdout: 'TRUNCATED_STREAM_OUTPUT',
+      stderr: '',
+      isSynthetic: false,
+      childProcessSpawned: true,
+      workerPid: 65435,
+      timedOut: false,
+      cancelled: false,
+      terminationConfirmed: true,
+      executionStatus: 'COMPLETED',
+      outputTruncated: true,
+    }),
+  });
+
+  const truncRes = await executeWithSupervisor({
+    supervisor: truncSup,
+    isSyntheticTest: true,
+    runId: 'run-trunc-7c',
+    workspaceRoot: auditWs,
+    approvedSnapshotDigest: 'snap-digest-7c',
+    command: 'npm run dump-large',
+    sessionId: 'session-7c-3',
+  });
+  assert.strictEqual(truncRes.ok, true);
+  assert.strictEqual(truncRes.outputTruncated, true);
+  assert.strictEqual(truncRes.actualExitCode, 0);
+
+  // 4. Multibyte UTF-8 stream decoding
+  const utf8Payload = 'Test multibyte characters: ñ, ü, 🚀, 中文, العربية';
+  const utf8Sup = createMockSupervisorC({
+    executeApprovedOperation: async () => ({
+      ok: true,
+      exitCode: 0,
+      actualExitCode: 0,
+      stdout: utf8Payload,
+      stderr: '',
+      isSynthetic: false,
+      childProcessSpawned: true,
+      workerPid: 65436,
+      timedOut: false,
+      cancelled: false,
+      terminationConfirmed: true,
+      executionStatus: 'COMPLETED',
+      outputTruncated: false,
+    }),
+  });
+
+  const utf8Res = await executeWithSupervisor({
+    supervisor: utf8Sup,
+    isSyntheticTest: true,
+    runId: 'run-utf8-7c',
+    workspaceRoot: auditWs,
+    approvedSnapshotDigest: 'snap-digest-7c',
+    command: 'echo utf8',
+    sessionId: 'session-7c-4',
+  });
+  assert.strictEqual(utf8Res.stdout, utf8Payload, 'UTF-8 multibyte characters must be preserved without corruption');
+}
+
 async function runAllTests() {
   try {
     await setupTestDir();
@@ -1121,6 +1310,7 @@ async function runAllTests() {
     await testV44856DSecurityRemediation();
     await testV44857ACommandOutputIntegrity();
     await testV44857BCommandOutputIntegrityAndEvidencePipeline();
+    await testV44857CExecutionAndLifecycleAudit();
     console.log('All Isolation Provider Verification & Sandbox Readiness regression tests passed successfully!');
   } finally {
     await cleanupTestDir();

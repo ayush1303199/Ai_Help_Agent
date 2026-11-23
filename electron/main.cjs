@@ -324,23 +324,59 @@ async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout
   }
 
   // Strictly NO blind scanning of default ports [3000, 5000, 5173, etc.] without verified port evidence
-  if (candidatePorts.length === 0) return null;
-
-  const verifiedPort = await findVerifiedOpenPort(candidatePorts, 2000);
-  if (!verifiedPort) return null;
-
-  const httpStatus = await probeHttpReadiness(verifiedPort, '127.0.0.1', 500);
-  if (typeof httpStatus === 'number') {
-    if (httpStatus >= 200 && httpStatus < 400) {
-      return `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Ready)`;
-    }
-    if (httpStatus >= 400 && httpStatus < 500) {
-      return `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Responsive)`;
-    }
-    return `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Unhealthy)`;
+  if (candidatePorts.length === 0) {
+    return {
+      commandExecutionStatus: 'SUCCESS',
+      processIdentityStatus: (processMeta.childProcessSpawned && (processMeta.workerPid || processMeta.pid)) ? 'VERIFIED' : 'UNVERIFIED',
+      listenerOwnershipStatus: 'NOT_VERIFIED',
+      httpReadinessStatus: 'NOT_VERIFIED',
+      serverStartupStatus: 'NOT_VERIFIED',
+      displayInfo: null,
+      toString() { return ''; },
+    };
   }
 
-  return `Server listening at http://localhost:${verifiedPort}`;
+  const verifiedPort = await findVerifiedOpenPort(candidatePorts, 2000);
+  if (!verifiedPort) {
+    return {
+      commandExecutionStatus: 'SUCCESS',
+      processIdentityStatus: (processMeta.childProcessSpawned && (processMeta.workerPid || processMeta.pid)) ? 'VERIFIED' : 'UNVERIFIED',
+      listenerOwnershipStatus: 'NOT_VERIFIED',
+      httpReadinessStatus: 'NOT_VERIFIED',
+      serverStartupStatus: 'NOT_VERIFIED',
+      displayInfo: null,
+      toString() { return ''; },
+    };
+  }
+
+  const httpStatus = await probeHttpReadiness(verifiedPort, '127.0.0.1', 500);
+  let displayInfo = `Server listening at http://localhost:${verifiedPort}`;
+  let httpReadinessStatus = 'NOT_VERIFIED';
+  let serverStartupStatus = 'NOT_VERIFIED';
+
+  if (typeof httpStatus === 'number') {
+    httpReadinessStatus = 'VERIFIED';
+    serverStartupStatus = 'VERIFIED';
+    if (httpStatus >= 200 && httpStatus < 400) {
+      displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Ready)`;
+    } else if (httpStatus >= 400 && httpStatus < 500) {
+      displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Responsive)`;
+    } else {
+      displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Unhealthy)`;
+    }
+  }
+
+  return {
+    commandExecutionStatus: 'SUCCESS',
+    processIdentityStatus: (processMeta.childProcessSpawned && (processMeta.workerPid || processMeta.pid)) ? 'VERIFIED' : 'UNVERIFIED',
+    listenerOwnershipStatus: 'ATTRIBUTED',
+    httpReadinessStatus,
+    serverStartupStatus,
+    port: verifiedPort,
+    httpStatus,
+    displayInfo,
+    toString() { return displayInfo; },
+  };
 }
 
 async function executeWorkspaceCommandsPipeline({
@@ -454,7 +490,11 @@ async function executeWorkspaceCommandsPipeline({
           isAlive: runResult.ok,
         });
         if (endpointInfo) {
-          runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
+          const displayStr = typeof endpointInfo === 'string' ? endpointInfo : endpointInfo.displayInfo;
+          if (displayStr) {
+            runResult.stdout = [runResult.stdout, displayStr].filter(Boolean).join('\n');
+          }
+          runResult.serverReadiness = endpointInfo;
         }
       }
     } else if (runResult && runResult.ok && !runResult.timedOut && !runResult.cancelled && (runResult.childProcessSpawned || runResult.workerPid || runResult.pid)) {
@@ -465,19 +505,32 @@ async function executeWorkspaceCommandsPipeline({
         isAlive: runResult.ok,
       });
       if (endpointInfo) {
-        runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
+        const displayStr = typeof endpointInfo === 'string' ? endpointInfo : endpointInfo.displayInfo;
+        if (displayStr) {
+          runResult.stdout = [runResult.stdout, displayStr].filter(Boolean).join('\n');
+        }
+        runResult.serverReadiness = endpointInfo;
       }
     }
+    const serverReadiness = runResult.serverReadiness;
     executedResults.push({
       command: cmd,
       ok: Boolean(runResult.ok),
       exitCode: typeof runResult.exitCode === 'number' ? runResult.exitCode : (runResult.ok ? 0 : 1),
+      actualExitCode: runResult.actualExitCode !== undefined ? runResult.actualExitCode : (runResult.timedOut ? null : (typeof runResult.exitCode === 'number' ? runResult.exitCode : null)),
       stdout: runResult.stdout || '',
       stderr: runResult.stderr || '',
       pid: runResult.workerPid || runResult.pid || null,
       childProcessSpawned: Boolean(runResult.childProcessSpawned),
       timedOut: Boolean(runResult.timedOut),
       cancelled: Boolean(runResult.cancelled),
+      terminationConfirmed: Boolean(runResult.terminationConfirmed ?? (runResult.ok && !runResult.timedOut)),
+      executionStatus: runResult.executionStatus || (runResult.timedOut ? 'TIMED_OUT' : (runResult.cancelled ? 'CANCELLED' : (runResult.ok ? 'COMPLETED' : 'FAILED'))),
+      commandExecutionStatus: runResult.ok ? 'COMPLETED' : 'FAILED',
+      processIdentityStatus: runResult.childProcessSpawned ? 'VERIFIED' : 'UNVERIFIED',
+      listenerOwnershipStatus: serverReadiness?.listenerOwnershipStatus || (isServerCmd ? 'NOT_VERIFIED' : 'NOT_APPLICABLE'),
+      httpReadinessStatus: serverReadiness?.httpReadinessStatus || (isServerCmd ? 'NOT_VERIFIED' : 'NOT_APPLICABLE'),
+      serverStartupStatus: serverReadiness?.serverStartupStatus || (isServerCmd ? 'NOT_VERIFIED' : 'NOT_APPLICABLE'),
       executionId: `exec-${Date.now()}-${executedResults.length}`,
     });
     if (!runResult.ok) {
@@ -505,6 +558,7 @@ async function executeWorkspaceCommandsPipeline({
       executed: true,
       ok: allOk,
       exitCode: lastResult?.exitCode ?? (allOk ? 0 : 1),
+      actualExitCode: lastResult?.actualExitCode ?? null,
       stdout: formatOutput(executedResults, 'stdout'),
       stderr: formatOutput(executedResults, 'stderr'),
       rawStdout,
@@ -512,6 +566,11 @@ async function executeWorkspaceCommandsPipeline({
       commands: commandsList,
       results: executedResults,
       isolated: true,
+      serverStartupStatus: isServerCmd ? (lastResult?.serverStartupStatus || 'NOT_VERIFIED') : 'NOT_APPLICABLE',
+      listenerOwnershipStatus: isServerCmd ? (lastResult?.listenerOwnershipStatus || 'NOT_VERIFIED') : 'NOT_APPLICABLE',
+      httpReadinessStatus: isServerCmd ? (lastResult?.httpReadinessStatus || 'NOT_VERIFIED') : 'NOT_APPLICABLE',
+      processIdentityStatus: lastResult?.processIdentityStatus || 'UNVERIFIED',
+      commandExecutionStatus: allOk ? 'COMPLETED' : 'FAILED',
       supervisorIdentity: isolationVerification.identity,
       processIsolationGate: 'ALLOWED',
     },
