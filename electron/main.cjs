@@ -274,6 +274,11 @@ async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout
   const isStartOrDev = /\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b/.test(cmdLower);
   if (!isStartOrDev) return null;
 
+  // Process evidence verification: must have actual child process or explicit live process evidence
+  if (!processMeta || (!processMeta.childProcessSpawned && !processMeta.pid && !processMeta.isAlive)) {
+    return null;
+  }
+
   const candidatePorts = [];
   const text = stdout || '';
   const urlMatches = text.matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1):(\d{2,5})/gi);
@@ -287,37 +292,41 @@ async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout
     if (!candidatePorts.includes(p)) candidatePorts.push(p);
   }
 
-  try {
-    const pkgPath = path.join(workspaceRoot, 'package.json');
-    if (fsSync.existsSync(pkgPath)) {
-      const pkgData = JSON.parse(fsSync.readFileSync(pkgPath, 'utf8'));
-      const startScript = String(pkgData?.scripts?.start || pkgData?.scripts?.dev || '');
-      const portMatch = startScript.match(/(?:--port|-p)\s+([0-9]+)/);
-      if (portMatch) {
-        const p = parseInt(portMatch[1], 10);
-        if (!candidatePorts.includes(p)) candidatePorts.push(p);
-      }
-    }
-  } catch {}
-
-  const configCandidates = ['config/db.js', 'config.js', '.env', '.env.example', 'server.js', 'app.js', 'vite.config.js', 'vite.config.ts', 'vite.config.mjs'];
-  for (const rel of configCandidates) {
+  // If output provided no ports, inspect manifest/config port specifications
+  if (candidatePorts.length === 0) {
     try {
-      const fullPath = path.join(workspaceRoot, rel);
-      if (fsSync.existsSync(fullPath)) {
-        const content = fsSync.readFileSync(fullPath, 'utf8');
-        const portMatch = content.match(/\b(?:port|PORT)\b\s*[:=]\s*(?:Number\(process\.env\.PORT\)\s*\|\|\s*)?(\d{2,5})/);
+      const pkgPath = path.join(workspaceRoot, 'package.json');
+      if (fsSync.existsSync(pkgPath)) {
+        const pkgData = JSON.parse(fsSync.readFileSync(pkgPath, 'utf8'));
+        const startScript = String(pkgData?.scripts?.start || pkgData?.scripts?.dev || '');
+        const portMatch = startScript.match(/(?:--port|-p)\s+([0-9]+)/);
         if (portMatch) {
           const p = parseInt(portMatch[1], 10);
           if (!candidatePorts.includes(p)) candidatePorts.push(p);
         }
       }
     } catch {}
+
+    const configCandidates = ['config/db.js', 'config.js', '.env', '.env.example', 'server.js', 'app.js', 'vite.config.js', 'vite.config.ts', 'vite.config.mjs'];
+    for (const rel of configCandidates) {
+      try {
+        const fullPath = path.join(workspaceRoot, rel);
+        if (fsSync.existsSync(fullPath)) {
+          const content = fsSync.readFileSync(fullPath, 'utf8');
+          const portMatch = content.match(/\b(?:port|PORT)\b\s*[:=]\s*(?:Number\(process\.env\.PORT\)\s*\|\|\s*)?(\d{2,5})/);
+          if (portMatch) {
+            const p = parseInt(portMatch[1], 10);
+            if (!candidatePorts.includes(p)) candidatePorts.push(p);
+          }
+        }
+      } catch {}
+    }
   }
 
+  // Strictly NO blind scanning of default ports [3000, 5000, 5173, etc.] without verified port evidence
   if (candidatePorts.length === 0) return null;
 
-  const verifiedPort = await findVerifiedOpenPort(candidatePorts, 3000);
+  const verifiedPort = await findVerifiedOpenPort(candidatePorts, 2000);
   if (!verifiedPort) return null;
 
   const httpStatus = await probeHttpReadiness(verifiedPort, '127.0.0.1', 500);
@@ -430,24 +439,47 @@ async function executeWorkspaceCommandsPipeline({
       }
     }
 
-    if (execTimedOut) {
-      runResult.ok = false;
-      runResult.exitCode = 124;
-      runResult.timedOut = true;
-      const timeoutMsg = 'Server command timed out before establishing a verified listening endpoint.';
-      runResult.stderr = [runResult.stderr, timeoutMsg].filter(Boolean).join('\n');
-    } else if (runResult && runResult.ok && !runResult.timedOut && !runResult.cancelled) {
-      if (runResult.childProcessSpawned || runResult.workerPid) {
+    if (isServerCmd) {
+      if (execTimedOut) {
+        runResult.ok = false;
+        runResult.exitCode = 124;
+        runResult.timedOut = true;
+        const timeoutMsg = 'Server command timed out before establishing a verified listening endpoint.';
+        runResult.stderr = [runResult.stderr, timeoutMsg].filter(Boolean).join('\n');
+      } else if (runResult.ok && !runResult.timedOut && !runResult.cancelled && (runResult.childProcessSpawned || runResult.workerPid || runResult.pid)) {
         const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout, {
+          pid: runResult.workerPid || runResult.pid,
+          workerPid: runResult.workerPid || runResult.pid,
           childProcessSpawned: runResult.childProcessSpawned,
-          workerPid: runResult.workerPid,
+          isAlive: runResult.ok,
         });
         if (endpointInfo) {
           runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
         }
       }
+    } else if (runResult && runResult.ok && !runResult.timedOut && !runResult.cancelled && (runResult.childProcessSpawned || runResult.workerPid || runResult.pid)) {
+      const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout, {
+        pid: runResult.workerPid || runResult.pid,
+        workerPid: runResult.workerPid || runResult.pid,
+        childProcessSpawned: runResult.childProcessSpawned,
+        isAlive: runResult.ok,
+      });
+      if (endpointInfo) {
+        runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
+      }
     }
-    executedResults.push({ command: cmd, ...runResult });
+    executedResults.push({
+      command: cmd,
+      ok: Boolean(runResult.ok),
+      exitCode: typeof runResult.exitCode === 'number' ? runResult.exitCode : (runResult.ok ? 0 : 1),
+      stdout: runResult.stdout || '',
+      stderr: runResult.stderr || '',
+      pid: runResult.workerPid || runResult.pid || null,
+      childProcessSpawned: Boolean(runResult.childProcessSpawned),
+      timedOut: Boolean(runResult.timedOut),
+      cancelled: Boolean(runResult.cancelled),
+      executionId: `exec-${Date.now()}-${executedResults.length}`,
+    });
     if (!runResult.ok) {
       break;
     }

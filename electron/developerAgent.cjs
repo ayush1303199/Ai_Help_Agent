@@ -6267,20 +6267,26 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
           dependencyResult: depExecResult,
           dependencyVerification: depVerification,
           executionBlocked: false,
-          processIsolationGate: 'ALLOWED',
+          processIsolationGate: isolationVerification.processIsolationGate || 'ALLOWED',
           supervisorIdentity: isolationVerification.identity,
           message: `Project runtime launch failed under supervisor: ${failReason}`,
           stdout: supervisorRunResult?.stdout || '',
-          stderr: supervisorRunResult?.stderr || supervisorRunError?.message || '',
+          stderr: supervisorRunResult?.stderr || failReason,
           filesModified: [],
-          codeApplied: false,
+          codeApplied: Boolean(depExecResult),
           codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'FAILED',
+            stagesCompleted: depExecResult
+              ? ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_PLAN', 'DEPENDENCY_INSTALL', 'RUN_GATE']
+              : ['UNDERSTAND', 'DISCOVER', 'DEPENDENCY_CHECK', 'RUN_GATE'],
+          }),
         };
       }
 
       advanceConversationTurn(turn.turnId, 'completed', owner, {
         phase: 'launch_verified',
-        processIsolationGate: 'ALLOWED',
+        processIsolationGate: isolationVerification.processIsolationGate,
         supervisorIdentity: isolationVerification.identity,
       });
       return {
@@ -6296,7 +6302,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         dependencyResult: depExecResult,
         dependencyVerification: depVerification,
         executionBlocked: false,
-        processIsolationGate: 'ALLOWED',
+        processIsolationGate: isolationVerification.processIsolationGate,
         supervisorIdentity: isolationVerification.identity,
         message: depExecResult
           ? `Dependencies installed and project runtime launch initiated under SYSTEM supervisor process isolation (${startCmd}).`
@@ -6831,20 +6837,24 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
           intentClassification: genericIntent,
           workspaceDiscovery,
           executionBlocked: false,
-          processIsolationGate: 'ALLOWED',
+          processIsolationGate: isolationVerification.processIsolationGate || 'ALLOWED',
           supervisorIdentity: isolationVerification.identity,
           message: `Project runtime launch failed under supervisor: ${failReason}`,
           stdout: supervisorRunResult?.stdout || '',
-          stderr: supervisorRunResult?.stderr || supervisorRunError?.message || '',
+          stderr: supervisorRunResult?.stderr || failReason,
           filesModified: [],
           codeApplied: false,
           codeVerified: false,
+          workflowReceipt: buildWorkflowReceipt({
+            outcome: 'FAILED',
+            stagesCompleted: ['UNDERSTAND', 'DISCOVER', 'RUN_GATE'],
+          }),
         };
       }
 
       advanceConversationTurn(turn.turnId, 'completed', owner, {
         phase: 'launch_verified',
-        processIsolationGate: 'ALLOWED',
+        processIsolationGate: isolationVerification.processIsolationGate,
         supervisorIdentity: isolationVerification.identity,
       });
       return {
@@ -6856,7 +6866,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         intentClassification: genericIntent,
         workspaceDiscovery,
         executionBlocked: false,
-        processIsolationGate: 'ALLOWED',
+        processIsolationGate: isolationVerification.processIsolationGate,
         supervisorIdentity: isolationVerification.identity,
         message: `Project runtime launch initiated under SYSTEM supervisor process isolation (${startCmd}).`,
         stdout: supervisorRunResult?.stdout || '',

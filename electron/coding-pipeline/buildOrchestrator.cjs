@@ -870,19 +870,19 @@ async function _executeBuildPlanCore({
         const isStart = plan.operation === BUILD_OPERATIONS.START;
         const realWorkerPid = supervisorResult.workerPid || supervisorResult.pid || undefined;
         return {
-          ok: true,
-          status: BUILD_OUTCOMES.PASSED,
+          ok: supervisorResult.ok === true,
+          status: supervisorResult.ok ? BUILD_OUTCOMES.PASSED : BUILD_OUTCOMES.FAILED,
           outcome: isStart ? 'STARTED' : 'COMPLETED',
-          exitCode: isStart ? null : 0,
+          exitCode: supervisorResult.exitCode ?? (supervisorResult.ok ? (isStart ? null : 0) : 1),
           pid: isStart ? realWorkerPid : undefined,
-          isAlive: isStart ? (Boolean(realWorkerPid) && supervisorResult.ok) : undefined,
+          isAlive: isStart ? Boolean(supervisorResult.ok && (supervisorResult.childProcessSpawned || realWorkerPid)) : undefined,
           supervisor: isStart ? {
             expectedProcessIdentity: liveIso.identity.supervisorId,
             processIdentity: liveIso.identity.supervisorId,
             expectedPid: liveIso.identity.pid,
             pid: liveIso.identity.pid,
             workerPid: realWorkerPid,
-            isAlive: Boolean(realWorkerPid) && supervisorResult.ok,
+            isAlive: Boolean(supervisorResult.ok && (supervisorResult.childProcessSpawned || realWorkerPid)),
           } : undefined,
           stdout: supervisorResult.stdout || '',
           stderr: supervisorResult.stderr || '',
