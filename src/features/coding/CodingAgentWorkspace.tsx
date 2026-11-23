@@ -911,7 +911,7 @@ export function CodingAgentWorkspace({
             )}
           </div>
           <p className="mt-1 truncate text-xs text-slate-400">
-            {projectRoot || (!canSelectProject ? 'Open the trusted desktop app to select and authorize a project.' : projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : projectStatus === 'ATTACHING_PROJECT' ? 'Attaching project…' : 'Mention the project folder in chat for automatic discovery, or select it under Advanced.')}
+            {projectRoot || (!canSelectProject ? 'Open the trusted desktop app to select and authorize a project.' : projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : projectStatus === 'ATTACHING_PROJECT' ? 'Attaching project…' : isTrustedDesktop ? 'Mention the project folder in chat for automatic discovery, or select it under Advanced.' : 'Open the trusted desktop app to select and authorize a project.')}
           </p>
           {projectRoot && <p className="mt-1 text-[11px] text-sky-300">Scope: {path || '.'}</p>}
         </div>
@@ -923,7 +923,7 @@ export function CodingAgentWorkspace({
               disabled={busy || streaming}
               className="rounded-md border border-sky-500/50 px-3 py-2 text-xs text-sky-300 hover:border-sky-400 disabled:opacity-40"
             >
-              Select project folder
+              {projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : 'Select project folder'}
             </button>
           )}
           <details className="relative">
@@ -940,7 +940,7 @@ export function CodingAgentWorkspace({
                 {projectRoot && <button onClick={onClearProject} disabled={busy || streaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Clear</button>}
               </div>
             </div>
-            {isBrowserDevelopment && (
+            {isTrustedDesktop && (
               <div className="mt-3 flex gap-2">
                 <input
                   aria-label="Project folder path"
@@ -961,8 +961,13 @@ export function CodingAgentWorkspace({
                   disabled={!projectPathInput.trim() || busy || streaming || !onAttachProjectByPath}
                   className="rounded-md border border-sky-500/50 px-2 py-1.5 text-[11px] text-sky-300 disabled:opacity-40"
                 >
-                  Attach path
+                  {projectStatus === 'ATTACHING_PROJECT' ? 'Attaching…' : 'Attach path'}
                 </button>
+              </div>
+            )}
+            {isBrowserDevelopment && (
+              <div className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-200">
+                Please open the trusted desktop application and select this project under Developer &gt; Advanced. Browser sessions cannot independently authorize local workspace access.
               </div>
             )}
             {projectCandidates.length > 0 && (

@@ -377,7 +377,6 @@ export function useCodingAgentController({
     try { return localStorage.getItem('coding-active-session-v1') || crypto.randomUUID(); } catch { return crypto.randomUUID(); }
   });
   const savedConversation = conversationStates.find((session) => session.id === conversationId);
-  const getSavedRoot = () => readStoredProjectRoot() || savedConversation?.projectRoot || null;
   const [messages, setMessages] = useState<CodingMessage[]>(() => savedConversation?.messages || []);
   const [activity, setActivity] = useState<CodingActivity[]>([]);
   const activeActivityExecutionRef = useRef<string | null>(null);
@@ -628,12 +627,12 @@ export function useCodingAgentController({
             throw new Error(`Project state request failed: HTTP ${response.status}`);
           }
           let state = await response.json();
-          const savedRoot = getSavedRoot();
-          if (state.status !== 'PROJECT_ATTACHED' && savedRoot) {
+          const rootToAttach = state.registeredProjectRoot || (state.status === 'PROJECT_ATTACHED' ? state.projectRoot : null);
+          if (state.status !== 'PROJECT_ATTACHED' && rootToAttach) {
             const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ projectRoot: savedRoot }),
+              body: JSON.stringify({ projectRoot: rootToAttach }),
             });
             if (attachResponse.ok) state = await attachResponse.json();
           }
@@ -663,35 +662,6 @@ export function useCodingAgentController({
             setDirectory([]);
             onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
           } else {
-            const rootToAttach = state.registeredProjectRoot || getSavedRoot();
-            if (rootToAttach) {
-              try {
-                const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ projectRoot: rootToAttach }),
-                });
-                if (!active) return;
-                if (attachResponse.ok) {
-                  const attached = await attachResponse.json();
-                  if (attached.projectRoot) {
-                    setProjectRoot(attached.projectRoot);
-                    setProjectLifecycleState('PROJECT_ATTACHED');
-                    persistStoredProjectRoot(attached.projectRoot);
-                    const directoryResponse = await codingFetch(
-                      `${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`,
-                    );
-                    if (directoryResponse.ok) {
-                      const listing = await directoryResponse.json();
-                      if (active) setDirectory(listing);
-                    }
-                    return;
-                  }
-                }
-              } catch {
-                // Ignore auto-attach error on startup
-              }
-            }
             setProjectRoot(null);
             setProjectLifecycleState('NO_PROJECT');
             setProjectCandidates([]);
@@ -781,9 +751,12 @@ export function useCodingAgentController({
           const payload = await response.json().catch(() => ({}));
           const detail = payload?.detail;
           const code = detail && typeof detail === 'object' ? detail.code : null;
-          const message = typeof detail === 'string'
+          let message = typeof detail === 'string'
             ? detail
             : detail && typeof detail.message === 'string' ? detail.message : `Project sync returned HTTP ${response.status}.`;
+          if (code === 'BROKER_PROJECT_UNAUTHORIZED' || response.status === 403) {
+            message = 'Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.';
+          }
           failureStatus = code === 'BROKER_PROJECT_UNAUTHORIZED' ? 'untrusted'
             : response.status === 401 || response.status === 403 ? 'unauthorized' : 'unavailable';
           throw new Error(message);
@@ -799,7 +772,11 @@ export function useCodingAgentController({
         failureStatus = code === 'BROKER_PROJECT_UNAUTHORIZED' || code === 'BROKER_PROJECT_NOT_REGISTERED'
           ? 'untrusted'
           : discovery.status === 401 || discovery.status === 403 ? 'unauthorized' : 'unavailable';
-        throw new Error(typeof detail?.message === 'string' ? detail.message : typeof detail === 'string' ? detail : `Broker discovery returned HTTP ${discovery.status}.`);
+        let discMessage = typeof detail?.message === 'string' ? detail.message : typeof detail === 'string' ? detail : `Broker discovery returned HTTP ${discovery.status}.`;
+        if (code === 'BROKER_PROJECT_UNAUTHORIZED' || code === 'BROKER_PROJECT_NOT_REGISTERED' || discovery.status === 403) {
+          discMessage = 'Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.';
+        }
+        throw new Error(discMessage);
       }
       setBrokerStatus('ready');
       onStatus('The attached workspace is synchronized with the trusted broker.');
@@ -2033,7 +2010,7 @@ export function useCodingAgentController({
         const stateRes = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-state`);
         if (stateRes.ok) {
           const stateData = await stateRes.json();
-          const candidate = stateData.registeredProjectRoot || stateData.projectRoot || getSavedRoot();
+          const candidate = stateData.registeredProjectRoot || (stateData.attached ? stateData.projectRoot : null);
           if (candidate) {
             const attachRes = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
               method: 'POST',
@@ -2128,17 +2105,11 @@ export function useCodingAgentController({
         });
         if (!response.ok) {
           const error = await response.json().catch(() => ({}));
-          if (typeof window !== 'undefined' && typeof window.prompt === 'function') {
-            const manualPath = window.prompt(
-              `Browser folder discovery cannot determine the full path for "${folderName}".\n\nEnter the full folder path to attach:`,
-              getSavedRoot() || ''
-            );
-            if (manualPath && manualPath.trim()) {
-              await attachProjectByPath(manualPath.trim());
-              return;
-            }
+          const code = error?.detail?.code || error?.code;
+          if (code === 'TRUSTED_PROJECT_SELECTION_REQUIRED' || response.status === 403) {
+            throw new Error('Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.');
           }
-          throw new Error(formatErrorMessage(error, 'Could not match the selected folder to a local project. Enter its full path in Advanced > Project tools.'));
+          throw new Error(formatErrorMessage(error, 'Could not match the selected folder to a local project. Please open the trusted desktop application to authorize this workspace.'));
         }
         const discovery = await response.json();
         const matches = Array.isArray(discovery.matches) ? discovery.matches : [];
@@ -2150,7 +2121,7 @@ export function useCodingAgentController({
           return;
         }
         if (!targetPath) {
-          throw new Error(`Could not locate "${folderName}" under the configured project discovery folders. Paste the folder's full path under Advanced > Project tools.`);
+          throw new Error(`Could not locate "${folderName}" under the configured project discovery folders. Please open the trusted desktop application to authorize this workspace.`);
         }
         const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
           method: 'POST',
@@ -2159,6 +2130,10 @@ export function useCodingAgentController({
         });
         if (!attachResponse.ok) {
           const error = await attachResponse.json().catch(() => ({}));
+          const code = error?.detail?.code || error?.code;
+          if (code === 'BROKER_PROJECT_UNAUTHORIZED' || attachResponse.status === 403) {
+            throw new Error('Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.');
+          }
           throw new Error(formatErrorMessage(error, 'Could not attach the selected project.'));
         }
         const attached = await attachResponse.json();
@@ -2202,8 +2177,15 @@ export function useCodingAgentController({
         setFilePath('');
         setDirectory(await desktopApi.listDeveloperDirectory('.'));
         onStatus(`Connected to project: ${result.projectRoot}`);
+      } else {
+        setProjectRoot(null);
+        setDirectory([]);
+        setProjectLifecycleState('ATTACH_FAILED');
+        onError(`Project selection failed: ${result.reason || 'Could not attach project.'}`);
       }
     } catch (error) {
+      setProjectRoot(null);
+      setDirectory([]);
       setProjectLifecycleState('ATTACH_FAILED');
       onError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -2230,38 +2212,30 @@ export function useCodingAgentController({
           setDirectory(await desktopApi.listDeveloperDirectory('.'));
           onStatus(`Connected to project: ${attached.projectRoot}`);
         } else if (attached.status === 'PROJECT_MISSING') {
+          setProjectRoot(null);
+          setDirectory([]);
           setProjectLifecycleState('PROJECT_MISSING');
           onError('The selected project folder could not be found on disk (PROJECT_MISSING).');
         } else if (attached.status === 'PROJECT_INACCESSIBLE') {
+          setProjectRoot(null);
+          setDirectory([]);
           setProjectLifecycleState('PROJECT_INACCESSIBLE');
           onError('The selected project folder cannot be accessed. Check its permissions, then select it again.');
         } else {
+          setProjectRoot(null);
+          setDirectory([]);
           setProjectLifecycleState('ATTACH_FAILED');
           onError(`Project attachment failed (ATTACH_FAILED): ${attached.reason || 'Could not attach'}`);
         }
       } else {
-        const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectRoot: targetPath }),
-        });
-        if (!response.ok) {
-          const error = await response.json().catch(() => ({}));
-          throw new Error(formatErrorMessage(error, 'Could not attach the selected project.'));
-        }
-        const attached = await response.json();
-        setProjectRoot(attached.projectRoot);
-        setProjectLifecycleState('PROJECT_ATTACHED');
-        persistStoredProjectRoot(attached.projectRoot);
-        setProjectCandidates([]);
-        setPath('.');
-        setFileContent('');
-        setFilePath('');
-        const directoryResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
-        if (directoryResponse.ok) setDirectory(await directoryResponse.json());
-        onStatus(`Connected to project: ${attached.projectRoot}`);
+        setProjectRoot(null);
+        setDirectory([]);
+        setProjectLifecycleState('ATTACH_FAILED');
+        onError('Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.');
       }
     } catch (err) {
+      setProjectRoot(null);
+      setDirectory([]);
       setProjectLifecycleState('ATTACH_FAILED');
       onError(err instanceof Error ? err.message : String(err));
     } finally {

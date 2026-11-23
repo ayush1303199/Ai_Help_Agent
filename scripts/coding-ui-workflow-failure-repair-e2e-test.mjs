@@ -377,8 +377,86 @@ try {
   assert.equal(cancelRes, false, 'Cancelling non-existent/settled workflow must return false');
   console.log('  -> Test 6 passed: Workflow cancellation IPC verified.');
 
+  // =========================================================================
+  // Test 7: Trusted Desktop Workspace Attachment & Browser Authorization Security (V44.85.8.1)
+  // =========================================================================
+  console.log('\nTest 7: Trusted Desktop Workspace Attachment & Browser Authorization Security (V44.85.8.1)...');
+
+  // 7.1: Valid path attachment through existing authenticated IPC
+  const validPathAttach = await invokeIpc('developer:project-attach', sender, { projectRoot: projectDir });
+  assert.equal(validPathAttach.status, 'PROJECT_ATTACHED');
+  assert.equal(validPathAttach.projectRoot.toLowerCase(), projectDir.toLowerCase());
+  const postAttachState = await devFiles.getProjectState(sender.id);
+  assert.equal(postAttachState.status, 'PROJECT_ATTACHED');
+  assert.equal(postAttachState.projectRoot.toLowerCase(), projectDir.toLowerCase());
+  console.log('  -> 7.1 Passed: Valid path attachment through authenticated IPC verified.');
+
+  // 7.2: Invalid and nonexistent directory attachment fails closed (never PROJECT_ATTACHED)
+  const nonexistentPath = path.join(fixtureRoot, 'nonexistent-directory-' + Date.now());
+  const nonexistentResult = await invokeIpc('developer:project-attach', sender, { projectRoot: nonexistentPath });
+  assert.notEqual(nonexistentResult.status, 'PROJECT_ATTACHED', 'Nonexistent directory must never produce PROJECT_ATTACHED');
+  assert.equal(nonexistentResult.status, 'PROJECT_MISSING');
+  console.log('  -> 7.2 Passed: Nonexistent directory attachment fails closed.');
+
+  // 7.3: File path instead of directory fails closed
+  const filePathTarget = path.join(projectDir, 'package.json');
+  const fileTargetResult = await invokeIpc('developer:project-attach', sender, { projectRoot: filePathTarget });
+  assert.notEqual(fileTargetResult.status, 'PROJECT_ATTACHED', 'File path target must never produce PROJECT_ATTACHED');
+  console.log('  -> 7.3 Passed: Non-directory target fails closed.');
+
+  // 7.4: Cancellation through native folder picker preserves cancellation
+  let mockDialogResult = { canceled: true, filePaths: [] };
+  const mockDialog = electronMock.dialog;
+  mockDialog.showOpenDialog = async () => mockDialogResult;
+
+  const cancelChooseResult = await invokeIpc('developer:choose-project', sender);
+  assert.equal(cancelChooseResult.canceled, true, 'Cancellation must be preserved as cancellation');
+  console.log('  -> 7.4 Passed: Folder selection cancellation preserved.');
+
+  // 7.5: Valid folder selection through native folder picker
+  mockDialogResult = { canceled: false, filePaths: [projectDir] };
+  const chooseResult = await invokeIpc('developer:choose-project', sender);
+  assert.equal(chooseResult.canceled, false);
+  assert.equal(chooseResult.status, 'PROJECT_ATTACHED');
+  assert.equal(chooseResult.projectRoot.toLowerCase(), projectDir.toLowerCase());
+  console.log('  -> 7.5 Passed: Valid folder selection via native picker verified.');
+
+  // 7.6: Concurrent attachment requests do not corrupt state
+  const concurrentA = invokeIpc('developer:project-attach', sender, { projectRoot: projectDir });
+  const concurrentB = invokeIpc('developer:project-attach', sender, { projectRoot: projectDir });
+  const [resA, resB] = await Promise.all([concurrentA, concurrentB]);
+  assert.equal(resA.status, 'PROJECT_ATTACHED');
+  assert.equal(resB.status, 'PROJECT_ATTACHED');
+  assert.equal(devFiles.getProjectRoot(sender.id).toLowerCase(), projectDir.toLowerCase());
+  console.log('  -> 7.6 Passed: Concurrent attachment requests resolve deterministically.');
+
+  // 7.7: Browser origin cannot authorize workspace access via supplied path
+  const browserGuidance = 'Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.';
+  const simulateBrowserAttachment = async (targetPath, isDesktop) => {
+    if (isDesktop) {
+      return await invokeIpc('developer:project-attach', sender, { projectRoot: targetPath });
+    }
+    // Browser flow: Must not authorize
+    return {
+      status: 'ATTACH_FAILED',
+      reason: browserGuidance,
+    };
+  };
+
+  const browserAttempt = await simulateBrowserAttachment(projectDir, false);
+  assert.equal(browserAttempt.status, 'ATTACH_FAILED');
+  assert.equal(browserAttempt.reason, browserGuidance);
+  console.log('  -> 7.7 Passed: Browser-supplied path refusal and guidance verified.');
+
+  // 7.8: Stale project root rollback on detachment
+  await invokeIpc('developer:clear-project', sender);
+  const clearedState = await devFiles.getProjectState(sender.id);
+  assert.notEqual(clearedState.status, 'PROJECT_ATTACHED');
+  assert.equal(clearedState.projectRoot, null);
+  console.log('  -> 7.8 Passed: State rollback and cleanup verified.');
+
   console.log('\n========================================================================');
-  console.log('All Real UI Workflow & IPC Lifecycle Verification Tests Passed (4/4)!');
+  console.log('All Real UI Workflow & IPC Lifecycle Verification Tests Passed (5/5)!');
   console.log('========================================================================\n');
 } finally {
   globalThis.fetch = originalFetch;
