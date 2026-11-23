@@ -70,21 +70,26 @@ async function verifyProjectProcessIsolation(options = {}) {
         timeoutMs: options.timeoutMs || 1500,
       });
       if (liveResult && liveResult.verified && liveResult.processIsolationGate === 'ALLOWED') {
+        const hasRealVm = Boolean(liveResult.hypervisorBoundary && liveResult.vmPartitionConfirmed);
+        const hasJobObject = Boolean(liveResult.containedByJobObject || liveResult.identity?.jobValid);
+        const hasVerifiedRelease = Boolean(liveResult.resourcesReleased);
+        const hasValidGrant = Boolean(liveResult.grant && liveResult.grant.granted);
+
         currentStatus = Object.freeze({
-          available: true,
-          verified: true,
+          available: hasRealVm,
+          verified: hasRealVm,
           platformRecognized: true,
-          reason: null,
+          reason: hasRealVm ? null : 'OS process isolation is not established: Hyper-V VM boundary unverified.',
           platform: 'win32',
           capabilityStates: createCapabilityStateMap({
-            osEnforcedProcessIsolation: 'SUPPORTED',
-            runtimeWorkerIdentityBinding: 'SUPPORTED',
-            effectiveNetworkEndpointRestrictions: 'SUPPORTED',
-            resourceFilesystemBoundaries: 'SUPPORTED',
-            hostObservedProcessWorkerTermination: 'SUPPORTED',
-            hostObservedResourceCleanup: 'SUPPORTED',
-            evidenceFreshnessIntegrityReplayProtection: 'SUPPORTED',
-            secureErasureEvidence: 'SUPPORTED',
+            osEnforcedProcessIsolation: hasRealVm ? 'SUPPORTED' : 'BLOCKED',
+            runtimeWorkerIdentityBinding: 'BLOCKED',
+            effectiveNetworkEndpointRestrictions: 'BLOCKED',
+            resourceFilesystemBoundaries: 'BLOCKED',
+            hostObservedProcessWorkerTermination: hasJobObject ? 'SUPPORTED' : 'BLOCKED',
+            hostObservedResourceCleanup: hasVerifiedRelease ? 'SUPPORTED' : 'NOT_ESTABLISHED',
+            evidenceFreshnessIntegrityReplayProtection: hasValidGrant ? 'SUPPORTED' : 'NOT_ESTABLISHED',
+            secureErasureEvidence: 'NOT_ESTABLISHED',
           }),
           supervisor: liveResult.identity,
           hcsStatus: liveResult.hcsStatus,

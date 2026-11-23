@@ -53,6 +53,24 @@ const {
   createLinuxNamespaceProvider,
 } = linuxProvPkg;
 
+import windowsAdapterPkg from '../electron/coding-pipeline/windowsSandboxProviderAdapter.cjs';
+const {
+  createNativeSupervisorClient,
+  queryWindowsOperatingSystemIdentity,
+  verifyLiveSupervisorProcessIsolation,
+} = windowsAdapterPkg;
+
+import projectIsoPkg from '../electron/coding-pipeline/projectProcessIsolation.cjs';
+const {
+  verifyProjectProcessIsolation,
+} = projectIsoPkg;
+
+import executionEvidencePkg from '../electron/coding-pipeline/executionEvidenceContract.cjs';
+const {
+  authenticateObserver,
+  validateRealIsolationEvidence,
+} = executionEvidencePkg;
+
 import devAgentPkg from '../electron/developerAgent.cjs';
 const {
   WORKER_CAPABILITIES,
@@ -332,6 +350,111 @@ async function testWindowsHostPolicyBlocksExecution() {
   assert.strictEqual(execResult.executionBlocked, true);
 }
 
+// -------------------------------------------------------------
+// Test 14: Milestone V44.85.6 Security Gate & Supervisor Remediation
+// -------------------------------------------------------------
+async function testV44856SecurityGateAndSupervisorRemediation() {
+  console.log('Testing Milestone V44.85.6: Security Gate & Supervisor Authorization Remediation...');
+
+  // 1. SYSTEM SID never implies synthetic mode
+  const sysClient = createNativeSupervisorClient({
+    tokenUserSid: 'S-1-5-18',
+    isSyntheticTest: false,
+  });
+  const desc = sysClient.getDescriptor();
+  assert.strictEqual(desc.windowsProcessPeer.tokenUserSid, 'S-1-5-18');
+  assert.strictEqual(desc.windowsProcessPeer.serviceSecurityBoundary, 'USER_PROCESS'); // not live service
+
+  // 2. HCS API success never promotes BLOCKED to ALLOWED on real host queries
+  const liveResult = await verifyLiveSupervisorProcessIsolation({
+    isSyntheticTest: false,
+    timeoutMs: 500,
+  });
+  assert.strictEqual(liveResult.verified, false);
+  assert.strictEqual(liveResult.processIsolationGate, 'BLOCKED');
+  assert.strictEqual(liveResult.hostFallback, 'ZERO');
+
+  // 3. Explicit synthetic test context is preserved
+  const synResult = await verifyLiveSupervisorProcessIsolation({
+    isSyntheticTest: true,
+    timeoutMs: 500,
+  });
+  if (synResult.identity?.ok) {
+    assert.strictEqual(synResult.verified, true);
+    assert.strictEqual(synResult.processIsolationGate, 'SYNTHETIC_ALLOW');
+    assert.strictEqual(synResult.isolationState, 'SYNTHETIC_TEST_BOUNDARY');
+  }
+
+  // 4. Capability states in projectProcessIsolation cannot be falsely promoted
+  const isoStatus = await verifyProjectProcessIsolation({ isSyntheticTest: false });
+  assert.strictEqual(isoStatus.available, false);
+  assert.strictEqual(isoStatus.verified, false);
+  assert.strictEqual(isoStatus.capabilityStates.osEnforcedProcessIsolation, 'BLOCKED');
+  assert.strictEqual(isoStatus.capabilityStates.runtimeWorkerIdentityBinding, 'NOT_ESTABLISHED');
+  assert.strictEqual(isoStatus.capabilityStates.effectiveNetworkEndpointRestrictions, 'NOT_ESTABLISHED');
+  assert.strictEqual(isoStatus.capabilityStates.resourceFilesystemBoundaries, 'NOT_ESTABLISHED');
+
+  // 5. Caller-supplied service identity claims rejected without verified service SID
+  const forgedAuth = authenticateObserver({
+    observerDescriptor: {
+      identitySource: 'independent_authenticated_observer',
+      pid: 9999,
+      executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\AiHelpAgentSupervisor.exe',
+      serviceSecurityBoundary: 'LOCAL_SYSTEM_SERVICE', // caller claim
+      windowsProcessPeer: {
+        pid: 9999,
+        handleValid: true,
+        processExited: false,
+        processCreationTimeUtc: new Date().toISOString(),
+        executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\AiHelpAgentSupervisor.exe',
+        tokenUserSid: 'S-1-5-21-unprivileged-user', // not SYSTEM
+        identitySource: 'independent_authenticated_observer',
+        serviceSecurityBoundary: 'LOCAL_SYSTEM_SERVICE',
+        isLiveSupervisorService: false,
+      },
+    },
+    peerCredentials: { authenticated: true, peerPid: 9999 },
+    isSyntheticTest: false,
+  });
+  assert.strictEqual(forgedAuth.isAuthenticated, false);
+  assert.strictEqual(forgedAuth.reasonCode, 'SECURITY_PRINCIPAL_MISMATCH');
+
+  // Also test forged claim with SYSTEM SID but unverified live service execution
+  const unverifiedServiceAuth = authenticateObserver({
+    observerDescriptor: {
+      identitySource: 'independent_authenticated_observer',
+      pid: 9999,
+      executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\AiHelpAgentSupervisor.exe',
+      serviceSecurityBoundary: 'LOCAL_SYSTEM_SERVICE', // caller claim
+      windowsProcessPeer: {
+        pid: 9999,
+        handleValid: true,
+        processExited: false,
+        processCreationTimeUtc: new Date().toISOString(),
+        executablePath: 'C:\\Program Files\\AI Help Agent\\libexec\\AiHelpAgentSupervisor.exe',
+        tokenUserSid: 'S-1-5-18',
+        identitySource: 'independent_authenticated_observer',
+        serviceSecurityBoundary: 'LOCAL_SYSTEM_SERVICE',
+        isLiveSupervisorService: false, // unverified service
+      },
+    },
+    peerCredentials: { authenticated: true, peerPid: 9999 },
+    isSyntheticTest: false,
+  });
+  assert.strictEqual(unverifiedServiceAuth.isAuthenticated, false);
+  assert.strictEqual(unverifiedServiceAuth.reasonCode, 'OS_PROCESS_IDENTITY_NOT_VERIFIED');
+
+  // 6. Host inspection failure returns honest states without fact fabrication
+  const osIdentity = queryWindowsOperatingSystemIdentity();
+  assert.ok(osIdentity.authoritativeProductName !== undefined);
+  if (osIdentity.inspectionState === 'UNAVAILABLE') {
+    assert.strictEqual(osIdentity.authoritativeProductName, 'UNKNOWN');
+    assert.strictEqual(osIdentity.buildNumber, null);
+    assert.strictEqual(osIdentity.hypervisorDetected, false);
+    assert.strictEqual(osIdentity.vbsRunning, false);
+  }
+}
+
 async function runAllTests() {
   try {
     await setupTestDir();
@@ -343,6 +466,7 @@ async function runAllTests() {
     await testPolicyChangeInvalidation();
     await testWorkerAuthCannotOverrideBlockedIsolation();
     await testWindowsHostPolicyBlocksExecution();
+    await testV44856SecurityGateAndSupervisorRemediation();
     console.log('All Isolation Provider Verification & Sandbox Readiness regression tests passed successfully!');
   } finally {
     await cleanupTestDir();

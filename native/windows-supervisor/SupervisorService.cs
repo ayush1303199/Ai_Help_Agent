@@ -659,6 +659,8 @@ namespace AiHelpAgent.NativeSupervisor
             string planDigest = GetStringVal(req, "planDigest");
             string taskId = GetStringVal(req, "taskId");
             string sessionId = GetStringVal(req, "sessionId");
+            string command = GetStringVal(req, "command");
+            string commandDigest = GetStringVal(req, "commandDigest");
 
             if (string.IsNullOrEmpty(runId) || string.IsNullOrEmpty(workspaceRoot) || string.IsNullOrEmpty(approvedSnapshotDigest))
             {
@@ -667,6 +669,36 @@ namespace AiHelpAgent.NativeSupervisor
                 rej["rejected"] = true;
                 rej["reason"] = "Missing mandatory parameters for execution grant.";
                 return rej;
+            }
+
+            // Reparse point / Directory Junction guard on workspaceRoot
+            try
+            {
+                if (Directory.Exists(workspaceRoot))
+                {
+                    DirectoryInfo di = new DirectoryInfo(workspaceRoot);
+                    if (di.Exists && di.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                    {
+                        Dictionary<string, object> repErr = new Dictionary<string, object>();
+                        repErr["granted"] = false;
+                        repErr["rejected"] = true;
+                        repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                        repErr["reason"] = "Workspace root contains an NTFS reparse point or directory junction, which is rejected for secure execution.";
+                        return repErr;
+                    }
+                }
+            }
+            catch { }
+
+            if (!string.IsNullOrEmpty(command) && string.IsNullOrEmpty(commandDigest))
+            {
+                using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    byte[] bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(command));
+                    StringBuilder sb = new StringBuilder();
+                    foreach (byte b in bytes) sb.Append(b.ToString("x2"));
+                    commandDigest = sb.ToString();
+                }
             }
 
             string grantId = "grant-" + Guid.NewGuid().ToString("N");
@@ -678,6 +710,8 @@ namespace AiHelpAgent.NativeSupervisor
             record.PlanDigest = planDigest;
             record.TaskId = taskId;
             record.SessionId = sessionId;
+            record.Command = command;
+            record.CommandDigest = commandDigest;
             record.ClientPid = peer.Pid;
             record.IssuedAt = DateTime.UtcNow;
             int ttlSec = 60;
@@ -701,6 +735,7 @@ namespace AiHelpAgent.NativeSupervisor
             grantResp["workspaceRoot"] = record.WorkspaceRoot;
             grantResp["approvedSnapshotDigest"] = approvedSnapshotDigest;
             grantResp["planDigest"] = planDigest;
+            grantResp["commandDigest"] = commandDigest;
             grantResp["taskId"] = taskId;
             grantResp["sessionId"] = sessionId;
             return grantResp;
@@ -812,13 +847,33 @@ namespace AiHelpAgent.NativeSupervisor
                 }
 
                 string reqWorkspace = GetStringVal(req, "workspaceRoot");
-                if (!string.IsNullOrEmpty(reqWorkspace) && !string.Equals(Path.GetFullPath(reqWorkspace), record.WorkspaceRoot, StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrEmpty(reqWorkspace))
                 {
-                    Dictionary<string, object> wsErr = new Dictionary<string, object>();
-                    wsErr["ok"] = false; wsErr["consumed"] = false;
-                    wsErr["reasonCode"] = "WORKSPACE_ROOT_MISMATCH";
-                    wsErr["reason"] = "Execution grant workspace root mismatch.";
-                    return wsErr;
+                    try
+                    {
+                        if (Directory.Exists(reqWorkspace))
+                        {
+                            DirectoryInfo di = new DirectoryInfo(reqWorkspace);
+                            if (di.Exists && di.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                            {
+                                Dictionary<string, object> repErr = new Dictionary<string, object>();
+                                repErr["ok"] = false; repErr["consumed"] = false;
+                                repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                                repErr["reason"] = "Workspace root contains an NTFS reparse point or directory junction, which is rejected for secure execution.";
+                                return repErr;
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (!string.Equals(Path.GetFullPath(reqWorkspace), record.WorkspaceRoot, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Dictionary<string, object> wsErr = new Dictionary<string, object>();
+                        wsErr["ok"] = false; wsErr["consumed"] = false;
+                        wsErr["reasonCode"] = "WORKSPACE_ROOT_MISMATCH";
+                        wsErr["reason"] = "Execution grant workspace root mismatch.";
+                        return wsErr;
+                    }
                 }
 
                 string reqDigest = GetStringVal(req, "approvedSnapshotDigest");
@@ -829,6 +884,16 @@ namespace AiHelpAgent.NativeSupervisor
                     digErr["reasonCode"] = "SNAPSHOT_DIGEST_MISMATCH";
                     digErr["reason"] = "Execution grant approved snapshot digest mismatch.";
                     return digErr;
+                }
+
+                string reqPlanDigest = GetStringVal(req, "planDigest");
+                if (!string.IsNullOrEmpty(reqPlanDigest) && !string.IsNullOrEmpty(record.PlanDigest) && !string.Equals(reqPlanDigest, record.PlanDigest, StringComparison.Ordinal))
+                {
+                    Dictionary<string, object> planErr = new Dictionary<string, object>();
+                    planErr["ok"] = false; planErr["consumed"] = false;
+                    planErr["reasonCode"] = "PLAN_DIGEST_MISMATCH";
+                    planErr["reason"] = "Execution grant plan digest mismatch.";
+                    return planErr;
                 }
 
                 _consumedGrants.Add(grantId);
@@ -850,6 +915,28 @@ namespace AiHelpAgent.NativeSupervisor
             string runId = GetStringVal(req, "runId");
             if (string.IsNullOrEmpty(runId)) runId = Guid.NewGuid().ToString("N");
             string workerId = "worker-wsb-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string grantId = GetStringVal(req, "grantId");
+            string workspaceRoot = GetStringVal(req, "workspaceRoot");
+
+            if (!string.IsNullOrEmpty(workspaceRoot))
+            {
+                try
+                {
+                    if (Directory.Exists(workspaceRoot))
+                    {
+                        DirectoryInfo di = new DirectoryInfo(workspaceRoot);
+                        if (di.Exists && di.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                        {
+                            Dictionary<string, object> repErr = new Dictionary<string, object>();
+                            repErr["allocated"] = false;
+                            repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                            repErr["error"] = "Workspace root contains an NTFS reparse point or directory junction.";
+                            return repErr;
+                        }
+                    }
+                }
+                catch { }
+            }
 
             IntPtr hJob = NativeMethods.CreateJobObject(IntPtr.Zero, "AiHelpAgentJob_" + workerId);
             if (hJob == IntPtr.Zero)
@@ -880,6 +967,19 @@ namespace AiHelpAgent.NativeSupervisor
             worker.RunId = runId;
             worker.JobHandle = hJob;
             worker.CreatedAt = DateTime.UtcNow;
+            worker.GrantId = grantId;
+            if (!string.IsNullOrEmpty(grantId))
+            {
+                lock (_lock)
+                {
+                    if (_issuedGrants.ContainsKey(grantId))
+                    {
+                        ExecutionGrantRecord gr = _issuedGrants[grantId];
+                        worker.ApprovedPlanDigest = gr.PlanDigest;
+                        worker.ApprovedCommandDigest = gr.CommandDigest;
+                    }
+                }
+            }
 
             lock (_lock)
             {
@@ -920,6 +1020,14 @@ namespace AiHelpAgent.NativeSupervisor
             if (req.ContainsKey("isSyntheticTest") && req["isSyntheticTest"] != null)
             {
                 bool.TryParse(req["isSyntheticTest"].ToString(), out isSyntheticTest);
+            }
+            if (req.ContainsKey("isLiveSupervisorService") && req["isLiveSupervisorService"] != null)
+            {
+                bool isLive;
+                if (bool.TryParse(req["isLiveSupervisorService"].ToString(), out isLive) && isLive)
+                {
+                    isSyntheticTest = false;
+                }
             }
 
             bool jobValid = worker != null && worker.JobHandle != IntPtr.Zero;
@@ -991,6 +1099,34 @@ namespace AiHelpAgent.NativeSupervisor
                 }
             }
             string commandLine = GetStringVal(req, "commandLine");
+            if (string.IsNullOrEmpty(commandLine))
+            {
+                commandLine = GetStringVal(req, "command");
+            }
+
+            if (!string.IsNullOrEmpty(worker.ApprovedCommandDigest) && !string.IsNullOrEmpty(commandLine))
+            {
+                string cmdDigest = null;
+                using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    byte[] bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(commandLine));
+                    StringBuilder sb = new StringBuilder();
+                    foreach (byte b in bytes) sb.Append(b.ToString("x2"));
+                    cmdDigest = sb.ToString();
+                }
+                if (!string.Equals(cmdDigest, worker.ApprovedCommandDigest, StringComparison.OrdinalIgnoreCase))
+                {
+                    Dictionary<string, object> cmdErr = new Dictionary<string, object>();
+                    cmdErr["ok"] = false; cmdErr["exitCode"] = -1;
+                    cmdErr["error"] = "COMMAND_APPROVAL_MISMATCH";
+                    cmdErr["reasonCode"] = "UNAPPROVED_COMMAND_EXECUTION_BLOCKED";
+                    cmdErr["reason"] = "Executed command does not match the approved command digest for this worker.";
+                    cmdErr["processIsolationGate"] = "BLOCKED";
+                    cmdErr["containedByJobObject"] = true;
+                    return cmdErr;
+                }
+            }
+
             if ((launchContainedProcess || explicitNonSynthetic) && !string.IsNullOrEmpty(commandLine))
             {
                 int timeoutMs = 5000;
@@ -1018,6 +1154,8 @@ namespace AiHelpAgent.NativeSupervisor
                     startErr["vmBoundaryEnforced"] = false;
                     return startErr;
                 }
+
+                worker.WorkerPid = (int)pi.dwProcessId;
 
                 try
                 {
@@ -1048,6 +1186,7 @@ namespace AiHelpAgent.NativeSupervisor
                     jobRes["containedByJobObject"] = true;
                     jobRes["vmBoundaryEnforced"] = false;
                     jobRes["processIsolationGate"] = "BLOCKED";
+                    jobRes["workerPid"] = (int)pi.dwProcessId;
                     return jobRes;
                 }
                 finally
@@ -1830,6 +1969,8 @@ namespace AiHelpAgent.NativeSupervisor
         public string PlanDigest;
         public string TaskId;
         public string SessionId;
+        public string Command;
+        public string CommandDigest;
         public int ClientPid;
         public DateTime IssuedAt;
         public int TtlSeconds = 60;
@@ -1841,6 +1982,10 @@ namespace AiHelpAgent.NativeSupervisor
         public string RunId;
         public IntPtr JobHandle;
         public DateTime CreatedAt;
+        public string GrantId;
+        public string ApprovedPlanDigest;
+        public string ApprovedCommandDigest;
+        public int WorkerPid;
     }
 
     public class QuarantineRecord

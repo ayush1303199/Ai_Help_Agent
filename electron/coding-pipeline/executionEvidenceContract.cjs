@@ -2490,8 +2490,8 @@ function authenticateObserver({
 
   // 8. Production check: independent OS daemon is implemented on Windows when verified supervisor service is active
   const isLiveNativeSupervisor = observerDescriptor?.windowsProcessPeer?.isLiveSupervisorService === true
-    || (observerDescriptor?.windowsProcessPeer?.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE' && observerDescriptor?.windowsProcessPeer?.tokenUserSid === 'S-1-5-18')
-    || observerDescriptor?.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE';
+    && observerDescriptor?.windowsProcessPeer?.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE'
+    && observerDescriptor?.windowsProcessPeer?.tokenUserSid === 'S-1-5-18';
   if (!isSyntheticTest && !isLiveNativeSupervisor) {
     return {
       isAuthenticated: false,
@@ -2727,7 +2727,8 @@ function validateWindowsProcessPeerIdentity({
 
   // 7. Production feasibility check
   const isLiveNativeSupervisor = peerProcessDescriptor.isLiveSupervisorService === true
-    || (peerProcessDescriptor.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE' && peerProcessDescriptor.tokenUserSid === 'S-1-5-18');
+    && peerProcessDescriptor.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE'
+    && peerProcessDescriptor.tokenUserSid === 'S-1-5-18';
   if (!isSyntheticTest && !isLiveNativeSupervisor) {
     return {
       valid: false,

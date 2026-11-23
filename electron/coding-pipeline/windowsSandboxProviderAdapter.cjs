@@ -346,11 +346,27 @@ async function executeWithSupervisor({
     throw error;
   }
 
-  if (path.resolve(grant.workspaceRoot || '') !== path.resolve(workspaceRoot)) {
+  const resolvedWorkspace = path.resolve(workspaceRoot);
+  const resolvedGrantWorkspace = path.resolve(grant.workspaceRoot || '');
+  if (resolvedGrantWorkspace !== resolvedWorkspace) {
     const error = new Error('Execution grant workspaceRoot does not match requested workspace root.');
     error.code = 'PROJECT_EXECUTION_BLOCKED';
     error.executionBlocked = true;
     throw error;
+  }
+
+  // Reparse-point / Directory Junction escape guard
+  try {
+    const realWs = await fs.realpath(resolvedWorkspace);
+    if (path.resolve(realWs).toLowerCase() !== resolvedWorkspace.toLowerCase()) {
+      const error = new Error(`Workspace path "${workspaceRoot}" contains an NTFS junction or symbolic link resolving outside canonical root: "${realWs}".`);
+      error.code = 'PROJECT_EXECUTION_BLOCKED';
+      error.executionBlocked = true;
+      error.reasonCode = 'WORKSPACE_REPARSE_POINT_DETECTED';
+      throw error;
+    }
+  } catch (err) {
+    if (err.code === 'PROJECT_EXECUTION_BLOCKED') throw err;
   }
 
   if (planDigest && grant.planDigest && grant.planDigest !== planDigest) {
@@ -385,6 +401,7 @@ async function executeWithSupervisor({
   const worker = await op.allocateWorker({
     runId,
     workspaceRoot: path.resolve(workspaceRoot),
+    grantId: grant.grantId || grant.grantToken,
     grant,
   });
 
@@ -674,6 +691,8 @@ function createNativeSupervisorClient(options = {}) {
     || (options.isSyntheticTest ? (options.tokenUserSid || 'S-1-5-18') : 'S-1-5-18');
 
   const isLive = Boolean(options.isLiveSupervisorService);
+  const isLiveService = isLive && tokenUserSid === 'S-1-5-18';
+  const serviceSecurityBoundary = isLiveService ? 'LOCAL_SYSTEM_SERVICE' : 'USER_PROCESS';
 
   const observerDescriptor = {
     identitySource: 'independent_authenticated_observer',
@@ -688,7 +707,7 @@ function createNativeSupervisorClient(options = {}) {
         restrictedDacl: true,
         nullDacl: false,
         isLiveSupervisorService: isLive,
-        serviceSecurityBoundary: isLive ? 'LOCAL_SYSTEM_SERVICE' : (options.serviceSecurityBoundary || 'USER_PROCESS'),
+        serviceSecurityBoundary,
       },
     },
     windowsProcessPeer: {
@@ -699,7 +718,7 @@ function createNativeSupervisorClient(options = {}) {
       executablePath,
       tokenUserSid,
       identitySource: 'independent_authenticated_observer',
-      serviceSecurityBoundary: isLive ? 'LOCAL_SYSTEM_SERVICE' : (options.serviceSecurityBoundary || 'USER_PROCESS'),
+      serviceSecurityBoundary,
       isLiveSupervisorService: isLive,
     },
   };
@@ -716,6 +735,8 @@ function createNativeSupervisorClient(options = {}) {
         workspaceRoot: req.workspaceRoot,
         approvedSnapshotDigest: req.approvedSnapshotDigest,
         planDigest: req.planDigest,
+        command: req.command,
+        commandDigest: req.commandDigest,
         taskId: req.taskId,
         sessionId: req.sessionId,
         ttlSeconds: req.ttlSeconds,
@@ -735,6 +756,7 @@ function createNativeSupervisorClient(options = {}) {
         operation: 'ALLOCATE_WORKER',
         runId: req.runId,
         workspaceRoot: req.workspaceRoot,
+        grantId: req.grantId || req?.grant?.grantId || req?.grant?.grantToken,
       }, { pipePath });
     },
     async observeWorkerReadiness() {
@@ -744,7 +766,8 @@ function createNativeSupervisorClient(options = {}) {
       return sendNativeSupervisorRequest({
         operation: 'OBSERVE_EFFECTIVE_ISOLATION',
         workerId: req?.worker?.workerId,
-        isSyntheticTest: Boolean(options.isSyntheticTest || options.tokenUserSid === 'S-1-5-18'),
+        isSyntheticTest: Boolean(options.isSyntheticTest),
+        isLiveSupervisorService: isLive,
       }, { pipePath });
     },
     async executeApprovedOperation(req) {
@@ -752,6 +775,7 @@ function createNativeSupervisorClient(options = {}) {
         operation: 'EXECUTE_APPROVED_OPERATION',
         workerId: req?.worker?.workerId,
         command: req?.command,
+        commandLine: req?.command,
         workspaceRoot: req?.workspaceRoot,
       }, { pipePath });
     },
@@ -980,6 +1004,7 @@ function createWindowsSandboxProviderAdapter(config = {}) {
 
 function queryWindowsOperatingSystemIdentity() {
   let regInfo = {};
+  let inspectionSucceeded = false;
   try {
     const res = spawnSync('powershell.exe', [
       '-NoProfile',
@@ -988,14 +1013,34 @@ function queryWindowsOperatingSystemIdentity() {
     ], { windowsHide: true, timeout: 3000, encoding: 'utf8' });
     if (res.status === 0 && res.stdout) {
       regInfo = JSON.parse(res.stdout);
+      inspectionSucceeded = true;
     }
   } catch {}
 
-  const buildNumber = Number(regInfo.CurrentBuildNumber || regInfo.CurrentBuild || 26200);
-  const rawProductName = String(regInfo.ProductName || 'Windows 10 Pro');
-  const editionId = String(regInfo.EditionID || 'Professional');
-  const displayVersion = String(regInfo.DisplayVersion || '25H2');
-  const ubr = Number(regInfo.UBR || 9818);
+  const buildNumberRaw = regInfo.CurrentBuildNumber || regInfo.CurrentBuild;
+  if (!inspectionSucceeded || !buildNumberRaw) {
+    return {
+      authoritativeProductName: 'UNKNOWN',
+      rawRegistryProductName: 'UNKNOWN',
+      editionId: 'UNKNOWN',
+      displayVersion: 'UNKNOWN',
+      buildNumber: null,
+      ubr: null,
+      fullVersion: 'UNKNOWN',
+      installationType: 'UNKNOWN',
+      hypervisorDetected: false,
+      vbsRunning: false,
+      inspectionState: 'UNAVAILABLE',
+      discrepancyIdentified: false,
+      discrepancyReason: null,
+    };
+  }
+
+  const buildNumber = Number(buildNumberRaw);
+  const rawProductName = String(regInfo.ProductName || 'UNKNOWN');
+  const editionId = String(regInfo.EditionID || 'UNKNOWN');
+  const displayVersion = String(regInfo.DisplayVersion || 'UNKNOWN');
+  const ubr = regInfo.UBR !== undefined ? Number(regInfo.UBR) : null;
   const installationType = String(regInfo.InstallationType || 'Client');
 
   const isWindows11 = buildNumber >= 22000;
@@ -1014,10 +1059,11 @@ function queryWindowsOperatingSystemIdentity() {
     displayVersion,
     buildNumber,
     ubr,
-    fullVersion: `10.0.${buildNumber}.${ubr}`,
+    fullVersion: ubr !== null ? `10.0.${buildNumber}.${ubr}` : `10.0.${buildNumber}`,
     installationType,
-    hypervisorDetected: true,
-    vbsRunning: true,
+    hypervisorDetected: false,
+    vbsRunning: false,
+    inspectionState: 'VERIFIED',
     discrepancyIdentified,
     discrepancyReason: discrepancyIdentified
       ? 'HKLM CurrentVersion ProductName reports "Windows 10 Pro" due to Microsoft backward-compatibility shim for legacy applications; authoritative operating system is Windows 11 (build >= 22000).'
@@ -1250,9 +1296,9 @@ async function verifyLiveSupervisorProcessIsolation(options = {}) {
       { operation: 'GET_SUPERVISOR_IDENTITY' },
       { pipePath, timeoutMs },
     );
-    const isLocalSystem = identity?.tokenUserSid === 'S-1-5-18'
-      || identity?.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE'
-      || (options.isSyntheticTest && identity?.ok);
+    const isLocalSystem = (identity?.tokenUserSid === 'S-1-5-18' && identity?.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE')
+      || identity?.tokenUserSid === 'S-1-5-18'
+      || (Boolean(options.isSyntheticTest) && identity?.ok);
 
     if (!identity?.ok || !isLocalSystem) {
       return {
@@ -1280,7 +1326,6 @@ async function verifyLiveSupervisorProcessIsolation(options = {}) {
       };
     }
 
-    // If an execution grant was supplied, verify it; otherwise issue and verify grant on supervisor
     const client = createNativeSupervisorClient({
       pipePath,
       pid: identity.pid,
@@ -1289,36 +1334,28 @@ async function verifyLiveSupervisorProcessIsolation(options = {}) {
       isLiveSupervisorService: true,
     });
 
-    const grantReq = {
-      runId: options.runId || crypto.randomUUID(),
-      workspaceRoot: options.workspaceRoot || process.cwd(),
-      approvedSnapshotDigest: options.approvedSnapshotDigest || crypto.createHash('sha256').update(options.workspaceRoot || process.cwd()).digest('hex'),
-      planDigest: options.planDigest || crypto.createHash('sha256').update(options.runId || 'plan').digest('hex'),
-      taskId: options.taskId || 'task-run-or-launch',
-      sessionId: options.sessionId || 'session-run-or-launch',
-      ttlSeconds: options.ttlSeconds || 300,
-    };
-
-    const grant = options.executionGrant && options.executionGrant.granted
-      ? options.executionGrant
-      : await client.issueExecutionGrant(grantReq);
-
-    if (!grant || !grant.granted) {
+    // Synthetic test path: explicitly authorized synthetic fixtures only
+    if (Boolean(options.isSyntheticTest)) {
       return {
-        verified: false,
-        processIsolationGate: 'BLOCKED',
-        reasonCode: 'GRANT_REJECTED',
-        reason: 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.',
+        verified: true,
+        processIsolationGate: 'SYNTHETIC_ALLOW',
+        isolationState: 'SYNTHETIC_TEST_BOUNDARY',
+        identity,
+        hcsStatus: safeInvoke,
+        client,
         hostFallback: 'ZERO',
       };
     }
 
+    // Real host environment: HCS discovery does NOT prove VM provisioning, filesystem
+    // write protection, or network egress firewall boundaries. Gate MUST remain BLOCKED.
     return {
-      verified: true,
-      processIsolationGate: 'ALLOWED',
+      verified: false,
+      processIsolationGate: 'BLOCKED',
+      reasonCode: 'HYPERVISOR_VM_NOT_PROVISIONED',
+      reason: 'Runtime process launch is blocked: verified Windows process isolation is required before starting long-running project servers or applications.',
       identity,
       hcsStatus: safeInvoke,
-      grant,
       client,
       hostFallback: 'ZERO',
     };
