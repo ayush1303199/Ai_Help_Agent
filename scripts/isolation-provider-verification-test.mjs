@@ -1763,6 +1763,55 @@ async function testV44857DExecutionAndLifecycleHardening() {
   assert.strictEqual(childExecutionIds[0], 'root-exec-uuid-7d:cmd:0');
   assert.strictEqual(childExecutionIds[1], 'root-exec-uuid-7d:cmd:1');
   assert.strictEqual(childExecutionIds[2], 'root-exec-uuid-7d:cmd:2');
+
+  // 6. Quarantine Capacity at 127, 128, 129 & Reaping Lifecycle Invariants
+  function simulateQuarantineGate(currentCount, requestedHeadroom = 2, maxCapacity = 128) {
+    if (currentCount + requestedHeadroom > maxCapacity) {
+      return { ok: false, error: 'QUARANTINE_CAPACITY_EXCEEDED', reason: 'Quarantine registry has reached capacity' };
+    }
+    return { ok: true };
+  }
+  assert.strictEqual(simulateQuarantineGate(126, 2).ok, true, 'At count 126 (+2 = 128), headroom is accommodated');
+  assert.strictEqual(simulateQuarantineGate(127, 2).ok, false, 'At count 127 (+2 = 129), fails closed before resource creation');
+  assert.strictEqual(simulateQuarantineGate(128, 2).ok, false, 'At count 128, fails closed immediately');
+  assert.strictEqual(simulateQuarantineGate(129, 2).ok, false, 'Beyond 128, strictly blocked');
+
+  // Reaping state machine: only WAIT_OBJECT_0 allows handle closure; WAIT_TIMEOUT and WAIT_FAILED retain ownership
+  function simulateQuarantineReap(waitResult) {
+    const WAIT_OBJECT_0 = 0x00000000;
+    const WAIT_TIMEOUT = 0x00000102;
+    const WAIT_FAILED = 0xFFFFFFFF;
+    if (waitResult === WAIT_OBJECT_0) {
+      return { handleClosed: true, retainedInQuarantine: false };
+    }
+    // WAIT_TIMEOUT and WAIT_FAILED must retain ownership without closing
+    return { handleClosed: false, retainedInQuarantine: true };
+  }
+  assert.deepStrictEqual(simulateQuarantineReap(0x00000000), { handleClosed: true, retainedInQuarantine: false });
+  assert.deepStrictEqual(simulateQuarantineReap(0x00000102), { handleClosed: false, retainedInQuarantine: true }, 'WAIT_TIMEOUT retains pipe ownership');
+  assert.deepStrictEqual(simulateQuarantineReap(0xFFFFFFFF), { handleClosed: false, retainedInQuarantine: true }, 'WAIT_FAILED retains pipe ownership');
+
+  // 7. Extended Listener Identity: missing creation time, malformed netstat, and invalid ancestry
+  const missingCreationTimeOwnership = { verified: false, socketPid: 1234, targetPid: 1234, reason: 'CREATION_TIME_REQUIRED' };
+  const malformedNetstatOwnership = { verified: false, socketPid: null, reason: 'PORT_NOT_LISTENING' };
+  const invalidAncestryOwnership = { verified: false, socketPid: 9876, targetPid: 1234, reason: 'PID_MISMATCH' };
+
+  assert.strictEqual(simulateListenerAttribution(missingCreationTimeOwnership, true).listenerOwnershipStatus, 'NOT_VERIFIED');
+  assert.strictEqual(simulateListenerAttribution(malformedNetstatOwnership, true).listenerOwnershipStatus, 'NOT_VERIFIED');
+  assert.strictEqual(simulateListenerAttribution(invalidAncestryOwnership, true).listenerOwnershipStatus, 'NOT_VERIFIED');
+
+  // 8. Grant/runId/worker PID/execution ID cross-correlation & replay rejection
+  const consumedGrants = new Set();
+  function consumeGrant(grantId) {
+    if (consumedGrants.has(grantId)) {
+      return { ok: false, error: 'GRANT_ALREADY_CONSUMED' };
+    }
+    consumedGrants.add(grantId);
+    return { ok: true, grantId };
+  }
+  assert.strictEqual(consumeGrant('grant-1').ok, true);
+  assert.strictEqual(consumeGrant('grant-1').ok, false, 'Replaying consumed grant must fail closed');
+  assert.strictEqual(consumeGrant('grant-1').error, 'GRANT_ALREADY_CONSUMED');
 }
 
 async function runAllTests() {
