@@ -455,6 +455,169 @@ async function testV44856SecurityGateAndSupervisorRemediation() {
   }
 }
 
+async function testV44856BSecurityHardening() {
+  console.log('Testing Milestone V44.85.6B: Trusted Supervisor IPC Authentication & Hardening...');
+
+  const { executeWithSupervisor } = windowsAdapterPkg;
+
+  function createMockSupervisor(overrides = {}) {
+    const base = createNativeSupervisorClient({
+      isSyntheticTest: true,
+      pid: 9999,
+      tokenUserSid: 'S-1-5-18',
+    });
+    return {
+      ...base,
+      issueExecutionGrant: async (req) => ({
+        granted: true,
+        runId: req.runId,
+        workspaceRoot: req.workspaceRoot,
+        approvedSnapshotDigest: req.approvedSnapshotDigest,
+        commandDigest: req.commandDigest,
+        sessionId: req.sessionId,
+      }),
+      consumeExecutionGrant: async () => ({ consumed: true }),
+      allocateWorker: async () => ({ workerId: 'w1' }),
+      observeEffectiveIsolation: async () => ({ effectiveIsolationVerified: true }),
+      executeApprovedOperation: async () => ({ ok: true, exitCode: 0 }),
+      enforceDeadlineAndCancellation: async () => {},
+      collectHostEvidence: async () => ({ evidenceCollected: true }),
+      terminateWorker: async () => ({ terminated: true }),
+      verifyWorkerTerminationAndResourceRelease: async () => ({ released: true }),
+      quarantineResource: async () => ({ quarantined: true }),
+      resolveQuarantine: async () => ({ resolved: true }),
+      ...overrides,
+    };
+  }
+
+  // 1. Path Traversal & Invalid Characters
+  const invalidAdPath = path.join(tempDir, 'workspace:stream');
+  let adErr = null;
+  try {
+    await executeWithSupervisor({
+      supervisor: createMockSupervisor(),
+      isSyntheticTest: true,
+      runId: 'run-path-ad',
+      workspaceRoot: invalidAdPath,
+      approvedSnapshotDigest: 'snap-digest',
+      command: 'echo hello',
+    });
+  } catch (err) {
+    adErr = err;
+  }
+  assert.ok(adErr, 'Should reject Alternate Data Stream in workspace path');
+  assert.strictEqual(adErr.reasonCode, 'INVALID_WORKSPACE_PATH');
+
+  // Null byte in workspace path
+  let nullErr = null;
+  try {
+    await executeWithSupervisor({
+      supervisor: createMockSupervisor(),
+      isSyntheticTest: true,
+      runId: 'run-path-null',
+      workspaceRoot: 'C:\\workspace\0evil',
+      approvedSnapshotDigest: 'snap-digest',
+      command: 'echo hello',
+    });
+  } catch (err) {
+    nullErr = err;
+  }
+  assert.ok(nullErr, 'Should reject null byte in workspace path');
+  assert.strictEqual(nullErr.reasonCode, 'INVALID_WORKSPACE_PATH');
+
+  // 2. Command Digest Tampering Guard in executeWithSupervisor
+  const testWorkspace = path.join(tempDir, 'safe-workspace');
+  await fs.mkdir(testWorkspace, { recursive: true });
+
+  let cmdMismatchErr = null;
+  try {
+    await executeWithSupervisor({
+      supervisor: createMockSupervisor({
+        issueExecutionGrant: async (req) => ({
+          granted: true,
+          runId: req.runId,
+          workspaceRoot: req.workspaceRoot,
+          approvedSnapshotDigest: req.approvedSnapshotDigest,
+          commandDigest: crypto.createHash('sha256').update('npm test').digest('hex'),
+          sessionId: req.sessionId,
+        }),
+      }),
+      isSyntheticTest: true,
+      runId: 'run-tampered-cmd',
+      workspaceRoot: testWorkspace,
+      approvedSnapshotDigest: 'snap-digest',
+      command: 'npm run malicious',
+    });
+  } catch (err) {
+    cmdMismatchErr = err;
+  }
+  assert.ok(cmdMismatchErr, 'Should reject execution when command does not match issued grant commandDigest');
+  assert.strictEqual(cmdMismatchErr.reasonCode, 'COMMAND_APPROVAL_MISMATCH');
+
+  // 3. Session Mismatch Rejection
+  let sessionMismatchErr = null;
+  try {
+    await executeWithSupervisor({
+      supervisor: createMockSupervisor({
+        issueExecutionGrant: async (req) => ({
+          granted: true,
+          runId: req.runId,
+          workspaceRoot: req.workspaceRoot,
+          approvedSnapshotDigest: req.approvedSnapshotDigest,
+          commandDigest: crypto.createHash('sha256').update('npm test').digest('hex'),
+          sessionId: 'session-attacker',
+        }),
+      }),
+      isSyntheticTest: true,
+      runId: 'run-sess-tamper',
+      workspaceRoot: testWorkspace,
+      approvedSnapshotDigest: 'snap-digest',
+      command: 'npm test',
+      sessionId: 'session-authorized',
+    });
+  } catch (err) {
+    sessionMismatchErr = err;
+  }
+  assert.ok(sessionMismatchErr, 'Should reject execution on session mismatch');
+  assert.strictEqual(sessionMismatchErr.reasonCode, 'SESSION_MISMATCH');
+
+  // 4. Reparse point / junction escape detection on child directories
+  const junctionTarget = path.join(tempDir, 'junction-target');
+  const junctionWorkspace = path.join(tempDir, 'workspace-with-junction');
+  const nestedJunction = path.join(junctionWorkspace, 'nested-link');
+  await fs.mkdir(junctionTarget, { recursive: true });
+  await fs.mkdir(junctionWorkspace, { recursive: true });
+
+  let junctionCreated = false;
+  try {
+    await fs.symlink(junctionTarget, nestedJunction, 'junction');
+    junctionCreated = true;
+  } catch {}
+
+  if (junctionCreated) {
+    let junctionErr = null;
+    try {
+      await executeWithSupervisor({
+        supervisor: createMockSupervisor(),
+        isSyntheticTest: true,
+        runId: 'run-junction-test',
+        workspaceRoot: junctionWorkspace,
+        approvedSnapshotDigest: 'snap-digest',
+        command: 'npm test',
+      });
+    } catch (err) {
+      junctionErr = err;
+    }
+    assert.ok(junctionErr, 'Should reject workspace containing nested junction/reparse point');
+    assert.strictEqual(junctionErr.reasonCode, 'WORKSPACE_REPARSE_POINT_DETECTED');
+  }
+
+  // 5. Fail-closed gates remain strictly enforced
+  const liveCheck = await verifyLiveSupervisorProcessIsolation({ isSyntheticTest: false, timeoutMs: 500 });
+  assert.strictEqual(liveCheck.processIsolationGate, 'BLOCKED');
+  assert.strictEqual(liveCheck.hostFallback, 'ZERO');
+}
+
 async function runAllTests() {
   try {
     await setupTestDir();
@@ -467,6 +630,7 @@ async function runAllTests() {
     await testWorkerAuthCannotOverrideBlockedIsolation();
     await testWindowsHostPolicyBlocksExecution();
     await testV44856SecurityGateAndSupervisorRemediation();
+    await testV44856BSecurityHardening();
     console.log('All Isolation Provider Verification & Sandbox Readiness regression tests passed successfully!');
   } finally {
     await cleanupTestDir();

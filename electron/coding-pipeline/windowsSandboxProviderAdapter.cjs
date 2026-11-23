@@ -85,6 +85,117 @@ async function assertPlainDirectory(candidate, expectedParent, label) {
   return realItem;
 }
 
+async function assertSecureWorkspacePath(workspaceRoot) {
+  if (typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) {
+    throw new TypeError('workspaceRoot is required and must be a non-empty string.');
+  }
+
+  // Reject alternate data streams, null bytes, device prefixes
+  if (workspaceRoot.includes('\0')) {
+    const error = new Error('Workspace path contains null byte characters.');
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    error.reasonCode = 'INVALID_WORKSPACE_PATH';
+    throw error;
+  }
+  const strippedDrive = workspaceRoot.replace(/^[a-zA-Z]:[\\/]/, '');
+  if (strippedDrive.includes(':')) {
+    const error = new Error(`Workspace path "${workspaceRoot}" contains NTFS Alternate Data Stream specifier.`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    error.reasonCode = 'INVALID_WORKSPACE_PATH';
+    throw error;
+  }
+  if (workspaceRoot.startsWith('\\\\.\\') || workspaceRoot.startsWith('\\\\?\\')) {
+    const error = new Error(`Workspace path "${workspaceRoot}" uses raw device path syntax.`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    error.reasonCode = 'INVALID_WORKSPACE_PATH';
+    throw error;
+  }
+
+  const resolved = path.resolve(workspaceRoot);
+
+  // 1. fs.realpath check on the workspace root
+  let realWs;
+  try {
+    realWs = await fs.realpath(resolved);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      realWs = resolved;
+    } else {
+      throw err;
+    }
+  }
+
+  if (path.resolve(realWs).toLowerCase() !== resolved.toLowerCase()) {
+    const error = new Error(`Workspace path "${workspaceRoot}" contains an NTFS junction or symbolic link resolving outside canonical root: "${realWs}".`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    error.reasonCode = 'WORKSPACE_REPARSE_POINT_DETECTED';
+    throw error;
+  }
+
+  // 2. Ancestor traversal check
+  let currentDir = resolved;
+  while (currentDir) {
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) break;
+    try {
+      const st = await fs.lstat(currentDir);
+      if (st.isSymbolicLink()) {
+        const error = new Error(`Workspace path "${workspaceRoot}" contains a symbolic link or junction at ancestor "${currentDir}".`);
+        error.code = 'PROJECT_EXECUTION_BLOCKED';
+        error.executionBlocked = true;
+        error.reasonCode = 'WORKSPACE_REPARSE_POINT_DETECTED';
+        throw error;
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    currentDir = parentDir;
+  }
+
+  // 3. Child directory inspection (nested reparse points / junctions)
+  try {
+    const queue = [{ dir: resolved, depth: 0 }];
+    while (queue.length > 0) {
+      const { dir, depth } = queue.shift();
+      if (depth >= 4) continue;
+      let entries = [];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory() || entry.isSymbolicLink()) {
+          const childPath = path.join(dir, entry.name);
+          try {
+            const st = await fs.lstat(childPath);
+            if (st.isSymbolicLink()) {
+              const error = new Error(`Workspace path "${workspaceRoot}" contains a nested reparse point or junction at "${childPath}".`);
+              error.code = 'PROJECT_EXECUTION_BLOCKED';
+              error.executionBlocked = true;
+              error.reasonCode = 'WORKSPACE_REPARSE_POINT_DETECTED';
+              throw error;
+            }
+            if (st.isDirectory()) {
+              queue.push({ dir: childPath, depth: depth + 1 });
+            }
+          } catch (stErr) {
+            if (stErr.code === 'PROJECT_EXECUTION_BLOCKED') throw stErr;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    if (err.code === 'PROJECT_EXECUTION_BLOCKED') throw err;
+  }
+
+  return resolved;
+}
+
 async function buildWindowsSandboxConfiguration(options = {}) {
   ensureOnlyKeys(options, ['temporaryRoot', 'controlDirectory', 'outputDirectory', 'memoryInMB'], 'Windows Sandbox options');
   const temporaryRoot = path.resolve(String(options.temporaryRoot || ''));
@@ -306,14 +417,19 @@ async function executeWithSupervisor({
     throw new TypeError('command is required for supervised execution.');
   }
 
+  const resolvedWorkspace = await assertSecureWorkspacePath(workspaceRoot);
+  const commandDigest = crypto.createHash('sha256').update(String(command || '')).digest('hex');
+  const effectiveSessionId = sessionId || crypto.randomUUID();
+
   const grant = await op.issueExecutionGrant({
     runId,
-    workspaceRoot: path.resolve(workspaceRoot),
+    workspaceRoot: resolvedWorkspace,
     approvedSnapshotDigest,
     planDigest,
     taskId,
-    sessionId,
+    sessionId: effectiveSessionId,
     command,
+    commandDigest,
     timeoutMs,
   });
 
@@ -346,27 +462,20 @@ async function executeWithSupervisor({
     throw error;
   }
 
-  const resolvedWorkspace = path.resolve(workspaceRoot);
   const resolvedGrantWorkspace = path.resolve(grant.workspaceRoot || '');
-  if (resolvedGrantWorkspace !== resolvedWorkspace) {
+  if (resolvedGrantWorkspace.toLowerCase() !== resolvedWorkspace.toLowerCase()) {
     const error = new Error('Execution grant workspaceRoot does not match requested workspace root.');
     error.code = 'PROJECT_EXECUTION_BLOCKED';
     error.executionBlocked = true;
     throw error;
   }
 
-  // Reparse-point / Directory Junction escape guard
-  try {
-    const realWs = await fs.realpath(resolvedWorkspace);
-    if (path.resolve(realWs).toLowerCase() !== resolvedWorkspace.toLowerCase()) {
-      const error = new Error(`Workspace path "${workspaceRoot}" contains an NTFS junction or symbolic link resolving outside canonical root: "${realWs}".`);
-      error.code = 'PROJECT_EXECUTION_BLOCKED';
-      error.executionBlocked = true;
-      error.reasonCode = 'WORKSPACE_REPARSE_POINT_DETECTED';
-      throw error;
-    }
-  } catch (err) {
-    if (err.code === 'PROJECT_EXECUTION_BLOCKED') throw err;
+  if (grant.commandDigest && grant.commandDigest.toLowerCase() !== commandDigest.toLowerCase()) {
+    const error = new Error(`Execution grant commandDigest mismatch: expected "${grant.commandDigest}", got "${commandDigest}".`);
+    error.code = 'PROJECT_EXECUTION_BLOCKED';
+    error.executionBlocked = true;
+    error.reasonCode = 'COMMAND_APPROVAL_MISMATCH';
+    throw error;
   }
 
   if (planDigest && grant.planDigest && grant.planDigest !== planDigest) {
@@ -383,10 +492,11 @@ async function executeWithSupervisor({
     throw error;
   }
 
-  if (sessionId && grant.sessionId && grant.sessionId !== sessionId) {
-    const error = new Error(`Execution grant sessionId mismatch: expected "${sessionId}", got "${grant.sessionId}".`);
+  if (effectiveSessionId && grant.sessionId && grant.sessionId !== effectiveSessionId) {
+    const error = new Error(`Execution grant sessionId mismatch: expected "${effectiveSessionId}", got "${grant.sessionId}".`);
     error.code = 'PROJECT_EXECUTION_BLOCKED';
     error.executionBlocked = true;
+    error.reasonCode = 'SESSION_MISMATCH';
     throw error;
   }
 
@@ -400,8 +510,9 @@ async function executeWithSupervisor({
 
   const worker = await op.allocateWorker({
     runId,
-    workspaceRoot: path.resolve(workspaceRoot),
+    workspaceRoot: resolvedWorkspace,
     grantId: grant.grantId || grant.grantToken,
+    sessionId: grant.sessionId || effectiveSessionId,
     grant,
   });
 
@@ -441,7 +552,10 @@ async function executeWithSupervisor({
     const runPromise = op.executeApprovedOperation({
       worker,
       command,
-      workspaceRoot: path.resolve(workspaceRoot),
+      commandLine: command,
+      commandDigest,
+      workspaceRoot: resolvedWorkspace,
+      sessionId: grant.sessionId || effectiveSessionId,
       grant,
     });
 
@@ -630,17 +744,48 @@ async function queryNativeSupervisorStatus(options = {}) {
       { pipePath, retries: 2, delayMs: 20, timeoutMs: 500 },
     );
 
+    if (!hello || typeof hello !== 'object' || hello.ok !== true) {
+      const err = new Error('Supervisor HELLO response is malformed.');
+      err.code = 'INVALID_SUPERVISOR_HELLO';
+      throw err;
+    }
+
+    const pid = Number(hello.pid);
+    if (!Number.isInteger(pid) || pid <= 4 || pid === process.pid) {
+      const err = new Error(`Supervisor reported invalid PID (${hello.pid}).`);
+      err.code = 'INVALID_SUPERVISOR_PID';
+      throw err;
+    }
+
+    try {
+      process.kill(pid, 0);
+    } catch (killErr) {
+      if (killErr.code === 'ESRCH') {
+        const err = new Error(`Supervisor reported PID ${pid} does not exist in the OS process table.`);
+        err.code = 'SUPERVISOR_PID_NOT_RUNNING';
+        throw err;
+      }
+    }
+
+    const tokenUserSid = String(hello.tokenUserSid || '').trim().toUpperCase();
+    if (!tokenUserSid || !/^S-1-[0-59]-\d+/i.test(tokenUserSid)) {
+      const err = new Error(`Supervisor reported invalid tokenUserSid (${hello.tokenUserSid}).`);
+      err.code = 'INVALID_SUPERVISOR_SID';
+      throw err;
+    }
+
+    const isSystemService = serviceInstalled && serviceState === 'RUNNING' && tokenUserSid === 'S-1-5-18';
     const running = true;
-    const runningMode = serviceInstalled && serviceState === 'RUNNING'
+    const runningMode = isSystemService
       ? 'WINDOWS_SERVICE'
       : 'INTERACTIVE_CONSOLE_DIAGNOSTIC';
-    const status = serviceInstalled && serviceState === 'RUNNING'
+    const status = isSystemService
       ? 'IMPLEMENTED_AND_RUNNING'
       : 'IMPLEMENTED_NOT_INSTALLED';
-    const reasonCode = serviceInstalled && serviceState === 'RUNNING'
+    const reasonCode = isSystemService
       ? null
       : 'WINDOWS_SERVICE_NOT_INSTALLED';
-    const reason = serviceInstalled && serviceState === 'RUNNING'
+    const reason = isSystemService
       ? 'Native supervisor is active as an installed Windows Service under NT AUTHORITY\\SYSTEM.'
       : 'Native supervisor is active in interactive console diagnostic mode, but is NOT installed as an elevated Windows Service under NT AUTHORITY\\SYSTEM.';
 
@@ -656,8 +801,8 @@ async function queryNativeSupervisorStatus(options = {}) {
       reasonCode,
       reason,
       supervisorId: hello.supervisorId,
-      pid: hello.pid,
-      tokenUserSid: hello.tokenUserSid,
+      pid,
+      tokenUserSid,
       isAlive: hello.isAlive,
     };
   } catch (err) {
@@ -686,6 +831,7 @@ function createNativeSupervisorClient(options = {}) {
   const pid = typeof options.pid === 'number' ? options.pid : 0;
   const tokenUserSid = options.tokenUserSid || 'S-1-5-18';
   const processCreationTimeUtc = options.processCreationTimeUtc || new Date().toISOString();
+  const defaultSessionId = options.sessionId || crypto.randomUUID();
 
   const expectedPrincipalSid = options.expectedPrincipalSid
     || (options.isSyntheticTest ? (options.tokenUserSid || 'S-1-5-18') : 'S-1-5-18');
@@ -738,7 +884,7 @@ function createNativeSupervisorClient(options = {}) {
         command: req.command,
         commandDigest: req.commandDigest,
         taskId: req.taskId,
-        sessionId: req.sessionId,
+        sessionId: req.sessionId || defaultSessionId,
         ttlSeconds: req.ttlSeconds,
       }, { pipePath });
     },
@@ -749,6 +895,7 @@ function createNativeSupervisorClient(options = {}) {
         runId: grant.runId,
         workspaceRoot: grant.workspaceRoot,
         approvedSnapshotDigest: grant.approvedSnapshotDigest,
+        sessionId: grant.sessionId || defaultSessionId,
       }, { pipePath });
     },
     async allocateWorker(req) {
@@ -757,6 +904,7 @@ function createNativeSupervisorClient(options = {}) {
         runId: req.runId,
         workspaceRoot: req.workspaceRoot,
         grantId: req.grantId || req?.grant?.grantId || req?.grant?.grantToken,
+        sessionId: req.sessionId || req?.grant?.sessionId || defaultSessionId,
       }, { pipePath });
     },
     async observeWorkerReadiness() {
@@ -775,8 +923,10 @@ function createNativeSupervisorClient(options = {}) {
         operation: 'EXECUTE_APPROVED_OPERATION',
         workerId: req?.worker?.workerId,
         command: req?.command,
-        commandLine: req?.command,
+        commandLine: req?.commandLine || req?.command,
+        commandDigest: req?.commandDigest,
         workspaceRoot: req?.workspaceRoot,
+        sessionId: req?.sessionId || req?.grant?.sessionId || defaultSessionId,
       }, { pipePath });
     },
     async enforceDeadlineAndCancellation({ timeoutMs, signal, isCancelled }) {
@@ -1297,7 +1447,6 @@ async function verifyLiveSupervisorProcessIsolation(options = {}) {
       { pipePath, timeoutMs },
     );
     const isLocalSystem = (identity?.tokenUserSid === 'S-1-5-18' && identity?.serviceSecurityBoundary === 'LOCAL_SYSTEM_SERVICE')
-      || identity?.tokenUserSid === 'S-1-5-18'
       || (Boolean(options.isSyntheticTest) && identity?.ok);
 
     if (!identity?.ok || !isLocalSystem) {

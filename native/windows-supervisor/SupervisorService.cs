@@ -500,6 +500,57 @@ namespace AiHelpAgent.NativeSupervisor
         private readonly Dictionary<string, HcsComputeSystemRecord> _activeHcsSystems = new Dictionary<string, HcsComputeSystemRecord>();
         private readonly Dictionary<string, HcsComputeSystemRecord> _quarantinedHcsSystems = new Dictionary<string, HcsComputeSystemRecord>();
 
+        private static bool HasReparsePointOrJunction(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            try
+            {
+                string fullPath = Path.GetFullPath(path);
+                DirectoryInfo current = new DirectoryInfo(fullPath);
+
+                // 1. Check current directory and ancestors up to drive root
+                DirectoryInfo ancestor = current;
+                while (ancestor != null)
+                {
+                    if (ancestor.Exists && (ancestor.Attributes & FileAttributes.ReparsePoint) != 0)
+                    {
+                        return true;
+                    }
+                    ancestor = ancestor.Parent;
+                }
+
+                // 2. Child directory inspection: scan nested directories up to bounded depth
+                if (current.Exists)
+                {
+                    Queue<KeyValuePair<DirectoryInfo, int>> queue = new Queue<KeyValuePair<DirectoryInfo, int>>();
+                    queue.Enqueue(new KeyValuePair<DirectoryInfo, int>(current, 0));
+                    while (queue.Count > 0)
+                    {
+                        KeyValuePair<DirectoryInfo, int> item = queue.Dequeue();
+                        DirectoryInfo dir = item.Key;
+                        int depth = item.Value;
+                        if (depth >= 4) continue;
+
+                        DirectoryInfo[] subs;
+                        try { subs = dir.GetDirectories(); } catch { return true; }
+                        foreach (DirectoryInfo sub in subs)
+                        {
+                            if ((sub.Attributes & FileAttributes.ReparsePoint) != 0)
+                            {
+                                return true;
+                            }
+                            queue.Enqueue(new KeyValuePair<DirectoryInfo, int>(sub, depth + 1));
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                return true;
+            }
+            return false;
+        }
+
         public Dictionary<string, object> ProcessRequest(Dictionary<string, object> request, ClientPeerInfo peer)
         {
             string op = string.Empty;
@@ -672,23 +723,15 @@ namespace AiHelpAgent.NativeSupervisor
             }
 
             // Reparse point / Directory Junction guard on workspaceRoot
-            try
+            if (HasReparsePointOrJunction(workspaceRoot))
             {
-                if (Directory.Exists(workspaceRoot))
-                {
-                    DirectoryInfo di = new DirectoryInfo(workspaceRoot);
-                    if (di.Exists && di.Attributes.HasFlag(FileAttributes.ReparsePoint))
-                    {
-                        Dictionary<string, object> repErr = new Dictionary<string, object>();
-                        repErr["granted"] = false;
-                        repErr["rejected"] = true;
-                        repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
-                        repErr["reason"] = "Workspace root contains an NTFS reparse point or directory junction, which is rejected for secure execution.";
-                        return repErr;
-                    }
-                }
+                Dictionary<string, object> repErr = new Dictionary<string, object>();
+                repErr["granted"] = false;
+                repErr["rejected"] = true;
+                repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                repErr["reason"] = "Workspace root or descendant path contains an NTFS reparse point or directory junction, which is rejected for secure execution.";
+                return repErr;
             }
-            catch { }
 
             if (!string.IsNullOrEmpty(command) && string.IsNullOrEmpty(commandDigest))
             {
@@ -849,22 +892,14 @@ namespace AiHelpAgent.NativeSupervisor
                 string reqWorkspace = GetStringVal(req, "workspaceRoot");
                 if (!string.IsNullOrEmpty(reqWorkspace))
                 {
-                    try
+                    if (HasReparsePointOrJunction(reqWorkspace))
                     {
-                        if (Directory.Exists(reqWorkspace))
-                        {
-                            DirectoryInfo di = new DirectoryInfo(reqWorkspace);
-                            if (di.Exists && di.Attributes.HasFlag(FileAttributes.ReparsePoint))
-                            {
-                                Dictionary<string, object> repErr = new Dictionary<string, object>();
-                                repErr["ok"] = false; repErr["consumed"] = false;
-                                repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
-                                repErr["reason"] = "Workspace root contains an NTFS reparse point or directory junction, which is rejected for secure execution.";
-                                return repErr;
-                            }
-                        }
+                        Dictionary<string, object> repErr = new Dictionary<string, object>();
+                        repErr["ok"] = false; repErr["consumed"] = false;
+                        repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                        repErr["reason"] = "Workspace root or descendant path contains an NTFS reparse point or directory junction, which is rejected for secure execution.";
+                        return repErr;
                     }
-                    catch { }
 
                     if (!string.Equals(Path.GetFullPath(reqWorkspace), record.WorkspaceRoot, StringComparison.OrdinalIgnoreCase))
                     {
@@ -874,6 +909,16 @@ namespace AiHelpAgent.NativeSupervisor
                         wsErr["reason"] = "Execution grant workspace root mismatch.";
                         return wsErr;
                     }
+                }
+
+                string reqSession = GetStringVal(req, "sessionId");
+                if (!string.IsNullOrEmpty(reqSession) && !string.IsNullOrEmpty(record.SessionId) && !string.Equals(reqSession, record.SessionId, StringComparison.Ordinal))
+                {
+                    Dictionary<string, object> sessErr = new Dictionary<string, object>();
+                    sessErr["ok"] = false; sessErr["consumed"] = false;
+                    sessErr["reasonCode"] = "SESSION_MISMATCH";
+                    sessErr["reason"] = "Execution grant session mismatch: request session differs from grant issue session.";
+                    return sessErr;
                 }
 
                 string reqDigest = GetStringVal(req, "approvedSnapshotDigest");
@@ -920,22 +965,14 @@ namespace AiHelpAgent.NativeSupervisor
 
             if (!string.IsNullOrEmpty(workspaceRoot))
             {
-                try
+                if (HasReparsePointOrJunction(workspaceRoot))
                 {
-                    if (Directory.Exists(workspaceRoot))
-                    {
-                        DirectoryInfo di = new DirectoryInfo(workspaceRoot);
-                        if (di.Exists && di.Attributes.HasFlag(FileAttributes.ReparsePoint))
-                        {
-                            Dictionary<string, object> repErr = new Dictionary<string, object>();
-                            repErr["allocated"] = false;
-                            repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
-                            repErr["error"] = "Workspace root contains an NTFS reparse point or directory junction.";
-                            return repErr;
-                        }
-                    }
+                    Dictionary<string, object> repErr = new Dictionary<string, object>();
+                    repErr["allocated"] = false;
+                    repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                    repErr["error"] = "Workspace root or descendant path contains an NTFS reparse point or directory junction.";
+                    return repErr;
                 }
-                catch { }
             }
 
             IntPtr hJob = NativeMethods.CreateJobObject(IntPtr.Zero, "AiHelpAgentJob_" + workerId);
@@ -977,6 +1014,35 @@ namespace AiHelpAgent.NativeSupervisor
                         ExecutionGrantRecord gr = _issuedGrants[grantId];
                         worker.ApprovedPlanDigest = gr.PlanDigest;
                         worker.ApprovedCommandDigest = gr.CommandDigest;
+                        worker.WorkspaceRoot = gr.WorkspaceRoot;
+                        worker.SessionId = gr.SessionId;
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(worker.WorkspaceRoot) && !string.IsNullOrEmpty(workspaceRoot))
+                {
+                    if (!string.Equals(Path.GetFullPath(workspaceRoot), worker.WorkspaceRoot, StringComparison.OrdinalIgnoreCase))
+                    {
+                        NativeMethods.CloseHandle(hJob);
+                        Dictionary<string, object> wsErr = new Dictionary<string, object>();
+                        wsErr["allocated"] = false;
+                        wsErr["reasonCode"] = "WORKSPACE_ROOT_MISMATCH";
+                        wsErr["error"] = "Worker allocation workspace root does not match execution grant.";
+                        return wsErr;
+                    }
+                }
+
+                string reqSession = GetStringVal(req, "sessionId");
+                if (!string.IsNullOrEmpty(reqSession) && !string.IsNullOrEmpty(worker.SessionId))
+                {
+                    if (!string.Equals(reqSession, worker.SessionId, StringComparison.Ordinal))
+                    {
+                        NativeMethods.CloseHandle(hJob);
+                        Dictionary<string, object> sessErr = new Dictionary<string, object>();
+                        sessErr["allocated"] = false;
+                        sessErr["reasonCode"] = "SESSION_MISMATCH";
+                        sessErr["error"] = "Worker allocation sessionId does not match execution grant session.";
+                        return sessErr;
                     }
                 }
             }
@@ -1082,6 +1148,76 @@ namespace AiHelpAgent.NativeSupervisor
                 err["error"] = "WORKER_NOT_CONTAINED";
                 err["reason"] = "Operation rejected: worker is not assigned to an active Windows Job Object containment boundary.";
                 return err;
+            }
+
+            if (worker.IsTerminated)
+            {
+                Dictionary<string, object> termErr = new Dictionary<string, object>();
+                termErr["ok"] = false; termErr["exitCode"] = -1;
+                termErr["error"] = "WORKER_ALREADY_TERMINATED";
+                termErr["reasonCode"] = "WORKER_PROCESS_TERMINATED";
+                termErr["reason"] = "Operation rejected: worker has already been terminated.";
+                termErr["processIsolationGate"] = "BLOCKED";
+                return termErr;
+            }
+
+            if (!string.IsNullOrEmpty(worker.SessionId))
+            {
+                string reqSession = GetStringVal(req, "sessionId");
+                if (!string.IsNullOrEmpty(reqSession) && !string.Equals(reqSession, worker.SessionId, StringComparison.Ordinal))
+                {
+                    Dictionary<string, object> sessErr = new Dictionary<string, object>();
+                    sessErr["ok"] = false; sessErr["exitCode"] = -1;
+                    sessErr["error"] = "SESSION_MISMATCH";
+                    sessErr["reasonCode"] = "SESSION_MISMATCH";
+                    sessErr["reason"] = "Operation rejected: sessionId does not match authorized worker session.";
+                    sessErr["processIsolationGate"] = "BLOCKED";
+                    return sessErr;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(worker.WorkspaceRoot))
+            {
+                string reqWs = GetStringVal(req, "workspaceRoot");
+                if (!string.IsNullOrEmpty(reqWs))
+                {
+                    if (HasReparsePointOrJunction(reqWs))
+                    {
+                        Dictionary<string, object> repErr = new Dictionary<string, object>();
+                        repErr["ok"] = false; repErr["exitCode"] = -1;
+                        repErr["error"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                        repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                        repErr["reason"] = "Workspace root contains an NTFS reparse point or junction.";
+                        repErr["processIsolationGate"] = "BLOCKED";
+                        return repErr;
+                    }
+                    if (!string.Equals(Path.GetFullPath(reqWs), worker.WorkspaceRoot, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Dictionary<string, object> wsErr = new Dictionary<string, object>();
+                        wsErr["ok"] = false; wsErr["exitCode"] = -1;
+                        wsErr["error"] = "WORKSPACE_ROOT_MISMATCH";
+                        wsErr["reasonCode"] = "WORKSPACE_ROOT_MISMATCH";
+                        wsErr["reason"] = "Executed workspace root does not match authorized worker workspace.";
+                        wsErr["processIsolationGate"] = "BLOCKED";
+                        return wsErr;
+                    }
+                }
+            }
+
+            if (worker.ProcessHandle != IntPtr.Zero)
+            {
+                uint exitCode = 0;
+                if (NativeMethods.GetExitCodeProcess(worker.ProcessHandle, out exitCode) && exitCode != 259)
+                {
+                    worker.IsTerminated = true;
+                    Dictionary<string, object> procErr = new Dictionary<string, object>();
+                    procErr["ok"] = false; procErr["exitCode"] = (int)exitCode;
+                    procErr["error"] = "WORKER_PROCESS_TERMINATED";
+                    procErr["reasonCode"] = "WORKER_PROCESS_TERMINATED";
+                    procErr["reason"] = "Worker process has already terminated. Further execution on this worker is rejected.";
+                    procErr["processIsolationGate"] = "BLOCKED";
+                    return procErr;
+                }
             }
 
             bool launchContainedProcess = false;
@@ -1223,11 +1359,29 @@ namespace AiHelpAgent.NativeSupervisor
                 _activeWorkers.TryGetValue(workerId, out worker);
             }
 
-            if (worker != null && worker.JobHandle != IntPtr.Zero)
+            if (worker != null)
             {
-                NativeMethods.TerminateJobObject(worker.JobHandle, 0);
-                NativeMethods.CloseHandle(worker.JobHandle);
-                worker.JobHandle = IntPtr.Zero;
+                worker.IsTerminated = true;
+                if (worker.ProcessHandle != IntPtr.Zero)
+                {
+                    NativeMethods.TerminateProcess(worker.ProcessHandle, 1);
+                    NativeMethods.CloseHandle(worker.ProcessHandle);
+                    worker.ProcessHandle = IntPtr.Zero;
+                }
+                if (worker.JobHandle != IntPtr.Zero)
+                {
+                    NativeMethods.TerminateJobObject(worker.JobHandle, 0);
+                    NativeMethods.CloseHandle(worker.JobHandle);
+                    worker.JobHandle = IntPtr.Zero;
+                }
+                lock (_lock)
+                {
+                    if (!string.IsNullOrEmpty(worker.GrantId))
+                    {
+                        _consumedGrants.Add(worker.GrantId);
+                    }
+                    _activeWorkers.Remove(workerId);
+                }
             }
 
             Dictionary<string, object> res = new Dictionary<string, object>();
@@ -1249,7 +1403,7 @@ namespace AiHelpAgent.NativeSupervisor
                 }
             }
 
-            bool handlesClosed = worker == null || worker.JobHandle == IntPtr.Zero;
+            bool handlesClosed = worker == null || (worker.JobHandle == IntPtr.Zero && worker.ProcessHandle == IntPtr.Zero);
 
             Dictionary<string, object> res = new Dictionary<string, object>();
             res["ok"] = handlesClosed;
@@ -1259,7 +1413,7 @@ namespace AiHelpAgent.NativeSupervisor
             res["jobClosed"] = handlesClosed;
             if (!handlesClosed)
             {
-                res["reason"] = "Worker Job Object handle remains unclosed.";
+                res["reason"] = "Worker Job Object or process handle remains unclosed.";
             }
             return res;
         }
@@ -1986,6 +2140,10 @@ namespace AiHelpAgent.NativeSupervisor
         public string ApprovedPlanDigest;
         public string ApprovedCommandDigest;
         public int WorkerPid;
+        public IntPtr ProcessHandle;
+        public string WorkspaceRoot;
+        public string SessionId;
+        public bool IsTerminated;
     }
 
     public class QuarantineRecord
