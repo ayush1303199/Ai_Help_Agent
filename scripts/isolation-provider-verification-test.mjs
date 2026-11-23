@@ -744,6 +744,189 @@ async function testV44856DSecurityRemediation() {
   assert.strictEqual(liveRes.hostFallback, 'ZERO');
 }
 
+async function testV44857BCommandOutputIntegrityAndEvidencePipeline() {
+  console.log('Testing V44.85.7B command output integrity, native output capture & evidence-based execution...');
+  const { executeWithSupervisor } = windowsAdapterPkg;
+
+  const safeWs = path.join(tempDir, 'v44-output-ws');
+  await fs.mkdir(safeWs, { recursive: true });
+
+  function createMockSupervisor(overrides = {}) {
+    const base = createNativeSupervisorClient({
+      isSyntheticTest: true,
+      pid: 9999,
+      tokenUserSid: 'S-1-5-18',
+    });
+    return {
+      ...base,
+      issueExecutionGrant: async (req) => ({
+        granted: true,
+        runId: req.runId,
+        workspaceRoot: req.workspaceRoot,
+        approvedSnapshotDigest: req.approvedSnapshotDigest,
+        commandDigest: crypto.createHash('sha256').update(String(req.command || '')).digest('hex'),
+        sessionId: req.sessionId,
+        grantId: 'grant-test-7b',
+      }),
+      consumeExecutionGrant: async () => ({ consumed: true }),
+      allocateWorker: async (req) => ({
+        workerId: 'worker-test-7b',
+        runId: req.runId,
+        sessionId: req.sessionId,
+        workerPid: 54321,
+      }),
+      observeEffectiveIsolation: async () => ({ effectiveIsolationVerified: true }),
+      executeApprovedOperation: async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        isSynthetic: true,
+        childProcessSpawned: false,
+        workerPid: null,
+      }),
+      enforceDeadlineAndCancellation: async () => new Promise(() => {}),
+      collectHostEvidence: async () => ({ evidenceCollected: true }),
+      terminateWorker: async () => ({ terminated: true }),
+      verifyWorkerTerminationAndResourceRelease: async () => ({ released: true }),
+      quarantineResource: async () => ({ quarantined: true }),
+      resolveQuarantine: async () => ({ resolved: true }),
+      ...overrides,
+    };
+  }
+
+  // 1. Synthetic supervisor operation never injects fake text into stdout
+  const syntheticSup = createMockSupervisor({
+    executeApprovedOperation: async () => ({
+      ok: true,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+      message: 'Synthetic supervisor operation acknowledged; no child process spawned.',
+      isSynthetic: true,
+      childProcessSpawned: false,
+      outputTruncated: false,
+    }),
+  });
+
+  const synRes = await executeWithSupervisor({
+    supervisor: syntheticSup,
+    isSyntheticTest: true,
+    runId: 'run-syn-7b',
+    workspaceRoot: safeWs,
+    approvedSnapshotDigest: 'snap-digest-7b',
+    command: 'npm test',
+    sessionId: 'session-7b-1',
+  });
+
+  assert.strictEqual(synRes.ok, true);
+  assert.strictEqual(synRes.exitCode, 0);
+  assert.strictEqual(synRes.stdout, '', 'Synthetic stdout must remain empty, never inject fake supervisor text');
+  assert.strictEqual(synRes.isSynthetic, true);
+  assert.strictEqual(synRes.childProcessSpawned, false);
+  assert.strictEqual(synRes.outputTruncated, false);
+  assert.ok(!synRes.stdout.includes('Execution verified under native supervisor containment'));
+
+  // 2. Real execution threads real stdout, stderr, workerPid, and childProcessSpawned
+  const realOutputSup = createMockSupervisor({
+    executeApprovedOperation: async () => ({
+      ok: true,
+      exitCode: 0,
+      stdout: 'PASS test/suite.js\n1 passed\n',
+      stderr: '',
+      workerPid: 9876,
+      childProcessSpawned: true,
+      isSynthetic: false,
+      outputTruncated: false,
+    }),
+  });
+
+  const realRes = await executeWithSupervisor({
+    supervisor: realOutputSup,
+    isSyntheticTest: true,
+    runId: 'run-real-7b',
+    workspaceRoot: safeWs,
+    approvedSnapshotDigest: 'snap-digest-7b',
+    command: 'npm test',
+    sessionId: 'session-7b-2',
+  });
+
+  assert.strictEqual(realRes.ok, true);
+  assert.strictEqual(realRes.exitCode, 0);
+  assert.strictEqual(realRes.stdout, 'PASS test/suite.js\n1 passed\n');
+  assert.strictEqual(realRes.stderr, '');
+  assert.strictEqual(realRes.workerPid, 9876);
+  assert.strictEqual(realRes.childProcessSpawned, true);
+  assert.strictEqual(realRes.isSynthetic, false);
+  assert.strictEqual(realRes.outputTruncated, false);
+
+  // 3. Failed command retains non-zero exit code and ok: false
+  const failedSup = createMockSupervisor({
+    executeApprovedOperation: async () => ({
+      ok: false,
+      exitCode: 1,
+      stdout: 'FAIL test/suite.js\n',
+      stderr: 'AssertionError: expected true, got false\n',
+      workerPid: 9877,
+      childProcessSpawned: true,
+      isSynthetic: false,
+      outputTruncated: false,
+    }),
+  });
+
+  const failRes = await executeWithSupervisor({
+    supervisor: failedSup,
+    isSyntheticTest: true,
+    runId: 'run-fail-7b',
+    workspaceRoot: safeWs,
+    approvedSnapshotDigest: 'snap-digest-7b',
+    command: 'npm test',
+    sessionId: 'session-7b-3',
+  });
+
+  assert.strictEqual(failRes.ok, false);
+  assert.strictEqual(failRes.exitCode, 1);
+  assert.strictEqual(failRes.stdout, 'FAIL test/suite.js\n');
+  assert.strictEqual(failRes.stderr, 'AssertionError: expected true, got false\n');
+  assert.strictEqual(failRes.childProcessSpawned, true);
+
+  // 4. Timed out command retains timedOut: true and ok: false
+  const timedOutSup = createMockSupervisor({
+    executeApprovedOperation: async () => {
+      const err = new Error('Execution deadline exceeded.');
+      err.timedOut = true;
+      err.exitCode = 124;
+      err.stdout = 'waiting...\n';
+      err.stderr = '';
+      err.childProcessSpawned = true;
+      err.workerPid = 9878;
+      throw err;
+    },
+  });
+
+  let timeoutErr = null;
+  try {
+    await executeWithSupervisor({
+      supervisor: timedOutSup,
+      isSyntheticTest: true,
+      runId: 'run-timeout-7b',
+      workspaceRoot: safeWs,
+      approvedSnapshotDigest: 'snap-digest-7b',
+      command: 'npm start',
+      sessionId: 'session-7b-4',
+    });
+  } catch (err) {
+    timeoutErr = err;
+  }
+  assert.ok(timeoutErr, 'Should reject on timeout');
+  assert.strictEqual(timeoutErr.timedOut, true);
+
+  // 5. Live supervisor process isolation gate remains strictly BLOCKED
+  const liveRes = await verifyLiveSupervisorProcessIsolation({ isSyntheticTest: false, timeoutMs: 500 });
+  assert.strictEqual(liveRes.processIsolationGate, 'BLOCKED');
+  assert.strictEqual(liveRes.hostFallback, 'ZERO');
+}
+
 async function runAllTests() {
   try {
     await setupTestDir();
@@ -758,6 +941,7 @@ async function runAllTests() {
     await testV44856SecurityGateAndSupervisorRemediation();
     await testV44856BSecurityHardening();
     await testV44856DSecurityRemediation();
+    await testV44857BCommandOutputIntegrityAndEvidencePipeline();
     console.log('All Isolation Provider Verification & Sandbox Readiness regression tests passed successfully!');
   } finally {
     await cleanupTestDir();

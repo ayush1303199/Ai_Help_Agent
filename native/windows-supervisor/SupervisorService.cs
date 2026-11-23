@@ -500,6 +500,48 @@ namespace AiHelpAgent.NativeSupervisor
         private readonly Dictionary<string, HcsComputeSystemRecord> _activeHcsSystems = new Dictionary<string, HcsComputeSystemRecord>();
         private readonly Dictionary<string, HcsComputeSystemRecord> _quarantinedHcsSystems = new Dictionary<string, HcsComputeSystemRecord>();
 
+        private static string ReadAllFromPipe(IntPtr hPipe, int maxBytes, out bool isTruncated)
+        {
+            isTruncated = false;
+            if (hPipe == IntPtr.Zero) return string.Empty;
+            byte[] buffer = new byte[4096];
+            List<byte> totalBytes = new List<byte>();
+            while (true)
+            {
+                uint bytesRead = 0;
+                bool success = NativeMethods.ReadFile(hPipe, buffer, (uint)buffer.Length, out bytesRead, IntPtr.Zero);
+                if (!success || bytesRead == 0)
+                {
+                    break;
+                }
+                if (totalBytes.Count + (int)bytesRead > maxBytes)
+                {
+                    int allowed = maxBytes - totalBytes.Count;
+                    if (allowed > 0)
+                    {
+                        byte[] slice = new byte[allowed];
+                        Array.Copy(buffer, 0, slice, 0, allowed);
+                        totalBytes.AddRange(slice);
+                    }
+                    isTruncated = true;
+                    while (true)
+                    {
+                        uint drainRead = 0;
+                        bool drainSuccess = NativeMethods.ReadFile(hPipe, buffer, (uint)buffer.Length, out drainRead, IntPtr.Zero);
+                        if (!drainSuccess || drainRead == 0) break;
+                    }
+                    break;
+                }
+                else
+                {
+                    byte[] slice = new byte[bytesRead];
+                    Array.Copy(buffer, 0, slice, 0, bytesRead);
+                    totalBytes.AddRange(slice);
+                }
+            }
+            return Encoding.UTF8.GetString(totalBytes.ToArray());
+        }
+
         private static bool HasReparsePointOrJunction(string path)
         {
             if (string.IsNullOrEmpty(path)) return false;
@@ -1303,15 +1345,59 @@ namespace AiHelpAgent.NativeSupervisor
                     if (timeoutMs > 30000) timeoutMs = 30000;
                 }
 
+                NativeMethods.SECURITY_ATTRIBUTES saAttr = new NativeMethods.SECURITY_ATTRIBUTES();
+                saAttr.nLength = Marshal.SizeOf(typeof(NativeMethods.SECURITY_ATTRIBUTES));
+                saAttr.bInheritHandle = true;
+                saAttr.lpSecurityDescriptor = IntPtr.Zero;
+
+                IntPtr hStdoutRead = IntPtr.Zero;
+                IntPtr hStdoutWrite = IntPtr.Zero;
+                IntPtr hStderrRead = IntPtr.Zero;
+                IntPtr hStderrWrite = IntPtr.Zero;
+
+                if (!NativeMethods.CreatePipe(out hStdoutRead, out hStdoutWrite, ref saAttr, 0) ||
+                    !NativeMethods.CreatePipe(out hStderrRead, out hStderrWrite, ref saAttr, 0))
+                {
+                    if (hStdoutRead != IntPtr.Zero) NativeMethods.CloseHandle(hStdoutRead);
+                    if (hStdoutWrite != IntPtr.Zero) NativeMethods.CloseHandle(hStdoutWrite);
+                    if (hStderrRead != IntPtr.Zero) NativeMethods.CloseHandle(hStderrRead);
+                    if (hStderrWrite != IntPtr.Zero) NativeMethods.CloseHandle(hStderrWrite);
+
+                    Dictionary<string, object> pipeErr = new Dictionary<string, object>();
+                    pipeErr["ok"] = false; pipeErr["exitCode"] = -1;
+                    pipeErr["error"] = "PIPE_CREATE_FAILED";
+                    pipeErr["win32Error"] = Marshal.GetLastWin32Error();
+                    pipeErr["processIsolationGate"] = "BLOCKED";
+                    pipeErr["vmBoundaryEnforced"] = false;
+                    return pipeErr;
+                }
+
+                NativeMethods.SetHandleInformation(hStdoutRead, NativeMethods.HANDLE_FLAG_INHERIT, 0);
+                NativeMethods.SetHandleInformation(hStderrRead, NativeMethods.HANDLE_FLAG_INHERIT, 0);
+
                 NativeMethods.STARTUPINFO si = new NativeMethods.STARTUPINFO();
                 si.cb = Marshal.SizeOf(typeof(NativeMethods.STARTUPINFO));
+                si.hStdOutput = hStdoutWrite;
+                si.hStdError = hStderrWrite;
+                si.hStdInput = NativeMethods.GetStdHandle(NativeMethods.STD_INPUT_HANDLE);
+                si.dwFlags |= NativeMethods.STARTF_USESTDHANDLES;
+
                 NativeMethods.PROCESS_INFORMATION pi = new NativeMethods.PROCESS_INFORMATION();
                 bool started = NativeMethods.CreateProcess(
-                    null, commandLine, IntPtr.Zero, IntPtr.Zero, false,
+                    null, commandLine, IntPtr.Zero, IntPtr.Zero, true,
                     NativeMethods.CREATE_SUSPENDED | NativeMethods.CREATE_NO_WINDOW,
                     IntPtr.Zero, null, ref si, out pi);
+
+                // Parent closes its copies of the write handles immediately so child process holds the only open write handles
+                NativeMethods.CloseHandle(hStdoutWrite);
+                hStdoutWrite = IntPtr.Zero;
+                NativeMethods.CloseHandle(hStderrWrite);
+                hStderrWrite = IntPtr.Zero;
+
                 if (!started)
                 {
+                    NativeMethods.CloseHandle(hStdoutRead);
+                    NativeMethods.CloseHandle(hStderrRead);
                     Dictionary<string, object> startErr = new Dictionary<string, object>();
                     startErr["ok"] = false; startErr["exitCode"] = -1;
                     startErr["error"] = "PROCESS_CREATE_FAILED";
@@ -1323,6 +1409,13 @@ namespace AiHelpAgent.NativeSupervisor
 
                 worker.WorkerPid = (int)pi.dwProcessId;
                 worker.ProcessHandle = pi.hProcess;
+
+                Thread stdoutThread = null;
+                Thread stderrThread = null;
+                string stdoutResult = string.Empty;
+                string stderrResult = string.Empty;
+                bool stdoutTruncated = false;
+                bool stderrTruncated = false;
 
                 try
                 {
@@ -1339,6 +1432,19 @@ namespace AiHelpAgent.NativeSupervisor
                         assignErr["vmBoundaryEnforced"] = false;
                         return assignErr;
                     }
+
+                    stdoutThread = new Thread(() =>
+                    {
+                        stdoutResult = ReadAllFromPipe(hStdoutRead, 1024 * 1024, out stdoutTruncated);
+                    });
+                    stderrThread = new Thread(() =>
+                    {
+                        stderrResult = ReadAllFromPipe(hStderrRead, 1024 * 1024, out stderrTruncated);
+                    });
+                    stdoutThread.IsBackground = true;
+                    stderrThread.IsBackground = true;
+                    stdoutThread.Start();
+                    stderrThread.Start();
 
                     uint resumeRes = NativeMethods.ResumeThread(pi.hThread);
                     if (resumeRes == 0xFFFFFFFF || resumeRes == unchecked((uint)-1))
@@ -1361,6 +1467,9 @@ namespace AiHelpAgent.NativeSupervisor
                     uint procExit = 1;
                     NativeMethods.GetExitCodeProcess(pi.hProcess, out procExit);
 
+                    if (stdoutThread != null && stdoutThread.IsAlive) stdoutThread.Join(2000);
+                    if (stderrThread != null && stderrThread.IsAlive) stderrThread.Join(2000);
+
                     worker.IsTerminated = true;
                     worker.ProcessHandle = IntPtr.Zero;
                     lock (_lock)
@@ -1374,16 +1483,27 @@ namespace AiHelpAgent.NativeSupervisor
                     Dictionary<string, object> jobRes = new Dictionary<string, object>();
                     jobRes["ok"] = !timedOut && procExit == 0;
                     jobRes["exitCode"] = (int)procExit;
-                    jobRes["stdout"] = ""; jobRes["stderr"] = "";
-                    jobRes["timedOut"] = timedOut; jobRes["cancelled"] = false;
+                    jobRes["stdout"] = stdoutResult ?? "";
+                    jobRes["stderr"] = stderrResult ?? "";
+                    jobRes["outputTruncated"] = stdoutTruncated || stderrTruncated;
+                    jobRes["timedOut"] = timedOut;
+                    jobRes["cancelled"] = false;
                     jobRes["containedByJobObject"] = true;
                     jobRes["vmBoundaryEnforced"] = false;
                     jobRes["processIsolationGate"] = "BLOCKED";
                     jobRes["workerPid"] = (int)pi.dwProcessId;
+                    jobRes["childProcessSpawned"] = true;
+                    jobRes["isSynthetic"] = false;
                     return jobRes;
                 }
                 finally
                 {
+                    if (stdoutThread != null && stdoutThread.IsAlive) stdoutThread.Join(1000);
+                    if (stderrThread != null && stderrThread.IsAlive) stderrThread.Join(1000);
+                    if (hStdoutRead != IntPtr.Zero) NativeMethods.CloseHandle(hStdoutRead);
+                    if (hStderrRead != IntPtr.Zero) NativeMethods.CloseHandle(hStderrRead);
+                    if (hStdoutWrite != IntPtr.Zero) NativeMethods.CloseHandle(hStdoutWrite);
+                    if (hStderrWrite != IntPtr.Zero) NativeMethods.CloseHandle(hStderrWrite);
                     if (pi.hThread != IntPtr.Zero) NativeMethods.CloseHandle(pi.hThread);
                     if (pi.hProcess != IntPtr.Zero) NativeMethods.CloseHandle(pi.hProcess);
                     worker.ProcessHandle = IntPtr.Zero;
@@ -1402,10 +1522,14 @@ namespace AiHelpAgent.NativeSupervisor
             Dictionary<string, object> res = new Dictionary<string, object>();
             res["ok"] = true;
             res["exitCode"] = 0;
-            res["stdout"] = "Execution verified under native supervisor containment.";
+            res["stdout"] = "";
             res["stderr"] = "";
+            res["message"] = "Synthetic supervisor operation acknowledged; no child process spawned.";
             res["timedOut"] = false;
             res["cancelled"] = false;
+            res["childProcessSpawned"] = false;
+            res["isSynthetic"] = true;
+            res["outputTruncated"] = false;
             return res;
         }
 
@@ -2676,6 +2800,31 @@ namespace AiHelpAgent.NativeSupervisor
         public const uint CREATE_SUSPENDED = 0x00000004;
         public const uint CREATE_NO_WINDOW = 0x08000000;
         public const uint WAIT_TIMEOUT = 0x00000102;
+        public const int STD_INPUT_HANDLE = -10;
+        public const int STD_OUTPUT_HANDLE = -11;
+        public const int STD_ERROR_HANDLE = -12;
+        public const int STARTF_USESTDHANDLES = 0x00000100;
+        public const uint HANDLE_FLAG_INHERIT = 0x00000001;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SECURITY_ATTRIBUTES
+        {
+            public int nLength;
+            public IntPtr lpSecurityDescriptor;
+            public bool bInheritHandle;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CreatePipe(out IntPtr hReadPipe, out IntPtr hWritePipe, ref SECURITY_ATTRIBUTES lpPipeAttributes, uint nSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetHandleInformation(IntPtr hObject, uint dwMask, uint dwFlags);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool ReadFile(IntPtr hFile, [Out] byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct STARTUPINFO

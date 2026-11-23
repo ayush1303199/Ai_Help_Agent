@@ -901,13 +901,14 @@ async function executeDependencyPlan({
         }
 
         const verification = await verifyInstalledDependencies(plan.projectRoot);
+        const isInstalled = Boolean(verification.isFullyInstalled && supervisorResult.ok);
         return {
-          ok: true,
-          status: 'INSTALLED',
-          exitCode: supervisorResult.exitCode ?? 0,
-          stdout: supervisorResult.stdout || 'Dependencies verified under native supervisor containment.',
+          ok: Boolean(supervisorResult.ok && verification.isFullyInstalled),
+          status: isInstalled ? 'INSTALLED' : 'FAILED',
+          exitCode: supervisorResult.exitCode ?? (supervisorResult.ok ? 0 : 1),
+          stdout: supervisorResult.stdout || '',
           stderr: supervisorResult.stderr || '',
-          installed: Boolean(verification.isFullyInstalled || supervisorResult.ok),
+          installed: isInstalled,
           dependencyVerification: verification,
           gate: 'PROCESS_ISOLATION_GATE',
           processIsolationGate: 'ALLOWED',

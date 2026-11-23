@@ -265,8 +265,11 @@ async function findVerifiedOpenPort(candidatePorts, maxDurationMs = 3000) {
   return null;
 }
 
-async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout = '') {
+async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout = '', processMeta = {}) {
   if (!workspaceRoot || typeof workspaceRoot !== 'string') return null;
+  if (!processMeta || (!processMeta.childProcessSpawned && !processMeta.workerPid)) {
+    return null;
+  }
   const cmdLower = (command || '').trim().toLowerCase();
   const isStartOrDev = /\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b/.test(cmdLower);
   if (!isStartOrDev) return null;
@@ -312,9 +315,7 @@ async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout
     } catch {}
   }
 
-  for (const defaultPort of [3000, 5000, 5173, 8080, 8000]) {
-    if (!candidatePorts.includes(defaultPort)) candidatePorts.push(defaultPort);
-  }
+  if (candidatePorts.length === 0) return null;
 
   const verifiedPort = await findVerifiedOpenPort(candidatePorts, 3000);
   if (!verifiedPort) return null;
@@ -411,6 +412,9 @@ async function executeWorkspaceCommandsPipeline({
           exitCode: 124,
           stdout: execErr?.stdout || '',
           stderr: execErr?.stderr || '',
+          timedOut: true,
+          childProcessSpawned: Boolean(execErr?.childProcessSpawned),
+          workerPid: execErr?.workerPid || null,
         };
       } else {
         runResult = {
@@ -418,28 +422,29 @@ async function executeWorkspaceCommandsPipeline({
           exitCode: execErr?.exitCode ?? 1,
           stdout: execErr?.stdout || '',
           stderr: execErr?.stderr || execErr?.message || String(execErr),
+          timedOut: Boolean(execErr?.timedOut),
+          cancelled: Boolean(execErr?.cancelled),
+          childProcessSpawned: Boolean(execErr?.childProcessSpawned),
+          workerPid: execErr?.workerPid || null,
         };
       }
     }
 
-    if (isServerCmd) {
-      const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout);
-      if (endpointInfo) {
-        runResult.ok = true;
-        runResult.exitCode = 0;
-        runResult.timedOut = false;
-        runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
-      } else if (execTimedOut) {
-        runResult.ok = false;
-        runResult.exitCode = 124;
-        runResult.timedOut = true;
-        const timeoutMsg = 'Server command timed out before establishing a verified listening endpoint.';
-        runResult.stderr = [runResult.stderr, timeoutMsg].filter(Boolean).join('\n');
-      }
-    } else if (runResult && runResult.ok) {
-      const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout);
-      if (endpointInfo) {
-        runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
+    if (execTimedOut) {
+      runResult.ok = false;
+      runResult.exitCode = 124;
+      runResult.timedOut = true;
+      const timeoutMsg = 'Server command timed out before establishing a verified listening endpoint.';
+      runResult.stderr = [runResult.stderr, timeoutMsg].filter(Boolean).join('\n');
+    } else if (runResult && runResult.ok && !runResult.timedOut && !runResult.cancelled) {
+      if (runResult.childProcessSpawned || runResult.workerPid) {
+        const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout, {
+          childProcessSpawned: runResult.childProcessSpawned,
+          workerPid: runResult.workerPid,
+        });
+        if (endpointInfo) {
+          runResult.stdout = [runResult.stdout, endpointInfo].filter(Boolean).join('\n');
+        }
       }
     }
     executedResults.push({ command: cmd, ...runResult });
@@ -449,6 +454,18 @@ async function executeWorkspaceCommandsPipeline({
   }
   const lastResult = executedResults[executedResults.length - 1];
   const allOk = executedResults.length > 0 && executedResults.every((r) => r.ok);
+
+  const formatOutput = (items, key) => {
+    return items.map((r) => {
+      const val = r[key];
+      const hasContent = typeof val === 'string' && val.trim().length > 0;
+      return `[command: ${r.command}]\n${key}: ${hasContent ? val : '(none)'}`;
+    }).join('\n\n');
+  };
+
+  const rawStdout = executedResults.map((r) => r.stdout || '').filter(Boolean).join('\n');
+  const rawStderr = executedResults.map((r) => r.stderr || '').filter(Boolean).join('\n');
+
   return {
     ok: allOk,
     tool: 'execute_workspace_commands',
@@ -456,8 +473,10 @@ async function executeWorkspaceCommandsPipeline({
       executed: true,
       ok: allOk,
       exitCode: lastResult?.exitCode ?? (allOk ? 0 : 1),
-      stdout: executedResults.map((r) => `[${r.command}]\n${r.stdout || ''}`).join('\n\n'),
-      stderr: executedResults.map((r) => `[${r.command}]\n${r.stderr || ''}`).join('\n\n'),
+      stdout: formatOutput(executedResults, 'stdout'),
+      stderr: formatOutput(executedResults, 'stderr'),
+      rawStdout,
+      rawStderr,
       commands: commandsList,
       results: executedResults,
       isolated: true,

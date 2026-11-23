@@ -158,6 +158,20 @@ async function assertSecureWorkspacePath(workspaceRoot) {
 
   // 3. Child directory inspection (nested reparse points / junctions)
   try {
+    let wsStat;
+    try {
+      wsStat = await fs.stat(resolved);
+    } catch (statErr) {
+      if (statErr.code === 'ENOENT') {
+        // Workspace directory does not exist on disk (synthetic test path)
+        return resolved;
+      }
+      throw statErr;
+    }
+    if (!wsStat.isDirectory()) {
+      return resolved;
+    }
+
     const queue = [{ dir: resolved, depth: 0 }];
     while (queue.length > 0) {
       const { dir, depth } = queue.shift();
@@ -573,6 +587,7 @@ async function executeWithSupervisor({
       workspaceRoot: resolvedWorkspace,
       sessionId: grant.sessionId || effectiveSessionId,
       grant,
+      isSyntheticTest: Boolean(isSyntheticTest),
     });
 
     executionResult = await Promise.race([runPromise, deadlinePromise]);
@@ -639,13 +654,24 @@ async function executeWithSupervisor({
     throw executionError;
   }
 
+  const isSynthetic = executionResult?.isSynthetic ?? Boolean(isSyntheticTest);
+  const isLegacySyntheticMsg = executionResult?.stdout === 'Execution verified under native supervisor containment.';
+  const cleanStdout = isLegacySyntheticMsg ? '' : (executionResult?.stdout || '');
+  const cleanMessage = executionResult?.message || (isLegacySyntheticMsg ? 'Synthetic supervisor operation acknowledged; no child process spawned.' : null);
+  const childProcessSpawned = executionResult?.childProcessSpawned ?? (!isSynthetic && Boolean(executionResult?.workerPid));
+
   return {
     ok: executionResult?.exitCode === 0,
     exitCode: executionResult?.exitCode ?? null,
-    stdout: executionResult?.stdout || '',
+    stdout: cleanStdout,
     stderr: executionResult?.stderr || '',
     timedOut: Boolean(executionResult?.timedOut),
     cancelled: Boolean(executionResult?.cancelled),
+    workerPid: executionResult?.workerPid ?? worker?.workerPid ?? null,
+    childProcessSpawned,
+    isSynthetic,
+    outputTruncated: Boolean(executionResult?.outputTruncated),
+    message: cleanMessage,
     hostEvidence,
     terminationResult,
     releaseVerification,
@@ -943,6 +969,7 @@ function createNativeSupervisorClient(options = {}) {
         commandDigest: req?.commandDigest,
         workspaceRoot: req?.workspaceRoot,
         sessionId: req?.sessionId || req?.grant?.sessionId || defaultSessionId,
+        isSyntheticTest: req?.isSyntheticTest !== undefined ? Boolean(req?.isSyntheticTest) : Boolean(options.isSyntheticTest),
       }, { pipePath });
     },
     async enforceDeadlineAndCancellation({ timeoutMs, signal, isCancelled }) {

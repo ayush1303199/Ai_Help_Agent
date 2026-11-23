@@ -6248,6 +6248,36 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         supervisorRunError = err;
       }
 
+      if (supervisorRunError || !supervisorRunResult?.ok) {
+        const failReason = supervisorRunError?.message || supervisorRunResult?.stderr || 'Execution failed under native supervisor containment.';
+        advanceConversationTurn(turn.turnId, 'failed', owner, {
+          phase: 'launch_failed',
+          reason: failReason,
+        });
+        return {
+          outcome: 'FAILED',
+          phase: 'RUN_OR_LAUNCH',
+          turnId: turn.turnId,
+          taskPlan,
+          buildPlan: runPlan,
+          intentClassification: genericIntent,
+          workspaceDiscovery,
+          dependencyReport,
+          dependencyPlan: depPlan,
+          dependencyResult: depExecResult,
+          dependencyVerification: depVerification,
+          executionBlocked: false,
+          processIsolationGate: 'ALLOWED',
+          supervisorIdentity: isolationVerification.identity,
+          message: `Project runtime launch failed under supervisor: ${failReason}`,
+          stdout: supervisorRunResult?.stdout || '',
+          stderr: supervisorRunResult?.stderr || supervisorRunError?.message || '',
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+        };
+      }
+
       advanceConversationTurn(turn.turnId, 'completed', owner, {
         phase: 'launch_verified',
         processIsolationGate: 'ALLOWED',
@@ -6271,7 +6301,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         message: depExecResult
           ? `Dependencies installed and project runtime launch initiated under SYSTEM supervisor process isolation (${startCmd}).`
           : `Project runtime launch initiated under SYSTEM supervisor process isolation (${startCmd}).`,
-        stdout: supervisorRunResult?.stdout || 'Execution verified under native supervisor containment.',
+        stdout: supervisorRunResult?.stdout || '',
         stderr: supervisorRunResult?.stderr || '',
         filesModified: [],
         codeApplied: depExecResult ? true : false,
@@ -6769,6 +6799,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
       });
       const startCmd = runPlan.fullCommandString || 'npm start';
       let supervisorRunResult = null;
+      let supervisorRunError = null;
       try {
         supervisorRunResult = await executeWithSupervisor({
           supervisor: isolationVerification.client,
@@ -6781,7 +6812,35 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
           command: startCmd,
           timeoutMs: runPlan.timeoutMs || 60000,
         });
-      } catch (_) {}
+      } catch (err) {
+        supervisorRunError = err;
+      }
+
+      if (supervisorRunError || !supervisorRunResult?.ok) {
+        const failReason = supervisorRunError?.message || supervisorRunResult?.stderr || 'Execution failed under native supervisor containment.';
+        advanceConversationTurn(turn.turnId, 'failed', owner, {
+          phase: 'launch_failed',
+          reason: failReason,
+        });
+        return {
+          outcome: 'FAILED',
+          phase: 'RUN_OR_LAUNCH',
+          turnId: turn.turnId,
+          taskPlan,
+          buildPlan: runPlan,
+          intentClassification: genericIntent,
+          workspaceDiscovery,
+          executionBlocked: false,
+          processIsolationGate: 'ALLOWED',
+          supervisorIdentity: isolationVerification.identity,
+          message: `Project runtime launch failed under supervisor: ${failReason}`,
+          stdout: supervisorRunResult?.stdout || '',
+          stderr: supervisorRunResult?.stderr || supervisorRunError?.message || '',
+          filesModified: [],
+          codeApplied: false,
+          codeVerified: false,
+        };
+      }
 
       advanceConversationTurn(turn.turnId, 'completed', owner, {
         phase: 'launch_verified',
@@ -6800,7 +6859,7 @@ function generateConversationalResponse(userRequest, contextMessages = []) {
         processIsolationGate: 'ALLOWED',
         supervisorIdentity: isolationVerification.identity,
         message: `Project runtime launch initiated under SYSTEM supervisor process isolation (${startCmd}).`,
-        stdout: supervisorRunResult?.stdout || 'Execution verified under native supervisor containment.',
+        stdout: supervisorRunResult?.stdout || '',
         stderr: supervisorRunResult?.stderr || '',
         filesModified: [],
         codeApplied: false,
