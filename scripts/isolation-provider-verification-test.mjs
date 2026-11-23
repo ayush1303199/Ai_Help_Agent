@@ -618,6 +618,132 @@ async function testV44856BSecurityHardening() {
   assert.strictEqual(liveCheck.hostFallback, 'ZERO');
 }
 
+// -------------------------------------------------------------
+// Test 11: Milestone V44.85.6D Security Remediation Tests
+// -------------------------------------------------------------
+async function testV44856DSecurityRemediation() {
+  console.log('Testing V44.85.6D fail-closed session, handle lifecycle and path validation...');
+
+  const { executeWithSupervisor, assertSecureWorkspacePath } = windowsAdapterPkg;
+
+  function createMockSupervisor(overrides = {}) {
+    const base = createNativeSupervisorClient({
+      isSyntheticTest: true,
+      pid: 9999,
+      tokenUserSid: 'S-1-5-18',
+    });
+    return {
+      ...base,
+      issueExecutionGrant: async (req) => {
+        if (!req.sessionId) {
+          return { granted: false, rejected: true, reasonCode: 'SESSION_ID_REQUIRED' };
+        }
+        return {
+          granted: true,
+          runId: req.runId,
+          workspaceRoot: req.workspaceRoot,
+          approvedSnapshotDigest: req.approvedSnapshotDigest,
+          commandDigest: req.commandDigest,
+          sessionId: req.sessionId,
+        };
+      },
+      consumeExecutionGrant: async (grant) => {
+        if (!grant.sessionId) {
+          return { ok: false, consumed: false, reasonCode: 'SESSION_ID_REQUIRED' };
+        }
+        return { ok: true, consumed: true };
+      },
+      allocateWorker: async (req) => {
+        if (!req.sessionId) {
+          return { allocated: false, reasonCode: 'SESSION_ID_REQUIRED' };
+        }
+        return { workerId: 'w-v44-test' };
+      },
+      observeEffectiveIsolation: async () => ({ effectiveIsolationVerified: true }),
+      executeApprovedOperation: async (req) => {
+        if (!req.sessionId) {
+          return { ok: false, exitCode: -1, reasonCode: 'SESSION_ID_REQUIRED' };
+        }
+        return { ok: true, exitCode: 0 };
+      },
+      enforceDeadlineAndCancellation: async () => {},
+      collectHostEvidence: async () => ({ evidenceCollected: true }),
+      terminateWorker: async () => ({ terminated: true }),
+      verifyWorkerTerminationAndResourceRelease: async () => ({ released: true }),
+      quarantineResource: async () => ({ quarantined: true }),
+      resolveQuarantine: async () => ({ resolved: true }),
+      ...overrides,
+    };
+  }
+
+  const safeWs = path.join(tempDir, 'v44-safe-ws');
+  await fs.mkdir(safeWs, { recursive: true });
+
+  // 1. Missing / Mismatched Session Rejection on Grant Issuance & Return
+  let missingSessErr = null;
+  try {
+    await executeWithSupervisor({
+      supervisor: createMockSupervisor({
+        issueExecutionGrant: async (req) => ({
+          granted: true,
+          runId: req.runId,
+          workspaceRoot: req.workspaceRoot,
+          approvedSnapshotDigest: req.approvedSnapshotDigest,
+          commandDigest: crypto.createHash('sha256').update('npm test').digest('hex'),
+          // Intentionally omitting sessionId
+        }),
+      }),
+      isSyntheticTest: true,
+      runId: 'run-missing-session-test',
+      workspaceRoot: safeWs,
+      approvedSnapshotDigest: 'snap-digest-v44',
+      command: 'npm test',
+      sessionId: 'session-explicit-123',
+    });
+  } catch (err) {
+    missingSessErr = err;
+  }
+  assert.ok(missingSessErr, 'Should reject execution when grant omits sessionId');
+  assert.strictEqual(missingSessErr.reasonCode, 'SESSION_MISMATCH');
+
+  // 2. Reparse-point scan bounded depth (depth >= 4) fails closed
+  const deepDir = path.join(tempDir, 'deep-ws', 'lvl1', 'lvl2', 'lvl3', 'lvl4');
+  await fs.mkdir(deepDir, { recursive: true });
+  const deepWsRoot = path.join(tempDir, 'deep-ws');
+
+  let scanBoundErr = null;
+  try {
+    await assertSecureWorkspacePath(deepWsRoot);
+  } catch (err) {
+    scanBoundErr = err;
+  }
+  assert.ok(scanBoundErr, 'Should fail closed when directory hierarchy reaches depth >= 4');
+  assert.strictEqual(scanBoundErr.reasonCode, 'WORKSPACE_SCAN_BOUND_EXCEEDED');
+
+  // 3. Unreadable workspace directory fails closed
+  let unreadableErr = null;
+  const originalReaddir = fs.readdir;
+  try {
+    fs.readdir = async () => {
+      const err = new Error('EACCES: permission denied');
+      err.code = 'EACCES';
+      throw err;
+    };
+    await assertSecureWorkspacePath(safeWs);
+  } catch (err) {
+    unreadableErr = err;
+  } finally {
+    fs.readdir = originalReaddir;
+  }
+  assert.ok(unreadableErr, 'Should fail closed on unreadable directory');
+  assert.strictEqual(unreadableErr.reasonCode, 'WORKSPACE_DIRECTORY_UNREADABLE');
+
+  // 4. Live supervisor process isolation gate remains strictly BLOCKED
+  const liveRes = await verifyLiveSupervisorProcessIsolation({ isSyntheticTest: false, timeoutMs: 500 });
+  assert.strictEqual(liveRes.processIsolationGate, 'BLOCKED');
+  assert.strictEqual(liveRes.hostFallback, 'ZERO');
+}
+
 async function runAllTests() {
   try {
     await setupTestDir();
@@ -631,6 +757,7 @@ async function runAllTests() {
     await testWindowsHostPolicyBlocksExecution();
     await testV44856SecurityGateAndSupervisorRemediation();
     await testV44856BSecurityHardening();
+    await testV44856DSecurityRemediation();
     console.log('All Isolation Provider Verification & Sandbox Readiness regression tests passed successfully!');
   } finally {
     await cleanupTestDir();

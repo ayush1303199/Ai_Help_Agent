@@ -505,6 +505,11 @@ namespace AiHelpAgent.NativeSupervisor
             if (string.IsNullOrEmpty(path)) return false;
             try
             {
+                if (path.IndexOf('\0') >= 0) return true;
+                if (path.StartsWith(@"\\.\") || path.StartsWith(@"\\?\")) return true;
+                string strippedDrive = System.Text.RegularExpressions.Regex.Replace(path, @"^[a-zA-Z]:[\\/]", "");
+                if (strippedDrive.Contains(":")) return true;
+
                 string fullPath = Path.GetFullPath(path);
                 DirectoryInfo current = new DirectoryInfo(fullPath);
 
@@ -529,7 +534,11 @@ namespace AiHelpAgent.NativeSupervisor
                         KeyValuePair<DirectoryInfo, int> item = queue.Dequeue();
                         DirectoryInfo dir = item.Key;
                         int depth = item.Value;
-                        if (depth >= 4) continue;
+                        if (depth >= 4)
+                        {
+                            // Reached maximum scan depth without completing tree; fail-closed!
+                            return true;
+                        }
 
                         DirectoryInfo[] subs;
                         try { subs = dir.GetDirectories(); } catch { return true; }
@@ -713,12 +722,13 @@ namespace AiHelpAgent.NativeSupervisor
             string command = GetStringVal(req, "command");
             string commandDigest = GetStringVal(req, "commandDigest");
 
-            if (string.IsNullOrEmpty(runId) || string.IsNullOrEmpty(workspaceRoot) || string.IsNullOrEmpty(approvedSnapshotDigest))
+            if (string.IsNullOrEmpty(runId) || string.IsNullOrEmpty(workspaceRoot) || string.IsNullOrEmpty(approvedSnapshotDigest) || string.IsNullOrEmpty(sessionId))
             {
                 Dictionary<string, object> rej = new Dictionary<string, object>();
                 rej["granted"] = false;
                 rej["rejected"] = true;
-                rej["reason"] = "Missing mandatory parameters for execution grant.";
+                rej["reasonCode"] = string.IsNullOrEmpty(sessionId) ? "SESSION_ID_REQUIRED" : "MANDATORY_PARAMETERS_MISSING";
+                rej["reason"] = "Missing mandatory parameters for execution grant (sessionId, runId, workspaceRoot, approvedSnapshotDigest).";
                 return rej;
             }
 
@@ -912,7 +922,15 @@ namespace AiHelpAgent.NativeSupervisor
                 }
 
                 string reqSession = GetStringVal(req, "sessionId");
-                if (!string.IsNullOrEmpty(reqSession) && !string.IsNullOrEmpty(record.SessionId) && !string.Equals(reqSession, record.SessionId, StringComparison.Ordinal))
+                if (string.IsNullOrEmpty(reqSession))
+                {
+                    Dictionary<string, object> sessErr = new Dictionary<string, object>();
+                    sessErr["ok"] = false; sessErr["consumed"] = false;
+                    sessErr["reasonCode"] = "SESSION_ID_REQUIRED";
+                    sessErr["reason"] = "Execution grant consumption requires a non-empty sessionId.";
+                    return sessErr;
+                }
+                if (string.IsNullOrEmpty(record.SessionId) || !string.Equals(reqSession, record.SessionId, StringComparison.Ordinal))
                 {
                     Dictionary<string, object> sessErr = new Dictionary<string, object>();
                     sessErr["ok"] = false; sessErr["consumed"] = false;
@@ -962,6 +980,16 @@ namespace AiHelpAgent.NativeSupervisor
             string workerId = "worker-wsb-" + Guid.NewGuid().ToString("N").Substring(0, 8);
             string grantId = GetStringVal(req, "grantId");
             string workspaceRoot = GetStringVal(req, "workspaceRoot");
+            string sessionId = GetStringVal(req, "sessionId");
+
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                Dictionary<string, object> sessErr = new Dictionary<string, object>();
+                sessErr["allocated"] = false;
+                sessErr["reasonCode"] = "SESSION_ID_REQUIRED";
+                sessErr["error"] = "Worker allocation requires a non-empty sessionId.";
+                return sessErr;
+            }
 
             if (!string.IsNullOrEmpty(workspaceRoot))
             {
@@ -1005,6 +1033,7 @@ namespace AiHelpAgent.NativeSupervisor
             worker.JobHandle = hJob;
             worker.CreatedAt = DateTime.UtcNow;
             worker.GrantId = grantId;
+            worker.SessionId = sessionId;
             if (!string.IsNullOrEmpty(grantId))
             {
                 lock (_lock)
@@ -1015,7 +1044,15 @@ namespace AiHelpAgent.NativeSupervisor
                         worker.ApprovedPlanDigest = gr.PlanDigest;
                         worker.ApprovedCommandDigest = gr.CommandDigest;
                         worker.WorkspaceRoot = gr.WorkspaceRoot;
-                        worker.SessionId = gr.SessionId;
+                        if (!string.IsNullOrEmpty(gr.SessionId) && !string.Equals(sessionId, gr.SessionId, StringComparison.Ordinal))
+                        {
+                            NativeMethods.CloseHandle(hJob);
+                            Dictionary<string, object> sessErr = new Dictionary<string, object>();
+                            sessErr["allocated"] = false;
+                            sessErr["reasonCode"] = "SESSION_MISMATCH";
+                            sessErr["error"] = "Worker allocation sessionId does not match execution grant session.";
+                            return sessErr;
+                        }
                     }
                 }
 
@@ -1029,20 +1066,6 @@ namespace AiHelpAgent.NativeSupervisor
                         wsErr["reasonCode"] = "WORKSPACE_ROOT_MISMATCH";
                         wsErr["error"] = "Worker allocation workspace root does not match execution grant.";
                         return wsErr;
-                    }
-                }
-
-                string reqSession = GetStringVal(req, "sessionId");
-                if (!string.IsNullOrEmpty(reqSession) && !string.IsNullOrEmpty(worker.SessionId))
-                {
-                    if (!string.Equals(reqSession, worker.SessionId, StringComparison.Ordinal))
-                    {
-                        NativeMethods.CloseHandle(hJob);
-                        Dictionary<string, object> sessErr = new Dictionary<string, object>();
-                        sessErr["allocated"] = false;
-                        sessErr["reasonCode"] = "SESSION_MISMATCH";
-                        sessErr["error"] = "Worker allocation sessionId does not match execution grant session.";
-                        return sessErr;
                     }
                 }
             }
@@ -1161,19 +1184,26 @@ namespace AiHelpAgent.NativeSupervisor
                 return termErr;
             }
 
-            if (!string.IsNullOrEmpty(worker.SessionId))
+            string reqSession = GetStringVal(req, "sessionId");
+            if (string.IsNullOrEmpty(reqSession))
             {
-                string reqSession = GetStringVal(req, "sessionId");
-                if (!string.IsNullOrEmpty(reqSession) && !string.Equals(reqSession, worker.SessionId, StringComparison.Ordinal))
-                {
-                    Dictionary<string, object> sessErr = new Dictionary<string, object>();
-                    sessErr["ok"] = false; sessErr["exitCode"] = -1;
-                    sessErr["error"] = "SESSION_MISMATCH";
-                    sessErr["reasonCode"] = "SESSION_MISMATCH";
-                    sessErr["reason"] = "Operation rejected: sessionId does not match authorized worker session.";
-                    sessErr["processIsolationGate"] = "BLOCKED";
-                    return sessErr;
-                }
+                Dictionary<string, object> sessErr = new Dictionary<string, object>();
+                sessErr["ok"] = false; sessErr["exitCode"] = -1;
+                sessErr["error"] = "SESSION_ID_REQUIRED";
+                sessErr["reasonCode"] = "SESSION_ID_REQUIRED";
+                sessErr["reason"] = "Operation rejected: sessionId is required.";
+                sessErr["processIsolationGate"] = "BLOCKED";
+                return sessErr;
+            }
+            if (!string.IsNullOrEmpty(worker.SessionId) && !string.Equals(reqSession, worker.SessionId, StringComparison.Ordinal))
+            {
+                Dictionary<string, object> sessErr = new Dictionary<string, object>();
+                sessErr["ok"] = false; sessErr["exitCode"] = -1;
+                sessErr["error"] = "SESSION_MISMATCH";
+                sessErr["reasonCode"] = "SESSION_MISMATCH";
+                sessErr["reason"] = "Operation rejected: sessionId does not match authorized worker session.";
+                sessErr["processIsolationGate"] = "BLOCKED";
+                return sessErr;
             }
 
             if (!string.IsNullOrEmpty(worker.WorkspaceRoot))
@@ -1292,12 +1322,15 @@ namespace AiHelpAgent.NativeSupervisor
                 }
 
                 worker.WorkerPid = (int)pi.dwProcessId;
+                worker.ProcessHandle = pi.hProcess;
 
                 try
                 {
                     if (!NativeMethods.AssignProcessToJobObject(worker.JobHandle, pi.hProcess))
                     {
                         NativeMethods.TerminateProcess(pi.hProcess, 1);
+                        worker.ProcessHandle = IntPtr.Zero;
+                        worker.IsTerminated = true;
                         Dictionary<string, object> assignErr = new Dictionary<string, object>();
                         assignErr["ok"] = false; assignErr["exitCode"] = -1;
                         assignErr["error"] = "JOB_ASSIGNMENT_FAILED";
@@ -1307,12 +1340,36 @@ namespace AiHelpAgent.NativeSupervisor
                         return assignErr;
                     }
 
-                    NativeMethods.ResumeThread(pi.hThread);
+                    uint resumeRes = NativeMethods.ResumeThread(pi.hThread);
+                    if (resumeRes == 0xFFFFFFFF || resumeRes == unchecked((uint)-1))
+                    {
+                        NativeMethods.TerminateProcess(pi.hProcess, 1);
+                        worker.ProcessHandle = IntPtr.Zero;
+                        worker.IsTerminated = true;
+                        Dictionary<string, object> resErr = new Dictionary<string, object>();
+                        resErr["ok"] = false; resErr["exitCode"] = -1;
+                        resErr["error"] = "RESUME_THREAD_FAILED";
+                        resErr["win32Error"] = Marshal.GetLastWin32Error();
+                        resErr["processIsolationGate"] = "BLOCKED";
+                        resErr["vmBoundaryEnforced"] = false;
+                        return resErr;
+                    }
+
                     uint waitRes = NativeMethods.WaitForSingleObject(pi.hProcess, (uint)timeoutMs);
                     bool timedOut = (waitRes == NativeMethods.WAIT_TIMEOUT);
                     if (timedOut) NativeMethods.TerminateProcess(pi.hProcess, 137);
                     uint procExit = 1;
                     NativeMethods.GetExitCodeProcess(pi.hProcess, out procExit);
+
+                    worker.IsTerminated = true;
+                    worker.ProcessHandle = IntPtr.Zero;
+                    lock (_lock)
+                    {
+                        if (!string.IsNullOrEmpty(worker.GrantId))
+                        {
+                            _consumedGrants.Add(worker.GrantId);
+                        }
+                    }
 
                     Dictionary<string, object> jobRes = new Dictionary<string, object>();
                     jobRes["ok"] = !timedOut && procExit == 0;
@@ -1329,6 +1386,16 @@ namespace AiHelpAgent.NativeSupervisor
                 {
                     if (pi.hThread != IntPtr.Zero) NativeMethods.CloseHandle(pi.hThread);
                     if (pi.hProcess != IntPtr.Zero) NativeMethods.CloseHandle(pi.hProcess);
+                    worker.ProcessHandle = IntPtr.Zero;
+                }
+            }
+
+            worker.IsTerminated = true;
+            lock (_lock)
+            {
+                if (!string.IsNullOrEmpty(worker.GrantId))
+                {
+                    _consumedGrants.Add(worker.GrantId);
                 }
             }
 

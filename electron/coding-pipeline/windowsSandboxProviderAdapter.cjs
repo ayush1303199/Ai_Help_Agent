@@ -161,12 +161,22 @@ async function assertSecureWorkspacePath(workspaceRoot) {
     const queue = [{ dir: resolved, depth: 0 }];
     while (queue.length > 0) {
       const { dir, depth } = queue.shift();
-      if (depth >= 4) continue;
+      if (depth >= 4) {
+        const error = new Error(`Workspace path "${workspaceRoot}" exceeds maximum reparse point scan depth (depth=${depth}). Fail-closed security boundary enforced.`);
+        error.code = 'PROJECT_EXECUTION_BLOCKED';
+        error.executionBlocked = true;
+        error.reasonCode = 'WORKSPACE_SCAN_BOUND_EXCEEDED';
+        throw error;
+      }
       let entries = [];
       try {
         entries = await fs.readdir(dir, { withFileTypes: true });
-      } catch {
-        continue;
+      } catch (readErr) {
+        const error = new Error(`Workspace path "${workspaceRoot}" contains unreadable directory "${dir}": ${readErr.message}`);
+        error.code = 'PROJECT_EXECUTION_BLOCKED';
+        error.executionBlocked = true;
+        error.reasonCode = 'WORKSPACE_DIRECTORY_UNREADABLE';
+        throw error;
       }
       for (const entry of entries) {
         if (entry.isDirectory() || entry.isSymbolicLink()) {
@@ -185,12 +195,18 @@ async function assertSecureWorkspacePath(workspaceRoot) {
             }
           } catch (stErr) {
             if (stErr.code === 'PROJECT_EXECUTION_BLOCKED') throw stErr;
+            const error = new Error(`Workspace path "${workspaceRoot}" could not be stat-checked at "${childPath}": ${stErr.message}`);
+            error.code = 'PROJECT_EXECUTION_BLOCKED';
+            error.executionBlocked = true;
+            error.reasonCode = 'WORKSPACE_DIRECTORY_UNREADABLE';
+            throw error;
           }
         }
       }
     }
   } catch (err) {
     if (err.code === 'PROJECT_EXECUTION_BLOCKED') throw err;
+    throw err;
   }
 
   return resolved;
@@ -492,8 +508,8 @@ async function executeWithSupervisor({
     throw error;
   }
 
-  if (effectiveSessionId && grant.sessionId && grant.sessionId !== effectiveSessionId) {
-    const error = new Error(`Execution grant sessionId mismatch: expected "${effectiveSessionId}", got "${grant.sessionId}".`);
+  if (effectiveSessionId && (!grant.sessionId || grant.sessionId !== effectiveSessionId)) {
+    const error = new Error(`Execution grant sessionId mismatch or missing: expected "${effectiveSessionId}", got "${grant.sessionId}".`);
     error.code = 'PROJECT_EXECUTION_BLOCKED';
     error.executionBlocked = true;
     error.reasonCode = 'SESSION_MISMATCH';
@@ -1533,6 +1549,7 @@ module.exports = {
   DISABLED_REASON,
   NATIVE_SUPERVISOR_EXECUTABLE,
   NATIVE_SUPERVISOR_PIPE,
+  assertSecureWorkspacePath,
   buildWindowsSandboxConfiguration,
   createNativeSupervisorClient,
   createSyntheticSandboxWorkspace,
