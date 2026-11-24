@@ -2019,39 +2019,6 @@ export function useCodingAgentController({
     if (busy || streaming) return;
     const desktopApi = window.electronAPI;
     if (!desktopApi) {
-      try {
-        const stateRes = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-state`);
-        if (stateRes.ok) {
-          const stateData = await stateRes.json();
-          const candidate = stateData.registeredProjectRoot || (stateData.attached ? stateData.projectRoot : null);
-          if (candidate) {
-            const attachRes = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ projectRoot: candidate }),
-            });
-            if (attachRes.ok) {
-              const attached = await attachRes.json();
-              if (attached.projectRoot) {
-                setProjectRoot(attached.projectRoot);
-                setProjectLifecycleState('PROJECT_ATTACHED');
-                persistStoredProjectRoot(attached.projectRoot);
-                setProjectCandidates([]);
-                setPath('.');
-                setFileContent('');
-                setFilePath('');
-                const dirResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
-                if (dirResponse.ok) setDirectory(await dirResponse.json());
-                onStatus(`Connected to project: ${attached.projectRoot}`);
-                return;
-              }
-            }
-          }
-        }
-      } catch {
-        // Continue to folder picker if state check fails
-      }
-
       setBusy(true);
       setProjectLifecycleState('SELECTING_PROJECT');
       try {
@@ -2114,6 +2081,20 @@ export function useCodingAgentController({
             }
           } catch (error) {
             if ((error as Error)?.name === 'AbortError') {
+              if (!projectRoot) {
+                try {
+                  const stateRes = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-state`);
+                  if (stateRes.ok) {
+                    const stateData = await stateRes.json();
+                    if (stateData.registeredProjectRoot) {
+                      await attachProjectByPath(stateData.registeredProjectRoot);
+                      return;
+                    }
+                  }
+                } catch {
+                  // Fall back
+                }
+              }
               setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
               return;
             }
