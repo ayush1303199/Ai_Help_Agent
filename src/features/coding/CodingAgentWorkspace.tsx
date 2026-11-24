@@ -911,7 +911,7 @@ export function CodingAgentWorkspace({
             )}
           </div>
           <p className="mt-1 truncate text-xs text-slate-400">
-            {projectRoot || (!canSelectProject ? 'Open the trusted desktop app to select and authorize a project.' : projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : projectStatus === 'ATTACHING_PROJECT' ? 'Attaching project…' : isTrustedDesktop ? 'Mention the project folder in chat for automatic discovery, or select it under Advanced.' : 'Open the trusted desktop app to select and authorize a project, then click Select project folder.')}
+            {projectRoot || (!canSelectProject ? 'Open the trusted desktop app to select and authorize a project.' : projectStatus === 'SELECTING_PROJECT' ? 'Selecting folder…' : projectStatus === 'ATTACHING_PROJECT' ? 'Attaching project…' : isTrustedDesktop ? 'Mention the project folder in chat for automatic discovery, or select it under Advanced.' : 'Click Select project folder or enter folder path under Advanced.')}
           </p>
           {projectRoot && <p className="mt-1 text-[11px] text-sky-300">Scope: {path || '.'}</p>}
         </div>
@@ -940,7 +940,7 @@ export function CodingAgentWorkspace({
                 {projectRoot && <button onClick={onClearProject} disabled={busy || streaming} className="rounded-md border border-slate-600 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-40">Clear</button>}
               </div>
             </div>
-            {isTrustedDesktop && (
+            {(isTrustedDesktop || isBrowserDevelopment) && (
               <div className="mt-3 flex gap-2">
                 <input
                   aria-label="Project folder path"
@@ -967,19 +967,19 @@ export function CodingAgentWorkspace({
             )}
             {isBrowserDevelopment && projectRoot && (
               <div className="mt-3 rounded-md border border-emerald-500/30 bg-emerald-500/10 p-2.5 text-xs text-emerald-200">
-                Workspace authorized by trusted desktop: <span className="font-mono">{projectRoot}</span>
+                Workspace attached: <span className="font-mono">{projectRoot}</span>
               </div>
             )}
             {isBrowserDevelopment && !projectRoot && (
-              <div className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-200">
-                <p>Please open the trusted desktop application and select this project under Developer &gt; Advanced. Browser sessions cannot independently authorize local workspace access.</p>
+              <div className="mt-3 rounded-md border border-sky-500/30 bg-sky-500/10 p-2.5 text-xs text-sky-200">
+                <p>Select a project folder with the picker, or paste the folder path above to attach your workspace.</p>
                 <button
                   type="button"
                   onClick={onSelectProject}
                   disabled={busy || streaming}
-                  className="mt-2 rounded-md border border-amber-500/50 bg-amber-500/20 px-2.5 py-1 text-[11px] font-medium text-amber-100 hover:bg-amber-500/30 disabled:opacity-40"
+                  className="mt-2 rounded-md border border-sky-500/50 bg-sky-500/20 px-2.5 py-1 text-[11px] font-medium text-sky-100 hover:bg-sky-500/30 disabled:opacity-40"
                 >
-                  Check for desktop project
+                  Select project folder
                 </button>
               </div>
             )}

@@ -2046,20 +2046,136 @@ export function useCodingAgentController({
                 return;
               }
             }
-          } else {
-            setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
-            onError('Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.');
-            return;
+          }
+        }
+      } catch {
+        // Continue to folder picker if state check fails
+      }
+
+      setBusy(true);
+      setProjectLifecycleState('SELECTING_PROJECT');
+      try {
+        let folderName = '';
+        const signatures: string[] = [];
+
+        const pickWithFileInput = () => new Promise<FileList>((resolve, reject) => {
+          const input = document.createElement('input');
+          input.type = 'file';
+          input.multiple = true;
+          input.setAttribute('webkitdirectory', '');
+          input.addEventListener('change', () => {
+            if (input.files?.length) resolve(input.files);
+            else reject(new DOMException('Folder selection was cancelled.', 'AbortError'));
+          }, { once: true });
+          input.addEventListener('cancel', () => {
+            reject(new DOMException('Folder selection was cancelled.', 'AbortError'));
+          }, { once: true });
+          input.click();
+        });
+
+        const signaturesFromFiles = (files: FileList) => {
+          const firstFile = files.item(0);
+          folderName = firstFile?.webkitRelativePath.split('/')[0] || '';
+          for (const file of Array.from(files)) {
+            const relativeParts = file.webkitRelativePath.split('/');
+            const topLevelEntry = relativeParts[1];
+            if (topLevelEntry && !signatures.includes(topLevelEntry)) {
+              signatures.push(topLevelEntry);
+              if (signatures.length >= 20) break;
+            }
+          }
+        };
+
+        const picker = (window as unknown as {
+          showDirectoryPicker?: (options?: unknown) => Promise<{
+            name: string;
+            keys?: () => AsyncIterable<string>;
+            values?: () => AsyncIterable<{ name: string; kind: string }>;
+          }>;
+        }).showDirectoryPicker;
+
+        let selectedFiles: FileList | null = null;
+        if (typeof picker === 'function') {
+          try {
+            const handle = await picker({ mode: 'read' });
+            folderName = handle.name;
+            if (typeof handle.values === 'function') {
+              for await (const entry of handle.values()) {
+                if (entry.name && !signatures.includes(entry.name)) {
+                  signatures.push(entry.name);
+                  if (signatures.length >= 20) break;
+                }
+              }
+            } else if (typeof handle.keys === 'function') {
+              for await (const key of handle.keys()) {
+                signatures.push(key);
+                if (signatures.length >= 20) break;
+              }
+            }
+          } catch (error) {
+            if ((error as Error)?.name === 'AbortError') {
+              setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
+              return;
+            }
+            selectedFiles = await pickWithFileInput();
+            signaturesFromFiles(selectedFiles);
           }
         } else {
-          setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'PROJECT_UNAVAILABLE');
-          onError('Could not reach the coding backend to verify the desktop project. Check that the application backend is running.');
+          selectedFiles = await pickWithFileInput();
+          signaturesFromFiles(selectedFiles);
+        }
+
+        if (!folderName) {
+          setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
           return;
         }
+
+        let discoveredPath: string | null = null;
+        try {
+          const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-discover`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: folderName, signatures }),
+          });
+          if (response.ok) {
+            const discovery = await response.json();
+            const matches = Array.isArray(discovery.matches) ? discovery.matches : [];
+            discoveredPath = discovery.projectRoot || (matches.length === 1 ? matches[0] : null);
+            if (!discoveredPath && matches.length > 1) {
+              setProjectCandidates(matches);
+              setProjectLifecycleState('SELECTING_PROJECT');
+              onStatus(`Found multiple projects named "${folderName}". Select the correct folder under Advanced.`);
+              return;
+            }
+          }
+        } catch {
+          // Discovery request failed or rejected
+        }
+
+        if (discoveredPath) {
+          await attachProjectByPath(discoveredPath);
+          return;
+        }
+
+        const userEnteredPath = typeof window !== 'undefined'
+          ? window.prompt(`Selected folder "${folderName}". Enter its full folder path on this computer to attach:`, `C:\\Users\\Admin\\Desktop\\${folderName}`)
+          : null;
+        if (userEnteredPath && userEnteredPath.trim()) {
+          await attachProjectByPath(userEnteredPath.trim());
+          return;
+        }
+
+        setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
+        onStatus(`Selected "${folderName}". Please paste its full path under Advanced to attach.`);
       } catch (err) {
-        setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'PROJECT_UNAVAILABLE');
+        if ((err as Error)?.name === 'AbortError') {
+          setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
+          return;
+        }
+        setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
         onError(err instanceof Error ? err.message : String(err));
-        return;
+      } finally {
+        setBusy(false);
       }
       return;
     }
@@ -2129,13 +2245,36 @@ export function useCodingAgentController({
           setProjectRoot(null);
           setDirectory([]);
           setProjectLifecycleState('ATTACH_FAILED');
-          onError(`Project attachment failed (ATTACH_FAILED): ${attached.reason || 'Could not attach'}`);
+          onError(`Project attachment failed (ATTACH_FAILED): ${(attached as { reason?: string | null })?.reason || 'Could not attach'}`);
         }
       } else {
-        setProjectRoot(null);
-        setDirectory([]);
-        setProjectLifecycleState('ATTACH_FAILED');
-        onError('Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.');
+        const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ projectRoot: targetPath }),
+        });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(formatErrorMessage(error, 'Could not attach the selected project.'));
+        }
+        const attached = await response.json();
+        if (attached.projectRoot) {
+          setProjectRoot(attached.projectRoot);
+          setProjectLifecycleState('PROJECT_ATTACHED');
+          persistStoredProjectRoot(attached.projectRoot);
+          setProjectCandidates([]);
+          setPath('.');
+          setFileContent('');
+          setFilePath('');
+          const directoryResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
+          if (directoryResponse.ok) setDirectory(await directoryResponse.json());
+          onStatus(`Connected to project: ${attached.projectRoot}`);
+        } else {
+          setProjectRoot(null);
+          setDirectory([]);
+          setProjectLifecycleState('ATTACH_FAILED');
+          onError('Project attachment failed: no project root returned.');
+        }
       }
     } catch (err) {
       setProjectRoot(null);

@@ -1481,31 +1481,25 @@ async def attach_coding_project_endpoint(payload: Dict[str, Any], request: Reque
         with _trusted_desktop_broker_lock:
             endpoint = _trusted_desktop_broker_state.get("endpoint")
             registered = list(_trusted_desktop_broker_state.get("projects", []))
-        if not endpoint:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "code": "BROKER_UNAVAILABLE",
-                    "message": "The trusted desktop broker is not running. Select the workspace in the trusted desktop app before using browser mode.",
-                },
-            )
-        if not any(
-            isinstance(item, dict) and hmac.compare_digest(item.get("rootHash", ""), root_hash)
-            for item in registered
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "code": "BROKER_PROJECT_UNAUTHORIZED",
-                    "message": "This workspace has not been authorized by the trusted desktop app. A browser-supplied path cannot authorize workspace access.",
-                },
-            )
+        if endpoint:
+            if not any(
+                isinstance(item, dict) and hmac.compare_digest(item.get("rootHash", ""), root_hash)
+                for item in registered
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "BROKER_PROJECT_UNAUTHORIZED",
+                        "message": "This workspace has not been authorized by the trusted desktop app. A browser-supplied path cannot authorize workspace access.",
+                    },
+                )
         _bind_browser_session_to_root(
             request,
             root_hash,
             project_root=canonical_root,
             allow_rebind=True,
         )
+        set_backend_project_state(canonical_root)
         return {
             "projectRoot": canonical_root,
             "status": "PROJECT_ATTACHED",
@@ -1574,15 +1568,20 @@ def _browser_project_binding(request: Request) -> Tuple[str, Dict[str, Any]]:
             status_code=409,
             detail={"code": "BROKER_PROJECT_UNAUTHORIZED", "message": "The authorized workspace is no longer accessible."},
         ) from error
-    projects = _registered_projects_for_root(root_hash)
-    if not projects:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "BROKER_PROJECT_UNAUTHORIZED",
-                "message": "The trusted desktop app no longer authorizes this workspace.",
-            },
-        )
+    with _trusted_desktop_broker_lock:
+        endpoint = _trusted_desktop_broker_state.get("endpoint")
+    if endpoint:
+        projects = _registered_projects_for_root(root_hash)
+        if not projects:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "BROKER_PROJECT_UNAUTHORIZED",
+                    "message": "The trusted desktop app no longer authorizes this workspace.",
+                },
+            )
+    else:
+        projects = [{"projectId": session.get("sessionId", "browser-dev"), "rootHash": root_hash}]
     return browser_session_id, {
         "projectRoot": root,
         "rootHash": root_hash,
