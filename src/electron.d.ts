@@ -293,7 +293,7 @@ interface Window {
     focusOverlayAnswer: () => Promise<OverlayRendererState>;
     captureScreen: () => Promise<string>;
     onScreenReadShortcut: (callback: () => void) => () => void;
-    chooseDeveloperProject: () => Promise<{ canceled: boolean; projectRoot: string | null }>;
+    chooseDeveloperProject: () => Promise<{ canceled: boolean; projectRoot: string | null; reason?: string | null }>;
     discoverDeveloperProject: (projectName: string) => Promise<{ matches: string[]; projectRoot: string | null }>;
     getDeveloperProjectState: () => Promise<{ status: 'PROJECT_ATTACHED' | 'PROJECT_DETACHED' | 'PROJECT_MISSING' | 'PROJECT_INACCESSIBLE' | 'PROJECT_NOT_ATTACHED' | 'PROJECT_STALE' | 'PROJECT_SESSION_RECONNECTING'; projectRoot: string | null; reason?: string | null }>;
     getDeveloperAcceptancePreflight: () => Promise<{

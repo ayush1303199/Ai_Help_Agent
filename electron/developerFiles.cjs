@@ -1529,10 +1529,10 @@ async function getVerificationScripts(ownerWebContentsId, requested = []) {
 
 function syncProjectStateToBackend(projectRoot) {
   try {
-    const port = services?.http?.port || 3001;
-    const url = `http://localhost:${port}/api/coding/project-state`;
+    const baseUrl = services?.http?.baseUrl || `http://127.0.0.1:${services?.http?.port || 3001}`;
+    const url = `${baseUrl.replace(/\/+$/, '')}/api/coding/project-state`;
     const authToken = process.env.AI_CODING_AUTH_TOKEN;
-    fetch(url, {
+    return fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1540,7 +1540,9 @@ function syncProjectStateToBackend(projectRoot) {
       },
       body: JSON.stringify({ projectRoot: projectRoot || null }),
     }).catch(() => undefined);
-  } catch {}
+  } catch {
+    return Promise.resolve();
+  }
 }
 
 async function setAuthoritativeProject(selectedRoot, ownerWebContentsId = null) {
@@ -1552,7 +1554,7 @@ async function setAuthoritativeProject(selectedRoot, ownerWebContentsId = null) 
   if (!stat.isDirectory()) throw new Error('Selected project path is not a directory.');
   authoritativeProjectRoot = resolved;
   authoritativeProjectStatus = PROJECT_STATUSES.ATTACHED;
-  syncProjectStateToBackend(resolved);
+  await syncProjectStateToBackend(resolved);
   if (ownerWebContentsId !== undefined && ownerWebContentsId !== null) {
     projectRoots.set(ownerWebContentsId, resolved);
     projectDiscoveryMatches.delete(ownerWebContentsId);

@@ -703,6 +703,84 @@ class TrustedDesktopBrokerBackendTests(unittest.IsolatedAsyncioTestCase):
             upstream.server_close()
             thread.join(timeout=2)
 
+    async def test_browser_recognizes_desktop_authorized_project_and_attaches_cleanly(self):
+        project_id = str(uuid.uuid4())
+        normalized_root = str(self.project_root).replace("\\", "/")
+        if sys.platform == "win32":
+            normalized_root = normalized_root.lower()
+        root_hash = hashlib.sha256(normalized_root.encode("utf-8")).hexdigest()
+        synchronization_server, synchronization_thread = start_synchronization_server()
+        try:
+            endpoint = f"http://127.0.0.1:{synchronization_server.server_address[1]}"
+            set_state_resp = await self.client.post(
+                "/api/coding/project-state",
+                headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
+                json={"projectRoot": str(self.project_root)},
+            )
+            self.assertEqual(set_state_resp.status_code, 200)
+            self.assertEqual(set_state_resp.json()["status"], "PROJECT_ATTACHED")
+
+            reg_resp = await self.client.post(
+                "/api/coding/broker/register",
+                headers={"X-Coding-Auth": index.CODING_AUTH_TOKEN},
+                json={
+                    "endpoint": endpoint,
+                    "projects": [{"projectId": project_id, "rootHash": root_hash}],
+                },
+            )
+            self.assertEqual(reg_resp.status_code, 200)
+
+            browser_headers = {
+                "Origin": self.origin,
+                "X-Coding-Browser-Session": self.browser_session_id,
+            }
+            state_resp = await self.client.get("/api/coding/project-state", headers=browser_headers)
+            self.assertEqual(state_resp.status_code, 200)
+            state_data = state_resp.json()
+            self.assertEqual(state_data["status"], "PROJECT_NOT_ATTACHED")
+            self.assertFalse(state_data["attached"])
+            self.assertIsNone(state_data["projectRoot"])
+            self.assertEqual(state_data["registeredProjectRoot"], str(self.project_root))
+
+            fake_dir = tempfile.TemporaryDirectory(prefix="forged-project-")
+            try:
+                forged_attach = await self.client.post(
+                    "/api/coding/project-attach",
+                    headers=browser_headers,
+                    json={"projectRoot": fake_dir.name},
+                )
+                self.assertEqual(forged_attach.status_code, 403)
+                self.assertEqual(forged_attach.json()["detail"]["code"], "BROKER_PROJECT_UNAUTHORIZED")
+            finally:
+                fake_dir.cleanup()
+
+            attach_resp = await self.client.post(
+                "/api/coding/project-attach",
+                headers=browser_headers,
+                json={"projectRoot": state_data["registeredProjectRoot"]},
+            )
+            self.assertEqual(attach_resp.status_code, 200)
+            attached_data = attach_resp.json()
+            self.assertEqual(attached_data["status"], "PROJECT_ATTACHED")
+            self.assertTrue(attached_data["attached"])
+            self.assertEqual(attached_data["projectRoot"], str(self.project_root))
+
+            recheck_resp = await self.client.get("/api/coding/project-state", headers=browser_headers)
+            self.assertEqual(recheck_resp.status_code, 200)
+            recheck_data = recheck_resp.json()
+            self.assertEqual(recheck_data["status"], "PROJECT_ATTACHED")
+            self.assertTrue(recheck_data["attached"])
+            self.assertEqual(recheck_data["projectRoot"], str(self.project_root))
+
+            clear_resp = await self.client.post("/api/coding/project-clear", headers=browser_headers)
+            self.assertEqual(clear_resp.status_code, 200)
+            post_clear_resp = await self.client.get("/api/coding/project-state", headers=browser_headers)
+            self.assertEqual(post_clear_resp.json()["status"], "PROJECT_NOT_ATTACHED")
+        finally:
+            synchronization_server.shutdown()
+            synchronization_server.server_close()
+            synchronization_thread.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()

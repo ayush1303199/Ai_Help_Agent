@@ -384,6 +384,8 @@ export function useCodingAgentController({
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [projectRoot, setProjectRoot] = useState<string | null>(null);
+  const projectRootRef = useRef<string | null>(null);
+  projectRootRef.current = projectRoot;
   const [projectLifecycleState, setProjectLifecycleState] = useState<ProjectLifecycleState>('PROJECT_UNVERIFIED');
   const [projectCandidates, setProjectCandidates] = useState<string[]>([]);
   const [directory, setDirectory] = useState<Array<{ name: string; type: 'file' | 'directory' }>>([]);
@@ -679,7 +681,18 @@ export function useCodingAgentController({
       }
     };
     void syncInitialProjectState();
-    return () => { active = false; };
+    const handleRecheck = () => {
+      if (!window.electronAPI && !projectRootRef.current) {
+        void syncInitialProjectState();
+      }
+    };
+    window.addEventListener('focus', handleRecheck);
+    document.addEventListener('visibilitychange', handleRecheck);
+    return () => {
+      active = false;
+      window.removeEventListener('focus', handleRecheck);
+      document.removeEventListener('visibilitychange', handleRecheck);
+    };
   }, [onError, savedConversation?.projectRoot]);
 
   useEffect(() => {
@@ -2033,129 +2046,20 @@ export function useCodingAgentController({
                 return;
               }
             }
-          }
-        }
-      } catch {
-        // Fall back to folder picker if state check fails
-      }
-      const picker = (window as unknown as {
-        showDirectoryPicker?: (options?: unknown) => Promise<{
-          name: string;
-          keys?: () => AsyncIterable<string>;
-        }>;
-      }).showDirectoryPicker;
-      setBusy(true);
-      setProjectLifecycleState('SELECTING_PROJECT');
-      try {
-        let folderName = '';
-        const signatures: string[] = [];
-        const pickWithFileInput = () => new Promise<FileList>((resolve, reject) => {
-          const input = document.createElement('input');
-          input.type = 'file';
-          input.multiple = true;
-          input.setAttribute('webkitdirectory', '');
-          input.addEventListener('change', () => {
-            if (input.files?.length) resolve(input.files);
-            else reject(new DOMException('Folder selection was cancelled.', 'AbortError'));
-          }, { once: true });
-          input.addEventListener('cancel', () => {
-            reject(new DOMException('Folder selection was cancelled.', 'AbortError'));
-          }, { once: true });
-          input.click();
-        });
-        const signaturesFromFiles = (files: FileList) => {
-          const firstFile = files.item(0);
-          folderName = firstFile?.webkitRelativePath.split('/')[0] || '';
-          for (const file of Array.from(files)) {
-            const relativeParts = file.webkitRelativePath.split('/');
-            const topLevelEntry = relativeParts[1];
-            if (topLevelEntry && !signatures.includes(topLevelEntry)) {
-              signatures.push(topLevelEntry);
-              if (signatures.length >= 20) break;
-            }
-          }
-        };
-        let selectedFiles: FileList | null = null;
-        if (typeof picker === 'function') {
-          try {
-            const handle = await picker({ mode: 'read' });
-            folderName = handle.name;
-            if (typeof handle.keys === 'function') {
-              for await (const key of handle.keys()) {
-                signatures.push(key);
-                if (signatures.length >= 20) break;
-              }
-            }
-          } catch (error) {
-            if ((error as Error)?.name === 'AbortError') throw error;
-            selectedFiles = await pickWithFileInput();
-            signaturesFromFiles(selectedFiles);
+          } else {
+            setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
+            onError('Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.');
+            return;
           }
         } else {
-          selectedFiles = await pickWithFileInput();
-          signaturesFromFiles(selectedFiles);
-        }
-        if (!folderName) {
-          throw new Error('The browser did not provide the selected folder name. Try another browser or attach its full path.');
-        }
-        const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-discover`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: folderName, signatures }),
-        });
-        if (!response.ok) {
-          const error = await response.json().catch(() => ({}));
-          const code = error?.detail?.code || error?.code;
-          if (code === 'TRUSTED_PROJECT_SELECTION_REQUIRED' || response.status === 403) {
-            throw new Error('Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.');
-          }
-          throw new Error(formatErrorMessage(error, 'Could not match the selected folder to a local project. Please open the trusted desktop application to authorize this workspace.'));
-        }
-        const discovery = await response.json();
-        const matches = Array.isArray(discovery.matches) ? discovery.matches : [];
-        const targetPath = discovery.projectRoot || (matches.length === 1 ? matches[0] : null);
-        if (!targetPath && matches.length > 1) {
-          setProjectCandidates(matches);
-          setProjectLifecycleState('SELECTING_PROJECT');
-          onStatus(`Found multiple projects named "${folderName}". Select the correct folder under Advanced.`);
+          setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'PROJECT_UNAVAILABLE');
+          onError('Could not reach the coding backend to verify the desktop project. Check that the application backend is running.');
           return;
         }
-        if (!targetPath) {
-          throw new Error(`Could not locate "${folderName}" under the configured project discovery folders. Please open the trusted desktop application to authorize this workspace.`);
-        }
-        const attachResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectRoot: targetPath }),
-        });
-        if (!attachResponse.ok) {
-          const error = await attachResponse.json().catch(() => ({}));
-          const code = error?.detail?.code || error?.code;
-          if (code === 'BROKER_PROJECT_UNAUTHORIZED' || attachResponse.status === 403) {
-            throw new Error('Please open the trusted desktop application and select this project under Developer > Advanced. Browser sessions cannot independently authorize local workspace access.');
-          }
-          throw new Error(formatErrorMessage(error, 'Could not attach the selected project.'));
-        }
-        const attached = await attachResponse.json();
-        setProjectRoot(attached.projectRoot);
-        setProjectLifecycleState('PROJECT_ATTACHED');
-        persistStoredProjectRoot(attached.projectRoot);
-        setProjectCandidates([]);
-        setPath('.');
-        setFileContent('');
-        setFilePath('');
-        const directoryResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
-        if (directoryResponse.ok) setDirectory(await directoryResponse.json());
-        onStatus(`Connected to project: ${attached.projectRoot}`);
-      } catch (error) {
-        if ((error as Error)?.name === 'AbortError') {
-          setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
-          return;
-        }
-        setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'NO_PROJECT');
-        onError(error instanceof Error ? error.message : String(error));
-      } finally {
-        setBusy(false);
+      } catch (err) {
+        setProjectLifecycleState(projectRoot ? 'PROJECT_ATTACHED' : 'PROJECT_UNAVAILABLE');
+        onError(err instanceof Error ? err.message : String(err));
+        return;
       }
       return;
     }
@@ -2181,7 +2085,7 @@ export function useCodingAgentController({
         setProjectRoot(null);
         setDirectory([]);
         setProjectLifecycleState('ATTACH_FAILED');
-        onError(`Project selection failed: ${result.reason || 'Could not attach project.'}`);
+        onError(`Project selection failed: ${(result as { reason?: string | null })?.reason || 'Could not attach project.'}`);
       }
     } catch (error) {
       setProjectRoot(null);

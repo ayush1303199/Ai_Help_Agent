@@ -1186,8 +1186,13 @@ def _bind_browser_session_to_root(
 
 
 @app.get("/api/coding/project-state")
-def get_coding_project_state_endpoint(request: Request) -> Dict[str, Any]:
-    if request.headers.get("origin") in TRUSTED_RENDERER_ORIGINS:
+async def get_coding_project_state_endpoint(request: Request) -> Dict[str, Any]:
+    origin = request.headers.get("origin")
+    if origin in TRUSTED_RENDERER_ORIGINS:
+        try:
+            await _synchronize_trusted_desktop_broker(origin)
+        except Exception:
+            pass
         try:
             browser_session_id = _browser_session_identity(request)
         except HTTPException:
@@ -1644,6 +1649,27 @@ async def _synchronize_trusted_desktop_broker(origin: str) -> None:
             status_code=503,
             detail={"code": "BROKER_SYNC_FAILED", "message": "The trusted broker could not synchronize the attached project."},
         )
+    try:
+        data = response.json()
+    except (ValueError, TypeError):
+        data = {}
+    if isinstance(data, dict) and isinstance(data.get("projects"), list) and data["projects"]:
+        with _trusted_desktop_broker_lock:
+            existing = {
+                item["rootHash"]: item
+                for item in _trusted_desktop_broker_state.get("projects", [])
+                if isinstance(item, dict) and "rootHash" in item
+            }
+            for item in data["projects"]:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("projectId"), str)
+                    and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", item["projectId"], re.I)
+                    and isinstance(item.get("rootHash"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", item["rootHash"], re.I)
+                ):
+                    existing[item["rootHash"].lower()] = {"projectId": item["projectId"], "rootHash": item["rootHash"].lower()}
+            _trusted_desktop_broker_state["projects"] = list(existing.values())
 
 
 @app.post("/api/coding/broker/register")
