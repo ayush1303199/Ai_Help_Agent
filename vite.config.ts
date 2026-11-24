@@ -12,6 +12,12 @@ const websocketUrl = process.env.VITE_WS_URL || websocket.baseUrl;
 const codingWebsocketUrl = process.env.VITE_CODING_WS_URL || codingWebsocket.baseUrl;
 const devServerUrl = process.env.VITE_DEV_SERVER_URL || `http://${devServer.host}:${devServer.port}`;
 const toWebSocketUrl = (url: string) => url.replace(/^http:/, 'ws:');
+const devPort = devServer.port || 5174;
+const devWsOrigins = [...new Set([
+  toWebSocketUrl(devServerUrl),
+  `ws://localhost:${devPort}`,
+  `ws://127.0.0.1:${devPort}`,
+])].join(' ');
 const e2eTestMode = process.env.AI_CODING_E2E_TEST_MODE === '1'
   ? require('./electron/electronE2eTestMode.cjs').loadElectronE2eTestMode(
     require('./src/config/runtimeSettings.json'),
@@ -26,8 +32,9 @@ const developmentCsp = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
-  `connect-src 'self' ${apiUrl} ${websocketUrl} ${toWebSocketUrl(devServerUrl)} ${codingWebsocketUrl}`,
+  `connect-src 'self' ${apiUrl} ${websocketUrl} ${devWsOrigins} ${codingWebsocketUrl}`,
   "media-src 'self' blob:",
+  "worker-src 'self' blob:",
 ].join('; ');
 
 const productionCsp = [
@@ -57,6 +64,11 @@ export default defineConfig(({ command }) => ({
   // Electron loads the production entrypoint from file://, so bundled assets
   // must resolve relative to dist/index.html rather than the filesystem root.
   base: command === 'build' ? './' : '/',
+  server: {
+    host: devServer.host || 'localhost',
+    port: devServer.port || 5174,
+    strictPort: true,
+  },
   ...(e2eTestMode ? { cacheDir: join(e2eTestMode.root, 'vite-cache') } : {}),
   plugins: [react(), contentSecurityPolicyPlugin(command)],
   resolve: {

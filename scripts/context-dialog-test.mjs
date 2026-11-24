@@ -26,12 +26,25 @@ assert.match(confirmationSource, /aria-modal="true"/);
 assert.match(confirmationSource, /event\.key === 'Escape'/);
 assert.match(confirmationSource, /event\.key !== 'Tab'/);
 assert.match(viteConfig, /productionCsp/);
-assert.match(viteConfig, /script-src 'self'/);
+assert.match(viteConfig, /productionCsp[\s\S]{0,1200}script-src 'self'/);
 assert.doesNotMatch(viteConfig, /productionCsp[\s\S]{0,1200}unsafe-eval/);
+assert.doesNotMatch(viteConfig, /productionCsp[\s\S]{0,1200}worker-src/);
+assert.doesNotMatch(viteConfig, /productionCsp[\s\S]{0,1200}script-src[^\n;]*blob:/);
+assert.doesNotMatch(viteConfig, /productionCsp[\s\S]{0,1200}devWsOrigins/);
+
+assert.match(viteConfig, /developmentCsp[\s\S]{0,1200}worker-src 'self' blob:/);
+assert.doesNotMatch(viteConfig, /developmentCsp[\s\S]{0,1200}script-src[^\n;]*blob:/);
+assert.match(viteConfig, /ws:\/\/localhost:\$\{devPort\}/);
+assert.match(viteConfig, /ws:\/\/127\.0\.0\.1:\$\{devPort\}/);
+assert.match(viteConfig, /server:\s*\{[\s\S]*?port:\s*devServer\.port\s*\|\|\s*5174/);
+assert.match(viteConfig, /strictPort:\s*true/);
 
 console.log(JSON.stringify({
   contextDialog: true,
   nativePromptRemoved: true,
   keyboardAccess: true,
   productionCspConfigured: true,
+  developmentWorkerCspConfigured: true,
+  developmentWebSocketOriginsConfigured: true,
+  vitePortConfigured: true,
 }));
