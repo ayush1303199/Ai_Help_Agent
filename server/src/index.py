@@ -1462,17 +1462,29 @@ def register_coding_mutation_handshake(payload: Dict[str, Any], request: Request
 
 @app.post("/api/coding/project-attach")
 async def attach_coding_project_endpoint(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
-    raw_root = str(payload.get("projectRoot") or "").strip().strip("\"'").strip()
+    raw_root = str(payload.get("projectRoot") or "").strip().strip("\"'").strip().rstrip("/\\")
     if not raw_root:
         active_state = get_backend_project_state()
         if active_state.get("attached") and active_state.get("projectRoot"):
-            raw_root = str(active_state["projectRoot"]).strip().strip("\"'").strip()
+            raw_root = str(active_state["projectRoot"]).strip().strip("\"'").strip().rstrip("/\\")
         else:
             raise HTTPException(status_code=400, detail="projectRoot is required.")
 
+    norm_name = raw_root.lower().replace("-", "_").replace(" ", "_")
+    app_parent_norm = APP_ROOT.parent.name.lower().replace("-", "_").replace(" ", "_")
+    is_workspace_match = (
+        not raw_root
+        or raw_root == "."
+        or norm_name == app_parent_norm
+        or norm_name.endswith(app_parent_norm)
+        or norm_name.endswith(f"desktop_{app_parent_norm}")
+    )
+
     candidate_paths = [
+        APP_ROOT.parent if is_workspace_match else None,
         Path(raw_root),
         Path(raw_root).expanduser(),
+        Path.home() / raw_root,
         APP_ROOT.parent if raw_root in (".", "", APP_ROOT.parent.name, APP_ROOT.parent.name.lower()) else None,
         Path.cwd() if raw_root in (".", "", Path.cwd().name, Path.cwd().name.lower()) else None,
         Path.home() / "Desktop" / raw_root,

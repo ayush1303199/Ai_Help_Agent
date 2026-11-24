@@ -2242,7 +2242,7 @@ export function useCodingAgentController({
 
   const attachProjectByPath = async (targetPath: string) => {
     if (!targetPath || busy || streaming) return;
-    const cleanPath = targetPath.trim().replace(/^["']|["']$/g, '').trim();
+    const cleanPath = targetPath.trim().replace(/^["']|["']$/g, '').trim().replace(/[/\\]+$/, '');
     if (!cleanPath) return;
     const desktopApi = window.electronAPI;
     setBusy(true);
