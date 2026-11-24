@@ -1462,17 +1462,41 @@ def register_coding_mutation_handshake(payload: Dict[str, Any], request: Request
 
 @app.post("/api/coding/project-attach")
 async def attach_coding_project_endpoint(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
-    project_root = str(payload.get("projectRoot") or "").strip()
-    if not project_root:
+    raw_root = str(payload.get("projectRoot") or "").strip().strip("\"'").strip()
+    if not raw_root:
         active_state = get_backend_project_state()
         if active_state.get("attached") and active_state.get("projectRoot"):
-            project_root = str(active_state["projectRoot"]).strip()
+            raw_root = str(active_state["projectRoot"]).strip().strip("\"'").strip()
         else:
             raise HTTPException(status_code=400, detail="projectRoot is required.")
-    p = Path(project_root)
-    if not p.is_dir():
+
+    candidate_paths = [
+        Path(raw_root),
+        Path(raw_root).expanduser(),
+        APP_ROOT.parent if raw_root in (".", "", APP_ROOT.parent.name, APP_ROOT.parent.name.lower()) else None,
+        Path.cwd() if raw_root in (".", "", Path.cwd().name, Path.cwd().name.lower()) else None,
+        Path.home() / "Desktop" / raw_root,
+        Path.home() / "Documents" / raw_root,
+        Path.home() / "Downloads" / raw_root,
+        Path.home() / "projects" / raw_root,
+        Path.home() / "workspace" / raw_root,
+        Path.cwd() / raw_root,
+        APP_ROOT.parent / raw_root,
+    ]
+    resolved_dir: Optional[Path] = None
+    for cand in candidate_paths:
+        if cand is not None:
+            try:
+                resolved = cand.resolve()
+                if resolved.is_dir() and not _is_coding_sensitive(str(resolved)):
+                    resolved_dir = resolved
+                    break
+            except Exception:
+                continue
+
+    if resolved_dir is None:
         raise HTTPException(status_code=400, detail="projectRoot does not exist or is not a directory.")
-    canonical_root = str(p.resolve())
+    canonical_root = str(resolved_dir)
     origin = request.headers.get("origin")
     if origin in TRUSTED_RENDERER_ORIGINS:
         _browser_session_identity(request)

@@ -2130,6 +2130,33 @@ export function useCodingAgentController({
           return;
         }
 
+        // 1. Try attaching directly with the folder name (resolved via backend workspace roots)
+        try {
+          const directAttach = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectRoot: folderName }),
+          });
+          if (directAttach.ok) {
+            const attached = await directAttach.json();
+            if (attached.projectRoot) {
+              setProjectRoot(attached.projectRoot);
+              setProjectLifecycleState('PROJECT_ATTACHED');
+              persistStoredProjectRoot(attached.projectRoot);
+              setProjectCandidates([]);
+              setPath('.');
+              setFileContent('');
+              setFilePath('');
+              const dirResponse = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/directory?path=${encodeURIComponent('.')}`);
+              if (dirResponse.ok) setDirectory(await dirResponse.json());
+              onStatus(`Connected to project: ${attached.projectRoot}`);
+              return;
+            }
+          }
+        } catch {
+          // Direct attach fallback
+        }
+
         let discoveredPath: string | null = null;
         try {
           const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-discover`, {
@@ -2158,7 +2185,7 @@ export function useCodingAgentController({
         }
 
         const userEnteredPath = typeof window !== 'undefined'
-          ? window.prompt(`Selected folder "${folderName}". Enter its full folder path on this computer to attach:`, `C:\\Users\\Admin\\Desktop\\${folderName}`)
+          ? window.prompt(`Selected folder "${folderName}". If located in a custom path, enter its full folder path:`, `C:\\Users\\Admin\\Desktop\\${folderName}`)
           : null;
         if (userEnteredPath && userEnteredPath.trim()) {
           await attachProjectByPath(userEnteredPath.trim());
@@ -2215,12 +2242,14 @@ export function useCodingAgentController({
 
   const attachProjectByPath = async (targetPath: string) => {
     if (!targetPath || busy || streaming) return;
+    const cleanPath = targetPath.trim().replace(/^["']|["']$/g, '').trim();
+    if (!cleanPath) return;
     const desktopApi = window.electronAPI;
     setBusy(true);
     setProjectLifecycleState('ATTACHING_PROJECT');
     try {
       if (desktopApi) {
-        const attached = await desktopApi.attachDeveloperProject(targetPath);
+        const attached = await desktopApi.attachDeveloperProject(cleanPath);
         if (attached.status === 'PROJECT_ATTACHED' && attached.projectRoot) {
           setProjectRoot(attached.projectRoot);
           setProjectLifecycleState('PROJECT_ATTACHED');
@@ -2251,7 +2280,7 @@ export function useCodingAgentController({
         const response = await codingFetch(`${runtimeConfig.services.http.baseUrl}/api/coding/project-attach`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ projectRoot: targetPath }),
+          body: JSON.stringify({ projectRoot: cleanPath }),
         });
         if (!response.ok) {
           const error = await response.json().catch(() => ({}));
