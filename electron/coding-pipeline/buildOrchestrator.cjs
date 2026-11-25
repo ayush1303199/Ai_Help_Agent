@@ -188,6 +188,7 @@ async function discoverBuildOperations(projectRoot) {
           scriptName: startScript,
           toolchain: `node:${pm}`,
           evidencePath: 'package.json',
+          executionKind: 'PERSISTENT_SERVICE',
         };
       }
     } catch {
@@ -839,6 +840,12 @@ async function _executeBuildPlanCore({
         const { verifyProjectProcessIsolation } = require('./projectProcessIsolation.cjs');
         await verifyProjectProcessIsolation({ isSyntheticTest: false }).catch(() => {});
         const commandStr = plan.fullCommandString || `${plan.binary} ${(plan.args || []).join(' ')}`.trim();
+        const isStart = plan.operation === BUILD_OPERATIONS.START || plan.executionKind === 'PERSISTENT_SERVICE';
+        const executionKind = isStart ? 'PERSISTENT_SERVICE' : (plan.executionKind || 'TRANSIENT_TASK');
+        if (liveIso.grant) {
+          liveIso.grant.executionKind = executionKind;
+          liveIso.grant.serviceId = plan.serviceId || plan.operation;
+        }
         const supervisorResult = await executeWithSupervisor({
           supervisor: liveIso.client,
           runId: crypto.randomUUID(),
@@ -848,7 +855,10 @@ async function _executeBuildPlanCore({
           taskId: plan.planId || 'task-build',
           sessionId,
           command: commandStr,
-          timeoutMs: plan.timeoutMs || 60000,
+          executionKind,
+          serviceId: plan.serviceId || plan.operation,
+          timeoutMs: plan.timeoutMs || (isStart ? 15000 : 60000),
+          grant: liveIso.grant,
         });
 
         if (!supervisorResult?.ok) {
@@ -867,15 +877,20 @@ async function _executeBuildPlanCore({
           };
         }
 
-        const isStart = plan.operation === BUILD_OPERATIONS.START;
         const realWorkerPid = supervisorResult.workerPid || supervisorResult.pid || undefined;
         return {
           ok: supervisorResult.ok === true,
           status: supervisorResult.ok ? BUILD_OUTCOMES.PASSED : BUILD_OUTCOMES.FAILED,
           outcome: isStart ? 'STARTED' : 'COMPLETED',
+          executionKind,
+          workerId: supervisorResult.workerId,
+          serviceId: plan.serviceId || plan.operation,
           exitCode: supervisorResult.exitCode ?? (supervisorResult.ok ? (isStart ? null : 0) : 1),
           actualExitCode: supervisorResult.actualExitCode !== undefined ? supervisorResult.actualExitCode : (supervisorResult.timedOut ? null : (supervisorResult.exitCode ?? null)),
           pid: isStart ? realWorkerPid : undefined,
+          workerPid: realWorkerPid,
+          processCreationTimeUtc: supervisorResult.processCreationTimeUtc,
+          retainedWorker: supervisorResult.retainedWorker,
           childProcessSpawned: Boolean(supervisorResult.childProcessSpawned),
           isSynthetic: Boolean(supervisorResult.isSynthetic),
           timedOut: Boolean(supervisorResult.timedOut),

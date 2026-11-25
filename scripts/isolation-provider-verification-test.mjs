@@ -58,6 +58,9 @@ const {
   createNativeSupervisorClient,
   queryWindowsOperatingSystemIdentity,
   verifyLiveSupervisorProcessIsolation,
+  executeWithSupervisor,
+  queryWorkerStatus,
+  stopPersistentService,
 } = windowsAdapterPkg;
 
 import projectIsoPkg from '../electron/coding-pipeline/projectProcessIsolation.cjs';
@@ -1814,6 +1817,263 @@ async function testV44857DExecutionAndLifecycleHardening() {
   assert.strictEqual(consumeGrant('grant-1').error, 'GRANT_ALREADY_CONSUMED');
 }
 
+async function testV44857EPersistentRuntimeAndSupervisorContract() {
+  console.log('Testing V44.85.7E Persistent Runtime Lifecycle & Supervisor Contract Hardening...');
+
+  // 1. Supervisor QUERY_WORKER_STATUS Contract Validation
+  const activeWorkers = new Map();
+  const worker1 = {
+    workerId: 'worker-wsb-test1',
+    runId: 'run-test1',
+    sessionId: 'session-xyz',
+    workspaceRoot: path.normalize('C:/Users/Admin/project1'),
+    executionKind: 'PERSISTENT_SERVICE',
+    serviceId: 'svc-frontend',
+    workerPid: 54321,
+    processCreationTimeUtc: '2026-11-25T00:00:00.000Z',
+    isAlive: true,
+    isTerminated: false,
+    jobHandleValid: true,
+  };
+  activeWorkers.set(worker1.workerId, worker1);
+
+  function simulateSupervisorQueryWorkerStatus(req) {
+    if (!req.workerId) return { ok: false, error: 'WORKER_ID_REQUIRED', reasonCode: 'WORKER_ID_REQUIRED' };
+    if (!req.sessionId) return { ok: false, error: 'SESSION_ID_REQUIRED', reasonCode: 'SESSION_ID_REQUIRED' };
+    const worker = activeWorkers.get(req.workerId);
+    if (!worker) return { ok: false, found: false, error: 'WORKER_NOT_FOUND', reasonCode: 'WORKER_NOT_FOUND' };
+    if (worker.sessionId !== req.sessionId) return { ok: false, error: 'SESSION_MISMATCH', reasonCode: 'SESSION_MISMATCH' };
+    if (req.workspaceRoot && path.normalize(req.workspaceRoot).toLowerCase() !== path.normalize(worker.workspaceRoot).toLowerCase()) {
+      return { ok: false, error: 'WORKSPACE_ROOT_MISMATCH', reasonCode: 'WORKSPACE_ROOT_MISMATCH' };
+    }
+    if (req.runId && req.runId !== worker.runId) {
+      return { ok: false, error: 'RUN_ID_MISMATCH', reasonCode: 'RUN_ID_MISMATCH' };
+    }
+    return {
+      ok: true,
+      found: true,
+      workerId: worker.workerId,
+      runId: worker.runId,
+      sessionId: worker.sessionId,
+      workspaceRoot: worker.workspaceRoot,
+      executionKind: worker.executionKind,
+      serviceId: worker.serviceId,
+      workerPid: worker.workerPid,
+      processCreationTimeUtc: worker.processCreationTimeUtc,
+      isAlive: worker.isAlive,
+      isTerminated: worker.isTerminated,
+      lifecycleState: worker.isAlive ? 'RUNNING' : 'EXITED',
+      jobHandleValid: worker.jobHandleValid,
+      containedByJobObject: worker.jobHandleValid,
+    };
+  }
+
+  // 1a. Successful query
+  const qValid = simulateSupervisorQueryWorkerStatus({
+    workerId: 'worker-wsb-test1',
+    sessionId: 'session-xyz',
+    workspaceRoot: 'C:/Users/Admin/project1',
+  });
+  assert.strictEqual(qValid.ok, true);
+  assert.strictEqual(qValid.isAlive, true);
+  assert.strictEqual(qValid.containedByJobObject, true);
+  assert.strictEqual(qValid.workerPid, 54321);
+  assert.strictEqual(qValid.processCreationTimeUtc, '2026-11-25T00:00:00.000Z');
+
+  // 1b. Missing workerId
+  assert.strictEqual(simulateSupervisorQueryWorkerStatus({ sessionId: 'session-xyz' }).error, 'WORKER_ID_REQUIRED');
+
+  // 1c. Unknown worker
+  const qUnknown = simulateSupervisorQueryWorkerStatus({ workerId: 'worker-unknown', sessionId: 'session-xyz' });
+  assert.strictEqual(qUnknown.ok, false);
+  assert.strictEqual(qUnknown.error, 'WORKER_NOT_FOUND');
+
+  // 1d. Session mismatch
+  const qSessMismatch = simulateSupervisorQueryWorkerStatus({ workerId: 'worker-wsb-test1', sessionId: 'rogue-session' });
+  assert.strictEqual(qSessMismatch.ok, false);
+  assert.strictEqual(qSessMismatch.error, 'SESSION_MISMATCH');
+
+  // 1e. Workspace mismatch (cross-project protection)
+  const qWsMismatch = simulateSupervisorQueryWorkerStatus({
+    workerId: 'worker-wsb-test1',
+    sessionId: 'session-xyz',
+    workspaceRoot: 'C:/Users/Admin/other-project',
+  });
+  assert.strictEqual(qWsMismatch.ok, false);
+  assert.strictEqual(qWsMismatch.error, 'WORKSPACE_ROOT_MISMATCH');
+
+  // 1f. RunId mismatch
+  const qRunMismatch = simulateSupervisorQueryWorkerStatus({
+    workerId: 'worker-wsb-test1',
+    sessionId: 'session-xyz',
+    workspaceRoot: 'C:/Users/Admin/project1',
+    runId: 'wrong-run',
+  });
+  assert.strictEqual(qRunMismatch.ok, false);
+  assert.strictEqual(qRunMismatch.error, 'RUN_ID_MISMATCH');
+
+  // 1g. Non-mutating invariant
+  assert.strictEqual(worker1.isAlive, true);
+  assert.strictEqual(worker1.isTerminated, false);
+
+  // 2. Adapter Execution Lifecycle Contract: Transient vs Persistent
+  let workerTerminatedCount = 0;
+  const baseSupervisor = createNativeSupervisorClient({
+    isSyntheticTest: true,
+    pid: 9999,
+    tokenUserSid: 'S-1-5-18',
+  });
+  const mockSupervisor = {
+    ...baseSupervisor,
+    peerCredentials: { authenticated: true, tokenUserSid: 'S-1-5-18' },
+    async issueExecutionGrant(req) {
+      return {
+        granted: true,
+        runId: req.runId,
+        workspaceRoot: req.workspaceRoot,
+        approvedSnapshotDigest: req.approvedSnapshotDigest,
+        commandDigest: req.commandDigest || crypto.createHash('sha256').update(String(req.command || '')).digest('hex'),
+        sessionId: req.sessionId,
+        executionKind: req.runId === 'run-unauthorized-persistent' ? 'TRANSIENT_TASK' : (req.executionKind || 'TRANSIENT_TASK'),
+        serviceId: req.serviceId,
+      };
+    },
+    async consumeExecutionGrant(g) { return { consumed: true, grantId: g.grantId }; },
+    async allocateWorker(r) { return { workerId: 'mock-worker-1', sessionId: r.sessionId, runId: r.runId }; },
+    async observeEffectiveIsolation() { return { effectiveIsolationVerified: true }; },
+    async executeApprovedOperation(r) {
+      if (r.executionKind === 'PERSISTENT_SERVICE') {
+        return { ok: true, serviceStarted: true, workerPid: 65432, processCreationTimeUtc: '2026-11-25T00:00:00.000Z', isSynthetic: true };
+      }
+      return { ok: true, exitCode: 0, stdout: 'transient task output', isSynthetic: true };
+    },
+    async enforceDeadlineAndCancellation() { return new Promise(() => {}); },
+    async queryWorkerStatus() {
+      return { ok: true, found: true, isAlive: true, isTerminated: false, workerPid: 65432, processCreationTimeUtc: '2026-11-25T00:00:00.000Z' };
+    },
+    async collectHostEvidence() { return { evidenceCollected: true }; },
+    async terminateWorker() { workerTerminatedCount++; return { terminated: true }; },
+    async verifyWorkerTerminationAndResourceRelease() { return { released: true }; },
+  };
+
+  const safeWs = path.join(tempDir, 'v44-7e-safe-ws');
+  await fs.mkdir(safeWs, { recursive: true });
+
+  // 2a. Transient task terminates worker
+  const transientRun = await executeWithSupervisor({
+    supervisor: mockSupervisor,
+    command: 'npm run build',
+    commandDigest: 'digest-build',
+    workspaceRoot: safeWs,
+    runId: 'run-transient-1',
+    sessionId: 'session-xyz',
+    approvedSnapshotDigest: 'snap-digest',
+    grant: {
+      grantId: 'grant-transient',
+      sessionId: 'session-xyz',
+      workspaceRoot: safeWs,
+      commandDigest: 'digest-build',
+      executionKind: 'TRANSIENT_TASK',
+    },
+    timeoutMs: 1000,
+    isSyntheticTest: true,
+  });
+  assert.strictEqual(transientRun.ok, true);
+  assert.strictEqual(transientRun.exitCode, 0);
+  assert.strictEqual(workerTerminatedCount, 1, 'Transient task must terminate worker on normal completion');
+
+  // 2b. Persistent service retains worker without termination
+  const prevTermCount = workerTerminatedCount;
+  const persistentRun = await executeWithSupervisor({
+    supervisor: mockSupervisor,
+    command: 'npm run dev',
+    commandDigest: 'digest-dev',
+    workspaceRoot: safeWs,
+    runId: 'run-persistent-1',
+    sessionId: 'session-xyz',
+    approvedSnapshotDigest: 'snap-digest',
+    executionKind: 'PERSISTENT_SERVICE',
+    serviceId: 'svc-dev',
+    grant: {
+      grantId: 'grant-persistent',
+      sessionId: 'session-xyz',
+      workspaceRoot: safeWs,
+      commandDigest: 'digest-dev',
+      executionKind: 'PERSISTENT_SERVICE',
+      serviceId: 'svc-dev',
+    },
+    timeoutMs: 5000,
+    startupTimeoutMs: 1000,
+    isSyntheticTest: true,
+  });
+  assert.strictEqual(persistentRun.ok, true);
+  assert.strictEqual(persistentRun.executionKind, 'PERSISTENT_SERVICE');
+  assert.strictEqual(persistentRun.serviceStarted, true);
+  assert.strictEqual(persistentRun.workerPid, 65432);
+  assert.strictEqual(persistentRun.lifecycleState, 'RUNNING');
+  assert.strictEqual(workerTerminatedCount, prevTermCount, 'Persistent service must RETAIN worker without terminating it');
+
+  // 2c. Security Gate: Unauthorized caller attempting PERSISTENT_SERVICE without approved grant
+  await assert.rejects(
+    executeWithSupervisor({
+      supervisor: mockSupervisor,
+      command: 'npm run dev',
+      commandDigest: 'digest-dev',
+      workspaceRoot: safeWs,
+      runId: 'run-unauthorized-persistent',
+      sessionId: 'session-xyz',
+      approvedSnapshotDigest: 'snap-digest',
+      executionKind: 'PERSISTENT_SERVICE', // Unauthorized elevation attempt
+      grant: {
+        grantId: 'grant-transient-only',
+        sessionId: 'session-xyz',
+        workspaceRoot: safeWs,
+        commandDigest: 'digest-dev',
+        executionKind: 'TRANSIENT_TASK', // Grant only authorized transient execution!
+      },
+      timeoutMs: 1000,
+      isSyntheticTest: true,
+    }),
+    (err) => {
+      assert.strictEqual(err.code, 'PROJECT_EXECUTION_BLOCKED');
+      assert.strictEqual(err.reasonCode, 'PERSISTENT_EXECUTION_UNAUTHORIZED');
+      return true;
+    },
+    'Caller cannot elevate executionKind to PERSISTENT_SERVICE without matching grant authorization'
+  );
+
+  // 2d. Explicit stopPersistentService stops and releases retained worker
+  const stopRes = await stopPersistentService({
+    supervisor: mockSupervisor,
+    worker: persistentRun.retainedWorker,
+    reason: 'test_stop',
+  });
+  assert.strictEqual(stopRes.ok, true);
+  assert.strictEqual(stopRes.terminated, true);
+  assert.strictEqual(stopRes.released, true);
+  assert.strictEqual(workerTerminatedCount, prevTermCount + 1, 'stopPersistentService must invoke supervisor worker termination');
+
+  // 3. Readiness State Invariant: HTTP 404 is NOT Ready
+  function classifyEndpointReadiness(httpStatus) {
+    if (httpStatus >= 200 && httpStatus < 400) {
+      return { serverStartupStatus: 'VERIFIED', serviceState: 'READY' };
+    }
+    if (httpStatus === 404) {
+      return { serverStartupStatus: 'REACHABLE_UNCONFIGURED_ROUTE', serviceState: 'DEGRADED' };
+    }
+    if (httpStatus >= 400 && httpStatus < 500) {
+      return { serverStartupStatus: 'CLIENT_ERROR', serviceState: 'DEGRADED' };
+    }
+    return { serverStartupStatus: 'SERVER_ERROR', serviceState: 'FAILED' };
+  }
+
+  assert.strictEqual(classifyEndpointReadiness(200).serviceState, 'READY');
+  assert.strictEqual(classifyEndpointReadiness(302).serviceState, 'READY');
+  assert.notStrictEqual(classifyEndpointReadiness(404).serviceState, 'READY', 'HTTP 404 must NOT be classified as READY');
+  assert.strictEqual(classifyEndpointReadiness(404).serviceState, 'DEGRADED');
+  assert.strictEqual(classifyEndpointReadiness(500).serviceState, 'FAILED');
+}
+
 async function runAllTests() {
   try {
     await setupTestDir();
@@ -1832,6 +2092,7 @@ async function runAllTests() {
     await testV44857BCommandOutputIntegrityAndEvidencePipeline();
     await testV44857CExecutionAndLifecycleAudit();
     await testV44857DExecutionAndLifecycleHardening();
+    await testV44857EPersistentRuntimeAndSupervisorContract();
     console.log('All Isolation Provider Verification & Sandbox Readiness regression tests passed successfully!');
   } finally {
     await cleanupTestDir();

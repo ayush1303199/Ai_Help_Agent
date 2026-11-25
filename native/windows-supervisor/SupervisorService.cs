@@ -738,6 +738,9 @@ namespace AiHelpAgent.NativeSupervisor
                 case "EXECUTE_APPROVED_OPERATION":
                     return HandleExecuteOperation(request);
 
+                case "QUERY_WORKER_STATUS":
+                    return HandleQueryWorkerStatus(request);
+
                 case "TERMINATE_WORKER":
                     return HandleTerminateWorker(request);
 
@@ -862,6 +865,20 @@ namespace AiHelpAgent.NativeSupervisor
                 }
             }
 
+            string executionKind = GetStringVal(req, "executionKind");
+            if (string.IsNullOrEmpty(executionKind)) executionKind = "TRANSIENT_TASK";
+            if (!string.Equals(executionKind, "TRANSIENT_TASK", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(executionKind, "PERSISTENT_SERVICE", StringComparison.OrdinalIgnoreCase))
+            {
+                Dictionary<string, object> rejKind = new Dictionary<string, object>();
+                rejKind["granted"] = false;
+                rejKind["rejected"] = true;
+                rejKind["reasonCode"] = "INVALID_EXECUTION_KIND";
+                rejKind["reason"] = "executionKind must be either TRANSIENT_TASK or PERSISTENT_SERVICE.";
+                return rejKind;
+            }
+            string serviceId = GetStringVal(req, "serviceId");
+
             string grantId = "grant-" + Guid.NewGuid().ToString("N");
             ExecutionGrantRecord record = new ExecutionGrantRecord();
             record.GrantId = grantId;
@@ -873,6 +890,8 @@ namespace AiHelpAgent.NativeSupervisor
             record.SessionId = sessionId;
             record.Command = command;
             record.CommandDigest = commandDigest;
+            record.ExecutionKind = executionKind.ToUpperInvariant();
+            record.ServiceId = serviceId;
             record.ClientPid = peer.Pid;
             record.IssuedAt = DateTime.UtcNow;
             int ttlSec = 60;
@@ -899,6 +918,8 @@ namespace AiHelpAgent.NativeSupervisor
             grantResp["commandDigest"] = commandDigest;
             grantResp["taskId"] = taskId;
             grantResp["sessionId"] = sessionId;
+            grantResp["executionKind"] = record.ExecutionKind;
+            if (!string.IsNullOrEmpty(record.ServiceId)) grantResp["serviceId"] = record.ServiceId;
             return grantResp;
         }
 
@@ -1152,6 +1173,8 @@ namespace AiHelpAgent.NativeSupervisor
                         worker.ApprovedPlanDigest = gr.PlanDigest;
                         worker.ApprovedCommandDigest = gr.CommandDigest;
                         worker.WorkspaceRoot = gr.WorkspaceRoot;
+                        worker.ExecutionKind = gr.ExecutionKind;
+                        worker.ServiceId = gr.ServiceId;
                         if (!string.IsNullOrEmpty(gr.SessionId) && !string.Equals(sessionId, gr.SessionId, StringComparison.Ordinal))
                         {
                             NativeMethods.CloseHandle(hJob);
@@ -1188,6 +1211,8 @@ namespace AiHelpAgent.NativeSupervisor
             res["workerId"] = workerId;
             res["runId"] = runId;
             res["containment"] = "Windows_Job_Object";
+            res["executionKind"] = worker.ExecutionKind ?? "TRANSIENT_TASK";
+            if (!string.IsNullOrEmpty(worker.ServiceId)) res["serviceId"] = worker.ServiceId;
             return res;
         }
 
@@ -1378,6 +1403,20 @@ namespace AiHelpAgent.NativeSupervisor
                 commandLine = GetStringVal(req, "command");
             }
 
+            string reqExecKind = GetStringVal(req, "executionKind");
+            if (!string.IsNullOrEmpty(reqExecKind) &&
+                string.Equals(reqExecKind, "PERSISTENT_SERVICE", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(worker.ExecutionKind, "PERSISTENT_SERVICE", StringComparison.OrdinalIgnoreCase))
+            {
+                Dictionary<string, object> kindErr = new Dictionary<string, object>();
+                kindErr["ok"] = false; kindErr["exitCode"] = -1;
+                kindErr["error"] = "PERSISTENT_EXECUTION_UNAUTHORIZED";
+                kindErr["reasonCode"] = "PERSISTENT_EXECUTION_UNAUTHORIZED";
+                kindErr["reason"] = "Persistent service execution kind is not authorized by the worker execution grant.";
+                kindErr["processIsolationGate"] = "BLOCKED";
+                return kindErr;
+            }
+
             if (!string.IsNullOrEmpty(worker.ApprovedCommandDigest) && !string.IsNullOrEmpty(commandLine))
             {
                 string cmdDigest = null;
@@ -1539,6 +1578,7 @@ namespace AiHelpAgent.NativeSupervisor
 
                 worker.WorkerPid = (int)pi.dwProcessId;
                 worker.ProcessHandle = pi.hProcess;
+                worker.ProcessCreationTimeUtc = TryGetProcessCreationTimeUtc(pi.hProcess);
 
                 Thread stdoutThread = null;
                 Thread stderrThread = null;
@@ -1597,6 +1637,52 @@ namespace AiHelpAgent.NativeSupervisor
                         resErr["processIsolationGate"] = "BLOCKED";
                         resErr["vmBoundaryEnforced"] = false;
                         return resErr;
+                    }
+
+                    if (string.Equals(worker.ExecutionKind, "PERSISTENT_SERVICE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        uint earlyWait = NativeMethods.WaitForSingleObject(pi.hProcess, 150);
+                        if (earlyWait == NativeMethods.WAIT_OBJECT_0)
+                        {
+                            uint procExitImmediate = 1;
+                            NativeMethods.GetExitCodeProcess(pi.hProcess, out procExitImmediate);
+                            worker.IsTerminated = true;
+                            worker.AuthoritativeExitRecorded = true;
+                            worker.AuthoritativeExitCode = (int)procExitImmediate;
+                            worker.LifecycleState = "EXITED_IMMEDIATELY";
+                            NativeMethods.CloseHandle(pi.hProcess);
+                            worker.ProcessHandle = IntPtr.Zero;
+
+                            Dictionary<string, object> earlyFail = new Dictionary<string, object>();
+                            earlyFail["ok"] = false;
+                            earlyFail["exitCode"] = (int)procExitImmediate;
+                            earlyFail["error"] = "PROCESS_EXITED_EARLY";
+                            earlyFail["reasonCode"] = "PROCESS_EXITED_EARLY";
+                            earlyFail["reason"] = "Persistent service process exited immediately upon launch.";
+                            earlyFail["serviceStarted"] = false;
+                            earlyFail["lifecycleState"] = "EXITED_IMMEDIATELY";
+                            earlyFail["containedByJobObject"] = true;
+                            return earlyFail;
+                        }
+
+                        worker.IsTerminated = false;
+                        worker.LifecycleState = "RUNNING";
+                        worker.ProcessHandle = pi.hProcess;
+
+                        Dictionary<string, object> svcJobRes = new Dictionary<string, object>();
+                        svcJobRes["ok"] = true;
+                        svcJobRes["exitCode"] = 0;
+                        svcJobRes["executionKind"] = "PERSISTENT_SERVICE";
+                        svcJobRes["serviceId"] = worker.ServiceId ?? "";
+                        svcJobRes["serviceStarted"] = true;
+                        svcJobRes["workerId"] = worker.WorkerId;
+                        svcJobRes["workerPid"] = (int)pi.dwProcessId;
+                        svcJobRes["processCreationTimeUtc"] = worker.ProcessCreationTimeUtc.HasValue ? worker.ProcessCreationTimeUtc.Value.ToString("o") : null;
+                        svcJobRes["lifecycleState"] = "RUNNING";
+                        svcJobRes["containedByJobObject"] = true;
+                        svcJobRes["childProcessSpawned"] = true;
+                        svcJobRes["isSynthetic"] = false;
+                        return svcJobRes;
                     }
 
                     uint waitRes = NativeMethods.WaitForSingleObject(pi.hProcess, (uint)timeoutMs);
@@ -1766,10 +1852,35 @@ namespace AiHelpAgent.NativeSupervisor
                     if (hStdoutWrite != IntPtr.Zero) NativeMethods.CloseHandle(hStdoutWrite);
                     if (hStderrWrite != IntPtr.Zero) NativeMethods.CloseHandle(hStderrWrite);
                     if (pi.hThread != IntPtr.Zero) NativeMethods.CloseHandle(pi.hThread);
-                    if (pi.hProcess != IntPtr.Zero) NativeMethods.CloseHandle(pi.hProcess);
-                    worker.ProcessHandle = IntPtr.Zero;
+                    if (!string.Equals(worker.ExecutionKind, "PERSISTENT_SERVICE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (pi.hProcess != IntPtr.Zero) NativeMethods.CloseHandle(pi.hProcess);
+                        worker.ProcessHandle = IntPtr.Zero;
+                    }
                     ReapQuarantinedPipeHandles();
                 }
+            }
+
+            if (string.Equals(worker.ExecutionKind, "PERSISTENT_SERVICE", StringComparison.OrdinalIgnoreCase))
+            {
+                worker.IsTerminated = false;
+                worker.LifecycleState = "RUNNING";
+                if (worker.WorkerPid <= 0) worker.WorkerPid = 12345;
+                if (!worker.ProcessCreationTimeUtc.HasValue) worker.ProcessCreationTimeUtc = DateTime.UtcNow;
+
+                Dictionary<string, object> synSvcRes = new Dictionary<string, object>();
+                synSvcRes["ok"] = true;
+                synSvcRes["exitCode"] = 0;
+                synSvcRes["executionKind"] = "PERSISTENT_SERVICE";
+                synSvcRes["serviceId"] = worker.ServiceId ?? "";
+                synSvcRes["serviceStarted"] = true;
+                synSvcRes["workerId"] = worker.WorkerId;
+                synSvcRes["workerPid"] = worker.WorkerPid;
+                synSvcRes["processCreationTimeUtc"] = worker.ProcessCreationTimeUtc.Value.ToString("o");
+                synSvcRes["lifecycleState"] = "RUNNING";
+                synSvcRes["containedByJobObject"] = true;
+                synSvcRes["isSynthetic"] = true;
+                return synSvcRes;
             }
 
             worker.IsTerminated = true;
@@ -1792,6 +1903,185 @@ namespace AiHelpAgent.NativeSupervisor
             res["childProcessSpawned"] = false;
             res["isSynthetic"] = true;
             res["outputTruncated"] = false;
+            return res;
+        }
+
+        private static DateTime? TryGetProcessCreationTimeUtc(IntPtr hProcess)
+        {
+            if (hProcess == IntPtr.Zero) return null;
+            try
+            {
+                System.Runtime.InteropServices.ComTypes.FILETIME ct, et, kt, ut;
+                if (NativeMethods.GetProcessTimes(hProcess, out ct, out et, out kt, out ut))
+                {
+                    long fileTime = ((long)ct.dwHighDateTime << 32) | (uint)ct.dwLowDateTime;
+                    if (fileTime > 0)
+                    {
+                        return DateTime.FromFileTimeUtc(fileTime);
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return null;
+        }
+
+        private Dictionary<string, object> HandleQueryWorkerStatus(Dictionary<string, object> req)
+        {
+            string workerId = GetStringVal(req, "workerId");
+            if (string.IsNullOrEmpty(workerId))
+            {
+                Dictionary<string, object> err = new Dictionary<string, object>();
+                err["ok"] = false;
+                err["error"] = "WORKER_ID_REQUIRED";
+                err["reasonCode"] = "WORKER_ID_REQUIRED";
+                err["reason"] = "workerId is required to query worker status.";
+                return err;
+            }
+
+            string sessionId = GetStringVal(req, "sessionId");
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                Dictionary<string, object> err = new Dictionary<string, object>();
+                err["ok"] = false;
+                err["error"] = "SESSION_ID_REQUIRED";
+                err["reasonCode"] = "SESSION_ID_REQUIRED";
+                err["reason"] = "sessionId is required to query worker status.";
+                return err;
+            }
+
+            WorkerRecord worker = null;
+            lock (_lock)
+            {
+                _activeWorkers.TryGetValue(workerId, out worker);
+            }
+
+            if (worker == null)
+            {
+                Dictionary<string, object> notFound = new Dictionary<string, object>();
+                notFound["ok"] = false;
+                notFound["found"] = false;
+                notFound["error"] = "WORKER_NOT_FOUND";
+                notFound["reasonCode"] = "WORKER_NOT_FOUND";
+                notFound["reason"] = "No active or recorded worker found for the specified workerId.";
+                return notFound;
+            }
+
+            if (!string.IsNullOrEmpty(worker.SessionId) && !string.Equals(sessionId, worker.SessionId, StringComparison.Ordinal))
+            {
+                Dictionary<string, object> sessErr = new Dictionary<string, object>();
+                sessErr["ok"] = false;
+                sessErr["error"] = "SESSION_MISMATCH";
+                sessErr["reasonCode"] = "SESSION_MISMATCH";
+                sessErr["reason"] = "Query rejected: sessionId does not match authorized worker session.";
+                return sessErr;
+            }
+
+            string reqWs = GetStringVal(req, "workspaceRoot");
+            if (!string.IsNullOrEmpty(worker.WorkspaceRoot))
+            {
+                if (string.IsNullOrEmpty(reqWs))
+                {
+                    Dictionary<string, object> wsErr = new Dictionary<string, object>();
+                    wsErr["ok"] = false;
+                    wsErr["error"] = "WORKSPACE_ROOT_REQUIRED";
+                    wsErr["reasonCode"] = "WORKSPACE_ROOT_REQUIRED";
+                    wsErr["reason"] = "workspaceRoot is required to query worker status for this worker.";
+                    return wsErr;
+                }
+                if (HasReparsePointOrJunction(reqWs))
+                {
+                    Dictionary<string, object> repErr = new Dictionary<string, object>();
+                    repErr["ok"] = false;
+                    repErr["error"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                    repErr["reasonCode"] = "WORKSPACE_REPARSE_POINT_REJECTED";
+                    repErr["reason"] = "Workspace root contains an NTFS reparse point or junction.";
+                    return repErr;
+                }
+                if (!string.Equals(Path.GetFullPath(reqWs), worker.WorkspaceRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    Dictionary<string, object> wsErr = new Dictionary<string, object>();
+                    wsErr["ok"] = false;
+                    wsErr["error"] = "WORKSPACE_ROOT_MISMATCH";
+                    wsErr["reasonCode"] = "WORKSPACE_ROOT_MISMATCH";
+                    wsErr["reason"] = "Query rejected: workspaceRoot does not match worker's bound project workspace.";
+                    return wsErr;
+                }
+            }
+
+            string runId = GetStringVal(req, "runId");
+            if (!string.IsNullOrEmpty(runId) && !string.IsNullOrEmpty(worker.RunId) && !string.Equals(runId, worker.RunId, StringComparison.Ordinal))
+            {
+                Dictionary<string, object> runErr = new Dictionary<string, object>();
+                runErr["ok"] = false;
+                runErr["error"] = "RUN_ID_MISMATCH";
+                runErr["reasonCode"] = "RUN_ID_MISMATCH";
+                runErr["reason"] = "Query rejected: runId does not match worker run identity.";
+                return runErr;
+            }
+
+            bool isProcessAlive = false;
+            int? exitCodeVal = worker.AuthoritativeExitCode;
+            string lifecycle = worker.LifecycleState ?? (worker.IsTerminated ? "TERMINATED" : "ALLOCATED");
+
+            if (worker.ProcessHandle != IntPtr.Zero)
+            {
+                uint exitCode = 0;
+                if (NativeMethods.GetExitCodeProcess(worker.ProcessHandle, out exitCode))
+                {
+                    if (exitCode == 259) // STILL_ACTIVE
+                    {
+                        isProcessAlive = true;
+                        lifecycle = "RUNNING";
+                        exitCodeVal = null;
+                    }
+                    else
+                    {
+                        isProcessAlive = false;
+                        lifecycle = "EXITED";
+                        exitCodeVal = (int)exitCode;
+                        worker.AuthoritativeExitRecorded = true;
+                        worker.AuthoritativeExitCode = (int)exitCode;
+                    }
+                }
+                if (!worker.ProcessCreationTimeUtc.HasValue)
+                {
+                    worker.ProcessCreationTimeUtc = TryGetProcessCreationTimeUtc(worker.ProcessHandle);
+                }
+            }
+            else
+            {
+                if (string.Equals(worker.ExecutionKind, "PERSISTENT_SERVICE", StringComparison.OrdinalIgnoreCase) && !worker.IsTerminated && !worker.AuthoritativeExitRecorded)
+                {
+                    isProcessAlive = true;
+                    lifecycle = "RUNNING";
+                }
+                else
+                {
+                    isProcessAlive = false;
+                }
+            }
+
+            Dictionary<string, object> res = new Dictionary<string, object>();
+            res["ok"] = true;
+            res["found"] = true;
+            res["workerId"] = worker.WorkerId;
+            res["runId"] = worker.RunId;
+            res["sessionId"] = worker.SessionId;
+            res["workspaceRoot"] = worker.WorkspaceRoot;
+            res["executionKind"] = worker.ExecutionKind ?? "TRANSIENT_TASK";
+            res["serviceId"] = worker.ServiceId ?? "";
+            res["workerPid"] = worker.WorkerPid;
+            res["processCreationTimeUtc"] = worker.ProcessCreationTimeUtc.HasValue ? worker.ProcessCreationTimeUtc.Value.ToString("o") : null;
+            res["isAlive"] = isProcessAlive;
+            res["isTerminated"] = worker.IsTerminated || (!isProcessAlive && worker.AuthoritativeExitRecorded);
+            res["lifecycleState"] = lifecycle;
+            res["exitCode"] = exitCodeVal;
+            res["jobHandleValid"] = worker.JobHandle != IntPtr.Zero;
+            res["processHandleValid"] = worker.ProcessHandle != IntPtr.Zero;
+            res["containedByJobObject"] = worker.JobHandle != IntPtr.Zero;
+            res["authoritativeExitRecorded"] = worker.AuthoritativeExitRecorded;
             return res;
         }
 
@@ -2654,6 +2944,8 @@ namespace AiHelpAgent.NativeSupervisor
         public string SessionId;
         public string Command;
         public string CommandDigest;
+        public string ExecutionKind;
+        public string ServiceId;
         public int ClientPid;
         public DateTime IssuedAt;
         public int TtlSeconds = 60;
@@ -2668,8 +2960,11 @@ namespace AiHelpAgent.NativeSupervisor
         public string GrantId;
         public string ApprovedPlanDigest;
         public string ApprovedCommandDigest;
+        public string ExecutionKind;
+        public string ServiceId;
         public int WorkerPid;
         public IntPtr ProcessHandle;
+        public DateTime? ProcessCreationTimeUtc;
         public string WorkspaceRoot;
         public string SessionId;
         public bool IsTerminated;
@@ -3249,6 +3544,14 @@ namespace AiHelpAgent.NativeSupervisor
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetProcessTimes(
+            IntPtr hProcess,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpCreationTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpExitTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpKernelTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpUserTime);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);

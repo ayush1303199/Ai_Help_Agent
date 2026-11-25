@@ -404,6 +404,9 @@ async function executeWithSupervisor({
   isCancelled,
   signal,
   isSyntheticTest = false,
+  executionKind = 'TRANSIENT_TASK',
+  serviceId = null,
+  startupTimeoutMs = 15000,
 }) {
   const auth = authenticateSupervisor(supervisor, { isSyntheticTest: Boolean(isSyntheticTest) });
   if (!auth.authenticated) {
@@ -427,6 +430,11 @@ async function executeWithSupervisor({
     observeEffectiveIsolation: supervisor.observeEffectiveIsolation.bind(supervisor),
     executeApprovedOperation: supervisor.executeApprovedOperation.bind(supervisor),
     enforceDeadlineAndCancellation: supervisor.enforceDeadlineAndCancellation.bind(supervisor),
+    queryWorkerStatus: typeof supervisor.queryWorkerStatus === 'function'
+      ? supervisor.queryWorkerStatus.bind(supervisor)
+      : (typeof supervisor.operations?.queryWorkerStatus === 'function'
+        ? supervisor.operations.queryWorkerStatus.bind(supervisor.operations)
+        : null),
     collectHostEvidence: supervisor.collectHostEvidence.bind(supervisor),
     terminateWorker: supervisor.terminateWorker.bind(supervisor),
     verifyWorkerTerminationAndResourceRelease: supervisor.verifyWorkerTerminationAndResourceRelease.bind(supervisor),
@@ -461,6 +469,8 @@ async function executeWithSupervisor({
     command,
     commandDigest,
     timeoutMs,
+    executionKind: executionKind || 'TRANSIENT_TASK',
+    serviceId: serviceId || null,
   });
 
   if (!grant || typeof grant !== 'object') {
@@ -530,6 +540,17 @@ async function executeWithSupervisor({
     throw error;
   }
 
+  const requestedExecutionKind = executionKind || grant?.executionKind || 'TRANSIENT_TASK';
+  if (requestedExecutionKind === 'PERSISTENT_SERVICE') {
+    if (!grant || grant.executionKind !== 'PERSISTENT_SERVICE') {
+      const error = new Error('Persistent service execution blocked: execution grant does not authorize PERSISTENT_SERVICE.');
+      error.code = 'PROJECT_EXECUTION_BLOCKED';
+      error.executionBlocked = true;
+      error.reasonCode = 'PERSISTENT_EXECUTION_UNAUTHORIZED';
+      throw error;
+    }
+  }
+
   const consumed = await op.consumeExecutionGrant(grant);
   if (!consumed || consumed.consumed !== true) {
     const error = new Error('Supervised execution blocked: single-use execution grant could not be consumed.');
@@ -566,6 +587,115 @@ async function executeWithSupervisor({
     error.code = 'PROJECT_EXECUTION_BLOCKED';
     error.executionBlocked = true;
     throw error;
+  }
+
+  if (requestedExecutionKind === 'PERSISTENT_SERVICE') {
+    let startupResult = null;
+    let startupError = null;
+
+    try {
+      const effectiveStartupTimeoutMs = typeof startupTimeoutMs === 'number' && startupTimeoutMs > 0
+        ? startupTimeoutMs
+        : (typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : 15000);
+
+      const deadlinePromise = op.enforceDeadlineAndCancellation({
+        worker,
+        timeoutMs: effectiveStartupTimeoutMs,
+        signal,
+        isCancelled,
+      });
+
+      const runPromise = op.executeApprovedOperation({
+        worker,
+        command,
+        commandLine: command,
+        commandDigest,
+        executionKind: 'PERSISTENT_SERVICE',
+        serviceId: grant.serviceId || serviceId,
+        workspaceRoot: resolvedWorkspace,
+        sessionId: grant.sessionId || effectiveSessionId,
+        grant,
+        isSyntheticTest: Boolean(isSyntheticTest),
+      });
+
+      startupResult = await Promise.race([runPromise, deadlinePromise]);
+    } catch (err) {
+      startupError = err;
+    }
+
+    let queryStatus = null;
+    if (!startupError && startupResult?.ok !== false) {
+      if (typeof op.queryWorkerStatus === 'function') {
+        queryStatus = await op.queryWorkerStatus({
+          worker,
+          sessionId: grant.sessionId || effectiveSessionId,
+          workspaceRoot: resolvedWorkspace,
+          runId,
+          isSyntheticTest: Boolean(isSyntheticTest),
+        }).catch((queryErr) => ({ ok: false, isAlive: false, error: queryErr.message }));
+      } else {
+        queryStatus = {
+          ok: true,
+          found: true,
+          isAlive: true,
+          workerPid: startupResult?.workerPid || 0,
+          processCreationTimeUtc: startupResult?.processCreationTimeUtc,
+        };
+      }
+    }
+
+    const failedStartup = Boolean(startupError || startupResult?.ok === false || startupResult?.timedOut || startupResult?.cancelled || !queryStatus?.isAlive || queryStatus?.isTerminated);
+
+    if (failedStartup) {
+      let terminationReason = 'startup_failure';
+      if (startupError) terminationReason = 'startup_error';
+      else if (startupResult?.timedOut) terminationReason = 'startup_timeout';
+      else if (startupResult?.cancelled) terminationReason = 'cancelled';
+      else if (queryStatus?.isTerminated) terminationReason = 'process_exited_early';
+
+      let terminationResult;
+      try {
+        terminationResult = await op.terminateWorker({ worker, reason: terminationReason });
+      } catch (termErr) {
+        await op.quarantineResource({ worker, error: termErr }).catch(() => {});
+      }
+      await op.verifyWorkerTerminationAndResourceRelease({ worker, terminationResult }).catch(() => {});
+
+      const exitCode = queryStatus?.exitCode ?? startupResult?.exitCode ?? -1;
+      const errorMsg = startupError?.message || startupResult?.error || (queryStatus?.isTerminated ? `Process exited early (exitCode=${exitCode})` : 'Persistent service startup failed');
+      const error = new Error(`Persistent service startup failed: ${errorMsg}`);
+      error.code = 'SERVICE_STARTUP_FAILED';
+      error.exitCode = exitCode;
+      error.serviceStarted = false;
+      error.startupResult = startupResult;
+      error.queryStatus = queryStatus;
+      throw error;
+    }
+
+    const hostEvidence = await op.collectHostEvidence({
+      worker,
+      runId,
+      executionResult: startupResult,
+      executionError: null,
+    }).catch((collectErr) => ({ evidenceCollected: false, error: collectErr.message }));
+
+    return {
+      ok: true,
+      serviceStarted: true,
+      executionKind: 'PERSISTENT_SERVICE',
+      serviceId: grant.serviceId || serviceId || '',
+      workerId: worker.workerId,
+      worker,
+      workerPid: queryStatus?.workerPid || startupResult?.workerPid || 0,
+      processCreationTimeUtc: queryStatus?.processCreationTimeUtc || startupResult?.processCreationTimeUtc || new Date().toISOString(),
+      lifecycleState: 'RUNNING',
+      workspaceRoot: resolvedWorkspace,
+      runId,
+      sessionId: grant.sessionId || effectiveSessionId,
+      containedByJobObject: true,
+      hostEvidence,
+      retainedWorker: worker,
+    };
   }
 
   let executionResult = null;
@@ -942,6 +1072,8 @@ function createNativeSupervisorClient(options = {}) {
         planDigest: req.planDigest,
         command: req.command,
         commandDigest: req.commandDigest,
+        executionKind: req.executionKind || 'TRANSIENT_TASK',
+        serviceId: req.serviceId,
         taskId: req.taskId,
         sessionId: req.sessionId || defaultSessionId,
         ttlSeconds: req.ttlSeconds,
@@ -984,8 +1116,20 @@ function createNativeSupervisorClient(options = {}) {
         command: req?.command,
         commandLine: req?.commandLine || req?.command,
         commandDigest: req?.commandDigest,
+        executionKind: req?.executionKind || req?.grant?.executionKind || 'TRANSIENT_TASK',
+        serviceId: req?.serviceId || req?.grant?.serviceId,
         workspaceRoot: req?.workspaceRoot,
         sessionId: req?.sessionId || req?.grant?.sessionId || defaultSessionId,
+        isSyntheticTest: req?.isSyntheticTest !== undefined ? Boolean(req?.isSyntheticTest) : Boolean(options.isSyntheticTest),
+      }, { pipePath });
+    },
+    async queryWorkerStatus(req) {
+      return sendNativeSupervisorRequest({
+        operation: 'QUERY_WORKER_STATUS',
+        workerId: req?.workerId || req?.worker?.workerId,
+        sessionId: req?.sessionId || req?.worker?.sessionId || req?.grant?.sessionId || defaultSessionId,
+        workspaceRoot: req?.workspaceRoot || req?.worker?.workspaceRoot,
+        runId: req?.runId || req?.worker?.runId,
         isSyntheticTest: req?.isSyntheticTest !== undefined ? Boolean(req?.isSyntheticTest) : Boolean(options.isSyntheticTest),
       }, { pipePath });
     },
@@ -1205,6 +1349,26 @@ function createWindowsSandboxProviderAdapter(config = {}) {
         supervisor: settings.supervisor,
         isSyntheticTest: Boolean(settings.isSyntheticTest),
         ...runRequest,
+      });
+    },
+    queryWorkerStatus: (queryRequest) => {
+      if (!settings.supervisor) {
+        throw new Error('No trusted supervisor configured for this Windows Sandbox adapter.');
+      }
+      return queryWorkerStatus({
+        supervisor: settings.supervisor,
+        isSyntheticTest: Boolean(settings.isSyntheticTest),
+        ...queryRequest,
+      });
+    },
+    stopPersistentService: (stopRequest) => {
+      if (!settings.supervisor) {
+        throw new Error('No trusted supervisor configured for this Windows Sandbox adapter.');
+      }
+      return stopPersistentService({
+        supervisor: settings.supervisor,
+        isSyntheticTest: Boolean(settings.isSyntheticTest),
+        ...stopRequest,
       });
     },
     disabledReason: DISABLED_REASON,
@@ -1579,6 +1743,53 @@ async function verifyLiveSupervisorProcessIsolation(options = {}) {
   }
 }
 
+async function queryWorkerStatus(options = {}) {
+  const supervisor = options.supervisor;
+  if (!supervisor) {
+    throw new Error('Supervisor is required to query worker status.');
+  }
+  const op = supervisor.operations || supervisor;
+  if (typeof op.queryWorkerStatus === 'function') {
+    return op.queryWorkerStatus(options);
+  }
+  return sendNativeSupervisorRequest({
+    operation: 'QUERY_WORKER_STATUS',
+    workerId: options.workerId || options.worker?.workerId,
+    sessionId: options.sessionId || options.worker?.sessionId,
+    workspaceRoot: options.workspaceRoot || options.worker?.workspaceRoot,
+    runId: options.runId || options.worker?.runId,
+    isSyntheticTest: Boolean(options.isSyntheticTest),
+  }, { pipePath: options.pipePath });
+}
+
+async function stopPersistentService(options = {}) {
+  const supervisor = options.supervisor;
+  if (!supervisor) {
+    throw new Error('Supervisor is required to stop persistent service.');
+  }
+  const op = supervisor.operations || supervisor;
+  const worker = options.worker || {
+    workerId: options.workerId,
+    sessionId: options.sessionId,
+    workspaceRoot: options.workspaceRoot,
+  };
+  const termRes = await op.terminateWorker({
+    worker,
+    reason: options.reason || 'user_stopped',
+  });
+  const releaseRes = await op.verifyWorkerTerminationAndResourceRelease({
+    worker,
+    terminationResult: termRes,
+  }).catch(() => null);
+  return {
+    ok: termRes?.terminated === true,
+    terminated: termRes?.terminated === true,
+    released: releaseRes?.released === true,
+    workerId: worker.workerId,
+    exitCode: termRes?.exitCode,
+  };
+}
+
 module.exports = {
   DEFAULT_MEMORY_MB,
   DIRECT_HCS_DISABLED_REASON,
@@ -1601,6 +1812,8 @@ module.exports = {
   createWindowsSandboxProviderAdapter,
   executeWithSupervisor,
   queryNativeSupervisorStatus,
+  queryWorkerStatus,
+  stopPersistentService,
   sendNativeSupervisorRequest,
   validateHostShutdownObservation,
   verifyLiveSupervisorProcessIsolation,

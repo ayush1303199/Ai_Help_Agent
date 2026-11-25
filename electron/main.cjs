@@ -254,12 +254,10 @@ async function findVerifiedOpenPort(candidatePorts, maxDurationMs = 3000) {
   while (Date.now() < deadline) {
     for (const port of candidatePorts) {
       if (port >= 1 && port <= 65535) {
-        // eslint-disable-next-line no-await-in-loop
         const isOpen = await probePort(port);
         if (isOpen) return port;
       }
     }
-    // eslint-disable-next-line no-await-in-loop
     await new Promise((r) => setTimeout(r, 200));
   }
   return null;
@@ -453,17 +451,27 @@ async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout
     ? verifySocketOwnership(verifiedPort, targetPid, processMeta.createdAt)
     : { verified: false };
 
+  let serviceState = 'STARTING';
   if (ownership.verified) {
     listenerOwnershipStatus = 'ATTRIBUTED';
     if (typeof httpStatus === 'number') {
       httpReadinessStatus = 'VERIFIED';
-      serverStartupStatus = 'VERIFIED';
       if (httpStatus >= 200 && httpStatus < 400) {
+        serverStartupStatus = 'VERIFIED';
+        serviceState = 'READY';
         displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Ready)`;
+      } else if (httpStatus === 404) {
+        serverStartupStatus = 'REACHABLE_UNCONFIGURED_ROUTE';
+        serviceState = 'DEGRADED';
+        displayInfo = `Server reachable at http://localhost:${verifiedPort} (HTTP 404 - Degraded, Route Not Found)`;
       } else if (httpStatus >= 400 && httpStatus < 500) {
-        displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Responsive)`;
+        serverStartupStatus = 'CLIENT_ERROR';
+        serviceState = 'DEGRADED';
+        displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Client Error)`;
       } else {
-        displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Unhealthy)`;
+        serverStartupStatus = 'SERVER_ERROR';
+        serviceState = 'FAILED';
+        displayInfo = `Server listening at http://localhost:${verifiedPort} (HTTP ${httpStatus} - Server Error)`;
       }
     }
   }
@@ -474,12 +482,139 @@ async function resolveWorkspaceServerEndpointInfo(workspaceRoot, command, stdout
     listenerOwnershipStatus,
     httpReadinessStatus,
     serverStartupStatus,
+    serviceState,
     port: verifiedPort,
     httpStatus,
     socketOwnerPid: ownership.socketPid || null,
     displayInfo,
     toString() { return displayInfo; },
   };
+}
+
+const projectRuntimeServices = new Map();
+let lastSupervisorClient = null;
+
+function getRuntimeServiceKey(projectRoot, serviceId = 'default') {
+  const normRoot = path.normalize(projectRoot || '').toLowerCase();
+  return `${normRoot}::${serviceId || 'default'}`;
+}
+
+function registerPersistentService(record) {
+  if (!record || !record.canonicalProjectRoot || !record.workerId) return null;
+  const key = getRuntimeServiceKey(record.canonicalProjectRoot, record.serviceId);
+  const entry = {
+    serviceId: record.serviceId || 'default',
+    serviceRole: record.serviceRole || 'BACKEND',
+    serviceKey: key,
+    canonicalProjectRoot: record.canonicalProjectRoot,
+    workerId: record.workerId,
+    workerPid: record.workerPid || 0,
+    processCreationTimeUtc: record.processCreationTimeUtc || null,
+    grantId: record.grantId || '',
+    executionKind: 'PERSISTENT_SERVICE',
+    state: record.state || 'STARTING',
+    command: record.command || '',
+    port: record.port || null,
+    httpStatus: record.httpStatus || null,
+    displayInfo: record.displayInfo || '',
+    startedAt: record.startedAt || new Date().toISOString(),
+    lastVerifiedAt: record.lastVerifiedAt || new Date().toISOString(),
+    retainedWorker: record.retainedWorker || null,
+    sessionId: record.sessionId || 'developer-session',
+  };
+  projectRuntimeServices.set(key, entry);
+  return entry;
+}
+
+function getPersistentService(projectRoot, serviceId = 'default') {
+  return projectRuntimeServices.get(getRuntimeServiceKey(projectRoot, serviceId)) || null;
+}
+
+function listPersistentServices(projectRoot) {
+  const normRoot = path.normalize(projectRoot || '').toLowerCase();
+  const list = [];
+  for (const entry of projectRuntimeServices.values()) {
+    if (path.normalize(entry.canonicalProjectRoot).toLowerCase() === normRoot) {
+      list.push({
+        serviceId: entry.serviceId,
+        serviceRole: entry.serviceRole,
+        workerId: entry.workerId,
+        workerPid: entry.workerPid,
+        processCreationTimeUtc: entry.processCreationTimeUtc,
+        state: entry.state,
+        command: entry.command,
+        port: entry.port,
+        httpStatus: entry.httpStatus,
+        displayInfo: entry.displayInfo,
+        startedAt: entry.startedAt,
+        lastVerifiedAt: entry.lastVerifiedAt,
+      });
+    }
+  }
+  return list;
+}
+
+async function reconcilePersistentService(projectRoot, serviceId, supervisorClient) {
+  const entry = getPersistentService(projectRoot, serviceId);
+  if (!entry) return null;
+  const client = supervisorClient || lastSupervisorClient;
+  if (!client) return entry;
+  try {
+    const supervisorAdapter = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
+    const status = await supervisorAdapter.queryWorkerStatus({
+      supervisor: client,
+      workerId: entry.workerId,
+      sessionId: entry.sessionId,
+      workspaceRoot: entry.canonicalProjectRoot,
+    });
+    if (!status || status.ok !== true || status.isAlive !== true || status.isTerminated === true) {
+      entry.state = status?.isTerminated ? 'STOPPED' : 'FAILED';
+    } else {
+      entry.state = 'READY';
+      entry.workerPid = status.workerPid || entry.workerPid;
+      entry.processCreationTimeUtc = status.processCreationTimeUtc || entry.processCreationTimeUtc;
+    }
+    entry.lastVerifiedAt = new Date().toISOString();
+  } catch (_) {
+    entry.state = 'DEGRADED';
+  }
+  return entry;
+}
+
+async function stopPersistentServiceRecord(projectRoot, serviceId, supervisorClient) {
+  const entry = getPersistentService(projectRoot, serviceId);
+  if (!entry) {
+    return { ok: true, stopped: true, message: 'Service not found or already stopped.' };
+  }
+  entry.state = 'STOPPING';
+  try {
+    const supervisorAdapter = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
+    const client = supervisorClient || lastSupervisorClient;
+    if (client) {
+      await supervisorAdapter.stopPersistentService({
+        supervisor: client,
+        workerId: entry.workerId,
+        sessionId: entry.sessionId,
+        workspaceRoot: entry.canonicalProjectRoot,
+        reason: 'user_requested_stop',
+      });
+    }
+    entry.state = 'STOPPED';
+    return { ok: true, stopped: true, serviceId: entry.serviceId, workerId: entry.workerId };
+  } catch (err) {
+    entry.state = 'FAILED';
+    return { ok: false, stopped: false, error: err.message };
+  }
+}
+
+async function stopAllPersistentServicesForProject(projectRoot, supervisorClient) {
+  const services = listPersistentServices(projectRoot);
+  const results = [];
+  for (const svc of services) {
+    const res = await stopPersistentServiceRecord(projectRoot, svc.serviceId, supervisorClient);
+    results.push(res);
+  }
+  return { ok: true, count: results.length, results };
 }
 
 async function executeWorkspaceCommandsPipeline({
@@ -491,8 +626,10 @@ async function executeWorkspaceCommandsPipeline({
   sessionId = 'developer-session',
   executionId = null,
   parentExecutionId = null,
+  executionKind = null,
 }) {
   const authoritativeExecutionId = executionId || parentExecutionId || `exec-${Date.now()}`;
+  const rawCommands = commands;
   const commandsList = Array.isArray(rawCommands)
     ? rawCommands.map((c) => String(c).trim()).filter(Boolean)
     : (typeof rawCommands === 'string' && rawCommands.trim() ? [rawCommands.trim()] : []);
@@ -533,10 +670,24 @@ async function executeWorkspaceCommandsPipeline({
       },
     };
   }
+  lastSupervisorClient = isolationVerification.client;
+
   const executedResults = [];
   for (const cmd of commandsList) {
-    const isServerCmd = /\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b/i.test(cmd);
-    const commandTimeout = isServerCmd ? 8000 : 120000;
+    const isPersistentCommand = Boolean(
+      executionKind === 'PERSISTENT_SERVICE' ||
+      /\b(?:npm\s+start|npm\s+run\s+dev|npm\s+run\s+start|node\s+server|node\s+app|vite|serve)\b/i.test(cmd)
+    );
+    const effectiveKind = isPersistentCommand ? 'PERSISTENT_SERVICE' : 'TRANSIENT_TASK';
+    const serviceId = `svc-${crypto.createHash('sha256').update(cmd).digest('hex').substring(0, 8)}`;
+    if (isolationVerification.grant) {
+      isolationVerification.grant.executionKind = effectiveKind;
+      isolationVerification.grant.serviceId = serviceId;
+    }
+    const startupTimeout = 15000;
+    const taskTimeout = 120000;
+    const commandTimeout = effectiveKind === 'PERSISTENT_SERVICE' ? startupTimeout : taskTimeout;
+
     let runResult;
     let execTimedOut = false;
     const commandStartTime = Date.now();
@@ -550,13 +701,17 @@ async function executeWorkspaceCommandsPipeline({
         taskId: `tool-cmd-${Date.now()}`,
         sessionId: sessionId || 'developer-session',
         command: cmd,
+        executionKind: effectiveKind,
+        serviceId,
         timeoutMs: commandTimeout,
+        startupTimeoutMs: startupTimeout,
         isSyntheticTest: Boolean(isSyntheticTest),
         autoAuthorizeAttachedProject,
         userApproved,
+        grant: isolationVerification.grant,
       });
     } catch (execErr) {
-      if (isServerCmd && execErr?.timedOut === true) {
+      if (effectiveKind === 'PERSISTENT_SERVICE' && execErr?.timedOut === true) {
         execTimedOut = true;
         runResult = {
           ok: false,
@@ -581,12 +736,12 @@ async function executeWorkspaceCommandsPipeline({
       }
     }
 
-    if (isServerCmd) {
+    if (effectiveKind === 'PERSISTENT_SERVICE') {
       if (execTimedOut) {
         runResult.ok = false;
         runResult.exitCode = 124;
         runResult.timedOut = true;
-        const timeoutMsg = 'Server command timed out before establishing a verified listening endpoint.';
+        const timeoutMsg = 'Server startup timed out before supervisor reported running state.';
         runResult.stderr = [runResult.stderr, timeoutMsg].filter(Boolean).join('\n');
       } else if (runResult.ok && !runResult.timedOut && !runResult.cancelled && (runResult.childProcessSpawned || runResult.workerPid || runResult.pid)) {
         const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout, {
@@ -603,6 +758,25 @@ async function executeWorkspaceCommandsPipeline({
           }
           runResult.serverReadiness = endpointInfo;
         }
+        registerPersistentService({
+          serviceId,
+          serviceRole: 'BACKEND',
+          canonicalProjectRoot: root,
+          workerId: runResult.workerId,
+          workerPid: runResult.workerPid || runResult.pid,
+          processCreationTimeUtc: runResult.processCreationTimeUtc,
+          grantId: isolationVerification.grant?.grantId,
+          executionKind: 'PERSISTENT_SERVICE',
+          state: endpointInfo?.serviceState || (endpointInfo?.serverStartupStatus === 'VERIFIED' ? 'READY' : 'STARTING'),
+          command: cmd,
+          port: endpointInfo?.port || null,
+          httpStatus: endpointInfo?.httpStatus || null,
+          displayInfo: endpointInfo?.displayInfo || '',
+          startedAt: new Date(commandStartTime).toISOString(),
+          lastVerifiedAt: new Date().toISOString(),
+          retainedWorker: runResult.retainedWorker,
+          sessionId: sessionId || 'developer-session',
+        });
       }
     } else if (runResult && runResult.ok && !runResult.timedOut && !runResult.cancelled && (runResult.childProcessSpawned || runResult.workerPid || runResult.pid)) {
       const endpointInfo = await resolveWorkspaceServerEndpointInfo(root, cmd, runResult.stdout, {
@@ -2188,6 +2362,32 @@ app.whenReady().then(async () => {
   ipcMain.handle('developer:read-file', (event, relativePath) => {
     developerAgent.getSession(event.sender.id);
     return developerFiles.readFile(relativePath, event.sender.id);
+  });
+  ipcMain.handle('developer:get-runtime-status', async (event, payload) => {
+    developerAgent.getSession(event.sender.id);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
+    const serviceId = typeof payload?.serviceId === 'string' ? payload.serviceId : 'default';
+    return reconcilePersistentService(root, serviceId, lastSupervisorClient);
+  });
+  ipcMain.handle('developer:list-runtime-services', async (event) => {
+    developerAgent.getSession(event.sender.id);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
+    return listPersistentServices(root);
+  });
+  ipcMain.handle('developer:stop-runtime-service', async (event, payload) => {
+    developerAgent.getSession(event.sender.id);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
+    const serviceId = typeof payload?.serviceId === 'string' ? payload.serviceId : 'default';
+    return stopPersistentServiceRecord(root, serviceId, lastSupervisorClient);
+  });
+  ipcMain.handle('developer:stop-all-runtime-services', async (event) => {
+    developerAgent.getSession(event.sender.id);
+    developerFiles.assertProjectOwner(event.sender.id);
+    const root = await fs.realpath(developerFiles.getProjectRoot(event.sender.id));
+    return stopAllPersistentServicesForProject(root, lastSupervisorClient);
   });
   ipcMain.handle('developer:search-code', (event, payload) => {
     developerAgent.getSession(event.sender.id);
@@ -3867,17 +4067,45 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', (event) => {
-  if (brokerShutdownStarted || !trustedBroker?.endpoint) return;
+  if (brokerShutdownStarted) return;
+  const activeServices = Array.from(projectRuntimeServices.values()).filter(
+    (s) => s.state === 'STARTING' || s.state === 'READY' || s.state === 'DEGRADED'
+  );
+  if (!trustedBroker?.endpoint && activeServices.length === 0) return;
   event.preventDefault();
   brokerShutdownStarted = true;
   void (async () => {
+    if (activeServices.length > 0) {
+      try {
+        const { stopPersistentService } = require('./coding-pipeline/windowsSandboxProviderAdapter.cjs');
+        await Promise.allSettled(
+          activeServices.map(async (svc) => {
+            svc.state = 'STOPPING';
+            try {
+              if (lastSupervisorClient) {
+                await stopPersistentService({
+                  supervisor: lastSupervisorClient,
+                  workerId: svc.workerId,
+                  sessionId: svc.sessionId || 'developer-session',
+                  workspaceRoot: svc.canonicalProjectRoot,
+                  reason: 'app_before_quit',
+                });
+              }
+            } catch (_) {}
+            svc.state = 'STOPPED';
+          })
+        );
+      } catch (svcErr) {
+        console.error('[CODING][RUNTIME] Failed to terminate active persistent services during shutdown:', svcErr);
+      }
+    }
     try {
       await publishTrustedBrokerRegistry([]);
     } catch (error) {
       console.error('[CODING][BROKER] Could not clear backend broker discovery during shutdown:', error);
     }
     try {
-      await trustedBroker.stop();
+      if (trustedBroker?.stop) await trustedBroker.stop();
     } catch (error) {
       console.error('[CODING][BROKER] Broker shutdown failed:', error);
     }
